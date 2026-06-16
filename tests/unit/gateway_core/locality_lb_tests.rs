@@ -750,6 +750,93 @@ fn strict_locality_present_source_unchanged_priority_tier() {
 }
 
 #[test]
+fn strict_locality_absent_source_falls_back_to_unhealthy_local_not_remote() {
+    // Strict mode is a fail-closed-to-local control: if configured local
+    // endpoints are currently unhealthy/ejected while remote endpoints remain
+    // healthy, selection may use a local fallback but must not widen to remote.
+    let local = target("local-a.local", Some("us-west/us-west-1/a"));
+    let up = strict_upstream(
+        None,
+        vec![
+            local.clone(),
+            remote_target("remote-a.local", Some("remote-cluster-east")),
+        ],
+    );
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let active_unhealthy = DashMap::new();
+    active_unhealthy.insert(target_key("u1", &local), 1);
+    let health = HealthContext {
+        active_unhealthy: &active_unhealthy,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    };
+
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "u1",
+            &format!("strict-local-fallback-{i}"),
+            Some(&health),
+        )
+        .expect("local fallback selected");
+        assert_eq!(selection.target.host, "local-a.local");
+        assert!(
+            selection.is_fallback,
+            "selecting an unhealthy local instead of a healthy remote must be marked as fallback"
+        );
+    }
+}
+
+#[test]
+fn strict_locality_vec_path_falls_back_to_unhealthy_local_not_remote() {
+    // Same regression guard for the >128-target Vec fallback path.
+    let mut targets = Vec::with_capacity(130);
+    let mut locals = Vec::new();
+    for i in 0..2 {
+        let local = target(&format!("local-{i}.local"), Some("us-west/us-west-1/a"));
+        locals.push(local.clone());
+        targets.push(local);
+    }
+    for i in 0..128 {
+        targets.push(remote_target(
+            &format!("remote-{i}.local"),
+            Some("remote-cluster-east"),
+        ));
+    }
+    let up = strict_upstream(None, targets);
+    let cache = LoadBalancerCache::new(&config(up));
+    let snapshot = cache.load();
+    let active_unhealthy = DashMap::new();
+    for local in &locals {
+        active_unhealthy.insert(target_key("u1", local), 1);
+    }
+    let health = HealthContext {
+        active_unhealthy: &active_unhealthy,
+        proxy_passive: None,
+        max_ejection_percent: None,
+    };
+
+    let mut seen = HashSet::new();
+    for i in 0..8 {
+        let selection = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "u1",
+            &format!("strict-local-vec-fallback-{i}"),
+            Some(&health),
+        )
+        .expect("local fallback selected");
+        assert!(selection.target.host.starts_with("local-"));
+        assert!(selection.is_fallback);
+        seen.insert(selection.target.host.clone());
+    }
+    assert!(
+        seen.iter().all(|host| host.starts_with("local-")),
+        "strict Vec fallback must not widen to remote endpoints — saw {seen:?}"
+    );
+}
+
+#[test]
 fn strict_locality_no_local_endpoints_falls_back_to_full_pool() {
     // Strict ON, absent source locality, and EVERY target is remote (tagged):
     // rather than black-holing, selection must widen to the full healthy pool so

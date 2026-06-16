@@ -2266,8 +2266,10 @@ impl LoadBalancer {
 
         // No source locality → no tier preference. Default (fail-open) returns
         // the input unchanged — the mixed local + remote pool. Strict mode
-        // (fail-closed-to-local) instead restricts to LOCAL endpoints, widening
-        // back to the full set only when none are local.
+        // (fail-closed-to-local) instead restricts to LOCAL endpoints. If local
+        // endpoints are configured but none survived health filtering, return
+        // an empty set so callers can fail over only to local endpoints rather
+        // than widening to healthy remote-cluster endpoints.
         if self.target_locality_ranks.is_empty() {
             if self.locality_lb_strict {
                 return self.strict_local_bitset(candidates);
@@ -2346,7 +2348,9 @@ impl LoadBalancer {
 
         // No source locality → no tier preference. Default returns the mixed
         // local + remote pool; strict mode restricts to LOCAL endpoints (Vec-
-        // path counterpart of `strict_local_bitset`), widening only when none.
+        // path counterpart of `strict_local_bitset`). When local endpoints are
+        // configured but currently unhealthy/ejected, return an empty set so
+        // callers do not widen to healthy remote-cluster endpoints.
         if self.target_locality_ranks.is_empty() {
             if self.locality_lb_strict {
                 return self.strict_local_candidates(candidates);
@@ -2390,8 +2394,9 @@ impl LoadBalancer {
     }
 
     /// Log the "strict locality LB found no local endpoints" widen-to-full-pool
-    /// warning at most once per balancer instance. Used by both the bitset and
-    /// Vec strict paths so the message is identical and never spams the hot path.
+    /// warning at most once per balancer instance. Used only when the upstream
+    /// has no configured local endpoints; strict mode must not widen merely
+    /// because configured local endpoints are currently unhealthy/ejected.
     #[cold]
     fn warn_strict_locality_widen(&self) {
         if !self
@@ -2422,8 +2427,9 @@ impl LoadBalancer {
 
     /// Strict local-first restriction for the bitset path: keep only candidates
     /// whose locality marks them LOCAL (precomputed in `local_locality_mask`).
-    /// When no candidate is local, widen back to the full input (warn once)
-    /// rather than black-holing — preserving availability over strictness.
+    /// Widen back to the full input only when the upstream has no configured
+    /// local endpoints at all; if local endpoints exist but were removed by
+    /// health filtering, return an empty set so callers can fail closed to local.
     #[inline]
     fn strict_local_bitset(&self, candidates: &HealthBitset) -> HealthBitset {
         if self.local_locality_mask.is_empty() {
@@ -2442,6 +2448,9 @@ impl LoadBalancer {
         }
         if !local.is_empty() {
             return local;
+        }
+        if self.local_locality_mask.iter().any(|is_local| *is_local) {
+            return HealthBitset::empty();
         }
         self.warn_strict_locality_widen();
         *candidates
@@ -2463,6 +2472,9 @@ impl LoadBalancer {
             .collect();
         if !local.is_empty() {
             return local;
+        }
+        if self.local_locality_mask.iter().any(|is_local| *is_local) {
+            return Vec::new();
         }
         self.warn_strict_locality_widen();
         candidates
@@ -2639,6 +2651,16 @@ impl LoadBalancer {
         }
 
         let healthy = self.preferred_locality_bitset(&healthy, self.locality_lb.as_ref());
+        if healthy.is_empty() {
+            let all = HealthBitset::all(n);
+            let all = self.preferred_locality_bitset(&all, self.locality_lb.as_ref());
+            return self
+                .select_with_bitset(ctx_key, &all)
+                .map(|target| TargetSelection {
+                    target,
+                    is_fallback: true,
+                });
+        }
         self.select_with_bitset(ctx_key, &healthy)
             .map(|target| TargetSelection {
                 target,
@@ -3135,6 +3157,16 @@ impl LoadBalancer {
                 });
         }
         let healthy = self.preferred_locality_candidates(healthy, self.locality_lb.as_ref());
+        if healthy.is_empty() {
+            let all: Vec<(usize, &Arc<UpstreamTarget>)> = self.targets.iter().enumerate().collect();
+            let all = self.preferred_locality_candidates(all, self.locality_lb.as_ref());
+            return self
+                .select_from_candidates_vec(ctx_key, &all)
+                .map(|target| TargetSelection {
+                    target,
+                    is_fallback: true,
+                });
+        }
         self.select_from_candidates_vec(ctx_key, &healthy)
             .map(|target| TargetSelection {
                 target,
