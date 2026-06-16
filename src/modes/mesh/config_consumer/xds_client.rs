@@ -4032,6 +4032,7 @@ mod tests {
             locality: None,
             service_account: Some("api".to_string()),
             pod_uid: None,
+            remote_provenance: false,
         };
         let service = MeshService {
             cluster_ips: Vec::new(),

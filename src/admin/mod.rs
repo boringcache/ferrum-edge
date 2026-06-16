@@ -3483,13 +3483,14 @@ async fn handle_restore(
             Ok(errs) => validation_errors.extend(errs),
             Err(err) => validation_errors.push(err.to_string()),
         }
-        // Restore is an admin write, so reject mesh-PROJECTED upstream fields the
-        // same way direct POST/PUT does. This check is intentionally NOT part of
-        // the shared `validate_all_fields` step (that step also runs on runtime
-        // config-apply, where mesh-projected upstreams legitimately carry these
-        // fields); the admin paths invoke it explicitly.
+        // Restore is an operator-provided admin write, so reject mesh-PROJECTED
+        // upstream fields the same way direct POST/PUT does. This check is
+        // intentionally NOT part of the shared `validate_all_fields` step (that
+        // step also runs on the mesh slice-apply path, where mesh-projected
+        // upstreams legitimately carry these fields); operator paths invoke it
+        // explicitly.
         for u in &temp_config.upstreams {
-            if let Err(errs) = u.validate_admin_only_fields() {
+            if let Err(errs) = u.validate_operator_provided_fields() {
                 for e in errs {
                     validation_errors.push(format!("Upstream '{}': {}", u.id, e));
                 }

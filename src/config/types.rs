@@ -4499,15 +4499,17 @@ impl Upstream {
 
         // NOTE: rejection of mesh-PROJECTED fields that an operator must not set
         // directly (`port_overrides`, `source_locality`, `locality_lb_strict`,
-        // `locality_lb_setting`) lives in [`Upstream::validate_admin_only_fields`],
-        // NOT here. `validate_fields` runs on BOTH the admin-write/admission path
-        // AND the runtime config-apply path (file/db/dp/cp loaders and mesh slice
-        // apply, via `GatewayConfig::validate_all_fields_with_ip_policy`). The
-        // mesh slice-prep path SETS those fields itself, so rejecting them in the
-        // shared validator made every mesh reload / remote-endpoint update emit a
-        // false "misconfigured" warning. The rejection is correct only for direct
-        // admin writes, so admin admission calls `validate_admin_only_fields`
-        // explicitly in addition to `validate_fields`.
+        // `locality_lb_setting`) lives in
+        // [`Upstream::validate_operator_provided_fields`], NOT here. The rejection
+        // belongs on every OPERATOR-PROVIDED load (admin write/admission AND the
+        // file-mode loader, via [`GatewayConfig::validate_operator_provided_fields`])
+        // but must NOT fire on the mesh slice-apply path, which legitimately
+        // PROJECTS those fields. `validate_fields` runs on the mesh slice-prep path
+        // too (it materializes upstreams carrying these fields), so putting the
+        // rejection here would make every mesh reload / remote-endpoint update emit
+        // a false "misconfigured" error. Operator entry points therefore call
+        // `validate_operator_provided_fields` explicitly in addition to
+        // `validate_fields`; the mesh slice-prep path never does.
 
         // Validate individual targets
         for (i, target) in self.targets.iter().enumerate() {
@@ -4728,24 +4730,28 @@ impl Upstream {
         }
     }
 
-    /// Reject mesh-PROJECTED fields that an operator must not set directly.
+    /// Reject mesh-PROJECTED fields that an OPERATOR must not set directly.
     ///
     /// `port_overrides`, `source_locality`, `locality_lb_strict`, and
     /// `locality_lb_setting` are all populated by the mesh slice-apply layer (from
     /// DestinationRules / the workload locality / `FERRUM_MESH_LOCALITY_LB_STRICT`),
     /// NOT by operators. None of them are persisted by the SQL / MongoDB schemas,
-    /// so a direct admin POST/PUT would "succeed" and then silently vanish on the
-    /// next reload. The canonical surface for each is named in its message.
+    /// so a direct admin POST/PUT — or an operator-authored YAML/JSON file in file
+    /// mode — would "succeed" and then silently vanish on the next reload. Worse, a
+    /// file-mode operator slipping in `locality_lb_strict` / `locality_lb_setting`
+    /// could enable strict-locality or DR-derived policy that the mesh layer is
+    /// meant to own. The canonical surface for each is named in its message.
     ///
-    /// This is **scoped to the admin write / admission path** and is deliberately
-    /// SEPARATE from [`Upstream::validate_fields`]: `validate_fields` also runs on
-    /// the runtime config-apply path (file/db/dp/cp loaders + mesh slice apply via
-    /// [`GatewayConfig::validate_all_fields_with_ip_policy`]), where these fields
-    /// are LEGITIMATELY present because the mesh layer projected them. Rejecting
-    /// them there produced a false "misconfigured" warning on every mesh reload /
-    /// remote-endpoint update. Admin admission therefore calls this in addition to
-    /// `validate_fields`; runtime apply never does.
-    pub fn validate_admin_only_fields(&self) -> Result<(), Vec<String>> {
+    /// This applies to **every operator-PROVIDED config load** — the admin write /
+    /// admission path AND the file-mode loader — and is deliberately SEPARATE from
+    /// [`Upstream::validate_fields`]: `validate_fields` also runs on the mesh
+    /// slice-apply path (which legitimately PROJECTS these fields), where rejecting
+    /// them would emit a false "misconfigured" error on every mesh reload /
+    /// remote-endpoint update. Operator entry points therefore call this in
+    /// addition to `validate_fields`; the mesh slice-prep path never does.
+    /// See [`GatewayConfig::validate_operator_provided_fields`] for the config-wide
+    /// wrapper the file loader uses.
+    pub fn validate_operator_provided_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
         if !self.port_overrides.is_empty() {
@@ -5576,6 +5582,38 @@ impl GatewayConfig {
             }
         }
 
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Reject mesh-PROJECTED upstream fields on operator-PROVIDED config loads.
+    ///
+    /// `Upstream.{port_overrides, source_locality, locality_lb_strict,
+    /// locality_lb_setting}` are owned by the mesh slice-apply layer (Destination
+    /// rules / workload locality / `FERRUM_MESH_LOCALITY_LB_STRICT`); an operator
+    /// must never set them directly. This is the config-wide wrapper over
+    /// [`Upstream::validate_operator_provided_fields`] that the **file-mode loader**
+    /// runs so an operator-authored YAML/JSON upstream cannot smuggle in strict
+    /// locality / DR-derived policy (none of these fields are persisted, so they
+    /// would silently vanish on reload, or worse, briefly take effect).
+    ///
+    /// It is deliberately SEPARATE from [`Self::validate_all_fields_with_ip_policy`]
+    /// (and is NOT part of the shared validation pipeline): the mesh slice-apply
+    /// path legitimately PROJECTS these fields and must keep applying clean, so
+    /// only operator entry points call this — file mode here, the admin API per
+    /// resource on POST/PUT/import/restore.
+    pub fn validate_operator_provided_fields(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        for upstream in &self.upstreams {
+            if let Err(errs) = upstream.validate_operator_provided_fields() {
+                for e in errs {
+                    errors.push(format!("Upstream '{}': {}", upstream.id, e));
+                }
+            }
+        }
         if errors.is_empty() {
             Ok(())
         } else {

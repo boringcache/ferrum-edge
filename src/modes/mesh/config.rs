@@ -101,6 +101,21 @@ pub struct Workload {
     /// labels are scoped independently instead of collapsed to one merged scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_uid: Option<String>,
+    /// Runtime-only RESERVED remote-cluster provenance marker: `true` iff this
+    /// workload was ingested from a REMOTE cluster's discovery slice. Set by
+    /// [`crate::modes::mesh::multicluster::tag_remote_workloads`] at the DP-side
+    /// remote-poll ingestion point (which KNOWS the source is the remote slice),
+    /// NOT inferred from `cluster` name equality — an Istio WorkloadEntry
+    /// translation can stamp a `cluster` that doesn't equal the configured
+    /// `RemoteCluster.name`, which would leave a genuinely-remote endpoint
+    /// classified LOCAL. The service discoverer copies this provenance into the
+    /// un-spoofable `mesh.remote=true` target tag that strict local-first locality
+    /// LB keys on. `#[serde(skip)]` (NOT `serde(default)` with skip-if): it is a
+    /// DP-local ingestion artifact and must NEVER ride a wire/file payload — a
+    /// remote CP or operator file could otherwise forge it; the marker is only
+    /// ever set locally, after `fetch()`, by the remote-poll loop.
+    #[serde(skip)]
+    pub remote_provenance: bool,
 }
 
 /// A port advertised by a workload.

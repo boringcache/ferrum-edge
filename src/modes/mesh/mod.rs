@@ -1540,11 +1540,19 @@ fn build_east_west_service_targets(
         };
 
         for address in &workload.addresses {
+            // Copy the workload's operator-authored labels as target tags, but
+            // STRIP the reserved `mesh.*` namespace first: those keys are mesh
+            // provenance/transport markers the data plane owns (e.g. the
+            // `mesh.remote=true` strict-locality signal). Without this, a workload
+            // labelled `mesh.remote: "true"` would make a LOCAL east-west target
+            // masquerade as remote and be excluded by strict locality LB.
+            let mut tags = workload.selector.labels.clone();
+            crate::modes::mesh::multicluster::strip_reserved_mesh_tags(&mut tags);
             targets.push(UpstreamTarget {
                 host: address.clone(),
                 port: target_port,
                 weight: 1,
-                tags: workload.selector.labels.clone(),
+                tags,
                 locality: workload.locality.clone(),
                 path: None,
             });
@@ -5197,11 +5205,17 @@ fn build_egress_upstream_targets(
                     None => Some(port_number),
                 }?;
 
+                // Copy the ServiceEntry endpoint's operator-authored labels as
+                // target tags, but STRIP the reserved `mesh.*` namespace first so a
+                // hand-authored `mesh.remote`/`mesh.hbone`/… label cannot forge a
+                // mesh provenance/transport marker the data plane owns.
+                let mut tags = ep.labels.clone();
+                crate::modes::mesh::multicluster::strip_reserved_mesh_tags(&mut tags);
                 Some(UpstreamTarget {
                     host: ep.address.clone(),
                     port: target_port,
                     weight: 1,
-                    tags: ep.labels.clone(),
+                    tags,
                     locality: None,
                     path: None,
                 })
@@ -10248,6 +10262,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         }
     }
 
@@ -10504,6 +10519,52 @@ mod tests {
             }],
             protocol_overrides: HashMap::new(),
         }
+    }
+
+    // ── East-west target tag hygiene (reserved mesh.* namespace) ──────────
+
+    /// codex r3 Finding C: `build_east_west_service_targets` copies the
+    /// workload's operator-authored `selector.labels` into `UpstreamTarget.tags`.
+    /// A workload labelled with the RESERVED provenance key `mesh.remote: "true"`
+    /// must NOT leak that label onto the target — otherwise strict locality LB
+    /// (whose `target_is_local` keys on this exact tag) would treat a
+    /// genuinely-LOCAL east-west endpoint as remote and exclude it. Only the
+    /// discoverer (from un-spoofable provenance) may stamp `mesh.remote`.
+    #[test]
+    fn east_west_targets_strip_reserved_mesh_labels() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let mut wl = workload_with_address("reviews", "reviews", "10.0.0.1");
+        // Operator/workload labels INCLUDING a forged reserved provenance marker
+        // and a forged transport marker, alongside a legitimate operator label.
+        wl.selector
+            .labels
+            .insert("version".to_string(), "v2".to_string());
+        wl.selector.labels.insert(
+            crate::modes::mesh::multicluster::MESH_REMOTE_TAG.to_string(),
+            crate::modes::mesh::multicluster::MESH_REMOTE_TAG_VALUE.to_string(),
+        );
+        wl.selector
+            .labels
+            .insert("mesh.hbone".to_string(), "true".to_string());
+
+        let service = http_mesh_service("reviews", 8080, spiffe);
+        let targets = build_east_west_service_targets(&service, std::slice::from_ref(&wl), None);
+        assert_eq!(targets.len(), 1, "one address → one target");
+        let tags = &targets[0].tags;
+        // The legitimate operator labels survive.
+        assert_eq!(tags.get("app").map(String::as_str), Some("reviews"));
+        assert_eq!(tags.get("version").map(String::as_str), Some("v2"));
+        // The forged reserved markers are stripped, so the LB's `target_is_local`
+        // (which keys on the exact `mesh.remote=true` tag) sees no remote marker
+        // and treats this genuinely-local endpoint as LOCAL.
+        assert!(
+            !tags.contains_key(crate::modes::mesh::multicluster::MESH_REMOTE_TAG),
+            "forged mesh.remote label must be stripped from the east-west target"
+        );
+        assert!(
+            !tags.contains_key("mesh.hbone"),
+            "forged mesh.hbone transport label must be stripped too"
+        );
     }
 
     // ── Ambient outbound (egress) HBONE materialization ───────────────────

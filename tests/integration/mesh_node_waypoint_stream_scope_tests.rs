@@ -155,6 +155,7 @@ fn workload(
         locality: None,
         service_account: None,
         pod_uid: Some(pod_uid.to_string()),
+        remote_provenance: false,
     }
 }
 

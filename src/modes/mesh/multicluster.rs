@@ -468,49 +468,74 @@ fn default_remote_locality(cluster_name: &str, network: Option<&str>) -> String 
 /// stamped from the workload's cross-cluster identity.
 pub(crate) const REMOTE_LOCALITY_PREFIX: &str = "remote-";
 
-/// Per-target tag key marking a target as a REMOTE-cluster-discovered endpoint.
-/// Stamped (`= "true"`) at materialization time in
-/// [`crate::service_discovery::mesh`] from the workload's cross-cluster identity
-/// ([`workload_is_remote`]) — the AUTHORITATIVE remote-provenance signal. Strict
-/// local-first locality LB (`Upstream.locality_lb_strict`) keys local vs. remote
-/// on the ABSENCE of this tag, so a real local Kubernetes region whose name
-/// happens to begin with `remote-` is never misclassified as remote. Absent on
-/// local-cluster and non-mesh targets.
+/// Per-target tag key marking a target as a REMOTE-cluster-discovered endpoint —
+/// a RESERVED provenance marker the data plane sets and trusts. Stamped
+/// (`= "true"`) at materialization time in [`crate::service_discovery::mesh`] from
+/// the workload's [`Workload::remote_provenance`] flag ([`workload_is_remote`]),
+/// which `tag_remote_workloads` set at remote-poll INGESTION (so it reflects real
+/// cross-cluster provenance, NOT `cluster`-name equality or a locality string).
+/// It is UN-SPOOFABLE: it never rides a wire/file payload (`#[serde(skip)]` on the
+/// flag), and every target builder that copies operator/workload labels into tags
+/// strips the reserved `mesh.*` namespace first ([`strip_reserved_mesh_tags`]), so
+/// a hand-authored `mesh.remote: "true"` label can never reach a target.
+/// Strict local-first locality LB (`Upstream.locality_lb_strict`) keys local vs.
+/// remote on the ABSENCE of this tag (checking the exact value), so a real local
+/// Kubernetes region whose name happens to begin with `remote-` is never
+/// misclassified as remote. Absent on local-cluster and non-mesh targets.
 pub(crate) const MESH_REMOTE_TAG: &str = "mesh.remote";
 
 /// The EXACT value the discoverer stamps for [`MESH_REMOTE_TAG`] when a target
 /// is a remote-cluster endpoint. Strict local-first locality LB classifies a
 /// target as remote ONLY when the tag equals this value, NOT on mere key
-/// presence: some mesh/east-west target builders copy workload/operator labels
-/// into `UpstreamTarget.tags`, so a local target could carry a `mesh.remote`
-/// key with a different value (e.g. `false`) or as a non-provenance label.
-/// Keying the local mask on this exact value keeps such targets LOCAL. Single
-/// source of truth shared by the stamp site
+/// presence. Single source of truth shared by the stamp site
 /// ([`crate::service_discovery::mesh`]) and the check site
 /// ([`crate::load_balancer`]) so they can never drift.
 pub(crate) const MESH_REMOTE_TAG_VALUE: &str = "true";
 
-/// Whether a workload is a REMOTE-cluster endpoint relative to this mesh's
-/// [`MultiClusterConfig`]. A workload is remote when it carries a `cluster`
-/// identity that the configuration places in another cluster — the same explicit
-/// provenance [`tag_remote_workloads`] stamps on cross-cluster-discovered
-/// workloads (`workload.cluster = Some(remote_cluster_name)`, where the name is a
-/// configured [`RemoteCluster::name`]).
+/// RESERVED tag-key namespace owned exclusively by Ferrum mesh internals
+/// (`mesh.remote`, `mesh.hbone`, `mesh.mtls`, `mesh.spiffe_id`, …). These tags
+/// are PROVENANCE / transport markers the data plane sets and trusts; an operator
+/// or workload label must never be able to forge one. Any target builder that
+/// COPIES workload/operator labels wholesale into `UpstreamTarget.tags` (e.g. the
+/// east-west `workload.selector.labels` copy, the egress ServiceEntry endpoint
+/// `labels` copy) must strip this namespace first via
+/// [`strip_reserved_mesh_tags`] so a user label literally named `mesh.remote:
+/// "true"` can never make a LOCAL target masquerade as remote (and so no copied
+/// label collides with a transport marker).
+pub(crate) const RESERVED_MESH_TAG_PREFIX: &str = "mesh.";
+
+/// Drop every reserved `mesh.*` key (see [`RESERVED_MESH_TAG_PREFIX`]) from a
+/// label map copied from operator/workload-controlled input, in place. Mesh
+/// internals re-stamp the legitimate `mesh.*` provenance/transport tags
+/// themselves (e.g. the discoverer's `mesh.remote`, the egress tag builders'
+/// `mesh.hbone`/`mesh.mtls`), so this only removes forge attempts, never a real
+/// marker.
+pub(crate) fn strip_reserved_mesh_tags(tags: &mut std::collections::HashMap<String, String>) {
+    tags.retain(|key, _| !key.starts_with(RESERVED_MESH_TAG_PREFIX));
+}
+
+/// Whether a workload is a REMOTE-cluster endpoint.
 ///
-/// Classification is by **discovery provenance**, NOT a locality string prefix,
-/// and crucially does NOT depend on `local_cluster` being set:
+/// Classification is by **discovery provenance**, NOT a locality string prefix:
 ///
-/// - `local_cluster` set: remote iff `workload.cluster` differs from it (the
-///   classic relative test).
-/// - `local_cluster` UNSET: remote iff `workload.cluster` matches a configured
-///   `remote_clusters[].name`. Remote endpoints reach the registry only via
-///   [`merge_remote_endpoints_into_mesh`] / [`tag_remote_workloads`], which stamp
-///   exactly that name, so this is the authoritative cross-cluster signal even
-///   when the operator omits the optional `local_cluster`. (Without this, a
-///   remote-discovered endpoint would be misclassified LOCAL and strict
-///   local-first LB would keep sending to it while locals are healthy.)
-/// - No workload cluster, or no `MultiClusterConfig` at all: LOCAL (default
-///   single-cluster posture).
+/// 1. **Authoritative signal — [`Workload::remote_provenance`]**: set `true` by
+///    [`tag_remote_workloads`] at the DP-side remote-poll ingestion point, which
+///    KNOWS the endpoint came from a remote discovery slice. This is checked FIRST
+///    and is independent of any `cluster`-name matching, so a genuinely-remote
+///    endpoint whose Istio WorkloadEntry translation stamped a `cluster` that does
+///    NOT equal the configured [`RemoteCluster::name`] is STILL classified remote
+///    (the former cluster-name-equality-only path misclassified it LOCAL, so
+///    strict local-first LB kept sending to it while locals were healthy).
+///
+/// 2. **Fallback — `cluster`-name vs [`MultiClusterConfig`]** (cannot cause a
+///    false-LOCAL for a genuinely-remote endpoint, since provenance already
+///    covers those): retained so a workload carrying a cross-cluster `cluster`
+///    identity is still classified remote even on a code path that did not run
+///    `tag_remote_workloads` (defense in depth). Depends on `local_cluster`:
+///    - `local_cluster` set: remote iff `workload.cluster` differs from it.
+///    - `local_cluster` UNSET: remote iff `workload.cluster` matches a configured
+///      `remote_clusters[].name`.
+///    - No workload cluster, or no `MultiClusterConfig`: LOCAL.
 ///
 /// Single source of truth shared by the materialization path
 /// ([`crate::service_discovery::mesh`]) and the east-west / outbound local-only
@@ -521,6 +546,13 @@ pub(crate) fn workload_is_remote(
     workload: &Workload,
     multi_cluster: Option<&MultiClusterConfig>,
 ) -> bool {
+    // Authoritative: the reserved provenance marker stamped at remote ingestion.
+    if workload.remote_provenance {
+        return true;
+    }
+    // Fallback (defense in depth): cluster-name vs configured clusters. Can only
+    // promote LOCAL→REMOTE, never the reverse, so it cannot misclassify a
+    // genuinely-remote (provenance-marked) endpoint as local.
     let Some(workload_cluster) = workload.cluster.as_deref() else {
         // A workload with no cluster identity is always local.
         return false;
@@ -543,7 +575,15 @@ pub(crate) fn workload_is_remote(
 
 /// Tag a remote cluster's workloads with provenance and a fail-safe locality.
 ///
-/// - `cluster` is stamped so introspection / metrics can attribute the target.
+/// - `remote_provenance` is set `true` — the RESERVED, un-spoofable remote marker.
+///   This is the AUTHORITATIVE remote signal: it is stamped HERE, at the DP-side
+///   remote-poll ingestion point that KNOWS the source is the remote slice, so a
+///   genuinely-remote endpoint is marked regardless of what `cluster` name an
+///   Istio WorkloadEntry translation may have stamped on it. The discoverer copies
+///   this into the `mesh.remote=true` target tag strict local-first LB keys on; it
+///   never crosses a wire/file boundary (`#[serde(skip)]`), so it cannot be forged.
+/// - `cluster` is stamped (only when absent) so introspection / metrics can
+///   attribute the target.
 /// - `network` is preserved (multi-network routing).
 /// - `locality` is always rewritten to a synthetic `remote-<cluster>` locality.
 ///   A remote CP can legitimately report the same region/zone strings as the
@@ -559,6 +599,11 @@ fn tag_remote_workloads(
     network: Option<&str>,
 ) {
     for workload in &mut endpoints.workloads {
+        // RESERVED provenance: this workload came from the remote discovery slice.
+        // Independent of `cluster`-name matching so a WorkloadEntry-translated
+        // `cluster` that diverges from the configured `RemoteCluster.name` still
+        // marks the endpoint remote.
+        workload.remote_provenance = true;
         if workload.cluster.is_none() {
             workload.cluster = Some(cluster_name.to_string());
         }
@@ -1574,6 +1619,7 @@ mod tests {
             locality: locality.map(str::to_string),
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         }
     }
 
@@ -1882,6 +1928,32 @@ mod tests {
         assert!(!local.same_region(&remote));
     }
 
+    /// codex r3 Finding C: the reserved-namespace stripper drops every `mesh.*`
+    /// key from a label map copied from operator/workload-controlled input so a
+    /// forged provenance/transport marker can never reach an `UpstreamTarget`.
+    #[test]
+    fn strip_reserved_mesh_tags_drops_mesh_namespace_only() {
+        let mut tags: std::collections::HashMap<String, String> = [
+            ("app", "reviews"),
+            ("version", "v2"),
+            (MESH_REMOTE_TAG, MESH_REMOTE_TAG_VALUE), // forged provenance marker
+            ("mesh.hbone", "true"),                   // forged transport marker
+            ("mesh.anything", "x"),                   // any reserved key
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        strip_reserved_mesh_tags(&mut tags);
+        // Operator labels survive.
+        assert_eq!(tags.get("app").map(String::as_str), Some("reviews"));
+        assert_eq!(tags.get("version").map(String::as_str), Some("v2"));
+        // Every reserved `mesh.*` key is gone.
+        assert!(!tags.contains_key(MESH_REMOTE_TAG));
+        assert!(!tags.contains_key("mesh.hbone"));
+        assert!(!tags.contains_key("mesh.anything"));
+        assert_eq!(tags.len(), 2);
+    }
+
     #[test]
     fn tag_remote_workloads_applies_locality_and_cluster() {
         let mut endpoints = RemoteClusterEndpoints {
@@ -1914,6 +1986,69 @@ mod tests {
             endpoints.workloads[1].locality.as_deref(),
             Some("remote-west/net2")
         );
+        // codex r3 Finding B: ingestion stamps the RESERVED provenance marker on
+        // every remote-discovered workload.
+        assert!(endpoints.workloads[0].remote_provenance);
+        assert!(endpoints.workloads[1].remote_provenance);
+    }
+
+    /// codex r3 Finding B: a genuinely-remote endpoint whose PRESERVED
+    /// `workload.cluster` does NOT equal the configured `RemoteCluster.name` (an
+    /// Istio WorkloadEntry translation can stamp such a `cluster`) must STILL be
+    /// classified remote. Before the fix, `workload_is_remote` keyed solely on
+    /// cluster-name equality, so this endpoint was misclassified LOCAL and strict
+    /// locality LB kept sending to it while locals were healthy. The reserved
+    /// `remote_provenance` marker — stamped at ingestion, independent of the
+    /// cluster name — fixes it.
+    #[test]
+    fn remote_provenance_overrides_divergent_cluster_name() {
+        // Workload pre-stamped (e.g. by WorkloadEntry translation) with a cluster
+        // name that does NOT match the configured remote alias `west`.
+        let mut diverged = workload(
+            "spiffe://remote.local/ns/default/sa/a",
+            "reviews",
+            "10.2.0.1",
+            None,
+        );
+        diverged.cluster = Some("some-other-cluster-id".to_string());
+        let mut endpoints = RemoteClusterEndpoints {
+            workloads: vec![diverged],
+            services: vec![],
+        };
+        // Ingest from the remote slice for configured cluster `west`.
+        tag_remote_workloads(&mut endpoints, "west", None);
+        let ingested = &endpoints.workloads[0];
+
+        // Provenance is stamped; the divergent cluster name is preserved.
+        assert!(ingested.remote_provenance);
+        assert_eq!(ingested.cluster.as_deref(), Some("some-other-cluster-id"));
+
+        // Config declares `west` as remote with NO local_cluster; the workload's
+        // cluster name does not match it, so the cluster-name fallback alone would
+        // say LOCAL. Provenance must win → REMOTE.
+        let cfg = MultiClusterConfig {
+            local_cluster: None,
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("remote.local"),
+                network: None,
+                control_plane_url: None,
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        assert!(
+            workload_is_remote(ingested, Some(&cfg)),
+            "a provenance-marked remote endpoint must classify remote even when its \
+             cluster name diverges from the configured alias"
+        );
+        // Sanity: the SAME divergent-cluster workload WITHOUT the provenance marker
+        // (never ingested from the remote slice) falls back to cluster-name match
+        // and is LOCAL — proving the provenance flag, not the cluster name, is what
+        // flips classification here.
+        let mut not_ingested = ingested.clone();
+        not_ingested.remote_provenance = false;
+        assert!(!workload_is_remote(&not_ingested, Some(&cfg)));
     }
 
     #[test]

@@ -3464,6 +3464,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         };
 
         // The single-target per-workload upstream the materializer would emit,

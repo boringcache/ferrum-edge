@@ -166,6 +166,7 @@ fn create_test_mesh_config() -> GatewayConfig {
             locality: None,
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         }],
         services: vec![MeshService {
             cluster_ips: Vec::new(),

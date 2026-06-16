@@ -20329,6 +20329,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         };
 
         let bywl_id = crate::modes::mesh::mesh_outbound_tcp_bywl_upstream_id(
@@ -24221,6 +24222,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         });
         // Now the workload's declared application port is allowed on loopback...
         assert!(inbound_hbone_relay_destination_allowed(
@@ -24998,6 +25000,7 @@ mod tests {
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                remote_provenance: false,
             }
         }
 

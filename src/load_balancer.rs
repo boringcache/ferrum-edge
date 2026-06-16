@@ -318,21 +318,24 @@ const LATENCY_UNSET: u64 = u64::MAX;
 const LOCALITY_DISTRIBUTE_WEIGHT_SCALE: u64 = 1_000_000;
 
 /// Whether a target is a LOCAL (same-cluster) endpoint for strict local-first
-/// locality LB. Keyed on the EXPLICIT remote-provenance tag
+/// locality LB. Keyed on the RESERVED, un-spoofable remote-provenance tag
 /// [`crate::modes::mesh::multicluster::MESH_REMOTE_TAG`] (`mesh.remote`) carrying
 /// the discoverer's exact internal value
-/// [`crate::modes::mesh::multicluster::MESH_REMOTE_TAG_VALUE`] (`"true"`), stamped
-/// at materialization time from the workload's cross-cluster identity — NOT on a
-/// locality string prefix, and NOT on mere key presence. Checking the VALUE (not
-/// the key) is load-bearing: some mesh/east-west target builders copy
-/// workload/operator labels into `UpstreamTarget.tags` (e.g. east-west targets
-/// use `workload.selector.labels`), so a LOCAL target can legitimately carry a
-/// `mesh.remote` key whose value is not the provenance marker (e.g. `false`, or a
-/// hand-authored label); such a target must stay LOCAL. This is also correct when
-/// a real local Kubernetes region is named `remote-<something>`: that target
-/// carries no provenance `mesh.remote=true` tag and stays LOCAL. A target without
-/// the marker (local-cluster, non-mesh, or operator-authored) is treated as
-/// local. Used at construction to precompute `LoadBalancer.local_locality_mask`.
+/// [`crate::modes::mesh::multicluster::MESH_REMOTE_TAG_VALUE`] (`"true"`). That tag
+/// is stamped ONLY by the service discoverer, from a workload's
+/// `remote_provenance` flag set at remote-poll INGESTION — NOT from a locality
+/// string prefix, and NOT from `cluster`-name equality. It is trustworthy here
+/// because two things guarantee only the discoverer can set it: (1) the provenance
+/// flag never crosses a wire/file boundary, and (2) every target builder that
+/// copies operator/workload labels into `UpstreamTarget.tags` (east-west, egress
+/// ServiceEntry) strips the reserved `mesh.*` namespace first
+/// ([`crate::modes::mesh::multicluster::strip_reserved_mesh_tags`]), so a
+/// hand-authored `mesh.remote: "true"` label can never reach a target. Checking
+/// the exact VALUE (not mere key presence) is belt-and-suspenders. A real local
+/// Kubernetes region named `remote-<something>` carries no provenance tag and
+/// stays LOCAL. A target without the marker (local-cluster, non-mesh, or
+/// operator-authored) is local. Used at construction to precompute
+/// `LoadBalancer.local_locality_mask`.
 #[inline]
 fn target_is_local(target: &UpstreamTarget) -> bool {
     target
