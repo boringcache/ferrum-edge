@@ -2940,6 +2940,20 @@ impl EnvConfig {
         {
             ports.insert(port);
         }
+        // Mesh UDP TPROXY capture listener port (F3 §3.3): when UDP capture is
+        // enabled the mesh runtime binds a real UDP socket on this port, so
+        // reserve it for stream-listener validation. Otherwise a mesh UDP/DTLS
+        // stream proxy or ServiceEntry declaring the same listen port passes
+        // validation and then races the capture listener at startup, failing one
+        // UDP bind and aborting startup (codex r4). Default-off, so non-capture
+        // deployments are unaffected; a malformed setting is handled fail-closed
+        // by the dedicated startup validation, so a parse error is ignored here.
+        if let Ok(udp) = crate::capture::udp_capture_settings_from_env()
+            && udp.udp_capture_enabled
+            && udp.udp_outbound_port != 0
+        {
+            ports.insert(udp.udp_outbound_port);
+        }
         ports
     }
 

@@ -42,6 +42,7 @@ pub mod headers;
 pub mod http2_pool;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
+pub mod mesh_udp_capture;
 pub mod netns_capture;
 pub mod sni;
 pub mod stream_error;
@@ -9425,6 +9426,49 @@ pub(crate) async fn start_mesh_plaintext_listener_with_signal(
         mesh_direction,
         started_tx,
     )
+    .await
+}
+
+/// Start the mesh UDP TPROXY capture listener (F3 §3.3 Stage 3).
+///
+/// Binds a transparent UDP socket on `addr` (the Stage-2 capture port,
+/// `FERRUM_MESH_CAPTURE_UDP_PORT`), recovers each captured datagram's original
+/// destination via the `IP(v6)_RECVORIGDSTADDR` cmsg, keys a session by
+/// `(client, orig-dst)`, and DROPS it (egress relay is Stage 4). DoS bounds are
+/// pulled from `EnvConfig` (`FERRUM_UDP_MAX_SESSIONS` /
+/// `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` / `FERRUM_UDP_RECVMMSG_BATCH_SIZE` /
+/// `FERRUM_POOL_SHARD_AMOUNT`), matching the plain UDP proxy. `tls_config` is
+/// always `None` for this plaintext listener (the parameter is accepted only so
+/// the mesh listener-spawn loop can call every kind uniformly). `mesh_direction`
+/// is accepted for call-site uniformity; the capture listener is always
+/// outbound and does not thread it further.
+pub(crate) async fn start_mesh_udp_capture_listener_with_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    _mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
+    debug_assert!(
+        tls_config.is_none(),
+        "mesh UDP capture listener is plaintext; tls_config must be None"
+    );
+    let _ = tls_config;
+    let env = &state.env_config;
+    mesh_udp_capture::start_mesh_udp_capture_listener(mesh_udp_capture::MeshUdpCaptureConfig {
+        addr,
+        shutdown,
+        // In mesh mode the per-listener `shutdown` is the runtime's
+        // SIGINT/SIGTERM-driven channel, so a separate global receiver is
+        // unnecessary here.
+        global_shutdown: None,
+        max_sessions: env.udp_max_sessions,
+        cleanup_interval_seconds: env.udp_cleanup_interval_seconds,
+        recvmmsg_batch_size: env.udp_recvmmsg_batch_size,
+        session_shard_amount: env.pool_shard_amount,
+        started_tx,
+    })
     .await
 }
 
