@@ -2162,9 +2162,12 @@ fn cleanup_commands_for_plan(include_v6: bool, udp_capture_enabled: bool) -> Vec
 /// route) — never the TCP nat chains, which setup is about to rebuild — so it can
 /// run before setup to reap stale UDP state from a prior UDP-enabled-then-crashed
 /// run without disturbing TCP capture. The IPv6 table half is guarded behind the
-/// `ip6tables` probe; the raw `ip`/`ip -6` routing halves are emitted
-/// unconditionally (they do not depend on `ip6tables` and must not leak the
-/// fwmark rule/route when it is absent). Every command is idempotent/best-effort.
+/// `ip6tables` probe, which checks the **mangle** table (where the UDP TPROXY
+/// chains live — probing `nat` would wrongly skip the mangle teardown on a host
+/// with mangle but no nat table, codex r10); the raw `ip`/`ip -6` routing halves
+/// are emitted unconditionally (they do not depend on `ip6tables` and must not
+/// leak the fwmark rule/route when it is absent). Every command is
+/// idempotent/best-effort.
 fn udp_pre_setup_teardown_commands(include_v6: bool) -> Vec<String> {
     let v4 = IptablesPlan::udp_teardown_split();
     let mut commands = v4.iptables;
@@ -2174,7 +2177,7 @@ fn udp_pre_setup_teardown_commands(include_v6: bool) -> Vec<String> {
         commands.extend(
             v6.iptables
                 .iter()
-                .map(|cmd| ip6tables_best_effort_wrapped_command(cmd)),
+                .map(|cmd| ip6tables_best_effort_wrapped_udp_command(cmd)),
         );
         commands.extend(v6.ip_routing);
     }
@@ -2182,8 +2185,22 @@ fn udp_pre_setup_teardown_commands(include_v6: bool) -> Vec<String> {
 }
 
 fn ip6tables_best_effort_wrapped_command(cmd: &str) -> String {
+    // TCP mesh capture lives in the `nat` table, so the availability probe checks
+    // `nat` for the setup/cleanup paths that wrap nat (and mixed nat+mangle) rules.
+    ip6tables_best_effort_wrapped_command_for_table(cmd, "nat")
+}
+
+/// The UDP TPROXY teardown operates on the `mangle` table, so it must probe
+/// `mangle` — NOT `nat` — for ip6tables availability: a host with `mangle`
+/// support but no `nat` table would otherwise wrongly skip the mangle UDP
+/// teardown behind a `nat` probe (codex r10).
+fn ip6tables_best_effort_wrapped_udp_command(cmd: &str) -> String {
+    ip6tables_best_effort_wrapped_command_for_table(cmd, "mangle")
+}
+
+fn ip6tables_best_effort_wrapped_command_for_table(cmd: &str, table: &str) -> String {
     format!(
-        "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t nat -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1; then\n    {cmd}\n  else\n    echo \"ip6tables nat table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\n  echo \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
+        "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1; then\n    {cmd}\n  else\n    echo \"ip6tables {table} table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\n  echo \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
     )
 }
 

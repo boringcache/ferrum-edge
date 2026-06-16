@@ -1682,8 +1682,19 @@ per-datagram recoverable original address, and there is no UDP equivalent of
     leads with a `-m mark --mark <mark>/<mask> -j RETURN` anti-loop guard and a
     proxy-UID `-m owner --uid-owner <uid> -j RETURN` self-exclusion — **owner-match
     IS valid in OUTPUT** (it is invalid in PREROUTING, which is why the dst-based
-    OUTBOUND chain carries no owner RETURN). It carries **no `! --dst-type LOCAL`**
-    scope: all OUTPUT-visible traffic is locally generated (egress by definition).
+    OUTBOUND chain carries no owner RETURN). **The MARK rules ALSO carry the SAME
+    `-m addrtype ! --dst-type LOCAL` egress scope (codex r9)** as the PREROUTING
+    OUTBOUND TPROXY rules — the two render from one shared selector set so the OUTPUT
+    capture scoping matches PREROUTING exactly. In the OUTPUT context the pod's own IP
+    AND loopback are `--dst-type LOCAL` (locally generated *and* locally destined),
+    while genuine egress to other hosts is non-LOCAL; without the scope the catch-all
+    `-p udp -d 0.0.0.0/0 -j MARK` would also fwmark pod-to-self / loopback UDP, reroute
+    it to `lo`, and TPROXY-capture it — but self/loopback UDP must **never** be captured
+    (only real egress). The proxy's own egress is still separately excluded by the
+    owner RETURN above; the `! --dst-type LOCAL` scope additionally covers a **non-proxy
+    local destination** (another UID's pod-to-self / loopback datagram) the owner RETURN
+    cannot. So locally-generated pod UDP egress is captured **only to real, non-local
+    destinations**.
   - The **existing** fwmark `ip rule` (priority `100` → table `33133`) + `ip route add
     local 0.0.0.0/0 dev lo table 33133` then reroute the marked datagram to loopback.
     A `local`-type route makes the kernel treat the datagram as destined for this
