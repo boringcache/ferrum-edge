@@ -367,6 +367,11 @@ pub async fn start_mesh_udp_capture_listener(
 mod tests {
     use super::*;
 
+    /// Build a test session map sized via the same hot-path helper the
+    /// listener uses ([`crate::util::sharding::pool_shard_amount`]). Pass `0`
+    /// to auto-size (the production default, which floors at 64); an explicit
+    /// override of `1` is invalid for DashMap (it asserts `shard_amount > 1`),
+    /// so callers must use `0` or a value the helper rounds up to >= 2.
     fn new_sessions(
         shards: usize,
     ) -> dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState> {
@@ -378,7 +383,7 @@ mod tests {
 
     #[test]
     fn datagram_without_origdst_is_dropped_unaccounted() {
-        let sessions = new_sessions(1);
+        let sessions = new_sessions(0);
         let client: SocketAddr = "10.0.0.5:40000".parse().unwrap();
         // No orig-dst ⇒ dropped, not accounted, no session created.
         assert!(!handle_captured_datagram(&sessions, client, None, 32, 1000));
@@ -387,7 +392,7 @@ mod tests {
 
     #[test]
     fn session_keyed_by_client_and_origdst() {
-        let sessions = new_sessions(1);
+        let sessions = new_sessions(0);
         let client: SocketAddr = "10.0.0.5:40000".parse().unwrap();
         let dst_a: SocketAddr = "10.96.0.10:53".parse().unwrap();
         let dst_b: SocketAddr = "10.96.0.11:53".parse().unwrap();
@@ -434,7 +439,7 @@ mod tests {
 
     #[test]
     fn session_cap_sheds_new_flows_but_serves_existing() {
-        let sessions = new_sessions(1);
+        let sessions = new_sessions(0);
         let dst: SocketAddr = "10.96.0.10:53".parse().unwrap();
         let client_a: SocketAddr = "10.0.0.5:40000".parse().unwrap();
         let client_b: SocketAddr = "10.0.0.6:40000".parse().unwrap();
