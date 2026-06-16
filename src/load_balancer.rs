@@ -660,6 +660,23 @@ impl LoadBalancerCache {
             .unwrap_or(HashOnStrategy::Ip)
     }
 
+    /// Get the pre-parsed hash-on strategy for the effective selection lane.
+    /// Precedence matches target selection: per-port override, then subset,
+    /// then upstream.
+    #[inline]
+    pub fn get_hash_on_strategy_for_selection_from(
+        snapshot: &LoadBalancerCacheInner,
+        upstream_id: &str,
+        port: Option<u16>,
+        subset_name: Option<&str>,
+    ) -> HashOnStrategy {
+        snapshot
+            .balancers
+            .get(upstream_id)
+            .map(|b| b.hash_on_strategy_for_selection(port, subset_name))
+            .unwrap_or(HashOnStrategy::Ip)
+    }
+
     /// Return the pre-computed port override that covers every target in an
     /// upstream, if one exists. This keeps initial request dispatch O(1) for
     /// large service-discovery upstreams.
@@ -1390,6 +1407,10 @@ pub struct LoadBalancer {
     /// `traffic_policy.load_balancer_algorithm` overrides the upstream's
     /// algorithm; otherwise this repeats `algorithm` for that subset.
     subset_algorithms: HashMap<String, LoadBalancerAlgorithm>,
+    /// Pre-parsed hash-key strategy per subset for consistent hashing. A subset
+    /// strategy overrides the upstream strategy when that subset's effective
+    /// algorithm is consistent hashing; non-hash subset lanes store `Ip`.
+    subset_hash_on_strategies: HashMap<String, HashOnStrategy>,
     /// Smooth-WRR state isolated per subset so weighted routing in one subset
     /// cannot perturb the current weights of another subset.
     subset_wrr_state: HashMap<String, std::sync::Mutex<Vec<i64>>>,
@@ -1591,32 +1612,44 @@ impl LoadBalancer {
         // Pre-compute subset → target indices for O(1) subset routing.
         // A target belongs to a subset if its `tags` are a superset of the
         // subset's `labels` (every label key-value pair appears in tags).
-        let (subset_indices, subset_algorithms) = if let Some(defs) = subsets {
-            let mut indices_map = HashMap::with_capacity(defs.len());
-            let mut algorithm_map = HashMap::with_capacity(defs.len());
-            for def in defs {
-                let mut indices = Vec::new();
-                for (i, target) in targets.iter().enumerate() {
-                    let matches = def
-                        .labels
-                        .iter()
-                        .all(|(k, v)| target.tags.get(k).is_some_and(|tv| tv == v));
-                    if matches {
-                        indices.push(i);
+        let (subset_indices, subset_algorithms, subset_hash_on_strategies) =
+            if let Some(defs) = subsets {
+                let mut indices_map = HashMap::with_capacity(defs.len());
+                let mut algorithm_map = HashMap::with_capacity(defs.len());
+                let mut hash_on_map = HashMap::with_capacity(defs.len());
+                for def in defs {
+                    let mut indices = Vec::new();
+                    for (i, target) in targets.iter().enumerate() {
+                        let matches = def
+                            .labels
+                            .iter()
+                            .all(|(k, v)| target.tags.get(k).is_some_and(|tv| tv == v));
+                        if matches {
+                            indices.push(i);
+                        }
                     }
+                    let effective_algorithm = def
+                        .traffic_policy
+                        .as_ref()
+                        .and_then(|policy| policy.load_balancer_algorithm)
+                        .unwrap_or(algorithm);
+                    let effective_hash_on =
+                        if effective_algorithm == LoadBalancerAlgorithm::ConsistentHashing {
+                            def.traffic_policy
+                                .as_ref()
+                                .and_then(|policy| policy.hash_on.as_deref())
+                                .or(hash_on.as_deref())
+                        } else {
+                            None
+                        };
+                    indices_map.insert(def.name.clone(), indices);
+                    algorithm_map.insert(def.name.clone(), effective_algorithm);
+                    hash_on_map.insert(def.name.clone(), HashOnStrategy::parse(effective_hash_on));
                 }
-                let effective_algorithm = def
-                    .traffic_policy
-                    .as_ref()
-                    .and_then(|policy| policy.load_balancer_algorithm)
-                    .unwrap_or(algorithm);
-                indices_map.insert(def.name.clone(), indices);
-                algorithm_map.insert(def.name.clone(), effective_algorithm);
-            }
-            (indices_map, algorithm_map)
-        } else {
-            (HashMap::new(), HashMap::new())
-        };
+                (indices_map, algorithm_map, hash_on_map)
+            } else {
+                (HashMap::new(), HashMap::new(), HashMap::new())
+            };
 
         let mut subset_wrr_state = HashMap::new();
         let mut subset_wrr_needs_stale_check = HashMap::new();
@@ -1738,6 +1771,7 @@ impl LoadBalancer {
             hash_on_strategy,
             subset_indices,
             subset_algorithms,
+            subset_hash_on_strategies,
             subset_wrr_state,
             subset_wrr_needs_stale_check,
             subset_hash_rings,
@@ -2795,6 +2829,31 @@ impl LoadBalancer {
             .get(subset_name)
             .copied()
             .unwrap_or(self.algorithm)
+    }
+
+    #[inline]
+    fn hash_on_strategy_for_subset(&self, subset_name: &str) -> HashOnStrategy {
+        self.subset_hash_on_strategies
+            .get(subset_name)
+            .cloned()
+            .unwrap_or_else(|| self.hash_on_strategy.clone())
+    }
+
+    #[inline]
+    fn hash_on_strategy_for_selection(
+        &self,
+        port: Option<u16>,
+        subset_name: Option<&str>,
+    ) -> HashOnStrategy {
+        if let Some(port) = port
+            && let Some(state) = self.port_overrides.get(&port)
+        {
+            return state.hash_on_strategy.clone();
+        }
+        if let Some(subset_name) = subset_name {
+            return self.hash_on_strategy_for_subset(subset_name);
+        }
+        self.hash_on_strategy.clone()
     }
 
     /// Resolve the effective algorithm a selection for `(port_override, subset)`
@@ -4356,6 +4415,7 @@ mod tests {
             labels: HashMap::from([("version".to_string(), "v2".to_string())]),
             traffic_policy: Some(crate::config::types::SubsetTrafficPolicy {
                 load_balancer_algorithm: Some(LoadBalancerAlgorithm::WeightedRoundRobin),
+                hash_on: None,
                 tls: None,
                 connect_timeout_ms: None,
                 passive_health_check: None,

@@ -1334,11 +1334,10 @@ fn build_east_west_service_proxies_and_upstreams(
 }
 
 /// Match a service's `WorkloadRef`s to slice `Workload`s one-to-one by index (so
-/// replicas sharing a SPIFFE id yield distinct workloads), then drop
-/// remote-cluster endpoints. Shared scaffold for the east-west and Ambient
-/// outbound target builders, which differ only in per-target port/tag policy. A
-/// remote-cluster match still consumes its index (mirroring the original inline
-/// loops) so a local replica isn't pulled into a remote ref's slot.
+/// replicas sharing a SPIFFE id yield distinct workloads), while filtering
+/// remote-cluster endpoints before consuming a ref slot. Shared scaffold for
+/// the east-west and Ambient outbound target builders, which differ only in
+/// per-target port/tag policy.
 fn matched_local_service_workloads<'a>(
     service: &crate::modes::mesh::config::MeshService,
     workloads: &'a [crate::modes::mesh::config::Workload],
@@ -1359,19 +1358,17 @@ fn matched_local_service_workloads<'a>(
                     && workload.spiffe_id == workload_ref.spiffe_id
                     && workload.namespace == service.namespace
                     && (workload.service_name == service.name || !has_matching_service_metadata)
+                    && !local_cluster.is_some_and(|local_cluster| {
+                        workload
+                            .cluster
+                            .as_deref()
+                            .is_some_and(|cluster| cluster != local_cluster)
+                    })
             })
         else {
             continue;
         };
         used_workload_indices.insert(workload_index);
-        if local_cluster.is_some_and(|local_cluster| {
-            workload
-                .cluster
-                .as_deref()
-                .is_some_and(|cluster| cluster != local_cluster)
-        }) {
-            continue;
-        }
         matched.push(workload);
     }
 
@@ -3892,6 +3889,7 @@ fn apply_destination_rules(
                             });
                             SubsetTrafficPolicy {
                                 load_balancer_algorithm: mesh_lb_to_ferrum(&sp.load_balancer),
+                                hash_on: mesh_hash_on_to_ferrum(&sp.load_balancer),
                                 tls: sp.tls.clone(),
                                 connect_timeout_ms: sp.connect_timeout_ms,
                                 passive_health_check,
@@ -13867,6 +13865,65 @@ mod tests {
     }
 
     #[test]
+    fn dr_subset_consistent_hash_projects_hash_key() {
+        // A subset-level consistentHash policy must carry both the algorithm
+        // and the hash key onto the Ferrum subset policy; otherwise the hot
+        // path builds a subset hash ring but still hashes on the upstream-level
+        // key or client IP.
+        let mut config = GatewayConfig {
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: vec![MeshSubset {
+                    name: "v1".to_string(),
+                    labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::ConsistentHash(
+                            crate::modes::mesh::config::MeshConsistentHash {
+                                http_header_name: Some("x-subset-session".to_string()),
+                                http_cookie_name: None,
+                                use_source_ip: false,
+                            },
+                        )),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let subset_policy = config.upstreams[0]
+            .subsets
+            .as_ref()
+            .expect("subsets")
+            .iter()
+            .find(|subset| subset.name == "v1")
+            .and_then(|subset| subset.traffic_policy.as_ref())
+            .expect("v1 subset traffic policy");
+        assert_eq!(
+            subset_policy.load_balancer_algorithm,
+            Some(LoadBalancerAlgorithm::ConsistentHashing)
+        );
+        assert_eq!(
+            subset_policy.hash_on.as_deref(),
+            Some("header:x-subset-session")
+        );
+    }
+
+    #[test]
     fn dr_later_rule_top_level_connect_timeout_overrides_earlier_subset() {
         // Two DestinationRules match the same upstream. The earlier-sorted rule
         // defines subset v1 with its own connectTimeout; the later-sorted rule
@@ -16230,6 +16287,42 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn matched_local_service_workloads_skips_remote_without_consuming_ref_slot() {
+        let spiffe = SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews").unwrap();
+        let mut remote = workload("reviews-remote", "reviews");
+        remote.spiffe_id = spiffe.clone();
+        remote.service_name = "reviews".to_string();
+        remote.addresses = vec!["172.16.0.5".to_string()];
+        remote.cluster = Some("cluster-b".to_string());
+
+        let mut local = workload("reviews-local", "reviews");
+        local.spiffe_id = spiffe.clone();
+        local.service_name = "reviews".to_string();
+        local.addresses = vec!["10.0.0.5".to_string()];
+        local.cluster = Some("cluster-a".to_string());
+
+        let service = MeshService {
+            cluster_ips: Vec::new(),
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 9080,
+                protocol: AppProtocol::Http,
+                name: None,
+                target_port: None,
+            }],
+            workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
+            protocol_overrides: HashMap::new(),
+        };
+
+        let workloads = vec![remote, local];
+        let matched = matched_local_service_workloads(&service, &workloads, Some("cluster-a"));
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].addresses, vec!["10.0.0.5"]);
     }
 
     #[test]

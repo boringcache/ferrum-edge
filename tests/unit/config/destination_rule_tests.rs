@@ -20,6 +20,7 @@ fn subset_definition_round_trip_json() {
         labels: HashMap::from([("version".into(), "v2".into())]),
         traffic_policy: Some(SubsetTrafficPolicy {
             load_balancer_algorithm: Some(LoadBalancerAlgorithm::Random),
+            hash_on: Some("header:x-user".into()),
             tls: None,
             connect_timeout_ms: None,
             passive_health_check: None,
@@ -38,6 +39,15 @@ fn subset_definition_round_trip_json() {
             .unwrap()
             .load_balancer_algorithm,
         Some(LoadBalancerAlgorithm::Random)
+    );
+    assert_eq!(
+        deserialized
+            .traffic_policy
+            .as_ref()
+            .unwrap()
+            .hash_on
+            .as_deref(),
+        Some("header:x-user")
     );
 }
 
@@ -72,6 +82,7 @@ fn subset_definition_multi_label_selector() {
 fn subset_traffic_policy_omits_none_fields() {
     let policy = SubsetTrafficPolicy {
         load_balancer_algorithm: None,
+        hash_on: None,
         tls: None,
         connect_timeout_ms: None,
         passive_health_check: None,
@@ -90,6 +101,7 @@ fn subset_traffic_policy_tls_round_trip_json() {
 
     let policy = SubsetTrafficPolicy {
         load_balancer_algorithm: None,
+        hash_on: None,
         tls: Some(MeshTrafficPolicyTls {
             mode: MtlsMode::Mutual,
             ca_certificates: Some("/etc/certs/subset-ca.pem".into()),
@@ -306,6 +318,7 @@ fn upstream_valid_subsets_pass_validation() {
             labels: HashMap::from([("version".into(), "v2".into())]),
             traffic_policy: Some(SubsetTrafficPolicy {
                 load_balancer_algorithm: Some(LoadBalancerAlgorithm::Random),
+                hash_on: None,
                 tls: None,
                 connect_timeout_ms: None,
                 passive_health_check: None,

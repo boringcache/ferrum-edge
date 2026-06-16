@@ -7144,21 +7144,12 @@ async fn handle_websocket_request_authenticated(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
-        let has_port_override = backend_dispatch::has_effective_port_override(
+        let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
             &proxy,
             &epoch.load_balancer,
             upstream_id,
             target.port,
         );
-        let strategy = if has_port_override {
-            LoadBalancerCache::get_hash_on_strategy_for_port_from(
-                &epoch.load_balancer,
-                upstream_id,
-                target.port,
-            )
-        } else {
-            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id)
-        };
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
@@ -13549,24 +13540,12 @@ async fn handle_proxy_request_inner(
                     && let (Some(upstream_id), Some(target)) =
                         (&proxy.upstream_id, &upstream_target)
                 {
-                    let has_port_override = backend_dispatch::has_effective_port_override(
+                    let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
                         &proxy,
                         &epoch.load_balancer,
                         upstream_id,
                         target.port,
                     );
-                    let strategy = if has_port_override {
-                        LoadBalancerCache::get_hash_on_strategy_for_port_from(
-                            &epoch.load_balancer,
-                            upstream_id,
-                            target.port,
-                        )
-                    } else {
-                        LoadBalancerCache::get_hash_on_strategy_from(
-                            &epoch.load_balancer,
-                            upstream_id,
-                        )
-                    };
                     if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
                         let upstream =
                             LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
@@ -14583,21 +14562,12 @@ async fn handle_proxy_request_inner(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
     {
-        let has_port_override = backend_dispatch::has_effective_port_override(
+        let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
             &proxy,
             &epoch.load_balancer,
             upstream_id,
             target.port,
         );
-        let strategy = if has_port_override {
-            LoadBalancerCache::get_hash_on_strategy_for_port_from(
-                &epoch.load_balancer,
-                upstream_id,
-                target.port,
-            )
-        } else {
-            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id)
-        };
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
