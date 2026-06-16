@@ -1457,7 +1457,7 @@ Datadog export groups spans by trace in the Agent v0.3 payload shape and sends t
 - `enabled`: toggle (default true). When false, the access log plugin is not injected.
 - `filter`: optional `AccessLogFilter` with `status_code_min`, `status_code_max`, `min_latency_ms`, and `errors_only`.
 
-The access log is injected as a `stdout_logging` global under the reserved id `__mesh_access_log` (carrying the `filter` above). Like every auto-injected global, an operator-managed global of the **same plugin type** overrides it: if you define your own global `stdout_logging`, the `__mesh_access_log` injection is suppressed so transactions are not logged twice, and the Telemetry CRD's `accessLogging.filter` is **not** applied on top of your plugin. To keep the mesh-managed filter, leave access logging to the injected plugin (do not also define a global `stdout_logging`), or fold the equivalent `filter` into your own global `stdout_logging` config.
+The access log is injected as a `stdout_logging` global under the reserved id `__mesh_access_log` (carrying the `filter` above). When the `GatewayConfig` handed to mesh preparation already contains an operator-managed global plugin of the **same plugin type**, that operator plugin overrides the mesh injection: if you define your own global `stdout_logging`, the `__mesh_access_log` injection is suppressed so transactions are not logged twice, and the Telemetry CRD's `accessLogging.filter` is **not** applied on top of your plugin. Native/xDS `MeshSlice` feeds do not currently carry operator `plugin_configs`, so slice-only runtimes receive the mesh-managed access log unless access logging is disabled by Telemetry. To keep the mesh-managed filter, leave access logging to the injected plugin (do not also define a global `stdout_logging` in a prepared config), or fold the equivalent `filter` into your own global `stdout_logging` config.
 
 ## Kubernetes Injector
 
@@ -1613,7 +1613,7 @@ Mesh mode automatically injects these global plugins with reserved IDs:
 | `__mesh_request_auth` | `jwks_auth` | (default) | JWT validation from MeshRequestAuthentication rules |
 | `__mesh_access_log` | `stdout_logging` | (default) | Access logging with optional Telemetry API filters |
 
-An operator-managed global plugin of the same type takes precedence over mesh-injected plugins (explicit override). See [plugin_execution_order.md](plugin_execution_order.md) for the full lifecycle phase matrix.
+Reserved mesh-managed plugin IDs are updated in place on each slice apply. If a prepared `GatewayConfig` already contains an operator-managed global plugin of the same plugin type but a different ID, that operator plugin takes precedence and the corresponding mesh injection is suppressed. Native/xDS `MeshSlice` feeds do not currently transport operator `plugin_configs`; this override hook applies only to prepared configs that enter mesh preparation with plugin configs already present. See [plugin_execution_order.md](plugin_execution_order.md) for the full lifecycle phase matrix.
 
 ## Gateway-to-Mesh Bridge
 

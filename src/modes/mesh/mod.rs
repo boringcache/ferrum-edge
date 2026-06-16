@@ -5915,7 +5915,10 @@ fn ensure_global_plugin(
         .any(|plugin| plugin.scope == PluginScope::Global && plugin.plugin_name == plugin_name)
     {
         // A user-managed global plugin of the same type is an explicit
-        // operator override. Reserved mesh-managed IDs still update above.
+        // operator override when plugin_configs are already present in the
+        // GatewayConfig handed to mesh preparation. Native/xDS MeshSlice feeds
+        // do not currently carry operator plugin_configs. Reserved
+        // mesh-managed IDs still update above.
     } else {
         config.plugin_configs.push(mesh_plugin);
     }
