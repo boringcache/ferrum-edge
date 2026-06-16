@@ -1223,7 +1223,7 @@ fn pod_state_key(pod_states: &DashMap<String, PodAttachmentState>, pod_uid: &str
 
 fn map_fingerprint(map: &HashMap<String, String>) -> u64 {
     let mut entries: Vec<_> = map.iter().collect();
-    entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+    entries.sort_unstable_by_key(|(left_key, _)| *left_key);
     let mut hasher = DefaultHasher::new();
     for (key, value) in entries {
         key.hash(&mut hasher);

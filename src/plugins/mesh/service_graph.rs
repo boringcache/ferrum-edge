@@ -178,7 +178,7 @@ impl ServiceGraphRegistry {
             .or_insert_with(|| ServiceGraphCounters::new(now_unix_ms))
             .observe(
                 summary.latency_total_ms,
-                service_graph_error(summary, &mesh_key),
+                service_graph_error(summary, mesh_key),
                 now_unix_ms,
             );
     }
