@@ -10,7 +10,7 @@ use dashmap::DashMap;
 use serde::Serialize;
 
 use crate::plugins::TransactionSummary;
-use crate::plugins::mesh::prometheus_helpers::{MeshRequestKey, mesh_request_key};
+use crate::plugins::mesh::prometheus_helpers::MeshRequestKey;
 
 const SNAPSHOT_REFRESH_MIN_MS: u64 = 1_000;
 const EDGE_RETENTION_MS: u64 = 5 * 60 * 1_000;
@@ -20,11 +20,6 @@ static GLOBAL_SERVICE_GRAPH: LazyLock<Arc<ServiceGraphRegistry>> =
 
 pub fn global_service_graph() -> &'static ServiceGraphRegistry {
     GLOBAL_SERVICE_GRAPH.as_ref()
-}
-
-pub fn record_transaction(summary: &TransactionSummary) {
-    let mesh_key = mesh_request_key(summary);
-    record_transaction_with_mesh_key(summary, mesh_key.as_ref());
 }
 
 pub fn record_transaction_with_mesh_key(
@@ -142,11 +137,6 @@ impl Drop for SnapshotWorkerGuard {
 }
 
 impl ServiceGraphRegistry {
-    pub fn record_transaction(&self, summary: &TransactionSummary) {
-        let mesh_key = mesh_request_key(summary);
-        self.record_transaction_with_mesh_key(summary, mesh_key.as_ref());
-    }
-
     pub fn record_transaction_with_mesh_key(
         &self,
         summary: &TransactionSummary,
@@ -363,6 +353,8 @@ fn unix_ms_rfc3339(unix_ms: u64) -> String {
 mod tests {
     use std::collections::HashMap;
 
+    use crate::plugins::mesh::prometheus_helpers::mesh_request_key;
+
     use super::*;
 
     #[test]
@@ -371,8 +363,8 @@ mod tests {
         let source = "spiffe://cluster.local/ns/default/sa/frontend";
         let destination = "spiffe://cluster.local/ns/default/sa/reviews";
 
-        registry.record_transaction(&summary(source, destination, 200, 12.5));
-        registry.record_transaction(&summary(source, destination, 503, 37.5));
+        record_for_test(&registry, &summary(source, destination, 200, 12.5));
+        record_for_test(&registry, &summary(source, destination, 503, 37.5));
         registry.force_rebuild_snapshot();
 
         let snapshot = registry.snapshot();
@@ -391,21 +383,27 @@ mod tests {
     #[test]
     fn ignores_non_mesh_and_mirror_summaries() {
         let registry = ServiceGraphRegistry::default();
-        registry.record_transaction(&TransactionSummary {
-            response_status_code: 200,
-            latency_total_ms: 1.0,
-            ..TransactionSummary::default()
-        });
-        registry.record_transaction(&TransactionSummary {
-            mirror: true,
-            response_status_code: 200,
-            latency_total_ms: 1.0,
-            metadata: mesh_metadata(
-                "spiffe://cluster.local/ns/default/sa/frontend",
-                "spiffe://cluster.local/ns/default/sa/reviews",
-            ),
-            ..TransactionSummary::default()
-        });
+        record_for_test(
+            &registry,
+            &TransactionSummary {
+                response_status_code: 200,
+                latency_total_ms: 1.0,
+                ..TransactionSummary::default()
+            },
+        );
+        record_for_test(
+            &registry,
+            &TransactionSummary {
+                mirror: true,
+                response_status_code: 200,
+                latency_total_ms: 1.0,
+                metadata: mesh_metadata(
+                    "spiffe://cluster.local/ns/default/sa/frontend",
+                    "spiffe://cluster.local/ns/default/sa/reviews",
+                ),
+                ..TransactionSummary::default()
+            },
+        );
         registry.force_rebuild_snapshot();
 
         assert!(registry.snapshot().edges.is_empty());
@@ -433,8 +431,8 @@ mod tests {
             .metadata
             .insert("mesh.source.service".to_string(), "checkout".to_string());
 
-        registry.record_transaction(&frontend);
-        registry.record_transaction(&checkout);
+        record_for_test(&registry, &frontend);
+        record_for_test(&registry, &checkout);
         registry.force_rebuild_snapshot();
 
         let snapshot = registry.snapshot();
@@ -473,12 +471,15 @@ mod tests {
     #[test]
     fn snapshot_rebuild_evicts_stale_edges() {
         let registry = ServiceGraphRegistry::default();
-        registry.record_transaction(&summary(
-            "spiffe://cluster.local/ns/default/sa/frontend",
-            "spiffe://cluster.local/ns/default/sa/reviews",
-            200,
-            10.0,
-        ));
+        record_for_test(
+            &registry,
+            &summary(
+                "spiffe://cluster.local/ns/default/sa/frontend",
+                "spiffe://cluster.local/ns/default/sa/reviews",
+                200,
+                10.0,
+            ),
+        );
         let last_seen = registry
             .edges
             .iter()
@@ -500,7 +501,7 @@ mod tests {
     fn global_registry_can_be_reset_for_tests() {
         let registry = global_service_graph();
         registry.clear_for_tests();
-        record_transaction(&summary(
+        record_global_for_test(&summary(
             "spiffe://cluster.local/ns/default/sa/a",
             "spiffe://cluster.local/ns/default/sa/b",
             200,
@@ -632,5 +633,15 @@ mod tests {
             last_seen_unix_ms: 0,
             last_seen: unix_ms_rfc3339(0),
         }
+    }
+
+    fn record_for_test(registry: &ServiceGraphRegistry, summary: &TransactionSummary) {
+        let mesh_key = mesh_request_key(summary);
+        registry.record_transaction_with_mesh_key(summary, mesh_key.as_ref());
+    }
+
+    fn record_global_for_test(summary: &TransactionSummary) {
+        let mesh_key = mesh_request_key(summary);
+        record_transaction_with_mesh_key(summary, mesh_key.as_ref());
     }
 }
