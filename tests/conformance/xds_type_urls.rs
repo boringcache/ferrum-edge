@@ -52,6 +52,7 @@ fn slice_with_one_service() -> MeshSlice {
         locality: None,
         service_account: Some("echo".to_string()),
         pod_uid: None,
+        remote_provenance: false,
     };
     let service = MeshService {
         cluster_ips: Vec::new(),

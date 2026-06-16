@@ -1110,6 +1110,17 @@ pub struct Upstream {
     /// balancing. Projected from the selected workload at slice-apply time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_locality: Option<String>,
+    /// Strict local-first locality LB for this upstream. Default `false`
+    /// (fail-open): when `source_locality` is absent the locality-aware LB
+    /// returns mixed local + remote endpoints. When `true` (fail-closed-to-
+    /// local): an absent `source_locality` restricts selection to LOCAL-locality
+    /// endpoints (targets not tagged with the synthetic `remote-<cluster>`
+    /// locality), widening to the full healthy pool only when there are no local
+    /// endpoints. Projected from `FERRUM_MESH_LOCALITY_LB_STRICT` onto mesh
+    /// upstreams at slice apply; the load balancer reads it at cache-build time.
+    /// Stays `false` for non-mesh upstreams, preserving existing behavior.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locality_lb_strict: bool,
     /// Optional projection of Istio
     /// `DestinationRule.trafficPolicy.localityLbSetting`. Populated by the
     /// mesh apply layer from a matching `MeshDestinationRule`; `None` for
@@ -4486,52 +4497,19 @@ impl Upstream {
             ));
         }
 
-        // `port_overrides` is mesh-derived state populated at apply time by
-        // `apply_destination_rules` from `DestinationRule.portLevelSettings`.
-        // Admin POST/PUT setting it directly is rejected because (a) the SQL
-        // / MongoDB schemas do not persist this field — INSERT/UPDATE drops
-        // it silently, leaving operators with a "successful write" that
-        // didn't take effect, and (b) the canonical place to express per-
-        // port traffic policy is a DestinationRule, not a back-channel POST
-        // to /upstreams. Mesh-injected upstreams populate this in-memory and
-        // skip admin admission entirely.
-        if !self.port_overrides.is_empty() {
-            errors.push(
-                "port_overrides is populated by mesh DestinationRule \
-                 portLevelSettings and cannot be set directly via the admin \
-                 API — express per-port traffic policy as a DestinationRule"
-                    .to_string(),
-            );
-        }
-
-        // `source_locality` follows the same pattern as `port_overrides`: it
-        // is mesh-derived state populated at slice-apply time by
-        // `project_mesh_source_locality` from the workload's locality. SQL
-        // backends do not persist it (no column), so an admin write would
-        // succeed and silently vanish on the next reload. The canonical place
-        // to express source locality is the mesh `Workload.locality` field.
-        if self.source_locality.is_some() {
-            errors.push(
-                "source_locality is projected from the mesh workload's \
-                 locality and cannot be set directly via the admin API — \
-                 set it on the Workload / pod topology labels instead"
-                    .to_string(),
-            );
-        }
-
-        // `locality_lb_setting` is mesh-derived state populated at slice-apply
-        // time from `DestinationRule.trafficPolicy.localityLbSetting`. The
-        // canonical surface is a DestinationRule, mirroring `port_overrides`
-        // and `source_locality` above.
-        if self.locality_lb_setting.is_some() {
-            errors.push(
-                "locality_lb_setting is projected from a mesh \
-                 DestinationRule's trafficPolicy.localityLbSetting and \
-                 cannot be set directly via the admin API — express \
-                 weighted distribute and failover via a DestinationRule"
-                    .to_string(),
-            );
-        }
+        // NOTE: rejection of mesh-PROJECTED fields that an operator must not set
+        // directly (`port_overrides`, `source_locality`, `locality_lb_strict`,
+        // `locality_lb_setting`) lives in
+        // [`Upstream::validate_operator_provided_fields`], NOT here. The rejection
+        // belongs on every OPERATOR-PROVIDED load (admin write/admission AND the
+        // file-mode loader, via [`GatewayConfig::validate_operator_provided_fields`])
+        // but must NOT fire on the mesh slice-apply path, which legitimately
+        // PROJECTS those fields. `validate_fields` runs on the mesh slice-prep path
+        // too (it materializes upstreams carrying these fields), so putting the
+        // rejection here would make every mesh reload / remote-endpoint update emit
+        // a false "misconfigured" error. Operator entry points therefore call
+        // `validate_operator_provided_fields` explicitly in addition to
+        // `validate_fields`; the mesh slice-prep path never does.
 
         // Validate individual targets
         for (i, target) in self.targets.iter().enumerate() {
@@ -4743,6 +4721,74 @@ impl Upstream {
                 );
             }
             _ => {}
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Reject mesh-PROJECTED fields that an OPERATOR must not set directly.
+    ///
+    /// `port_overrides`, `source_locality`, `locality_lb_strict`, and
+    /// `locality_lb_setting` are all populated by the mesh slice-apply layer (from
+    /// DestinationRules / the workload locality / `FERRUM_MESH_LOCALITY_LB_STRICT`),
+    /// NOT by operators. None of them are persisted by the SQL / MongoDB schemas,
+    /// so a direct admin POST/PUT — or an operator-authored YAML/JSON file in file
+    /// mode — would "succeed" and then silently vanish on the next reload. Worse, a
+    /// file-mode operator slipping in `locality_lb_strict` / `locality_lb_setting`
+    /// could enable strict-locality or DR-derived policy that the mesh layer is
+    /// meant to own. The canonical surface for each is named in its message.
+    ///
+    /// This applies to **every operator-PROVIDED config load** — the admin write /
+    /// admission path AND the file-mode loader — and is deliberately SEPARATE from
+    /// [`Upstream::validate_fields`]: `validate_fields` also runs on the mesh
+    /// slice-apply path (which legitimately PROJECTS these fields), where rejecting
+    /// them would emit a false "misconfigured" error on every mesh reload /
+    /// remote-endpoint update. Operator entry points therefore call this in
+    /// addition to `validate_fields`; the mesh slice-prep path never does.
+    /// See [`GatewayConfig::validate_operator_provided_fields`] for the config-wide
+    /// wrapper the file loader uses.
+    pub fn validate_operator_provided_fields(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if !self.port_overrides.is_empty() {
+            errors.push(
+                "port_overrides is populated by mesh DestinationRule \
+                 portLevelSettings and cannot be set directly via the admin \
+                 API — express per-port traffic policy as a DestinationRule"
+                    .to_string(),
+            );
+        }
+
+        if self.source_locality.is_some() {
+            errors.push(
+                "source_locality is projected from the mesh workload's \
+                 locality and cannot be set directly via the admin API — \
+                 set it on the Workload / pod topology labels instead"
+                    .to_string(),
+            );
+        }
+
+        if self.locality_lb_strict {
+            errors.push(
+                "locality_lb_strict is projected from the \
+                 FERRUM_MESH_LOCALITY_LB_STRICT environment flag and cannot be \
+                 set directly via the admin API — set the env var instead"
+                    .to_string(),
+            );
+        }
+
+        if self.locality_lb_setting.is_some() {
+            errors.push(
+                "locality_lb_setting is projected from a mesh \
+                 DestinationRule's trafficPolicy.localityLbSetting and \
+                 cannot be set directly via the admin API — express \
+                 weighted distribute and failover via a DestinationRule"
+                    .to_string(),
+            );
         }
 
         if errors.is_empty() {
@@ -5536,6 +5582,38 @@ impl GatewayConfig {
             }
         }
 
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Reject mesh-PROJECTED upstream fields on operator-PROVIDED config loads.
+    ///
+    /// `Upstream.{port_overrides, source_locality, locality_lb_strict,
+    /// locality_lb_setting}` are owned by the mesh slice-apply layer (Destination
+    /// rules / workload locality / `FERRUM_MESH_LOCALITY_LB_STRICT`); an operator
+    /// must never set them directly. This is the config-wide wrapper over
+    /// [`Upstream::validate_operator_provided_fields`] that the **file-mode loader**
+    /// runs so an operator-authored YAML/JSON upstream cannot smuggle in strict
+    /// locality / DR-derived policy (none of these fields are persisted, so they
+    /// would silently vanish on reload, or worse, briefly take effect).
+    ///
+    /// It is deliberately SEPARATE from [`Self::validate_all_fields_with_ip_policy`]
+    /// (and is NOT part of the shared validation pipeline): the mesh slice-apply
+    /// path legitimately PROJECTS these fields and must keep applying clean, so
+    /// only operator entry points call this — file mode here, the admin API per
+    /// resource on POST/PUT/import/restore.
+    pub fn validate_operator_provided_fields(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        for upstream in &self.upstreams {
+            if let Err(errs) = upstream.validate_operator_provided_fields() {
+                for e in errs {
+                    errors.push(format!("Upstream '{}': {}", upstream.id, e));
+                }
+            }
+        }
         if errors.is_empty() {
             Ok(())
         } else {

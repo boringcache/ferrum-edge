@@ -97,6 +97,7 @@ fn egress_runtime() -> MeshRuntimeConfig {
         egress_stream_enabled: true,
         egress_stream_allow_plaintext: false,
         request_auth_require_exp: true,
+        locality_lb_strict: false,
     }
 }
 

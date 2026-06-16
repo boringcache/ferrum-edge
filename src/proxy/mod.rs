@@ -4379,14 +4379,10 @@ impl ProxyState {
         // index/dispatch use, so probe and dispatch capability keys agree.
         // `mesh.mtls` (Sidecar) per-workload targets are skipped (no probe),
         // exactly like the VIP pass.
-        let local_cluster = mesh
-            .multi_cluster
-            .as_ref()
-            .and_then(|mc| mc.local_cluster.as_deref());
         for spec in crate::modes::mesh::mesh_outbound_tcp_bywl_upstreams(
             &mesh.services,
             &mesh.workloads,
-            local_cluster,
+            mesh.multi_cluster.as_ref(),
         ) {
             let Some(upstream) = upstream_map.get(spec.upstream_id.as_str()) else {
                 continue;
@@ -20774,6 +20770,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         };
 
         let bywl_id = crate::modes::mesh::mesh_outbound_tcp_bywl_upstream_id(
@@ -24880,6 +24877,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         });
         // Now the workload's declared application port is allowed on loopback...
         assert!(inbound_hbone_relay_destination_allowed(
@@ -25657,6 +25655,7 @@ mod tests {
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                remote_provenance: false,
             }
         }
 
@@ -26478,6 +26477,7 @@ mod tests {
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            locality_lb_strict: false,
             locality_lb_setting: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
@@ -26533,6 +26533,7 @@ mod tests {
                 subsets: None,
                 port_overrides: HashMap::new(),
                 source_locality: None,
+                locality_lb_strict: false,
                 locality_lb_setting: None,
                 backend_tls_client_cert_path: None,
                 backend_tls_client_key_path: None,

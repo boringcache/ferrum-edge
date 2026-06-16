@@ -34,6 +34,7 @@ fn fresh_workload() -> Workload {
         locality: None,
         service_account: None,
         pod_uid: None,
+        remote_provenance: false,
     }
 }
 
@@ -924,6 +925,7 @@ fn gateway_config_validate_mesh_fields_dispatches() {
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                remote_provenance: false,
             }],
             ..Default::default()
         })),
