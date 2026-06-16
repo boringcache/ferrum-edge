@@ -1614,6 +1614,11 @@ impl MeshSidecarEgress {
 
 // ── Multi-cluster ────────────────────────────────────────────────────────
 
+/// Maximum number of remote clusters accepted in one mesh slice. Each remote
+/// cluster may spawn federation and/or endpoint-discovery work, so keep the
+/// fan-out explicitly bounded even though the source is a trusted CP/config.
+pub const MAX_MESH_REMOTE_CLUSTERS: usize = 256;
+
 /// Layer-10 multi-cluster mesh settings.
 ///
 /// This is intentionally control-plane neutral. Istio CRDs, Gateway API,
@@ -2832,6 +2837,13 @@ fn validate_multi_cluster(
     {
         errors
             .push("MultiClusterConfig.federation_endpoint must not be empty when set".to_string());
+    }
+    if multi_cluster.remote_clusters.len() > MAX_MESH_REMOTE_CLUSTERS {
+        errors.push(format!(
+            "MultiClusterConfig.remote_clusters has {} entries; max is {}",
+            multi_cluster.remote_clusters.len(),
+            MAX_MESH_REMOTE_CLUSTERS
+        ));
     }
 
     let mut seen_cluster_names = HashSet::new();
