@@ -1509,7 +1509,7 @@ The injector checks annotations and labels to decide whether to inject:
 | `ferrum.io/inject: "false"` | Skip injection |
 | `sidecar.istio.io/inject: "false"` | Skip injection (Istio compat) |
 | `ferrum.io/mesh: "false"` or `"disabled"` (label) | Skip injection |
-| `ferrum.io/injected` | Skip (already injected) |
+| `ferrum.io/injected` | Written by the injector as an observability marker only; not trusted as a skip signal. Re-invocation is rejected by reserved `ferrum-edge` / `ferrum-edge-init` name conflicts |
 
 When `FERRUM_INJECTOR_REQUIRE_ANNOTATION=true` (default), pods must explicitly opt in via `ferrum.io/inject: "true"`, `sidecar.istio.io/inject: "true"` (Istio compat), or the `ferrum.io/mesh: "enabled"` label. When `false`, all pods are injected unless explicitly opted out.
 
