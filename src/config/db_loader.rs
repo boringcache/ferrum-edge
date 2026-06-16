@@ -1299,6 +1299,17 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         upstream_id: &str,
     ) -> Result<(), anyhow::Error> {
+        let upstream_owner: Option<Option<String>> =
+            sqlx::query(&self.q("SELECT api_spec_id FROM upstreams WHERE id = ? LIMIT 1"))
+                .bind(upstream_id)
+                .fetch_optional(&mut **tx)
+                .await?
+                .map(|row| row.try_get::<Option<String>, _>("api_spec_id"))
+                .transpose()?;
+        if upstream_owner.flatten().is_some() {
+            return Ok(());
+        }
+
         let ref_rows: Vec<AnyRow> =
             sqlx::query(&self.q("SELECT id FROM proxies WHERE upstream_id = ? LIMIT 1"))
                 .bind(upstream_id)
