@@ -515,7 +515,7 @@ impl DatabaseStore {
         proxy: &Proxy,
         exclude_id: Option<&str>,
     ) -> Result<(), anyhow::Error> {
-        if proxy.dispatch_kind.is_stream() {
+        if proxy.effective_scheme().is_stream() {
             return Ok(());
         }
 
