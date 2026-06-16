@@ -1420,6 +1420,10 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         api_spec_id: None,
@@ -1680,6 +1684,10 @@ fn east_west_service_proxy(
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
         api_spec_id: None,
@@ -2776,6 +2784,10 @@ fn mesh_inbound_loopback_proxy_to(
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         api_spec_id: None,
@@ -2854,6 +2866,10 @@ pub(crate) fn mesh_inbound_hbone_relay_proxy(host: &str, port: u16) -> Proxy {
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         api_spec_id: None,
@@ -3394,6 +3410,10 @@ fn mesh_outbound_tcp_relay_proxy_with_id(id: String, namespace: &str, upstream_i
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
         api_spec_id: None,
@@ -3582,6 +3602,10 @@ fn mesh_outbound_route_proxy(
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
         api_spec_id: None,
@@ -4342,6 +4366,9 @@ fn apply_connection_pool_http_to_port_override(
     }
     if let Some(max_retries) = http.max_retries {
         slot.max_retries = Some(max_retries);
+    }
+    if let Some(pending) = http.http1_max_pending_requests {
+        slot.http1_max_pending_requests = Some(pending);
     }
 }
 
@@ -5415,6 +5442,10 @@ fn egress_gateway_proxy(
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
         api_spec_id: None,
@@ -5504,6 +5535,10 @@ fn stream_egress_gateway_proxy(
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
         api_spec_id: None,

@@ -65,8 +65,10 @@ need them, or because they are blocked upstream / architecturally:
   the v6 socket-cookie read; dual-stack **sidecar** serves IPv6 fully.
 - **UDP/DTLS per-pod authz scoping** — architectural (no UDP capture hooks);
   mesh-wide + fail-closed is the safe invariant.
-- **DR `connectionPool.http.maxRequestsPerConnection` / `http1MaxPendingRequests`**
-  — blocked on hyper (no close-after-N / pending-queue knob); use `http2MaxRequests`.
+- **DR `connectionPool.http.maxRequestsPerConnection`** — wire-projected but inert
+  at runtime, blocked on hyper (no close-after-N knob); use `http2MaxRequests`.
+  (`http1MaxPendingRequests` IS enforced — a 503-on-overflow pending-request gate
+  on the HTTP/1.1 dispatch path; see the DR table in `docs/mesh.md`.)
 - **LB `MAGLEV` / `PASSTHROUGH`** — niche; `PASSTHROUGH` approximates to round-robin.
 - **VirtualService `tcp[]` source/dest-CIDR L4 routing** — uncommon; model with a
   stream `Proxy` or east-west SNI passthrough (TLS-SNI L4 routing is on the roadmap).

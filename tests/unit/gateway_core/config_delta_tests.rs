@@ -47,6 +47,7 @@ fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         api_spec_id: None,
