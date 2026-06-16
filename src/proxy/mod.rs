@@ -42,6 +42,7 @@ pub mod headers;
 pub mod http2_pool;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
+mod mesh_tcp_inbound;
 pub mod netns_capture;
 pub mod sni;
 pub mod stream_error;
@@ -9818,6 +9819,31 @@ async fn run_accept_loop(
                                         return;
                                     }
                                     None => {}
+                                }
+                            }
+
+                            // Raw-TCP Sidecar inbound: when mesh inbound TLS
+                            // is intentionally disabled/absent and iptables
+                            // REDIRECT captures plaintext TCP for a local
+                            // stream-family app port, route by the captured
+                            // original destination before Hyper tries to parse
+                            // Redis/MySQL/etc. bytes as HTTP.
+                            if tls_config.is_none()
+                                && mesh_direction
+                                    == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+                                && let Some(dst) = orig_dst
+                            {
+                                let epoch = state.request_epoch.load();
+                                if let Some(entry) = epoch.route_table.mesh_tcp_inbound_entry(dst) {
+                                    mesh_tcp_inbound::handle_mesh_tcp_inbound(
+                                        stream,
+                                        remote_addr,
+                                        &state,
+                                        &entry,
+                                        dst,
+                                    )
+                                    .await;
+                                    return;
                                 }
                             }
 
