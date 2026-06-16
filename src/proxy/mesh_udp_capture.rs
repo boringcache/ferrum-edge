@@ -280,25 +280,36 @@ fn handle_captured_datagram(
 
     let key = CaptureSessionKey { client, orig_dst };
     let now = crate::socket_opts::monotonic_now_ms();
-    let admitted = match sessions.entry(key) {
-        dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-            occ.get_mut().last_activity = now;
-            true
+    // NEVER call another `sessions.*` op (e.g. `len()`) while holding an entry
+    // guard: `DashMap::len()` reads every shard, including the one the entry
+    // guard has locked, which self-deadlocks (codex r1 P1). Refresh an existing
+    // flow with a short-lived `get_mut` guard that is dropped before the cap
+    // check, then read the count and `entry().or_insert` the new flow with NO
+    // nested `sessions` access inside the guard's scope.
+    if let Some(mut existing) = sessions.get_mut(&key) {
+        // Existing flow already holds a slot — always refresh, even at the cap.
+        existing.last_activity = now;
+        // (guard `existing` drops at end of this block)
+    } else {
+        // New flow: read the count with no guard held, then admit-or-shed.
+        if sessions.len() >= max_sessions {
+            // Cap reached — shed this new flow without reserving a slot.
+            debug!(
+                client = %client,
+                orig_dst = %orig_dst,
+                "Mesh UDP capture: session cap reached, dropping datagram from new flow"
+            );
+            return false;
         }
-        dashmap::mapref::entry::Entry::Vacant(vacant) => {
-            if sessions.len() >= max_sessions {
-                // Cap reached — shed this new flow without reserving a slot.
-                debug!(
-                    client = %client,
-                    orig_dst = %orig_dst,
-                    "Mesh UDP capture: session cap reached, dropping datagram from new flow"
-                );
-                return false;
-            }
-            vacant.insert(CaptureSession { last_activity: now });
-            true
-        }
-    };
+        // `entry().or_insert_with` runs the closure WITHOUT touching `sessions`
+        // (the closure is pure), so no map op nests under the entry guard. A
+        // racing datagram for the same key that inserted between the `get_mut`
+        // miss and here is harmless — `or_insert_with` keeps the existing entry.
+        sessions
+            .entry(key)
+            .or_insert_with(|| CaptureSession { last_activity: now });
+    }
+    let admitted = true;
 
     // Stage 3: capture → DROP. Egress relay (forward over the mesh transport to
     // `orig_dst`'s workload) is Stage 4.
@@ -355,7 +366,14 @@ pub async fn start_mesh_udp_capture_listener(
 ) -> Result<(), anyhow::Error> {
     let _ = cfg.shutdown;
     let _ = cfg.global_shutdown;
-    let _ = cfg.started_tx;
+    // Fire the startup-ready signal before returning: mesh startup's
+    // `wait_for_start_signals()` blocks on this listener's `started_tx` even on
+    // non-Linux, so dropping the sender unsent would fail startup with a closed
+    // oneshot instead of behaving as the documented no-op (codex r1 P3). Mirror
+    // the other listener stubs and signal ready, then return.
+    if let Some(tx) = cfg.started_tx {
+        let _ = tx.send(());
+    }
     tracing::warn!(
         addr = %cfg.addr,
         "Mesh UDP capture listener is Linux-only (IP_TRANSPARENT + recvmsg cmsg); not starting"
@@ -435,6 +453,28 @@ mod tests {
             1000
         ));
         assert_eq!(sessions.len(), 3);
+    }
+
+    #[test]
+    fn first_datagram_new_session_does_not_deadlock() {
+        // Regression for codex r1 P1: the first datagram for a fresh
+        // (client, orig-dst) must admit a session WITHOUT re-entering the
+        // DashMap (`len()`) while an entry guard is held — otherwise this call
+        // self-deadlocks and the test hangs. A plain return here is the proof
+        // it no longer nests map ops under a guard.
+        let sessions = new_sessions(0);
+        let client: SocketAddr = "10.0.0.5:40000".parse().unwrap();
+        let dst: SocketAddr = "10.96.0.10:53".parse().unwrap();
+        // Cap well above 1 so the new flow is admitted via the count-then-insert
+        // path (the exact path that previously held a guard across `len()`).
+        assert!(handle_captured_datagram(
+            &sessions,
+            client,
+            Some(dst),
+            64,
+            1000
+        ));
+        assert_eq!(sessions.len(), 1);
     }
 
     #[test]

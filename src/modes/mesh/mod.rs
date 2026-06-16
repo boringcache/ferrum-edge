@@ -707,11 +707,13 @@ impl MeshRuntimeConfig {
     /// listener (and UDP stays mesh-wide-only there per the per-pod-scope
     /// notes). Returns at most one listener, gated on
     /// `FERRUM_MESH_CAPTURE_UDP_ENABLED` (default-off via
-    /// [`crate::capture::udp_capture_settings_from_env`]), bound on the same IP
-    /// as the outbound capture listener (so it follows
-    /// `FERRUM_MESH_OUTBOUND_LISTEN_ADDR`) but on the Stage-2 UDP capture port
-    /// (`FERRUM_MESH_CAPTURE_UDP_PORT`). A parse error or disabled flag yields
-    /// no listener — the capture path stays inert.
+    /// [`crate::capture::udp_capture_settings_from_env`]), bound on the
+    /// WILDCARD address (family following `FERRUM_MESH_OUTBOUND_LISTEN_ADDR`) on
+    /// the Stage-2 UDP capture port (`FERRUM_MESH_CAPTURE_UDP_PORT`): TPROXY
+    /// leaves each datagram's original (non-local) destination intact, so a
+    /// specific-IP bind would miss them — only a wildcard `IP_TRANSPARENT`
+    /// socket receives the captured non-local dests. A parse error or disabled
+    /// flag yields no listener — the capture path stays inert.
     fn udp_capture_listener(&self) -> Option<MeshListener> {
         let settings = match crate::capture::udp_capture_settings_from_env() {
             Ok(s) => s,
@@ -723,8 +725,20 @@ impl MeshRuntimeConfig {
         if !settings.udp_capture_enabled {
             return None;
         }
-        let addr =
-            std::net::SocketAddr::new(self.outbound_listen_addr.ip(), settings.udp_outbound_port);
+        // Bind the capture port on the WILDCARD address, not the configured
+        // outbound IP (codex r1 P2). TPROXY (`--on-port` only, no `--on-ip`)
+        // diverts the datagram to this socket WITHOUT rewriting its
+        // destination, so each captured datagram still carries the pod's real
+        // service/cluster-IP destination, never the listener's IP. A specific-IP
+        // bind (e.g. the default `127.0.0.1`) would not match those non-local
+        // destinations and the transparent socket would receive nothing; the
+        // `IP_TRANSPARENT` socket is what lets a wildcard bind accept the
+        // non-local dests. The family follows the configured outbound IP.
+        let wildcard_ip = match self.outbound_listen_addr.ip() {
+            std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        };
+        let addr = std::net::SocketAddr::new(wildcard_ip, settings.udp_outbound_port);
         Some(MeshListener {
             direction: MeshTrafficDirection::Outbound,
             kind: MeshListenerKind::PlaintextUdpCapture,
@@ -5832,6 +5846,15 @@ fn mesh_outbound_registry_listen_ports(runtime: &MeshRuntimeConfig) -> Vec<u16> 
         .listener_plan()
         .into_iter()
         .filter(|listener| listener.direction == MeshTrafficDirection::Outbound)
+        // Exclude the UDP TPROXY capture port (codex r1 P3): the outbound
+        // registry enforces HTTP/stream egress that arrived through the TCP
+        // `PlaintextCapture` listener, but the UDP capture socket is a
+        // separate UDP-only sink. TCP and UDP can coexist on the same numeric
+        // port, so including the UDP capture port here would make a regular
+        // TCP/HTTP listener on that number be treated as mesh captured egress
+        // and rejected against the registry even though it never arrived via
+        // the TCP capture listener.
+        .filter(|listener| listener.kind != MeshListenerKind::PlaintextUdpCapture)
         .filter_map(|listener| {
             let port = listener.addr.port();
             (port != 0).then_some(port)
