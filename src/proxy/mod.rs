@@ -15867,6 +15867,38 @@ pub(crate) fn resolve_backend_http1_max_pending_requests(
         .and_then(|override_config| override_config.http1_max_pending_requests)
 }
 
+/// Whether the reqwest-backed backend client for this (effective) proxy will
+/// dispatch over **HTTP/1.1** — the only transport the
+/// `connectionPool.http.http1MaxPendingRequests` pending-request gate applies
+/// to.
+///
+/// The reqwest fallback negotiates HTTP/2 (ALPN) when per-proxy pooling has
+/// `enable_http2` true and the backend advertises h2 — including the case where
+/// the direct-H2 pool is bypassed for a buffered / retained request body
+/// (`enable_http2 && (retain_request_body || requires_request_body_buffering)`).
+/// An H2 backend must NOT be capped by an `http1*` knob (that is
+/// `http2MaxRequests`'s job), so the gate is consulted ONLY when the reqwest
+/// client is forced/known HTTP/1.1:
+///
+/// * `!enable_http2` — the per-proxy reqwest client never advertises h2 ALPN, so
+///   every dial is HTTP/1.1; or
+/// * `proxy.forces_backend_http1_only()` — DestinationRule
+///   `h2UpgradePolicy: DO_NOT_UPGRADE` restricts the reqwest client's ALPN to
+///   `http/1.1` (see `BackendTlsConfigBuilder::build_reqwest`), so even an
+///   h2-capable backend is pinned to HTTP/1.1.
+///
+/// Only ever called after a non-`None` `http1MaxPendingRequests` cap has been
+/// resolved (the rare case a DestinationRule sets the knob), so the
+/// `for_proxy` pool-config resolve never runs on the no-cap hot path.
+pub(crate) fn reqwest_dispatch_is_http1_only(state: &ProxyState, proxy: &Proxy) -> bool {
+    proxy.forces_backend_http1_only()
+        || !state
+            .connection_pool
+            .global_pool_config()
+            .for_proxy(proxy)
+            .enable_http2
+}
+
 /// Resolve the per-port retry lane after a concrete target has failed.
 ///
 /// Initial selection may use the full upstream for mixed-port target sets when
@@ -16853,66 +16885,6 @@ async fn proxy_to_backend(
         }
     }
 
-    // DestinationRule `connectionPool.http.http1MaxPendingRequests`: bound the
-    // number of requests simultaneously waiting on connection capacity for this
-    // backend destination on the reqwest/HTTP-1.1 dispatch path. This is the
-    // *pending-acquire phase* — acquire a slot here, immediately before the
-    // request is dispatched onto the shared reqwest client; the RAII guard is
-    // held only until this function returns (response begun / dial failed), so
-    // a request counts as "pending" exactly while it waits for a connection
-    // slot, matching Envoy's pending-request gauge. When the queue is full the
-    // request is shed with a 503 ("upstream overflow"), NOT queued unboundedly.
-    //
-    // HTTP/1.1-scoped: the direct-H2 / gRPC / H3 / HBONE / mesh-mTLS branches
-    // above already returned before reaching here, so the multiplexed transports
-    // never consult this gate (their concurrency is governed by
-    // `http2MaxRequests` → `h2_max_concurrent_streams`). The retry path
-    // (`proxy_to_backend_retry`) deliberately does NOT acquire a pending slot,
-    // so an initial attempt and its connection-failure retry never both count.
-    let pending_dispatch_port = upstream_target
-        .map(|t| t.port)
-        .unwrap_or(proxy.backend_port);
-    let pending_cap = resolve_backend_http1_max_pending_requests(proxy, pending_dispatch_port);
-    let _pending_slot = match state.backend_pending_limit.try_acquire(
-        effective_host,
-        pending_dispatch_port,
-        pending_cap,
-    ) {
-        Ok(slot) => slot,
-        Err(limit) => {
-            warn!(
-                proxy_id = %proxy.id,
-                backend_host = %effective_host,
-                backend_port = pending_dispatch_port,
-                pending_requests = limit.current,
-                max_pending_requests = limit.cap,
-                "Shedding HTTP/1.1 request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
-            );
-            return backend_dispatch_response(
-                retry::BackendResponse {
-                    status_code: 503,
-                    body: ResponseBody::Buffered(
-                        r#"{"error":"Upstream pending request queue full"}"#
-                            .as_bytes()
-                            .to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    // Gateway-side capacity shed before any backend dial: the
-                    // request never reached the backend application layer, but
-                    // it is classified `DispatchPolicyRejected` (NOT a transport
-                    // connection_error) so retries do not amplify the overflow
-                    // or trip backend circuit breakers — mirrors the
-                    // backend-TLS-SNI gateway reject above.
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip.clone(),
-                    error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
-                },
-                None,
-                None,
-            );
-        }
-    };
-
     // Get client from connection pool for HTTP/1.1 and HTTP/2.
     // The client uses our DnsCacheResolver for transparent DNS cache lookups.
     // All upstream targets share one reqwest::Client since it handles
@@ -17248,6 +17220,81 @@ async fn proxy_to_backend(
         }
     }
 
+    // DestinationRule `connectionPool.http.http1MaxPendingRequests`: bound the
+    // number of requests simultaneously waiting on connection capacity for this
+    // backend destination on the reqwest/HTTP-1.1 dispatch path. This is the
+    // *pending-acquire phase* — acquired here, AFTER local 413 / plugin
+    // rejections and request-body collection / final-body hooks, immediately
+    // before backend admission and the dispatch onto the shared reqwest client.
+    // Acquiring after body handling means a slow client upload does not hold a
+    // "pending backend connection" slot while its body is still streaming in;
+    // the slot reflects requests genuinely *waiting on connection capacity*.
+    //
+    // Released the moment `send().await` returns (see the explicit `drop` below)
+    // — BEFORE any response-body collection — so a request counts as "pending"
+    // exactly while it waits for a connection slot, matching Envoy's
+    // pending-request gauge, NOT for the response-stream / response-buffering
+    // lifetime. When the queue is full the request is shed with a 503 ("upstream
+    // overflow"), NOT queued unboundedly.
+    //
+    // HTTP/1.1-scoped: the direct-H2 / gRPC / H3 / HBONE / mesh-mTLS branches
+    // above already returned before reaching here, so the multiplexed transports
+    // never consult this gate. The reqwest fallback ALSO negotiates ALPN HTTP/2
+    // when the direct-H2 pool is bypassed for a buffered/retained body
+    // (`enable_http2 && (retain_request_body || requires_request_body_buffering)`);
+    // an H2 backend must not be capped by an `http1*` knob, so the slot is taken
+    // only when the reqwest client is forced/known HTTP/1.1
+    // (`reqwest_dispatch_is_http1_only`). Their concurrency is instead governed
+    // by `http2MaxRequests` → `h2_max_concurrent_streams`. The retry path
+    // (`proxy_to_backend_retry`) deliberately does NOT acquire a pending slot,
+    // so an initial attempt and its connection-failure retry never both count.
+    let pending_dispatch_port = upstream_target
+        .map(|t| t.port)
+        .unwrap_or(proxy.backend_port);
+    let pending_cap = resolve_backend_http1_max_pending_requests(proxy, pending_dispatch_port)
+        // Only an HTTP/1.1-bound reqwest dispatch consults the gate; a reqwest
+        // fallback that will ALPN-negotiate h2 ignores the `http1*` cap.
+        .filter(|_| reqwest_dispatch_is_http1_only(state, proxy));
+    let pending_slot = match state.backend_pending_limit.try_acquire(
+        effective_host,
+        pending_dispatch_port,
+        pending_cap,
+    ) {
+        Ok(slot) => slot,
+        Err(limit) => {
+            warn!(
+                proxy_id = %proxy.id,
+                backend_host = %effective_host,
+                backend_port = pending_dispatch_port,
+                pending_requests = limit.current,
+                max_pending_requests = limit.cap,
+                "Shedding HTTP/1.1 request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
+            );
+            return backend_dispatch_response(
+                retry::BackendResponse {
+                    status_code: 503,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Upstream pending request queue full"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    // Gateway-side capacity shed before any backend dial: the
+                    // request never reached the backend application layer, but
+                    // it is classified `DispatchPolicyRejected` (NOT a transport
+                    // connection_error) so retries do not amplify the overflow
+                    // or trip backend circuit breakers — mirrors the
+                    // backend-TLS-SNI gateway reject above.
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
+                    error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                },
+                None,
+                None,
+            );
+        }
+    };
+
     backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
         backend_admission_plugins,
         request_ctx,
@@ -17265,7 +17312,17 @@ async fn proxy_to_backend(
     // Send
     let mut reqwest_backend_guard =
         Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
-    let response = match req_builder.send().await {
+    let send_result = req_builder.send().await;
+    // Release the pending-request slot the instant dispatch returns: the
+    // connection-wait phase is over once `send()` resolves (capacity obtained
+    // and the response has begun, or the dial failed). Dropping here — before
+    // response-body collection / eager buffering / response-inspection — keeps
+    // the gauge measuring connection-wait only, never the response lifetime.
+    // RAII covers all the early returns ABOVE this point (admission reject); this
+    // explicit drop covers the response-handling tail BELOW it. A no-cap /
+    // non-HTTP-1.1 dispatch holds `None` here, so the drop is a no-op.
+    drop(pending_slot);
+    let response = match send_result {
         Ok(response) => {
             // A streaming request body that overran `max_request_body_size_bytes`
             // is authoritative regardless of how the send/receive race resolved.
