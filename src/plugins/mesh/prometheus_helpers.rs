@@ -34,6 +34,15 @@ static MESH_FEDERATION_POLL_FAILURES: LazyLock<DashMap<MeshFederationPollFailure
     LazyLock::new(DashMap::new);
 static MESH_FEDERATION_LAST_SUCCESS: LazyLock<DashMap<Arc<str>, AtomicU64>> =
     LazyLock::new(DashMap::new);
+static MESH_REMOTE_DISCOVERY_POLL_FAILURES: LazyLock<
+    DashMap<MeshRemoteDiscoveryPollFailureKey, AtomicU64>,
+> = LazyLock::new(DashMap::new);
+static MESH_REMOTE_DISCOVERY_POLL_SUCCESSES: LazyLock<
+    DashMap<MeshRemoteDiscoveryPollSuccessKey, AtomicU64>,
+> = LazyLock::new(DashMap::new);
+static MESH_REMOTE_DISCOVERY_LAST_SUCCESS: LazyLock<
+    DashMap<MeshRemoteDiscoveryPollSuccessKey, AtomicU64>,
+> = LazyLock::new(DashMap::new);
 static XDS_STREAMS_REJECTED: AtomicU64 = AtomicU64::new(0);
 static XDS_WARMING_PARTIAL_APPLIES: LazyLock<DashMap<Arc<str>, AtomicU64>> =
     LazyLock::new(DashMap::new);
@@ -91,6 +100,19 @@ struct MeshMtlsHandshakeFailureKey {
 struct MeshFederationPollFailureKey {
     trust_domain: Arc<str>,
     endpoint: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MeshRemoteDiscoveryPollFailureKey {
+    cluster: Arc<str>,
+    trust_domain: Arc<str>,
+    control_plane: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MeshRemoteDiscoveryPollSuccessKey {
+    cluster: Arc<str>,
+    trust_domain: Arc<str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -281,6 +303,41 @@ pub fn record_mesh_federation_poll_success(
         .store(fetched_at_unix_seconds, Ordering::Relaxed);
 }
 
+pub fn increment_mesh_remote_discovery_poll_failure(
+    cluster: impl AsRef<str>,
+    trust_domain: impl AsRef<str>,
+    control_plane: impl AsRef<str>,
+) {
+    let key = MeshRemoteDiscoveryPollFailureKey {
+        cluster: Arc::from(cluster.as_ref()),
+        trust_domain: Arc::from(trust_domain.as_ref()),
+        control_plane: Arc::from(control_plane.as_ref()),
+    };
+    MESH_REMOTE_DISCOVERY_POLL_FAILURES
+        .entry(key)
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_mesh_remote_discovery_poll_success(
+    cluster: impl AsRef<str>,
+    trust_domain: impl AsRef<str>,
+    fetched_at_unix_seconds: u64,
+) {
+    let key = MeshRemoteDiscoveryPollSuccessKey {
+        cluster: Arc::from(cluster.as_ref()),
+        trust_domain: Arc::from(trust_domain.as_ref()),
+    };
+    MESH_REMOTE_DISCOVERY_POLL_SUCCESSES
+        .entry(key.clone())
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+    MESH_REMOTE_DISCOVERY_LAST_SUCCESS
+        .entry(key)
+        .or_insert_with(|| AtomicU64::new(0))
+        .store(fetched_at_unix_seconds, Ordering::Relaxed);
+}
+
 pub fn increment_mesh_mtls_handshake_failure(reason: impl AsRef<str>) {
     let key = MeshMtlsHandshakeFailureKey {
         reason: Arc::from(reason.as_ref()),
@@ -463,6 +520,63 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
             output.push_str(&format!(
                 "ferrum_mesh_federation_bundle_age_seconds{{trust_domain=\"{}\"}} {}\n",
                 trust_domain, age
+            ));
+        }
+    }
+
+    if !MESH_REMOTE_DISCOVERY_POLL_FAILURES.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_remote_discovery_poll_failures_total Remote-cluster endpoint discovery poll failures.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_remote_discovery_poll_failures_total counter\n");
+        for entry in MESH_REMOTE_DISCOVERY_POLL_FAILURES.iter() {
+            output.push_str(&format!(
+                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{}\",trust_domain=\"{}\",control_plane=\"{}\"}} {}\n",
+                escape_label_value(&entry.key().cluster),
+                escape_label_value(&entry.key().trust_domain),
+                escape_label_value(&entry.key().control_plane),
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    if !MESH_REMOTE_DISCOVERY_POLL_SUCCESSES.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_remote_discovery_poll_successes_total Successful remote-cluster endpoint discovery polls.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_remote_discovery_poll_successes_total counter\n");
+        for entry in MESH_REMOTE_DISCOVERY_POLL_SUCCESSES.iter() {
+            output.push_str(&format!(
+                "ferrum_mesh_remote_discovery_poll_successes_total{{cluster=\"{}\",trust_domain=\"{}\"}} {}\n",
+                escape_label_value(&entry.key().cluster),
+                escape_label_value(&entry.key().trust_domain),
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    if !MESH_REMOTE_DISCOVERY_LAST_SUCCESS.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_remote_discovery_last_success_timestamp_seconds Unix timestamp of last successful remote-cluster endpoint discovery poll.\n",
+        );
+        output
+            .push_str("# TYPE ferrum_mesh_remote_discovery_last_success_timestamp_seconds gauge\n");
+        output.push_str(
+            "# HELP ferrum_mesh_remote_discovery_endpoint_age_seconds Age of the cached remote-cluster endpoints, in seconds.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_remote_discovery_endpoint_age_seconds gauge\n");
+        for entry in MESH_REMOTE_DISCOVERY_LAST_SUCCESS.iter() {
+            let last = entry.value().load(Ordering::Relaxed);
+            let cluster = escape_label_value(&entry.key().cluster);
+            let trust_domain = escape_label_value(&entry.key().trust_domain);
+            output.push_str(&format!(
+                "ferrum_mesh_remote_discovery_last_success_timestamp_seconds{{cluster=\"{}\",trust_domain=\"{}\"}} {}\n",
+                cluster, trust_domain, last
+            ));
+            let age = now.saturating_sub(last);
+            output.push_str(&format!(
+                "ferrum_mesh_remote_discovery_endpoint_age_seconds{{cluster=\"{}\",trust_domain=\"{}\"}} {}\n",
+                cluster, trust_domain, age
             ));
         }
     }
@@ -900,6 +1014,61 @@ mod tests {
                 "ferrum_xds_warming_partial_applies_total{{namespace=\"{namespace}\"}} 1"
             )),
             "warming partial-apply counter series missing: {output}"
+        );
+    }
+
+    #[test]
+    fn render_emits_remote_discovery_poll_metrics() {
+        let suffix = format!("{}-{}", std::process::id(), line!());
+        let cluster = format!("remote-{suffix}");
+        let trust_domain = format!("td-{suffix}.example");
+        let control_plane = format!("https://remote-{suffix}.example:9443");
+        let fetched_at = unix_now_seconds().saturating_sub(5);
+
+        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain, &control_plane);
+        increment_mesh_remote_discovery_poll_failure(&cluster, &trust_domain, &control_plane);
+        record_mesh_remote_discovery_poll_success(&cluster, &trust_domain, fetched_at);
+
+        let mut output = String::new();
+        render_mesh_observability_metrics(&mut output);
+
+        assert!(
+            output.contains("# TYPE ferrum_mesh_remote_discovery_poll_failures_total counter"),
+            "remote discovery failure counter TYPE line missing: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\",control_plane=\"{control_plane}\"}} 2"
+            )),
+            "remote discovery failure counter series missing: {output}"
+        );
+        assert!(
+            output.contains("# TYPE ferrum_mesh_remote_discovery_poll_successes_total counter"),
+            "remote discovery success counter TYPE line missing: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "ferrum_mesh_remote_discovery_poll_successes_total{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\"}} 1"
+            )),
+            "remote discovery success counter series missing: {output}"
+        );
+        assert!(
+            output.contains(
+                "# TYPE ferrum_mesh_remote_discovery_last_success_timestamp_seconds gauge"
+            ),
+            "remote discovery last-success gauge TYPE line missing: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "ferrum_mesh_remote_discovery_last_success_timestamp_seconds{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\"}} {fetched_at}"
+            )),
+            "remote discovery last-success series missing: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "ferrum_mesh_remote_discovery_endpoint_age_seconds{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\"}} "
+            )),
+            "remote discovery endpoint age series missing: {output}"
         );
     }
 }

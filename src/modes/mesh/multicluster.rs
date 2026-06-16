@@ -1121,6 +1121,11 @@ async fn remote_discovery_loop(
                         "Remote-cluster poll succeeded with no endpoint change; not re-installing"
                     );
                 }
+                crate::plugins::mesh::prometheus_helpers::record_mesh_remote_discovery_poll_success(
+                    &ctx.cluster_name,
+                    ctx.trust_domain.as_str(),
+                    now,
+                );
                 backoff_secs = REMOTE_BACKOFF_INITIAL_SECS;
                 let elapsed = attempt_started_at.elapsed();
                 (true, ctx.config.poll_interval.saturating_sub(elapsed))
@@ -1131,6 +1136,11 @@ async fn remote_discovery_loop(
                     control_plane = %url_for_logs,
                     error = %err,
                     "Remote-cluster endpoint discovery failed; keeping last-good endpoints if any"
+                );
+                crate::plugins::mesh::prometheus_helpers::increment_mesh_remote_discovery_poll_failure(
+                    &ctx.cluster_name,
+                    ctx.trust_domain.as_str(),
+                    &url_for_logs,
                 );
                 (false, jittered_backoff(backoff_secs))
             }
