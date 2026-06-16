@@ -59,6 +59,12 @@ pub struct RecvMmsgBatch {
     /// TPROXY-captured datagram recovers the `service:port` the pod dialed,
     /// since TPROXY delivers without rewriting the destination.
     orig_dsts: Vec<Option<SocketAddr>>,
+    /// Whether to parse the IP(v6)_RECVORIGDSTADDR cmsg per datagram. Enabled
+    /// ONLY for the mesh UDP capture listener (which sets `IP_RECVORIGDSTADDR`);
+    /// plain UDP proxy listeners leave it `false` so they do not pay an
+    /// ancillary-data scan on every datagram for a value that is always `None`
+    /// there (codex r2 P2).
+    parse_orig_dst: bool,
     /// Maximum datagrams per recvmmsg call.
     capacity: usize,
     /// Number of datagrams received in the last `recv()` call.
@@ -81,7 +87,12 @@ impl RecvMmsgBatch {
     ///
     /// Allocates `capacity * 65535` bytes for datagram buffers plus bookkeeping
     /// arrays. This is a one-time allocation at listener startup.
-    pub fn new(capacity: usize) -> Self {
+    ///
+    /// `parse_orig_dst` opts this batch into per-datagram
+    /// `IP_RECVORIGDSTADDR` cmsg parsing; pass `true` only for the mesh UDP
+    /// capture listener and `false` for plain UDP proxy listeners (which never
+    /// enable the socket option and so would scan ancillary data for nothing).
+    pub fn new(capacity: usize, parse_orig_dst: bool) -> Self {
         let capacity = capacity.max(1);
         // cmsg buffer must hold UDP_GRO (u16) + IP_PKTINFO / IPV6_PKTINFO in the
         // same allocation; sized for the v6 worst case so both families fit.
@@ -103,6 +114,7 @@ impl RecvMmsgBatch {
             gro_segments: vec![None; capacity],
             local_addrs: vec![None; capacity],
             orig_dsts: vec![None; capacity],
+            parse_orig_dst,
             capacity,
             count: 0,
         }
@@ -219,6 +231,9 @@ impl RecvMmsgBatch {
         }
 
         let received = ret as usize;
+        // Hoisted (Copy bool) so the per-datagram loop never re-reads the field
+        // and so plain UDP proxy listeners skip the orig-dst cmsg scan entirely.
+        let parse_orig_dst = self.parse_orig_dst;
         for i in 0..received {
             self.result_lens[i] = self.msgs[i].msg_len;
             self.result_addrs[i] = sockaddr_storage_to_std(&self.raw_addrs[i])?;
@@ -231,10 +246,15 @@ impl RecvMmsgBatch {
             self.local_addrs[i] =
                 crate::socket_opts::extract_pktinfo_local_addr(&self.msgs[i].msg_hdr);
             // Parse IP(v6)_RECVORIGDSTADDR cmsg to recover the original
-            // (pre-TPROXY) destination. Present only on the mesh UDP capture
-            // socket (which enables IP_RECVORIGDSTADDR); `None` for plain UDP
-            // proxy listeners and non-Linux.
-            self.orig_dsts[i] = crate::socket_opts::extract_origdst(&self.msgs[i].msg_hdr);
+            // (pre-TPROXY) destination. Only the mesh UDP capture socket enables
+            // `IP_RECVORIGDSTADDR`, so gate the scan on `parse_orig_dst`: plain
+            // UDP proxy listeners would always get `None` and must not pay the
+            // ancillary-data walk per datagram on the hot path (codex r2 P2).
+            self.orig_dsts[i] = if parse_orig_dst {
+                crate::socket_opts::extract_origdst(&self.msgs[i].msg_hdr)
+            } else {
+                None
+            };
         }
         self.count = received;
         Ok(received)

@@ -712,8 +712,12 @@ impl MeshRuntimeConfig {
     /// the Stage-2 UDP capture port (`FERRUM_MESH_CAPTURE_UDP_PORT`): TPROXY
     /// leaves each datagram's original (non-local) destination intact, so a
     /// specific-IP bind would miss them — only a wildcard `IP_TRANSPARENT`
-    /// socket receives the captured non-local dests. A parse error or disabled
-    /// flag yields no listener — the capture path stays inert.
+    /// socket receives the captured non-local dests. A disabled flag yields no
+    /// listener — the capture path stays inert. A *parse error* warn-skips here
+    /// (this helper is infallible because read-only predicates call it too), but
+    /// `serve_mesh_runtime` validates the same env with `?` before binding, so on
+    /// the serving path a malformed setting fails startup rather than reaching
+    /// this branch (codex r2 P2).
     fn udp_capture_listener(&self) -> Option<MeshListener> {
         let settings = match crate::capture::udp_capture_settings_from_env() {
             Ok(s) => s,
@@ -6914,6 +6918,16 @@ async fn serve_mesh_runtime(
         shutdown_tx.subscribe(),
         dns_proxy_handle,
     );
+
+    // Fail closed on malformed UDP capture settings (codex r2 P2). The
+    // `udp_capture_listener()` helper feeding `listener_plan()` is infallible
+    // (it is also called from read-only predicates), so it can only warn-and-skip
+    // a parse error — which would silently drop the capture listener while the
+    // Stage-2 TPROXY rules still divert UDP to that now-unbound port. Validate
+    // the same env here, before binding any listener, so an operator config
+    // error aborts mesh startup instead of black-holing captured UDP.
+    crate::capture::udp_capture_settings_from_env()
+        .map_err(|e| anyhow::anyhow!("Invalid mesh UDP capture settings: {e}"))?;
 
     info!(
         listeners = runtime.listener_plan().len(),

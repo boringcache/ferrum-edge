@@ -1056,6 +1056,27 @@ fn sidecar_env(config: &InjectorConfig, pod: &Value, namespace: &str) -> Vec<Val
         json!({"name": "FERRUM_MESH_CAPTURE_MODE", "value": format!("{:?}", config.capture_mode).to_ascii_lowercase()}),
         json!({"name": "FERRUM_MESH_WORKLOAD_SPIFFE_ID", "value": workload_spiffe_id(config, pod, namespace)}),
     ];
+    // When the injector enables UDP capture, the init container installs the
+    // Stage-2 TPROXY rules from `config.udp_*`, but the sidecar mesh runtime
+    // re-reads these vars in `udp_capture_listener()`/`serve_mesh_runtime` to
+    // bind the Stage-3 listener. They are NOT in `SIDECAR_ENV_KEYS` (which copy
+    // the injector's own runtime env), so set them here from the SAME config
+    // fields the init container uses — otherwise the sidecar defaults to
+    // disabled/default-port and captured UDP is diverted to an unbound port
+    // (codex r2 P2). The mark is propagated too so the listener's
+    // `udp_capture_settings_from_env()` agrees with the init container and the
+    // Stage-4 egress reinjection mark stays consistent.
+    if config.udp_capture_enabled {
+        env.push(json!({"name": "FERRUM_MESH_CAPTURE_UDP_ENABLED", "value": "true"}));
+        env.push(json!({
+            "name": "FERRUM_MESH_CAPTURE_UDP_PORT",
+            "value": config.udp_outbound_port.to_string()
+        }));
+        env.push(json!({
+            "name": "FERRUM_MESH_TPROXY_MARK",
+            "value": config.tproxy_mark.to_string()
+        }));
+    }
     env.extend(
         config
             .sidecar_env

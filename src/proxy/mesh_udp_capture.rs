@@ -172,7 +172,9 @@ pub async fn start_mesh_udp_capture_listener(
 
     let mut shutdown_rx = shutdown;
     let mut global_shutdown_rx = global_shutdown;
-    let mut recv_batch = super::udp_batch::RecvMmsgBatch::new(recvmmsg_batch_size);
+    // `true`: this listener enables `IP_RECVORIGDSTADDR` and keys sessions on
+    // the captured orig-dst, so it opts into per-datagram orig-dst cmsg parsing.
+    let mut recv_batch = super::udp_batch::RecvMmsgBatch::new(recvmmsg_batch_size, true);
 
     loop {
         tokio::select! {

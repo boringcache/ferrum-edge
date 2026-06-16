@@ -1674,13 +1674,27 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   `mangle`/TPROXY/routing rules and binds **no** listener. When on, the capture
   rules (Stage 2) and the consuming UDP listener (Stage 3) come up together
   behind the **same** `FERRUM_MESH_CAPTURE_UDP_ENABLED` flag, so an upgraded
-  injector never redirects UDP into a void.
+  injector never redirects UDP into a void. For **injected** pods the webhook
+  propagates `FERRUM_MESH_CAPTURE_UDP_ENABLED`, `FERRUM_MESH_CAPTURE_UDP_PORT`,
+  and `FERRUM_MESH_TPROXY_MARK` into the sidecar env from the **same** injector
+  config that drives the init container's TPROXY rules (these are not in
+  `SIDECAR_ENV_KEYS`, which only copy the injector's own runtime env), so the
+  sidecar runtime binds the very port the rules divert to instead of defaulting
+  to disabled/default-port and black-holing captured UDP. **Fail-closed on
+  malformed settings:** when the flag is set but a UDP capture var is malformed,
+  mesh startup aborts (`serve_mesh_runtime` validates the env before binding any
+  listener) rather than silently omitting the listener while the Stage-2 rules
+  still divert UDP to a now-unbound port.
 - **Stage 3 — consuming UDP listener (capture → drop, egress deferred to Stage 4).**
   When `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`, the captured topologies
   (**Sidecar** / **Ambient** — the same ones that run the outbound `:15001` TCP
   capture listener) emit a **`PlaintextUdpCapture` mesh listener** bound on the
-  outbound listener's IP and the Stage-2 `FERRUM_MESH_CAPTURE_UDP_PORT`
-  (default `15011`). The listener (`src/proxy/mesh_udp_capture.rs`, Linux-only):
+  **wildcard** address (family following the outbound listener) and the Stage-2
+  `FERRUM_MESH_CAPTURE_UDP_PORT` (default `15011`) — a wildcard bind because
+  TPROXY (`--on-port` only, no `--on-ip`) leaves each datagram's original
+  (non-local) destination intact, so a specific-IP socket would never receive
+  them; only a wildcard `IP_TRANSPARENT` socket claims the captured non-local
+  dests. The listener (`src/proxy/mesh_udp_capture.rs`, Linux-only):
   binds a **transparent** UDP socket (`IP_TRANSPARENT`/`IPV6_TRANSPARENT`, so it
   can claim the TPROXY-diverted datagrams whose destination is the captured
   pod's real `service:port`, not the listener's own bind address), enables
