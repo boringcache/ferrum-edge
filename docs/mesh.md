@@ -1712,9 +1712,13 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   SocketAddr)`**. **For now each captured datagram is DROPPED** with a `debug!`
   log — the egress relay (forwarding the datagram over the topology's mesh
   transport to the destination workload) is **Stage 4**. DoS bounds are reused
-  from the plain UDP proxy: a bounded session map (`FERRUM_UDP_MAX_SESSIONS`),
-  an idle-expiry sweep (`FERRUM_UDP_CLEANUP_INTERVAL_SECONDS`), and the recvmmsg
-  batch cap (`FERRUM_UDP_RECVMMSG_BATCH_SIZE`). The listener carries
+  from the plain UDP proxy: a bounded session map (`FERRUM_UDP_MAX_SESSIONS`,
+  enforced with a lock-free atomic count so a spoofed-source flood never walks
+  every DashMap shard), an idle-expiry sweep (`FERRUM_UDP_CLEANUP_INTERVAL_SECONDS`),
+  and the recvmmsg batch cap (`FERRUM_UDP_RECVMMSG_BATCH_SIZE`). When capture is
+  enabled the capture port is added to `reserved_gateway_ports()`, so a mesh
+  UDP/DTLS stream proxy or ServiceEntry declaring the same listen port is
+  rejected at validation rather than racing the capture listener at startup. The listener carries
   `node_waypoint_policy_scope: None` (UDP has no per-source-pod cookie — see the
   UDP/DTLS limitation above). **Linux-only** (`IP_TRANSPARENT` + recvmsg cmsg);
   on other platforms the listener is a no-op stub. This stage is still inert:

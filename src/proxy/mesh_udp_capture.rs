@@ -71,6 +71,22 @@ pub struct CaptureSessionKey {
     pub orig_dst: SocketAddr,
 }
 
+/// Whether `e` indicates IPv6 is unavailable on this host (so the dual-stack
+/// `[::]` capture bind may safely fall back to the v4 wildcard). True ONLY for
+/// "address family not supported" / "cannot assign requested address" /
+/// "protocol not supported" — NOT for a real conflict like `EADDRINUSE`, which
+/// must surface so IPv6 UDP is never silently left black-holed behind a v4-only
+/// listener while `ip6tables` still diverts it to this port.
+#[cfg(target_os = "linux")]
+fn is_ipv6_unavailable_error(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
+        matches!(
+            io_err.raw_os_error(),
+            Some(libc::EAFNOSUPPORT) | Some(libc::EADDRNOTAVAIL) | Some(libc::EPROTONOSUPPORT)
+        ) || io_err.kind() == std::io::ErrorKind::AddrNotAvailable
+    })
+}
+
 /// Start the mesh UDP capture listener (Linux).
 ///
 /// Binds a transparent UDP socket on `cfg.addr`, enables per-datagram orig-dst
@@ -158,16 +174,20 @@ pub async fn start_mesh_udp_capture_listener(
         };
 
     // Prefer the dual-stack `[::]` bind so one transparent socket captures both
-    // v4-mapped and v6 datagrams; fall back to the v4 wildcard on IPv6-less
-    // hosts (v6 UDP capture is then unavailable there, logged loudly).
+    // v4-mapped and v6 datagrams; fall back to the v4 wildcard ONLY when IPv6 is
+    // genuinely unavailable on this host (codex r4). Falling back on ANY error
+    // (e.g. the port is already owned by a v6-only socket, EADDRINUSE) would
+    // report the listener "started" on v4 while ip6tables still diverts IPv6 UDP
+    // to this port with no working v6 listener — blackholing v6 while the pod
+    // looks ready. So a non-IPv6-availability error is returned, not masked.
     let (std_socket, addr, v4_origdst, v6_origdst) = match build_bound_socket(addr) {
         Ok((s, v4, v6)) => (s, addr, v4, v6),
-        Err(e) if addr.ip().is_ipv6() => {
+        Err(e) if addr.ip().is_ipv6() && is_ipv6_unavailable_error(&e) => {
             let v4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), addr.port());
             warn!(
                 requested = %addr,
                 fallback = %v4_addr,
-                "Mesh UDP capture: dual-stack [::] bind failed ({e}); falling back to v4 wildcard (IPv6 UDP capture unavailable on this host)"
+                "Mesh UDP capture: IPv6 unavailable for dual-stack [::] bind ({e}); falling back to v4 wildcard (IPv6 UDP capture unavailable on this host)"
             );
             let (s, v4, v6) = build_bound_socket(v4_addr)?;
             (s, v4_addr, v4, v6)
