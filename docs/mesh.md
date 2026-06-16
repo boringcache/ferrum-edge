@@ -1689,12 +1689,17 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   When `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`, the captured topologies
   (**Sidecar** / **Ambient** — the same ones that run the outbound `:15001` TCP
   capture listener) emit a **`PlaintextUdpCapture` mesh listener** bound on the
-  **wildcard** address (family following the outbound listener) and the Stage-2
-  `FERRUM_MESH_CAPTURE_UDP_PORT` (default `15011`) — a wildcard bind because
-  TPROXY (`--on-port` only, no `--on-ip`) leaves each datagram's original
-  (non-local) destination intact, so a specific-IP socket would never receive
-  them; only a wildcard `IP_TRANSPARENT` socket claims the captured non-local
-  dests. The listener (`src/proxy/mesh_udp_capture.rs`, Linux-only):
+  **dual-stack IPv6 wildcard** (`[::]`, independent of the TCP outbound listener
+  family) and the Stage-2 `FERRUM_MESH_CAPTURE_UDP_PORT` (default `15011`) — a
+  wildcard bind because TPROXY (`--on-port` only, no `--on-ip`) leaves each
+  datagram's original (non-local) destination intact, so a specific-IP socket
+  would never receive them; only a wildcard `IP_TRANSPARENT` socket claims the
+  captured non-local dests. A single dual-stack `[::]` socket (V6ONLY disabled,
+  both v4+v6 transparency + orig-dst opts set) captures **both** v4-mapped and v6
+  datagrams; a v4-only bind would black-hole the v6 half when IPv6 capture rules
+  (`ip6tables` TPROXY) are present. On a host without IPv6 the `[::]` bind fails
+  and the listener falls back to the v4 wildcard (v6 capture then unavailable,
+  logged). The listener (`src/proxy/mesh_udp_capture.rs`, Linux-only):
   binds a **transparent** UDP socket (`IP_TRANSPARENT`/`IPV6_TRANSPARENT`, so it
   can claim the TPROXY-diverted datagrams whose destination is the captured
   pod's real `service:port`, not the listener's own bind address), enables

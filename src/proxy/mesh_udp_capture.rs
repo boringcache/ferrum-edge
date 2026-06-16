@@ -81,9 +81,10 @@ pub struct CaptureSessionKey {
 pub async fn start_mesh_udp_capture_listener(
     cfg: MeshUdpCaptureConfig,
 ) -> Result<(), anyhow::Error> {
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::os::fd::AsRawFd;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
     use tokio::net::UdpSocket;
     use tracing::{info, warn};
 
@@ -98,51 +99,81 @@ pub async fn start_mesh_udp_capture_listener(
         started_tx,
     } = cfg;
 
-    // Bind a std socket so we can set IP_TRANSPARENT / IP_RECVORIGDSTADDR BEFORE
-    // the socket starts receiving, then hand it to tokio. socket2 gives us
-    // SO_REUSEADDR + the raw fd without binding twice.
-    let domain = match addr.ip() {
-        IpAddr::V4(_) => socket2::Domain::IPV4,
-        IpAddr::V6(_) => socket2::Domain::IPV6,
-    };
-    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-    // TPROXY delivery requires SO_REUSEADDR so the transparent socket can claim
-    // the marked datagrams alongside the kernel's normal routing.
-    socket.set_reuse_address(true)?;
-    socket.set_nonblocking(true)?;
+    // Build a bound transparent capture socket on `bind_addr`. Factored into a
+    // closure so the preferred dual-stack `[::]` bind can fall back to the v4
+    // wildcard on hosts without IPv6 (codex r3 P2). Sets IP_TRANSPARENT /
+    // IP_RECVORIGDSTADDR BEFORE binding (socket2 gives SO_REUSEADDR + the raw fd
+    // without binding twice); returns the bound std socket + which orig-dst
+    // families were enabled.
+    let build_bound_socket =
+        |bind_addr: SocketAddr| -> Result<(std::net::UdpSocket, bool, bool), anyhow::Error> {
+            let domain = match bind_addr.ip() {
+                IpAddr::V4(_) => socket2::Domain::IPV4,
+                IpAddr::V6(_) => socket2::Domain::IPV6,
+            };
+            let socket =
+                socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+            // TPROXY delivery requires SO_REUSEADDR so the transparent socket can
+            // claim the marked datagrams alongside the kernel's normal routing.
+            socket.set_reuse_address(true)?;
+            socket.set_nonblocking(true)?;
 
-    let fd = socket.as_raw_fd();
-    // IP_TRANSPARENT: accept datagrams whose dst is not local to this host (the
-    // captured pod's real service:port, un-rewritten by TPROXY). Fatal if it
-    // fails — without transparency the socket can't receive the captured
-    // traffic at all, so a half-bound listener would silently black-hole.
-    match addr.ip() {
-        IpAddr::V4(_) => crate::socket_opts::set_ip_transparent(fd)?,
-        IpAddr::V6(_) => {
-            // A dual-stack `::` bind may carry v4-mapped traffic, so set both
-            // when binding v6; v4-only binds set only IP_TRANSPARENT above.
-            crate::socket_opts::set_ipv6_transparent(fd)?;
-            // Best-effort v4 transparency for v4-mapped datagrams on `::`.
-            let _ = crate::socket_opts::set_ip_transparent(fd);
+            let fd = socket.as_raw_fd();
+            // IP_TRANSPARENT: accept datagrams whose dst is not local to this host
+            // (the captured pod's real service:port, un-rewritten by TPROXY).
+            // Fatal if it fails — without transparency the socket can't receive
+            // the captured traffic at all, so a half-bound listener would
+            // silently black-hole.
+            match bind_addr.ip() {
+                IpAddr::V4(_) => crate::socket_opts::set_ip_transparent(fd)?,
+                IpAddr::V6(_) => {
+                    // Dual-stack `[::]`: disable V6ONLY so this one socket also
+                    // receives v4-mapped datagrams, and set BOTH transparencies
+                    // so v4-mapped and native-v6 captured traffic are both
+                    // claimed (codex r3 P2).
+                    socket.set_only_v6(false)?;
+                    crate::socket_opts::set_ipv6_transparent(fd)?;
+                    // Best-effort v4 transparency for v4-mapped datagrams on `::`.
+                    let _ = crate::socket_opts::set_ip_transparent(fd);
+                }
+            }
+            // IP(v6)_RECVORIGDSTADDR: surface each datagram's original destination
+            // as a cmsg (TPROXY does not rewrite it). Request both variants so a
+            // dual-stack listener recovers orig-dst regardless of family.
+            let v4_origdst = crate::socket_opts::set_ip_recvorigdstaddr(fd).is_ok();
+            let v6_origdst = crate::socket_opts::set_ipv6_recvorigdstaddr(fd).is_ok();
+            if !v4_origdst && !v6_origdst {
+                // Without orig-dst recovery a captured datagram cannot be routed
+                // to its real destination, so refuse rather than bind a listener
+                // that can only drop-without-knowing-where. (Stage 3 drops anyway,
+                // but Stage 4 relies on this; failing here surfaces a bad kernel
+                // early.)
+                return Err(anyhow::anyhow!(
+                    "mesh UDP capture: IP_RECVORIGDSTADDR setsockopt failed on both v4 and v6 (kernel lacks orig-dst recovery)"
+                ));
+            }
+
+            socket.bind(&bind_addr.into())?;
+            Ok((socket.into(), v4_origdst, v6_origdst))
+        };
+
+    // Prefer the dual-stack `[::]` bind so one transparent socket captures both
+    // v4-mapped and v6 datagrams; fall back to the v4 wildcard on IPv6-less
+    // hosts (v6 UDP capture is then unavailable there, logged loudly).
+    let (std_socket, addr, v4_origdst, v6_origdst) = match build_bound_socket(addr) {
+        Ok((s, v4, v6)) => (s, addr, v4, v6),
+        Err(e) if addr.ip().is_ipv6() => {
+            let v4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), addr.port());
+            warn!(
+                requested = %addr,
+                fallback = %v4_addr,
+                "Mesh UDP capture: dual-stack [::] bind failed ({e}); falling back to v4 wildcard (IPv6 UDP capture unavailable on this host)"
+            );
+            let (s, v4, v6) = build_bound_socket(v4_addr)?;
+            (s, v4_addr, v4, v6)
         }
-    }
-    // IP(v6)_RECVORIGDSTADDR: surface each datagram's original destination as a
-    // cmsg (TPROXY does not rewrite it). Request both variants so a dual-stack
-    // listener recovers orig-dst regardless of the datagram's family.
-    let v4_origdst = crate::socket_opts::set_ip_recvorigdstaddr(fd).is_ok();
-    let v6_origdst = crate::socket_opts::set_ipv6_recvorigdstaddr(fd).is_ok();
-    if !v4_origdst && !v6_origdst {
-        // Without orig-dst recovery a captured datagram cannot be routed to its
-        // real destination, so refuse rather than bind a listener that can only
-        // drop-without-knowing-where. (Stage 3 drops anyway, but Stage 4 relies
-        // on this; failing here surfaces a misconfigured kernel early.)
-        return Err(anyhow::anyhow!(
-            "mesh UDP capture: IP_RECVORIGDSTADDR setsockopt failed on both v4 and v6 (kernel lacks orig-dst recovery)"
-        ));
-    }
-
-    socket.bind(&addr.into())?;
-    let std_socket: std::net::UdpSocket = socket.into();
+        Err(e) => return Err(e),
+    };
     let frontend_socket = Arc::new(UdpSocket::from_std(std_socket)?);
 
     let session_shard_amount = crate::util::sharding::pool_shard_amount(session_shard_amount);
@@ -153,6 +184,13 @@ pub async fn start_mesh_udp_capture_listener(
             ahash::RandomState::default(),
             session_shard_amount,
         ));
+    // Cheap atomic session count for the per-datagram cap check. The spoofed-
+    // source flood path hits a map miss for every new (client, orig-dst), so the
+    // cap MUST NOT call `DashMap::len()` there (it walks/locks every shard —
+    // exactly what the cap defends against). Mirror the plain UDP proxy's
+    // `active_sessions` atomic: bumped on insert, decremented as the idle sweep
+    // reaps (codex r3 P2).
+    let active_sessions = Arc::new(AtomicU64::new(0));
 
     if let Some(tx) = started_tx {
         let _ = tx.send(());
@@ -168,7 +206,12 @@ pub async fn start_mesh_udp_capture_listener(
     // than the idle timeout, so a spoofed-source flood ages out instead of
     // accumulating. Mirrors `udp_proxy::spawn_session_cleanup`'s identity-aware
     // expiry, simplified (no backend leg / plugins in Stage 3).
-    spawn_capture_session_cleanup(sessions.clone(), shutdown.clone(), cleanup_interval_seconds);
+    spawn_capture_session_cleanup(
+        sessions.clone(),
+        active_sessions.clone(),
+        shutdown.clone(),
+        cleanup_interval_seconds,
+    );
 
     let mut shutdown_rx = shutdown;
     let mut global_shutdown_rx = global_shutdown;
@@ -219,6 +262,7 @@ pub async fn start_mesh_udp_capture_listener(
                                 let orig_dst = recv_batch.orig_dst(i);
                                 handle_captured_datagram(
                                     &sessions,
+                                    &active_sessions,
                                     client,
                                     orig_dst,
                                     data_len,
@@ -262,11 +306,14 @@ struct CaptureSession {
 #[cfg(target_os = "linux")]
 fn handle_captured_datagram(
     sessions: &dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
+    active_sessions: &std::sync::atomic::AtomicU64,
     client: SocketAddr,
     orig_dst: Option<SocketAddr>,
     data_len: usize,
     max_sessions: usize,
 ) -> bool {
+    use dashmap::mapref::entry::Entry;
+    use std::sync::atomic::Ordering;
     use tracing::debug;
 
     let Some(orig_dst) = orig_dst else {
@@ -282,34 +329,33 @@ fn handle_captured_datagram(
 
     let key = CaptureSessionKey { client, orig_dst };
     let now = crate::socket_opts::monotonic_now_ms();
-    // NEVER call another `sessions.*` op (e.g. `len()`) while holding an entry
-    // guard: `DashMap::len()` reads every shard, including the one the entry
-    // guard has locked, which self-deadlocks (codex r1 P1). Refresh an existing
-    // flow with a short-lived `get_mut` guard that is dropped before the cap
-    // check, then read the count and `entry().or_insert` the new flow with NO
-    // nested `sessions` access inside the guard's scope.
-    if let Some(mut existing) = sessions.get_mut(&key) {
-        // Existing flow already holds a slot — always refresh, even at the cap.
-        existing.last_activity = now;
-        // (guard `existing` drops at end of this block)
-    } else {
-        // New flow: read the count with no guard held, then admit-or-shed.
-        if sessions.len() >= max_sessions {
-            // Cap reached — shed this new flow without reserving a slot.
-            debug!(
-                client = %client,
-                orig_dst = %orig_dst,
-                "Mesh UDP capture: session cap reached, dropping datagram from new flow"
-            );
-            return false;
+    // A single `entry()` guard refreshes-or-admits without re-entering the map.
+    // An Occupied flow already holds a slot, so it is always refreshed (even at
+    // the cap). A Vacant flow reserves a slot via the cheap `active_sessions`
+    // atomic — NOT `DashMap::len()`, which walks/locks every shard on the exact
+    // per-datagram flood path the cap defends against (codex r3 P2) — and is
+    // inserted only when under the cap. Only the atomic (never another
+    // `sessions.*` op) is touched while the entry guard is held, so this cannot
+    // self-deadlock the way a nested `len()` did (codex r1 P1).
+    match sessions.entry(key) {
+        Entry::Occupied(mut occupied) => {
+            occupied.get_mut().last_activity = now;
         }
-        // `entry().or_insert_with` runs the closure WITHOUT touching `sessions`
-        // (the closure is pure), so no map op nests under the entry guard. A
-        // racing datagram for the same key that inserted between the `get_mut`
-        // miss and here is harmless — `or_insert_with` keeps the existing entry.
-        sessions
-            .entry(key)
-            .or_insert_with(|| CaptureSession { last_activity: now });
+        Entry::Vacant(vacant) => {
+            // Reserve a slot atomically; hand it back and shed if over the cap
+            // (mirrors `udp_proxy`'s `active_sessions` admit-or-shed).
+            let prev = active_sessions.fetch_add(1, Ordering::Relaxed);
+            if prev >= max_sessions as u64 {
+                active_sessions.fetch_sub(1, Ordering::Relaxed);
+                debug!(
+                    client = %client,
+                    orig_dst = %orig_dst,
+                    "Mesh UDP capture: session cap reached, dropping datagram from new flow"
+                );
+                return false;
+            }
+            vacant.insert(CaptureSession { last_activity: now });
+        }
     }
     let admitted = true;
 
@@ -332,9 +378,11 @@ fn spawn_capture_session_cleanup(
     sessions: std::sync::Arc<
         dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
     >,
+    active_sessions: std::sync::Arc<std::sync::atomic::AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
     cleanup_interval_seconds: u64,
 ) {
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
     tokio::spawn(async move {
         let mut interval =
@@ -343,10 +391,22 @@ fn spawn_capture_session_cleanup(
             tokio::select! {
                 _ = interval.tick() => {
                     let now = crate::socket_opts::monotonic_now_ms();
+                    // Count reaped sessions so the `active_sessions` cap counter
+                    // stays in lockstep with the map. `retain`'s closure is
+                    // `FnMut` (called sequentially across shards), so a plain
+                    // accumulator is safe; one `fetch_sub` after keeps it lock-free.
+                    let mut reaped: u64 = 0;
                     sessions.retain(|_, session| {
-                        now.saturating_sub(session.last_activity)
-                            <= CAPTURE_SESSION_IDLE_TIMEOUT_MS
+                        let keep = now.saturating_sub(session.last_activity)
+                            <= CAPTURE_SESSION_IDLE_TIMEOUT_MS;
+                        if !keep {
+                            reaped += 1;
+                        }
+                        keep
                     });
+                    if reaped > 0 {
+                        active_sessions.fetch_sub(reaped, Ordering::Relaxed);
+                    }
                 }
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
@@ -404,15 +464,20 @@ mod tests {
     #[test]
     fn datagram_without_origdst_is_dropped_unaccounted() {
         let sessions = new_sessions(0);
+        let active = std::sync::atomic::AtomicU64::new(0);
         let client: SocketAddr = "10.0.0.5:40000".parse().unwrap();
         // No orig-dst ⇒ dropped, not accounted, no session created.
-        assert!(!handle_captured_datagram(&sessions, client, None, 32, 1000));
+        assert!(!handle_captured_datagram(
+            &sessions, &active, client, None, 32, 1000
+        ));
         assert_eq!(sessions.len(), 0);
+        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[test]
     fn session_keyed_by_client_and_origdst() {
         let sessions = new_sessions(0);
+        let active = std::sync::atomic::AtomicU64::new(0);
         let client: SocketAddr = "10.0.0.5:40000".parse().unwrap();
         let dst_a: SocketAddr = "10.96.0.10:53".parse().unwrap();
         let dst_b: SocketAddr = "10.96.0.11:53".parse().unwrap();
@@ -420,6 +485,7 @@ mod tests {
         // Same client, two distinct destinations ⇒ two sessions.
         assert!(handle_captured_datagram(
             &sessions,
+            &active,
             client,
             Some(dst_a),
             16,
@@ -427,6 +493,7 @@ mod tests {
         ));
         assert!(handle_captured_datagram(
             &sessions,
+            &active,
             client,
             Some(dst_b),
             16,
@@ -438,6 +505,7 @@ mod tests {
         // existing session — does NOT create a third.
         assert!(handle_captured_datagram(
             &sessions,
+            &active,
             client,
             Some(dst_a),
             16,
@@ -449,6 +517,7 @@ mod tests {
         let client2: SocketAddr = "10.0.0.6:50000".parse().unwrap();
         assert!(handle_captured_datagram(
             &sessions,
+            &active,
             client2,
             Some(dst_a),
             16,
@@ -465,12 +534,14 @@ mod tests {
         // self-deadlocks and the test hangs. A plain return here is the proof
         // it no longer nests map ops under a guard.
         let sessions = new_sessions(0);
+        let active = std::sync::atomic::AtomicU64::new(0);
         let client: SocketAddr = "10.0.0.5:40000".parse().unwrap();
         let dst: SocketAddr = "10.96.0.10:53".parse().unwrap();
         // Cap well above 1 so the new flow is admitted via the count-then-insert
         // path (the exact path that previously held a guard across `len()`).
         assert!(handle_captured_datagram(
             &sessions,
+            &active,
             client,
             Some(dst),
             64,
@@ -482,6 +553,7 @@ mod tests {
     #[test]
     fn session_cap_sheds_new_flows_but_serves_existing() {
         let sessions = new_sessions(0);
+        let active = std::sync::atomic::AtomicU64::new(0);
         let dst: SocketAddr = "10.96.0.10:53".parse().unwrap();
         let client_a: SocketAddr = "10.0.0.5:40000".parse().unwrap();
         let client_b: SocketAddr = "10.0.0.6:40000".parse().unwrap();
@@ -489,6 +561,7 @@ mod tests {
         // Cap of 1: first new flow admitted.
         assert!(handle_captured_datagram(
             &sessions,
+            &active,
             client_a,
             Some(dst),
             8,
@@ -499,6 +572,7 @@ mod tests {
         // Second NEW flow is shed at the cap.
         assert!(!handle_captured_datagram(
             &sessions,
+            &active,
             client_b,
             Some(dst),
             8,
@@ -509,6 +583,7 @@ mod tests {
         // The already-admitted flow is still served (refresh), even at the cap.
         assert!(handle_captured_datagram(
             &sessions,
+            &active,
             client_a,
             Some(dst),
             8,

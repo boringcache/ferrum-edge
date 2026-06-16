@@ -2608,7 +2608,8 @@ mod pktinfo_tests {
             client.send_to(b"hello", server_addr).await.unwrap();
 
             // Use recvmsg via recvmmsg wrapper (already exercises the cmsg path).
-            let mut batch = crate::proxy::udp_batch::RecvMmsgBatch::new(1);
+            // `false`: this test exercises pktinfo, not orig-dst recovery.
+            let mut batch = crate::proxy::udp_batch::RecvMmsgBatch::new(1, false);
             // Poll until the datagram arrives.
             server.readable().await.unwrap();
             let n = batch.recv(server.as_raw_fd(), 1).unwrap();
@@ -2782,7 +2783,8 @@ mod pktinfo_tests {
             let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             client.send_to(b"capture", server_addr).await.unwrap();
 
-            let mut batch = crate::proxy::udp_batch::RecvMmsgBatch::new(1);
+            // `true`: this test asserts orig-dst recovery, so opt the batch in.
+            let mut batch = crate::proxy::udp_batch::RecvMmsgBatch::new(1, true);
             server.readable().await.unwrap();
             let n = batch.recv(server.as_raw_fd(), 1).unwrap();
             assert_eq!(n, 1);

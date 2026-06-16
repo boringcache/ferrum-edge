@@ -708,11 +708,15 @@ impl MeshRuntimeConfig {
     /// notes). Returns at most one listener, gated on
     /// `FERRUM_MESH_CAPTURE_UDP_ENABLED` (default-off via
     /// [`crate::capture::udp_capture_settings_from_env`]), bound on the
-    /// WILDCARD address (family following `FERRUM_MESH_OUTBOUND_LISTEN_ADDR`) on
-    /// the Stage-2 UDP capture port (`FERRUM_MESH_CAPTURE_UDP_PORT`): TPROXY
-    /// leaves each datagram's original (non-local) destination intact, so a
-    /// specific-IP bind would miss them — only a wildcard `IP_TRANSPARENT`
-    /// socket receives the captured non-local dests. A disabled flag yields no
+    /// **dual-stack IPv6 wildcard** (`[::]`, independent of
+    /// `FERRUM_MESH_OUTBOUND_LISTEN_ADDR`'s family) on the Stage-2 UDP capture
+    /// port (`FERRUM_MESH_CAPTURE_UDP_PORT`): TPROXY leaves each datagram's
+    /// original (non-local) destination intact, so a specific-IP bind would miss
+    /// them — only a wildcard `IP_TRANSPARENT` socket receives the captured
+    /// non-local dests. A dual-stack `[::]` socket captures **both** v4-mapped
+    /// and v6 datagrams from one listener (codex r3 P2 — a v4-only bind
+    /// black-holes the v6 half when IPv6 capture rules are present); the bind
+    /// falls back to the v4 wildcard on hosts without IPv6. A disabled flag yields no
     /// listener — the capture path stays inert. A *parse error* warn-skips here
     /// (this helper is infallible because read-only predicates call it too), but
     /// `serve_mesh_runtime` validates the same env with `?` before binding, so on
@@ -729,20 +733,21 @@ impl MeshRuntimeConfig {
         if !settings.udp_capture_enabled {
             return None;
         }
-        // Bind the capture port on the WILDCARD address, not the configured
-        // outbound IP (codex r1 P2). TPROXY (`--on-port` only, no `--on-ip`)
-        // diverts the datagram to this socket WITHOUT rewriting its
-        // destination, so each captured datagram still carries the pod's real
-        // service/cluster-IP destination, never the listener's IP. A specific-IP
-        // bind (e.g. the default `127.0.0.1`) would not match those non-local
-        // destinations and the transparent socket would receive nothing; the
-        // `IP_TRANSPARENT` socket is what lets a wildcard bind accept the
-        // non-local dests. The family follows the configured outbound IP.
-        let wildcard_ip = match self.outbound_listen_addr.ip() {
-            std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-        };
-        let addr = std::net::SocketAddr::new(wildcard_ip, settings.udp_outbound_port);
+        // Bind the capture port on the DUAL-STACK IPv6 WILDCARD (`[::]`), not the
+        // configured outbound IP (codex r1 P2) and not a family-following v4/v6
+        // choice (codex r3 P2). TPROXY (`--on-port` only, no `--on-ip`) diverts
+        // the datagram to this socket WITHOUT rewriting its destination, so each
+        // captured datagram still carries the pod's real service/cluster-IP
+        // destination, never the listener's IP; only a wildcard `IP_TRANSPARENT`
+        // socket receives those non-local dests. A single dual-stack `[::]`
+        // socket (V6ONLY disabled at bind time) claims BOTH v4-mapped and v6
+        // captured datagrams — a v4-only `0.0.0.0` bind would black-hole the v6
+        // half whenever IPv6 capture rules (`ip6tables` TPROXY) are present. The
+        // listener bind falls back to the v4 wildcard on IPv6-less hosts.
+        let addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            settings.udp_outbound_port,
+        );
         Some(MeshListener {
             direction: MeshTrafficDirection::Outbound,
             kind: MeshListenerKind::PlaintextUdpCapture,
@@ -6320,6 +6325,18 @@ async fn serve_mesh_runtime(
     initial_applied_mesh_slice: Option<Arc<MeshSlice>>,
     mut mesh_background_handles: Vec<JoinHandle<()>>,
 ) -> Result<(), anyhow::Error> {
+    // Fail closed on malformed UDP capture settings (codex r2 P2 / r3 P2),
+    // BEFORE binding the DNS proxy or spawning any mesh background task. The
+    // `udp_capture_listener()` helper feeding `listener_plan()` is infallible
+    // (read-only predicates call it too), so it can only warn-and-skip a parse
+    // error — which would silently drop the capture listener while the Stage-2
+    // TPROXY rules still divert UDP to a now-unbound port. Validating here, at
+    // the very top of the serving path, makes an operator config error abort
+    // mesh startup cleanly instead of leaking a bound DNS socket / spawned tasks
+    // (which a later `?` would have left running for in-process retries/tests).
+    crate::capture::udp_capture_settings_from_env()
+        .map_err(|e| anyhow::anyhow!("Invalid mesh UDP capture settings: {e}"))?;
+
     let dns_cache = DnsCache::new(DnsConfig {
         global_overrides: env_config.dns_overrides.clone(),
         resolver_addresses: env_config.dns_resolver_address.clone(),
@@ -6918,16 +6935,6 @@ async fn serve_mesh_runtime(
         shutdown_tx.subscribe(),
         dns_proxy_handle,
     );
-
-    // Fail closed on malformed UDP capture settings (codex r2 P2). The
-    // `udp_capture_listener()` helper feeding `listener_plan()` is infallible
-    // (it is also called from read-only predicates), so it can only warn-and-skip
-    // a parse error — which would silently drop the capture listener while the
-    // Stage-2 TPROXY rules still divert UDP to that now-unbound port. Validate
-    // the same env here, before binding any listener, so an operator config
-    // error aborts mesh startup instead of black-holing captured UDP.
-    crate::capture::udp_capture_settings_from_env()
-        .map_err(|e| anyhow::anyhow!("Invalid mesh UDP capture settings: {e}"))?;
 
     info!(
         listeners = runtime.listener_plan().len(),
