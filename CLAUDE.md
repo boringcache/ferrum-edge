@@ -4,7 +4,7 @@ Keep this root memory compact and always relevant. Subsystem details live in pat
 
 ## Project Overview
 
-Ferrum Edge is a high-performance Rust edge proxy for HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC, raw TCP, and UDP. It ships as one `ferrum-edge` binary with CLI subcommands, env/config-file configuration, load balancing, health checks, and 58+ plugins. Rust edition 2024, tokio, hyper 1.x. License: PolyForm Noncommercial 1.0.0 with dual commercial licensing.
+Ferrum Edge is a high-performance Rust edge proxy for HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC, raw TCP, and UDP. It ships as one `ferrum-edge` binary with CLI subcommands, env/config-file configuration, load balancing, health checks, and 75+ plugins. Rust edition 2024, tokio, hyper 1.x. License: PolyForm Noncommercial 1.0.0 with dual commercial licensing.
 
 ## Build-Out Policy
 

@@ -23,7 +23,7 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_CONF_PATH` | No | `./ferrum.conf` | Path to optional conf file (provides defaults; env vars override) |
-| `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp`, `mesh`, `injector`, `migrate` |
+| `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp`, `mesh`, `injector`, `node_agent`, `migrate` |
 | `FERRUM_NAMESPACE` | No | `ferrum` | Namespace this gateway loads and manages |
 | `FERRUM_LOG_LEVEL` | No | `warn` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace`. Controls the runtime tracing logs only; per-transaction access logs from the `stdout_logging` plugin are emitted independent of this level |
 | `FERRUM_LOG_BUFFER_CAPACITY` | No | `128000` | Max buffered log lines in the non-blocking writer channel. When full, new events are dropped to avoid backpressure on request threads |

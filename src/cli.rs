@@ -47,7 +47,7 @@ pub struct RunArgs {
     #[arg(short = 'c', long = "spec")]
     pub spec: Option<PathBuf>,
 
-    /// Operating mode (database, file, cp, dp, mesh, injector, migrate).
+    /// Operating mode (database, file, cp, dp, mesh, injector, node_agent, migrate).
     #[arg(short = 'm', long = "mode")]
     pub mode: Option<String>,
 

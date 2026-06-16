@@ -21,6 +21,8 @@ A comprehensive feature list for Ferrum Edge.
 - **Data Plane (DP)** — horizontally scalable traffic processing nodes with multi-CP failover (`FERRUM_DP_CP_GRPC_URLS`)
 - **Mesh** — service-mesh data plane with six topologies (sidecar, ambient, node waypoint, service waypoint, east-west gateway, egress gateway). Consumes native `MeshSubscribe` slices, standard xDS ADS, or a localized mesh config file (`FERRUM_MESH_CONFIG_PROTOCOL=file`, SIGHUP reload, no control plane), waits for an initial valid slice, and hot-applies later valid mesh updates atomically. SPIFFE-identity-aware authorization, HBONE termination (HTTP/2 CONNECT over mTLS), REGISTRY_ONLY outbound policy, transparent DNS proxy for ServiceEntry resolution, Istio/GAMMA RED metrics, RequestAuthentication JWT validation, Telemetry API per-scope configuration, multi-cluster east-west routing, and trust domain federation. See [docs/mesh.md](docs/mesh.md)
 - **Injector** — Kubernetes admission webhook that injects Ferrum mesh sidecars and init capture containers into opted-in workloads. Derives SPIFFE IDs from pod service accounts, supports iptables/eBPF capture modes, and injects JWT secrets via Kubernetes SecretKeyRef
+- **Node Agent** — per-node eBPF capture manager for ambient mesh. Programs socket-cookie / original-destination eBPF maps and per-pod identity enrollment; runs no proxy listeners. See [docs/node_agent.md](docs/node_agent.md)
+- **Migrate** — runs the `FERRUM_MIGRATE_ACTION` then exits: `up` applies database schema migrations, `status` reports pending DB migrations, and `config` rewrites a YAML/JSON config file to the current schema (a file rewrite, not a DB operation)
 
 ## Routing
 

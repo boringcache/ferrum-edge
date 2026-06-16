@@ -1,0 +1,33 @@
+//! Functional integration tests for Ferrum's external-middleware integrations
+//! that can only be validated against the REAL third-party software — a
+//! service registry and a directory server — imitated locally with free OSS
+//! containers (`testcontainers`/Docker). No managed or cloud service is ever
+//! used.
+//!
+//! These exercise the REAL integration code paths against locally-run servers:
+//!
+//!   - **consul** — HashiCorp Consul dev agent. Drives
+//!     [`ferrum_edge::service_discovery::consul::ConsulDiscoverer::discover`]
+//!     against live Consul health-API output (Service-vs-Node address
+//!     fallback, weights, tags, the `passing=true` filter, blocking-query
+//!     index tracking). Only `build_url` was previously covered.
+//!   - **ldap** — OpenLDAP seeded via a controlled LDIF. Drives the real
+//!     `ldap_auth` plugin through `create_plugin` → `authenticate`, covering
+//!     direct bind, search-then-bind, and group-membership — the `ldap3`
+//!     bind/search paths that the existing functional test (unreachable
+//!     server) never reaches.
+//!
+//! Container-backed tests self-skip (with a printed notice) when Docker is
+//! unavailable, so the suite is safe to run locally without Docker. In CI the
+//! `test-service-integration` matrix runs on Docker-enabled runners where a
+//! container that fails to start is a HARD failure (see
+//! `common::containers::fail_in_ci_else_skip`).
+//!
+//! Run per backend (see also the CI matrix):
+//!   cargo test --test service_integration consul
+//!   cargo test --test service_integration ldap
+
+mod common;
+
+mod consul;
+mod ldap;

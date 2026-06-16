@@ -852,16 +852,22 @@ pub fn escape_dn_value(input: &str) -> String {
 /// Escape a string for use in an LDAP search filter value (RFC 4515 §3).
 ///
 /// The five characters `*`, `(`, `)`, `\`, and NUL are hex-escaped as `\xx`.
+/// All other characters — including multi-byte UTF-8 — are passed through
+/// unchanged. Iterate over `char`s (not bytes): a byte loop with `byte as char`
+/// would re-encode each UTF-8 continuation byte as its own code point,
+/// corrupting non-ASCII values so the directory search never matches the entry.
+/// The five escaped characters are all single-byte ASCII, so injection
+/// protection is unaffected.
 pub fn escape_filter_value(input: &str) -> String {
     let mut out = String::with_capacity(input.len() + 8);
-    for byte in input.bytes() {
-        match byte {
-            b'*' => out.push_str("\\2a"),
-            b'(' => out.push_str("\\28"),
-            b')' => out.push_str("\\29"),
-            b'\\' => out.push_str("\\5c"),
-            0x00 => out.push_str("\\00"),
-            _ => out.push(byte as char),
+    for ch in input.chars() {
+        match ch {
+            '*' => out.push_str("\\2a"),
+            '(' => out.push_str("\\28"),
+            ')' => out.push_str("\\29"),
+            '\\' => out.push_str("\\5c"),
+            '\0' => out.push_str("\\00"),
+            _ => out.push(ch),
         }
     }
     out
