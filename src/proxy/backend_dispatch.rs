@@ -657,13 +657,25 @@ pub(crate) fn deferred_circuit_breaker_is_stale(
     final_cb_target_key: Option<&str>,
     admission_open_epoch: u64,
 ) -> bool {
-    proxy.circuit_breaker.as_ref().is_some_and(|cfg| {
-        state
-            .circuit_breaker_cache
-            .get_or_create(&proxy.id, final_cb_target_key, cfg)
-            .open_epoch()
-            != admission_open_epoch
-    })
+    let Some(cfg) = proxy.circuit_breaker.as_ref() else {
+        return false;
+    };
+    // Inspect the CURRENT cached breaker read-only (#1649 R8): `get_or_create`
+    // with this request's captured `proxy`/`cfg` would, after a config reload that
+    // replaced the breaker, treat the old config as a change and write a stale
+    // (old-config) breaker back into the live cache. `peek` never mutates.
+    match state
+        .circuit_breaker_cache
+        .peek(&proxy.id, final_cb_target_key)
+    {
+        // Same config still cached: stale iff a new open generation has begun since
+        // admission.
+        Some(cb) if cb.config() == cfg => cb.open_epoch() != admission_open_epoch,
+        // Breaker evicted, or replaced by a reloaded config: the cycle this stream
+        // was admitted under is gone, so the deferred outcome is stale — drop it
+        // rather than record against (or resurrect) a bygone breaker.
+        _ => true,
+    }
 }
 
 /// A post-wire backend failure: the request reached the backend's application

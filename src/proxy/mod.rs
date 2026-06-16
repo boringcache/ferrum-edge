@@ -12975,6 +12975,11 @@ async fn handle_proxy_request_inner(
                 // recorder owns the slot release); the recorder is then marked so it
                 // does not double-record.
                 let grpc_body_ended = http_body::Body::is_end_stream(&grpc_streaming.body);
+                // Set when an already-ended CLEAN response is handed to the recorder
+                // (#1649 R8 finding 1): the body-terminal observer must then be
+                // suppressed so the ended body's `Drop` can't deliver a second
+                // (ClientDisconnect) terminal that neutralizes the deferred success.
+                let mut grpc_recorder_owns_ended_response = false;
                 let grpc_cb_recorded_eagerly = if grpc_skip_final_cb_record {
                     // A rotated retry already recorded (and released) the prior
                     // target's breaker — never record again here.
@@ -12992,6 +12997,30 @@ async fn handle_proxy_request_inner(
                         grpc_backend_dispatch_status,
                     ),
                 ) {
+                    false
+                } else if grpc_body_ended
+                    && let Some(recorder) = &grpc_streaming_probe_recorder
+                    && !proxy.circuit_breaker.as_ref().is_some_and(|cb| {
+                        cb.failure_status_codes
+                            .contains(&grpc_backend_dispatch_status)
+                    })
+                {
+                    // #1649 R8 finding 1 (re-raised R6-5): an already-ended CLEAN gRPC
+                    // success (Trailers-Only / empty 2xx) with a recorder must NOT be
+                    // banked eagerly. A client upload still in flight could overflow
+                    // `max_grpc_recv_size_bytes` AFTER the response ends, and only the
+                    // recorder's upload-termination join re-checks the overflow flag.
+                    // Hand the clean outcome to the recorder (it defers the success to
+                    // upload termination, overflow-aware) and suppress the
+                    // body-terminal observer below. A KNOWN failure status still falls
+                    // through to the eager arm so it trips promptly.
+                    crate::proxy::body::GrpcResponseTerminalObserver::on_response_terminal(
+                        recorder.as_ref(),
+                        grpc_backend_dispatch_status,
+                        false,
+                        None,
+                    );
+                    grpc_recorder_owns_ended_response = true;
                     false
                 } else if let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
@@ -13378,7 +13407,15 @@ async fn handle_proxy_request_inner(
                     body =
                         body.with_deferred_dispatch_admission_open_epoch(cb_admission_open_epoch);
                 }
-                if let Some(recorder) = &grpc_streaming_probe_recorder {
+                // Suppress the body-terminal observer when an already-ended clean
+                // response was already handed to the recorder at header time (#1649
+                // R8 finding 1) — otherwise the ended body's `Drop` would deliver a
+                // second, ClientDisconnect-classified terminal that neutralizes the
+                // deferred clean success the recorder is waiting to settle at upload
+                // termination.
+                if !grpc_recorder_owns_ended_response
+                    && let Some(recorder) = &grpc_streaming_probe_recorder
+                {
                     let recorder = Arc::clone(recorder);
                     // `let`-binding drives the `Arc<Concrete>` -> `Arc<dyn Trait>`
                     // unsizing coercion.
@@ -14562,13 +14599,19 @@ async fn handle_proxy_request_inner(
     // *outcome* is deferred — so a long-lived stream never pins the slot, and the
     // deferred record runs as a non-probe (`is_half_open_probe = false`).
     //
-    // HBONE (`current_dispatch_hbone`) flows through the same `StreamingH2` arm
-    // but size-limits the tunneled upload, so a late client-upload overflow could
-    // flip `body_size_exceeded` after headers and be misclassified as a backend
-    // body failure by the deferred path. Until that overflow flag is threaded into
-    // the H2 deferred outcome (the gRPC path's `request_body_exceeded` equivalent),
-    // HBONE keeps the eager header-time record — its 2xx-then-stall accounting is
-    // a documented follow-up.
+    // HBONE (`current_dispatch_hbone`) flows through the same `StreamingH2` arm.
+    // Unlike direct-H2 (gated on `max_request_body_size == 0` by
+    // `can_dispatch_direct_http2_pool`), HBONE can carry a request-body size limit,
+    // and a late tunnel overflow would be misclassified as a backend body failure
+    // by the deferred path (no `request_body_exceeded` flag is threaded on the H2
+    // path, unlike gRPC). So defer HBONE only when NO request-body limit applies —
+    // provably no overflow, the same condition that makes direct-H2 safe — which
+    // fixes 2xx-then-stall accounting for the common (unlimited) mesh config so an
+    // HBONE backend that stalls/resets its body after 2xx headers trips the breaker
+    // instead of banking a phantom success (#1649 R8 finding 2). With a request-body
+    // limit configured, HBONE keeps the eager header-time record (residual
+    // follow-up: thread an HBONE request-body overflow flag to defer
+    // unconditionally).
     // Whether the H2 response body is already end-of-stream at header time (empty
     // 200 / `content-length: 0` / END_STREAM-in-headers). Such a body is dropped
     // without being polled, so deferring it would be misread as a client
@@ -14578,7 +14621,7 @@ async fn handle_proxy_request_inner(
         _ => false,
     };
     let defer_streaming_h2_dispatch = matches!(&response_body, ResponseBody::StreamingH2(_))
-        && !current_dispatch_hbone
+        && (!current_dispatch_hbone || state.max_request_body_size_bytes == 0)
         && streaming_dispatch_should_defer(
             &proxy,
             response_status,

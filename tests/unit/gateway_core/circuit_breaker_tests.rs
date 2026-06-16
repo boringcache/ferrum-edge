@@ -1770,6 +1770,51 @@ fn open_epoch_is_visible_to_a_probe_admitted_immediately_after_open() {
 }
 
 #[test]
+fn peek_is_read_only_and_does_not_create_or_resurrect() {
+    // #1649 R8: the deferred stale check must inspect the cached breaker WITHOUT
+    // mutating the cache. `peek` returns None for an absent key (never inserting),
+    // and after a config reload it returns the CURRENT cached breaker — so the
+    // stale check can never write a request-scoped (old-config) breaker back in.
+    let cache = CircuitBreakerCache::new();
+    let cfg_a = default_config();
+    let tk = target_key("10.0.0.1", 8080);
+
+    // Absent key: peek returns None and must NOT create an entry.
+    assert!(cache.peek("proxy-x", Some(&tk)).is_none());
+    assert_eq!(cache.len(), 0, "peek must not insert a breaker");
+
+    // After a real admission the breaker is cached and peek observes it.
+    let _ = cache.can_execute("proxy-x", Some(&tk), &cfg_a);
+    assert_eq!(cache.len(), 1);
+    assert_eq!(
+        cache
+            .peek("proxy-x", Some(&tk))
+            .expect("breaker is cached")
+            .config()
+            .failure_threshold,
+        cfg_a.failure_threshold,
+        "peek observes the cached breaker's config"
+    );
+
+    // A config reload replaces the cached breaker; peek returns the NEW one, and
+    // the cache still holds exactly one entry (no resurrection of the old config).
+    let cfg_b = CircuitBreakerConfig {
+        failure_threshold: cfg_a.failure_threshold + 5,
+        ..default_config()
+    };
+    let _new = cache.get_or_create("proxy-x", Some(&tk), &cfg_b);
+    assert_eq!(cache.len(), 1, "reload replaces in place");
+    let peeked_b = cache
+        .peek("proxy-x", Some(&tk))
+        .expect("new breaker is cached");
+    assert_eq!(
+        peeked_b.config().failure_threshold,
+        cfg_b.failure_threshold,
+        "peek returns the current (reloaded) config, never resurrecting the old one"
+    );
+}
+
+#[test]
 fn open_generation_is_preserved_across_non_open_transitions() {
     // #1649 R7: the generation is packed into the same atomic as state+count and
     // must be PRESERVED by every non-open transition (probe admission, slot

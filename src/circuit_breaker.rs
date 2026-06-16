@@ -624,6 +624,20 @@ impl CircuitBreakerCache {
         cb
     }
 
+    /// Read-only lookup of the breaker currently cached for a proxy (+target),
+    /// WITHOUT creating or replacing one.
+    ///
+    /// Unlike [`get_or_create`](Self::get_or_create), this never writes to the
+    /// cache, so a long-lived deferred streaming completion that outlives a config
+    /// reload cannot resurrect a request-scoped (old-config) breaker into the live
+    /// cache (#1649 R8). Returns `None` when no breaker is cached for the key (it
+    /// was evicted or replaced by a reload), which the deferred stale check treats
+    /// as "the admitted cycle is gone → stale".
+    pub fn peek(&self, proxy_id: &str, target_key: Option<&str>) -> Option<Arc<CircuitBreaker>> {
+        let key = circuit_breaker_key(proxy_id, target_key);
+        self.breakers.get(&key).map(|entry| entry.value().clone())
+    }
+
     /// Check if a request can proceed for a given proxy (or proxy+target).
     ///
     /// `target_key` should be `Some("host:port")` when the proxy uses an upstream,
