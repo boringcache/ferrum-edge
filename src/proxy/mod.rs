@@ -1924,6 +1924,11 @@ struct GrpcStreamingProbeRecorder {
     /// `start_post_header_upload_timeout`), not dispatch start, so a slow-header
     /// backend does not consume the window.
     post_header_upload_timeout_ms: Option<u64>,
+    /// The breaker's open generation captured at admission. The settled outcome
+    /// is recorded NEUTRAL if the breaker has since opened a new cycle (#1649
+    /// round-4 B) so a stream admitted under one generation cannot heal/reopen a
+    /// later HALF_OPEN cycle it never probed.
+    admission_open_epoch: u64,
 }
 
 impl GrpcStreamingProbeRecorder {
@@ -1932,6 +1937,7 @@ impl GrpcStreamingProbeRecorder {
         is_half_open_probe: bool,
         request_body_exceeded: Arc<std::sync::atomic::AtomicBool>,
         post_header_upload_timeout_ms: Option<u64>,
+        admission_open_epoch: u64,
     ) -> Self {
         Self {
             cb,
@@ -1944,6 +1950,7 @@ impl GrpcStreamingProbeRecorder {
             slot_released: std::sync::atomic::AtomicBool::new(false),
             health_recorded: std::sync::atomic::AtomicBool::new(false),
             post_header_upload_timeout_ms,
+            admission_open_epoch,
         }
     }
 
@@ -1996,12 +2003,13 @@ impl GrpcStreamingProbeRecorder {
         if self.health_recorded.swap(true, Ordering::AcqRel) {
             return;
         }
-        backend_dispatch::apply_circuit_breaker_outcome(
+        backend_dispatch::apply_deferred_circuit_breaker_outcome(
             &self.cb,
             self.clean_response_status.load(Ordering::Acquire),
             false,
             None,
             false,
+            self.admission_open_epoch,
         );
     }
 
@@ -2039,12 +2047,21 @@ impl GrpcStreamingProbeRecorder {
         if self.is_half_open_probe && !self.slot_released.swap(true, Ordering::AcqRel) {
             self.cb.record_neutral(true);
         }
-        if self.health_recorded.swap(true, Ordering::AcqRel) {
-            return;
+        // #1649 round-4 finding A: only CONSUME the health outcome when the
+        // response already completed CLEAN — that clean success cannot be
+        // confirmed without upload termination (overflow check), so it settles
+        // NEUTRAL. If the response has NOT terminated, do NOT mark health here:
+        // a still-streaming response may yet FAIL (a 2xx-then-stall), and that
+        // failure — recorded promptly by `on_response_terminal` — must not be
+        // masked by an unended-upload guard (this guard now runs for every
+        // streaming RPC with a breaker, not just HALF_OPEN probes).
+        if self.response_clean.load(Ordering::Acquire)
+            && !self.health_recorded.swap(true, Ordering::AcqRel)
+        {
+            warn!(
+                "gRPC streaming probe upload did not terminate before its deadline; settling clean response neutral",
+            );
         }
-        warn!(
-            "gRPC streaming probe upload did not terminate before its deadline; settling neutral",
-        );
     }
 }
 
@@ -2077,13 +2094,16 @@ impl crate::proxy::body::GrpcResponseTerminalObserver for GrpcStreamingProbeReco
         ) {
             // A real backend failure (post-wire body error / non-OK grpc-status
             // trailer) trips promptly — no need to wait for upload termination.
+            // Still epoch-checked: a stream admitted before a new open cycle must
+            // not reopen a later HALF_OPEN cycle it never probed (round-4 B).
             if !self.health_recorded.swap(true, Ordering::AcqRel) {
-                backend_dispatch::apply_circuit_breaker_outcome(
+                backend_dispatch::apply_deferred_circuit_breaker_outcome(
                     &self.cb,
                     response_status,
                     connection_error,
                     error_class,
                     false,
+                    self.admission_open_epoch,
                 );
             }
             return;
@@ -11882,7 +11902,7 @@ async fn handle_proxy_request_inner(
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet> = None;
 
     // Circuit breaker check — per-target when upstream is configured, per-proxy otherwise
-    let (cb_target_key, cb_is_half_open_probe) =
+    let (cb_target_key, cb_is_half_open_probe, cb_admission_open_epoch) =
         match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {
@@ -12364,6 +12384,7 @@ async fn handle_proxy_request_inner(
                                 grpc_cb_probe_slot,
                                 Arc::clone(&body_size_exceeded),
                                 post_header_upload_timeout_ms,
+                                cb_admission_open_epoch,
                             ));
                             grpc_streaming_probe_recorder = Some(Arc::clone(&recorder));
                             // `let`-binding the trait object drives the
@@ -15142,20 +15163,25 @@ async fn handle_proxy_request_inner(
             // `connection_error` from the terminal body error class, so pass
             // `connection_error = false` / `error_class = None` here.
             if defer_streaming_h2_dispatch {
-                body = body.with_deferred_backend_dispatch_outcome(
-                    Arc::clone(&state),
-                    Arc::clone(&proxy),
-                    Arc::clone(&epoch.load_balancer),
-                    upstream_balancer.clone(),
-                    upstream_target.clone(),
-                    final_cb_target_key.clone(),
-                    backend_admission_response_status,
-                    false,
-                    None,
-                    false,
-                    skip_final_cb_record,
-                    streaming_h2_dispatch_elapsed,
-                );
+                body = body
+                    .with_deferred_backend_dispatch_outcome(
+                        Arc::clone(&state),
+                        Arc::clone(&proxy),
+                        Arc::clone(&epoch.load_balancer),
+                        upstream_balancer.clone(),
+                        upstream_target.clone(),
+                        final_cb_target_key.clone(),
+                        backend_admission_response_status,
+                        false,
+                        None,
+                        false,
+                        skip_final_cb_record,
+                        streaming_h2_dispatch_elapsed,
+                    )
+                    // #1649 round-4 B: skip the deferred CB record if the breaker
+                    // opened a new cycle since admission (stale stream must not
+                    // heal/reopen a later HALF_OPEN cycle).
+                    .with_deferred_dispatch_admission_open_epoch(cb_admission_open_epoch);
             }
             body
         }
@@ -20670,11 +20696,15 @@ mod tests {
             overflow: Arc<AtomicBool>,
             post_header_upload_timeout_ms: Option<u64>,
         ) -> Arc<super::super::GrpcStreamingProbeRecorder> {
+            // Capture the breaker's current open generation as the admission epoch,
+            // matching the runtime (`check_circuit_breaker`).
+            let admission_open_epoch = cb.open_epoch();
             Arc::new(super::super::GrpcStreamingProbeRecorder::new(
                 cb,
                 true,
                 overflow,
                 post_header_upload_timeout_ms,
+                admission_open_epoch,
             ))
         }
 
@@ -20918,6 +20948,31 @@ mod tests {
                 cb.state_name(),
                 "half_open",
                 "a client-upload overflow reset must be neutral, not a backend failure"
+            );
+        }
+
+        #[test]
+        fn stale_outcome_after_breaker_reopened_does_not_heal() {
+            // #1649 round-4 B: a stream admitted under one open generation must NOT
+            // heal a LATER HALF_OPEN cycle it never probed. Admit a probe, capture
+            // its admission epoch, then reopen the breaker (a sibling probe fails)
+            // so a new generation begins — this stream's clean completion is stale
+            // and must record NEUTRAL.
+            let cb = Arc::new(breaker_with_admitted_half_open_probe());
+            let recorder = recorder(Arc::clone(&cb), None); // captures admission epoch
+
+            // A sibling HALF_OPEN probe fails → reopen → NEW open generation.
+            cb.record_failure(500, false, true);
+            assert_eq!(cb.state_name(), "open");
+
+            // This (stale) stream now completes clean.
+            recorder.note_headers_arrived();
+            recorder.on_response_terminal(200, false, None);
+            GrpcUploadTerminationObserver::on_upload_terminated(recorder.as_ref());
+            assert_eq!(
+                cb.state_name(),
+                "open",
+                "a stale clean stream from a prior generation must not heal the reopened breaker"
             );
         }
     }

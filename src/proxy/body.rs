@@ -149,6 +149,13 @@ struct DeferredBackendDispatchOutcome {
     /// is `true`); instead the terminal `(status, connection_error, error_class)`
     /// is handed to the recorder, which settles the breaker.
     grpc_response_observer: Option<Arc<dyn GrpcResponseTerminalObserver>>,
+    /// Direct-H2/HBONE: the breaker's open generation captured at admission. When
+    /// `Some`, the deferred CB record is SKIPPED if the breaker has since opened a
+    /// new cycle (`open_epoch` advanced) — a stream admitted while the breaker was
+    /// CLOSED must not heal/reopen a later HALF_OPEN cycle it never probed (#1649
+    /// round-4 B). Passive-health + least-latency still record (per-target, not
+    /// per-cycle). `None` on the gRPC path, where the recorder does the check.
+    deferred_admission_open_epoch: Option<u64>,
 }
 
 /// Inner body variant — buffered, streaming, or tracked-streaming.
@@ -480,7 +487,19 @@ impl ProxyBody {
             classify_grpc_trailer: false,
             grpc_trailer_http_status: None,
             grpc_response_observer: None,
+            deferred_admission_open_epoch: None,
         });
+        self
+    }
+
+    /// Tag the deferred backend-dispatch outcome with the breaker's open
+    /// generation captured at admission (direct-H2/HBONE #1649 round-4 B). The CB
+    /// is skipped at completion if the breaker has since opened a new cycle.
+    /// No-op when no deferred dispatch outcome is attached.
+    pub(crate) fn with_deferred_dispatch_admission_open_epoch(mut self, epoch: u64) -> Self {
+        if let Some(outcome) = self.backend_dispatch_outcome.as_mut() {
+            outcome.deferred_admission_open_epoch = Some(epoch);
+        }
         self
     }
 
@@ -739,6 +758,27 @@ impl ProxyBody {
             return;
         }
 
+        // Direct-H2/HBONE (#1649 round-4 B): skip the deferred CB record if the
+        // breaker has opened a new generation since this request was admitted —
+        // this completion is stale for the current cycle and must not heal/reopen
+        // a HALF_OPEN cycle it never probed. Passive-health + least-latency still
+        // record (per-target, not per-cycle). The gRPC path leaves this `None`
+        // (its recorder does the epoch check).
+        let cb_stale = outcome.deferred_admission_open_epoch.is_some_and(|epoch| {
+            outcome.proxy.circuit_breaker.as_ref().is_some_and(|cfg| {
+                outcome
+                    .state
+                    .circuit_breaker_cache
+                    .get_or_create(
+                        &outcome.proxy.id,
+                        outcome.final_cb_target_key.as_deref(),
+                        cfg,
+                    )
+                    .open_epoch()
+                    != epoch
+            })
+        });
+
         super::backend_dispatch::record_backend_outcome_no_conn_end(
             &outcome.state,
             &outcome.proxy,
@@ -750,7 +790,7 @@ impl ProxyBody {
             connection_error,
             error_class,
             outcome.is_half_open_probe,
-            outcome.skip_circuit_breaker_record,
+            outcome.skip_circuit_breaker_record || cb_stale,
             outcome.backend_elapsed,
         );
     }

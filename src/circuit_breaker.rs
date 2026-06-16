@@ -50,6 +50,14 @@ pub struct CircuitBreaker {
     failure_count: AtomicU32,
     success_count: AtomicU32,
     last_failure_epoch_ms: AtomicU64,
+    /// Monotonic counter incremented on every CLOSED→OPEN / HALF_OPEN→OPEN
+    /// transition (one "open generation"). A request captures this at admission
+    /// (`can_execute`); a deferred streaming outcome compares it at completion so
+    /// a stream admitted under one generation cannot heal/reopen a *later*
+    /// HALF_OPEN cycle it never probed (#1649 — the breaker stays correct even
+    /// though the streaming CB outcome is recorded at body completion). HALF_OPEN
+    /// admission does NOT bump it — it is the same open cycle.
+    open_epoch: AtomicU64,
     config: CircuitBreakerConfig,
 }
 
@@ -70,6 +78,7 @@ impl CircuitBreaker {
             failure_count: AtomicU32::new(0),
             success_count: AtomicU32::new(0),
             last_failure_epoch_ms: AtomicU64::new(0),
+            open_epoch: AtomicU64::new(0),
             config,
         }
     }
@@ -365,6 +374,9 @@ impl CircuitBreaker {
                             );
                             return;
                         }
+                        // New open generation: a deferred streaming outcome
+                        // admitted before this point is now stale (#1649 R4-B).
+                        self.open_epoch.fetch_add(1, Ordering::AcqRel);
                         warn!(
                             "Circuit breaker opening after {} failures",
                             current_failures
@@ -415,6 +427,8 @@ impl CircuitBreaker {
                         )
                         .is_ok()
                     {
+                        // New open generation (see CLOSED→OPEN above, #1649 R4-B).
+                        self.open_epoch.fetch_add(1, Ordering::AcqRel);
                         warn!("Circuit breaker reopening (probe failed)");
                         break;
                     }
@@ -444,6 +458,15 @@ impl CircuitBreaker {
     /// Get the config for this circuit breaker.
     pub fn config(&self) -> &CircuitBreakerConfig {
         &self.config
+    }
+
+    /// Current open generation. Captured at admission (`can_execute`) and
+    /// re-checked when a deferred streaming outcome settles so a stream admitted
+    /// under one generation cannot heal/reopen a later HALF_OPEN cycle (#1649).
+    /// Incremented on every transition INTO `Open`; HALF_OPEN admission does not
+    /// change it (same open cycle).
+    pub fn open_epoch(&self) -> u64 {
+        self.open_epoch.load(Ordering::Acquire)
     }
 
     /// Current failure count (for metrics).

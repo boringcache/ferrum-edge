@@ -395,7 +395,10 @@ pub(super) async fn handle_hbone_request(
     let upstream_target = selection.target;
     let upstream_balancer = selection.balancer;
 
-    let (cb_target_key, cb_is_half_open_probe) =
+    // HBONE records the circuit-breaker outcome at header time (its `StreamingH2`
+    // responses are excluded from the deferred-dispatch path, #1649), so the
+    // admission open-epoch is unused here.
+    let (cb_target_key, cb_is_half_open_probe, _cb_admission_open_epoch) =
         match backend_dispatch::check_circuit_breaker(proxy, state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {

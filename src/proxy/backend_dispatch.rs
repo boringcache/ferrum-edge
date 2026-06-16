@@ -453,7 +453,7 @@ pub(crate) fn check_circuit_breaker(
     proxy: &Proxy,
     state: &ProxyState,
     upstream_target: Option<&UpstreamTarget>,
-) -> Result<(Option<String>, bool), ()> {
+) -> Result<(Option<String>, bool, u64), ()> {
     let cb_target_key = circuit_breaker_target_key(proxy, upstream_target);
 
     if let Some(cb_config) = &proxy.circuit_breaker {
@@ -462,7 +462,13 @@ pub(crate) fn check_circuit_breaker(
             cb_target_key.as_deref(),
             cb_config,
         ) {
-            Ok((_cb, is_half_open_probe)) => return Ok((cb_target_key, is_half_open_probe)),
+            // Capture the open generation at admission so a deferred streaming
+            // outcome can detect that the breaker has since opened a new cycle
+            // (#1649 round-4 B) and avoid healing/reopening a HALF_OPEN cycle it
+            // never probed.
+            Ok((cb, is_half_open_probe)) => {
+                return Ok((cb_target_key, is_half_open_probe, cb.open_epoch()));
+            }
             Err(_) => {
                 warn!(proxy_id = %proxy.id, "Request rejected: circuit breaker open");
                 return Err(());
@@ -470,7 +476,7 @@ pub(crate) fn check_circuit_breaker(
         }
     }
 
-    Ok((cb_target_key, false))
+    Ok((cb_target_key, false, 0))
 }
 
 fn circuit_breaker_target_key(
@@ -698,6 +704,34 @@ pub(crate) fn apply_circuit_breaker_outcome(
     } else {
         cb.record_success(is_half_open_probe);
     }
+}
+
+/// Like [`apply_circuit_breaker_outcome`], but for a DEFERRED streaming outcome:
+/// if the breaker has advanced to a new open generation since this request was
+/// admitted (`cb.open_epoch() != admission_open_epoch`), the completion is stale
+/// for the current cycle — a stream admitted while the breaker was CLOSED must
+/// not heal/reopen a later HALF_OPEN cycle it never probed (#1649 round-4 B). In
+/// that case record NEUTRAL (release any slot, no health change); otherwise apply
+/// the outcome normally.
+pub(crate) fn apply_deferred_circuit_breaker_outcome(
+    cb: &crate::circuit_breaker::CircuitBreaker,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<ErrorClass>,
+    is_half_open_probe: bool,
+    admission_open_epoch: u64,
+) {
+    if cb.open_epoch() != admission_open_epoch {
+        cb.record_neutral(is_half_open_probe);
+        return;
+    }
+    apply_circuit_breaker_outcome(
+        cb,
+        response_status,
+        connection_error,
+        error_class,
+        is_half_open_probe,
+    );
 }
 
 /// Whether [`apply_circuit_breaker_outcome`] would record a backend FAILURE (as
@@ -1535,7 +1569,7 @@ mod tests {
         cb.record_failure(500, false, false);
         assert_eq!(cb.state_name(), "open");
 
-        let (final_cb_target_key, is_half_open_probe) =
+        let (final_cb_target_key, is_half_open_probe, _admission_open_epoch) =
             check_circuit_breaker(proxy, &state, None).expect("timeout=0 admits a probe");
         assert!(
             is_half_open_probe,
