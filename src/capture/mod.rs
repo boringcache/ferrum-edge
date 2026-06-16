@@ -1143,10 +1143,17 @@ fn udp_tproxy_commands_for_family(
     // share identical capture scoping (codex r6):
     //   - PREROUTING TPROXY rules append the `! --dst-type LOCAL` egress scope so
     //     they never grab inbound (the INBOUND chain's `--dst-type LOCAL` job).
-    //   - OUTPUT MARK rules carry NO dst-type scope: all OUTPUT-visible traffic is
-    //     locally generated (egress by definition), and the proxy's own datagrams
-    //     are excluded by an owner-match RETURN at the top of the OUTPUT chain
-    //     (owner-match is OUTPUT-context-only — invalid in PREROUTING).
+    //   - OUTPUT MARK rules ALSO append the SAME `! --dst-type LOCAL` egress scope
+    //     (codex r9): in the OUTPUT context the pod's OWN IP and loopback are
+    //     `--dst-type LOCAL` (locally generated AND locally destined), while real
+    //     egress to other hosts is non-LOCAL. Without this scope the catch-all
+    //     `-p udp -d 0.0.0.0/0 -j MARK` would also fwmark pod-to-self / loopback
+    //     UDP, reroute it to `lo`, and TPROXY-capture it — but self/loopback UDP
+    //     must NOT be captured (only genuine outbound egress). The proxy's own
+    //     egress is still separately excluded by the owner-match RETURN at the top
+    //     of the OUTPUT chain (owner-match is OUTPUT-context-only — invalid in
+    //     PREROUTING); the dst-type scope handles non-proxy local destinations the
+    //     owner RETURN cannot (a different UID's pod-to-self/loopback datagram).
     // `catch_all` selectors (the implicit-CIDR / `include_all_outbound_ports`
     // catch-alls) are suppressed when this family was NOT CIDR-selected
     // (cross-family case); the per-CIDR `-d` and per-port `--dport` selectors
@@ -1189,7 +1196,7 @@ fn udp_tproxy_commands_for_family(
         .collect();
     let outbound_mark_rules: Vec<String> = outbound_selectors
         .iter()
-        .map(|sel| format!("{sel} {mark_jump}"))
+        .map(|sel| format!("{sel} {outbound_dst_scope} {mark_jump}"))
         .collect();
 
     // The inbound catch-all is itself an unqualified `-j TPROXY` diversion, so it
@@ -1305,11 +1312,14 @@ fn udp_tproxy_commands_for_family(
     //      in PREROUTING, which is why the OUTBOUND chain has no owner RETURN).
     //   3. the same exclude-CIDR / exclude-port RETURNs as the OUTBOUND chain.
     //   4. the MARK rules derived from the SAME outbound selectors as the TPROXY
-    //      rules, so OUTPUT capture scoping matches PREROUTING capture scoping
-    //      exactly. NO `! --dst-type LOCAL` scope here: all OUTPUT-visible traffic
-    //      is locally generated (egress by definition); pod-to-self loopback is not
-    //      captured because the mark-RETURN guard / the absence of a matching
-    //      selector keeps it out, and self-exclusion rides the owner RETURN.
+    //      rules AND carrying the SAME `! --dst-type LOCAL` egress scope (codex r9),
+    //      so OUTPUT capture scoping matches PREROUTING capture scoping exactly.
+    //      The dst-type scope is what keeps pod-to-self / loopback (`--dst-type
+    //      LOCAL` in OUTPUT) OUT of the mark set so it is never fwmark-rerouted to
+    //      `lo` and TPROXY-captured — only genuine egress to other hosts is marked.
+    //      The proxy's OWN egress is separately excluded by the owner RETURN above;
+    //      the dst-type scope additionally covers a NON-proxy local destination
+    //      (another UID's loopback / self UDP) the owner RETURN cannot.
     // The chain is populated regardless of whether any selector matched: if it is
     // empty of MARK rules nothing is marked, and the OUTPUT jump below is a no-op.
     commands.push(idempotent_append(
@@ -3274,9 +3284,9 @@ mod tests {
         // so OUTPUT capture exactly matches PREROUTING capture.
         // Default config (`include_cidrs = ["0.0.0.0/0"]`, NOT explicit): the
         // OUTPUT MARK chain mirrors the OUTBOUND TPROXY chain's selector exactly —
-        // a `-p udp -d 0.0.0.0/0 -j MARK` rule (same `-d 0.0.0.0/0` the TPROXY rule
-        // carries). Only the jump differs (MARK vs TPROXY) and the egress dst-scope
-        // is omitted in OUTPUT (owner-RETURN handles self-exclusion there).
+        // a `-p udp -d 0.0.0.0/0 -m addrtype ! --dst-type LOCAL -j MARK` rule (same
+        // `-d 0.0.0.0/0` selector AND the same `! --dst-type LOCAL` egress scope the
+        // TPROXY rule carries). Only the jump differs (MARK vs TPROXY).
         let default_plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
         let mark_arg = format!("0x{:x}/0x{:x}", DEFAULT_TPROXY_MARK, TPROXY_MARK_MASK);
         // The OUTBOUND TPROXY chain carries `-p udp -d 0.0.0.0/0 -m addrtype ! ...`.
@@ -3289,33 +3299,50 @@ mod tests {
             "default OUTBOUND TPROXY rule shape changed: {:?}",
             default_plan.v4_commands
         );
-        // The OUTPUT MARK chain mirrors the SAME `-p udp -d 0.0.0.0/0` selector with
-        // a MARK jump (and no dst-scope).
+        // The OUTPUT MARK chain mirrors the SAME `-p udp -d 0.0.0.0/0` selector AND
+        // the SAME `! --dst-type LOCAL` egress scope, with a MARK jump (codex r9):
+        // loopback / the pod's own IP are `--dst-type LOCAL` in OUTPUT and must NOT
+        // be marked (else they would be fwmark-rerouted to `lo` + TPROXY-captured);
+        // only genuine non-local egress is marked.
         assert!(
             default_plan
                 .v4_commands
                 .iter()
                 .any(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK")
                     && c.contains(&format!(
-                        "-p udp -d 0.0.0.0/0 -j MARK --set-mark {mark_arg}"
+                        "-p udp -d 0.0.0.0/0 -m addrtype ! --dst-type LOCAL -j MARK --set-mark {mark_arg}"
                     ))),
-            "OUTPUT MARK must mirror the OUTBOUND `-p udp -d 0.0.0.0/0` selector: {:?}",
+            "OUTPUT MARK must mirror the OUTBOUND selector AND `! --dst-type LOCAL` scope: {:?}",
             default_plan.v4_commands
         );
-        // And the OUTPUT MARK chain carries NO `-m addrtype` dst-scope (that is a
-        // PREROUTING-direction discriminator; OUTPUT is locally-generated egress).
+        // Every OUTPUT MARK `-j MARK` rule MUST carry the `! --dst-type LOCAL` scope
+        // (codex r9 — exclude loopback / self), and NONE may carry the inbound
+        // `--dst-type LOCAL` (without the `!`) discriminator. We assert each marking
+        // rule contains `addrtype ! --dst-type LOCAL` and that no marking rule
+        // carries a bare (non-negated) `--dst-type LOCAL`.
+        let mark_rules: Vec<&String> = default_plan
+            .v4_commands
+            .iter()
+            .filter(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK") && c.contains("-j MARK"))
+            .collect();
         assert!(
-            !default_plan
-                .v4_commands
-                .iter()
-                .any(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK")
-                    && c.contains("-j MARK")
-                    && c.contains("addrtype")),
-            "OUTPUT MARK rules must not carry an `-m addrtype` dst-scope: {:?}",
+            !mark_rules.is_empty(),
+            "expected at least one OUTPUT MARK marking rule: {:?}",
             default_plan.v4_commands
         );
+        for rule in &mark_rules {
+            assert!(
+                rule.contains("-m addrtype ! --dst-type LOCAL"),
+                "OUTPUT MARK rule must exclude LOCAL (loopback/self) destinations: {rule}"
+            );
+            assert!(
+                !rule.contains("addrtype --dst-type LOCAL"),
+                "OUTPUT MARK rule must NOT carry the inbound (non-negated) `--dst-type LOCAL`: {rule}"
+            );
+        }
 
-        // Per-port includes: a `--dport` MARK rule per port, and NO catch-all MARK.
+        // Per-port includes: a `--dport` MARK rule per port (each carrying the
+        // `! --dst-type LOCAL` egress scope), and NO catch-all MARK.
         let mut port_config = udp_enabled_iptables_config();
         port_config.include_outbound_ports = vec![5432, 9092];
         let port_plan = IptablesPlan::for_config(&port_config);
@@ -3326,10 +3353,21 @@ mod tests {
                     .iter()
                     .any(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK")
                         && c.contains(&format!(
-                            "-p udp --dport {port} -j MARK --set-mark {mark_arg}"
+                            "-p udp --dport {port} -m addrtype ! --dst-type LOCAL -j MARK --set-mark {mark_arg}"
                         ))),
-                "per-port OUTPUT MARK missing for {port}: {:?}",
+                "per-port OUTPUT MARK (with `! --dst-type LOCAL`) missing for {port}: {:?}",
                 port_plan.v4_commands
+            );
+        }
+        // Every per-port MARK rule still excludes LOCAL destinations.
+        for rule in port_plan
+            .v4_commands
+            .iter()
+            .filter(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK") && c.contains("-j MARK"))
+        {
+            assert!(
+                rule.contains("-m addrtype ! --dst-type LOCAL"),
+                "per-port OUTPUT MARK rule must exclude LOCAL (loopback/self): {rule}"
             );
         }
         assert!(
