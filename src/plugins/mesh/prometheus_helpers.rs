@@ -571,7 +571,8 @@ const MESH_LABEL_INTERN_CAP: usize = 4096;
 /// Process-wide intern pool that turns repeated mesh-label `&str` values into a
 /// shared `Arc<str>` so [`mesh_request_key`] can clone (atomic increment)
 /// instead of heap-allocating a fresh `Arc` per field on every call.
-static MESH_LABEL_INTERN: LazyLock<DashMap<Box<str>, Arc<str>>> = LazyLock::new(DashMap::new);
+static MESH_LABEL_INTERN: LazyLock<DashMap<Box<str>, Arc<str>>> =
+    LazyLock::new(|| DashMap::with_shard_amount(super::observability_shard_amount()));
 static MESH_LABEL_INTERN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Intern a mesh label value into a shared `Arc<str>`.
