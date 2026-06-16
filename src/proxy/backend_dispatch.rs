@@ -634,11 +634,34 @@ pub(crate) fn record_backend_outcome_no_conn_end(
 }
 
 #[inline]
-fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> bool {
+pub(crate) fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> bool {
     matches!(
         error_class,
         Some(ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge)
     )
+}
+
+/// Whether a deferred streaming outcome admitted at `admission_open_epoch` is now
+/// stale for the breaker's current cycle: the breaker has opened a new generation
+/// since admission, so this completion must NOT heal/reopen a HALF_OPEN cycle it
+/// never probed (#1649 R4-B). Returns `false` when the proxy has no breaker
+/// configured (nothing to stale-check). Shared by the body-deferred path
+/// (`record_deferred_backend_dispatch`) and the synchronous after_proxy-reject
+/// fallbacks (direct-H2 + buffered-gRPC) so the epoch check has a single source of
+/// truth.
+pub(crate) fn deferred_circuit_breaker_is_stale(
+    state: &ProxyState,
+    proxy: &Proxy,
+    final_cb_target_key: Option<&str>,
+    admission_open_epoch: u64,
+) -> bool {
+    proxy.circuit_breaker.as_ref().is_some_and(|cfg| {
+        state
+            .circuit_breaker_cache
+            .get_or_create(&proxy.id, final_cb_target_key, cfg)
+            .open_epoch()
+            != admission_open_epoch
+    })
 }
 
 /// A post-wire backend failure: the request reached the backend's application

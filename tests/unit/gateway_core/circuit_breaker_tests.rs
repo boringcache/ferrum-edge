@@ -1718,3 +1718,53 @@ fn half_open_probe_failure_after_recovery_counts_toward_threshold_not_reopen() {
         "the threshold is reached via the counted failures"
     );
 }
+
+#[test]
+fn open_epoch_is_visible_to_a_probe_admitted_immediately_after_open() {
+    // #1649 R5 finding 2: the open generation must be published BEFORE OPEN
+    // becomes observable, so a request that observes OPEN and immediately
+    // re-enters HALF_OPEN (possible because `timeout_seconds == 0`) captures the
+    // NEW generation — never the pre-open value. A deferred streaming outcome
+    // compares the captured generation at completion, so capturing the stale
+    // generation would wrongly neutralize a valid probe and the breaker could
+    // never heal/reopen. This single-threaded test asserts the observable
+    // invariant the ordering fix guarantees.
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 0, // OPEN is immediately re-admissible as HALF_OPEN
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+    assert_eq!(cb.open_epoch(), 0, "fresh breaker starts at generation 0");
+
+    // CLOSED -> OPEN advances the generation.
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+    let gen_after_open = cb.open_epoch();
+    assert_eq!(gen_after_open, 1, "opening advances the generation");
+
+    // A probe admitted immediately after open observes the NEW generation — the
+    // increment is published with (not after) the OPEN/HALF_OPEN transition.
+    assert!(
+        cb.can_execute().unwrap(),
+        "timeout=0 admits a probe at once"
+    );
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(
+        cb.open_epoch(),
+        gen_after_open,
+        "HALF_OPEN admission does not change the generation (same open cycle)"
+    );
+
+    // Reopening (a probe fails in HALF_OPEN) advances the generation again.
+    cb.record_failure(500, false, true);
+    assert_eq!(cb.state_name(), "open");
+    assert_eq!(
+        cb.open_epoch(),
+        gen_after_open + 1,
+        "reopening after a probe failure advances the generation"
+    );
+}

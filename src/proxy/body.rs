@@ -765,18 +765,12 @@ impl ProxyBody {
         // record (per-target, not per-cycle). The gRPC path leaves this `None`
         // (its recorder does the epoch check).
         let cb_stale = outcome.deferred_admission_open_epoch.is_some_and(|epoch| {
-            outcome.proxy.circuit_breaker.as_ref().is_some_and(|cfg| {
-                outcome
-                    .state
-                    .circuit_breaker_cache
-                    .get_or_create(
-                        &outcome.proxy.id,
-                        outcome.final_cb_target_key.as_deref(),
-                        cfg,
-                    )
-                    .open_epoch()
-                    != epoch
-            })
+            super::backend_dispatch::deferred_circuit_breaker_is_stale(
+                &outcome.state,
+                &outcome.proxy,
+                outcome.final_cb_target_key.as_deref(),
+                epoch,
+            )
         });
 
         super::backend_dispatch::record_backend_outcome_no_conn_end(

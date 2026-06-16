@@ -354,6 +354,24 @@ impl CircuitBreaker {
                     }
                     // CLOSED always carries count=0, so the expected/desired
                     // values both hold count=0; the transition only flips state.
+                    //
+                    // Publish the new open generation BEFORE the CAS makes OPEN
+                    // visible: a concurrent observer of OPEN can immediately
+                    // transition to HALF_OPEN (notably when `timeout_seconds == 0`)
+                    // and capture `open_epoch` in `can_execute`. It must read the
+                    // NEW generation, not the old one — otherwise its valid probe's
+                    // deferred streaming outcome is wrongly judged stale and can
+                    // never heal/reopen the breaker (#1649 R5 finding 2). The CAS's
+                    // Release publishes this increment to any Acquire load that
+                    // observes OPEN. Every increment here is gated by the
+                    // (re-checked) `failures >= failure_threshold` condition, so it
+                    // always corresponds to a real open attempt; on a lost CAS a
+                    // sibling opened (advancing the generation anyway), and on the
+                    // rare rollback path below the generation stays advanced — the
+                    // only effect is that a CLOSED-admitted (non-probe) deferred
+                    // outcome captured just before this point is dropped instead of
+                    // recorded, which is negligible and conservative.
+                    self.open_epoch.fetch_add(1, Ordering::AcqRel);
                     if self
                         .packed
                         .compare_exchange(
@@ -374,9 +392,6 @@ impl CircuitBreaker {
                             );
                             return;
                         }
-                        // New open generation: a deferred streaming outcome
-                        // admitted before this point is now stale (#1649 R4-B).
-                        self.open_epoch.fetch_add(1, Ordering::AcqRel);
                         warn!(
                             "Circuit breaker opening after {} failures",
                             current_failures
@@ -410,6 +425,17 @@ impl CircuitBreaker {
     /// this cycle releases as a no-op at 0.
     fn reopen_after_probe_failure(&self) {
         self.success_count.store(0, Ordering::Relaxed);
+        // Publish the new open generation BEFORE the CAS makes OPEN visible, for
+        // the same reason as the CLOSED→OPEN path: a concurrent observer of OPEN
+        // can immediately re-enter HALF_OPEN (when `timeout_seconds == 0`) and
+        // capture `open_epoch`, so it must see the NEW generation (#1649 R5
+        // finding 2). Every call here corresponds to a genuine reopen of the
+        // generation this failure observed, so advancing the counter up front is
+        // never spurious; if a sibling already reopened (the `STATE_OPEN` arm
+        // below) the extra increment is harmless — `open_epoch` is an
+        // equality-compared generation marker, and a stream from the superseded
+        // cycle is correctly stale either way.
+        self.open_epoch.fetch_add(1, Ordering::AcqRel);
         loop {
             let p = self.packed.load(Ordering::Acquire);
             match packed_state(p) {
@@ -427,8 +453,6 @@ impl CircuitBreaker {
                         )
                         .is_ok()
                     {
-                        // New open generation (see CLOSED→OPEN above, #1649 R4-B).
-                        self.open_epoch.fetch_add(1, Ordering::AcqRel);
                         warn!("Circuit breaker reopening (probe failed)");
                         break;
                     }
