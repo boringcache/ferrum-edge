@@ -228,6 +228,35 @@ async fn test_pii_detection_redact() {
 }
 
 #[tokio::test]
+async fn test_all_mode_decodes_json_escaped_pii_for_redaction() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let body = br#"{"choices":[{"message":{"content":"Contact user\u0040example.com"}}]}"#;
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
+
+    let transformed = plugin
+        .transform_response_body(body, Some("application/json"), &headers)
+        .await
+        .expect("expected escaped email to be redacted");
+    let value: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(
+        value["choices"][0]["message"]["content"],
+        "Contact [REDACTED:pii:email]"
+    );
+}
+
+#[tokio::test]
 async fn test_blocked_phrase_detection() {
     let config = json!({
         "blocked_phrases": ["harmful content"],
@@ -822,6 +851,32 @@ async fn test_sse_pii_redaction() {
         transformed_str.contains("[DONE]"),
         "[DONE] sentinel must be preserved"
     );
+}
+
+#[tokio::test]
+async fn test_sse_scan_all_decodes_escaped_pii_for_redaction() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"Contact user\\u0040example.com\"}}]}\n\ndata: [DONE]\n\n";
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &sse_headers(), body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
+
+    let transformed = plugin
+        .transform_response_body(body, Some("text/event-stream"), &sse_headers())
+        .await
+        .expect("expected escaped email to be redacted");
+    let transformed_str = String::from_utf8(transformed).unwrap();
+    assert!(transformed_str.contains("[REDACTED:pii:email]"));
+    assert!(!transformed_str.contains("\\u0040"));
+    assert!(transformed_str.contains("[DONE]"));
 }
 
 #[tokio::test]

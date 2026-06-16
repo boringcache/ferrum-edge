@@ -434,19 +434,18 @@ impl AiResponseGuard {
         detected
     }
 
-    /// Detect matches in a raw string (for "all" scan mode).
-    /// Single `RegexSet` DFA pass — O(text_len).
-    fn detect_matches_in_str(&self, text: &str) -> Vec<String> {
-        if self.detection_pattern_count == 0 {
-            return Vec::new();
+    fn detect_matches_in_decoded_json(&self, json: &Value) -> Vec<String> {
+        let mut texts = Vec::new();
+        collect_decoded_json_strings(json, &mut texts);
+        self.detect_matches(&texts)
+    }
+
+    fn detect_matches_in_decoded_sse_frames(&self, frames: &[Value]) -> Vec<String> {
+        let mut texts = Vec::new();
+        for frame in frames {
+            collect_decoded_json_strings(frame, &mut texts);
         }
-        let mut detected = Vec::new();
-        for idx in self.detection_set.matches(text).into_iter() {
-            if let Some(name) = self.pattern_name(idx) {
-                detected.push(name.to_string());
-            }
-        }
-        detected
+        self.detect_matches(&texts)
     }
 
     /// Replace all pattern matches with the redaction placeholder.
@@ -717,10 +716,18 @@ impl AiResponseGuard {
     fn redact_sse_body(&self, body: &[u8]) -> Option<Vec<u8>> {
         let body_str = std::str::from_utf8(body).ok()?;
 
-        // Fast-skip: a single DFA pass over the whole body tells us whether
-        // any pattern can match. Mirrors the JSON path so the common
-        // "redact mode but no PII in the stream" case stays zero-copy.
-        if !self.detection_set.is_match(body_str) {
+        // Fast-skip the common "redact mode but no PII in the stream" case.
+        // Scan-all mode checks decoded frame strings so JSON escapes cannot
+        // hide content from the redactor.
+        let has_match = if self.scan_mode == ScanMode::All {
+            let frames = parse_sse_data_frames(body);
+            !self
+                .detect_matches_in_decoded_sse_frames(&frames)
+                .is_empty()
+        } else {
+            self.detection_set.is_match(body_str)
+        };
+        if !has_match {
             return None;
         }
 
@@ -890,11 +897,7 @@ impl Plugin for AiResponseGuard {
             }
 
             let detected = if self.scan_mode == ScanMode::All {
-                let body_str = match std::str::from_utf8(body) {
-                    Ok(s) => s,
-                    Err(_) => return PluginResult::Continue,
-                };
-                self.detect_matches_in_str(body_str)
+                self.detect_matches_in_decoded_sse_frames(&frames)
             } else {
                 let refs: Vec<&str> = accumulated.iter().map(|s| s.as_str()).collect();
                 self.detect_matches(&refs)
@@ -969,11 +972,7 @@ impl Plugin for AiResponseGuard {
 
         // Detect PII and blocked content
         let detected = if self.scan_mode == ScanMode::All {
-            let body_str = match std::str::from_utf8(body) {
-                Ok(s) => s,
-                Err(_) => return PluginResult::Continue,
-            };
-            self.detect_matches_in_str(body_str)
+            self.detect_matches_in_decoded_json(&json)
         } else {
             self.detect_matches(&texts)
         };
@@ -1014,8 +1013,7 @@ impl Plugin for AiResponseGuard {
         let mut json: Value = serde_json::from_slice(body).ok()?;
 
         if self.scan_mode == ScanMode::All {
-            let body_str = std::str::from_utf8(body).ok()?;
-            if !self.detection_set.is_match(body_str) {
+            if self.detect_matches_in_decoded_json(&json).is_empty() {
                 return None;
             }
             let known_texts = self.extract_completion_texts(&json);
@@ -1033,6 +1031,23 @@ impl Plugin for AiResponseGuard {
         }
 
         serde_json::to_vec(&json).ok()
+    }
+}
+
+fn collect_decoded_json_strings<'a>(value: &'a Value, texts: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) => texts.push(text.as_str()),
+        Value::Array(items) => {
+            for item in items {
+                collect_decoded_json_strings(item, texts);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_decoded_json_strings(value, texts);
+            }
+        }
+        _ => {}
     }
 }
 
