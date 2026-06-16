@@ -1837,16 +1837,17 @@ fn grpc_request_body_limit_exceeded(flag: &Option<Arc<std::sync::atomic::AtomicB
 /// least-latency) should be DEFERRED to body completion rather than recorded at
 /// response-header time (#1649 items 2 & 3).
 ///
-/// Defer ONLY a response that looks healthy at headers AND has an open body that
-/// can still fail post-wire — i.e. a `2xx` status (not a configured CB
-/// `failure_status_codes`) whose body is NOT already end-of-stream. Everything
-/// else is header-time-final and must be recorded eagerly:
-///   * **Non-`2xx`** (3xx/4xx/5xx, including a passive `unhealthy_status_codes`
+/// Defer a response whose header-time status is not already a configured
+/// failure/unhealthy signal AND has an open body that can still fail post-wire —
+/// i.e. any `< 500` status (not a configured CB `failure_status_codes` and not
+/// passively unhealthy) whose body is NOT already end-of-stream. Everything else
+/// is header-time-final and must be recorded eagerly:
+///   * **5xx / configured failures** (including a passive `unhealthy_status_codes`
 ///     entry like `429` or a CB failure status): the outcome is known now, so
 ///     trip the breaker / report passive health promptly instead of waiting for a
-///     possibly long-lived/stalled body. Restricting deferral to `2xx` keeps any
-///     non-`2xx` status the resolved CB **or** passive-health config might treat
-///     as unhealthy on the eager path.
+///     possibly long-lived/stalled body. Deferring streamable non-failure 3xx/4xx
+///     responses preserves post-wire body timeout/reset accounting instead of
+///     banking a header-time success before the body can fail.
 ///   * **Already-ended body** (`is_end_stream()` — empty `200`, gRPC
 ///     Trailers-Only, `content-length: 0`, 204/304) OR a **HEAD request** (the
 ///     response body is suppressed regardless of the backend stream's
@@ -1854,11 +1855,12 @@ fn grpc_request_body_limit_exceeded(flag: &Option<Arc<std::sync::atomic::AtomicB
 ///     deferred outcome would be misread as a client disconnect by the
 ///     never-polled `ProxyBody::Drop` path (`src/proxy/body.rs`) and a successful
 ///     no-body probe would never heal a HALF_OPEN breaker (#1649 R7 finding 1).
-///   * **Passively-unhealthy `2xx`** (`status_is_passively_unhealthy`): an
-///     operator may list a `2xx` (e.g. `206`/`299`) in the target's resolved
-///     passive `unhealthy_status_codes`. That header is already a configured
-///     unhealthy outcome, so report it eagerly instead of leaving the target in
-///     rotation until a long-lived/stalled body terminates (#1649 R7 finding 3).
+///   * **Passively-unhealthy status** (`status_is_passively_unhealthy`): an
+///     operator may list an otherwise streamable status (e.g. `206`/`299`/`429`)
+///     in the target's resolved passive `unhealthy_status_codes`. That header is
+///     already a configured unhealthy outcome, so report it eagerly instead of
+///     leaving the target in rotation until a long-lived/stalled body terminates
+///     (#1649 R7 finding 3).
 fn streaming_dispatch_should_defer(
     proxy: &Proxy,
     response_status: u16,
@@ -1869,7 +1871,7 @@ fn streaming_dispatch_should_defer(
     if body_already_ended || request_is_head {
         return false;
     }
-    (200..300).contains(&response_status)
+    response_status < 500
         && !proxy
             .circuit_breaker
             .as_ref()
@@ -12956,7 +12958,7 @@ async fn handle_proxy_request_inner(
                     &response_headers,
                     grpc_streaming.status,
                 );
-                // #1649 item 3: a healthy 2xx streaming header defers the circuit
+                // #1649 item 3: a streamable non-failure streaming header defers the circuit
                 // breaker — for the fully-streaming path the recorder settles it at
                 // the upload-termination + response-completion join (overflow-aware,
                 // #1640), and for the buffered-request path the deferred dispatch
@@ -14583,10 +14585,10 @@ async fn handle_proxy_request_inner(
     // gauge is not decremented twice per request (guard + this call).
     //
     // #1649 item 2: a direct-H2 `StreamingH2` response can fail *after* headers —
-    // a 2xx-then-stall body raises a post-wire read-timeout / reset once the
-    // streaming read-timeout window (#1626) fires. Recording the dispatch outcome
-    // here, at header time, would bank a phantom success and even feed the broken
-    // backend's fast TTFB into least-latency, and a mid-stream failure could never
+    // a streamable non-failure status followed by a stalled body raises a post-wire
+    // read-timeout / reset once the streaming read-timeout window (#1626) fires.
+    // Recording the dispatch outcome here, at header time, would bank a phantom
+    // success and even feed the broken backend's fast TTFB into least-latency, and a mid-stream failure could never
     // correct it. Only that genuinely-unknown case is deferred to body completion
     // via `with_deferred_backend_dispatch_outcome` (mirroring the gRPC streaming
     // path); `streaming_dispatch_should_defer` keeps known-failure-status and
@@ -14602,9 +14604,9 @@ async fn handle_proxy_request_inner(
     // by the deferred path (no `request_body_exceeded` flag is threaded on the H2
     // path, unlike gRPC). So defer HBONE only when NO request-body limit applies —
     // provably no overflow, the same condition that makes direct-H2 safe — which
-    // fixes 2xx-then-stall accounting for the common (unlimited) mesh config so an
-    // HBONE backend that stalls/resets its body after 2xx headers trips the breaker
-    // instead of banking a phantom success (#1649 R8 finding 2). With a request-body
+    // fixes streamable-status-then-stall accounting for the common (unlimited)
+    // mesh config so an HBONE backend that stalls/resets its body after headers
+    // trips the breaker instead of banking a phantom success (#1649 R8 finding 2). With a request-body
     // limit configured, HBONE keeps the eager header-time record (residual
     // follow-up: thread an HBONE request-body overflow flag to defer
     // unconditionally).
