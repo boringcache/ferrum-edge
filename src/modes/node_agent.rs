@@ -1509,9 +1509,7 @@ fn reconcile_existing_pod_ip(
     pod_ip: Option<std::net::Ipv4Addr>,
     state: &mut PodAttachmentState,
 ) -> Option<std::net::Ipv4Addr> {
-    let Some(new_ip) = pod_ip else {
-        return None;
-    };
+    let new_ip = pod_ip?;
     if state.pod_ip == Some(new_ip) {
         return None;
     }
