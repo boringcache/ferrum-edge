@@ -5525,6 +5525,10 @@ fn row_to_proxy(
             .try_get::<i64, _>("pool_max_requests_per_connection")
             .ok()
             .map(|v| v.max(0) as u64),
+        // Derived-only: `pool_http1_max_pending_requests` is projected from the
+        // mesh DestinationRule port overrides at dispatch time, never persisted
+        // as a proxy column, so a DB-loaded proxy always starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_subset: row.try_get::<String, _>("upstream_subset").ok(),
         listen_port: row
             .try_get::<i32, _>("listen_port")

@@ -2632,6 +2632,17 @@ pub struct ProxyState {
     /// `src/backend_conn_limit.rs` for why their pool-internal connection
     /// lifecycle makes a request-keyed counter the wrong control.
     pub backend_conn_limit: Arc<crate::backend_conn_limit::BackendConnectionLimiter>,
+    /// Per-destination *pending-request* limiter enforcing DestinationRule
+    /// `connectionPool.http.http1MaxPendingRequests` on the reqwest/HTTP-1.1
+    /// backend-dispatch path. Bounds how many requests can be simultaneously
+    /// waiting on connection capacity for a `(host, port)`; an over-cap request
+    /// is shed with a 503 ("upstream overflow") in the connection-pending phase
+    /// via an RAII [`crate::backend_pending_limit::BackendPendingGuard`] held
+    /// only until dispatch returns. HTTP/1.1-scoped: the multiplexed transports
+    /// (direct H2, gRPC, H3, HBONE, mesh-mTLS) do NOT consume it — their
+    /// concurrency is governed by `h2_max_concurrent_streams`. See
+    /// `docs/mesh.md` and `src/backend_pending_limit.rs`.
+    pub backend_pending_limit: Arc<crate::backend_pending_limit::BackendPendingLimiter>,
 }
 
 #[inline]
@@ -4182,6 +4193,11 @@ impl ProxyState {
             bpf_metrics_state,
             backend_conn_limit: Arc::new(
                 crate::backend_conn_limit::BackendConnectionLimiter::with_shard_amount(
+                    pool_shard_amount,
+                ),
+            ),
+            backend_pending_limit: Arc::new(
+                crate::backend_pending_limit::BackendPendingLimiter::with_shard_amount(
                     pool_shard_amount,
                 ),
             ),
@@ -15682,12 +15698,22 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
         .h2_upgrade_policy
         .filter(|new| Some(*new) != proxy.h2_upgrade_policy);
 
+    // Per-port `http1MaxPendingRequests` (DestinationRule `connectionPool.http`).
+    // Drives the reqwest/H1 dispatch path's pending-request gate in
+    // `proxy_to_backend` via the effective proxy's
+    // `pool_http1_max_pending_requests`. Project it when the per-port value
+    // differs from what the proxy already carries.
+    let http1_pending_override = override_config
+        .http1_max_pending_requests
+        .filter(|new| Some(*new) != proxy.pool_http1_max_pending_requests);
+
     if connect_override.is_none()
         && h2_streams_override.is_none()
         && idle_seconds_override.is_none()
         && max_reqs_override.is_none()
         && tls_override.is_none()
         && h2_upgrade_override.is_none()
+        && http1_pending_override.is_none()
     {
         return std::borrow::Cow::Borrowed(proxy);
     }
@@ -15710,6 +15736,9 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     }
     if let Some(policy) = h2_upgrade_override {
         owned.h2_upgrade_policy = Some(policy);
+    }
+    if let Some(pending) = http1_pending_override {
+        owned.pool_http1_max_pending_requests = Some(pending);
     }
     std::borrow::Cow::Owned(owned)
 }
@@ -15813,6 +15842,29 @@ pub(crate) fn resolve_backend_max_connections(proxy: &Proxy, dispatch_port: u16)
         .as_ref()
         .and_then(|overrides| overrides.get(&dispatch_port))
         .and_then(|override_config| override_config.max_connections)
+}
+
+/// Resolve the DestinationRule `connectionPool.http.http1MaxPendingRequests`
+/// cap for the destination port a backend dial will target.
+///
+/// Returns `None` (no cap) in the common case: the proxy has no
+/// `dispatch_port_overrides`, the resolved port has no override, or the
+/// override carries no `http1_max_pending_requests`. Hot-path discipline
+/// matches [`resolve_backend_max_connections`]: a single field read on the
+/// precomputed `Proxy.dispatch_port_overrides` map, no `ArcSwap` load.
+///
+/// `dispatch_port` is the port the dial will actually use: the LB-selected
+/// `UpstreamTarget.port` for upstream proxies, or `proxy.backend_port` for a
+/// direct-backend proxy with no upstream.
+pub(crate) fn resolve_backend_http1_max_pending_requests(
+    proxy: &Proxy,
+    dispatch_port: u16,
+) -> Option<u32> {
+    proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&dispatch_port))
+        .and_then(|override_config| override_config.http1_max_pending_requests)
 }
 
 /// Resolve the per-port retry lane after a concrete target has failed.
@@ -16800,6 +16852,66 @@ async fn proxy_to_backend(
             );
         }
     }
+
+    // DestinationRule `connectionPool.http.http1MaxPendingRequests`: bound the
+    // number of requests simultaneously waiting on connection capacity for this
+    // backend destination on the reqwest/HTTP-1.1 dispatch path. This is the
+    // *pending-acquire phase* — acquire a slot here, immediately before the
+    // request is dispatched onto the shared reqwest client; the RAII guard is
+    // held only until this function returns (response begun / dial failed), so
+    // a request counts as "pending" exactly while it waits for a connection
+    // slot, matching Envoy's pending-request gauge. When the queue is full the
+    // request is shed with a 503 ("upstream overflow"), NOT queued unboundedly.
+    //
+    // HTTP/1.1-scoped: the direct-H2 / gRPC / H3 / HBONE / mesh-mTLS branches
+    // above already returned before reaching here, so the multiplexed transports
+    // never consult this gate (their concurrency is governed by
+    // `http2MaxRequests` → `h2_max_concurrent_streams`). The retry path
+    // (`proxy_to_backend_retry`) deliberately does NOT acquire a pending slot,
+    // so an initial attempt and its connection-failure retry never both count.
+    let pending_dispatch_port = upstream_target
+        .map(|t| t.port)
+        .unwrap_or(proxy.backend_port);
+    let pending_cap = resolve_backend_http1_max_pending_requests(proxy, pending_dispatch_port);
+    let _pending_slot = match state.backend_pending_limit.try_acquire(
+        effective_host,
+        pending_dispatch_port,
+        pending_cap,
+    ) {
+        Ok(slot) => slot,
+        Err(limit) => {
+            warn!(
+                proxy_id = %proxy.id,
+                backend_host = %effective_host,
+                backend_port = pending_dispatch_port,
+                pending_requests = limit.current,
+                max_pending_requests = limit.cap,
+                "Shedding HTTP/1.1 request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
+            );
+            return backend_dispatch_response(
+                retry::BackendResponse {
+                    status_code: 503,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Upstream pending request queue full"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    // Gateway-side capacity shed before any backend dial: the
+                    // request never reached the backend application layer, but
+                    // it is classified `DispatchPolicyRejected` (NOT a transport
+                    // connection_error) so retries do not amplify the overflow
+                    // or trip backend circuit breakers — mirrors the
+                    // backend-TLS-SNI gateway reject above.
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
+                    error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                },
+                None,
+                None,
+            );
+        }
+    };
 
     // Get client from connection pool for HTTP/1.1 and HTTP/2.
     // The client uses our DnsCacheResolver for transparent DNS cache lookups.
@@ -25996,6 +26108,64 @@ mod tests {
         );
     }
 
+    // ── DestinationRule per-port http1MaxPendingRequests resolution ──────
+    //
+    // `resolve_backend_http1_max_pending_requests` is the projection seam the
+    // reqwest/H1 dispatch path reads to enforce
+    // `connectionPool.http.http1MaxPendingRequests`. Same contract shape as the
+    // maxConnections resolver: the cap surfaces only for the matching
+    // destination port; no-override / no-cap / wrong-port all return `None`.
+
+    fn proxy_with_http1_pending_override(port: u16, cap: Option<u32>) -> Proxy {
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "id": "p-pending",
+            "backend_host": "backend.local",
+            "backend_port": 8080,
+            "upstream_id": "u1",
+        }))
+        .expect("test proxy should deserialize");
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            port,
+            crate::config::types::ResolvedPortOverride {
+                http1_max_pending_requests: cap,
+                ..Default::default()
+            },
+        )]));
+        proxy
+    }
+
+    #[test]
+    fn resolve_backend_http1_max_pending_returns_cap_for_matching_port() {
+        let proxy = proxy_with_http1_pending_override(8080, Some(64));
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&proxy, 8080),
+            Some(64),
+            "cap must surface for the matching destination port"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_http1_max_pending_none_for_other_port_or_no_override() {
+        let proxy = proxy_with_http1_pending_override(8080, Some(64));
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&proxy, 9090),
+            None,
+            "a port without an override must be unbounded"
+        );
+        let no_overrides = proxy_with_port_overrides_for_test(5000, &[]);
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&no_overrides, 8080),
+            None,
+            "a proxy with no port overrides must be unbounded"
+        );
+        let lacks_cap = proxy_with_http1_pending_override(8080, None);
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&lacks_cap, 8080),
+            None,
+            "an override without http1_max_pending_requests must be unbounded"
+        );
+    }
+
     #[test]
     fn resolve_effective_proxy_returns_borrowed_when_no_upstream_target() {
         // Direct-backend proxy (no upstream) → no per-target lookup possible.
@@ -26071,6 +26241,25 @@ mod tests {
         let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
         assert!(matches!(effective, std::borrow::Cow::Owned(_)));
         assert_eq!(effective.pool_max_requests_per_connection, Some(40));
+    }
+
+    #[test]
+    fn resolve_effective_proxy_projects_http1_max_pending_requests_per_port() {
+        // The per-port `http1MaxPendingRequests` cap projects onto the effective
+        // proxy's `pool_http1_max_pending_requests`, which the reqwest/H1
+        // dispatch gate then reads (via `resolve_backend_http1_max_pending_requests`).
+        let proxy = proxy_with_http1_pending_override(8080, Some(64));
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Owned(_)),
+            "differing pending cap must take the owned-clone branch"
+        );
+        assert_eq!(effective.pool_http1_max_pending_requests, Some(64));
+        assert!(
+            proxy.pool_http1_max_pending_requests.is_none(),
+            "original proxy is untouched"
+        );
     }
 
     #[test]

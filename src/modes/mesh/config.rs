@@ -1762,15 +1762,13 @@ pub struct MeshTrafficPolicy {
     /// Optional `DestinationRule.trafficPolicy.connectionPool.http` block.
     /// When present, the K8s translator has parsed at least one of the
     /// supported HTTP connection-pool knobs (`maxRequestsPerConnection`,
-    /// `idleTimeout`, `http2MaxRequests`, `h2UpgradePolicy`, `maxRetries`);
-    /// the mesh apply layer projects these onto the matching upstream's
-    /// `port_overrides[port]` slot (top-level fan-out applies to every
-    /// target port; per-port `portLevelSettings` overrides per-port). Old
-    /// DPs reading new slices see this as a no-op via the serde default.
-    /// The only currently-deferred Istio HTTP knob,
-    /// `http1MaxPendingRequests`, is intentionally absent — the K8s
-    /// translator emits a warning when an operator sets it and otherwise
-    /// drops it (it needs a Ferrum-side pending-request gauge).
+    /// `idleTimeout`, `http2MaxRequests`, `h2UpgradePolicy`, `maxRetries`,
+    /// `http1MaxPendingRequests`); the mesh apply layer projects these onto
+    /// the matching upstream's `port_overrides[port]` slot (top-level fan-out
+    /// applies to every target port; per-port `portLevelSettings` overrides
+    /// per-port). Old DPs reading new slices see this as a no-op via the
+    /// serde default. There are no longer any deferred `connectionPool.http`
+    /// knobs at top-level/`portLevelSettings` scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_pool_http: Option<MeshConnectionPoolHttp>,
 }
@@ -1822,6 +1820,18 @@ pub struct MeshConnectionPoolHttp {
     /// positive when set (zero/negative rejected at translate time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
+    /// Mapped from `http1MaxPendingRequests`. The maximum number of requests
+    /// that may be simultaneously *waiting on connection capacity* for a
+    /// backend destination on the HTTP/1.1 dispatch path. Projects onto
+    /// `Upstream.port_overrides[port].http1_max_pending_requests` and is
+    /// enforced as a per-`(host, port)` pending gate: when the queue is full a
+    /// new H1 request is shed with a 503 ("upstream overflow" in Envoy terms)
+    /// rather than queued unboundedly. HTTP/1.1-scoped: it does NOT gate
+    /// direct-H2 / gRPC / HTTP/3 / HBONE / mesh-mTLS dispatch (those use
+    /// `http2MaxRequests` → `h2_max_concurrent_streams` for concurrency).
+    /// Always positive when set (zero/negative rejected at translate time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http1_max_pending_requests: Option<u32>,
 }
 
 /// `DestinationRule.trafficPolicy.tls` settings mapped from Istio's
