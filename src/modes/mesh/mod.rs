@@ -12461,13 +12461,20 @@ mod tests {
         };
         let mut service = http_mesh_service("redis", 6379, spiffe);
         service.ports[0].protocol = AppProtocol::Redis;
+        service.ports[0].target_port = Some(ServiceTargetPort::Name("redis".to_string()));
+        let mut local = workload("redis", "redis");
+        local.ports = vec![WorkloadPort {
+            port: 6379,
+            protocol: AppProtocol::Redis,
+            name: Some("redis".to_string()),
+        }];
         let slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
             version: "test".to_string(),
             workloads: Vec::new(),
             services: Vec::new(),
-            local_inbound_workloads: Some(vec![workload("redis", "redis")]),
+            local_inbound_workloads: Some(vec![local]),
             local_inbound_services: vec![service],
             ..MeshSlice::default()
         };
