@@ -860,6 +860,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     // HBONE routes; Sidecar (SVID-mTLS) lands in a follow-up.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_tcp_upstreams(&mut config, runtime, mesh_slice);
+    materialize_mesh_outbound_udp_upstreams(&mut config, runtime, mesh_slice);
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
     project_mesh_source_locality(&mut config, runtime, mesh_slice);
     // Project slice-filtered ServiceEntries back into the prepared mesh
@@ -1948,16 +1949,13 @@ pub(crate) fn service_tcp_stream_ports(
 
 /// UDP service ports of an in-mesh service, with `protocol_overrides` applied:
 /// the third leg of the HTTP-family / raw-TCP-stream / UDP port partition.
-/// UDP capture/egress is not yet wired (REDIRECT / `SO_ORIGINAL_DST` does not
-/// apply to the UDP model), so this currently materializes nothing — it exists
-/// so a `protocol: UDP` port partitions cleanly out of the other two lanes
-/// instead of being mis-routed as HTTP, and so the later F3 §3.3 datapath stage
-/// has a single forward-derivation source. Mirrors [`service_http_family_ports`]
-/// and [`service_tcp_stream_ports`].
-// Inert in this schema-only stage: the UDP capture/egress materializer that
-// consumes this arrives in a later F3 §3.3 stage. Exercised today only by the
-// partition unit test.
-#[allow(dead_code)]
+/// Consumed by the Ambient UDP egress materializer
+/// (`materialize_mesh_outbound_udp_upstreams`, F3 §3.3 Stage 4) and the route
+/// table's `mesh_udp_egress` index — a captured UDP datagram whose orig-dst
+/// matches `(service VIP, UDP service port)` is tunnelled over a `udp`-marked
+/// HBONE CONNECT. Mirrors [`service_http_family_ports`] and
+/// [`service_tcp_stream_ports`]; the SINGLE forward-derivation source the
+/// materializer, the route table, and the capability enrollment share.
 pub(crate) fn service_udp_stream_ports(
     service: &crate::modes::mesh::config::MeshService,
 ) -> Vec<&crate::modes::mesh::config::ServicePort> {
@@ -2084,6 +2082,17 @@ fn mesh_outbound_upstream_id(namespace: &str, name: &str, port: u16) -> String {
 /// fan-out between its HTTP and TCP lanes. Same non-route prefix rationale.
 pub(crate) fn mesh_outbound_tcp_upstream_id(namespace: &str, name: &str, port: u16) -> String {
     format!("__mesh-out-tcp-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
+}
+
+/// Upstream id for a materialized UDP egress port, one per UDP service port
+/// (F3 §3.3 Stage 4). A DISTINCT id space from both
+/// [`mesh_outbound_upstream_id`] (HTTP per-port) and
+/// [`mesh_outbound_tcp_upstream_id`] (raw-TCP per-port) so a service exposing
+/// the same port number across the three lanes (via `protocol_overrides` skew)
+/// can never conflate LB counters / passive health / DR fan-out. Same non-route
+/// prefix rationale (never enters the route table or `config.proxies`).
+pub(crate) fn mesh_outbound_udp_upstream_id(namespace: &str, name: &str, port: u16) -> String {
+    format!("__mesh-out-udp-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
 
 /// Upstream id for a raw-TCP egress upstream addressed by a DIRECT pod IP
@@ -3308,6 +3317,118 @@ fn materialize_mesh_outbound_tcp_upstreams(
     }
 }
 
+/// Materialize per-port UDP egress upstreams for the UDP service ports of
+/// in-mesh services (F3 §3.3 Stage 4). **Ambient-only.**
+///
+/// Like raw-TCP egress, NO route proxy enters the config: a UDP datagram has no
+/// Host header to route by. Instead the captured datagram's original
+/// destination (recovered from the TPROXY `IP_RECVORIGDSTADDR` cmsg, NOT
+/// `SO_ORIGINAL_DST` which is TCP-only) is matched STRICTLY against
+/// `(cluster_ip, UDP service port)` by the route table's `mesh_udp_egress`
+/// index and tunnelled over a `udp`-marked HBONE CONNECT to the LB-selected
+/// workload's app port (length-delimited datagrams — see
+/// `crate::proxy::mesh_udp_frame`). The destination's inbound relay unframes the
+/// tunnel into a local `UdpSocket` to the CONNECT authority.
+///
+/// **Sidecar UDP egress is intentionally DEFERRED**: Sidecar peers expose no
+/// `:15008` HBONE listener (they speak plain SVID-mTLS HTTP on `:15006`), so a
+/// datagram tunnel there would need a `MeshMtlsConnectionPool` datagram variant.
+/// The materializer therefore gates `Ambient => Hbone, _ => return`; a non-Ambient
+/// topology materializes nothing and UDP stays outside the mesh (documented
+/// follow-up). Headless / VIP-less UDP services also materialize nothing (a UDP
+/// datagram carries no Host, so captured dials are matched strictly by VIP).
+fn materialize_mesh_outbound_udp_upstreams(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
+    // Ambient-only: HBONE datagram tunnel over `:15008`. Sidecar UDP egress is
+    // deferred (no `:15008`; needs a mesh-mTLS datagram tunnel).
+    let transport = match runtime.topology {
+        MeshTopology::Ambient => MeshEgressTransport::Hbone,
+        _ => return,
+    };
+    let multi_cluster = mesh_slice.multi_cluster.as_ref();
+    let now = chrono::Utc::now();
+    let mut materialized = 0usize;
+    for service in &mesh_slice.services {
+        let udp_ports = service_udp_stream_ports(service);
+        if udp_ports.is_empty() {
+            continue;
+        }
+        if service.cluster_ips.is_empty() {
+            warn!(
+                service = %service.name,
+                namespace = %service.namespace,
+                udp_ports = udp_ports.len(),
+                "In-mesh service declares UDP ports but carries no cluster_ips; UDP egress maps \
+                 captured original destinations to services strictly by service VIP (a datagram \
+                 has no Host header and a bare port number is ambiguous), so these ports cannot \
+                 be egress-routed. Headless services are expected here; otherwise populate \
+                 cluster_ips."
+            );
+            continue;
+        }
+        for service_port in &udp_ports {
+            let protocol = service
+                .protocol_overrides
+                .get(&service_port.port)
+                .copied()
+                .unwrap_or(service_port.protocol);
+            let targets = build_outbound_mesh_targets(
+                transport,
+                runtime,
+                service,
+                service_port,
+                protocol,
+                &mesh_slice.workloads,
+                multi_cluster,
+                false,
+            );
+            if targets.is_empty() {
+                debug!(
+                    service = %service.name,
+                    namespace = %service.namespace,
+                    service_port = service_port.port,
+                    "Skipping UDP mesh service port with no reachable local-cluster workload targets"
+                );
+                continue;
+            }
+            let upstream_id =
+                mesh_outbound_udp_upstream_id(&service.namespace, &service.name, service_port.port);
+            let service_fqdn = format!(
+                "{}.{}.svc.{}",
+                service.name,
+                service.namespace,
+                runtime.cluster_domain.trim_matches('.')
+            );
+            let upstream = mesh_outbound_route_upstream(
+                &upstream_id,
+                &service.namespace,
+                &service_fqdn,
+                targets,
+                now,
+            );
+            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+                *existing = upstream;
+            } else {
+                config.upstreams.push(upstream);
+            }
+            materialized += 1;
+        }
+    }
+
+    if materialized > 0 {
+        info!(
+            udp_upstreams = materialized,
+            topology = ?runtime.topology,
+            "Materialized mesh UDP egress upstreams for in-mesh services (datagrams tunnelled over \
+             a udp-marked HBONE CONNECT, selected by captured original destination against service \
+             VIPs)"
+        );
+    }
+}
+
 /// Reserved id prefix for the synthesized raw-TCP egress relay proxies. Like
 /// the upstream id, deliberately NOT under `__mesh-outbound-` so it can never
 /// be misclassified as a direction-scoped route id — these proxies never
@@ -3339,7 +3460,7 @@ pub(crate) fn mesh_outbound_tcp_relay_proxy(
 ) -> Proxy {
     let id = format!("{MESH_OUTBOUND_TCP_RELAY_PROXY_ID_PREFIX}{namespace}-{name}-{port}")
         .replace(['/', '.'], "-");
-    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id)
+    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id, BackendScheme::Tcp)
 }
 
 /// Build the synthesized relay proxy backing one DIRECT-pod-IP raw-TCP egress
@@ -3359,24 +3480,54 @@ pub(crate) fn mesh_outbound_tcp_bywl_relay_proxy(
         "{MESH_OUTBOUND_TCP_BYWL_RELAY_PROXY_ID_PREFIX}{namespace}-{name}-{port}-{canonical_ip}"
     )
     .replace(['/', '.', ':'], "-");
-    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id)
+    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id, BackendScheme::Tcp)
 }
 
-/// Shared body for the raw-TCP egress relay proxies (VIP and by-workload). The
-/// only fields that vary between the two are the `id` and the `upstream_id` it
-/// dispatches through — everything else (the `BackendScheme::Tcp` capability
-/// gate, the connect/read/write budgets, the stream idle default) is identical,
-/// so both relay flavors stay byte-for-byte consistent in the capability key /
-/// pool-config dimensions.
-fn mesh_outbound_tcp_relay_proxy_with_id(id: String, namespace: &str, upstream_id: &str) -> Proxy {
+/// Reserved id prefix for the synthesized UDP egress relay proxies (F3 §3.3
+/// Stage 4). Same non-route-prefix rationale as the raw-TCP relay proxies; a
+/// DISTINCT prefix so a TCP relay proxy and a UDP relay proxy for the same
+/// service port never collide in the capability registry / pool-config keys.
+pub(crate) const MESH_OUTBOUND_UDP_RELAY_PROXY_ID_PREFIX: &str = "__mesh-out-udp-relay-";
+
+/// Build the synthesized relay proxy backing one UDP egress entry (F3 §3.3
+/// Stage 4). Same deterministic shape and capability/pool-config contract as
+/// [`mesh_outbound_tcp_relay_proxy`] (shares the builder body), but uses
+/// `BackendScheme::Udp` — which the capability probe gate recognizes for HBONE
+/// probing (a UDP egress target still rides an HBONE CONNECT, so its HBONE
+/// support must be proven) while keeping the plain-HTTP/h2c probes off it. The
+/// id is forward-derived, never parsed.
+pub(crate) fn mesh_outbound_udp_relay_proxy(
+    namespace: &str,
+    name: &str,
+    port: u16,
+    upstream_id: &str,
+) -> Proxy {
+    let id = format!("{MESH_OUTBOUND_UDP_RELAY_PROXY_ID_PREFIX}{namespace}-{name}-{port}")
+        .replace(['/', '.'], "-");
+    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id, BackendScheme::Udp)
+}
+
+/// Shared body for the mesh egress relay proxies (raw-TCP VIP/by-workload and
+/// UDP). The fields that vary between flavors are the `id`, the `upstream_id` it
+/// dispatches through, and the `scheme` (`Tcp` for raw-TCP, `Udp` for UDP — both
+/// keep the plain-HTTP/h2c probes away from the app port while still letting the
+/// HBONE probe run); everything else (the connect/read/write budgets, the stream
+/// idle default) is identical, so the flavors stay byte-for-byte consistent in
+/// the capability key / pool-config dimensions.
+fn mesh_outbound_tcp_relay_proxy_with_id(
+    id: String,
+    namespace: &str,
+    upstream_id: &str,
+    scheme: BackendScheme,
+) -> Proxy {
     let now = chrono::Utc::now();
     Proxy {
-        name: Some(format!("mesh raw-tcp egress {id}")),
+        name: Some(format!("mesh egress {id}")),
         id,
         namespace: namespace.to_string(),
         hosts: Vec::new(),
         listen_path: None,
-        backend_scheme: Some(BackendScheme::Tcp),
+        backend_scheme: Some(scheme),
         dispatch_kind: Default::default(),
         backend_host: String::new(),
         backend_port: 0,

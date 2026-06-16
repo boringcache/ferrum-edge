@@ -15,6 +15,14 @@ use crate::identity::SpiffeId;
 pub const ISTIO_HBONE_PORT: u16 = 15008;
 pub const BAGGAGE_HEADER: &str = "baggage";
 pub const HBONE_PROTOCOL: &str = "hbone";
+/// `x-ferrum-mesh-protocol` value stamped on a datagram-over-HBONE CONNECT
+/// (F3 §3.3 Stage 4). DISTINCT from [`HBONE_PROTOCOL`]: a `udp` CONNECT carries
+/// length-delimited datagrams (see `crate::proxy::mesh_udp_frame`), not a raw
+/// byte stream, so the destination MUST unframe it into a local `UdpSocket`
+/// rather than byte-relaying it to a TCP backend. The two markers are mutually
+/// exclusive; an OLD destination that predates Stage 4 sees an unrecognized
+/// marker and `is_hbone_connect` returns `false`, so it 404s (fail-closed skew).
+pub const UDP_PROTOCOL: &str = "udp";
 
 /// Per-stream identity metadata carried by ambient HBONE requests.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -107,6 +115,35 @@ pub fn is_hbone_connect(method: &Method, version: Version, headers: &HeaderMap) 
         .or_else(|| headers.get("x-istio-protocol"))
         .and_then(|value| value.to_str().ok());
     protocol.is_none_or(|value| value.eq_ignore_ascii_case(HBONE_PROTOCOL))
+}
+
+/// Detect a datagram-over-HBONE CONNECT (F3 §3.3 Stage 4): an HTTP/2 CONNECT
+/// carrying an EXPLICIT `x-ferrum-mesh-protocol: udp` (or `x-istio-protocol: udp`)
+/// marker.
+///
+/// This is intentionally NARROWER than [`is_hbone_connect`]: where the HBONE
+/// predicate accepts a marker-LESS CONNECT (`None` → byte-stream HBONE), the UDP
+/// predicate requires the EXPLICIT `udp` marker. That keeps the two transports
+/// disjoint — a bare CONNECT is byte-stream HBONE (`is_hbone_connect` true,
+/// `is_udp_hbone_connect` false); a `udp`-marked CONNECT is datagram UDP
+/// (`is_hbone_connect` FALSE because the marker isn't `hbone`,
+/// `is_udp_hbone_connect` true). A destination that predates Stage 4 has no
+/// `udp` branch, so a `udp` CONNECT falls through both its `is_hbone_connect`
+/// check (false) and its (absent) UDP check → 404, the fail-closed skew posture.
+///
+/// Like [`is_hbone_connect`] this is a WIRE-SHAPE predicate only and says
+/// nothing about the authenticated peer. The relay path must still require an
+/// authenticated mesh peer (`peer_spiffe_id.is_some()`) before unframing a
+/// `udp` CONNECT into a local socket — a marker alone never authorizes a tunnel.
+pub fn is_udp_hbone_connect(method: &Method, version: Version, headers: &HeaderMap) -> bool {
+    if method != Method::CONNECT || version != Version::HTTP_2 {
+        return false;
+    }
+    headers
+        .get("x-ferrum-mesh-protocol")
+        .or_else(|| headers.get("x-istio-protocol"))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case(UDP_PROTOCOL))
 }
 
 /// Predicate combining the [`is_hbone_connect`] wire shape **and** an

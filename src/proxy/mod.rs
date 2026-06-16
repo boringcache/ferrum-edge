@@ -43,6 +43,7 @@ pub mod http2_pool;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
 pub mod mesh_udp_capture;
+pub mod mesh_udp_frame;
 pub mod netns_capture;
 pub mod sni;
 pub mod stream_error;
@@ -4422,6 +4423,43 @@ impl ProxyState {
                 }
             }
         }
+
+        // Third pass: the UDP egress upstreams (F3 §3.3 Stage 4). Same trap as
+        // the raw-TCP VIP upstreams — referenced by NO config proxy, so without
+        // enrollment `retain_keys` evicts their HBONE records and every Ambient
+        // UDP dial 502s `hbone_required` forever. Built from the SAME
+        // deterministic UDP relay proxy the route table / dispatch use, so probe
+        // and dispatch capability keys agree. UDP egress is Ambient-only, so all
+        // its targets carry `mesh.hbone` (there is no Sidecar UDP target to
+        // skip); the predicate is kept for consistency with the TCP passes.
+        for service in &mesh.services {
+            for sp in crate::modes::mesh::service_udp_stream_ports(service) {
+                let upstream_id = crate::modes::mesh::mesh_outbound_udp_upstream_id(
+                    &service.namespace,
+                    &service.name,
+                    sp.port,
+                );
+                let Some(upstream) = upstream_map.get(upstream_id.as_str()) else {
+                    continue;
+                };
+                let relay_proxy = crate::modes::mesh::mesh_outbound_udp_relay_proxy(
+                    &service.namespace,
+                    &service.name,
+                    sp.port,
+                    &upstream_id,
+                );
+                for target in &upstream.targets {
+                    if !crate::proxy::hbone_pool::target_hbone_enabled(target) {
+                        continue;
+                    }
+                    let probe_target =
+                        BackendCapabilityProbeTarget::from_proxy(&relay_proxy, Some(target));
+                    if seen.insert(probe_target.key.clone()) {
+                        targets.push(probe_target);
+                    }
+                }
+            }
+        }
     }
 
     fn collect_mesh_route_dispatch_capability_targets(
@@ -4567,11 +4605,20 @@ impl ProxyState {
             BackendScheme::Tcp | BackendScheme::Tcps | BackendScheme::Udp | BackendScheme::Dtls => {
             }
         }
-        // `Tcp` joins `Http` here for the raw-TCP mesh egress relay targets:
-        // their scheme keeps the plain-HTTP/h2c probes away from a raw-TCP
-        // app port (nothing above probes the Tcp arm), but HBONE support must
-        // still be proven — the probe only performs the CONNECT handshake.
-        if target.hbone_hint && matches!(scheme, BackendScheme::Http | BackendScheme::Tcp) {
+        // `Tcp` and `Udp` join `Http` here for the mesh egress relay targets:
+        // their scheme keeps the plain-HTTP/h2c probes away from a raw-TCP /
+        // UDP app port (nothing above probes those arms), but HBONE support
+        // must still be proven — a UDP egress target rides a `udp`-marked HBONE
+        // CONNECT, so without this its HBONE record is never probed AND
+        // `retain_keys` evicts it, permanently failing the UDP dispatch gate
+        // closed (the same trap as raw-TCP). The probe only performs the CONNECT
+        // handshake, identical for both transports.
+        if target.hbone_hint
+            && matches!(
+                scheme,
+                BackendScheme::Http | BackendScheme::Tcp | BackendScheme::Udp
+            )
+        {
             self.probe_hbone(
                 &probe_proxy,
                 probe_timeout,
