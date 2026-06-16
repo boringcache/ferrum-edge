@@ -1770,6 +1770,53 @@ fn open_epoch_is_visible_to_a_probe_admitted_immediately_after_open() {
 }
 
 #[test]
+fn open_generation_is_preserved_across_non_open_transitions() {
+    // #1649 R7: the generation is packed into the same atomic as state+count and
+    // must be PRESERVED by every non-open transition (probe admission, slot
+    // release, recovery/close) and advanced ONLY by opens. A packing bug that
+    // dropped or mutated the generation on a slot release or a close would silently
+    // break the deferred-streaming stale check. Drive a full open → probe →
+    // recover → re-trip cycle and assert the generation only moves on opens.
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 2, // two probes recover -> exercises slot churn + close
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 2,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+    assert_eq!(cb.open_epoch(), 0);
+
+    cb.record_failure(500, false, false); // CLOSED -> OPEN, gen 1
+    assert_eq!(cb.state_name(), "open");
+    assert_eq!(cb.open_epoch(), 1);
+
+    // Admit two probes (slot acquisitions) — generation preserved.
+    assert!(cb.can_execute().unwrap());
+    assert!(cb.can_execute().unwrap());
+    assert_eq!(cb.half_open_in_flight(), 2);
+    assert_eq!(cb.open_epoch(), 1, "admission preserves the generation");
+
+    // Two successes release slots and close the breaker (recovery) — generation
+    // preserved (a close is not a new open cycle).
+    cb.record_success(true);
+    cb.record_success(true);
+    assert_eq!(cb.state_name(), "closed");
+    assert_eq!(cb.half_open_in_flight(), 0);
+    assert_eq!(
+        cb.open_epoch(),
+        1,
+        "recovery/close and slot releases preserve the generation"
+    );
+
+    // Re-trip: a brand-new open cycle advances the generation again.
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+    assert_eq!(cb.open_epoch(), 2, "a fresh open advances the generation");
+}
+
+#[test]
 fn can_execute_with_admission_epoch_returns_the_admitted_generation() {
     // #1649 R6 finding 3: the admission epoch must reflect the generation the
     // request is admitted under. A CLOSED admission captures the last open

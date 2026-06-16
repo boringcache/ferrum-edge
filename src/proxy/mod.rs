@@ -1848,16 +1848,25 @@ fn grpc_request_body_limit_exceeded(flag: &Option<Arc<std::sync::atomic::AtomicB
 ///     non-`2xx` status the resolved CB **or** passive-health config might treat
 ///     as unhealthy on the eager path.
 ///   * **Already-ended body** (`is_end_stream()` — empty `200`, gRPC
-///     Trailers-Only, `content-length: 0`, HEAD/204/304): nothing streams, so a
+///     Trailers-Only, `content-length: 0`, 204/304) OR a **HEAD request** (the
+///     response body is suppressed regardless of the backend stream's
+///     `END_STREAM` state at header time): nothing streams to the client, so a
 ///     deferred outcome would be misread as a client disconnect by the
 ///     never-polled `ProxyBody::Drop` path (`src/proxy/body.rs`) and a successful
-///     no-body probe would never heal a HALF_OPEN breaker.
+///     no-body probe would never heal a HALF_OPEN breaker (#1649 R7 finding 1).
+///   * **Passively-unhealthy `2xx`** (`status_is_passively_unhealthy`): an
+///     operator may list a `2xx` (e.g. `206`/`299`) in the target's resolved
+///     passive `unhealthy_status_codes`. That header is already a configured
+///     unhealthy outcome, so report it eagerly instead of leaving the target in
+///     rotation until a long-lived/stalled body terminates (#1649 R7 finding 3).
 fn streaming_dispatch_should_defer(
     proxy: &Proxy,
     response_status: u16,
     body_already_ended: bool,
+    request_is_head: bool,
+    status_is_passively_unhealthy: bool,
 ) -> bool {
-    if body_already_ended {
+    if body_already_ended || request_is_head {
         return false;
     }
     (200..300).contains(&response_status)
@@ -1865,6 +1874,31 @@ fn streaming_dispatch_should_defer(
             .circuit_breaker
             .as_ref()
             .is_some_and(|cb| cb.failure_status_codes.contains(&response_status))
+        && !status_is_passively_unhealthy
+}
+
+/// Whether `response_status` is in the dispatched target's effective passive
+/// `unhealthy_status_codes`, resolved with the SAME precedence as the
+/// passive-health reporter ([`backend_dispatch::passive_health_for_target`]) so
+/// the header-time eager-vs-defer decision and the eventual passive-health report
+/// agree (#1649 R7 finding 3). Returns false for direct-backend proxies (no
+/// upstream) or when no passive health is configured.
+fn streaming_response_status_is_passively_unhealthy(
+    lb_snapshot: &crate::load_balancer::LoadBalancerCacheInner,
+    proxy: &Proxy,
+    target: Option<&UpstreamTarget>,
+    response_status: u16,
+) -> bool {
+    let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), target) else {
+        return false;
+    };
+    let Some(upstream) =
+        crate::load_balancer::LoadBalancerCache::get_upstream_from(lb_snapshot, upstream_id)
+    else {
+        return false;
+    };
+    backend_dispatch::passive_health_for_target(proxy, &upstream, target)
+        .is_some_and(|passive| passive.unhealthy_status_codes.contains(&response_status))
 }
 
 /// Owns the gRPC **streaming** circuit-breaker outcome, settling it at the join of
@@ -12949,6 +12983,14 @@ async fn handle_proxy_request_inner(
                     &proxy,
                     grpc_backend_dispatch_status,
                     grpc_body_ended,
+                    // gRPC requests are always POST — never a body-suppressed HEAD.
+                    false,
+                    streaming_response_status_is_passively_unhealthy(
+                        &epoch.load_balancer,
+                        &proxy,
+                        grpc_final_upstream_target.as_deref(),
+                        grpc_backend_dispatch_status,
+                    ),
                 ) {
                     false
                 } else if let Some(cb_config) = &proxy.circuit_breaker {
@@ -14537,7 +14579,20 @@ async fn handle_proxy_request_inner(
     };
     let defer_streaming_h2_dispatch = matches!(&response_body, ResponseBody::StreamingH2(_))
         && !current_dispatch_hbone
-        && streaming_dispatch_should_defer(&proxy, response_status, streaming_h2_body_ended);
+        && streaming_dispatch_should_defer(
+            &proxy,
+            response_status,
+            streaming_h2_body_ended,
+            // HEAD responses suppress the body, so a deferred outcome would be
+            // misread as a client disconnect (#1649 R7 finding 1).
+            method.eq_ignore_ascii_case("HEAD"),
+            streaming_response_status_is_passively_unhealthy(
+                &epoch.load_balancer,
+                &proxy,
+                upstream_target.as_deref(),
+                response_status,
+            ),
+        );
     // TTFB captured at header arrival; reused whether the deferred outcome is
     // recorded synchronously (an after_proxy reject replaced the streaming body)
     // or at body completion, matching the synchronous path's

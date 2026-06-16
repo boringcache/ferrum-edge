@@ -15,49 +15,67 @@ const STATE_CLOSED: u8 = 0;
 const STATE_OPEN: u8 = 1;
 const STATE_HALF_OPEN: u8 = 2;
 
-// The breaker's `state` and its `half_open_in_flight` probe counter are packed
-// into a SINGLE `AtomicU32` so that every state transition and every probe
-// admission is one atomic compare-exchange. With two separate atomics, no
-// ordering of two stores can make "publish state X" and "set/clear the probe
-// count" happen together, leaving a race window in which a concurrent
-// `can_execute()` observes a transient (state, count) pair and over-admits,
-// admits after a reopen, or wedges the breaker at capacity. Packing them
-// removes the window entirely: the high 2 bits hold the state, the low 30 bits
-// hold the in-flight count (far beyond any realistic `half_open_max_requests`).
+// The breaker's open `generation`, its `state`, and its `half_open_in_flight`
+// probe counter are packed into a SINGLE `AtomicU64` so that every state
+// transition, probe admission, and generation bump is ONE atomic
+// compare-exchange. With separate atomics, no ordering of two stores can make
+// "publish state X", "set/clear the probe count", and "advance the generation"
+// happen together, leaving race windows in which a concurrent `can_execute()`
+// observes a transient triple and over-admits, admits after a reopen, wedges the
+// breaker at capacity, OR (#1649) captures a stale/loser-advanced generation.
+// Fusing them removes every window: the high 32 bits hold the generation, the
+// next 2 bits hold the state, and the low 30 bits hold the in-flight count (far
+// beyond any realistic `half_open_max_requests`). Because the generation bump
+// rides the SAME CAS as the OPEN transition, only the transition winner advances
+// it, and the new generation is visible to any observer that sees OPEN — so a
+// deferred streaming outcome captured at admission compares against a coherent
+// generation (#1649 R5 finding 2 / R7 — no bump-before/after race, no loser
+// bumps). The generation is compared for equality only; 32 bits (4 billion opens
+// of a single breaker within one streaming request's lifetime) cannot collide in
+// practice, and it wraps harmlessly.
 const STATE_SHIFT: u32 = 30;
 const COUNT_MASK: u32 = (1u32 << STATE_SHIFT) - 1;
 
 #[inline]
-const fn pack(state: u8, count: u32) -> u32 {
-    ((state as u32) << STATE_SHIFT) | (count & COUNT_MASK)
+const fn pack_full(generation: u32, state: u8, count: u32) -> u64 {
+    ((generation as u64) << 32)
+        | (((state as u32) << STATE_SHIFT) as u64)
+        | ((count & COUNT_MASK) as u64)
 }
 
 #[inline]
-const fn packed_state(packed: u32) -> u8 {
-    (packed >> STATE_SHIFT) as u8
+const fn packed_generation(packed: u64) -> u32 {
+    (packed >> 32) as u32
 }
 
 #[inline]
-const fn packed_count(packed: u32) -> u32 {
-    packed & COUNT_MASK
+const fn packed_state(packed: u64) -> u8 {
+    ((packed as u32) >> STATE_SHIFT) as u8
+}
+
+#[inline]
+const fn packed_count(packed: u64) -> u32 {
+    (packed as u32) & COUNT_MASK
 }
 
 /// Circuit breaker state for a single proxy or target.
 pub struct CircuitBreaker {
-    /// Packed `(state, half_open_in_flight)` — high 2 bits state, low 30 bits
-    /// probe count. See the module-level note above for why these are fused.
-    packed: AtomicU32,
+    /// Packed `(open_generation, state, half_open_in_flight)` — high 32 bits
+    /// generation, next 2 bits state, low 30 bits probe count. See the
+    /// module-level note above for why these are fused.
+    ///
+    /// The generation is advanced on every CLOSED→OPEN / HALF_OPEN→OPEN
+    /// transition (one "open generation"), in the SAME CAS that publishes OPEN. A
+    /// request captures it at admission (`can_execute`); a deferred streaming
+    /// outcome compares it at completion so a stream admitted under one generation
+    /// cannot heal/reopen a *later* HALF_OPEN cycle it never probed (#1649 — the
+    /// breaker stays correct even though the streaming CB outcome is recorded at
+    /// body completion). HALF_OPEN admission does NOT advance it — it is the same
+    /// open cycle.
+    packed: AtomicU64,
     failure_count: AtomicU32,
     success_count: AtomicU32,
     last_failure_epoch_ms: AtomicU64,
-    /// Monotonic counter incremented on every CLOSED→OPEN / HALF_OPEN→OPEN
-    /// transition (one "open generation"). A request captures this at admission
-    /// (`can_execute`); a deferred streaming outcome compares it at completion so
-    /// a stream admitted under one generation cannot heal/reopen a *later*
-    /// HALF_OPEN cycle it never probed (#1649 — the breaker stays correct even
-    /// though the streaming CB outcome is recorded at body completion). HALF_OPEN
-    /// admission does NOT bump it — it is the same open cycle.
-    open_epoch: AtomicU64,
     config: CircuitBreakerConfig,
 }
 
@@ -74,11 +92,10 @@ impl std::fmt::Display for CircuitOpenError {
 impl CircuitBreaker {
     pub fn new(config: CircuitBreakerConfig) -> Self {
         Self {
-            packed: AtomicU32::new(pack(STATE_CLOSED, 0)),
+            packed: AtomicU64::new(pack_full(0, STATE_CLOSED, 0)),
             failure_count: AtomicU32::new(0),
             success_count: AtomicU32::new(0),
             last_failure_epoch_ms: AtomicU64::new(0),
-            open_epoch: AtomicU64::new(0),
             config,
         }
     }
@@ -115,10 +132,13 @@ impl CircuitBreaker {
                     // can never be rejected after publishing HALF_OPEN (no wedge).
                     // OPEN always carries count=0 — reopen/close zero the count
                     // atomically and slot releases are no-ops at 0 — so the
-                    // expected value below is exact.
+                    // expected value below is exact. The generation is PRESERVED
+                    // (OPEN→HALF_OPEN is the same open cycle): the desired value
+                    // carries the same generation observed in `packed`.
+                    let generation = packed_generation(packed);
                     match self.packed.compare_exchange(
-                        pack(STATE_OPEN, 0),
-                        pack(STATE_HALF_OPEN, 1),
+                        pack_full(generation, STATE_OPEN, 0),
+                        pack_full(generation, STATE_HALF_OPEN, 1),
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     ) {
@@ -173,9 +193,11 @@ impl CircuitBreaker {
                     if count >= max {
                         return Err(CircuitOpenError);
                     }
+                    // Preserve the generation (steady-state HALF_OPEN admission is
+                    // the same open cycle); `packed` already carries it.
                     match self.packed.compare_exchange_weak(
                         packed,
-                        pack(STATE_HALF_OPEN, count + 1),
+                        pack_full(packed_generation(packed), STATE_HALF_OPEN, count + 1),
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     ) {
@@ -226,11 +248,13 @@ impl CircuitBreaker {
                         if packed_state(p) != STATE_HALF_OPEN {
                             break;
                         }
+                        // Closing preserves the generation (recovery is not a new
+                        // open cycle — only opens advance it).
                         if self
                             .packed
                             .compare_exchange_weak(
                                 p,
-                                pack(STATE_CLOSED, 0),
+                                pack_full(packed_generation(p), STATE_CLOSED, 0),
                                 Ordering::SeqCst,
                                 Ordering::Relaxed,
                             )
@@ -352,31 +376,31 @@ impl CircuitBreaker {
                     if self.failure_count.load(Ordering::Acquire) < self.config.failure_threshold {
                         return;
                     }
-                    // CLOSED always carries count=0, so the expected/desired
-                    // values both hold count=0; the transition only flips state.
+                    // CLOSED always carries count=0, so the expected/desired values
+                    // both hold count=0; the transition flips state and advances the
+                    // generation in the SAME CAS.
                     //
-                    // Publish the new open generation BEFORE the CAS makes OPEN
-                    // visible: a concurrent observer of OPEN can immediately
-                    // transition to HALF_OPEN (notably when `timeout_seconds == 0`)
-                    // and capture `open_epoch` in `can_execute`. It must read the
-                    // NEW generation, not the old one — otherwise its valid probe's
-                    // deferred streaming outcome is wrongly judged stale and can
-                    // never heal/reopen the breaker (#1649 R5 finding 2). The CAS's
-                    // Release publishes this increment to any Acquire load that
-                    // observes OPEN. Every increment here is gated by the
-                    // (re-checked) `failures >= failure_threshold` condition, so it
-                    // always corresponds to a real open attempt; on a lost CAS a
-                    // sibling opened (advancing the generation anyway), and on the
+                    // Advancing the generation atomically with the OPEN transition is
+                    // what makes the streaming-outcome accounting correct (#1649 R5
+                    // finding 2 + R7): (1) only the CAS WINNER advances the
+                    // generation — a concurrent failure that loses the CAS leaves it
+                    // untouched, so it cannot stale a valid probe that already
+                    // captured the winner's generation; and (2) the new generation is
+                    // published WITH OPEN, so any observer that sees OPEN (and can
+                    // immediately re-enter HALF_OPEN when `timeout_seconds == 0`)
+                    // reads the new generation, never the pre-open value. The
+                    // generation comes from a fresh load of the CLOSED state; if it
+                    // changed under us the CAS simply fails (a sibling opened). On the
                     // rare rollback path below the generation stays advanced — the
                     // only effect is that a CLOSED-admitted (non-probe) deferred
                     // outcome captured just before this point is dropped instead of
                     // recorded, which is negligible and conservative.
-                    self.open_epoch.fetch_add(1, Ordering::AcqRel);
+                    let generation = packed_generation(self.packed.load(Ordering::Acquire));
                     if self
                         .packed
                         .compare_exchange(
-                            pack(STATE_CLOSED, 0),
-                            pack(STATE_OPEN, 0),
+                            pack_full(generation, STATE_CLOSED, 0),
+                            pack_full(generation.wrapping_add(1), STATE_OPEN, 0),
                             Ordering::AcqRel,
                             Ordering::Relaxed,
                         )
@@ -384,9 +408,11 @@ impl CircuitBreaker {
                     {
                         let current_failures = self.failure_count.load(Ordering::Acquire);
                         if current_failures < self.config.failure_threshold {
+                            // Roll back OPEN→CLOSED, keeping the advanced generation
+                            // (see note above).
                             let _ = self.packed.compare_exchange(
-                                pack(STATE_OPEN, 0),
-                                pack(STATE_CLOSED, 0),
+                                pack_full(generation.wrapping_add(1), STATE_OPEN, 0),
+                                pack_full(generation.wrapping_add(1), STATE_CLOSED, 0),
                                 Ordering::AcqRel,
                                 Ordering::Relaxed,
                             );
@@ -425,29 +451,24 @@ impl CircuitBreaker {
     /// this cycle releases as a no-op at 0.
     fn reopen_after_probe_failure(&self) {
         self.success_count.store(0, Ordering::Relaxed);
-        // Publish the new open generation BEFORE the CAS makes OPEN visible, for
-        // the same reason as the CLOSED→OPEN path: a concurrent observer of OPEN
-        // can immediately re-enter HALF_OPEN (when `timeout_seconds == 0`) and
-        // capture `open_epoch`, so it must see the NEW generation (#1649 R5
-        // finding 2). Every call here corresponds to a genuine reopen of the
-        // generation this failure observed, so advancing the counter up front is
-        // never spurious; if a sibling already reopened (the `STATE_OPEN` arm
-        // below) the extra increment is harmless — `open_epoch` is an
-        // equality-compared generation marker, and a stream from the superseded
-        // cycle is correctly stale either way.
-        self.open_epoch.fetch_add(1, Ordering::AcqRel);
         loop {
             let p = self.packed.load(Ordering::Acquire);
             match packed_state(p) {
                 // A sibling probe failure already reopened — done.
                 STATE_OPEN => break,
-                // HALF_OPEN or CLOSED → reopen, clearing the count in the same CAS.
+                // HALF_OPEN or CLOSED → reopen, clearing the count AND advancing the
+                // generation in the same CAS. Bundling the generation bump into the
+                // CAS means only the reopen winner advances it (no loser bumps) and
+                // the new generation is visible to any observer that sees OPEN —
+                // exactly as on the CLOSED→OPEN path (#1649 R5 finding 2 + R7). If a
+                // sibling already reopened, the `STATE_OPEN` arm above leaves it
+                // alone; a stream from the superseded cycle is correctly stale.
                 _ => {
                     if self
                         .packed
                         .compare_exchange_weak(
                             p,
-                            pack(STATE_OPEN, 0),
+                            pack_full(packed_generation(p).wrapping_add(1), STATE_OPEN, 0),
                             Ordering::AcqRel,
                             Ordering::Relaxed,
                         )
@@ -474,7 +495,12 @@ impl CircuitBreaker {
                 if count == 0 {
                     None
                 } else {
-                    Some(pack(packed_state(packed), count - 1))
+                    // Preserve the generation and state; only the count changes.
+                    Some(pack_full(
+                        packed_generation(packed),
+                        packed_state(packed),
+                        count - 1,
+                    ))
                 }
             });
     }
@@ -487,10 +513,10 @@ impl CircuitBreaker {
     /// Current open generation. Captured at admission (`can_execute`) and
     /// re-checked when a deferred streaming outcome settles so a stream admitted
     /// under one generation cannot heal/reopen a later HALF_OPEN cycle (#1649).
-    /// Incremented on every transition INTO `Open`; HALF_OPEN admission does not
-    /// change it (same open cycle).
+    /// Advanced (in the same CAS) on every transition INTO `Open`; HALF_OPEN
+    /// admission does not change it (same open cycle).
     pub fn open_epoch(&self) -> u64 {
-        self.open_epoch.load(Ordering::Acquire)
+        packed_generation(self.packed.load(Ordering::Acquire)) as u64
     }
 
     /// Current failure count (for metrics).
