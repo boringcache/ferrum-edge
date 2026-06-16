@@ -1016,16 +1016,28 @@ fn commands_for_family(
 /// `NF_ACCEPT`, ending PREROUTING traversal) would grab pod EGRESS too — the
 /// outbound include/exclude/CIDR/port rules would be silently bypassed.
 ///
-/// **PREROUTING-only this stage (TPROXY-in-OUTPUT is invalid):** the TPROXY
-/// target runs ONLY in `PREROUTING`, never for locally-generated (OUTPUT)
-/// packets. Jumping into a `-j TPROXY` chain from `mangle OUTPUT` is invalid and
-/// can make iptables setup fail, so this stage emits **no `mangle OUTPUT` jump**
-/// and captures only PREROUTING-visible UDP. Sidecar-self-egress (the pod's OWN
-/// locally-generated UDP) needs a separate MARK-only OUTPUT chain (`mangle OUTPUT
-/// -j MARK` + reinjection through the routing rule, the Istio-equivalent pattern)
-/// and is DEFERRED to a later stage (see `docs/mesh.md`). Because there is no
-/// OUTPUT path, there is also no proxy-UID `-m owner` self-exclusion (owner-match
-/// is OUTPUT-context-only).
+/// **TPROXY is PREROUTING-only; locally-generated egress rides an OUTPUT MARK →
+/// lo-reroute → PREROUTING-TPROXY loop (codex r6).** The TPROXY target runs ONLY
+/// in `PREROUTING`, never for locally-generated (OUTPUT) packets — jumping into a
+/// `-j TPROXY` chain from `mangle OUTPUT` is invalid and can make iptables setup
+/// fail. But Linux routes a pod's OWN application UDP egress through
+/// OUTPUT→POSTROUTING and NEVER through PREROUTING, so the PREROUTING TPROXY
+/// chains alone would never see the primary egress case (outbound UDP capture
+/// would be inert in the pod netns). The standard "TPROXY for locally-generated
+/// traffic" pattern closes this: a `mangle OUTPUT` chain (`FERRUM_MESH_UDP_OUTPUT_
+/// MARK`) MARKs the egress (NOT TPROXY) with the same fwmark the PREROUTING rules
+/// use; the existing fwmark `ip rule` (priority [`TPROXY_ROUTE_RULE_PRIORITY`] →
+/// table [`TPROXY_ROUTE_TABLE`]) + `ip route add local ... dev lo` reroute the
+/// marked datagram to loopback; it re-enters the INPUT path, traverses PREROUTING
+/// once, and a mark-match `-j TPROXY` rule (in `FERRUM_MESH_UDP_REINJECT`, jumped
+/// from PREROUTING FIRST) captures it to the UDP port. The `local`-route delivery
+/// diverts the looped datagram to the INPUT side, so OUTPUT is hit exactly once
+/// (no loop), and the OUTPUT chain leads with a `-m mark --mark <mark> -j RETURN`
+/// anti-loop guard plus a proxy-UID `-m owner --uid-owner <uid> -j RETURN`
+/// self-exclusion (owner-match IS valid in OUTPUT — it is invalid in PREROUTING,
+/// which is why the dst-based OUTBOUND chain carries no owner RETURN). The full
+/// datapath correctness of this loop is validated by the Stage-7
+/// `netns-capture-live` e2e (see `docs/mesh.md`).
 ///
 /// **Fail closed when policy routing is unavailable (codex r2).** TPROXY local
 /// delivery REQUIRES the `ip rule` + `ip route local` plumbing; installing the
@@ -1114,6 +1126,10 @@ fn udp_tproxy_commands_for_family(
         "-j TPROXY --on-port {} --tproxy-mark {mark_arg}",
         config.udp_outbound_port
     );
+    // OUTPUT-path MARK jump (codex r6): stamps the same fwmark the PREROUTING
+    // TPROXY rules use, so a locally-generated pod UDP datagram is rerouted to
+    // loopback by the fwmark `ip rule` and re-enters PREROUTING to be TPROXY'd.
+    let mark_jump = format!("-j MARK --set-mark {mark_arg}");
     // Outbound (egress) discriminator: a remote/non-local destination. Mirrors
     // the TCP path's hook-based direction separation (which TPROXY can't use,
     // being PREROUTING-only) via destination address type, so this OUTBOUND chain
@@ -1121,15 +1137,24 @@ fn udp_tproxy_commands_for_family(
     // chain's job, scoped with the complementary `--dst-type LOCAL`).
     let outbound_dst_scope = "-m addrtype ! --dst-type LOCAL";
 
-    // Build the OUTBOUND TPROXY rules first into a temp list. The unqualified
-    // catch-alls (`include_all_outbound_ports` and the implicit-CIDR catch-all)
-    // are suppressed when this family was NOT CIDR-selected (cross-family case);
-    // the per-CIDR `-d` and per-port `--dport` rules always emit (codex r5
-    // finding #2 — port includes are not family-scoped).
-    let mut outbound_tproxy_rules: Vec<String> = Vec::new();
+    // Compute the OUTBOUND selector specs ONCE (the `-p udp [-d <cidr>|--dport
+    // <port>]` portion before any direction-scope / jump), then render two rule
+    // sets from them so the PREROUTING TPROXY chain and the OUTPUT MARK chain
+    // share identical capture scoping (codex r6):
+    //   - PREROUTING TPROXY rules append the `! --dst-type LOCAL` egress scope so
+    //     they never grab inbound (the INBOUND chain's `--dst-type LOCAL` job).
+    //   - OUTPUT MARK rules carry NO dst-type scope: all OUTPUT-visible traffic is
+    //     locally generated (egress by definition), and the proxy's own datagrams
+    //     are excluded by an owner-match RETURN at the top of the OUTPUT chain
+    //     (owner-match is OUTPUT-context-only — invalid in PREROUTING).
+    // `catch_all` selectors (the implicit-CIDR / `include_all_outbound_ports`
+    // catch-alls) are suppressed when this family was NOT CIDR-selected
+    // (cross-family case); the per-CIDR `-d` and per-port `--dport` selectors
+    // always emit (codex r5 finding #2 — port includes are not family-scoped).
+    let mut outbound_selectors: Vec<String> = Vec::new();
     if config.include_all_outbound_ports {
         if !suppress_catch_all {
-            outbound_tproxy_rules.push(format!("-p udp {outbound_dst_scope} {tproxy_jump}"));
+            outbound_selectors.push("-p udp".to_string());
         }
     } else {
         let emit_include_cidrs =
@@ -1142,14 +1167,11 @@ fn udp_tproxy_commands_for_family(
                 // of which intend full-family UDP capture). Suppressed for a family
                 // the operator did not select by CIDR (codex r4 + r5).
                 if !suppress_catch_all {
-                    outbound_tproxy_rules
-                        .push(format!("-p udp {outbound_dst_scope} {tproxy_jump}"));
+                    outbound_selectors.push("-p udp".to_string());
                 }
             } else {
                 for cidr in include_cidrs {
-                    outbound_tproxy_rules.push(format!(
-                        "-p udp -d {cidr} {outbound_dst_scope} {tproxy_jump}"
-                    ));
+                    outbound_selectors.push(format!("-p udp -d {cidr}"));
                 }
             }
         }
@@ -1158,11 +1180,17 @@ fn udp_tproxy_commands_for_family(
         // (codex r5 finding #2). These survive the cross-family catch-all
         // suppression above.
         for port in &config.include_outbound_ports {
-            outbound_tproxy_rules.push(format!(
-                "-p udp --dport {port} {outbound_dst_scope} {tproxy_jump}"
-            ));
+            outbound_selectors.push(format!("-p udp --dport {port}"));
         }
     }
+    let outbound_tproxy_rules: Vec<String> = outbound_selectors
+        .iter()
+        .map(|sel| format!("{sel} {outbound_dst_scope} {tproxy_jump}"))
+        .collect();
+    let outbound_mark_rules: Vec<String> = outbound_selectors
+        .iter()
+        .map(|sel| format!("{sel} {mark_jump}"))
+        .collect();
 
     // The inbound catch-all is itself an unqualified `-j TPROXY` diversion, so it
     // is suppressed for a cross-family-unselected family too (codex r5 finding #2)
@@ -1202,8 +1230,27 @@ fn udp_tproxy_commands_for_family(
             .to_string(),
         idempotent_new_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"),
         idempotent_new_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTBOUND"),
+        // OUTPUT MARK chain (codex r6): captures the pod's OWN locally-generated
+        // UDP egress, which never traverses PREROUTING (Linux routes locally-
+        // generated traffic OUTPUT -> POSTROUTING). It MARKs (does not TPROXY —
+        // TPROXY is PREROUTING-only) so the fwmark `ip rule` reroutes the datagram
+        // to loopback, where it re-enters PREROUTING and the reinject chain (below)
+        // captures it.
+        idempotent_new_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTPUT_MARK"),
+        // REINJECT chain (codex r6): holds the single mark-match `-j TPROXY` rule
+        // that captures the OUTPUT-marked datagram after the fwmark route loops it
+        // back to loopback and it re-enters PREROUTING. It lives in its OWN custom
+        // chain (jumped from PREROUTING first) rather than as a bare PREROUTING
+        // rule so the stale-rule-on-mark-change hazard the create+flush sequence
+        // already fixes for the other chains (codex r3) covers it too: the built-in
+        // PREROUTING chain cannot be flushed, but a custom chain can, and teardown
+        // reaps it by name (mark-independent), exactly like the OUTBOUND/INBOUND
+        // chains and the priority-keyed fwmark `ip rule`.
+        idempotent_new_chain(binary, "mangle", "FERRUM_MESH_UDP_REINJECT"),
         flush_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"),
         flush_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTBOUND"),
+        flush_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTPUT_MARK"),
+        flush_chain(binary, "mangle", "FERRUM_MESH_UDP_REINJECT"),
     ];
 
     // Outbound exclusions first (RETURN wins by rule order), mirroring TCP.
@@ -1223,18 +1270,83 @@ fn udp_tproxy_commands_for_family(
             &format!("-p udp --dport {port} -j RETURN"),
         ));
     }
-    // NOTE: no proxy-UID (`-m owner --uid-owner`) self-exclusion here. `-m owner`
-    // matches only locally-generated packets, so it is valid only in an
-    // OUTPUT-context chain — but this OUTBOUND chain is reached from PREROUTING
-    // (TPROXY is PREROUTING-only; the invalid `mangle OUTPUT` jump was removed).
-    // The proxy's own UDP egress is locally generated, so it is captured only by
-    // an OUTPUT path, which is DEFERRED to a later stage (a MARK-only OUTPUT
-    // chain — TPROXY cannot run in OUTPUT). See the fn doc.
+    // NOTE: no proxy-UID (`-m owner --uid-owner`) self-exclusion in THIS chain.
+    // `-m owner` matches only locally-generated packets, so it is valid only in an
+    // OUTPUT-context chain — and this OUTBOUND chain is reached from PREROUTING
+    // (TPROXY is PREROUTING-only). The proxy's own UDP egress is locally generated,
+    // so its self-exclusion lives in the OUTPUT MARK chain below (the owner-match
+    // RETURN), not here.
     for rule in &outbound_tproxy_rules {
         commands.push(idempotent_append(
             binary,
             "mangle",
             "FERRUM_MESH_UDP_OUTBOUND",
+            rule,
+        ));
+    }
+
+    // OUTPUT MARK chain population (codex r6): the pod's OWN locally-generated UDP
+    // egress goes OUTPUT -> POSTROUTING and NEVER hits PREROUTING, so the OUTBOUND
+    // TPROXY chain above (reached only from PREROUTING) never sees it. This chain —
+    // jumped from `mangle OUTPUT` (added below) — MARKs that egress with the same
+    // fwmark the PREROUTING TPROXY rules use, so the fwmark `ip rule` (priority
+    // <P> -> table <T>) + `ip route add local ... dev lo table <T>` reroute the
+    // marked datagram to loopback, where it re-enters the INPUT path, traverses
+    // PREROUTING a single time, and is captured by the mark-match TPROXY rule
+    // (added below). It uses MARK, NOT TPROXY, because TPROXY is invalid for
+    // locally-generated (OUTPUT) packets. The chain order is:
+    //   1. `-m mark --mark <mark>/<mask> -j RETURN` — never re-mark an already-
+    //      marked packet (anti-loop belt-and-suspenders; the `local` route diverts
+    //      the looped datagram to the INPUT side so OUTPUT is hit once, but this
+    //      guard is the canonical safety rail).
+    //   2. proxy-UID `-m owner --uid-owner <uid> -j RETURN` — exclude the proxy's
+    //      OWN egress so it is neither captured nor looped. Owner-match is valid
+    //      here precisely because OUTPUT sees the originating socket (it is invalid
+    //      in PREROUTING, which is why the OUTBOUND chain has no owner RETURN).
+    //   3. the same exclude-CIDR / exclude-port RETURNs as the OUTBOUND chain.
+    //   4. the MARK rules derived from the SAME outbound selectors as the TPROXY
+    //      rules, so OUTPUT capture scoping matches PREROUTING capture scoping
+    //      exactly. NO `! --dst-type LOCAL` scope here: all OUTPUT-visible traffic
+    //      is locally generated (egress by definition); pod-to-self loopback is not
+    //      captured because the mark-RETURN guard / the absence of a matching
+    //      selector keeps it out, and self-exclusion rides the owner RETURN.
+    // The chain is populated regardless of whether any selector matched: if it is
+    // empty of MARK rules nothing is marked, and the OUTPUT jump below is a no-op.
+    commands.push(idempotent_append(
+        binary,
+        "mangle",
+        "FERRUM_MESH_UDP_OUTPUT_MARK",
+        &format!("-m mark --mark {mark_arg} -j RETURN"),
+    ));
+    if let Some(uid) = config.proxy_uid {
+        commands.push(idempotent_append(
+            binary,
+            "mangle",
+            "FERRUM_MESH_UDP_OUTPUT_MARK",
+            &format!("-m owner --uid-owner {uid} -j RETURN"),
+        ));
+    }
+    for cidr in exclude_cidrs {
+        commands.push(idempotent_append(
+            binary,
+            "mangle",
+            "FERRUM_MESH_UDP_OUTPUT_MARK",
+            &format!("-p udp -d {cidr} -j RETURN"),
+        ));
+    }
+    for port in &config.exclude_ports {
+        commands.push(idempotent_append(
+            binary,
+            "mangle",
+            "FERRUM_MESH_UDP_OUTPUT_MARK",
+            &format!("-p udp --dport {port} -j RETURN"),
+        ));
+    }
+    for rule in &outbound_mark_rules {
+        commands.push(idempotent_append(
+            binary,
+            "mangle",
+            "FERRUM_MESH_UDP_OUTPUT_MARK",
             rule,
         ));
     }
@@ -1316,23 +1428,46 @@ fn udp_tproxy_commands_for_family(
         "{ip} route add {local_route} table {TPROXY_ROUTE_TABLE}"
     ));
 
-    // PREROUTING jumps LAST (codex r5 finding #3): these start steering UDP into
-    // the now-fully-built chains, and the routing above is already installed, so
-    // there is no window where TPROXY is wired without policy routing. The
-    // OUTBOUND jump is installed BEFORE the INBOUND jump so pod EGRESS is
+    // PREROUTING jumps + the locally-generated reinjection capture, all LAST
+    // (codex r5 finding #3): these start steering UDP into the now-fully-built
+    // chains, and the routing above is already installed, so there is no window
+    // where TPROXY is wired without policy routing.
+    //
+    // (1) REINJECT chain: the mark-match `-j TPROXY` rule, populated then jumped
+    // from PREROUTING FIRST (codex r6). The OUTPUT MARK chain marks the pod's OWN
+    // egress; the fwmark `ip rule` + `local ... dev lo` route then reroute that
+    // marked datagram to loopback, where it re-enters the INPUT path and traverses
+    // PREROUTING. This rule captures the rerouted datagram by its MARK (the only
+    // reliable selector — TPROXY/loopback do NOT rewrite the header, so the
+    // datagram still carries its ORIGINAL remote destination and would also match
+    // the dst-based OUTBOUND chain). Because xt_TPROXY returns NF_ACCEPT and ends
+    // PREROUTING traversal, jumping into this chain BEFORE the OUTBOUND/INBOUND
+    // chain jumps guarantees the rerouted datagram is TPROXY'd exactly once and
+    // never double-processed by the dst-based chains. It carries the SAME mark
+    // (`--tproxy-mark`) so TPROXY re-stamps the mark the local-delivery route
+    // already used. The chain is inert for ordinary inbound/forwarded UDP (which
+    // carries no Ferrum mark) — only the OUTPUT-marked, rerouted datagrams match.
+    commands.push(idempotent_append(
+        binary,
+        "mangle",
+        "FERRUM_MESH_UDP_REINJECT",
+        &format!("-p udp -m mark --mark {mark_arg} {tproxy_jump}"),
+    ));
+    commands.push(idempotent_append(
+        binary,
+        "mangle",
+        "PREROUTING",
+        "-p udp -j FERRUM_MESH_UDP_REINJECT",
+    ));
+    // (2) The OUTBOUND jump is installed BEFORE the INBOUND jump so pod EGRESS is
     // matched/routed first: the inbound catch-all (xt_TPROXY returns NF_ACCEPT,
     // ending traversal) must not swallow egress and bypass the outbound
     // include/exclude/CIDR/port rules. The two chains are also destination-scoped
     // (`! --dst-type LOCAL` outbound, `--dst-type LOCAL` inbound) so each captures
     // only its own direction regardless of order; the ordering is the
-    // belt-and-suspenders mirror of the TCP chains (codex r2).
-    //
-    // There is deliberately NO `mangle OUTPUT` jump: the OUTBOUND chain ends in
-    // `-j TPROXY`, and TPROXY is invalid for locally-generated (OUTPUT) packets —
-    // jumping into it from OUTPUT can make iptables setup fail outright.
-    // Sidecar-self-egress (locally-generated) UDP capture needs a separate
-    // MARK-only OUTPUT chain and is DEFERRED to a later stage (see the fn doc +
-    // docs/mesh.md).
+    // belt-and-suspenders mirror of the TCP chains (codex r2). These see only
+    // genuinely PREROUTING-visible UDP (forwarded / inbound-to-pod), NOT the pod's
+    // own locally-generated egress — that is the OUTPUT MARK chain's job (1).
     commands.push(idempotent_append(
         binary,
         "mangle",
@@ -1344,6 +1479,19 @@ fn udp_tproxy_commands_for_family(
         "mangle",
         "PREROUTING",
         "-p udp -j FERRUM_MESH_UDP_INBOUND",
+    ));
+    // (3) The OUTPUT jump into the MARK-only chain (codex r6). This is the path for
+    // the pod's OWN locally-generated UDP egress (OUTPUT -> POSTROUTING never hits
+    // PREROUTING). The chain MARKs (does NOT TPROXY — TPROXY is invalid in OUTPUT
+    // and jumping into a `-j TPROXY` chain from OUTPUT can fail iptables setup
+    // outright); the fwmark route reroutes to lo and (1) above completes the
+    // capture loop: OUTPUT-MARK -> lo-reroute (fwmark `ip rule` -> local route) ->
+    // PREROUTING mark-match TPROXY -> the Stage 3 transparent UDP socket.
+    commands.push(idempotent_append(
+        binary,
+        "mangle",
+        "OUTPUT",
+        "-p udp -j FERRUM_MESH_UDP_OUTPUT_MARK",
     ));
 
     commands
@@ -1445,11 +1593,24 @@ fn udp_teardown_for(binary: &str) -> CleanupCommands {
         CidrFamily::V4
     };
 
-    // mangle chain teardown: jumps first, then flush, then delete. There is NO
-    // `mangle OUTPUT` jump to remove — setup never installs one (TPROXY is
-    // PREROUTING-only). These are ip6tables-TABLE commands, so for IPv6 the
-    // node-agent guards them behind its `ip6tables` availability probe.
+    // mangle chain teardown: jumps first, then flush, then delete. The OUTPUT MARK
+    // path (codex r6) adds a `mangle OUTPUT -j FERRUM_MESH_UDP_OUTPUT_MARK` jump and
+    // a `mangle PREROUTING -j FERRUM_MESH_UDP_REINJECT` jump that must also be torn
+    // down (the legacy "no OUTPUT jump" note is obsolete). Every target is an EXACT
+    // Ferrum-owned object (chain by name, jump by exact `-j <chain>` spec —
+    // mark-independent), so this teardown is fully mark-independent and can run
+    // UNCONDITIONALLY pre-setup to reap stale state even across a changed
+    // `FERRUM_MESH_TPROXY_MARK` (the mark-match rule lives INSIDE the reinject
+    // chain, which is reaped by name, never as a bare PREROUTING rule). These are
+    // ip6tables-TABLE commands, so for IPv6 the node-agent guards them behind its
+    // `ip6tables` availability probe.
     let iptables = vec![
+        idempotent_delete(
+            binary,
+            "mangle",
+            "PREROUTING",
+            "-p udp -j FERRUM_MESH_UDP_REINJECT",
+        ),
         idempotent_delete(
             binary,
             "mangle",
@@ -1462,10 +1623,20 @@ fn udp_teardown_for(binary: &str) -> CleanupCommands {
             "PREROUTING",
             "-p udp -j FERRUM_MESH_UDP_OUTBOUND",
         ),
+        idempotent_delete(
+            binary,
+            "mangle",
+            "OUTPUT",
+            "-p udp -j FERRUM_MESH_UDP_OUTPUT_MARK",
+        ),
         flush_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"),
         flush_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTBOUND"),
+        flush_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTPUT_MARK"),
+        flush_chain(binary, "mangle", "FERRUM_MESH_UDP_REINJECT"),
         delete_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"),
         delete_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTBOUND"),
+        delete_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTPUT_MARK"),
+        delete_chain(binary, "mangle", "FERRUM_MESH_UDP_REINJECT"),
     ];
 
     // Remove ONLY the EXACT Ferrum-owned routing rule + route from the
@@ -2611,9 +2782,11 @@ mod tests {
             "missing inbound UDP TPROXY jump: {cmds:?}"
         );
 
-        // mangle PREROUTING jumps for both chains. TPROXY is PREROUTING-only, so
-        // there must be NO `mangle OUTPUT` jump (jumping into a `-j TPROXY` chain
-        // from OUTPUT is invalid — codex r1).
+        // mangle PREROUTING jumps for both dst-based chains, plus the reinject chain
+        // jump. TPROXY is PREROUTING-only, so the OUTPUT path is MARK-only (codex
+        // r6): a `mangle OUTPUT -j FERRUM_MESH_UDP_OUTPUT_MARK` jump MUST exist, but
+        // the OUTPUT chain must NEVER jump into a `-j TPROXY` chain (which would be
+        // invalid).
         assert!(
             cmds.iter().any(|c| c.contains("-t mangle")
                 && c.contains("PREROUTING")
@@ -2627,10 +2800,23 @@ mod tests {
             "missing mangle PREROUTING -> UDP outbound jump: {cmds:?}"
         );
         assert!(
-            !cmds
-                .iter()
-                .any(|c| c.contains("-t mangle") && c.contains("-A OUTPUT")),
-            "must NOT emit any mangle OUTPUT jump (TPROXY is invalid in OUTPUT): {cmds:?}"
+            cmds.iter().any(|c| c.contains("-t mangle")
+                && c.contains("PREROUTING")
+                && c.contains("-j FERRUM_MESH_UDP_REINJECT")),
+            "missing mangle PREROUTING -> UDP reinject jump (codex r6): {cmds:?}"
+        );
+        // The OUTPUT jump must target the MARK-only chain, NOT a TPROXY chain.
+        assert!(
+            cmds.iter().any(|c| c.contains("-t mangle")
+                && c.contains("-A OUTPUT")
+                && c.contains("-j FERRUM_MESH_UDP_OUTPUT_MARK")),
+            "missing mangle OUTPUT -> UDP OUTPUT MARK jump (codex r6): {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains("-t mangle")
+                && c.contains("-A OUTPUT")
+                && c.contains("TPROXY")),
+            "mangle OUTPUT must never jump into a TPROXY rule (invalid in OUTPUT): {cmds:?}"
         );
 
         // Transparent-routing plumbing: a FATAL `command -v ip` preflight (codex
@@ -2892,7 +3078,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_capture_mirrors_exclude_rules_but_omits_owner_match() {
+    fn udp_capture_mirrors_exclude_rules_and_scopes_owner_match_to_output() {
         let mut config = udp_enabled_iptables_config();
         config.exclude_cidrs = vec!["10.0.0.0/8".to_string()];
         config.exclude_ports = vec![53];
@@ -2911,17 +3097,46 @@ mod tests {
                 && c.contains("-p udp --dport 53 -j RETURN")),
             "UDP outbound exclude port RETURN missing: {cmds:?}"
         );
-        // No proxy-UID `-m owner` self-exclusion in the UDP mangle chain:
-        // owner-match is OUTPUT-context only, and this OUTBOUND chain is reached
-        // from PREROUTING (the OUTPUT path is deferred — codex r1). Emitting it
-        // would be an invalid rule. (The TCP `nat` chain still uses `-m owner`
-        // legitimately, so scope this to the UDP mangle chains.)
+        // The OUTPUT MARK chain mirrors the SAME exclude rules (codex r6) so a
+        // locally-generated egress to an excluded CIDR/port is not marked/looped.
         assert!(
-            !cmds
-                .iter()
-                .any(|c| c.contains("FERRUM_MESH_UDP") && c.contains("-m owner")),
-            "UDP mangle capture must NOT emit `-m owner` (no OUTPUT path this stage): {cmds:?}"
+            cmds.iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK")
+                    && c.contains("-p udp -d 10.0.0.0/8 -j RETURN")),
+            "UDP OUTPUT MARK exclude CIDR RETURN missing: {cmds:?}"
         );
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK")
+                    && c.contains("-p udp --dport 53 -j RETURN")),
+            "UDP OUTPUT MARK exclude port RETURN missing: {cmds:?}"
+        );
+        // Owner-match self-exclusion is OUTPUT-context ONLY (codex r6): it MUST
+        // appear in the OUTPUT MARK chain (locally-generated egress sees the
+        // originating socket) and MUST NOT appear in any PREROUTING-reached chain
+        // (OUTBOUND/INBOUND/REINJECT — owner-match is invalid there). (The TCP `nat`
+        // chain still uses `-m owner` legitimately, so scope this to the UDP chains.)
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK")
+                    && c.contains(&format!(
+                        "-m owner --uid-owner {} -j RETURN",
+                        DEFAULT_PROXY_UID
+                    ))),
+            "UDP OUTPUT MARK chain must carry the proxy-UID owner RETURN: {cmds:?}"
+        );
+        for chain in [
+            "FERRUM_MESH_UDP_OUTBOUND",
+            "FERRUM_MESH_UDP_INBOUND",
+            "FERRUM_MESH_UDP_REINJECT",
+        ] {
+            assert!(
+                !cmds
+                    .iter()
+                    .any(|c| c.contains(chain) && c.contains("-m owner")),
+                "PREROUTING-reached chain {chain} must NOT emit `-m owner` (invalid context): {cmds:?}"
+            );
+        }
 
         // Inbound exclude RETURN must precede the inbound catch-all TPROXY.
         let return_pos = cmds
@@ -2937,6 +3152,195 @@ mod tests {
         assert!(
             return_pos < tproxy_pos,
             "UDP inbound RETURN must precede the inbound TPROXY: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn udp_output_mark_loop_captures_locally_generated_egress() {
+        // codex r6: the pod's OWN locally-generated UDP egress goes OUTPUT ->
+        // POSTROUTING and never PREROUTING, so it is captured via an OUTPUT MARK
+        // chain -> fwmark reroute to lo -> a mark-match PREROUTING TPROXY rule (in
+        // the reinject chain). Assert the whole loop is wired in the injector
+        // (pod-netns) path.
+        let config = udp_enabled_iptables_config();
+        assert!(!config.host_netns, "this test exercises the pod-netns path");
+        let plan = IptablesPlan::for_config(&config);
+        let cmds = &plan.v4_commands;
+
+        let mark_arg = format!("0x{:x}/0x{:x}", DEFAULT_TPROXY_MARK, TPROXY_MARK_MASK);
+
+        // (a) The OUTPUT MARK chain is created and jumped from `mangle OUTPUT`.
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("-t mangle") && c.contains("-N FERRUM_MESH_UDP_OUTPUT_MARK")),
+            "missing OUTPUT MARK chain creation: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("-t mangle")
+                && c.contains("-A OUTPUT")
+                && c.contains("-p udp -j FERRUM_MESH_UDP_OUTPUT_MARK")),
+            "missing `mangle OUTPUT -j FERRUM_MESH_UDP_OUTPUT_MARK` jump: {cmds:?}"
+        );
+
+        // (b) The OUTPUT MARK chain leads with an anti-loop mark RETURN and a
+        // proxy-UID owner RETURN, then MARKs egress with the TPROXY fwmark (NOT
+        // TPROXY — invalid in OUTPUT).
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK")
+                    && c.contains(&format!("-m mark --mark {mark_arg} -j RETURN"))),
+            "missing anti-loop mark RETURN at top of OUTPUT MARK chain: {cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK")
+                    && c.contains(&format!("-j MARK --set-mark {mark_arg}"))),
+            "missing `-j MARK --set-mark <mark>` rule in OUTPUT MARK chain: {cmds:?}"
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK") && c.contains("TPROXY")),
+            "OUTPUT MARK chain must MARK, never TPROXY (invalid in OUTPUT): {cmds:?}"
+        );
+
+        // (c) The reinject chain holds the mark-match TPROXY rule and is jumped from
+        // PREROUTING BEFORE the dst-based OUTBOUND/INBOUND chains (so the looped
+        // datagram is TPROXY'd once, never double-processed by the dst-based chain).
+        let reinject_tproxy = format!(
+            "-p udp -m mark --mark {mark_arg} -j TPROXY --on-port {} --tproxy-mark {mark_arg}",
+            DEFAULT_UDP_OUTBOUND_PORT
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_REINJECT") && c.contains(&reinject_tproxy)),
+            "missing mark-match TPROXY rule in reinject chain: {cmds:?}"
+        );
+        let reinject_jump = cmds
+            .iter()
+            .position(|c| {
+                c.contains("-t mangle")
+                    && c.contains("PREROUTING")
+                    && c.contains("-j FERRUM_MESH_UDP_REINJECT")
+            })
+            .expect("PREROUTING -> reinject jump");
+        let outbound_jump = cmds
+            .iter()
+            .position(|c| {
+                c.contains("-t mangle")
+                    && c.contains("PREROUTING")
+                    && c.contains("-j FERRUM_MESH_UDP_OUTBOUND")
+            })
+            .expect("PREROUTING -> outbound jump");
+        let inbound_jump = cmds
+            .iter()
+            .position(|c| {
+                c.contains("-t mangle")
+                    && c.contains("PREROUTING")
+                    && c.contains("-j FERRUM_MESH_UDP_INBOUND")
+            })
+            .expect("PREROUTING -> inbound jump");
+        assert!(
+            reinject_jump < outbound_jump && reinject_jump < inbound_jump,
+            "reinject PREROUTING jump must precede the dst-based chain jumps: {cmds:?}"
+        );
+
+        // (d) Host-netns (node-agent) path emits NO UDP rules at all — including no
+        // OUTPUT MARK chain / OUTPUT jump — because the addrtype direction split is
+        // wrong in the host netns (round-5 limitation, preserved).
+        let mut host_config = config.clone();
+        host_config.host_netns = true;
+        let host_plan = IptablesPlan::for_config(&host_config);
+        for cmd in host_plan
+            .v4_commands
+            .iter()
+            .chain(host_plan.v6_commands.iter())
+        {
+            assert!(
+                !(cmd.contains("FERRUM_MESH_UDP_OUTPUT_MARK")
+                    || cmd.contains("FERRUM_MESH_UDP_REINJECT")
+                    || cmd.contains("-j MARK --set-mark")
+                    || (cmd.contains("-t mangle") && cmd.contains("OUTPUT"))),
+                "host-netns path must emit NO UDP OUTPUT MARK / reinject rules: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn udp_output_mark_mirrors_outbound_capture_scope() {
+        // The OUTPUT MARK chain must mirror the SAME include scoping as the
+        // PREROUTING outbound TPROXY chain (codex r6): per-port includes emit a
+        // per-port `-j MARK` and the implicit catch-all emits a catch-all `-j MARK`,
+        // so OUTPUT capture exactly matches PREROUTING capture.
+        // Default config (`include_cidrs = ["0.0.0.0/0"]`, NOT explicit): the
+        // OUTPUT MARK chain mirrors the OUTBOUND TPROXY chain's selector exactly —
+        // a `-p udp -d 0.0.0.0/0 -j MARK` rule (same `-d 0.0.0.0/0` the TPROXY rule
+        // carries). Only the jump differs (MARK vs TPROXY) and the egress dst-scope
+        // is omitted in OUTPUT (owner-RETURN handles self-exclusion there).
+        let default_plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
+        let mark_arg = format!("0x{:x}/0x{:x}", DEFAULT_TPROXY_MARK, TPROXY_MARK_MASK);
+        // The OUTBOUND TPROXY chain carries `-p udp -d 0.0.0.0/0 -m addrtype ! ...`.
+        assert!(
+            default_plan
+                .v4_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTBOUND")
+                    && c.contains("-p udp -d 0.0.0.0/0 -m addrtype ! --dst-type LOCAL -j TPROXY")),
+            "default OUTBOUND TPROXY rule shape changed: {:?}",
+            default_plan.v4_commands
+        );
+        // The OUTPUT MARK chain mirrors the SAME `-p udp -d 0.0.0.0/0` selector with
+        // a MARK jump (and no dst-scope).
+        assert!(
+            default_plan
+                .v4_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK")
+                    && c.contains(&format!(
+                        "-p udp -d 0.0.0.0/0 -j MARK --set-mark {mark_arg}"
+                    ))),
+            "OUTPUT MARK must mirror the OUTBOUND `-p udp -d 0.0.0.0/0` selector: {:?}",
+            default_plan.v4_commands
+        );
+        // And the OUTPUT MARK chain carries NO `-m addrtype` dst-scope (that is a
+        // PREROUTING-direction discriminator; OUTPUT is locally-generated egress).
+        assert!(
+            !default_plan
+                .v4_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK")
+                    && c.contains("-j MARK")
+                    && c.contains("addrtype")),
+            "OUTPUT MARK rules must not carry an `-m addrtype` dst-scope: {:?}",
+            default_plan.v4_commands
+        );
+
+        // Per-port includes: a `--dport` MARK rule per port, and NO catch-all MARK.
+        let mut port_config = udp_enabled_iptables_config();
+        port_config.include_outbound_ports = vec![5432, 9092];
+        let port_plan = IptablesPlan::for_config(&port_config);
+        for port in [5432, 9092] {
+            assert!(
+                port_plan
+                    .v4_commands
+                    .iter()
+                    .any(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK")
+                        && c.contains(&format!(
+                            "-p udp --dport {port} -j MARK --set-mark {mark_arg}"
+                        ))),
+                "per-port OUTPUT MARK missing for {port}: {:?}",
+                port_plan.v4_commands
+            );
+        }
+        assert!(
+            !port_plan
+                .v4_commands
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK")
+                    && c.contains("-j MARK")
+                    && !c.contains("--dport")),
+            "implicit catch-all MARK must not fire when includeOutboundPorts narrows: {:?}",
+            port_plan.v4_commands
         );
     }
 
@@ -3042,8 +3446,15 @@ mod tests {
     fn cleanup_removes_udp_tproxy_chains_and_routing() {
         let cleanup = IptablesPlan::cleanup_commands(true);
 
-        // mangle chain teardown (jumps, flush, delete).
-        for chain in ["FERRUM_MESH_UDP_INBOUND", "FERRUM_MESH_UDP_OUTBOUND"] {
+        // mangle chain teardown (jumps, flush, delete) for ALL FOUR UDP chains —
+        // the dst-based PREROUTING pair plus the OUTPUT MARK + reinject chains
+        // (codex r6).
+        for chain in [
+            "FERRUM_MESH_UDP_INBOUND",
+            "FERRUM_MESH_UDP_OUTBOUND",
+            "FERRUM_MESH_UDP_OUTPUT_MARK",
+            "FERRUM_MESH_UDP_REINJECT",
+        ] {
             assert!(
                 cleanup
                     .iter()
@@ -3057,8 +3468,12 @@ mod tests {
                 "cleanup missing delete of {chain}"
             );
         }
-        // PREROUTING jump deletes for both chains.
-        for chain in ["FERRUM_MESH_UDP_INBOUND", "FERRUM_MESH_UDP_OUTBOUND"] {
+        // PREROUTING jump deletes for the three PREROUTING-jumped chains.
+        for chain in [
+            "FERRUM_MESH_UDP_INBOUND",
+            "FERRUM_MESH_UDP_OUTBOUND",
+            "FERRUM_MESH_UDP_REINJECT",
+        ] {
             assert!(
                 cleanup.iter().any(|c| c.contains("-t mangle")
                     && c.contains("PREROUTING")
@@ -3067,13 +3482,20 @@ mod tests {
                 "cleanup missing mangle PREROUTING jump delete for {chain}"
             );
         }
-        // There is NO `mangle OUTPUT` jump to delete — setup never installs one
-        // (TPROXY is PREROUTING-only — codex r1).
+        // The `mangle OUTPUT -j FERRUM_MESH_UDP_OUTPUT_MARK` jump (codex r6) MUST be
+        // deleted — and the OUTPUT delete must target the MARK chain, never a TPROXY
+        // chain (none was installed there).
         assert!(
-            !cleanup
-                .iter()
-                .any(|c| c.contains("-t mangle") && c.contains("-D OUTPUT")),
-            "cleanup must NOT delete a mangle OUTPUT jump (none is installed): {cleanup:?}"
+            cleanup.iter().any(|c| c.contains("-t mangle")
+                && c.contains("-D OUTPUT")
+                && c.contains("-j FERRUM_MESH_UDP_OUTPUT_MARK")),
+            "cleanup missing mangle OUTPUT MARK jump delete (codex r6): {cleanup:?}"
+        );
+        assert!(
+            !cleanup.iter().any(|c| c.contains("-t mangle")
+                && c.contains("-D OUTPUT")
+                && c.contains("TPROXY")),
+            "cleanup OUTPUT delete must not reference a TPROXY chain: {cleanup:?}"
         );
 
         // Routing teardown deletes ONLY the EXACT Ferrum-owned rule (by explicit

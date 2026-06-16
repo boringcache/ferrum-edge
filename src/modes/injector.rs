@@ -1120,9 +1120,11 @@ fn init_container(config: &InjectorConfig, pod: &Value) -> Result<Value, String>
             "runAsNonRoot": false,
             "allowPrivilegeEscalation": false,
             // NET_ADMIN already covers everything UDP TPROXY capture needs
-            // (the TPROXY target, the fwmark `ip rule`, and `ip route add local`
-            // into the dedicated table), so no extra capability is required when
-            // `udp_capture_enabled` is on. NET_RAW remains for the TCP path.
+            // (the TPROXY + MARK targets, the owner-match, the fwmark `ip rule`,
+            // and `ip route add local` into the dedicated table — including the
+            // OUTPUT-MARK->lo-reroute->PREROUTING-TPROXY locally-generated egress
+            // loop), so no extra capability is required when `udp_capture_enabled`
+            // is on. NET_RAW remains for the TCP path.
             "capabilities": {
                 "drop": ["ALL"],
                 "add": ["NET_ADMIN", "NET_RAW"]

@@ -1574,7 +1574,7 @@ The container runs as `FERRUM_MESH_PROXY_UID` (default 1337) with `allowPrivileg
 | `iptables` | Inject init container with `NET_ADMIN`/`NET_RAW` capabilities that sets up iptables rules to redirect traffic through the sidecar (inbound to 15006, outbound to 15001) |
 | `ebpf` | eBPF-based capture handled by a node-level agent (requires kernel 5.7+). The injector does not inject a privileged init container for this mode -- the node agent's DaemonSet manages eBPF program attachment. Capture planning infrastructure (`EbpfPlan` with iptables fallback for pre-5.7 kernels) is available in `src/capture/mod.rs` for the node agent path. **Build requirement:** real eBPF attachment needs a binary built with the Cargo `ebpf` feature (`cargo build --features ebpf`, Linux only; Docker `--build-arg FEATURES=cloud-secrets,ebpf`). The **default published image uses a no-op mock backend** (`MockEbpfBackend`) that attaches nothing and sets `ferrum_mesh_node_topology_degraded` — see [Maturity and Support Status](#maturity-and-support-status) |
 
-#### UDP TPROXY capture (F3 §3.3, flag-gated, Stage 2 — rules only)
+#### UDP TPROXY capture (F3 §3.3, flag-gated, Stage 2 — capture rules only)
 
 TCP mesh capture uses iptables `REDIRECT` in the `nat` table: REDIRECT rewrites the
 packet's destination to the proxy port, and the proxy recovers the pre-NAT
@@ -1590,12 +1590,14 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   `FERRUM_MESH_UDP_INBOUND` / `FERRUM_MESH_UDP_OUTBOUND` mirror the TCP
   include/exclude/CIDR scoping with `-p udp ... -j TPROXY --on-port
   <FERRUM_MESH_CAPTURE_UDP_PORT> --tproxy-mark <FERRUM_MESH_TPROXY_MARK>/<mask>`,
-  jumped from `mangle PREROUTING`. The UDP chains are **PREROUTING-only**, so —
-  unlike the TCP `nat OUTPUT` outbound chain — they carry **no proxy-UID `-m owner
-  --uid-owner` self-exclusion** (owner-match is OUTPUT-context only; see the
-  PREROUTING-only note below). The UDP listener port (default `15011`) is
-  **distinct from the TCP outbound port** (`15001`) because UDP and TCP cannot
-  share one listener socket.
+  jumped from `mangle PREROUTING`. These dst-based PREROUTING chains are
+  **PREROUTING-only**, so — unlike the TCP `nat OUTPUT` outbound chain — they carry
+  **no proxy-UID `-m owner --uid-owner` self-exclusion** (owner-match is
+  OUTPUT-context only). The pod's **own** locally-generated UDP egress (which never
+  hits PREROUTING) is captured separately via a `mangle OUTPUT` MARK chain whose
+  proxy-UID owner RETURN provides that self-exclusion — see the OUTPUT-MARK loop
+  bullet below. The UDP listener port (default `15011`) is **distinct from the TCP
+  outbound port** (`15001`) because UDP and TCP cannot share one listener socket.
 - **Direction scoping (both chains ride PREROUTING).** The TCP chains stay
   direction-disjoint by hook (inbound = `nat PREROUTING`, outbound = `nat OUTPUT`);
   TPROXY cannot use that (it is PREROUTING-only), so both UDP chains ride
@@ -1662,30 +1664,70 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   injector with UDP capture on but no listener would redirect UDP into a void, so
   the flag defaults off and, when off, emits **no** `mangle`/TPROXY/routing rules
   at all. This stage is rules-only/inert.
-- **PREROUTING-only this stage; sidecar-self-egress (OUTPUT) UDP DEFERRED.** The
-  TPROXY target runs **only in `PREROUTING`**, never for locally-generated (OUTPUT)
+- **Locally-generated pod UDP egress: OUTPUT-MARK → lo-reroute → PREROUTING-TPROXY
+  loop.** TPROXY runs **only in `PREROUTING`**, never for locally-generated (OUTPUT)
   packets — jumping into a `-j TPROXY` chain from `mangle OUTPUT` is invalid and can
-  make iptables setup fail outright. This stage therefore emits **no `mangle OUTPUT`
-  jump** (and, consequently, **no proxy-UID `-m owner` self-exclusion**, since
-  owner-match is OUTPUT-context only) and captures only PREROUTING-visible UDP. For
-  a sidecar capturing the pod's **own** UDP egress, the Istio-equivalent pattern is
-  a separate **MARK-only** OUTPUT chain (`mangle OUTPUT -p udp ... -j MARK
-  --set-mark <mark>`, NOT TPROXY) + reinjection through the routing rule, or
-  reliance on PREROUTING inside the pod netns. That **sidecar-self-egress UDP path
-  is DEFERRED to a later stage** and is not claimed to work until the
-  `netns-capture-live` job validates it end-to-end.
+  make iptables setup fail outright. But Linux routes a pod's **own** application UDP
+  egress through **OUTPUT → POSTROUTING and never through PREROUTING**, so the
+  PREROUTING TPROXY chains alone would never see the primary egress case (outbound
+  UDP capture would be inert in the pod netns). Ferrum closes this with the standard
+  "TPROXY for locally-generated traffic" pattern (the injector / pod-netns path):
+  - A `mangle OUTPUT` chain `FERRUM_MESH_UDP_OUTPUT_MARK` **MARKs** the pod's egress
+    (`-j MARK --set-mark <mark>/<mask>`, **not** TPROXY) using the **same fwmark** the
+    PREROUTING TPROXY rules use, with the same include/exclude/CIDR/port scoping. It
+    leads with a `-m mark --mark <mark>/<mask> -j RETURN` anti-loop guard and a
+    proxy-UID `-m owner --uid-owner <uid> -j RETURN` self-exclusion — **owner-match
+    IS valid in OUTPUT** (it is invalid in PREROUTING, which is why the dst-based
+    OUTBOUND chain carries no owner RETURN). It carries **no `! --dst-type LOCAL`**
+    scope: all OUTPUT-visible traffic is locally generated (egress by definition).
+  - The **existing** fwmark `ip rule` (priority `100` → table `33133`) + `ip route add
+    local 0.0.0.0/0 dev lo table 33133` then reroute the marked datagram to loopback.
+    A `local`-type route makes the kernel treat the datagram as destined for this
+    host, so it is diverted to the **INPUT** path (not re-emitted via OUTPUT) — OUTPUT
+    is therefore traversed **exactly once** and there is **no loop**.
+  - The rerouted datagram re-enters and traverses **PREROUTING** once, where a
+    dedicated `FERRUM_MESH_UDP_REINJECT` chain (jumped from PREROUTING **first**)
+    holds a single **mark-match** `-p udp -m mark --mark <mark>/<mask> -j TPROXY
+    --on-port <udp_port> --tproxy-mark <mark>/<mask>` rule that captures it to the UDP
+    capture port. It matches by the **mark** (the only reliable selector — TPROXY /
+    loopback do **not** rewrite the header, so the datagram still carries its
+    **original remote destination** and would otherwise also match the dst-based
+    OUTBOUND chain); xt_TPROXY returns `NF_ACCEPT` and ends traversal, so jumping into
+    the reinject chain before the OUTBOUND/INBOUND chains guarantees the rerouted
+    datagram is TPROXY'd **exactly once** and never double-processed. The reinject
+    rule lives in its own custom chain (reaped by name, mark-independent) rather than
+    as a bare PREROUTING rule, so the create+flush idempotency that protects the other
+    chains against a changed `FERRUM_MESH_TPROXY_MARK` (the built-in PREROUTING chain
+    cannot be flushed) covers it too.
 
-Cleanup (`IptablesPlan::cleanup_commands(udp_capture_enabled)`) removes the
-`mangle` chains and tears down routing state by deleting **only the EXACT
-Ferrum-owned rule** (`ip rule del priority 100 lookup 33133`) and **the exact
-route** (`ip route del local 0.0.0.0/0 dev lo table 33133`) — never `ip rule del
-lookup <table>` or `ip route flush table <table>`, which could drop a co-resident
-route. Cleanup deletes stay best-effort (`|| true`) — unlike the load-bearing
-setup adds, teardown must never fail on already-absent state or a missing `ip`
-binary. The UDP teardown is **gated on `udp_capture_enabled`**, so a non-UDP
-install never touches routing state it never created. The init container already
-grants `NET_ADMIN`, which covers the TPROXY target, the `addrtype` direction
-scoping, and the `ip rule`/`ip route` plumbing — no extra capability is needed.
+  This is the **injector (pod-netns) path only**. The **node-agent host-netns
+  fallback still emits NO UDP rules at all** (the `addrtype` direction split is wrong
+  in the host netns — see the pod-netns-only limitation above; eBPF is the supported
+  node-agent UDP capture path), so the OUTPUT MARK chain is likewise not emitted
+  there. **Full datapath correctness** of the OUTPUT-MARK → lo-reroute →
+  PREROUTING-TPROXY loop (and of the PREROUTING-visible inbound/forwarded capture) is
+  validated by the **Stage-7 `netns-capture-live` e2e**, not by these unit tests
+  (which assert only the emitted rule shapes); the consuming transparent UDP listener
+  itself arrives in **Stage 3**, so until then the flag stays default-off.
+
+Cleanup (`IptablesPlan::cleanup_commands(udp_capture_enabled)`) removes all four
+`mangle` chains (`FERRUM_MESH_UDP_INBOUND` / `FERRUM_MESH_UDP_OUTBOUND` /
+`FERRUM_MESH_UDP_OUTPUT_MARK` / `FERRUM_MESH_UDP_REINJECT`), deletes their
+PREROUTING jumps **and the `mangle OUTPUT -j FERRUM_MESH_UDP_OUTPUT_MARK` jump**,
+and tears down routing state by deleting **only the EXACT Ferrum-owned rule** (`ip
+rule del priority 100 lookup 33133`) and **the exact route** (`ip route del local
+0.0.0.0/0 dev lo table 33133`) — never `ip rule del lookup <table>` or `ip route
+flush table <table>`, which could drop a co-resident route. Every iptables target
+is an exact Ferrum-owned object (chain by name, jump by exact `-j <chain>` spec),
+so teardown is **mark-independent** and reaps stale state even across a changed
+`FERRUM_MESH_TPROXY_MARK` (the mark-match TPROXY rule lives inside the reinject
+chain, reaped by name, never as a bare PREROUTING rule). Cleanup deletes stay
+best-effort (`|| true`) — unlike the load-bearing setup adds, teardown must never
+fail on already-absent state or a missing `ip` binary. The UDP teardown is **gated
+on `udp_capture_enabled`**, so a non-UDP install never touches routing state it
+never created. The init container already grants `NET_ADMIN`, which covers the
+TPROXY/MARK targets, the `addrtype` direction scoping, the owner-match, and the `ip
+rule`/`ip route` plumbing — no extra capability is needed.
 
 ## Control Plane Integration
 
