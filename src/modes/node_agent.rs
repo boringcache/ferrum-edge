@@ -513,11 +513,7 @@ async fn run_with_backend(
                     }
                     Some(Ok(Event::InitDone)) => {
                         if let Some(seen) = init_seen.take() {
-                            let stale_uids: Vec<String> = pod_states
-                                .iter()
-                                .filter(|entry| !seen.contains(entry.key().as_str()))
-                                .map(|entry| entry.key().clone())
-                                .collect();
+                            let stale_uids = watcher_init_stale_uids(&pod_states, &seen);
                             for uid in stale_uids {
                                 handle_pod_removed(backend.as_mut(), &pod_states, config, metrics.as_ref(), &uid);
                             }
@@ -538,6 +534,7 @@ async fn run_with_backend(
             cni_work = cni_work_rx.recv(), if cni_work_open => {
                 match cni_work {
                     Some(work) => {
+                        let cni_request = work.request.clone();
                         process_cni_work_item(
                             backend.as_mut(),
                             &pod_states,
@@ -546,6 +543,7 @@ async fn run_with_backend(
                             &client,
                             work,
                         ).await;
+                        mark_relist_seen_from_cni_add(&mut init_seen, &pod_states, &cni_request);
                     }
                     None => {
                         // Channel closed — listener task exited. Disable this
@@ -575,6 +573,36 @@ async fn run_with_backend(
     }
 
     Ok(())
+}
+
+fn watcher_init_stale_uids(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    seen: &HashSet<String>,
+) -> Vec<String> {
+    pod_states
+        .iter()
+        .filter(|entry| !seen.contains(entry.key().as_str()))
+        .map(|entry| entry.key().clone())
+        .collect()
+}
+
+fn mark_relist_seen_from_cni_add(
+    init_seen: &mut Option<HashSet<String>>,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    request: &CniRpcRequest,
+) {
+    let Some(seen) = init_seen else {
+        return;
+    };
+    if request.verb != RpcVerb::Add {
+        return;
+    }
+    let Some(pod_uid) = request.pod_uid.as_deref() else {
+        return;
+    };
+    if pod_states.contains_key(pod_uid) {
+        seen.insert(pod_uid.to_string());
+    }
 }
 
 /// Apply one CNI plugin RPC to the same state the kube-rs watcher
@@ -3677,6 +3705,85 @@ mod tests {
         assert!(pod_states.contains_key("pod-uid-1"));
         assert!(backend.detached_pods.is_empty());
         assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cni_add_during_relist_marks_tracked_pod_seen() {
+        use crate::cni::rpc::{CniRpcRequest, RpcVerb};
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "alpha".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: None,
+                cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid1".to_string()),
+                veth_iface: Some("veth123".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+            },
+        );
+        let mut init_seen = Some(HashSet::new());
+        let req = CniRpcRequest {
+            verb: RpcVerb::Add,
+            pod_namespace: "default".to_string(),
+            pod_name: "alpha".to_string(),
+            pod_uid: Some("pod-uid-1".to_string()),
+            container_id: "ctr-1".to_string(),
+            netns_path: Some("/var/run/netns/cni-1".to_string()),
+            args: HashMap::new(),
+        };
+
+        mark_relist_seen_from_cni_add(&mut init_seen, &pod_states, &req);
+
+        let seen = init_seen.take().expect("relist in progress");
+        assert!(
+            watcher_init_stale_uids(&pod_states, &seen).is_empty(),
+            "CNI-enrolled pod should survive the current watcher InitDone sweep"
+        );
+    }
+
+    #[test]
+    fn unrelated_cni_add_during_relist_does_not_mask_stale_pod() {
+        use crate::cni::rpc::{CniRpcRequest, RpcVerb};
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        pod_states.insert(
+            "pod-uid-1".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-uid-1".to_string(),
+                pod_name: "alpha".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: None,
+                cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid1".to_string()),
+                veth_iface: Some("veth123".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+            },
+        );
+        let mut init_seen = Some(HashSet::new());
+        let req = CniRpcRequest {
+            verb: RpcVerb::Add,
+            pod_namespace: "default".to_string(),
+            pod_name: "beta".to_string(),
+            pod_uid: Some("pod-uid-2".to_string()),
+            container_id: "ctr-2".to_string(),
+            netns_path: Some("/var/run/netns/cni-2".to_string()),
+            args: HashMap::new(),
+        };
+
+        mark_relist_seen_from_cni_add(&mut init_seen, &pod_states, &req);
+
+        let seen = init_seen.take().expect("relist in progress");
+        assert_eq!(
+            watcher_init_stale_uids(&pod_states, &seen),
+            vec!["pod-uid-1".to_string()],
+            "unrelated CNI ADD must not protect a stale watcher entry"
+        );
     }
 
     /// `apply_cni_request` ADD without a pod_uid maps to `Rejected` (we
