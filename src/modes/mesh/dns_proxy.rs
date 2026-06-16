@@ -34,6 +34,7 @@ const DNS_UPSTREAM_TIMEOUT_SECS: u64 = 5;
 const DNS_UPSTREAM_ID_SPACE: usize = u16::MAX as usize + 1;
 const DNS_TCP_QUERY_READ_TIMEOUT_SECS: u64 = 5;
 const DNS_TCP_WRITE_TIMEOUT_SECS: u64 = 5;
+const DNS_MAX_NAME_POINTER_JUMPS: u32 = 16;
 pub const DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES: usize = 4096;
 pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
@@ -216,8 +217,7 @@ impl DnsResolutionTable {
             let ips: Vec<IpAddr> = wl
                 .addresses
                 .iter()
-                .filter_map(|addr| addr.parse::<IpAddr>().ok())
-                .filter(is_routable_mesh_dns_ip)
+                .filter_map(|addr| parse_routable_mesh_dns_ip(addr))
                 .collect();
             if !ips.is_empty() {
                 let entries = workload_ips
@@ -243,8 +243,7 @@ impl DnsResolutionTable {
             let ips: Vec<IpAddr> = entry
                 .endpoints
                 .iter()
-                .filter_map(|ep| ep.address.parse::<IpAddr>().ok())
-                .filter(is_routable_mesh_dns_ip)
+                .filter_map(|ep| parse_routable_mesh_dns_ip(&ep.address))
                 .collect();
             if ips.is_empty() {
                 continue;
@@ -393,11 +392,21 @@ impl DnsResolutionTable {
         let mut template = build_response();
         clear_response_transaction_id(&mut template);
         let response = response_from_cached_template(&template, query_id);
-        if self.reserve_response_cache_slot() && self.response_cache.insert(key, template).is_some()
-        {
+        self.insert_response_cache_template(key, template);
+        response
+    }
+
+    fn insert_response_cache_template(&self, key: DnsResponseCacheKey, template: Vec<u8>) {
+        if !self.reserve_response_cache_slot() {
+            self.evict_response_cache_entry();
+            if !self.reserve_response_cache_slot() {
+                return;
+            }
+        }
+
+        if self.response_cache.insert(key, template).is_some() {
             self.response_cache_entries.fetch_sub(1, Ordering::Relaxed);
         }
-        response
     }
 
     fn reserve_response_cache_slot(&self) -> bool {
@@ -416,6 +425,24 @@ impl DnsResolutionTable {
                 Ok(_) => return true,
                 Err(observed) => current = observed,
             }
+        }
+    }
+
+    fn evict_response_cache_entry(&self) -> bool {
+        let evict_key = self
+            .response_cache
+            .iter()
+            .next()
+            .map(|entry| entry.key().clone());
+        let Some(evict_key) = evict_key else {
+            return false;
+        };
+
+        if self.response_cache.remove(&evict_key).is_some() {
+            self.response_cache_entries.fetch_sub(1, Ordering::Relaxed);
+            true
+        } else {
+            false
         }
     }
 
@@ -492,8 +519,23 @@ fn is_authoritative_mesh_dns_name(name: &str, cluster_domain: &str) -> bool {
     name.ends_with(&svc_suffix) || name == format!("svc.{cluster_domain}")
 }
 
-fn is_routable_mesh_dns_ip(ip: &IpAddr) -> bool {
+fn parse_routable_mesh_dns_ip(addr: &str) -> Option<IpAddr> {
+    let ip = canonicalize_mesh_dns_ip(addr.parse::<IpAddr>().ok()?);
+    is_routable_mesh_dns_ip(&ip).then_some(ip)
+}
+
+fn canonicalize_mesh_dns_ip(ip: IpAddr) -> IpAddr {
     match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(addr) => addr
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(addr)),
+    }
+}
+
+fn is_routable_mesh_dns_ip(ip: &IpAddr) -> bool {
+    match canonicalize_mesh_dns_ip(*ip) {
         IpAddr::V4(addr) => {
             !addr.is_unspecified()
                 && !addr.is_loopback()
@@ -1141,6 +1183,7 @@ async fn run_udp_forwarder(
     let mut pending: HashMap<u16, PendingForward> = HashMap::new();
     let mut next_id = 0u16;
     let mut response_buf = vec![0u8; DNS_MAX_UDP_PACKET_SIZE];
+    let mut expired_ids = Vec::new();
     let mut cleanup = tokio::time::interval(Duration::from_secs(1));
 
     loop {
@@ -1228,11 +1271,11 @@ async fn run_udp_forwarder(
             }
             _ = cleanup.tick() => {
                 let now = Instant::now();
-                let expired: Vec<u16> = pending
+                expired_ids.clear();
+                expired_ids.extend(pending
                     .iter()
-                    .filter_map(|(id, request)| (request.expires_at <= now).then_some(*id))
-                    .collect();
-                for id in expired {
+                    .filter_map(|(id, request)| (request.expires_at <= now).then_some(*id)));
+                for id in expired_ids.drain(..) {
                     if let Some(request) = pending.remove(&id) {
                         warn!(client = %request.client, upstream = %upstream, "Upstream DNS query timed out");
                         send_udp_servfail(&client_socket, &request.query, request.client).await;
@@ -1385,9 +1428,12 @@ fn parse_dns_query(packet: &[u8]) -> Option<DnsQuery> {
     let mut additional_offset = question_end;
     let mut opt_record = None;
     let mut udp_payload_size = DNS_UDP_SAFE_PACKET_SIZE;
+    if usize::from(arcount) > packet.len().saturating_sub(question_end) / 11 {
+        return None;
+    }
     for _ in 0..arcount {
         let record_start = additional_offset;
-        let (_, record_name_end) = parse_dns_name(packet, additional_offset)?;
+        let record_name_end = skip_dns_name(packet, additional_offset)?;
         if record_name_end + 10 > packet.len() {
             return None;
         }
@@ -1444,7 +1490,6 @@ fn parse_dns_name(packet: &[u8], start: usize) -> Option<(String, usize)> {
     // allocation amplifier. 16 jumps is far more than any legitimate query
     // name needs (a QNAME never uses compression; AR names rarely do).
     let mut pointer_jumps = 0u32;
-    const MAX_POINTER_JUMPS: u32 = 16;
 
     loop {
         if offset >= packet.len() {
@@ -1470,7 +1515,7 @@ fn parse_dns_name(packet: &[u8], start: usize) -> Option<(String, usize)> {
                 return_offset = Some(offset + 2);
             }
             pointer_jumps += 1;
-            if pointer_jumps > MAX_POINTER_JUMPS {
+            if pointer_jumps > DNS_MAX_NAME_POINTER_JUMPS {
                 return None;
             }
             let pointer = ((len & 0x3F) << 8) | packet[offset + 1] as usize;
@@ -1508,6 +1553,73 @@ fn parse_dns_name(packet: &[u8], start: usize) -> Option<(String, usize)> {
     }
 
     Some((name, return_offset.unwrap_or(offset)))
+}
+
+fn skip_dns_name(packet: &[u8], start: usize) -> Option<usize> {
+    let mut offset = start;
+    let mut return_offset = None;
+    let mut pointer_jumps = 0u32;
+    let mut name_len = 0usize;
+
+    loop {
+        if offset >= packet.len() {
+            return None;
+        }
+
+        let len = packet[offset] as usize;
+        if len == 0 {
+            if return_offset.is_none() {
+                return_offset = Some(offset + 1);
+            }
+            break;
+        }
+
+        if len & 0xC0 == 0xC0 {
+            if offset + 1 >= packet.len() {
+                return None;
+            }
+            if return_offset.is_none() {
+                return_offset = Some(offset + 2);
+            }
+            pointer_jumps += 1;
+            if pointer_jumps > DNS_MAX_NAME_POINTER_JUMPS {
+                return None;
+            }
+            let pointer = ((len & 0x3F) << 8) | packet[offset + 1] as usize;
+            if pointer >= packet.len() {
+                return None;
+            }
+            offset = pointer;
+            continue;
+        }
+
+        if len > 63 {
+            return None;
+        }
+
+        offset += 1;
+        if offset + len > packet.len() {
+            return None;
+        }
+
+        if name_len != 0 {
+            name_len += 1;
+        }
+        name_len += len;
+        if name_len + 1 > 255 {
+            return None;
+        }
+        if !packet[offset..offset + len]
+            .iter()
+            .copied()
+            .all(is_valid_dns_label_byte)
+        {
+            return None;
+        }
+        offset += len;
+    }
+
+    Some(return_offset.unwrap_or(offset))
 }
 
 fn is_valid_dns_label_byte(byte: u8) -> bool {
@@ -1802,6 +1914,16 @@ mod tests {
         packet
     }
 
+    fn append_empty_additional_record(packet: &mut Vec<u8>, name: &str, record_type: u16) {
+        let arcount = u16::from_be_bytes([packet[10], packet[11]]);
+        packet[10..12].copy_from_slice(&arcount.saturating_add(1).to_be_bytes());
+        encode_dns_name(name, packet).expect("test additional record name should encode");
+        packet.extend_from_slice(&record_type.to_be_bytes());
+        packet.extend_from_slice(&QCLASS_IN.to_be_bytes());
+        packet.extend_from_slice(&0u32.to_be_bytes()); // TTL
+        packet.extend_from_slice(&0u16.to_be_bytes()); // RDLEN
+    }
+
     #[test]
     fn parse_dns_query_valid_a_query() {
         let packet = build_a_query("example.com");
@@ -1909,6 +2031,31 @@ mod tests {
         let query = parse_dns_query(&packet).expect("should parse");
         assert_eq!(query.udp_payload_size, 1232);
         assert!(query.opt_record.is_some());
+    }
+
+    #[test]
+    fn parse_dns_query_skips_non_opt_additional_records() {
+        let mut packet = build_a_query("example.com");
+        for index in 0..32 {
+            append_empty_additional_record(
+                &mut packet,
+                &format!("ignored-{index}.example.com"),
+                QTYPE_TXT,
+            );
+        }
+
+        let query = parse_dns_query(&packet).expect("should parse");
+
+        assert!(query.opt_record.is_none());
+        assert_eq!(query.udp_payload_size, DNS_UDP_SAFE_PACKET_SIZE);
+    }
+
+    #[test]
+    fn parse_dns_query_rejects_impossible_additional_record_count() {
+        let mut packet = build_a_query("example.com");
+        packet[10..12].copy_from_slice(&u16::MAX.to_be_bytes());
+
+        assert!(parse_dns_query(&packet).is_none());
     }
 
     #[test]
@@ -2193,6 +2340,36 @@ mod tests {
         }
 
         assert_eq!(table.response_cache_len(), 2);
+    }
+
+    #[test]
+    fn mesh_response_cache_replaces_entries_after_reaching_cap() {
+        let table = DnsResolutionTable::empty_with_response_cache_max_entries(1);
+        let old_key = DnsResponseCacheKey {
+            name: Arc::from("old.example.com"),
+            qtype: QTYPE_A,
+            qclass: QCLASS_IN,
+            rd: true,
+            cd: false,
+            ad: false,
+            ttl: 60,
+            max_response_size: DNS_UDP_SAFE_PACKET_SIZE,
+            opt_record: None,
+        };
+        let new_key = DnsResponseCacheKey {
+            name: Arc::from("new.example.com"),
+            ..old_key.clone()
+        };
+
+        let _ = table.cached_mesh_response(old_key, 0x1234, || vec![0x12, 0x34, 0x81, 0x80]);
+        let _ =
+            table.cached_mesh_response(new_key.clone(), 0x5678, || vec![0x56, 0x78, 0x81, 0x80]);
+
+        assert_eq!(table.response_cache_len(), 1);
+        assert!(
+            table.response_cache.contains_key(&new_key),
+            "full cache should evict an older template and admit the new key"
+        );
     }
 
     #[test]
@@ -2647,7 +2824,15 @@ mod tests {
         let slice = MeshSlice {
             service_entries: vec![test_service_entry(
                 vec!["mixed.example.com"],
-                vec!["10.0.0.1", "not-an-ip", "::1", "127.0.0.1", "169.254.1.1"],
+                vec![
+                    "10.0.0.1",
+                    "not-an-ip",
+                    "::1",
+                    "127.0.0.1",
+                    "169.254.1.1",
+                    "::ffff:127.0.0.1",
+                    "::ffff:169.254.1.1",
+                ],
             )],
             ..MeshSlice::default()
         };
@@ -3319,6 +3504,16 @@ mod tests {
         assert!(!is_routable_mesh_dns_ip(&"::1".parse().unwrap()));
         assert!(!is_routable_mesh_dns_ip(&"fe80::1".parse().unwrap()));
         assert!(!is_routable_mesh_dns_ip(&"ff02::1".parse().unwrap()));
+        assert!(!is_routable_mesh_dns_ip(&"::ffff:0.0.0.0".parse().unwrap()));
+        assert!(!is_routable_mesh_dns_ip(
+            &"::ffff:127.0.0.1".parse().unwrap()
+        ));
+        assert!(!is_routable_mesh_dns_ip(
+            &"::ffff:169.254.1.1".parse().unwrap()
+        ));
+        assert!(!is_routable_mesh_dns_ip(
+            &"::ffff:224.0.0.1".parse().unwrap()
+        ));
     }
 
     #[test]
@@ -3328,6 +3523,14 @@ mod tests {
         assert!(is_routable_mesh_dns_ip(&"8.8.8.8".parse().unwrap()));
         assert!(is_routable_mesh_dns_ip(&"fd00::1".parse().unwrap()));
         assert!(is_routable_mesh_dns_ip(&"2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn parse_routable_mesh_dns_ip_canonicalizes_ipv4_mapped_ipv6() {
+        assert_eq!(
+            parse_routable_mesh_dns_ip("::ffff:10.0.0.1"),
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        );
     }
 
     // ── is_authoritative_mesh_dns_name helper ───────────────────────────
