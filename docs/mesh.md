@@ -1619,9 +1619,13 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   discriminator without per-pod IP knowledge the iptables fallback does not carry,
   so the **node-agent's host-netns iptables fallback emits NO UDP TPROXY rules**
   (`CaptureConfig::host_netns` short-circuits `udp_tproxy_commands_for_family`) and
-  logs the limitation when `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`. **eBPF is the
-  supported node-agent UDP capture path**; the iptables fallback is TCP-only in the
-  host netns. The injector (pod-netns) UDP path is unaffected.
+  logs the limitation when `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`. **Node-agent
+  host-netns UDP capture is unsupported in this stage**, and **eBPF does not cover
+  UDP either** — the eBPF capture programs are `connect()`-cgroup-hooked and
+  TCP-only (no UDP hooks; see the node-waypoint UDP/DTLS limitation above). UDP
+  capture lives in the **injector's pod-netns path** (its iptables init container
+  runs in the pod netns, where the pod IP is `LOCAL` so the direction split holds);
+  node-agent / node-waypoint UDP capture is a **future stage**.
 - **Transparent-routing plumbing** (raw `ip` commands, not iptables): TPROXY
   delivery additionally needs `ip rule add priority <P> fwmark <mark>/<mask> lookup
   <table>` plus `ip route add local 0.0.0.0/0 dev lo table <table>` (and the `ip -6`

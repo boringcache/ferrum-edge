@@ -107,8 +107,11 @@ impl NodeAgentConfig {
         // The node-agent DaemonSet runs `hostNetwork: true` (host netns), so the
         // UDP TPROXY `addrtype --dst-type LOCAL` direction split (valid only in a
         // pod netns) is suppressed for the iptables fallback — see
-        // `CaptureConfig::host_netns` and `udp_tproxy_commands_for_family`. eBPF is
-        // the node-agent's supported UDP capture path.
+        // `CaptureConfig::host_netns` and `udp_tproxy_commands_for_family`.
+        // Node-agent host-netns UDP capture is unsupported in this stage; eBPF does
+        // not cover UDP either (TCP-only connect()-cgroup hooks). UDP capture lives
+        // in the injector's pod-netns path (node-agent/node-waypoint UDP is a future
+        // stage).
         capture_config.host_netns = true;
         // Both the node-agent and the mesh proxy read FERRUM_MESH_OUTBOUND_LISTEN_ADDR
         // (default 127.0.0.1:15001), so the eBPF connect4 rewrite port and the
@@ -1997,17 +2000,24 @@ where
             // FORWARDED, not LOCAL), so `udp_tproxy_commands_for_family` emits NO
             // UDP TPROXY rules for `host_netns`. Surface that explicitly so an
             // operator who set FERRUM_MESH_CAPTURE_UDP_ENABLED=true on the
-            // node-agent is not silently left without UDP capture: eBPF is the
-            // supported node-agent UDP capture path; the iptables fallback is
-            // TCP-only in the host netns.
+            // node-agent is not silently left thinking UDP is captured: node-agent
+            // host-netns UDP capture is unsupported in this stage and eBPF does NOT
+            // cover UDP either (the connect()-cgroup hooks are TCP-only). UDP
+            // capture lives in the injector's pod-netns path; node-agent /
+            // node-waypoint UDP capture is a future stage.
             if udp_capture_enabled && config.capture_config.host_netns {
                 warn!(
                     "FERRUM_MESH_CAPTURE_UDP_ENABLED=true but the node-agent iptables \
                      fallback runs in the host network namespace, where the UDP TPROXY \
                      direction split (addrtype --dst-type LOCAL) cannot distinguish \
                      inbound-to-pod from outbound traffic. No UDP TPROXY rules will be \
-                     installed (TCP capture is unaffected). Use eBPF capture (kernel >= 5.7 \
-                     with cgroup v2 + bpffs) for node-agent UDP capture."
+                     installed (TCP capture is unaffected). Node-agent host-netns UDP \
+                     capture is NOT supported in this stage (the direction split is \
+                     pod-netns-only); eBPF capture does NOT cover UDP either (the \
+                     connect()-cgroup hooks are TCP-only). For UDP capture, use the \
+                     injector's pod-netns path (an iptables init container that runs in \
+                     the pod netns where the pod IP is LOCAL); node-agent / node-waypoint \
+                     UDP capture is a future stage."
                 );
             }
 
