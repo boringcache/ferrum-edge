@@ -4016,10 +4016,10 @@ mod tests {
         dtls_disconnect_cause, dtls_disconnect_direction, emit_udp_stream_disconnect,
         reserve_udp_session_slot, resolve_or_reuse_backend_target, udp_session_shard_amount,
     };
-    use crate::config::GatewayConfig;
     use crate::config::types::{BackendScheme, BackendTlsConfig, Proxy};
     use crate::load_balancer::LoadBalancerCache;
     use crate::plugins::{Plugin, StreamTransactionSummary};
+    use crate::proxy::GatewayConfig;
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::net::SocketAddr;

@@ -2461,8 +2461,9 @@ async fn handle_tcp_connection_inner(
             Err(e) => {
                 record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
                 let err_msg = format!("DNS resolution failed for {}: {}", current_host, e);
-                if can_retry && attempt < max_retries {
-                    if let Some(next) = try_next_enforced_target(
+                if can_retry
+                    && attempt < max_retries
+                    && let Some(next) = try_next_enforced_target(
                         &params,
                         &current_host,
                         current_port,
@@ -2471,34 +2472,33 @@ async fn handle_tcp_connection_inner(
                         stream_ctx.listen_port,
                         proxy_id,
                         remote_addr.ip(),
-                    )? {
-                        warn!(
-                            proxy_id = %proxy_id,
-                            attempt,
-                            "TCP DNS failed for {}:{}, retrying with {}:{}",
-                            current_host, current_port, next.0, next.1
-                        );
-                        current_host = next.0;
-                        current_port = next.1;
-                        current_cb_info = TcpConnCbInfo {
-                            cb_config: current_cb_info.cb_config.clone(),
-                            cb_target_key: params.upstream_id.as_ref().map(|_| {
-                                crate::circuit_breaker::target_key(&current_host, current_port)
-                            }),
-                            is_half_open_probe: false,
-                        };
-                        // Update backend info to reflect the retry target.
-                        backend_info.backend_target =
-                            format_backend_target(&current_host, current_port);
-                        backend_info.backend_resolved_ip = None;
-                        last_connect_err = Some(anyhow::anyhow!(err_msg));
-                        attempt += 1;
-                        if let Some(ref retry_config) = params.retry {
-                            tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt))
-                                .await;
-                        }
-                        continue;
+                    )?
+                {
+                    warn!(
+                        proxy_id = %proxy_id,
+                        attempt,
+                        "TCP DNS failed for {}:{}, retrying with {}:{}",
+                        current_host, current_port, next.0, next.1
+                    );
+                    current_host = next.0;
+                    current_port = next.1;
+                    current_cb_info = TcpConnCbInfo {
+                        cb_config: current_cb_info.cb_config.clone(),
+                        cb_target_key: params.upstream_id.as_ref().map(|_| {
+                            crate::circuit_breaker::target_key(&current_host, current_port)
+                        }),
+                        is_half_open_probe: false,
+                    };
+                    // Update backend info to reflect the retry target.
+                    backend_info.backend_target =
+                        format_backend_target(&current_host, current_port);
+                    backend_info.backend_resolved_ip = None;
+                    last_connect_err = Some(anyhow::anyhow!(err_msg));
+                    attempt += 1;
+                    if let Some(ref retry_config) = params.retry {
+                        tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt)).await;
                     }
+                    continue;
                 }
                 return Err(anyhow::anyhow!(err_msg));
             }
@@ -2540,8 +2540,9 @@ async fn handle_tcp_connection_inner(
                 // until a config reload. This is neutral: the cap is not a
                 // backend failure.
                 record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
-                if can_retry && attempt < max_retries {
-                    if let Some(next) = try_next_enforced_target(
+                if can_retry
+                    && attempt < max_retries
+                    && let Some(next) = try_next_enforced_target(
                         &params,
                         &current_host,
                         current_port,
@@ -2550,37 +2551,33 @@ async fn handle_tcp_connection_inner(
                         stream_ctx.listen_port,
                         proxy_id,
                         remote_addr.ip(),
-                    )? {
-                        current_host = next.0;
-                        current_port = next.1;
-                        current_cb_info = TcpConnCbInfo {
-                            cb_config: current_cb_info.cb_config.clone(),
-                            cb_target_key: params.upstream_id.as_ref().map(|_| {
-                                crate::circuit_breaker::target_key(&current_host, current_port)
-                            }),
-                            is_half_open_probe: false,
-                        };
-                        backend_info.backend_target =
-                            format_backend_target(&current_host, current_port);
-                        backend_info.backend_resolved_ip = None;
-                        last_connect_err = Some(
-                            StreamSetupError::with_source(
-                                StreamSetupKind::BackendMaxConnectionsExceeded,
-                                format!(
-                                    "for {}",
-                                    format_backend_target(&current_host, current_port)
-                                ),
-                                reason,
-                            )
-                            .into(),
-                        );
-                        attempt += 1;
-                        if let Some(ref retry_config) = params.retry {
-                            tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt))
-                                .await;
-                        }
-                        continue;
+                    )?
+                {
+                    current_host = next.0;
+                    current_port = next.1;
+                    current_cb_info = TcpConnCbInfo {
+                        cb_config: current_cb_info.cb_config.clone(),
+                        cb_target_key: params.upstream_id.as_ref().map(|_| {
+                            crate::circuit_breaker::target_key(&current_host, current_port)
+                        }),
+                        is_half_open_probe: false,
+                    };
+                    backend_info.backend_target =
+                        format_backend_target(&current_host, current_port);
+                    backend_info.backend_resolved_ip = None;
+                    last_connect_err = Some(
+                        StreamSetupError::with_source(
+                            StreamSetupKind::BackendMaxConnectionsExceeded,
+                            format!("for {}", format_backend_target(&current_host, current_port)),
+                            reason,
+                        )
+                        .into(),
+                    );
+                    attempt += 1;
+                    if let Some(ref retry_config) = params.retry {
+                        tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt)).await;
                     }
+                    continue;
                 }
                 return Err(StreamSetupError::with_source(
                     StreamSetupKind::BackendMaxConnectionsExceeded,
@@ -2627,8 +2624,9 @@ async fn handle_tcp_connection_inner(
             }
             Err(e) => {
                 record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
-                if can_retry && attempt < max_retries {
-                    if let Some(next) = try_next_enforced_target(
+                if can_retry
+                    && attempt < max_retries
+                    && let Some(next) = try_next_enforced_target(
                         &params,
                         &current_host,
                         current_port,
@@ -2637,35 +2635,34 @@ async fn handle_tcp_connection_inner(
                         stream_ctx.listen_port,
                         proxy_id,
                         remote_addr.ip(),
-                    )? {
-                        warn!(
-                            proxy_id = %proxy_id,
-                            attempt,
-                            error = %e,
-                            "TCP connect failed to {}:{}, retrying with {}:{}",
-                            current_host, current_port, next.0, next.1
-                        );
-                        current_host = next.0;
-                        current_port = next.1;
-                        current_cb_info = TcpConnCbInfo {
-                            cb_config: current_cb_info.cb_config.clone(),
-                            cb_target_key: params.upstream_id.as_ref().map(|_| {
-                                crate::circuit_breaker::target_key(&current_host, current_port)
-                            }),
-                            is_half_open_probe: false,
-                        };
-                        // Update backend info to reflect the retry target.
-                        backend_info.backend_target =
-                            format_backend_target(&current_host, current_port);
-                        backend_info.backend_resolved_ip = None;
-                        last_connect_err = Some(e);
-                        attempt += 1;
-                        if let Some(ref retry_config) = params.retry {
-                            tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt))
-                                .await;
-                        }
-                        continue;
+                    )?
+                {
+                    warn!(
+                        proxy_id = %proxy_id,
+                        attempt,
+                        error = %e,
+                        "TCP connect failed to {}:{}, retrying with {}:{}",
+                        current_host, current_port, next.0, next.1
+                    );
+                    current_host = next.0;
+                    current_port = next.1;
+                    current_cb_info = TcpConnCbInfo {
+                        cb_config: current_cb_info.cb_config.clone(),
+                        cb_target_key: params.upstream_id.as_ref().map(|_| {
+                            crate::circuit_breaker::target_key(&current_host, current_port)
+                        }),
+                        is_half_open_probe: false,
+                    };
+                    // Update backend info to reflect the retry target.
+                    backend_info.backend_target =
+                        format_backend_target(&current_host, current_port);
+                    backend_info.backend_resolved_ip = None;
+                    last_connect_err = Some(e);
+                    attempt += 1;
+                    if let Some(ref retry_config) = params.retry {
+                        tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt)).await;
                     }
+                    continue;
                 }
                 return Err(e);
             }
