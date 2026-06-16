@@ -2943,7 +2943,7 @@ fn validate_mesh_traffic_policy_tls(
 }
 
 fn validate_required_tls_path(context: String, value: Option<&str>, errors: &mut Vec<String>) {
-    if !value.is_some_and(|value| !value.trim().is_empty()) {
+    if value.is_none_or(|value| value.trim().is_empty()) {
         errors.push(format!("{context}: must be set and non-empty"));
     }
 }
