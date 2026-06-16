@@ -130,7 +130,13 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    needs: [build-release-binaries, docker-manifest]
+    # Wait for BOTH manifests: the release notes advertise the `:<tag>` default
+    # image AND the `:<tag>-ebpf` variant, so the GitHub Release must not publish
+    # until the eBPF manifest exists — otherwise the notes link `-ebpf` tags that
+    # were never pushed. Both `docker-manifest` and `docker-ebpf-manifest` run
+    # unconditionally on every `v*` tag (no `if:`/path filters), so this keeps the
+    # default release path intact.
+    needs: [build-release-binaries, docker-manifest, docker-ebpf-manifest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -182,6 +188,31 @@ jobs:
           \`\`\`bash
           docker pull ferrumedge/ferrum-edge:$TAG_NAME
           docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME
+          \`\`\`
+
+          The default image ships the no-op **mock** eBPF capture backend. For
+          real ambient / node-waypoint eBPF capture, pull the **Linux-only**
+          \`-ebpf\` variant (built with \`--features ebpf\`; requires kernel
+          ≥ 5.7 with cgroup v2 + bpffs). Capabilities depend on the kernel: on
+          **≥ 5.8** use \`CAP_BPF\`/\`CAP_PERFMON\`/\`CAP_NET_ADMIN\`; on the
+          **5.7.x** window use \`CAP_SYS_ADMIN\` + \`CAP_NET_ADMIN\` instead,
+          because \`CAP_BPF\`/\`CAP_PERFMON\` were only split out of
+          \`CAP_SYS_ADMIN\` in 5.8 — see
+          [docs/node_agent_security.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent_security.md).
+          On a node whose kernel/cgroup/bpffs probe fails, the \`-ebpf\` pod
+          **exits** (default \`FERRUM_NODE_AGENT_FALLBACK_MODE=fail\`) rather than
+          degrading. The published \`-ebpf\` image is **distroless** — it has no
+          \`/bin/sh\` and no \`iptables\`, and the fallback runs commands via
+          \`sh -c\`, so \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` on the
+          published image **crash-loops**. To use the iptables fallback, build a
+          custom runtime image that adds \`/bin/sh\` + \`iptables\`/\`ip6tables\`
+          (see [docs/node_agent.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/docs/node_agent.md#kernel-fallback)),
+          then set \`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables\` to fall back to
+          host iptables capture:
+
+          \`\`\`bash
+          docker pull ferrumedge/ferrum-edge:$TAG_NAME-ebpf
+          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME-ebpf
           \`\`\`
 
           ## Checksums
@@ -356,4 +387,158 @@ jobs:
             -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.TAG_NAME }} \
             -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }} \
             -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.MAJOR_MINOR }} \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+
+  # ── eBPF capture image variant (`-ebpf` suffix) ────────────────────────────
+  # The default `docker` job above ships the historical multi-platform image
+  # built from pre-built `--features cloud-secrets` binaries, where the
+  # node-agent / node-waypoint capture path runs the no-op MOCK eBPF backend
+  # (attaches nothing, sets `ferrum_mesh_node_topology_degraded`). This second,
+  # `-ebpf`-suffixed variant ships the REAL aya-based capture backend.
+  #
+  # It is LINUX-ONLY: real capture needs the aya kernel loader, which compiles
+  # only on Linux with `--features ebpf`, plus the compiled `ferrum-ebpf` BPF
+  # ELF embedded in the image. Unlike the default job (which copies a pre-built
+  # binary into Dockerfile.release), this variant builds from source with the
+  # root `Dockerfile`, which BOTH builds the `--build-arg FEATURES=...,ebpf`
+  # binary AND compiles+COPYs the BPF ELF via its `ebpf-builder` stage. Each
+  # platform builds natively (no QEMU) so the from-source Rust + nightly eBPF
+  # build stays within sane time limits.
+  #
+  # The default image is unchanged: a variant build failure never blocks the
+  # default `:<tag>` image or the binary assets (those flow through `docker` /
+  # `docker-manifest`). It DOES gate the GitHub Release, because `create-release`
+  # `needs: docker-ebpf-manifest` — the release notes advertise the `-ebpf` tags,
+  # so the release must not publish until those manifests actually exist.
+  docker-ebpf:
+    name: Docker eBPF variant (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux/amd64
+            arch_dir: amd64
+          - os: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch_dir: arm64
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push per-platform eBPF digest
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            FEATURES=cloud-secrets,ebpf
+          outputs: type=image,"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: docker-ebpf-digest-${{ matrix.arch_dir }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+
+  docker-ebpf-manifest:
+    name: Docker eBPF Manifest
+    # Gate the public `:<tag>-ebpf` registry tags on the CORE release path, not
+    # just the eBPF build. `create-release`'s `needs` only blocks the GitHub
+    # Release *page* — it cannot retract tags this job already pushed. So if the
+    # core artifacts (`build-release-binaries`) or the default `:<tag>` manifest
+    # (`docker-manifest`) failed, we must NOT publish the `-ebpf` variant either,
+    # or the registry advertises an `-ebpf` image for a release whose core
+    # artifacts never shipped. `docker-manifest` already transitively requires
+    # `docker` (per-arch core build), and `docker-ebpf` is added here so the
+    # eBPF build still gates its own manifest. The graph stays acyclic.
+    needs: [build-release-binaries, docker-manifest, docker-ebpf]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Extract version tag
+        id: version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid release tag format: $TAG_NAME" >&2
+            exit 1
+          fi
+          VERSION="${TAG_NAME#v}"
+          MAJOR_MINOR="${VERSION%.*}"
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "MAJOR_MINOR=$MAJOR_MINOR" >> $GITHUB_OUTPUT
+
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: /tmp/digests
+          pattern: docker-ebpf-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch eBPF manifest (Docker Hub)
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.TAG_NAME }}-ebpf \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.VERSION }}-ebpf \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.MAJOR_MINOR }}-ebpf \
+            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)
+
+      - name: Create and push multi-arch eBPF manifest (GHCR)
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.TAG_NAME }}-ebpf \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }}-ebpf \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.MAJOR_MINOR }}-ebpf \
             $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
