@@ -821,9 +821,7 @@ impl MeshSlice {
             .peer_authentications
             .iter()
             .filter(|peer_auth| {
-                policy_candidate_labels.iter().any(|labels| {
-                    peer_auth_applies_to_workload(peer_auth, effective_namespace, *labels)
-                })
+                peer_auth_applies_to_workload(peer_auth, effective_namespace, &effective_labels)
             })
             .cloned()
             .collect();
@@ -844,20 +842,14 @@ impl MeshSlice {
             .request_authentications
             .iter()
             .filter(|ra| {
-                policy_candidate_labels.iter().any(|labels| {
-                    scope_applies_to_workload(&ra.scope, effective_namespace, *labels)
-                })
+                scope_applies_to_workload(&ra.scope, effective_namespace, &effective_labels)
             })
             .cloned()
             .collect();
         let telemetry_resources: Vec<MeshTelemetryResource> = mesh
             .telemetry_resources
             .iter()
-            .filter(|t| {
-                policy_candidate_labels
-                    .iter()
-                    .any(|labels| scope_applies_to_workload(&t.scope, effective_namespace, *labels))
-            })
+            .filter(|t| scope_applies_to_workload(&t.scope, effective_namespace, &effective_labels))
             .cloned()
             .collect();
         let destination_rules: Vec<MeshDestinationRule> = mesh
@@ -3463,6 +3455,88 @@ mod tests {
             MeshSlice::from_gateway_config(&config, slice_request_with_labels("alpha", labels));
         assert_eq!(slice.telemetry_resources.len(), 1);
         assert_eq!(slice.telemetry_resources[0].name, "tel-match");
+    }
+
+    #[test]
+    fn inferred_labels_filter_selector_scoped_single_winner_resources_by_intersection() {
+        let workload_a = make_workload(
+            "alpha",
+            "shared",
+            HashMap::from([
+                ("app".into(), "shared".into()),
+                ("role".into(), "api".into()),
+            ]),
+        );
+        let workload_b = make_workload(
+            "alpha",
+            "shared",
+            HashMap::from([
+                ("app".into(), "shared".into()),
+                ("role".into(), "worker".into()),
+            ]),
+        );
+        let workload_spiffe_id = workload_a.spiffe_id.to_string();
+        let role_api_selector = WorkloadSelector {
+            labels: HashMap::from([("role".into(), "api".into())]),
+            namespace: Some("alpha".into()),
+        };
+        let mesh = MeshConfig {
+            workloads: vec![workload_a, workload_b],
+            peer_authentications: vec![
+                make_peer_auth("pa-alpha", "alpha", None),
+                make_peer_auth("pa-role-api", "alpha", Some(role_api_selector.clone())),
+            ],
+            request_authentications: vec![
+                make_request_auth(
+                    "ra-alpha",
+                    "alpha",
+                    PolicyScope::Namespace {
+                        namespace: "alpha".into(),
+                    },
+                ),
+                make_request_auth(
+                    "ra-role-api",
+                    "alpha",
+                    PolicyScope::WorkloadSelector {
+                        selector: role_api_selector.clone(),
+                    },
+                ),
+            ],
+            telemetry_resources: vec![
+                make_telemetry(
+                    "tel-alpha",
+                    "alpha",
+                    PolicyScope::Namespace {
+                        namespace: "alpha".into(),
+                    },
+                ),
+                make_telemetry(
+                    "tel-role-api",
+                    "alpha",
+                    PolicyScope::WorkloadSelector {
+                        selector: role_api_selector,
+                    },
+                ),
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let mut request = slice_request("alpha");
+        request.workload_spiffe_id = Some(workload_spiffe_id);
+
+        let slice = MeshSlice::from_gateway_config(&config, request);
+
+        assert_eq!(
+            slice.labels,
+            BTreeMap::from([("app".into(), "shared".into())]),
+            "only labels common to every matching workload should be authoritative"
+        );
+        assert_eq!(slice.peer_authentications.len(), 1);
+        assert_eq!(slice.peer_authentications[0].name, "pa-alpha");
+        assert_eq!(slice.request_authentications.len(), 1);
+        assert_eq!(slice.request_authentications[0].name, "ra-alpha");
+        assert_eq!(slice.telemetry_resources.len(), 1);
+        assert_eq!(slice.telemetry_resources[0].name, "tel-alpha");
     }
 
     #[test]
