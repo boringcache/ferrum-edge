@@ -1768,3 +1768,50 @@ fn open_epoch_is_visible_to_a_probe_admitted_immediately_after_open() {
         "reopening after a probe failure advances the generation"
     );
 }
+
+#[test]
+fn can_execute_with_admission_epoch_returns_the_admitted_generation() {
+    // #1649 R6 finding 3: the admission epoch must reflect the generation the
+    // request is admitted under. A CLOSED admission captures the last open
+    // generation; a HALF_OPEN probe captures the generation it is probing. (The
+    // pre-admission snapshot also guarantees the captured value is never NEWER than
+    // the admission generation, so a concurrent open can only neutralize — never
+    // wrongly heal — a deferred outcome; that race is not reproducible
+    // single-threaded, but the per-state values are asserted here.)
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cache = CircuitBreakerCache::new();
+    let proxy_id = "epoch-proxy";
+    let tk = target_key("10.0.0.1", 8080);
+
+    // CLOSED admission captures generation 0 and is not a probe.
+    let (_cb, is_probe, epoch) = cache
+        .can_execute_with_admission_epoch(proxy_id, Some(&tk), &config)
+        .expect("closed admits");
+    assert!(!is_probe, "closed-state admission is not a half-open probe");
+    assert_eq!(epoch, 0, "closed admission captures the current generation");
+
+    // Trip the breaker (generation -> 1).
+    let (cb, _, _) = cache
+        .can_execute_with_admission_epoch(proxy_id, Some(&tk), &config)
+        .expect("still closed");
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+
+    // The next admission (timeout=0) is a HALF_OPEN probe and captures generation 1
+    // — the cycle it is probing — not the pre-trip generation 0.
+    let (_cb, is_probe, epoch) = cache
+        .can_execute_with_admission_epoch(proxy_id, Some(&tk), &config)
+        .expect("half-open admits a probe");
+    assert!(is_probe, "open+timeout=0 admits a half-open probe");
+    assert_eq!(
+        epoch, 1,
+        "the probe captures the generation it is probing, not the pre-open value"
+    );
+}

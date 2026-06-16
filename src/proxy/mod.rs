@@ -11936,7 +11936,11 @@ async fn handle_proxy_request_inner(
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet> = None;
 
     // Circuit breaker check — per-target when upstream is configured, per-proxy otherwise
-    let (cb_target_key, cb_is_half_open_probe, cb_admission_open_epoch) =
+    // `cb_admission_open_epoch` is re-captured on retry-target rotation (the gRPC
+    // and direct-H2 retry loops below) so a deferred streaming outcome is
+    // stale-checked against the FINAL admitted target's generation, not the initial
+    // target's (#1649 R6 findings 1 & 2).
+    let (cb_target_key, cb_is_half_open_probe, mut cb_admission_open_epoch) =
         match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {
@@ -12699,13 +12703,32 @@ async fn handle_proxy_request_inner(
                 // HALF_OPEN probe slot, letting an unadmitted retry advance or
                 // close a breaker that should have rejected the attempt.
                 if let Some(cb_config) = &proxy.circuit_breaker {
-                    match state.circuit_breaker_cache.can_execute(
-                        &proxy.id,
-                        grpc_current_cb_key.as_deref(),
-                        cb_config,
-                    ) {
-                        Ok((_cb, is_half_open_probe)) => {
+                    match state
+                        .circuit_breaker_cache
+                        .can_execute_with_admission_epoch(
+                            &proxy.id,
+                            grpc_current_cb_key.as_deref(),
+                            cb_config,
+                        ) {
+                        Ok((cb, is_half_open_probe, admission_open_epoch)) => {
                             grpc_cb_probe_slot = is_half_open_probe;
+                            // #1649 R6 finding 1: re-capture the admission epoch for
+                            // the rotated target so the deferred body-completion
+                            // outcome is stale-checked against THIS target's
+                            // generation, not the initial target's.
+                            cb_admission_open_epoch = admission_open_epoch;
+                            // #1649 R6 finding 4: re-point the probe-release guard at
+                            // the rotated target. On rotation the guard was disarmed
+                            // (after recording the prior target's intermediate
+                            // failure), so without this a HALF_OPEN slot acquired on
+                            // the rotated target would never be released on the
+                            // buffered streaming path (the deferred outcome records
+                            // the health as a non-probe). The buffered/retry request
+                            // has finished uploading, so header-flush release (guard
+                            // Drop) is the correct timing; the eager-record arms below
+                            // disarm the guard and release via `grpc_cb_probe_slot`.
+                            grpc_probe_guard.cb = is_half_open_probe.then(|| Arc::clone(&cb));
+                            grpc_probe_guard.armed = is_half_open_probe;
                         }
                         Err(_) => {
                             // Rotated/retried target's breaker rejected: don't
@@ -12732,6 +12755,11 @@ async fn handle_proxy_request_inner(
                 ) {
                     Ok(permits) => permits,
                     Err(rejection) => {
+                        // Disarm the RAII guard first so its Drop doesn't
+                        // double-release: after a rotation the guard was re-armed to
+                        // this target (#1649 R6 finding 4), so the explicit release
+                        // below would otherwise be duplicated by the guard's Drop.
+                        grpc_probe_guard.disarm();
                         release_circuit_breaker_probe_on_admission_reject(
                             &state,
                             &proxy,
@@ -14258,13 +14286,21 @@ async fn handle_proxy_request_inner(
             // `record_backend_outcome` attributes against the target that
             // actually produced `result`, not the never-called new target.
             if let Some(cb_config) = &proxy.circuit_breaker {
-                match state.circuit_breaker_cache.can_execute(
-                    &proxy.id,
-                    current_cb_target_key.as_deref(),
-                    cb_config,
-                ) {
-                    Ok((_cb, is_half_open_probe)) => {
+                match state
+                    .circuit_breaker_cache
+                    .can_execute_with_admission_epoch(
+                        &proxy.id,
+                        current_cb_target_key.as_deref(),
+                        cb_config,
+                    ) {
+                    Ok((_cb, is_half_open_probe, admission_open_epoch)) => {
                         cb_retry_probe_slot_available = is_half_open_probe;
+                        // #1649 R6 finding 2: re-capture the admission epoch for the
+                        // rotated target so the deferred StreamingH2 body-completion
+                        // outcome is stale-checked against THIS target's generation,
+                        // not the initial target's (the header-time neutral release
+                        // and the deferred record both use `final_cb_target_key`).
+                        cb_admission_open_epoch = admission_open_epoch;
                     }
                     Err(_err) => {
                         current_cb_target_key = pre_rotation_cb_key;

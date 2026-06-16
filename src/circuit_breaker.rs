@@ -618,6 +618,32 @@ impl CircuitBreakerCache {
         Ok((cb, is_half_open_probe))
     }
 
+    /// Like [`can_execute`](Self::can_execute), but also returns the breaker's open
+    /// generation captured BEFORE the admission decision.
+    ///
+    /// Because the snapshot is taken before `can_execute`, the returned epoch is
+    /// always `<=` the generation the request is actually admitted under: a
+    /// concurrent open racing this admission can only make a later deferred
+    /// streaming outcome look *stale* (neutralized — recovered by the next probe),
+    /// never *too new* (which would let a request heal/reopen a HALF_OPEN cycle it
+    /// never probed). Combined with the bump-before-publish ordering in
+    /// `record_failure`/`reopen_after_probe_failure`, a probe admitted into the
+    /// current OPEN cycle still captures that cycle's generation in the common
+    /// (non-racy) case. Used by the #1649 streaming-deferral admission sites — the
+    /// initial admission and every retry-target rotation — where the backend-health
+    /// outcome is recorded at response-body completion. (#1649 R6 finding 3)
+    pub fn can_execute_with_admission_epoch(
+        &self,
+        proxy_id: &str,
+        target_key: Option<&str>,
+        config: &CircuitBreakerConfig,
+    ) -> Result<(Arc<CircuitBreaker>, bool, u64), CircuitOpenError> {
+        let cb = self.get_or_create(proxy_id, target_key, config);
+        let admission_open_epoch = cb.open_epoch();
+        let is_half_open_probe = cb.can_execute()?;
+        Ok((cb, is_half_open_probe, admission_open_epoch))
+    }
+
     /// Snapshot of all circuit breaker states for metrics.
     pub fn snapshot(&self) -> Vec<(String, &'static str, u32, u32)> {
         self.breakers

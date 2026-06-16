@@ -457,17 +457,19 @@ pub(crate) fn check_circuit_breaker(
     let cb_target_key = circuit_breaker_target_key(proxy, upstream_target);
 
     if let Some(cb_config) = &proxy.circuit_breaker {
-        match state.circuit_breaker_cache.can_execute(
-            &proxy.id,
-            cb_target_key.as_deref(),
-            cb_config,
-        ) {
-            // Capture the open generation at admission so a deferred streaming
-            // outcome can detect that the breaker has since opened a new cycle
-            // (#1649 round-4 B) and avoid healing/reopening a HALF_OPEN cycle it
-            // never probed.
-            Ok((cb, is_half_open_probe)) => {
-                return Ok((cb_target_key, is_half_open_probe, cb.open_epoch()));
+        // Capture the open generation at admission so a deferred streaming outcome
+        // can detect that the breaker has since opened a new cycle (#1649 round-4 B)
+        // and avoid healing/reopening a HALF_OPEN cycle it never probed. The epoch
+        // is snapshotted BEFORE the admission decision (inside
+        // `can_execute_with_admission_epoch`) so a concurrent open racing this
+        // admission can only make the outcome look stale, never too-new (#1649 R6
+        // finding 3).
+        match state
+            .circuit_breaker_cache
+            .can_execute_with_admission_epoch(&proxy.id, cb_target_key.as_deref(), cb_config)
+        {
+            Ok((_cb, is_half_open_probe, admission_open_epoch)) => {
+                return Ok((cb_target_key, is_half_open_probe, admission_open_epoch));
             }
             Err(_) => {
                 warn!(proxy_id = %proxy.id, "Request rejected: circuit breaker open");
