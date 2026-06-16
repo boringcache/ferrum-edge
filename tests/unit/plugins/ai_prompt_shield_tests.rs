@@ -20,6 +20,16 @@ fn make_post_ctx(body: &serde_json::Value) -> ferrum_edge::plugins::RequestConte
     ctx
 }
 
+fn make_post_ctx_with_raw_body(body: &str) -> ferrum_edge::plugins::RequestContext {
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata
+        .insert("request_body".to_string(), body.to_string());
+    ctx
+}
+
 fn make_post_headers() -> HashMap<String, String> {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
@@ -415,6 +425,51 @@ async fn test_scan_all_mode() {
     // With "all" mode, the entire body is scanned.
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_scan_all_mode_rejects_json_escaped_pii() {
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["email"],
+        "scan_fields": "all"
+    }))
+    .unwrap();
+    let raw_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"contact \u0061\u0040\u0062\u002e\u0063\u006f\u006d"}]}"#;
+    assert!(
+        !raw_body.contains("a@b.com"),
+        "test payload must only contain the escaped form"
+    );
+
+    let mut ctx = make_post_ctx_with_raw_body(raw_body);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_scan_all_mode_redacts_json_escaped_pii() {
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+    let raw_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"contact \u0061\u0040\u0062\u002e\u0063\u006f\u006d"}]}"#;
+
+    let transformed = plugin
+        .transform_request_body(
+            raw_body.as_bytes(),
+            Some("application/json"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("escaped decoded email should trigger redaction");
+    let value: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    let content = value["messages"][0]["content"].as_str().unwrap();
+
+    assert!(content.contains("[REDACTED:email]"));
+    assert!(!content.contains("a@b.com"));
 }
 
 #[tokio::test]

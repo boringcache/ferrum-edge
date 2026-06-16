@@ -322,19 +322,6 @@ impl AiPromptShield {
             .collect()
     }
 
-    /// Detect PII in a raw string (for "all" scan mode).
-    /// Single `RegexSet` DFA pass — O(text_len).
-    fn detect_pii_in_str(&self, text: &str) -> Vec<String> {
-        if self.patterns.is_empty() {
-            return Vec::new();
-        }
-        self.detection_set
-            .matches(text)
-            .into_iter()
-            .filter_map(|idx| self.patterns.get(idx).map(|p| p.name.clone()))
-            .collect()
-    }
-
     /// Parse the body as JSON, apply mode-appropriate redaction, and return
     /// the mutated `Value`. Returns `None` when the body isn't valid JSON,
     /// is over `max_scan_bytes`, or contains no PII to redact (so callers
@@ -353,8 +340,12 @@ impl AiPromptShield {
         let mut json: Value = serde_json::from_str(body).ok()?;
 
         if self.scan_mode == ScanMode::All {
-            // Single DFA pass to short-circuit when no pattern matches.
-            if !self.detection_set.is_match(body) {
+            let detected = {
+                let mut texts = Vec::new();
+                collect_json_strings(&json, &mut texts);
+                self.detect_pii(&texts)
+            };
+            if detected.is_empty() {
                 return None;
             }
             // Run structured redaction first on known prompt-content
@@ -519,21 +510,23 @@ impl Plugin for AiPromptShield {
             return PluginResult::Continue;
         }
 
-        // Detect PII and (in non-scan-all mode) capture streaming intent from
-        // the same parsed JSON. Scan-all mode operates on the raw body string,
-        // so a full JSON parse just to read `stream` would be pure overhead —
-        // gate it behind a cheap byte-level substring check first.
+        // Detect PII and capture streaming intent from the same parsed JSON.
+        // Scan-all mode walks decoded JSON string values instead of raw bytes
+        // so JSON escapes cannot hide PII or prompt-injection payloads from the
+        // detector while the backend sees the decoded text.
         //
         // The streaming flag is captured before mutating `ctx.metadata`
         // because `body` borrows from `ctx.metadata.get("request_body")`.
         let (detected, is_streaming_request) = if self.scan_mode == ScanMode::All {
-            let detected = self.detect_pii_in_str(body);
-            let is_streaming = body.contains("\"stream\"")
-                && serde_json::from_str::<Value>(body)
-                    .ok()
-                    .and_then(|json| json.get("stream").and_then(|s| s.as_bool()))
-                    == Some(true);
-            (detected, is_streaming)
+            match serde_json::from_str::<Value>(body) {
+                Ok(json) => {
+                    let is_streaming = json.get("stream").and_then(|s| s.as_bool()) == Some(true);
+                    let mut texts = Vec::new();
+                    collect_json_strings(&json, &mut texts);
+                    (self.detect_pii(&texts), is_streaming)
+                }
+                Err(_) => return PluginResult::Continue,
+            }
         } else {
             match serde_json::from_str::<Value>(body) {
                 Ok(json) => {
@@ -722,6 +715,26 @@ fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option
     usize::try_from(value)
         .map(Some)
         .map_err(|_| format!("ai_prompt_shield: '{field}' is too large for this platform"))
+}
+
+/// Collect every decoded JSON string value for `ScanMode::All` detection.
+/// Serde has already resolved `\uXXXX` and other JSON string escapes here, so
+/// detection sees the same text the backend LLM will receive after parsing.
+fn collect_json_strings<'a>(value: &'a Value, texts: &mut Vec<&'a str>) {
+    match value {
+        Value::String(s) => texts.push(s.as_str()),
+        Value::Array(items) => {
+            for item in items {
+                collect_json_strings(item, texts);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_json_strings(value, texts);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Collect scannable prompt text from a top-level LLM field that may be a
