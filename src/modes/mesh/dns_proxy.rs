@@ -2418,6 +2418,7 @@ mod tests {
     #[test]
     fn mesh_response_cache_replaces_entries_after_reaching_cap() {
         let table = DnsResolutionTable::empty_with_response_cache_max_entries(1);
+        let query = cache_materialization_query();
         let old_key = DnsResponseCacheKey {
             name: Arc::from("old.example.com"),
             qtype: QTYPE_A,
@@ -2427,16 +2428,16 @@ mod tests {
             ad: false,
             ttl: 60,
             max_response_size: DNS_UDP_SAFE_PACKET_SIZE,
-            opt_record: None,
+            opt_record_len: 0,
         };
         let new_key = DnsResponseCacheKey {
             name: Arc::from("new.example.com"),
             ..old_key.clone()
         };
 
-        let _ = table.cached_mesh_response(old_key, 0x1234, || vec![0x12, 0x34, 0x81, 0x80]);
+        let _ = table.cached_mesh_response(old_key, &query, || vec![0x12, 0x34, 0x81, 0x80]);
         let _ =
-            table.cached_mesh_response(new_key.clone(), 0x5678, || vec![0x56, 0x78, 0x81, 0x80]);
+            table.cached_mesh_response(new_key.clone(), &query, || vec![0x56, 0x78, 0x81, 0x80]);
 
         assert_eq!(table.response_cache_len(), 1);
         assert!(
