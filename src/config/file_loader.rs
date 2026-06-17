@@ -132,6 +132,23 @@ pub fn load_config_from_file(
         ))
         .run()?;
 
+    // Reject mesh-PROJECTED upstream fields on this operator-provided file load.
+    // File config is operator-authored, so (like the admin write path) it must not
+    // carry `Upstream.{port_overrides, source_locality, locality_lb_strict,
+    // locality_lb_setting}` — those are owned by the mesh slice-apply layer and are
+    // not persisted/round-tripped here. This is deliberately OUTSIDE the shared
+    // validation pipeline (which also runs on the mesh slice-apply path, where the
+    // mesh layer legitimately projects these fields); only operator entry points
+    // call it. Fatal in file mode, matching the rest of file-mode validation.
+    if let Err(errors) = config.validate_operator_provided_fields() {
+        anyhow::bail!(
+            "Configuration validation failed: {} mesh-projected upstream field(s) \
+             cannot be set in file config: {}",
+            errors.len(),
+            errors.join("; ")
+        );
+    }
+
     // Capture all distinct namespaces before filtering so `GET /namespaces`
     // can return the full set even though only one namespace's resources are kept.
     {

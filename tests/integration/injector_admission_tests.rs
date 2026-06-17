@@ -9,7 +9,9 @@
 //!   - a real core `v1` Pod is still injected (happy path).
 
 use base64::Engine as _;
-use ferrum_edge::capture::{CaptureMode, Ip6TablesMode};
+use ferrum_edge::capture::{
+    CaptureMode, DEFAULT_TPROXY_MARK, DEFAULT_UDP_OUTBOUND_PORT, Ip6TablesMode,
+};
 use ferrum_edge::modes::injector::{
     ContainerResourceConfig, InjectorConfig, SecretKeyRef, admission_response,
 };
@@ -48,6 +50,9 @@ fn injector_config(capture_mode: CaptureMode) -> InjectorConfig {
         include_outbound_cidrs: Vec::new(),
         exclude_outbound_cidrs: Vec::new(),
         ip6tables_mode: Ip6TablesMode::Auto,
+        udp_capture_enabled: false,
+        udp_outbound_port: DEFAULT_UDP_OUTBOUND_PORT,
+        tproxy_mark: DEFAULT_TPROXY_MARK,
         trust_domain: "cluster.local".to_string(),
         tls_cert_path: None,
         tls_key_path: None,

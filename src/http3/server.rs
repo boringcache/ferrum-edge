@@ -1874,7 +1874,10 @@ async fn handle_h3_request(
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
     let mut backend_admission_start: std::time::Instant;
 
-    let (cb_target_key, cb_is_half_open_probe) =
+    // H3 records the circuit-breaker outcome at header time (it does not defer the
+    // dispatch outcome like the direct-H2 path), so the admission open-epoch is
+    // unused here.
+    let (cb_target_key, cb_is_half_open_probe, _cb_admission_open_epoch) =
         match crate::proxy::backend_dispatch::check_circuit_breaker(
             &proxy,
             &state,

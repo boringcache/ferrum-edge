@@ -94,6 +94,7 @@ fn create_http3_test_proxy() -> Proxy {
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         api_spec_id: None,
@@ -436,6 +437,9 @@ async fn test_http3_proxy_state_creation() {
         backend_conn_limit: Arc::new(
             ferrum_edge::backend_conn_limit::BackendConnectionLimiter::new(),
         ),
+        backend_pending_limit: Arc::new(
+            ferrum_edge::backend_pending_limit::BackendPendingLimiter::new(),
+        ),
     };
 
     // Verify proxy state is created successfully
@@ -716,6 +720,9 @@ async fn test_http3_full_integration() {
         backend_conn_limit: Arc::new(
             ferrum_edge::backend_conn_limit::BackendConnectionLimiter::new(),
         ),
+        backend_pending_limit: Arc::new(
+            ferrum_edge::backend_pending_limit::BackendPendingLimiter::new(),
+        ),
     };
 
     // Verify proxy state is created successfully
@@ -798,6 +805,7 @@ async fn test_http3_streaming_decision_logic() {
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         api_spec_id: None,

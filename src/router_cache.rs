@@ -176,7 +176,7 @@ pub(crate) struct HostRouteTable {
     /// host/path tiers, since they are (host, path)-keyed and every sibling
     /// shares its service's hosts + `/`). After a representative matches on
     /// the outbound capture listener,
-    /// [`HostRouteTable::select_mesh_outbound_port_route`] swaps in the
+    /// [`HostRouteTable::select_mesh_outbound_port_route_with_authz_port`] swaps in the
     /// sibling whose service port equals the connection's captured original
     /// destination port. Built at route-table construction; empty outside
     /// mesh mode.
@@ -203,6 +203,20 @@ pub(crate) struct HostRouteTable {
     /// backing workload addresses, canonicalized the SAME way as the VIP keys);
     /// empty outside mesh mode.
     mesh_tcp_egress_by_workload: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision>,
+    /// UDP mesh egress lookup (F3 §3.3 Stage 4): strict `(service VIP, UDP
+    /// service port)` → relay entry, consulted by the UDP capture listener for
+    /// each captured datagram's recovered original destination BEFORE any
+    /// forwarding. Built forward from the prepared `mesh` block (UDP ports ×
+    /// `cluster_ips`); Ambient-only relay (the materializer skips non-Ambient
+    /// topologies, so non-Ambient entries are always `CloseNotRoutable`). Empty
+    /// outside mesh mode.
+    //
+    // Consumed by the mesh UDP capture listener, which is Linux-only
+    // (`IP_TRANSPARENT` + recvmsg cmsg). The field is still built on every
+    // platform (the route table is platform-agnostic), so silence the dead-code
+    // warning where the only consumer is `#[cfg(not(linux))]`-compiled out.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    mesh_udp_egress: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision>,
 }
 
 /// One routable raw-TCP egress destination: the per-port upstream to
@@ -321,7 +335,7 @@ pub(crate) enum MeshInboundPortSelectError {
     PortNotMaterialized,
 }
 
-/// Why [`HostRouteTable::select_mesh_outbound_port_route`] refused to pick a
+/// Why [`HostRouteTable::select_mesh_outbound_port_route_with_authz_port`] refused to pick a
 /// per-port sibling. Both cases fail closed at the request handler — captured
 /// traffic is never forwarded to a port the client did not dial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,23 +371,43 @@ impl HostRouteTable {
     ///   even for single-port groups — the client dialed a port the mesh does
     ///   not route, and forwarding it to a different port's backend would be a
     ///   misroute.
+    #[cfg(test)]
     pub(crate) fn select_mesh_outbound_port_route(
         &self,
         current: RouteMatch,
         orig_dst_port: Option<u16>,
     ) -> Result<RouteMatch, MeshOutboundPortSelectError> {
+        self.select_mesh_outbound_port_route_with_authz_port(current, orig_dst_port)
+            .map(|(route_match, _)| route_match)
+    }
+
+    /// Swap a matched mesh outbound representative route for the sibling
+    /// matching the connection's captured original-destination port, plus the
+    /// service port that authorization policy should see as
+    /// `destination.port` when the selected route belongs to a mesh outbound
+    /// service group.
+    pub(crate) fn select_mesh_outbound_port_route_with_authz_port(
+        &self,
+        current: RouteMatch,
+        orig_dst_port: Option<u16>,
+    ) -> Result<(RouteMatch, Option<u16>), MeshOutboundPortSelectError> {
         let Some(group) = self.mesh_outbound_ports.get(&current.proxy.id) else {
-            return Ok(current);
+            return Ok((current, None));
         };
         match orig_dst_port {
-            None if group.declared_http_ports == 1 => Ok(current),
+            None if group.declared_http_ports == 1 => {
+                Ok((current, group.ports.first().map(|(port, _)| *port)))
+            }
             None => Err(MeshOutboundPortSelectError::OrigDstUnavailable),
             Some(port) => match group.ports.iter().find(|(p, _)| *p == port) {
-                Some((_, proxy)) => Ok(RouteMatch {
-                    proxy: Arc::clone(proxy),
-                    path_params: current.path_params,
-                    matched_prefix_len: current.matched_prefix_len,
-                }),
+                Some((selected_port, proxy)) => Ok((
+                    RouteMatch {
+                        proxy: Arc::clone(proxy),
+                        path_params: current.path_params,
+                        matched_prefix_len: current.matched_prefix_len,
+                    },
+                    Some(*selected_port),
+                )),
                 None => Err(MeshOutboundPortSelectError::PortNotMaterialized),
             },
         }
@@ -515,6 +549,27 @@ impl HostRouteTable {
             return None;
         }
         self.mesh_tcp_egress_by_workload
+            .get(&(orig_dst.ip().to_canonical(), orig_dst.port()))
+    }
+
+    /// UDP mesh egress lookup (F3 §3.3 Stage 4) for a captured datagram's
+    /// recovered original destination. `None` ⇒ not a declared `(service VIP,
+    /// UDP service port)` pair: the datagram is NOT mesh-routable and is dropped
+    /// by the capture listener (UDP has no fall-through HTTP path). A declared
+    /// but unroutable pair is `CloseNotRoutable` — fail closed, never guessed.
+    //
+    // Linux-only consumer (the UDP capture listener); see the field comment.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn mesh_udp_egress_decision(
+        &self,
+        orig_dst: std::net::SocketAddr,
+    ) -> Option<&MeshTcpEgressDecision> {
+        if self.mesh_udp_egress.is_empty() {
+            return None;
+        }
+        // Canonicalized so an IPv4-mapped IPv6 capture address still matches the
+        // IPv4 VIP the slice declared.
+        self.mesh_udp_egress
             .get(&(orig_dst.ip().to_canonical(), orig_dst.port()))
     }
 }
@@ -1442,14 +1497,10 @@ impl RouterCache {
         if let Some(mesh) = config.mesh.as_deref() {
             let upstream_ids: std::collections::HashSet<&str> =
                 config.upstreams.iter().map(|u| u.id.as_str()).collect();
-            let local_cluster = mesh
-                .multi_cluster
-                .as_ref()
-                .and_then(|mc| mc.local_cluster.as_deref());
             for spec in crate::modes::mesh::mesh_outbound_tcp_bywl_upstreams(
                 &mesh.services,
                 &mesh.workloads,
-                local_cluster,
+                mesh.multi_cluster.as_ref(),
             ) {
                 let decision = if upstream_ids.contains(spec.upstream_id.as_str()) {
                     let relay_proxy =
@@ -1481,6 +1532,75 @@ impl RouterCache {
                 mesh_tcp_egress_by_workload
                     .entry((spec.canonical_ip, spec.target_port))
                     .or_insert(decision);
+            }
+        }
+
+        // ── UDP egress (VIP, UDP port) lookup (F3 §3.3 Stage 4) ─────────────
+        // Forward-derived from the prepared `mesh` block: every declared UDP
+        // service port × every declared service VIP. Routable when its per-port
+        // UDP upstream materialized (Ambient-only — the materializer skips
+        // non-Ambient topologies, so those pairs resolve to CloseNotRoutable);
+        // otherwise the pair is mesh-owned but unroutable and the capture
+        // listener drops it (never guesses). VIPs are canonicalized so
+        // mapped-IPv6 captures match. Mirrors the raw-TCP VIP table above.
+        let mut mesh_udp_egress: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision> =
+            HashMap::new();
+        if let Some(mesh) = config.mesh.as_deref() {
+            let upstream_ids: std::collections::HashSet<&str> =
+                config.upstreams.iter().map(|u| u.id.as_str()).collect();
+            for service in &mesh.services {
+                let udp_ports = crate::modes::mesh::service_udp_stream_ports(service);
+                if udp_ports.is_empty() || service.cluster_ips.is_empty() {
+                    continue;
+                }
+                for sp in udp_ports {
+                    let upstream_id = crate::modes::mesh::mesh_outbound_udp_upstream_id(
+                        &service.namespace,
+                        &service.name,
+                        sp.port,
+                    );
+                    let decision = if upstream_ids.contains(upstream_id.as_str()) {
+                        let mut relay_proxy = crate::modes::mesh::mesh_outbound_udp_relay_proxy(
+                            &service.namespace,
+                            &service.name,
+                            sp.port,
+                            &upstream_id,
+                        );
+                        // Project the UDP upstream's DestinationRule per-port
+                        // overrides (`portLevelSettings`: connectTimeout,
+                        // tcpKeepalive, ...) onto the synthesized relay proxy's
+                        // `dispatch_port_overrides`. `resolve_dispatch_port_overrides`
+                        // only populates configured `config.proxies`, not these
+                        // router-synthesized egress relay proxies, so without this
+                        // the UDP egress dial (`hbone_pool::get_datagram_tunnel`,
+                        // which reads `dispatch_port_overrides`) would ignore the
+                        // DR (codex r5 P2).
+                        relay_proxy.dispatch_port_overrides =
+                            dispatch_port_overrides_for_upstream(config, &upstream_id);
+                        let relay_proxy = Arc::new(relay_proxy);
+                        let service_fqdn = config
+                            .upstreams
+                            .iter()
+                            .find(|u| u.id == upstream_id)
+                            .and_then(|u| u.name.clone())
+                            .unwrap_or_else(|| format!("{}.{}", service.name, service.namespace));
+                        MeshTcpEgressDecision::Relay(Arc::new(MeshTcpEgressEntry {
+                            upstream_id,
+                            relay_proxy,
+                            service_fqdn,
+                        }))
+                    } else {
+                        MeshTcpEgressDecision::CloseNotRoutable
+                    };
+                    for vip in &service.cluster_ips {
+                        let Ok(ip) = vip.parse::<std::net::IpAddr>() else {
+                            continue;
+                        };
+                        mesh_udp_egress
+                            .entry((ip.to_canonical(), sp.port))
+                            .or_insert_with(|| decision.clone());
+                    }
+                }
             }
         }
 
@@ -1719,8 +1839,35 @@ impl RouterCache {
             mesh_inbound_ports,
             mesh_tcp_egress,
             mesh_tcp_egress_by_workload,
+            mesh_udp_egress,
         }
     }
+}
+
+/// Project an upstream's DestinationRule per-port overrides (`port_overrides`)
+/// into the `dispatch_port_overrides` shape carried on a `Proxy`. Mirrors
+/// `GatewayConfig::resolve_dispatch_port_overrides` for a single upstream, used
+/// to populate router-synthesized mesh egress relay proxies (which are NOT in
+/// `config.proxies`, so the GatewayConfig-level pass never touches them).
+/// Returns `None` when the upstream is absent or declares no port overrides.
+fn dispatch_port_overrides_for_upstream(
+    config: &GatewayConfig,
+    upstream_id: &str,
+) -> Option<std::collections::HashMap<u16, crate::config::types::ResolvedPortOverride>> {
+    let upstream = config.upstreams.iter().find(|u| u.id == upstream_id)?;
+    if upstream.port_overrides.is_empty() {
+        return None;
+    }
+    let resolved: std::collections::HashMap<u16, crate::config::types::ResolvedPortOverride> =
+        upstream
+            .port_overrides
+            .iter()
+            .filter_map(|(port, ovr)| {
+                crate::config::types::ResolvedPortOverride::from_upstream_override(ovr)
+                    .map(|resolved| (*port, resolved))
+            })
+            .collect();
+    (!resolved.is_empty()).then_some(resolved)
 }
 
 impl IndexedExactPathRoutes {
@@ -2297,6 +2444,7 @@ mod tests {
             pool_http3_connections_per_backend: None,
             h2_upgrade_policy: None,
             pool_max_requests_per_connection: None,
+            pool_http1_max_pending_requests: None,
             upstream_id: None,
             upstream_subset: None,
             api_spec_id: None,
@@ -3421,6 +3569,76 @@ mod tests {
     }
 
     #[test]
+    fn mesh_udp_egress_table_routes_by_vip_and_port() {
+        // F3 §3.3 Stage 4: a UDP service port × VIP routes through the per-port
+        // UDP upstream; an undeclared port / different IP misses; a declared pair
+        // whose upstream did not materialize is CloseNotRoutable (fail closed).
+        use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+        let service = MeshService {
+            name: "dns".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 53,
+                protocol: AppProtocol::Udp,
+                name: Some("dns".to_string()),
+                target_port: None,
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: std::collections::HashMap::new(),
+            cluster_ips: vec!["10.96.0.10".to_string()],
+        };
+        let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
+            "id": "__mesh-out-udp-upstream-default-dns-53",
+            "name": "dns.default.svc.cluster.local",
+            "targets": [{"host": "10.0.0.9", "port": 53}],
+        }))
+        .expect("upstream deserializes");
+        let config = GatewayConfig {
+            upstreams: vec![upstream],
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service.clone()],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+        let decision =
+            |addr: &str| table.mesh_udp_egress_decision(addr.parse().expect("socket addr"));
+
+        match decision("10.96.0.10:53") {
+            Some(MeshTcpEgressDecision::Relay(entry)) => {
+                assert_eq!(entry.upstream_id, "__mesh-out-udp-upstream-default-dns-53");
+                assert_eq!(entry.service_fqdn, "dns.default.svc.cluster.local");
+            }
+            _ => panic!("expected Relay decision for an exact (VIP, UDP port) match"),
+        }
+        // Mapped-IPv6 capture of the same IPv4 VIP still matches.
+        assert!(matches!(
+            decision("[::ffff:10.96.0.10]:53"),
+            Some(MeshTcpEgressDecision::Relay(_))
+        ));
+        // Undeclared port / different IP miss (not mesh UDP destinations).
+        assert!(decision("10.96.0.10:54").is_none());
+        assert!(decision("10.96.0.11:53").is_none());
+
+        // Declared pair whose upstream did NOT materialize: CloseNotRoutable.
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![service],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+        assert!(matches!(
+            table.mesh_udp_egress_decision("10.96.0.10:53".parse().expect("addr")),
+            Some(MeshTcpEgressDecision::CloseNotRoutable)
+        ));
+    }
+
+    #[test]
     fn mesh_tcp_egress_by_workload_routes_direct_pod_ip_dials() {
         // F3 §3.4: a HEADLESS service (no cluster_ips) backed by a workload whose
         // pod IP a client dials directly routes via the by-workload index, keyed
@@ -3468,6 +3686,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         };
 
         // The single-target per-workload upstream the materializer would emit,

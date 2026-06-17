@@ -467,16 +467,24 @@ pub(crate) fn check_circuit_breaker(
     proxy: &Proxy,
     state: &ProxyState,
     upstream_target: Option<&UpstreamTarget>,
-) -> Result<(Option<String>, bool), ()> {
+) -> Result<(Option<String>, bool, u64), ()> {
     let cb_target_key = circuit_breaker_target_key(proxy, upstream_target);
 
     if let Some(cb_config) = &proxy.circuit_breaker {
-        match state.circuit_breaker_cache.can_execute(
-            &proxy.id,
-            cb_target_key.as_deref(),
-            cb_config,
-        ) {
-            Ok((_cb, is_half_open_probe)) => return Ok((cb_target_key, is_half_open_probe)),
+        // Capture the open generation at admission so a deferred streaming outcome
+        // can detect that the breaker has since opened a new cycle (#1649 round-4 B)
+        // and avoid healing/reopening a HALF_OPEN cycle it never probed. The epoch
+        // is snapshotted BEFORE the admission decision (inside
+        // `can_execute_with_admission_epoch`) so a concurrent open racing this
+        // admission can only make the outcome look stale, never too-new (#1649 R6
+        // finding 3).
+        match state
+            .circuit_breaker_cache
+            .can_execute_with_admission_epoch(&proxy.id, cb_target_key.as_deref(), cb_config)
+        {
+            Ok((_cb, is_half_open_probe, admission_open_epoch)) => {
+                return Ok((cb_target_key, is_half_open_probe, admission_open_epoch));
+            }
             Err(_) => {
                 warn!(proxy_id = %proxy.id, "Request rejected: circuit breaker open");
                 return Err(());
@@ -484,7 +492,7 @@ pub(crate) fn check_circuit_breaker(
         }
     }
 
-    Ok((cb_target_key, false))
+    Ok((cb_target_key, false, 0))
 }
 
 fn circuit_breaker_target_key(
@@ -641,12 +649,66 @@ pub(crate) fn record_backend_outcome_no_conn_end(
     );
 }
 
+/// Whether an outcome's `error_class` carries NO signal about backend health,
+/// so circuit-breaker / passive-health / least-latency / adaptive-concurrency
+/// accounting must treat it as neutral (no failure ding, no permit shrink, no
+/// latency sample):
+///
+/// * `ClientDisconnect` / `RequestBodyTooLarge` — client/gateway-side terminals;
+///   the client gave up or over-sent, which says nothing about the backend.
+/// * `DispatchPolicyRejected` — a gateway-side dispatch-policy shed BEFORE the
+///   backend was dialed (backend-TLS-SNI reject, or the
+///   `http1MaxPendingRequests` in-flight-overflow 503). The request never
+///   reached the backend, so the synthetic 503 must not trip the backend's
+///   circuit breaker / passive health, nor shrink its adaptive-concurrency
+///   permit — those would penalize a backend that was never contacted and let
+///   an overflow burst falsely eject a healthy target. Without this, default
+///   CB/AC failure classification (which counts 503) would do exactly that.
 #[inline]
-fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> bool {
+pub(crate) fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> bool {
     matches!(
         error_class,
-        Some(ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge)
+        Some(
+            ErrorClass::ClientDisconnect
+                | ErrorClass::RequestBodyTooLarge
+                | ErrorClass::DispatchPolicyRejected
+        )
     )
+}
+
+/// Whether a deferred streaming outcome admitted at `admission_open_epoch` is now
+/// stale for the breaker's current cycle: the breaker has opened a new generation
+/// since admission, so this completion must NOT heal/reopen a HALF_OPEN cycle it
+/// never probed (#1649 R4-B). Returns `false` when the proxy has no breaker
+/// configured (nothing to stale-check). Shared by the body-deferred path
+/// (`record_deferred_backend_dispatch`) and the synchronous after_proxy-reject
+/// fallbacks (direct-H2 + buffered-gRPC) so the epoch check has a single source of
+/// truth.
+pub(crate) fn deferred_circuit_breaker_is_stale(
+    state: &ProxyState,
+    proxy: &Proxy,
+    final_cb_target_key: Option<&str>,
+    admission_open_epoch: u64,
+) -> bool {
+    let Some(cfg) = proxy.circuit_breaker.as_ref() else {
+        return false;
+    };
+    // Inspect the CURRENT cached breaker read-only (#1649 R8): `get_or_create`
+    // with this request's captured `proxy`/`cfg` would, after a config reload that
+    // replaced the breaker, treat the old config as a change and write a stale
+    // (old-config) breaker back into the live cache. `peek` never mutates.
+    match state
+        .circuit_breaker_cache
+        .peek(&proxy.id, final_cb_target_key)
+    {
+        // Same config still cached: stale iff a new open generation has begun since
+        // admission.
+        Some(cb) if cb.config() == cfg => cb.open_epoch() != admission_open_epoch,
+        // Breaker evicted, or replaced by a reloaded config: the cycle this stream
+        // was admitted under is gone, so the deferred outcome is stale — drop it
+        // rather than record against (or resurrect) a bygone breaker.
+        _ => true,
+    }
 }
 
 /// A post-wire backend failure: the request reached the backend's application
@@ -681,6 +743,85 @@ pub(crate) fn error_class_is_post_wire_backend_failure(error_class: Option<Error
                 | ErrorClass::ResponseBodyTooLarge
         )
     )
+}
+
+/// Classify a backend outcome and apply it to `cb`. This is the circuit-breaker
+/// arm of [`record_backend_outcome_inner`], extracted so the gRPC streaming probe
+/// recorder can settle the breaker at the upload-termination / response-completion
+/// join (#1649 item 3) using the identical classification rules:
+///   * client-side (disconnect / request-body-too-large) → NEUTRAL,
+///   * pre-wire connection error → connection-level failure (gated by
+///     `trip_on_connection_errors`),
+///   * configured `failure_status_codes` → status failure (ungated),
+///   * post-wire backend failure (mid-stream timeout / reset) → connection-level
+///     failure even with a healthy status,
+///   * otherwise → success.
+pub(crate) fn apply_circuit_breaker_outcome(
+    cb: &crate::circuit_breaker::CircuitBreaker,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<ErrorClass>,
+    is_half_open_probe: bool,
+) {
+    if client_side_no_backend_signal(error_class) {
+        cb.record_neutral(is_half_open_probe);
+    } else if connection_error {
+        cb.record_failure(response_status, true, is_half_open_probe);
+    } else if cb.config().failure_status_codes.contains(&response_status) {
+        cb.record_failure(response_status, false, is_half_open_probe);
+    } else if error_class_is_post_wire_backend_failure(error_class) {
+        cb.record_failure(response_status, true, is_half_open_probe);
+    } else {
+        cb.record_success(is_half_open_probe);
+    }
+}
+
+/// Like [`apply_circuit_breaker_outcome`], but for a DEFERRED streaming outcome:
+/// if the breaker has advanced to a new open generation since this request was
+/// admitted (`cb.open_epoch() != admission_open_epoch`), the completion is stale
+/// for the current cycle — a stream admitted while the breaker was CLOSED must
+/// not heal/reopen a later HALF_OPEN cycle it never probed (#1649 round-4 B). In
+/// that case record NEUTRAL (release any slot, no health change); otherwise apply
+/// the outcome normally.
+pub(crate) fn apply_deferred_circuit_breaker_outcome(
+    cb: &crate::circuit_breaker::CircuitBreaker,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<ErrorClass>,
+    is_half_open_probe: bool,
+    admission_open_epoch: u64,
+) {
+    if cb.open_epoch() != admission_open_epoch {
+        cb.record_neutral(is_half_open_probe);
+        return;
+    }
+    apply_circuit_breaker_outcome(
+        cb,
+        response_status,
+        connection_error,
+        error_class,
+        is_half_open_probe,
+    );
+}
+
+/// Whether [`apply_circuit_breaker_outcome`] would record a backend FAILURE (as
+/// opposed to a success or a client-side neutral). Lets the gRPC streaming probe
+/// recorder record failures promptly at response completion while deferring a
+/// clean SUCCESS until request-upload termination, so a late client-upload
+/// overflow cannot falsely heal the breaker.
+pub(crate) fn circuit_breaker_outcome_is_failure(
+    failure_status_codes: &[u16],
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<ErrorClass>,
+) -> bool {
+    if client_side_no_backend_signal(error_class) {
+        false
+    } else {
+        connection_error
+            || failure_status_codes.contains(&response_status)
+            || error_class_is_post_wire_backend_failure(error_class)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -750,29 +891,13 @@ fn record_backend_outcome_inner(
             state
                 .circuit_breaker_cache
                 .get_or_create(&proxy.id, final_cb_target_key, cb_config);
-        if client_side_no_backend_signal {
-            cb.record_neutral(is_half_open_probe);
-        } else if connection_error {
-            // Pre-wire connection error → routed as connection-level, gated by
-            // trip_on_connection_errors. When that is false, record_failure()
-            // treats it as neutral while still releasing half-open probe slots.
-            cb.record_failure(response_status, true, is_half_open_probe);
-        } else if cb.config().failure_status_codes.contains(&response_status) {
-            // A configured failure status (5xx etc.) trips the breaker
-            // regardless of connection-error gating. Checked BEFORE the
-            // post-wire arm so a backend that returns a failure status AND then
-            // stalls / RSTs mid-body still records the (ungated) status-code
-            // failure rather than a trip_on_connection_errors-gated one.
-            cb.record_failure(response_status, false, is_half_open_probe);
-        } else if error_class_is_post_wire_backend_failure(error_class) {
-            // Post-wire backend failure with a non-failure status (a 2xx stream
-            // that then timed out / reset mid-body): route through the
-            // connection-level path so it can trip even though the status looked
-            // healthy, gated by trip_on_connection_errors like a transport fault.
-            cb.record_failure(response_status, true, is_half_open_probe);
-        } else {
-            cb.record_success(is_half_open_probe);
-        }
+        apply_circuit_breaker_outcome(
+            &cb,
+            response_status,
+            connection_error,
+            error_class,
+            is_half_open_probe,
+        );
     }
 
     // Passive health check reporting (O(1) upstream lookup via index).
@@ -1514,7 +1639,7 @@ mod tests {
         cb.record_failure(500, false, false);
         assert_eq!(cb.state_name(), "open");
 
-        let (final_cb_target_key, is_half_open_probe) =
+        let (final_cb_target_key, is_half_open_probe, _admission_open_epoch) =
             check_circuit_breaker(proxy, &state, None).expect("timeout=0 admits a probe");
         assert!(
             is_half_open_probe,

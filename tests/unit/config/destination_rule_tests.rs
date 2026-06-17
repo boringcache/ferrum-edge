@@ -202,6 +202,7 @@ fn make_upstream(subsets: Option<Vec<SubsetDefinition>>) -> Upstream {
         subsets,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,

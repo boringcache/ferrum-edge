@@ -42,6 +42,8 @@ pub mod headers;
 pub mod http2_pool;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
+pub mod mesh_udp_capture;
+pub mod mesh_udp_frame;
 pub mod netns_capture;
 pub mod sni;
 pub mod stream_error;
@@ -264,6 +266,11 @@ struct HboneProbeTarget<'a> {
     /// Pinned destination identity for the probe handshake (mirrors dispatch).
     expected_peer: Option<&'a crate::identity::SpiffeId>,
     previous_hbone: Option<ProtocolSupport>,
+    /// `true` for a UDP egress target: probe with a `udp`-marked datagram-over-
+    /// HBONE CONNECT (the marker the dispatch datapath uses) instead of the
+    /// `hbone` byte-stream marker, so the probe reaches the destination's `udp`
+    /// relay rather than its byte-stream relay (codex r1 P1).
+    is_udp: bool,
 }
 
 fn gateway_managed_plugin_timestamp() -> chrono::DateTime<chrono::Utc> {
@@ -1111,6 +1118,14 @@ pub fn is_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> 
     hbone_proxy::is_connect_request(req, env_config)
 }
 
+/// Whether `req` is a datagram-over-HBONE CONNECT (F3 §3.3 Stage 4). Disjoint
+/// from [`is_hbone_connect_request`]; the dispatch ladder treats EITHER as a
+/// CONNECT-relay (shared path normalization, body-buffering avoidance, route-miss
+/// relay synthesis) but routes the `udp` flavor to the unframing UDP handler.
+pub fn is_udp_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> bool {
+    hbone_proxy::is_udp_connect_request(req, env_config)
+}
+
 /// Whether an authenticated inbound HBONE CONNECT to `host:port` may be
 /// transparently relayed. SAFE local targets only: a loopback address on an
 /// application port declared by the slice, or an in-mesh workload address+port
@@ -1833,120 +1848,143 @@ fn grpc_request_body_limit_exceeded(flag: &Option<Arc<std::sync::atomic::AtomicB
     flag.as_ref().is_some_and(|f| f.load(Ordering::Acquire))
 }
 
-/// Classify and record a gRPC streaming probe outcome onto an already-resolved
-/// breaker. A client-upload overflow (`request_body_exceeded`) is a gateway-side
-/// abort — the gateway RST the request because the *client* exceeded the
-/// configured size, not because the backend misbehaved — so it is recorded
-/// NEUTRAL: client-controlled upload size must neither heal nor trip the backend
-/// breaker. Otherwise the backend's HTTP status classifies the probe, exactly
-/// like [`record_grpc_backend_status_outcome`].
+/// Whether a streaming response's backend-dispatch outcome (CB / passive-health /
+/// least-latency) should be DEFERRED to body completion rather than recorded at
+/// response-header time (#1649 items 2 & 3).
 ///
-/// Split out from [`record_grpc_streaming_circuit_breaker_outcome`] so the
-/// classification rule is unit-testable against a real `CircuitBreaker` without
-/// constructing a full `ProxyState`.
-fn record_grpc_streaming_outcome_on_breaker(
-    cb: &crate::circuit_breaker::CircuitBreaker,
-    backend_status: u16,
-    request_body_exceeded: bool,
-    is_half_open_probe: bool,
-) {
-    if request_body_exceeded {
-        cb.record_neutral(is_half_open_probe);
-    } else {
-        record_grpc_backend_status_outcome(cb, backend_status, is_half_open_probe);
-    }
-}
-
-/// Record a gRPC streaming probe outcome to the circuit breaker at response-header
-/// time, treating a client-upload overflow as NEUTRAL rather than a backend
-/// success/failure. Resolves the breaker, disarms the neutral-release guard, then
-/// delegates the classification to [`record_grpc_streaming_outcome_on_breaker`].
-///
-/// Used by the **buffered-request** streaming path (`proxy_grpc_request_core`
-/// with `stream_response = true`): there the request body is fully collected and
-/// sent before dispatch, so `request_body_exceeded` is `None` and no *late*
-/// overflow is possible — sampling once at header time is exact.
-///
-/// Also used by the **fully-streaming fast path** (`proxy_grpc_request_streaming`)
-/// for CLOSED-state (non-probe) requests, so a backend failure trips the breaker
-/// at header time rather than being withheld until a long/slow upload finishes.
-/// On that path a HALF_OPEN *probe* instead defers classification + probe-slot
-/// release to request-upload termination via [`GrpcStreamingProbeRecorder`],
-/// because only a probe can be falsely healed by a late upload overflow.
-fn record_grpc_streaming_circuit_breaker_outcome(
-    state: &ProxyState,
+/// Defer ONLY a response that looks healthy at headers AND has an open body that
+/// can still fail post-wire — i.e. a `2xx` status (not a configured CB
+/// `failure_status_codes`) whose body is NOT already end-of-stream. Everything
+/// else is header-time-final and must be recorded eagerly:
+///   * **Non-`2xx`** (3xx/4xx/5xx, including a passive `unhealthy_status_codes`
+///     entry like `429` or a CB failure status): the outcome is known now, so
+///     trip the breaker / report passive health promptly instead of waiting for a
+///     possibly long-lived/stalled body. Restricting deferral to `2xx` keeps any
+///     non-`2xx` status the resolved CB **or** passive-health config might treat
+///     as unhealthy on the eager path.
+///   * **Already-ended body** (`is_end_stream()` — empty `200`, gRPC
+///     Trailers-Only, `content-length: 0`, 204/304) OR a **HEAD request** (the
+///     response body is suppressed regardless of the backend stream's
+///     `END_STREAM` state at header time): nothing streams to the client, so a
+///     deferred outcome would be misread as a client disconnect by the
+///     never-polled `ProxyBody::Drop` path (`src/proxy/body.rs`) and a successful
+///     no-body probe would never heal a HALF_OPEN breaker (#1649 R7 finding 1).
+///   * **Passively-unhealthy `2xx`** (`status_is_passively_unhealthy`): an
+///     operator may list a `2xx` (e.g. `206`/`299`) in the target's resolved
+///     passive `unhealthy_status_codes`. That header is already a configured
+///     unhealthy outcome, so report it eagerly instead of leaving the target in
+///     rotation until a long-lived/stalled body terminates (#1649 R7 finding 3).
+fn streaming_dispatch_should_defer(
     proxy: &Proxy,
-    cb_target_key: Option<&str>,
-    backend_status: u16,
-    request_body_exceeded: bool,
-    is_half_open_probe: bool,
-    probe_guard: &mut GrpcProbeReleaseGuard,
-) {
-    if let Some(cb_config) = &proxy.circuit_breaker {
-        probe_guard.disarm();
-        let cb = state
-            .circuit_breaker_cache
-            .get_or_create(&proxy.id, cb_target_key, cb_config);
-        record_grpc_streaming_outcome_on_breaker(
-            &cb,
-            backend_status,
-            request_body_exceeded,
-            is_half_open_probe,
-        );
+    response_status: u16,
+    body_already_ended: bool,
+    request_is_head: bool,
+    status_is_passively_unhealthy: bool,
+) -> bool {
+    if body_already_ended || request_is_head {
+        return false;
     }
+    (200..300).contains(&response_status)
+        && !proxy
+            .circuit_breaker
+            .as_ref()
+            .is_some_and(|cb| cb.failure_status_codes.contains(&response_status))
+        && !status_is_passively_unhealthy
 }
 
-/// Defers a gRPC streaming **HALF_OPEN probe's** circuit-breaker classification
-/// and probe-slot release to **request-upload termination** rather than
-/// response-header time, so a client-upload overflow that only trips during
-/// response-body streaming (bidi / client-streaming) is recorded NEUTRAL and
-/// cannot falsely heal the probe.
+/// Whether `response_status` is in the dispatched target's effective passive
+/// `unhealthy_status_codes`, resolved with the SAME precedence as the
+/// passive-health reporter ([`backend_dispatch::passive_health_for_target`]) so
+/// the header-time eager-vs-defer decision and the eventual passive-health report
+/// agree (#1649 R7 finding 3). Returns false for direct-backend proxies (no
+/// upstream) or when no passive health is configured.
+fn streaming_response_status_is_passively_unhealthy(
+    lb_snapshot: &crate::load_balancer::LoadBalancerCacheInner,
+    proxy: &Proxy,
+    target: Option<&UpstreamTarget>,
+    response_status: u16,
+) -> bool {
+    let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), target) else {
+        return false;
+    };
+    let Some(upstream) =
+        crate::load_balancer::LoadBalancerCache::get_upstream_from(lb_snapshot, upstream_id)
+    else {
+        return false;
+    };
+    backend_dispatch::passive_health_for_target(proxy, &upstream, target)
+        .is_some_and(|passive| passive.unhealthy_status_codes.contains(&response_status))
+}
+
+/// Owns the gRPC **streaming** circuit-breaker outcome, settling it at the join of
+/// request-upload termination and response-body completion so a streaming RPC is
+/// classified correctly without pinning a HALF_OPEN probe slot (#1649 item 3,
+/// building on the #1640 upload-termination machinery).
 ///
-/// Used only for HALF_OPEN probes. CLOSED-state (non-probe) streaming requests
-/// record at header time via [`record_grpc_streaming_circuit_breaker_outcome`]
-/// so a backend failure trips the breaker promptly instead of being withheld for
-/// the duration of a long/slow upload.
+/// A streaming RPC has three signals that arrive at different times: the response
+/// can send `2xx` headers then stall / reset / carry a non-OK `grpc-status`
+/// trailer (response-body completion), the client upload can overflow
+/// `max_grpc_recv_size_bytes` at any point (the shared `request_body_exceeded`
+/// flag), and either of upload or response can finish first (bidi /
+/// client-streaming). The recorder reconciles them:
 ///
-/// The outcome is recorded **exactly once**, at the join of two events:
-///  1. `note_status` — the backend response status is known (header time), set by
-///     the proxy handler before response hooks run.
-///  2. `on_upload_terminated` — the request upload reached a terminal state
-///     (clean EOF / overflow abort / stream drop), fired from the request body's
-///     `Drop` via [`grpc_proxy::GrpcUploadTerminationObserver`].
+///  * **Probe-slot release** (HALF_OPEN only) happens at the join of
+///    `headers_seen` + `upload_terminated` (or the post-header upload guard) —
+///    the #1640 timing, so the single slot is freed as soon as the upload ends
+///    and never pinned for a long-lived response stream. It is a NEUTRAL release
+///    (`record_neutral`), decoupled from the health outcome.
+///  * **A backend FAILURE** (post-wire body error / non-OK grpc-status trailer)
+///    is recorded as soon as the response terminates — a real failure should trip
+///    promptly and need not wait for the upload — UNLESS the client upload
+///    already overflowed (client-side → NEUTRAL).
+///  * **A clean SUCCESS** is deferred until upload termination so the overflow
+///    flag is final: a backend can legally complete `200`/`grpc-status: 0` before
+///    the client finishes uploading, and a late overflow must not be able to
+///    falsely heal a HALF_OPEN breaker.
 ///
-/// Whichever event happens *second* performs the record (a `recorded` CAS keeps
-/// it exactly-once). `status_known` doubles as the activation gate: until the
-/// handler calls `note_status` the recorder is inert, so an overflow detected
-/// BEFORE headers (which surfaces as `GrpcProxyError::ResourceExhausted` and is
-/// recorded NEUTRAL by the handler's error arm) is not double-recorded here.
-///
-/// At the record point the overflow flag is re-read: NEUTRAL if set, otherwise
-/// classified by the captured backend status — identical to
-/// [`record_grpc_streaming_outcome_on_breaker`]. Keying off upload termination
-/// rather than response-body completion avoids pinning a HALF_OPEN probe slot
-/// for the entire — potentially very long-lived — server/bidi response stream.
-/// Once response headers are known, a bounded post-header upload timer records
-/// NEUTRAL if a client keeps the upload open past the route/client timeout, so
-/// HALF_OPEN probe slots cannot be pinned by an unended bidi/client-streaming
-/// upload.
+/// `health_recorded` is a single exactly-once CAS shared by every settle path
+/// (eager known-failure record at header time via `mark_health_recorded`, the
+/// prompt-failure path, the clean-success join, and the post-header guard's
+/// NEUTRAL fallback). The response outcome is delivered by
+/// [`body::GrpcResponseTerminalObserver`]; upload termination by
+/// [`grpc_proxy::GrpcUploadTerminationObserver`].
 struct GrpcStreamingProbeRecorder {
     cb: Arc<crate::circuit_breaker::CircuitBreaker>,
     is_half_open_probe: bool,
-    /// Shared with `GrpcBody::Streaming.exceeded`; re-read at the record point so
-    /// an overflow that trips after `note_status` is still classified NEUTRAL.
+    /// Shared with `GrpcBody::Streaming.exceeded`: a late client-upload overflow.
+    /// Re-read at every settle point so an overflow that trips after a clean
+    /// response is still classified NEUTRAL.
     request_body_exceeded: Arc<std::sync::atomic::AtomicBool>,
-    backend_status: std::sync::atomic::AtomicU16,
-    status_known: std::sync::atomic::AtomicBool,
+    headers_seen: std::sync::atomic::AtomicBool,
     upload_terminated: std::sync::atomic::AtomicBool,
-    recorded: std::sync::atomic::AtomicBool,
+    /// Set when the response body terminated CLEAN (no failure outcome). The
+    /// clean success is then recorded at the upload-termination join.
+    response_clean: std::sync::atomic::AtomicBool,
+    /// The clean response's effective status (grpc-trailer-mapped), captured for
+    /// the deferred clean-success record.
+    clean_response_status: std::sync::atomic::AtomicU16,
+    /// HALF_OPEN probe-slot release (NEUTRAL), exactly-once.
+    slot_released: std::sync::atomic::AtomicBool,
+    /// Backend-health outcome (success / failure / neutral), exactly-once across
+    /// all settle paths.
+    health_recorded: std::sync::atomic::AtomicBool,
+    /// Set when the post-header upload guard expired while the response was still
+    /// streaming (#1649 R5 finding 5). A clean completion that arrives AFTER the
+    /// upload missed its deadline must settle NEUTRAL rather than heal — the
+    /// upload's late termination can't be trusted to confirm a HALF_OPEN probe.
+    /// A backend FAILURE after expiry is unaffected (it records promptly via
+    /// `on_response_terminal`, not the clean-success join).
+    upload_guard_expired: std::sync::atomic::AtomicBool,
     /// Post-header upload guard window in milliseconds, or `None` when no guard
-    /// applies. Stored as a duration rather than an absolute deadline so the
-    /// guard is measured from response-header arrival (in
-    /// `start_post_header_upload_timeout`) instead of from dispatch start —
-    /// otherwise a backend that returns headers slowly would burn the window
-    /// before the upload phase even begins and a healthy probe could never heal
-    /// the breaker.
+    /// applies. Measured from response-header arrival (in
+    /// `start_post_header_upload_timeout`), not dispatch start, so a slow-header
+    /// backend does not consume the window.
     post_header_upload_timeout_ms: Option<u64>,
+    /// The breaker's open generation captured at admission. The settled outcome
+    /// is recorded NEUTRAL if the breaker has since opened a new cycle (#1649
+    /// round-4 B) so a stream admitted under one generation cannot heal/reopen a
+    /// later HALF_OPEN cycle it never probed.
+    admission_open_epoch: u64,
 }
 
 impl GrpcStreamingProbeRecorder {
@@ -1955,49 +1993,88 @@ impl GrpcStreamingProbeRecorder {
         is_half_open_probe: bool,
         request_body_exceeded: Arc<std::sync::atomic::AtomicBool>,
         post_header_upload_timeout_ms: Option<u64>,
+        admission_open_epoch: u64,
     ) -> Self {
         Self {
             cb,
             is_half_open_probe,
             request_body_exceeded,
-            backend_status: std::sync::atomic::AtomicU16::new(0),
-            status_known: std::sync::atomic::AtomicBool::new(false),
+            headers_seen: std::sync::atomic::AtomicBool::new(false),
             upload_terminated: std::sync::atomic::AtomicBool::new(false),
-            recorded: std::sync::atomic::AtomicBool::new(false),
+            response_clean: std::sync::atomic::AtomicBool::new(false),
+            clean_response_status: std::sync::atomic::AtomicU16::new(0),
+            slot_released: std::sync::atomic::AtomicBool::new(false),
+            health_recorded: std::sync::atomic::AtomicBool::new(false),
+            upload_guard_expired: std::sync::atomic::AtomicBool::new(false),
             post_header_upload_timeout_ms,
+            admission_open_epoch,
         }
     }
 
-    /// Capture the backend response status (known at header time) and activate
-    /// the recorder. Records now if the upload has already terminated. Otherwise
-    /// starts a post-header upload guard so a client cannot pin the HALF_OPEN
-    /// probe slot indefinitely by keeping a bidi/client-streaming upload open.
-    fn note_status(self: &Arc<Self>, backend_status: u16) {
-        self.backend_status.store(backend_status, Ordering::Release);
-        self.status_known.store(true, Ordering::Release);
+    /// Activate the recorder once response headers are known. Settles the probe
+    /// slot / clean success if their other join input is already present, and
+    /// starts the post-header upload guard.
+    fn note_headers_arrived(self: &Arc<Self>) {
+        self.headers_seen.store(true, Ordering::Release);
         self.start_post_header_upload_timeout();
-        self.try_record();
+        self.try_release_slot();
+        self.try_record_clean_success();
     }
 
-    /// Record the deferred outcome exactly once, when BOTH the status is known
-    /// AND the upload has terminated. The `recorded` CAS makes the two callers
-    /// (`note_status` / `on_upload_terminated`) race-safe.
-    fn try_record(&self) {
-        if !self.status_known.load(Ordering::Acquire) {
+    /// Mark the breaker outcome as already recorded (used by the eager
+    /// known-failure-status header-time path) so no settle path double-records.
+    fn mark_health_recorded(&self) {
+        self.health_recorded.store(true, Ordering::Release);
+    }
+
+    /// Release the HALF_OPEN probe slot (NEUTRAL) at the join of headers + upload
+    /// termination, exactly once. Decoupled from the health outcome.
+    fn try_release_slot(&self) {
+        if !self.is_half_open_probe {
             return;
         }
-        if !self.upload_terminated.load(Ordering::Acquire) {
+        if !self.headers_seen.load(Ordering::Acquire)
+            || !self.upload_terminated.load(Ordering::Acquire)
+        {
             return;
         }
-        if self.recorded.swap(true, Ordering::AcqRel) {
+        if self.slot_released.swap(true, Ordering::AcqRel) {
             return;
         }
-        let request_body_exceeded = self.request_body_exceeded.load(Ordering::Acquire);
-        record_grpc_streaming_outcome_on_breaker(
+        self.cb.record_neutral(true);
+    }
+
+    /// Record a clean SUCCESS at the join of a clean response + upload
+    /// termination, re-checking the overflow flag (a late overflow → NEUTRAL).
+    fn try_record_clean_success(&self) {
+        if !self.response_clean.load(Ordering::Acquire)
+            || !self.upload_terminated.load(Ordering::Acquire)
+        {
+            return;
+        }
+        if self.request_body_exceeded.load(Ordering::Acquire) {
+            // Late client-upload overflow after a clean response → NEUTRAL.
+            self.health_recorded.store(true, Ordering::Release);
+            return;
+        }
+        if self.upload_guard_expired.load(Ordering::Acquire) {
+            // #1649 R5 finding 5: the post-header upload guard already expired while
+            // the response was still streaming. The upload missed its deadline, so
+            // this late clean completion (clean trailers + an eventual upload
+            // termination) must NOT heal the breaker — settle NEUTRAL.
+            self.health_recorded.store(true, Ordering::Release);
+            return;
+        }
+        if self.health_recorded.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        backend_dispatch::apply_deferred_circuit_breaker_outcome(
             &self.cb,
-            self.backend_status.load(Ordering::Acquire),
-            request_body_exceeded,
-            self.is_half_open_probe,
+            self.clean_response_status.load(Ordering::Acquire),
+            false,
+            None,
+            false,
+            self.admission_open_epoch,
         );
     }
 
@@ -2008,44 +2085,118 @@ impl GrpcStreamingProbeRecorder {
         if self.upload_terminated.load(Ordering::Acquire) {
             return;
         }
-        // Measure the guard window from response-header arrival (now), because
-        // this method runs from `note_status` when the backend status is first
-        // known. Anchoring to dispatch start instead would let the time the
-        // backend spent producing headers consume the window, so a healthy
-        // probe behind a slow-header backend would be recorded NEUTRAL the
-        // instant headers arrive and could never heal the breaker.
         let Some(timeout) = grpc_post_header_upload_guard_duration(timeout_ms) else {
-            self.record_neutral_if_upload_still_open();
+            self.settle_neutral_if_upload_still_open();
             return;
         };
         let recorder = Arc::clone(self);
         std::mem::drop(tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
-            recorder.record_neutral_if_upload_still_open();
+            recorder.settle_neutral_if_upload_still_open();
         }));
     }
 
-    fn record_neutral_if_upload_still_open(&self) {
-        if !self.status_known.load(Ordering::Acquire) {
+    /// Post-header upload guard: if the upload has not terminated by the deadline,
+    /// release the probe slot and settle the health outcome NEUTRAL. A clean
+    /// success cannot be confirmed without upload termination (overflow check),
+    /// and any backend FAILURE already recorded health promptly (so the
+    /// `health_recorded` CAS no-ops here).
+    fn settle_neutral_if_upload_still_open(&self) {
+        if !self.headers_seen.load(Ordering::Acquire) {
             return;
         }
         if self.upload_terminated.load(Ordering::Acquire) {
             return;
         }
-        if self.recorded.swap(true, Ordering::AcqRel) {
-            return;
+        // #1649 R5 finding 5: remember the guard expired with the upload still
+        // open. If the backend LATER sends clean trailers and the client upload
+        // eventually terminates, `try_record_clean_success` must settle NEUTRAL
+        // instead of healing on that stale timing. Set before the slot release so
+        // any concurrent upload-termination join observes it.
+        self.upload_guard_expired.store(true, Ordering::Release);
+        // Release the slot the unended upload is pinning (NEUTRAL), once.
+        if self.is_half_open_probe && !self.slot_released.swap(true, Ordering::AcqRel) {
+            self.cb.record_neutral(true);
         }
-        warn!(
-            "gRPC streaming HALF_OPEN probe upload did not terminate before its deadline; recording neutral outcome",
-        );
-        self.cb.record_neutral(self.is_half_open_probe);
+        // #1649 round-4 finding A: only CONSUME the health outcome when the
+        // response already completed CLEAN — that clean success cannot be
+        // confirmed without upload termination (overflow check), so it settles
+        // NEUTRAL. If the response has NOT terminated, do NOT mark health here:
+        // a still-streaming response may yet FAIL (a 2xx-then-stall), and that
+        // failure — recorded promptly by `on_response_terminal` — must not be
+        // masked by an unended-upload guard (this guard now runs for every
+        // streaming RPC with a breaker, not just HALF_OPEN probes).
+        if self.response_clean.load(Ordering::Acquire)
+            && !self.health_recorded.swap(true, Ordering::AcqRel)
+        {
+            warn!(
+                "gRPC streaming probe upload did not terminate before its deadline; settling clean response neutral",
+            );
+        }
     }
 }
 
 impl crate::proxy::grpc_proxy::GrpcUploadTerminationObserver for GrpcStreamingProbeRecorder {
     fn on_upload_terminated(&self) {
         self.upload_terminated.store(true, Ordering::Release);
-        self.try_record();
+        self.try_release_slot();
+        self.try_record_clean_success();
+    }
+}
+
+impl crate::proxy::body::GrpcResponseTerminalObserver for GrpcStreamingProbeRecorder {
+    fn on_response_terminal(
+        &self,
+        response_status: u16,
+        connection_error: bool,
+        error_class: Option<retry::ErrorClass>,
+    ) {
+        // A client-upload overflow (set before/at the terminating reset) is a
+        // client-side size violation → NEUTRAL, never a backend failure.
+        if self.request_body_exceeded.load(Ordering::Acquire) {
+            self.health_recorded.store(true, Ordering::Release);
+            return;
+        }
+        // #1649 R5 finding 4: a client-side terminal (downstream disconnect /
+        // request-body-too-large) carries NO backend health signal → settle
+        // NEUTRAL. `circuit_breaker_outcome_is_failure` returns false for these
+        // classes, so without this guard the clean branch below would bank a
+        // phantom SUCCESS — and a client that cancels a stream during HALF_OPEN
+        // could then falsely heal an unhealthy backend (or reset closed-state
+        // failures). The probe slot is still released via the headers+upload-term
+        // join / guard; only the health outcome is consumed here.
+        if backend_dispatch::client_side_no_backend_signal(error_class) {
+            self.health_recorded.store(true, Ordering::Release);
+            return;
+        }
+        if backend_dispatch::circuit_breaker_outcome_is_failure(
+            &self.cb.config().failure_status_codes,
+            response_status,
+            connection_error,
+            error_class,
+        ) {
+            // A real backend failure (post-wire body error / non-OK grpc-status
+            // trailer) trips promptly — no need to wait for upload termination.
+            // Still epoch-checked: a stream admitted before a new open cycle must
+            // not reopen a later HALF_OPEN cycle it never probed (round-4 B).
+            if !self.health_recorded.swap(true, Ordering::AcqRel) {
+                backend_dispatch::apply_deferred_circuit_breaker_outcome(
+                    &self.cb,
+                    response_status,
+                    connection_error,
+                    error_class,
+                    false,
+                    self.admission_open_epoch,
+                );
+            }
+            return;
+        }
+        // Clean response: defer the SUCCESS to upload termination so a late
+        // overflow can't falsely heal the breaker.
+        self.clean_response_status
+            .store(response_status, Ordering::Release);
+        self.response_clean.store(true, Ordering::Release);
+        self.try_record_clean_success();
     }
 }
 
@@ -2063,41 +2214,30 @@ fn grpc_post_header_upload_guard_duration(timeout_ms: u64) -> Option<Duration> {
 }
 
 /// Finalize a gRPC streaming probe's circuit-breaker outcome once the response
-/// headers are known, before response hooks run. With a deferred `recorder` (a
-/// HALF_OPEN probe on the fully-streaming fast path) the eager probe guard is
-/// disarmed and classification is handed off to [`GrpcStreamingProbeRecorder`],
-/// which fires at request-upload termination or records NEUTRAL if the
-/// post-header upload guard expires. Without one (buffered-request streaming
-/// path, or a CLOSED-state non-probe request) the outcome is recorded
-/// immediately by backend status, exactly as before.
-#[allow(clippy::too_many_arguments)]
+/// headers are known, before response hooks run.
+///
+/// #1649 item 3: the streaming probe's backend-health outcome is no longer
+/// recorded here — it is deferred to response-**body** completion via the
+/// streaming body's `with_deferred_backend_dispatch_outcome` (as a non-probe),
+/// so a `2xx`-then-stall / mid-stream reset / non-OK grpc-status trailer is
+/// recorded as the failure it is instead of a phantom header-time success. This
+/// function only settles the HALF_OPEN **probe slot**: with a deferred `recorder`
+/// (a HALF_OPEN probe on the fully-streaming fast path) the eager probe guard is
+/// disarmed and slot release is handed to [`GrpcStreamingProbeRecorder`], which
+/// frees the slot (NEUTRAL) at request-upload termination (or when the
+/// post-header upload guard expires). Without one (buffered-request streaming
+/// path, or a CLOSED-state non-probe request) there is no probe slot to settle
+/// here and the outcome is recorded solely at body completion.
 fn finalize_grpc_streaming_probe_outcome(
     recorder: Option<&Arc<GrpcStreamingProbeRecorder>>,
-    state: &ProxyState,
-    proxy: &Proxy,
-    cb_target_key: Option<&str>,
-    backend_status: u16,
-    request_body_exceeded: bool,
-    is_half_open_probe: bool,
     probe_guard: &mut GrpcProbeReleaseGuard,
 ) {
-    match recorder {
-        Some(recorder) => {
-            // The recorder owns the probe-slot release (it records at upload
-            // termination, or NEUTRAL when the post-header upload guard expires),
-            // so disarm the eager guard to avoid a double release.
-            probe_guard.disarm();
-            recorder.note_status(backend_status);
-        }
-        None => record_grpc_streaming_circuit_breaker_outcome(
-            state,
-            proxy,
-            cb_target_key,
-            backend_status,
-            request_body_exceeded,
-            is_half_open_probe,
-            probe_guard,
-        ),
+    if let Some(recorder) = recorder {
+        // The recorder owns the probe-slot release (NEUTRAL at upload
+        // termination, or when the post-header upload guard expires), so disarm
+        // the eager guard to avoid a double release.
+        probe_guard.disarm();
+        recorder.note_headers_arrived();
     }
 }
 
@@ -2507,6 +2647,17 @@ pub struct ProxyState {
     /// `src/backend_conn_limit.rs` for why their pool-internal connection
     /// lifecycle makes a request-keyed counter the wrong control.
     pub backend_conn_limit: Arc<crate::backend_conn_limit::BackendConnectionLimiter>,
+    /// Per-destination *pending-request* limiter enforcing DestinationRule
+    /// `connectionPool.http.http1MaxPendingRequests` on the reqwest/HTTP-1.1
+    /// backend-dispatch path. Bounds how many requests can be simultaneously
+    /// waiting on connection capacity for a `(host, port)`; an over-cap request
+    /// is shed with a 503 ("upstream overflow") in the connection-pending phase
+    /// via an RAII [`crate::backend_pending_limit::BackendPendingGuard`] held
+    /// only until dispatch returns. HTTP/1.1-scoped: the multiplexed transports
+    /// (direct H2, gRPC, H3, HBONE, mesh-mTLS) do NOT consume it — their
+    /// concurrency is governed by `h2_max_concurrent_streams`. See
+    /// `docs/mesh.md` and `src/backend_pending_limit.rs`.
+    pub backend_pending_limit: Arc<crate::backend_pending_limit::BackendPendingLimiter>,
 }
 
 #[inline]
@@ -4060,6 +4211,11 @@ impl ProxyState {
                     pool_shard_amount,
                 ),
             ),
+            backend_pending_limit: Arc::new(
+                crate::backend_pending_limit::BackendPendingLimiter::with_shard_amount(
+                    pool_shard_amount,
+                ),
+            ),
         };
         if let Some(handle) =
             state.start_gateway_svid_file_rotation_task(health_check_restart_rx.clone())
@@ -4254,14 +4410,10 @@ impl ProxyState {
         // index/dispatch use, so probe and dispatch capability keys agree.
         // `mesh.mtls` (Sidecar) per-workload targets are skipped (no probe),
         // exactly like the VIP pass.
-        let local_cluster = mesh
-            .multi_cluster
-            .as_ref()
-            .and_then(|mc| mc.local_cluster.as_deref());
         for spec in crate::modes::mesh::mesh_outbound_tcp_bywl_upstreams(
             &mesh.services,
             &mesh.workloads,
-            local_cluster,
+            mesh.multi_cluster.as_ref(),
         ) {
             let Some(upstream) = upstream_map.get(spec.upstream_id.as_str()) else {
                 continue;
@@ -4281,6 +4433,47 @@ impl ProxyState {
                     BackendCapabilityProbeTarget::from_proxy(&relay_proxy, Some(target));
                 if seen.insert(probe_target.key.clone()) {
                     targets.push(probe_target);
+                }
+            }
+        }
+
+        // Third pass: the UDP egress upstreams (F3 §3.3 Stage 4). Same trap as
+        // the raw-TCP VIP upstreams — referenced by NO config proxy, so without
+        // enrollment `retain_keys` evicts their HBONE records and every Ambient
+        // UDP dial 502s `hbone_required` forever. Built from the SAME
+        // deterministic UDP relay proxy the route table / dispatch use, so probe
+        // and dispatch capability keys agree. UDP egress is now dual-transport
+        // (#1808): Ambient `mesh.hbone` UDP targets ARE enrolled (HBONE capability
+        // registry), Sidecar `mesh.mtls` UDP targets are SKIPPED below — they
+        // dispatch over a mesh-mTLS CONNECT with NO capability probe (a
+        // slice-declared sidecar speaks mesh-mTLS by construction), and probing
+        // them would dial a non-existent `:15008` HBONE listener and record a
+        // spurious unsupported verdict (mirrors the raw-TCP passes).
+        for service in &mesh.services {
+            for sp in crate::modes::mesh::service_udp_stream_ports(service) {
+                let upstream_id = crate::modes::mesh::mesh_outbound_udp_upstream_id(
+                    &service.namespace,
+                    &service.name,
+                    sp.port,
+                );
+                let Some(upstream) = upstream_map.get(upstream_id.as_str()) else {
+                    continue;
+                };
+                let relay_proxy = crate::modes::mesh::mesh_outbound_udp_relay_proxy(
+                    &service.namespace,
+                    &service.name,
+                    sp.port,
+                    &upstream_id,
+                );
+                for target in &upstream.targets {
+                    if !crate::proxy::hbone_pool::target_hbone_enabled(target) {
+                        continue;
+                    }
+                    let probe_target =
+                        BackendCapabilityProbeTarget::from_proxy(&relay_proxy, Some(target));
+                    if seen.insert(probe_target.key.clone()) {
+                        targets.push(probe_target);
+                    }
                 }
             }
         }
@@ -4429,11 +4622,20 @@ impl ProxyState {
             BackendScheme::Tcp | BackendScheme::Tcps | BackendScheme::Udp | BackendScheme::Dtls => {
             }
         }
-        // `Tcp` joins `Http` here for the raw-TCP mesh egress relay targets:
-        // their scheme keeps the plain-HTTP/h2c probes away from a raw-TCP
-        // app port (nothing above probes the Tcp arm), but HBONE support must
-        // still be proven — the probe only performs the CONNECT handshake.
-        if target.hbone_hint && matches!(scheme, BackendScheme::Http | BackendScheme::Tcp) {
+        // `Tcp` and `Udp` join `Http` here for the mesh egress relay targets:
+        // their scheme keeps the plain-HTTP/h2c probes away from a raw-TCP /
+        // UDP app port (nothing above probes those arms), but HBONE support
+        // must still be proven — a UDP egress target rides a `udp`-marked HBONE
+        // CONNECT, so without this its HBONE record is never probed AND
+        // `retain_keys` evicts it, permanently failing the UDP dispatch gate
+        // closed (the same trap as raw-TCP). The probe only performs the CONNECT
+        // handshake, identical for both transports.
+        if target.hbone_hint
+            && matches!(
+                scheme,
+                BackendScheme::Http | BackendScheme::Tcp | BackendScheme::Udp
+            )
+        {
             self.probe_hbone(
                 &probe_proxy,
                 probe_timeout,
@@ -4443,6 +4645,10 @@ impl ProxyState {
                     hbone_port: target.hbone_port,
                     expected_peer: target.hbone_expected_peer.as_ref(),
                     previous_hbone,
+                    // A UDP egress target's destination relay expects the `udp`
+                    // marker; probe it with the matching datagram CONNECT so the
+                    // handshake reaches the right relay (codex r1 P1).
+                    is_udp: matches!(scheme, BackendScheme::Udp),
                 },
                 &mut record,
             )
@@ -4563,18 +4769,29 @@ impl ProxyState {
             return;
         }
 
-        match tokio::time::timeout(
-            probe_timeout,
-            self.hbone_pool.warmup_connection(
-                probe_proxy,
-                host,
-                port,
-                hbone_port,
-                target.expected_peer,
-            ),
-        )
-        .await
-        {
+        // A UDP egress target rides a `udp`-marked datagram CONNECT, which the
+        // destination unframes into a local `UdpSocket`; a byte-stream
+        // (`hbone`-marked) probe would hit the wrong relay there. Probe with the
+        // SAME marker the dispatch path uses so the handshake proves the
+        // capability the egress datapath actually needs (codex r1 P1).
+        let warmup = async {
+            if target.is_udp {
+                self.hbone_pool
+                    .warmup_datagram_connection(
+                        probe_proxy,
+                        host,
+                        port,
+                        hbone_port,
+                        target.expected_peer,
+                    )
+                    .await
+            } else {
+                self.hbone_pool
+                    .warmup_connection(probe_proxy, host, port, hbone_port, target.expected_peer)
+                    .await
+            }
+        };
+        match tokio::time::timeout(probe_timeout, warmup).await {
             Ok(Ok(())) => {
                 record.hbone = ProtocolSupport::Supported;
             }
@@ -9298,6 +9515,56 @@ pub(crate) async fn start_mesh_plaintext_listener_with_signal(
     .await
 }
 
+/// Start the mesh UDP TPROXY capture listener (F3 §3.3 Stage 3).
+///
+/// Binds a transparent UDP socket on `addr` (the Stage-2 capture port,
+/// `FERRUM_MESH_CAPTURE_UDP_PORT`), recovers each captured datagram's original
+/// destination via the `IP(v6)_RECVORIGDSTADDR` cmsg, keys a session by
+/// `(client, orig-dst)`, and DROPS it (egress relay is Stage 4). DoS bounds are
+/// pulled from `EnvConfig` (`FERRUM_UDP_MAX_SESSIONS` /
+/// `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` / `FERRUM_UDP_RECVMMSG_BATCH_SIZE` /
+/// `FERRUM_POOL_SHARD_AMOUNT`), matching the plain UDP proxy. `tls_config` is
+/// always `None` for this plaintext listener (the parameter is accepted only so
+/// the mesh listener-spawn loop can call every kind uniformly). `mesh_direction`
+/// is accepted for call-site uniformity; the capture listener is always
+/// outbound and does not thread it further.
+pub(crate) async fn start_mesh_udp_capture_listener_with_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    _mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
+    debug_assert!(
+        tls_config.is_none(),
+        "mesh UDP capture listener is plaintext; tls_config must be None"
+    );
+    let _ = tls_config;
+    let env = &state.env_config;
+    let max_sessions = env.udp_max_sessions;
+    let cleanup_interval_seconds = env.udp_cleanup_interval_seconds;
+    let recvmmsg_batch_size = env.udp_recvmmsg_batch_size;
+    let session_shard_amount = env.pool_shard_amount;
+    mesh_udp_capture::start_mesh_udp_capture_listener(mesh_udp_capture::MeshUdpCaptureConfig {
+        addr,
+        // Stage 4 needs the full proxy state for egress (route table, LB,
+        // capability registry, HBONE pool, SVID).
+        state: Arc::new(state),
+        shutdown,
+        // In mesh mode the per-listener `shutdown` is the runtime's
+        // SIGINT/SIGTERM-driven channel, so a separate global receiver is
+        // unnecessary here.
+        global_shutdown: None,
+        max_sessions,
+        cleanup_interval_seconds,
+        recvmmsg_batch_size,
+        session_shard_amount,
+        started_tx,
+    })
+    .await
+}
+
 /// Start a mesh mTLS/HBONE listener with handshake-failure telemetry enabled.
 ///
 /// `mesh_direction` is stamped onto every accepted connection's
@@ -10690,8 +10957,16 @@ async fn handle_proxy_request_inner(
     let method = req.method().as_str().to_owned();
     let inbound_version = req.version();
     let is_hbone_connect = is_hbone_connect_request(&req, &state.env_config);
+    // Datagram-over-HBONE CONNECT (F3 §3.3 Stage 4) — disjoint from the
+    // byte-stream `is_hbone_connect` (different wire marker). EITHER shape is a
+    // CONNECT-relay for the shared dispatch machinery (path normalization,
+    // body-buffering avoidance, route-miss relay synthesis, CONNECT-405 bypass),
+    // so the combined `is_hbone_connect_any` drives those; the `udp` flavor is
+    // routed to the unframing UDP handler at the final dispatch branch.
+    let is_udp_hbone_connect = is_udp_hbone_connect_request(&req, &state.env_config);
+    let is_hbone_connect_any = is_hbone_connect || is_udp_hbone_connect;
     let raw_path = req.uri().path();
-    let path = if is_hbone_connect && raw_path.is_empty() {
+    let path = if is_hbone_connect_any && raw_path.is_empty() {
         "/".to_string()
     } else {
         raw_path.to_string()
@@ -10875,7 +11150,7 @@ async fn handle_proxy_request_inner(
     // Note: we enable_connect_protocol() on the h2 server to support WebSocket,
     // which means h2 will deliver Extended CONNECT requests to us — we must
     // filter non-WebSocket ones here before routing.
-    if method == "CONNECT" && !is_h2_websocket_connect(&req) && !is_hbone_connect {
+    if method == "CONNECT" && !is_h2_websocket_connect(&req) && !is_hbone_connect_any {
         warn!("Rejected non-WebSocket CONNECT request");
         record_request(&state, 405);
         return Ok(build_response(
@@ -10885,6 +11160,8 @@ async fn handle_proxy_request_inner(
     }
     if is_hbone_connect {
         hbone_proxy::tag_request_metadata(&mut ctx);
+    } else if is_udp_hbone_connect {
+        hbone_proxy::tag_udp_request_metadata(&mut ctx);
     }
 
     // TLS 1.3 0-RTT early data enforcement (RFC 8470).
@@ -11089,9 +11366,14 @@ async fn handle_proxy_request_inner(
             let representative_id = Arc::clone(&rm.proxy);
             match epoch
                 .route_table
-                .select_mesh_outbound_port_route(rm, ctx.orig_dst.map(|addr| addr.port()))
-            {
-                Ok(rm) => Some(rm),
+                .select_mesh_outbound_port_route_with_authz_port(
+                    rm,
+                    ctx.orig_dst.map(|addr| addr.port()),
+                ) {
+                Ok((rm, authz_port)) => {
+                    ctx.mesh_outbound_destination_authz_port = authz_port;
+                    Some(rm)
+                }
                 Err(reason) => {
                     debug!(
                         proxy_id = %representative_id.id,
@@ -11186,6 +11468,25 @@ async fn handle_proxy_request_inner(
         other => other,
     };
 
+    // Datagram-over-HBONE CONNECTs MUST always traverse the guarded inbound
+    // relay-synthesis path, never an LB-backed HTTP/TCP route. The UDP handler
+    // dials a local `UdpSocket` straight at the route's backend addr+port, so a
+    // `udp`-marked CONNECT whose `:authority` happens to match a materialized
+    // HTTP/TCP route would open a socket to that route's destination WITHOUT the
+    // open-relay destination guard (`inbound_hbone_relay_destination_allowed`)
+    // that `build_inbound_hbone_relay_proxy` applies. Forcing a route miss here
+    // funnels every UDP CONNECT through that guard (which bounds the authority to
+    // a loopback / slice-known workload addr+port) or a fail-closed 404 — the
+    // same destination check the byte-stream relay's synthesis path enforces
+    // (codex r5 P2). The byte-stream HBONE relay deliberately keeps matched-route
+    // dispatch (VirtualService `mesh_route_dispatch` overrides ride it), so this
+    // is scoped to the UDP variant only.
+    let route_match = if is_udp_hbone_connect {
+        None
+    } else {
+        route_match
+    };
+
     let (proxy, strip_len) = match route_match {
         Some(rm) => {
             // Materialize headers now — path param injection writes to ctx.headers,
@@ -11243,9 +11544,14 @@ async fn handle_proxy_request_inner(
             // proxy is built only on the inbound listener (`mesh_direction ==
             // Inbound`) and only for a loopback / slice-known workload
             // destination, with loopback ports constrained to the slice's
-            // declared workload application ports; `handle_hbone_request`
-            // re-checks the authenticated-peer gate before dialing.
-            let hbone_relay = if is_hbone_connect
+            // declared workload application ports; `handle_hbone_request` /
+            // `handle_hbone_udp_request` re-checks the authenticated-peer gate
+            // before dialing. A datagram-over-HBONE CONNECT (`is_udp_hbone_connect`)
+            // takes the SAME transparent-relay synthesis — the open-relay guard
+            // (`inbound_hbone_relay_destination_allowed`) bounds the authority to
+            // a loopback / slice-known workload addr+port the same way — and is
+            // then routed to the UDP unframing handler at the dispatch branch.
+            let hbone_relay = if is_hbone_connect_any
                 && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
             {
                 build_inbound_hbone_relay_proxy(req.uri().authority(), epoch.config.mesh.as_deref())
@@ -11411,7 +11717,7 @@ async fn handle_proxy_request_inner(
     // WebSocket Extended CONNECT is also excluded: DATA frames after the 200
     // response are WebSocket bytes, not an HTTP request body to drain before
     // authentication.
-    let requires_body_before_authenticate = !is_hbone_connect
+    let requires_body_before_authenticate = !is_hbone_connect_any
         && allows_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
         && plugins.iter().any(|plugin| {
@@ -11554,7 +11860,7 @@ async fn handle_proxy_request_inner(
     // HBONE CONNECT requests must keep hyper's upgrade handle in the streaming
     // body (see `handle_hbone_request`), so pre-`before_proxy` buffering is
     // skipped — same reason as the pre-authenticate buffering guard above.
-    let requires_request_body_buffering = !is_hbone_connect
+    let requires_request_body_buffering = !is_hbone_connect_any
         && allows_request_body_buffering
         && maybe_requires_request_body_buffering
         && plugins
@@ -11732,6 +12038,24 @@ async fn handle_proxy_request_inner(
         )
         .await);
     }
+    // Datagram-over-HBONE CONNECT (F3 §3.3 Stage 4): same short-circuit as the
+    // byte-stream HBONE relay, but the destination side UNFRAMES the tunnel into
+    // a local `UdpSocket` toward the CONNECT authority instead of byte-relaying
+    // to a TCP backend.
+    if is_udp_hbone_connect {
+        return Ok(hbone_proxy::handle_hbone_udp_request(
+            &state,
+            &proxy,
+            &epoch,
+            &mut ctx,
+            client_request_body,
+            &plugins,
+            start_time,
+            &method,
+            plugin_execution_ns,
+        )
+        .await);
+    }
 
     // Inject identity headers when authentication resolved a principal.
     if let Some(username) = ctx.backend_consumer_username() {
@@ -11836,7 +12160,11 @@ async fn handle_proxy_request_inner(
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet> = None;
 
     // Circuit breaker check — per-target when upstream is configured, per-proxy otherwise
-    let (cb_target_key, cb_is_half_open_probe) =
+    // `cb_admission_open_epoch` is re-captured on retry-target rotation (the gRPC
+    // and direct-H2 retry loops below) so a deferred streaming outcome is
+    // stale-checked against the FINAL admitted target's generation, not the initial
+    // target's (#1649 R6 findings 1 & 2).
+    let (cb_target_key, cb_is_half_open_probe, mut cb_admission_open_epoch) =
         match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {
@@ -12035,8 +12363,8 @@ async fn handle_proxy_request_inner(
         //     retry, so retry alone is NOT a reason to buffer.
         //   * The REQUEST body still has to be collected up-front when
         //     retry is configured (caller side), so the retry loop can
-        //     replay it. `proxy_grpc_request` preserves the collected
-        //     request bytes regardless of the `stream_response` flag.
+        //     replay the collected request bytes regardless of the
+        //     `stream_response` flag.
         //   * Streaming IS unsafe when a plugin (or explicit
         //     `response_body_mode = Buffer`) requires the full response
         //     body in memory to make an admission decision.
@@ -12062,9 +12390,9 @@ async fn handle_proxy_request_inner(
         // `proxy_grpc_request_streaming` streams BOTH the request AND the
         // response, which means the request body is consumed on the wire
         // and cannot be replayed — incompatible with retry. Gate it on
-        // `!grpc_has_retry` so retry-enabled streaming proxies still flow
-        // via `proxy_grpc_request` (collects request body up-front,
-        // streams response frame-by-frame).
+        // `!grpc_has_retry` so retry-enabled streaming proxies still use the
+        // buffered-request path (collects request body up-front, streams
+        // response frame-by-frame).
         let grpc_can_use_streaming_fast_path = grpc_should_stream && !grpc_has_retry;
         // Deferred circuit-breaker probe recorder for the fully-streaming fast
         // path. Set only when that path is taken AND the request was admitted as
@@ -12174,8 +12502,7 @@ async fn handle_proxy_request_inner(
             // `Bytes::new()` here on the streaming branch silently fed the
             // retry loop an empty body whenever a body-hook proxy also had
             // `retry_on_connect_failure` enabled. Mirrors the same
-            // single-return contract documented in
-            // `proxy_grpc_request`.
+            // single-return contract used by the buffered-request gRPC path.
             backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
                 backend_admission_plugins.as_ref(),
                 &ctx,
@@ -12274,29 +12601,31 @@ async fn handle_proxy_request_inner(
                 // frame without collecting. No retries possible (request
                 // body consumed on wire) and no body plugins.
                 //
-                // The request body keeps uploading after response headers
-                // arrive (bidi / client-streaming), so a client-upload overflow
-                // can trip *during* response-body streaming. For a HALF_OPEN
-                // probe that would falsely heal the breaker, so defer the
-                // outcome: build a recorder wired to the body's overflow flag
-                // and fired from the request body's `Drop`, classifying the
-                // probe at upload termination (NEUTRAL on overflow) instead of
-                // healing it at header time. No retry on this path means
-                // `grpc_final_cb_key == cb_target_key` and `grpc_cb_probe_slot`
-                // is unconsumed, so the recorder owns the single outcome.
-                //
-                // Limit the deferral to HALF_OPEN probes. A CLOSED-state
-                // (non-probe) streaming request records at response-header time
-                // (the `None` branch in `finalize_grpc_streaming_probe_outcome`),
-                // so a backend failure trips the breaker promptly rather than
-                // being withheld for the duration of a long/slow upload. That
-                // matches the HTTP path, which records the backend outcome at
-                // header time and likewise does not neutralize a late
-                // streaming-upload overflow.
+                // The backend-health outcome (CB / passive / least-latency) for
+                // every streaming response is recorded at response-**body**
+                // completion via the deferred dispatch outcome (#1649 items 2/3),
+                // so a `2xx`-then-stall is recorded as a failure rather than a
+                // phantom header-time success. All this fast path settles eagerly
+                // is the HALF_OPEN **probe slot**: for a probe, build a recorder
+                // fired from the request body's `Drop` so the single slot is
+                // released (NEUTRAL) at upload termination — never pinned for the
+                // life of a long server/bidi response stream. No retry on this
+                // path means `grpc_final_cb_key == cb_target_key` and
+                // `grpc_cb_probe_slot` is unconsumed, so the recorder owns the
+                // single slot release. A CLOSED-state (non-probe) request has no
+                // slot to settle.
                 let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                // Build the recorder whenever a breaker is configured (not just for
+                // HALF_OPEN probes): on the fully-streaming path it owns the gRPC
+                // circuit-breaker outcome, settling it at the join of request-upload
+                // termination and response-body completion so a clean SUCCESS waits
+                // for the overflow flag to be final while a body FAILURE trips
+                // promptly (#1649 item 3 / #1640). `is_half_open_probe` controls
+                // only the probe-slot release; CLOSED-state requests still defer the
+                // health outcome to the join.
                 let upload_observer: Option<Arc<dyn grpc_proxy::GrpcUploadTerminationObserver>> =
-                    match (grpc_cb_probe_slot, proxy.circuit_breaker.as_ref()) {
-                        (true, Some(cb_config)) => {
+                    match proxy.circuit_breaker.as_ref() {
+                        Some(cb_config) => {
                             let cb = state.circuit_breaker_cache.get_or_create(
                                 &proxy.id,
                                 grpc_final_cb_key.as_deref(),
@@ -12316,6 +12645,7 @@ async fn handle_proxy_request_inner(
                                 grpc_cb_probe_slot,
                                 Arc::clone(&body_size_exceeded),
                                 post_header_upload_timeout_ms,
+                                cb_admission_open_epoch,
                             ));
                             grpc_streaming_probe_recorder = Some(Arc::clone(&recorder));
                             // `let`-binding the trait object drives the
@@ -12325,9 +12655,9 @@ async fn handle_proxy_request_inner(
                                 recorder;
                             Some(observer)
                         }
-                        // Non-probe (CLOSED state) or no breaker: record at
-                        // header time, no deferral.
-                        _ => None,
+                        // No breaker: nothing to record. The deferred dispatch
+                        // outcome still records passive-health + least-latency.
+                        None => None,
                     };
                 backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
                     backend_admission_plugins.as_ref(),
@@ -12596,13 +12926,32 @@ async fn handle_proxy_request_inner(
                 // HALF_OPEN probe slot, letting an unadmitted retry advance or
                 // close a breaker that should have rejected the attempt.
                 if let Some(cb_config) = &proxy.circuit_breaker {
-                    match state.circuit_breaker_cache.can_execute(
-                        &proxy.id,
-                        grpc_current_cb_key.as_deref(),
-                        cb_config,
-                    ) {
-                        Ok((_cb, is_half_open_probe)) => {
+                    match state
+                        .circuit_breaker_cache
+                        .can_execute_with_admission_epoch(
+                            &proxy.id,
+                            grpc_current_cb_key.as_deref(),
+                            cb_config,
+                        ) {
+                        Ok((cb, is_half_open_probe, admission_open_epoch)) => {
                             grpc_cb_probe_slot = is_half_open_probe;
+                            // #1649 R6 finding 1: re-capture the admission epoch for
+                            // the rotated target so the deferred body-completion
+                            // outcome is stale-checked against THIS target's
+                            // generation, not the initial target's.
+                            cb_admission_open_epoch = admission_open_epoch;
+                            // #1649 R6 finding 4: re-point the probe-release guard at
+                            // the rotated target. On rotation the guard was disarmed
+                            // (after recording the prior target's intermediate
+                            // failure), so without this a HALF_OPEN slot acquired on
+                            // the rotated target would never be released on the
+                            // buffered streaming path (the deferred outcome records
+                            // the health as a non-probe). The buffered/retry request
+                            // has finished uploading, so header-flush release (guard
+                            // Drop) is the correct timing; the eager-record arms below
+                            // disarm the guard and release via `grpc_cb_probe_slot`.
+                            grpc_probe_guard.cb = is_half_open_probe.then(|| Arc::clone(&cb));
+                            grpc_probe_guard.armed = is_half_open_probe;
                         }
                         Err(_) => {
                             // Rotated/retried target's breaker rejected: don't
@@ -12629,6 +12978,11 @@ async fn handle_proxy_request_inner(
                 ) {
                     Ok(permits) => permits,
                     Err(rejection) => {
+                        // Disarm the RAII guard first so its Drop doesn't
+                        // double-release: after a rotation the guard was re-armed to
+                        // this target (#1649 R6 finding 4), so the explicit release
+                        // below would otherwise be duplicated by the guard's Drop.
+                        grpc_probe_guard.disarm();
                         release_circuit_breaker_probe_on_admission_reject(
                             &state,
                             &proxy,
@@ -12778,20 +13132,12 @@ async fn handle_proxy_request_inner(
             Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {
                 let grpc_backend_admission_elapsed = grpc_backend_admission_started_at.elapsed();
                 // Frame-by-frame streaming path: headers arrived, body not buffered.
-                // Arm/defer circuit-breaker recording before after_proxy hooks
-                // so the post-header upload guard is measured from header
-                // arrival, even if a response hook blocks.
+                // Settle the HALF_OPEN probe slot before after_proxy hooks so the
+                // post-header upload guard is measured from header arrival, even
+                // if a response hook blocks.
                 if !grpc_skip_final_cb_record {
-                    let body_exceeded_at_headers =
-                        grpc_request_body_limit_exceeded(&grpc_streaming.request_body_exceeded);
                     finalize_grpc_streaming_probe_outcome(
                         grpc_streaming_probe_recorder.as_ref(),
-                        &state,
-                        &proxy,
-                        grpc_final_cb_key.as_deref(),
-                        grpc_streaming.status,
-                        body_exceeded_at_headers,
-                        grpc_cb_probe_slot,
                         &mut grpc_probe_guard,
                     );
                 }
@@ -12803,6 +13149,83 @@ async fn handle_proxy_request_inner(
                     &response_headers,
                     grpc_streaming.status,
                 );
+                // #1649 item 3: a healthy 2xx streaming header defers the circuit
+                // breaker — for the fully-streaming path the recorder settles it at
+                // the upload-termination + response-completion join (overflow-aware,
+                // #1640), and for the buffered-request path the deferred dispatch
+                // records it at response completion. A KNOWN failure status at
+                // header time (a trailers-only error mapped to 5xx, or a sandwiched
+                // LB 5xx) — and an already-end-of-stream body (gRPC Trailers-Only)
+                // whose outcome is final now — is recorded EAGERLY here so the
+                // breaker trips/heals promptly instead of waiting out a possibly
+                // long-lived/stalled upload (matches
+                // `grpc_streaming_closed_state_backend_failure_trips_breaker_at_header_time`
+                // and #1649 round-2 finding C). The eager record is a non-probe (the
+                // recorder owns the slot release); the recorder is then marked so it
+                // does not double-record.
+                let grpc_body_ended = http_body::Body::is_end_stream(&grpc_streaming.body);
+                // Set when an already-ended CLEAN response is handed to the recorder
+                // (#1649 R8 finding 1): the body-terminal observer must then be
+                // suppressed so the ended body's `Drop` can't deliver a second
+                // (ClientDisconnect) terminal that neutralizes the deferred success.
+                let mut grpc_recorder_owns_ended_response = false;
+                let grpc_cb_recorded_eagerly = if grpc_skip_final_cb_record {
+                    // A rotated retry already recorded (and released) the prior
+                    // target's breaker — never record again here.
+                    true
+                } else if streaming_dispatch_should_defer(
+                    &proxy,
+                    grpc_backend_dispatch_status,
+                    grpc_body_ended,
+                    // gRPC requests are always POST — never a body-suppressed HEAD.
+                    false,
+                    streaming_response_status_is_passively_unhealthy(
+                        &epoch.load_balancer,
+                        &proxy,
+                        grpc_final_upstream_target.as_deref(),
+                        grpc_backend_dispatch_status,
+                    ),
+                ) {
+                    false
+                } else if grpc_body_ended
+                    && let Some(recorder) = &grpc_streaming_probe_recorder
+                    && !proxy.circuit_breaker.as_ref().is_some_and(|cb| {
+                        cb.failure_status_codes
+                            .contains(&grpc_backend_dispatch_status)
+                    })
+                {
+                    // #1649 R8 finding 1 (re-raised R6-5): an already-ended CLEAN gRPC
+                    // success (Trailers-Only / empty 2xx) with a recorder must NOT be
+                    // banked eagerly. A client upload still in flight could overflow
+                    // `max_grpc_recv_size_bytes` AFTER the response ends, and only the
+                    // recorder's upload-termination join re-checks the overflow flag.
+                    // Hand the clean outcome to the recorder (it defers the success to
+                    // upload termination, overflow-aware) and suppress the
+                    // body-terminal observer below. A KNOWN failure status still falls
+                    // through to the eager arm so it trips promptly.
+                    crate::proxy::body::GrpcResponseTerminalObserver::on_response_terminal(
+                        recorder.as_ref(),
+                        grpc_backend_dispatch_status,
+                        false,
+                        None,
+                    );
+                    grpc_recorder_owns_ended_response = true;
+                    false
+                } else if let Some(cb_config) = &proxy.circuit_breaker {
+                    let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.id,
+                        grpc_final_cb_key.as_deref(),
+                        cb_config,
+                    );
+                    record_grpc_backend_status_outcome(&cb, grpc_backend_dispatch_status, false);
+                    if let Some(recorder) = &grpc_streaming_probe_recorder {
+                        recorder.mark_health_recorded();
+                    }
+                    true
+                } else {
+                    // No breaker configured — nothing to record or defer.
+                    true
+                };
                 {
                     let phase_start = Instant::now();
                     if let Some(reject) = run_after_proxy_hooks(
@@ -12830,18 +13253,53 @@ async fn handle_proxy_request_inner(
                                 backend_elapsed: grpc_backend_admission_elapsed,
                             });
                         }
-                        record_grpc_backend_dispatch_outcome(
+                        // #1649 item 3: record passive-health + least-latency for
+                        // the rejected streaming response. The circuit breaker is
+                        // owned by the recorder on the fully-streaming path
+                        // (settled at the upload-termination join, overflow-aware) —
+                        // signal it the header outcome here since the rejected
+                        // response body is never wrapped, so a healthy 2xx still
+                        // heals once the upload terminates without overflow, while a
+                        // client that rejects + overflows cannot falsely heal
+                        // (round-2 finding A / round-3 findings). The buffered-request
+                        // path (no recorder, upload already complete) records the CB
+                        // directly here unless it was recorded eagerly (round-3 B).
+                        let reject_skip_cb =
+                            grpc_streaming_probe_recorder.is_some() || grpc_cb_recorded_eagerly;
+                        // #1649 R5 finding 1 (parity): the buffered-request path
+                        // records the CB here directly; skip it if the breaker opened
+                        // a new cycle since admission (the recorder path is already
+                        // epoch-checked inside `on_response_terminal`). Passive-health
+                        // + least-latency still record below.
+                        let reject_cb_stale = !reject_skip_cb
+                            && backend_dispatch::deferred_circuit_breaker_is_stale(
+                                &state,
+                                &proxy,
+                                grpc_final_cb_key.as_deref(),
+                                cb_admission_open_epoch,
+                            );
+                        backend_dispatch::record_backend_outcome_no_conn_end(
                             &state,
                             &proxy,
                             &epoch.load_balancer,
                             upstream_balancer.as_ref(),
-                            grpc_final_upstream_target.as_ref(),
+                            grpc_final_upstream_target.as_deref(),
                             grpc_final_cb_key.as_deref(),
                             grpc_backend_dispatch_status,
                             false,
                             None,
+                            false,
+                            reject_skip_cb || reject_cb_stale,
                             grpc_backend_admission_elapsed,
                         );
+                        if let Some(recorder) = &grpc_streaming_probe_recorder {
+                            crate::proxy::body::GrpcResponseTerminalObserver::on_response_terminal(
+                                recorder.as_ref(),
+                                grpc_backend_dispatch_status,
+                                false,
+                                None,
+                            );
+                        }
                         drop(grpc_lb_connection_guard.take());
                         // Use `original_request_path` so the log records the
                         // path the client actually requested, not the
@@ -13097,6 +13555,16 @@ async fn handle_proxy_request_inner(
                 if let Some(guard) = grpc_lb_connection_guard.take() {
                     body = body.with_lb_connection_guard(guard);
                 }
+                // #1649 item 3: the deferred dispatch outcome records passive-health
+                // + least-latency at response-body completion. The circuit breaker
+                // is owned by the recorder on the fully-streaming path (it settles
+                // it at the upload-termination join, overflow-aware) — so skip the CB
+                // here and hand the terminal outcome to the recorder via the
+                // response-terminal observer. On the buffered-request path (no
+                // recorder, upload already complete) the CB is recorded here at
+                // response completion unless it was already recorded eagerly.
+                let grpc_dispatch_skip_cb =
+                    grpc_streaming_probe_recorder.is_some() || grpc_cb_recorded_eagerly;
                 body = body
                     .with_deferred_backend_dispatch_outcome(
                         Arc::clone(&state),
@@ -13106,16 +13574,44 @@ async fn handle_proxy_request_inner(
                         grpc_final_upstream_target.clone(),
                         grpc_final_cb_key.clone(),
                         grpc_backend_dispatch_status,
-                        false,
-                        None,
-                        false,
-                        true,
+                        false, // connection_error: post-wire, derived at body completion
+                        None,  // error_class: derived from the terminal body error
+                        false, // is_half_open_probe: slot released separately by the recorder
+                        grpc_dispatch_skip_cb,
                         grpc_backend_admission_elapsed,
                     )
                     .with_grpc_trailer_backend_dispatch_classification()
                     .with_deferred_dispatch_request_body_exceeded_flag(
                         grpc_streaming.request_body_exceeded.clone(),
                     );
+                // #1649 R5 finding 1: on the buffered-request streaming path there
+                // is no recorder, so the deferred dispatch records the CB itself at
+                // body completion — carry the admission epoch so a stream admitted
+                // before the breaker opened a new cycle can't heal/reopen a later
+                // HALF_OPEN cycle it never probed (parity with the direct-H2 path and
+                // the recorder's own epoch check). With a recorder present the
+                // recorder owns the epoch check; when recorded eagerly the CB is
+                // skipped here entirely, so the epoch is irrelevant in both cases.
+                if grpc_streaming_probe_recorder.is_none() && !grpc_cb_recorded_eagerly {
+                    body =
+                        body.with_deferred_dispatch_admission_open_epoch(cb_admission_open_epoch);
+                }
+                // Suppress the body-terminal observer when an already-ended clean
+                // response was already handed to the recorder at header time (#1649
+                // R8 finding 1) — otherwise the ended body's `Drop` would deliver a
+                // second, ClientDisconnect-classified terminal that neutralizes the
+                // deferred clean success the recorder is waiting to settle at upload
+                // termination.
+                if !grpc_recorder_owns_ended_response
+                    && let Some(recorder) = &grpc_streaming_probe_recorder
+                {
+                    let recorder = Arc::clone(recorder);
+                    // `let`-binding drives the `Arc<Concrete>` -> `Arc<dyn Trait>`
+                    // unsizing coercion.
+                    let observer: Arc<dyn crate::proxy::body::GrpcResponseTerminalObserver> =
+                        recorder;
+                    body = body.with_grpc_response_terminal_observer(observer);
+                }
                 if let Some(permits) = backend_admission_permits.take() {
                     body = body
                         .with_deferred_backend_admission_outcome(
@@ -14046,13 +14542,21 @@ async fn handle_proxy_request_inner(
             // `record_backend_outcome` attributes against the target that
             // actually produced `result`, not the never-called new target.
             if let Some(cb_config) = &proxy.circuit_breaker {
-                match state.circuit_breaker_cache.can_execute(
-                    &proxy.id,
-                    current_cb_target_key.as_deref(),
-                    cb_config,
-                ) {
-                    Ok((_cb, is_half_open_probe)) => {
+                match state
+                    .circuit_breaker_cache
+                    .can_execute_with_admission_epoch(
+                        &proxy.id,
+                        current_cb_target_key.as_deref(),
+                        cb_config,
+                    ) {
+                    Ok((_cb, is_half_open_probe, admission_open_epoch)) => {
                         cb_retry_probe_slot_available = is_half_open_probe;
+                        // #1649 R6 finding 2: re-capture the admission epoch for the
+                        // rotated target so the deferred StreamingH2 body-completion
+                        // outcome is stale-checked against THIS target's generation,
+                        // not the initial target's (the header-time neutral release
+                        // and the deferred record both use `final_cb_target_key`).
+                        cb_admission_open_epoch = admission_open_epoch;
                     }
                     Err(_err) => {
                         current_cb_target_key = pre_rotation_cb_key;
@@ -14258,20 +14762,93 @@ async fn handle_proxy_request_inner(
     // drop), which correctly defers the decrement until a streaming response
     // body completes. Use the no-conn-end variant so the least-connections
     // gauge is not decremented twice per request (guard + this call).
-    backend_dispatch::record_backend_outcome_no_conn_end(
-        &state,
-        &proxy,
-        &epoch.load_balancer,
-        upstream_balancer.as_ref(),
-        upstream_target.as_deref(),
-        final_cb_target_key.as_deref(),
-        response_status,
-        backend_resp.connection_error,
-        backend_error_class,
-        cb_retry_probe_slot_available,
-        skip_final_cb_record,
-        backend_start.elapsed(),
-    );
+    //
+    // #1649 item 2: a direct-H2 `StreamingH2` response can fail *after* headers —
+    // a 2xx-then-stall body raises a post-wire read-timeout / reset once the
+    // streaming read-timeout window (#1626) fires. Recording the dispatch outcome
+    // here, at header time, would bank a phantom success and even feed the broken
+    // backend's fast TTFB into least-latency, and a mid-stream failure could never
+    // correct it. Only that genuinely-unknown case is deferred to body completion
+    // via `with_deferred_backend_dispatch_outcome` (mirroring the gRPC streaming
+    // path); `streaming_dispatch_should_defer` keeps known-failure-status and
+    // no-body responses on the eager header-time record. The HALF_OPEN probe slot
+    // is still RELEASED here (same timing as the eager record), only the health
+    // *outcome* is deferred — so a long-lived stream never pins the slot, and the
+    // deferred record runs as a non-probe (`is_half_open_probe = false`).
+    //
+    // HBONE (`current_dispatch_hbone`) flows through the same `StreamingH2` arm.
+    // Unlike direct-H2 (gated on `max_request_body_size == 0` by
+    // `can_dispatch_direct_http2_pool`), HBONE can carry a request-body size limit,
+    // and a late tunnel overflow would be misclassified as a backend body failure
+    // by the deferred path (no `request_body_exceeded` flag is threaded on the H2
+    // path, unlike gRPC). So defer HBONE only when NO request-body limit applies —
+    // provably no overflow, the same condition that makes direct-H2 safe — which
+    // fixes 2xx-then-stall accounting for the common (unlimited) mesh config so an
+    // HBONE backend that stalls/resets its body after 2xx headers trips the breaker
+    // instead of banking a phantom success (#1649 R8 finding 2). With a request-body
+    // limit configured, HBONE keeps the eager header-time record (residual
+    // follow-up: thread an HBONE request-body overflow flag to defer
+    // unconditionally).
+    // Whether the H2 response body is already end-of-stream at header time (empty
+    // 200 / `content-length: 0` / END_STREAM-in-headers). Such a body is dropped
+    // without being polled, so deferring it would be misread as a client
+    // disconnect — record it eagerly instead (#1649 round-2 finding C).
+    let streaming_h2_body_ended = match &response_body {
+        ResponseBody::StreamingH2(resp) => http_body::Body::is_end_stream(resp.body()),
+        _ => false,
+    };
+    let defer_streaming_h2_dispatch = matches!(&response_body, ResponseBody::StreamingH2(_))
+        && (!current_dispatch_hbone || state.max_request_body_size_bytes == 0)
+        && streaming_dispatch_should_defer(
+            &proxy,
+            response_status,
+            streaming_h2_body_ended,
+            // HEAD responses suppress the body, so a deferred outcome would be
+            // misread as a client disconnect (#1649 R7 finding 1).
+            method.eq_ignore_ascii_case("HEAD"),
+            streaming_response_status_is_passively_unhealthy(
+                &epoch.load_balancer,
+                &proxy,
+                upstream_target.as_deref(),
+                response_status,
+            ),
+        );
+    // TTFB captured at header arrival; reused whether the deferred outcome is
+    // recorded synchronously (an after_proxy reject replaced the streaming body)
+    // or at body completion, matching the synchronous path's
+    // `backend_start.elapsed()` least-latency sample.
+    let streaming_h2_dispatch_elapsed = backend_start.elapsed();
+    if defer_streaming_h2_dispatch {
+        // Release the half-open probe slot promptly without recording a health
+        // outcome; the deferred dispatch records the real outcome at body
+        // completion as a non-probe. Gated by `!skip_final_cb_record` because a
+        // rotated-retry break already recorded (and released) the breaker for
+        // the prior target.
+        if cb_retry_probe_slot_available
+            && !skip_final_cb_record
+            && let Some(cb_config) = &proxy.circuit_breaker
+        {
+            state
+                .circuit_breaker_cache
+                .get_or_create(&proxy.id, final_cb_target_key.as_deref(), cb_config)
+                .record_neutral(true);
+        }
+    } else {
+        backend_dispatch::record_backend_outcome_no_conn_end(
+            &state,
+            &proxy,
+            &epoch.load_balancer,
+            upstream_balancer.as_ref(),
+            upstream_target.as_deref(),
+            final_cb_target_key.as_deref(),
+            response_status,
+            backend_resp.connection_error,
+            backend_error_class,
+            cb_retry_probe_slot_available,
+            skip_final_cb_record,
+            backend_start.elapsed(),
+        );
+    }
     let backend_admission_response_status = response_status;
     let backend_admission_connection_error = backend_resp.connection_error;
     let backend_admission_error_class = backend_error_class;
@@ -14341,6 +14918,39 @@ async fn handle_proxy_request_inner(
             error_class: backend_admission_error_class,
             backend_elapsed: backend_admission_elapsed,
         });
+    }
+
+    // #1649 item 2: an after_proxy reject can replace the `StreamingH2` body with
+    // a buffered response, so the body will no longer carry the deferred dispatch
+    // outcome. Record it synchronously now, using the BACKEND's captured
+    // status/error (NOT the plugin reject's, which says nothing about backend
+    // health) and as a non-probe (the slot was released at header time).
+    if defer_streaming_h2_dispatch && !matches!(&response_body, ResponseBody::StreamingH2(_)) {
+        // #1649 R5 finding 3: the after_proxy hook may have run long enough for the
+        // breaker to open a new cycle. Skip the CB record if this header-time
+        // outcome is stale for the current generation (parity with the
+        // body-deferred path's `cb_stale` check), while still recording
+        // passive-health + least-latency below.
+        let cb_stale = backend_dispatch::deferred_circuit_breaker_is_stale(
+            &state,
+            &proxy,
+            final_cb_target_key.as_deref(),
+            cb_admission_open_epoch,
+        );
+        backend_dispatch::record_backend_outcome_no_conn_end(
+            &state,
+            &proxy,
+            &epoch.load_balancer,
+            upstream_balancer.as_ref(),
+            upstream_target.as_deref(),
+            final_cb_target_key.as_deref(),
+            backend_admission_response_status,
+            backend_admission_connection_error,
+            backend_admission_error_class,
+            false,
+            skip_final_cb_record || cb_stale,
+            streaming_h2_dispatch_elapsed,
+        );
     }
 
     // on_response_body hooks — only for buffered responses, only when plugins exist.
@@ -14915,6 +15525,35 @@ async fn handle_proxy_request_inner(
                     backend_admission_elapsed,
                 );
             }
+            // #1649 item 2: defer the dispatch outcome (CB / passive health /
+            // least-latency) to body completion so a 2xx-then-stall H2/HBONE body
+            // trips the breaker and reports a passive-health failure instead of
+            // banking a phantom header-time success. The probe slot was already
+            // released at header time, so this records as a non-probe.
+            // `record_deferred_backend_dispatch` derives the post-wire
+            // `connection_error` from the terminal body error class, so pass
+            // `connection_error = false` / `error_class = None` here.
+            if defer_streaming_h2_dispatch {
+                body = body
+                    .with_deferred_backend_dispatch_outcome(
+                        Arc::clone(&state),
+                        Arc::clone(&proxy),
+                        Arc::clone(&epoch.load_balancer),
+                        upstream_balancer.clone(),
+                        upstream_target.clone(),
+                        final_cb_target_key.clone(),
+                        backend_admission_response_status,
+                        false,
+                        None,
+                        false,
+                        skip_final_cb_record,
+                        streaming_h2_dispatch_elapsed,
+                    )
+                    // #1649 round-4 B: skip the deferred CB record if the breaker
+                    // opened a new cycle since admission (stale stream must not
+                    // heal/reopen a later HALF_OPEN cycle).
+                    .with_deferred_dispatch_admission_open_epoch(cb_admission_open_epoch);
+            }
             body
         }
         ResponseBody::StreamingH3(h3_resp) => {
@@ -15215,12 +15854,22 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
         .h2_upgrade_policy
         .filter(|new| Some(*new) != proxy.h2_upgrade_policy);
 
+    // Per-port `http1MaxPendingRequests` (DestinationRule `connectionPool.http`).
+    // Drives the reqwest/H1 dispatch path's pending-request gate in
+    // `proxy_to_backend` via the effective proxy's
+    // `pool_http1_max_pending_requests`. Project it when the per-port value
+    // differs from what the proxy already carries.
+    let http1_pending_override = override_config
+        .http1_max_pending_requests
+        .filter(|new| Some(*new) != proxy.pool_http1_max_pending_requests);
+
     if connect_override.is_none()
         && h2_streams_override.is_none()
         && idle_seconds_override.is_none()
         && max_reqs_override.is_none()
         && tls_override.is_none()
         && h2_upgrade_override.is_none()
+        && http1_pending_override.is_none()
     {
         return std::borrow::Cow::Borrowed(proxy);
     }
@@ -15243,6 +15892,9 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     }
     if let Some(policy) = h2_upgrade_override {
         owned.h2_upgrade_policy = Some(policy);
+    }
+    if let Some(pending) = http1_pending_override {
+        owned.pool_http1_max_pending_requests = Some(pending);
     }
     std::borrow::Cow::Owned(owned)
 }
@@ -15346,6 +15998,106 @@ pub(crate) fn resolve_backend_max_connections(proxy: &Proxy, dispatch_port: u16)
         .as_ref()
         .and_then(|overrides| overrides.get(&dispatch_port))
         .and_then(|override_config| override_config.max_connections)
+}
+
+/// Resolve the DestinationRule `connectionPool.http.http1MaxPendingRequests`
+/// cap for the destination port a backend dial will target.
+///
+/// Returns `None` (no cap) in the common case: the proxy has no
+/// `dispatch_port_overrides`, the resolved port has no override, or the
+/// override carries no `http1_max_pending_requests`. Hot-path discipline
+/// matches [`resolve_backend_max_connections`]: a single field read on the
+/// precomputed `Proxy.dispatch_port_overrides` map, no `ArcSwap` load.
+///
+/// `dispatch_port` is the port the dial will actually use: the LB-selected
+/// `UpstreamTarget.port` for upstream proxies, or `proxy.backend_port` for a
+/// direct-backend proxy with no upstream.
+pub(crate) fn resolve_backend_http1_max_pending_requests(
+    proxy: &Proxy,
+    dispatch_port: u16,
+) -> Option<u32> {
+    proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&dispatch_port))
+        .and_then(|override_config| override_config.http1_max_pending_requests)
+}
+
+/// Whether the reqwest-backed backend client for this (effective) proxy is
+/// **known to dispatch over HTTP/1.1 at acquire time** — the only transport the
+/// `connectionPool.http.http1MaxPendingRequests` pending-request gate applies
+/// to. The gate is consulted ONLY when this returns `true`, so a backend that
+/// MIGHT negotiate h2 is left uncapped (an `http1*` knob must not 503 an h2
+/// backend — that is `http2MaxRequests`'s job).
+///
+/// HTTP/1.1 is *known* in exactly three cases:
+///
+/// * `proxy.forces_backend_http1_only()` — DestinationRule
+///   `h2UpgradePolicy: DO_NOT_UPGRADE` restricts the reqwest client's ALPN to
+///   `http/1.1` (see `BackendTlsConfigBuilder::build_reqwest`), so even an
+///   h2-capable backend is pinned to HTTP/1.1; or
+/// * the backend scheme is **plaintext `http`** (`DispatchKind::HttpPool`,
+///   i.e. `!is_tls_backend()` on the HTTP-family reqwest path) — reqwest never
+///   speaks h2c / HTTP/2-prior-knowledge over cleartext, so every cleartext
+///   dial is HTTP/1.1; or
+/// * the backend is **HTTPS but the capability registry has already classified
+///   this target H2/TLS-unsupported (H1-only)** — the direct-H2 pool fork
+///   (`direct_h2_known_unsupported` in `proxy_to_backend`) then bypasses the H2
+///   pool and falls to this reqwest path, where the backend re-negotiates
+///   HTTP/1.1 every time (the verdict was learned from a prior
+///   `Http2PoolError::BackendSelectedHttp1` fallback or a startup probe), so the
+///   dispatch is known HTTP/1.1 at acquire time and must be capped.
+///
+/// A **HTTPS** backend with no H1-only registry verdict MAY still negotiate h2
+/// via ALPN — unknown until the TLS handshake completes — so it is deliberately
+/// NOT capped (an `http1*` knob must not 503 a reqwest dispatch that becomes h2).
+/// This holds **even when `pool_enable_http2 == false`** (codex r6): that flag
+/// only steers `should_dispatch_direct_h2` away from the direct-H2 pool onto
+/// reqwest — it does NOT set reqwest `http1_only()` nor restrict the rustls ALPN
+/// (only `forces_backend_http1_only()` does, see `build_rustls_for_reqwest`), so
+/// the reqwest client still advertises h2 ALPN and the dial can become h2.
+/// (That `pool_enable_http2=false` doesn't enforce H1 on the reqwest client is a
+/// separate pre-existing gap, tracked in the F5.1 follow-up.) The
+/// buffered/retained-body bypass
+/// (`enable_http2 && (retain_request_body || requires_request_body_buffering)`)
+/// likewise stays uncapped absent a registry verdict.
+///
+/// Only ever called after a non-`None` `http1MaxPendingRequests` cap has been
+/// resolved (the rare case a DestinationRule sets the knob), so the
+/// `for_proxy` pool-config resolve and registry lookup never run on the no-cap
+/// hot path.
+pub(crate) fn reqwest_dispatch_is_http1_only(
+    state: &ProxyState,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> bool {
+    if proxy.forces_backend_http1_only() {
+        return true;
+    }
+    // Plaintext `http` backend: reqwest dispatches HTTP/1.1 (no h2c / prior
+    // knowledge over cleartext), so the H1 cap applies regardless of the h2
+    // preference. Only an HTTPS backend can ALPN-negotiate h2.
+    if !proxy.dispatch_kind.is_tls_backend() {
+        return true;
+    }
+    // HTTPS backend: HTTP/1.1 is *known* only when the capability registry has
+    // already classified this target H2/TLS-unsupported — then, even though the
+    // reqwest client still advertises h2 ALPN, the backend negotiates h1, and
+    // `proxy_to_backend`'s direct-H2 fork keys this exact verdict
+    // (`record.plain_http.h2_tls == Unsupported`) to bypass the H2 pool and fall
+    // to reqwest-H1. `pool_enable_http2 == false` is deliberately NOT treated as
+    // known-H1 (codex r6): it does not set reqwest `http1_only()` / restrict the
+    // ALPN, so that dispatch can still become h2 (see the doc comment above).
+    // Lookup is the same alloc-free thread-local-keyed `get` the H2 fork uses.
+    state
+        .backend_capabilities
+        .get(proxy, upstream_target)
+        .is_some_and(|record| {
+            matches!(
+                record.plain_http.h2_tls,
+                crate::proxy::backend_capabilities::ProtocolSupport::Unsupported
+            )
+        })
 }
 
 /// Resolve the per-port retry lane after a concrete target has failed.
@@ -15562,9 +16314,70 @@ pub(crate) async fn proxy_to_backend_retry(
         req_builder = req_builder.body(body.to_vec());
     }
 
+    // DestinationRule `connectionPool.http.http1MaxPendingRequests`: re-enter the
+    // same per-`(host, port)` pending gate as the initial attempt
+    // (`proxy_to_backend`). The initial attempt's slot was already released
+    // before the retry loop ran (it drops the moment that attempt's `send()`
+    // returns), so a retry no longer overlaps it — without acquiring here, a
+    // `retry_on_connect_failure`-driven retry storm would dial this destination
+    // unboundedly, bypassing the cap. Acquire under the SAME H1 predicate
+    // (`reqwest_dispatch_is_http1_only`). Under the in-flight reinterpretation
+    // (see `proxy_to_backend` / `docs/mesh.md`) every H1-determined attempt
+    // counts, so there is no body-shape exclusion. The slot is released the
+    // instant this attempt's `send()` returns (the `drop` below), so it spans
+    // only this attempt's in-flight window and an attempt never double-counts.
+    let retry_dispatch_port = upstream_target
+        .map(|t| t.port)
+        .unwrap_or(proxy.backend_port);
+    let retry_pending_cap = resolve_backend_http1_max_pending_requests(proxy, retry_dispatch_port)
+        .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
+    let retry_pending_slot = match state.backend_pending_limit.try_acquire(
+        effective_host,
+        retry_dispatch_port,
+        retry_pending_cap,
+    ) {
+        Ok(slot) => slot,
+        Err(limit) => {
+            warn!(
+                proxy_id = %proxy.id,
+                backend_host = %effective_host,
+                backend_port = retry_dispatch_port,
+                pending_requests = limit.current,
+                max_pending_requests = limit.cap,
+                "Shedding HTTP/1.1 retry: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
+            );
+            // Gateway-side capacity shed before the retry dial: classify
+            // `DispatchPolicyRejected` (NOT a connection_error) so the retry
+            // loop does not treat the shed as another connect failure and
+            // amplify the overflow. That class is a no-backend-signal
+            // (`client_side_no_backend_signal`), so this overflow 503 stays
+            // NEUTRAL to backend health/CB/AC, mirroring the initial-attempt
+            // shed.
+            return retry::BackendResponse {
+                status_code: 503,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Upstream pending request queue full"}"#
+                        .as_bytes()
+                        .to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip.clone(),
+                error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+            };
+        }
+    };
+
     let mut reqwest_backend_guard =
         Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
-    match req_builder.send().await {
+    let send_result = req_builder.send().await;
+    // Release this retry attempt's in-flight slot the instant `send()` resolves
+    // (response headers / dial failure) — BEFORE any response-body collection —
+    // so it spans this attempt's dispatch → response-headers window only, never
+    // the response lifetime. A no-cap / non-HTTP-1.1 retry holds `None` here, so
+    // the drop is a no-op.
+    drop(retry_pending_slot);
+    match send_result {
         Ok(response) => {
             let status = response.status().as_u16();
             let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -16669,6 +17482,98 @@ async fn proxy_to_backend(
         }
     }
 
+    // DestinationRule `connectionPool.http.http1MaxPendingRequests`: bound the
+    // number of concurrent in-flight HTTP/1.1 requests to this backend
+    // destination on the reqwest/HTTP-1.1 dispatch path (in-flight
+    // reinterpretation — see the detailed note below and `docs/mesh.md`). The
+    // slot is acquired here, AFTER local 413 / plugin rejections and
+    // request-body collection / final-body hooks, immediately before backend
+    // admission and the dispatch onto the shared reqwest client.
+    //
+    // Released the moment `send().await` returns (see the explicit `drop` below)
+    // — BEFORE any response-body collection — so the slot spans dispatch →
+    // response-headers (the in-flight window reqwest exposes), NOT the
+    // response-stream / response-buffering lifetime. When the destination is at
+    // its in-flight cap the request is shed with a 503 ("upstream overflow"),
+    // NOT queued unboundedly.
+    //
+    // HTTP/1.1-scoped: the direct-H2 / gRPC / H3 / HBONE / mesh-mTLS branches
+    // above already returned before reaching here, so the multiplexed transports
+    // never consult this gate. The reqwest fallback ALSO negotiates ALPN HTTP/2
+    // when the direct-H2 pool is bypassed for a buffered/retained body
+    // (`enable_http2 && (retain_request_body || requires_request_body_buffering)`);
+    // an H2 backend must not be capped by an `http1*` knob, so the slot is taken
+    // only when the reqwest client is forced/known HTTP/1.1
+    // (`reqwest_dispatch_is_http1_only`). Their concurrency is instead governed
+    // by `http2MaxRequests` → `h2_max_concurrent_streams`.
+    //
+    // In-flight reinterpretation (codex r3, finding 3): reqwest's `send()`
+    // resolves when RESPONSE HEADERS arrive, not when a connection slot is
+    // assigned, and reqwest exposes no connection-acquisition hook — so a slot
+    // held acquire-before-send / release-after-send inevitably spans
+    // connection-wait + upload + backend-TTFB. We therefore CANNOT implement
+    // Envoy's true pending-queue depth over reqwest. Mirroring how this repo
+    // honestly reinterprets DR `maxRetries` as a per-request cap, the knob is
+    // reframed as a **max concurrent in-flight HTTP/1.1 requests per
+    // `(host, port)`** cap (measured dispatch → response-headers), shedding
+    // excess with a 503 ("upstream overflow"). Under that framing a streamed
+    // upload IS legitimately in-flight, so there is NO body-shape exclusion —
+    // bodyless GET/HEAD/OPTIONS (where `stream_request_body` is true) are capped
+    // too, which is the most common H1 traffic. The connection-failure retry
+    // path (`proxy_to_backend_retry`) re-enters this same gate per attempt (see
+    // its own acquire); the initial slot is already released before the retry
+    // loop runs, so an attempt and its retry never double-count.
+    let pending_dispatch_port = upstream_target
+        .map(|t| t.port)
+        .unwrap_or(proxy.backend_port);
+    let pending_cap = resolve_backend_http1_max_pending_requests(proxy, pending_dispatch_port)
+        // Only an HTTP/1.1-determined reqwest dispatch consults the gate; a
+        // reqwest fallback that may ALPN-negotiate h2 ignores the `http1*` cap.
+        .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
+    let pending_slot = match state.backend_pending_limit.try_acquire(
+        effective_host,
+        pending_dispatch_port,
+        pending_cap,
+    ) {
+        Ok(slot) => slot,
+        Err(limit) => {
+            warn!(
+                proxy_id = %proxy.id,
+                backend_host = %effective_host,
+                backend_port = pending_dispatch_port,
+                pending_requests = limit.current,
+                max_pending_requests = limit.cap,
+                "Shedding HTTP/1.1 request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
+            );
+            return backend_dispatch_response(
+                retry::BackendResponse {
+                    status_code: 503,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Upstream pending request queue full"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    // Gateway-side capacity shed before any backend dial: the
+                    // request never reached the backend application layer, so it
+                    // is classified `DispatchPolicyRejected` (NOT a transport
+                    // connection_error). That class is now a no-backend-signal
+                    // (`client_side_no_backend_signal`), so this overflow 503 is
+                    // NEUTRAL to backend health: it is not retried, does not trip
+                    // the backend circuit breaker / passive health, and does not
+                    // shrink the adaptive-concurrency permit for a backend that
+                    // was never dialed — mirrors the backend-TLS-SNI gateway
+                    // reject above.
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
+                    error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                },
+                None,
+                None,
+            );
+        }
+    };
+
     backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
         backend_admission_plugins,
         request_ctx,
@@ -16686,7 +17591,18 @@ async fn proxy_to_backend(
     // Send
     let mut reqwest_backend_guard =
         Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
-    let response = match req_builder.send().await {
+    let send_result = req_builder.send().await;
+    // Release the in-flight slot the instant `send()` resolves — i.e. when
+    // RESPONSE HEADERS arrive (or the dial failed). This is the only join point
+    // reqwest exposes, so under the in-flight reinterpretation it IS the correct
+    // release point by definition (codex r3, finding 3): the slot spans dispatch
+    // → response-headers. Dropping here — before response-body collection /
+    // eager buffering / response-inspection — keeps the slot off the
+    // response-streaming lifetime. RAII covers all the early returns ABOVE this
+    // point (admission reject); this explicit drop covers the response-handling
+    // tail BELOW it. A no-cap / non-HTTP-1.1 dispatch holds `None`, so it no-ops.
+    drop(pending_slot);
+    let response = match send_result {
         Ok(response) => {
             // A streaming request body that overran `max_request_body_size_bytes`
             // is authoritative regardless of how the send/receive race resolved.
@@ -20303,6 +21219,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         };
 
         let bywl_id = crate::modes::mesh::mesh_outbound_tcp_bywl_upstream_id(
@@ -20373,18 +21290,99 @@ mod tests {
         );
     }
 
-    /// Directly exercises the gRPC streaming circuit-breaker classification:
-    /// a late client-upload overflow is gateway-side and must be NEUTRAL, while
-    /// a non-overflow outcome is classified by the backend HTTP status. These
-    /// drive `record_grpc_streaming_outcome_on_breaker` — the `ProxyState`-free
-    /// core of `record_grpc_streaming_circuit_breaker_outcome` — against a real
-    /// breaker, so a regression that dropped the `request_body_exceeded` branch
-    /// or misclassified the status would fail here (unlike a bare
-    /// `record_neutral` call, which only tests the breaker primitive).
-    mod grpc_streaming_cb_outcome {
-        use super::super::record_grpc_streaming_outcome_on_breaker;
+    /// F3 §3.3 Stage 4: the UDP egress upstreams are referenced by NO config
+    /// proxy, so without a dedicated enrollment pass `retain_keys` would evict
+    /// their HBONE records and every Ambient UDP dial would 502 forever.
+    /// `collect_mesh_tcp_egress_capability_targets` must enroll the Ambient
+    /// `mesh.hbone` UDP per-port targets (keyed by the SAME deterministic UDP
+    /// relay proxy dispatch uses).
+    #[test]
+    fn collect_mesh_udp_egress_capability_targets_enrolls_hbone() {
+        use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let svc = MeshService {
+            name: "dns".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 53,
+                protocol: AppProtocol::Udp,
+                name: Some("dns".to_string()),
+                target_port: None,
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: HashMap::new(),
+            cluster_ips: vec!["10.96.0.10".to_string()],
+        };
+        let udp_id = crate::modes::mesh::mesh_outbound_udp_upstream_id("default", "dns", 53);
+        let upstream: Upstream = serde_json::from_value(json!({
+            "id": udp_id,
+            "name": "dns.default.svc.cluster.local",
+            "targets": [{
+                "host": "10.0.0.9",
+                "port": 53,
+                "tags": {"mesh.hbone": "true", "mesh.spiffe_id": spiffe},
+            }],
+        }))
+        .expect("upstream deserializes");
+        let config = GatewayConfig {
+            upstreams: vec![upstream],
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![svc],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        let upstream_map: HashMap<&str, &Upstream> = config
+            .upstreams
+            .iter()
+            .map(|u| (u.id.as_str(), u))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut targets = Vec::new();
+        ProxyState::collect_mesh_tcp_egress_capability_targets(
+            &config,
+            &upstream_map,
+            &mut seen,
+            &mut targets,
+        );
+
+        let relay =
+            crate::modes::mesh::mesh_outbound_udp_relay_proxy("default", "dns", 53, &udp_id);
+        let expected =
+            BackendCapabilityProbeTarget::from_proxy(&relay, Some(&config.upstreams[0].targets[0]));
+        let enrolled = targets
+            .iter()
+            .find(|t| t.key == expected.key)
+            .expect("the UDP Ambient HBONE target is enrolled for probing");
+        assert!(
+            enrolled.hbone_hint,
+            "the enrolled UDP target opts into HBONE probing"
+        );
+        assert_eq!(
+            enrolled.hbone_expected_peer.as_ref().map(|p| p.as_str()),
+            Some(spiffe),
+            "the HBONE probe pins the same destination identity dispatch uses"
+        );
+    }
+
+    /// Exercises `GrpcStreamingProbeRecorder` against a real breaker. Since
+    /// #1649 item 3 the recorder ONLY settles the HALF_OPEN probe slot — it
+    /// records a NEUTRAL outcome (release, no heal/trip) at the join of header
+    /// arrival + upload termination, or when the post-header upload guard
+    /// expires. The probe's backend-health outcome (heal on a clean stream, trip
+    /// on a `2xx`-then-stall / non-OK grpc-status trailer) is decided at
+    /// response-body completion by the deferred dispatch outcome
+    /// (`record_backend_outcome_inner`), covered by `backend_dispatch` unit
+    /// tests and the functional 2xx-then-stall tests — NOT here.
+    mod grpc_streaming_probe_slot {
         use crate::circuit_breaker::CircuitBreaker;
         use crate::config::types::CircuitBreakerConfig;
+        use crate::proxy::body::GrpcResponseTerminalObserver;
+        use crate::proxy::grpc_proxy::GrpcUploadTerminationObserver;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
 
         fn half_open_probe_config() -> CircuitBreakerConfig {
             CircuitBreakerConfig {
@@ -20408,64 +21406,96 @@ mod tests {
             cb
         }
 
+        fn no_overflow() -> Arc<AtomicBool> {
+            Arc::new(AtomicBool::new(false))
+        }
+
+        fn recorder(
+            cb: Arc<CircuitBreaker>,
+            post_header_upload_timeout_ms: Option<u64>,
+        ) -> Arc<super::super::GrpcStreamingProbeRecorder> {
+            recorder_with_overflow(cb, no_overflow(), post_header_upload_timeout_ms)
+        }
+
+        fn recorder_with_overflow(
+            cb: Arc<CircuitBreaker>,
+            overflow: Arc<AtomicBool>,
+            post_header_upload_timeout_ms: Option<u64>,
+        ) -> Arc<super::super::GrpcStreamingProbeRecorder> {
+            // Capture the breaker's current open generation as the admission epoch,
+            // matching the runtime (`check_circuit_breaker`).
+            let admission_open_epoch = cb.open_epoch();
+            Arc::new(super::super::GrpcStreamingProbeRecorder::new(
+                cb,
+                true,
+                overflow,
+                post_header_upload_timeout_ms,
+                admission_open_epoch,
+            ))
+        }
+
         #[test]
-        fn late_upload_overflow_is_neutral_and_keeps_breaker_half_open() {
-            let cb = breaker_with_admitted_half_open_probe();
-            // Backend headers were 200, but the client upload overran
-            // (request_body_exceeded == true): gateway-side, must not heal.
-            record_grpc_streaming_outcome_on_breaker(&cb, 200, true, true);
+        fn header_then_upload_termination_releases_slot_neutral() {
+            // The recorder releases the slot at the JOIN of header arrival +
+            // upload termination, and the release is NEUTRAL: it never heals the
+            // breaker (that is now decided at body completion).
+            let cb = std::sync::Arc::new(breaker_with_admitted_half_open_probe());
+            let recorder = recorder(std::sync::Arc::clone(&cb), None);
+
+            recorder.note_headers_arrived();
             assert_eq!(
-                cb.state_name(),
-                "half_open",
-                "client-upload overflow must not close a HALF_OPEN breaker"
+                cb.half_open_in_flight(),
+                1,
+                "the slot is held until the upload terminates"
+            );
+
+            super::super::grpc_proxy::GrpcUploadTerminationObserver::on_upload_terminated(
+                recorder.as_ref(),
             );
             assert_eq!(
                 cb.half_open_in_flight(),
                 0,
-                "neutral outcome must release the probe slot"
+                "upload termination after headers releases the probe slot"
             );
-        }
-
-        #[test]
-        fn overflow_is_neutral_regardless_of_backend_status() {
-            // Even a 500 backend status is neutral when the upload overran — the
-            // abort is gateway-side, so it must neither trip nor heal.
-            let cb = breaker_with_admitted_half_open_probe();
-            record_grpc_streaming_outcome_on_breaker(&cb, 500, true, true);
             assert_eq!(
                 cb.state_name(),
                 "half_open",
-                "overflow must be neutral regardless of backend status"
+                "the recorder release is NEUTRAL — it must not heal the breaker"
             );
-            assert_eq!(cb.half_open_in_flight(), 0);
         }
 
         #[test]
-        fn clean_2xx_streaming_probe_heals_breaker() {
-            let cb = breaker_with_admitted_half_open_probe();
-            // No overflow, backend 200: a genuine probe success.
-            // success_threshold == 1, so the breaker closes.
-            record_grpc_streaming_outcome_on_breaker(&cb, 200, false, true);
-            assert_eq!(
-                cb.state_name(),
-                "closed",
-                "a clean 2xx streaming probe must heal the breaker"
+        fn upload_termination_before_headers_waits_for_headers() {
+            // If the upload terminates before headers arrive, the recorder stays
+            // inert until `note_headers_arrived` activates it (the gate also
+            // anchors the post-header guard to header arrival).
+            let cb = std::sync::Arc::new(breaker_with_admitted_half_open_probe());
+            let recorder = recorder(std::sync::Arc::clone(&cb), None);
+
+            super::super::grpc_proxy::GrpcUploadTerminationObserver::on_upload_terminated(
+                recorder.as_ref(),
             );
+            assert_eq!(
+                cb.half_open_in_flight(),
+                1,
+                "no release before headers are known"
+            );
+
+            recorder.note_headers_arrived();
+            assert_eq!(
+                cb.half_open_in_flight(),
+                0,
+                "headers arriving after upload termination release the slot"
+            );
+            assert_eq!(cb.state_name(), "half_open");
         }
 
         #[tokio::test]
         async fn post_header_upload_timeout_releases_probe_slot_neutral() {
             let cb = std::sync::Arc::new(breaker_with_admitted_half_open_probe());
-            let request_body_exceeded =
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let recorder = std::sync::Arc::new(super::super::GrpcStreamingProbeRecorder::new(
-                std::sync::Arc::clone(&cb),
-                true,
-                request_body_exceeded,
-                Some(10),
-            ));
+            let recorder = recorder(std::sync::Arc::clone(&cb), Some(10));
 
-            recorder.note_status(200);
+            recorder.note_headers_arrived();
             assert_eq!(
                 cb.half_open_in_flight(),
                 1,
@@ -20491,23 +21521,19 @@ mod tests {
             assert_eq!(
                 cb.state_name(),
                 "half_open",
-                "late upload termination after the timeout must not double-record"
+                "late upload termination after the timeout must not double-release"
             );
         }
 
         #[test]
         fn oversized_post_header_upload_guard_releases_probe_slot_neutral() {
             let cb = std::sync::Arc::new(breaker_with_admitted_half_open_probe());
-            let request_body_exceeded =
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let recorder = std::sync::Arc::new(super::super::GrpcStreamingProbeRecorder::new(
+            let recorder = recorder(
                 std::sync::Arc::clone(&cb),
-                true,
-                request_body_exceeded,
                 Some(super::super::MAX_GRPC_POST_HEADER_UPLOAD_GUARD_MS + 1),
-            ));
+            );
 
-            recorder.note_status(200);
+            recorder.note_headers_arrived();
 
             assert_eq!(
                 cb.state_name(),
@@ -20526,23 +21552,15 @@ mod tests {
             // Regression guard: the post-header upload window must be counted
             // from when response headers arrive, not from dispatch start. A
             // backend that takes a while to return headers must not consume the
-            // guard window — otherwise a healthy probe would be recorded NEUTRAL
-            // the instant headers land and could never heal the breaker.
+            // guard window — otherwise a healthy probe's slot would be released
+            // the instant headers land.
             let cb = std::sync::Arc::new(breaker_with_admitted_half_open_probe());
-            let request_body_exceeded =
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let recorder = std::sync::Arc::new(super::super::GrpcStreamingProbeRecorder::new(
-                std::sync::Arc::clone(&cb),
-                true,
-                request_body_exceeded,
-                Some(40),
-            ));
+            let recorder = recorder(std::sync::Arc::clone(&cb), Some(40));
 
             // Simulate a slow-header backend: meaningful time elapses between
-            // recorder construction (dispatch start) and the status becoming
-            // known (header arrival).
+            // recorder construction (dispatch start) and header arrival.
             tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-            recorder.note_status(200);
+            recorder.note_headers_arrived();
 
             // Even though more than the 40ms window has elapsed since dispatch
             // start, the guard has not fired: it starts counting now.
@@ -20567,15 +21585,205 @@ mod tests {
         }
 
         #[test]
-        fn streaming_5xx_without_overflow_reopens_breaker() {
-            let cb = breaker_with_admitted_half_open_probe();
-            // No overflow, backend 500 (a configured failure status): the probe
-            // failed, so the breaker reopens.
-            record_grpc_streaming_outcome_on_breaker(&cb, 500, false, true);
+        fn clean_response_then_upload_termination_heals() {
+            // A clean 2xx/grpc-status:0 response heals the breaker — but only once
+            // the upload terminates (so the overflow flag is final). The slot is
+            // released NEUTRAL at the join; the success is recorded as a non-probe.
+            let cb = Arc::new(breaker_with_admitted_half_open_probe());
+            let recorder = recorder(Arc::clone(&cb), None);
+
+            recorder.note_headers_arrived();
+            recorder.on_response_terminal(200, false, None);
+            assert_eq!(
+                cb.state_name(),
+                "half_open",
+                "a clean response must NOT heal before upload termination"
+            );
+
+            GrpcUploadTerminationObserver::on_upload_terminated(recorder.as_ref());
+            assert_eq!(
+                cb.state_name(),
+                "closed",
+                "clean response + upload termination (no overflow) heals the breaker"
+            );
+            assert_eq!(cb.half_open_in_flight(), 0, "slot released");
+        }
+
+        #[test]
+        fn clean_response_then_late_overflow_does_not_heal() {
+            // #1649 round-3 A: a backend can complete a clean response BEFORE the
+            // client upload, then the upload overflows. The deferred clean success
+            // must re-check the overflow flag at upload termination and stay
+            // NEUTRAL — it must not falsely heal the HALF_OPEN breaker.
+            let cb = Arc::new(breaker_with_admitted_half_open_probe());
+            let overflow = no_overflow();
+            let recorder = recorder_with_overflow(Arc::clone(&cb), Arc::clone(&overflow), None);
+
+            recorder.note_headers_arrived();
+            recorder.on_response_terminal(200, false, None);
+            // Client upload overflows AFTER the clean response.
+            overflow.store(true, std::sync::atomic::Ordering::Release);
+            GrpcUploadTerminationObserver::on_upload_terminated(recorder.as_ref());
+
+            assert_eq!(
+                cb.state_name(),
+                "half_open",
+                "a late client-upload overflow must not heal a clean-response probe"
+            );
+            assert_eq!(cb.half_open_in_flight(), 0, "slot still released");
+        }
+
+        #[test]
+        fn post_wire_failure_trips_promptly_before_upload_termination() {
+            // A 2xx-then-stall body (post-wire ReadWriteTimeout) is a real backend
+            // failure: it trips the breaker at response completion WITHOUT waiting
+            // for the upload to terminate.
+            let cb = Arc::new(breaker_with_admitted_half_open_probe());
+            let recorder = recorder(Arc::clone(&cb), None);
+
+            recorder.note_headers_arrived();
+            recorder.on_response_terminal(
+                200,
+                false,
+                Some(crate::retry::ErrorClass::ReadWriteTimeout),
+            );
             assert_eq!(
                 cb.state_name(),
                 "open",
-                "a 5xx streaming probe must reopen the breaker"
+                "a post-wire body failure reopens the breaker promptly at response completion"
+            );
+        }
+
+        #[test]
+        fn overflow_at_response_terminal_is_neutral() {
+            // A client-upload overflow that resets the response stream is
+            // client-side: NEUTRAL, never a backend failure, even though it
+            // surfaces as a stream reset.
+            let cb = Arc::new(breaker_with_admitted_half_open_probe());
+            let overflow = Arc::new(AtomicBool::new(true));
+            let recorder = recorder_with_overflow(Arc::clone(&cb), overflow, None);
+
+            recorder.note_headers_arrived();
+            recorder.on_response_terminal(
+                200,
+                false,
+                Some(crate::retry::ErrorClass::ConnectionReset),
+            );
+            GrpcUploadTerminationObserver::on_upload_terminated(recorder.as_ref());
+            assert_eq!(
+                cb.state_name(),
+                "half_open",
+                "a client-upload overflow reset must be neutral, not a backend failure"
+            );
+        }
+
+        #[test]
+        fn stale_outcome_after_breaker_reopened_does_not_heal() {
+            // #1649 round-4 B: a stream admitted under one open generation must NOT
+            // heal a LATER HALF_OPEN cycle it never probed. Admit a probe, capture
+            // its admission epoch, then reopen the breaker (a sibling probe fails)
+            // so a new generation begins — this stream's clean completion is stale
+            // and must record NEUTRAL.
+            let cb = Arc::new(breaker_with_admitted_half_open_probe());
+            let recorder = recorder(Arc::clone(&cb), None); // captures admission epoch
+
+            // A sibling HALF_OPEN probe fails → reopen → NEW open generation.
+            cb.record_failure(500, false, true);
+            assert_eq!(cb.state_name(), "open");
+
+            // This (stale) stream now completes clean.
+            recorder.note_headers_arrived();
+            recorder.on_response_terminal(200, false, None);
+            GrpcUploadTerminationObserver::on_upload_terminated(recorder.as_ref());
+            assert_eq!(
+                cb.state_name(),
+                "open",
+                "a stale clean stream from a prior generation must not heal the reopened breaker"
+            );
+        }
+
+        #[test]
+        fn client_disconnect_at_response_terminal_is_neutral() {
+            // #1649 R5 finding 4: a downstream client disconnect carries NO backend
+            // health signal. `circuit_breaker_outcome_is_failure` returns false for
+            // `ClientDisconnect`, so without the explicit client-side guard the
+            // recorder would treat it as a clean success and a client cancelling a
+            // stream during HALF_OPEN could falsely heal an unhealthy backend. It
+            // must settle NEUTRAL while still releasing the probe slot.
+            let cb = Arc::new(breaker_with_admitted_half_open_probe());
+            let recorder = recorder(Arc::clone(&cb), None);
+
+            recorder.note_headers_arrived();
+            recorder.on_response_terminal(
+                200,
+                false,
+                Some(crate::retry::ErrorClass::ClientDisconnect),
+            );
+            GrpcUploadTerminationObserver::on_upload_terminated(recorder.as_ref());
+            assert_eq!(
+                cb.state_name(),
+                "half_open",
+                "a client disconnect must be neutral, not a clean success that heals the probe"
+            );
+            assert_eq!(cb.half_open_in_flight(), 0, "slot still released");
+        }
+
+        #[tokio::test]
+        async fn clean_completion_after_upload_guard_expiry_does_not_heal() {
+            // #1649 R5 finding 5: the post-header upload guard fires while the
+            // response is still streaming (upload not terminated). If the backend
+            // LATER completes cleanly and the client upload eventually terminates,
+            // the clean success must NOT heal — the upload missed its deadline, so
+            // its late termination cannot be trusted to confirm the HALF_OPEN probe.
+            let cb = Arc::new(breaker_with_admitted_half_open_probe());
+            let recorder = recorder(Arc::clone(&cb), Some(10));
+
+            recorder.note_headers_arrived();
+            // Let the post-header upload guard fire with the upload still open.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(
+                cb.half_open_in_flight(),
+                0,
+                "the guard released the probe slot when the upload missed its deadline"
+            );
+            assert_eq!(cb.state_name(), "half_open", "the guard release is neutral");
+
+            // The backend now completes cleanly and the upload finally terminates.
+            recorder.on_response_terminal(200, false, None);
+            GrpcUploadTerminationObserver::on_upload_terminated(recorder.as_ref());
+            assert_eq!(
+                cb.state_name(),
+                "half_open",
+                "a clean completion after upload-guard expiry must settle neutral, not heal"
+            );
+        }
+
+        #[tokio::test]
+        async fn failure_after_upload_guard_expiry_still_trips() {
+            // #1649 R5 finding 5 (counterpart): expiring the upload guard must NOT
+            // mask a genuine later backend failure — only a clean success is
+            // neutralized. A 2xx-then-stall body failing after the guard expired
+            // still reopens the breaker.
+            let cb = Arc::new(breaker_with_admitted_half_open_probe());
+            let recorder = recorder(Arc::clone(&cb), Some(10));
+
+            recorder.note_headers_arrived();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(
+                cb.state_name(),
+                "half_open",
+                "guard release is neutral so far"
+            );
+
+            recorder.on_response_terminal(
+                200,
+                false,
+                Some(crate::retry::ErrorClass::ReadWriteTimeout),
+            );
+            assert_eq!(
+                cb.state_name(),
+                "open",
+                "a post-wire failure after upload-guard expiry must still reopen the breaker"
             );
         }
     }
@@ -24195,6 +25403,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         });
         // Now the workload's declared application port is allowed on loopback...
         assert!(inbound_hbone_relay_destination_allowed(
@@ -24434,7 +25643,7 @@ mod tests {
         crate::identity::SvidBundle {
             spiffe_id,
             cert_chain_der: vec![vec![42]],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles,
         }
     }
@@ -24972,6 +26181,7 @@ mod tests {
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                remote_provenance: false,
             }
         }
 
@@ -25312,6 +26522,64 @@ mod tests {
         );
     }
 
+    // ── DestinationRule per-port http1MaxPendingRequests resolution ──────
+    //
+    // `resolve_backend_http1_max_pending_requests` is the projection seam the
+    // reqwest/H1 dispatch path reads to enforce
+    // `connectionPool.http.http1MaxPendingRequests`. Same contract shape as the
+    // maxConnections resolver: the cap surfaces only for the matching
+    // destination port; no-override / no-cap / wrong-port all return `None`.
+
+    fn proxy_with_http1_pending_override(port: u16, cap: Option<u32>) -> Proxy {
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "id": "p-pending",
+            "backend_host": "backend.local",
+            "backend_port": 8080,
+            "upstream_id": "u1",
+        }))
+        .expect("test proxy should deserialize");
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            port,
+            crate::config::types::ResolvedPortOverride {
+                http1_max_pending_requests: cap,
+                ..Default::default()
+            },
+        )]));
+        proxy
+    }
+
+    #[test]
+    fn resolve_backend_http1_max_pending_returns_cap_for_matching_port() {
+        let proxy = proxy_with_http1_pending_override(8080, Some(64));
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&proxy, 8080),
+            Some(64),
+            "cap must surface for the matching destination port"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_http1_max_pending_none_for_other_port_or_no_override() {
+        let proxy = proxy_with_http1_pending_override(8080, Some(64));
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&proxy, 9090),
+            None,
+            "a port without an override must be unbounded"
+        );
+        let no_overrides = proxy_with_port_overrides_for_test(5000, &[]);
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&no_overrides, 8080),
+            None,
+            "a proxy with no port overrides must be unbounded"
+        );
+        let lacks_cap = proxy_with_http1_pending_override(8080, None);
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&lacks_cap, 8080),
+            None,
+            "an override without http1_max_pending_requests must be unbounded"
+        );
+    }
+
     #[test]
     fn resolve_effective_proxy_returns_borrowed_when_no_upstream_target() {
         // Direct-backend proxy (no upstream) → no per-target lookup possible.
@@ -25387,6 +26655,25 @@ mod tests {
         let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
         assert!(matches!(effective, std::borrow::Cow::Owned(_)));
         assert_eq!(effective.pool_max_requests_per_connection, Some(40));
+    }
+
+    #[test]
+    fn resolve_effective_proxy_projects_http1_max_pending_requests_per_port() {
+        // The per-port `http1MaxPendingRequests` cap projects onto the effective
+        // proxy's `pool_http1_max_pending_requests`, which the reqwest/H1
+        // dispatch gate then reads (via `resolve_backend_http1_max_pending_requests`).
+        let proxy = proxy_with_http1_pending_override(8080, Some(64));
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Owned(_)),
+            "differing pending cap must take the owned-clone branch"
+        );
+        assert_eq!(effective.pool_http1_max_pending_requests, Some(64));
+        assert!(
+            proxy.pool_http1_max_pending_requests.is_none(),
+            "original proxy is untouched"
+        );
     }
 
     #[test]
@@ -25793,6 +27080,7 @@ mod tests {
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            locality_lb_strict: false,
             locality_lb_setting: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
@@ -25848,6 +27136,7 @@ mod tests {
                 subsets: None,
                 port_overrides: HashMap::new(),
                 source_locality: None,
+                locality_lb_strict: false,
                 locality_lb_setting: None,
                 backend_tls_client_cert_path: None,
                 backend_tls_client_key_path: None,

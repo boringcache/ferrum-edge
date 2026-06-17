@@ -3226,6 +3226,15 @@ where
     )
 }
 
+fn inspected_emitted_response_limit_exceeded(
+    bytes_streamed: u64,
+    next_len: usize,
+    max_response_body_size_bytes: usize,
+) -> bool {
+    max_response_body_size_bytes > 0
+        && bytes_streamed.saturating_add(next_len as u64) > max_response_body_size_bytes as u64
+}
+
 /// Drive a response-stream [`ResponseStreamInspector`] over a reqwest backend
 /// response, writing released bytes to the H3 client stream. The cross-protocol
 /// (H3 client → HTTP/1/2 backend) counterpart of the native-H3 inspected loop and
@@ -3269,6 +3278,19 @@ where
                 match inspector.on_chunk(&chunk).await {
                     ResponseStreamAction::Forward(out) => {
                         if !out.is_empty() {
+                            if inspected_emitted_response_limit_exceeded(
+                                bytes_streamed,
+                                out.len(),
+                                max_response_body_size_bytes,
+                            ) {
+                                warn!(
+                                    "Inspected response exceeded {} byte emitted limit during cross-protocol H3 stream",
+                                    max_response_body_size_bytes
+                                );
+                                crate::http3::stream_util::abort_response_stream(stream);
+                                body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
+                                break;
+                            }
                             let out_len = out.len() as u64;
                             if stream.send_data(out).await.is_err() {
                                 client_disconnected = true;
@@ -3282,6 +3304,19 @@ where
                         if let Some(fb) = final_bytes
                             && !fb.is_empty()
                         {
+                            if inspected_emitted_response_limit_exceeded(
+                                bytes_streamed,
+                                fb.len(),
+                                max_response_body_size_bytes,
+                            ) {
+                                warn!(
+                                    "Inspected response exceeded {} byte emitted limit during cross-protocol H3 stream termination",
+                                    max_response_body_size_bytes
+                                );
+                                crate::http3::stream_util::abort_response_stream(stream);
+                                body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
+                                break;
+                            }
                             let fb_len = fb.len() as u64;
                             if stream.send_data(fb).await.is_ok() {
                                 bytes_streamed += fb_len;
@@ -3300,6 +3335,19 @@ where
                 match inspector.on_end().await {
                     ResponseStreamAction::Forward(out) => {
                         if !out.is_empty() {
+                            if inspected_emitted_response_limit_exceeded(
+                                bytes_streamed,
+                                out.len(),
+                                max_response_body_size_bytes,
+                            ) {
+                                warn!(
+                                    "Inspected response exceeded {} byte emitted limit at end of cross-protocol H3 stream",
+                                    max_response_body_size_bytes
+                                );
+                                crate::http3::stream_util::abort_response_stream(stream);
+                                body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
+                                break;
+                            }
                             let out_len = out.len() as u64;
                             if stream.send_data(out).await.is_err() {
                                 client_disconnected = true;
@@ -3313,6 +3361,19 @@ where
                         if let Some(fb) = final_bytes
                             && !fb.is_empty()
                         {
+                            if inspected_emitted_response_limit_exceeded(
+                                bytes_streamed,
+                                fb.len(),
+                                max_response_body_size_bytes,
+                            ) {
+                                warn!(
+                                    "Inspected response exceeded {} byte emitted limit during end-of-stream termination",
+                                    max_response_body_size_bytes
+                                );
+                                crate::http3::stream_util::abort_response_stream(stream);
+                                body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
+                                break;
+                            }
                             let fb_len = fb.len() as u64;
                             if stream.send_data(fb).await.is_ok() {
                                 bytes_streamed += fb_len;
@@ -4014,8 +4075,8 @@ mod tests {
     use super::{
         apply_buffered_grpc_plugin_reject, apply_buffered_plain_plugin_reject,
         apply_h3_grpc_reject_metadata, build_plain_request_builder,
-        cross_protocol_header_write_disconnect_outcome, normalize_h3_grpc_reject,
-        reject_body_as_h3_grpc_message,
+        cross_protocol_header_write_disconnect_outcome, inspected_emitted_response_limit_exceeded,
+        normalize_h3_grpc_reject, reject_body_as_h3_grpc_message,
         release_cross_protocol_circuit_breaker_probe_on_admission_reject,
         sanitize_h3_grpc_message_for_header, should_finish_h3_stream_without_trailers,
         should_skip_cross_protocol_backend_header,
@@ -4116,6 +4177,18 @@ mod tests {
         assert!(should_finish_h3_stream_without_trailers(None));
         assert!(should_finish_h3_stream_without_trailers(Some(&empty)));
         assert!(!should_finish_h3_stream_without_trailers(Some(&non_empty)));
+    }
+
+    #[test]
+    fn inspected_emitted_response_limit_tracks_transformed_output() {
+        assert!(!inspected_emitted_response_limit_exceeded(900, 200, 0));
+        assert!(!inspected_emitted_response_limit_exceeded(900, 100, 1_000));
+        assert!(inspected_emitted_response_limit_exceeded(900, 101, 1_000));
+        assert!(inspected_emitted_response_limit_exceeded(
+            u64::MAX - 1,
+            10,
+            1_024
+        ));
     }
 
     #[tokio::test]
