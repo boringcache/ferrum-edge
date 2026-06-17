@@ -2384,6 +2384,11 @@ pub trait Plugin: Send + Sync {
     /// `Content-Type` is unknown at the pre-flight `should_buffer_response_body`
     /// decision, which is why this is a separate hook.
     ///
+    /// The full `response_headers` map (and `response_status`) are also passed so
+    /// a plugin can release a response it will decline to transform once headers
+    /// are known — e.g. `compression` skips `206 Partial Content` / `Content-Range`
+    /// responses, so it must not pin them onto the buffered path either.
+    ///
     /// Contract: this MUST only narrow `should_buffer_response_body` — it may
     /// return `false` where the unconditional check returned `true`, but never
     /// the reverse. The proxy uses it solely to downgrade buffer -> stream and
@@ -2395,6 +2400,8 @@ pub trait Plugin: Send + Sync {
         &self,
         ctx: &RequestContext,
         _content_type: Option<&str>,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
     }

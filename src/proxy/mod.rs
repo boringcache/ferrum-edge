@@ -880,6 +880,7 @@ pub(crate) fn refine_stream_response_for_content_type(
     proxy: &Proxy,
     plugins: &[Arc<dyn Plugin>],
     ctx: Option<&RequestContext>,
+    response_status: u16,
     response_headers: &HashMap<String, String>,
 ) -> bool {
     if stream_response {
@@ -900,10 +901,17 @@ pub(crate) fn refine_stream_response_for_content_type(
         return false;
     }
     // Keep buffering only while at least one plugin still needs the body for
-    // this content-type; otherwise stream it straight through.
-    !plugins
-        .iter()
-        .any(|plugin| plugin.should_buffer_response_body_for_content_type(ctx, content_type))
+    // this content-type; otherwise stream it straight through. Plugins also see
+    // the response status/headers so a plugin can release a response it will not
+    // transform (e.g. `compression` skips `206`/`Content-Range` range responses).
+    !plugins.iter().any(|plugin| {
+        plugin.should_buffer_response_body_for_content_type(
+            ctx,
+            content_type,
+            response_status,
+            response_headers,
+        )
+    })
 }
 
 /// Fix 5: decide whether a plain-HTTPS direct-H2 response body should skip
@@ -16769,6 +16777,7 @@ async fn proxy_to_backend(
                 proxy,
                 plugins,
                 response_decision_ctx,
+                status,
                 &resp_headers,
             );
 
@@ -18114,6 +18123,7 @@ async fn proxy_to_backend_hbone(
         proxy,
         plugins,
         ctx,
+        status,
         &resp_headers,
     );
 
@@ -18617,6 +18627,7 @@ async fn proxy_to_backend_mesh_mtls(
         proxy,
         plugins,
         ctx,
+        status,
         &resp_headers,
     );
 
@@ -18902,6 +18913,7 @@ async fn proxy_to_backend_http2(
         proxy,
         plugins,
         ctx,
+        status,
         &resp_headers,
     );
 
@@ -20656,6 +20668,8 @@ mod tests {
             &self,
             _ctx: &RequestContext,
             content_type: Option<&str>,
+            _response_status: u16,
+            _response_headers: &HashMap<String, String>,
         ) -> bool {
             content_type == Some(self.buffer_content_type)
         }
@@ -22219,6 +22233,7 @@ mod tests {
             &proxy,
             &plugins,
             Some(&ctx),
+            200,
             &json_headers,
         ));
 
@@ -22228,6 +22243,7 @@ mod tests {
             &proxy,
             &plugins,
             Some(&ctx),
+            200,
             &binary_headers,
         ));
 
@@ -22256,6 +22272,7 @@ mod tests {
             &proxy,
             &relabel_plugins,
             Some(&ctx),
+            200,
             &binary_headers,
         ));
 
@@ -22284,6 +22301,7 @@ mod tests {
             &proxy,
             &route_relabel_plugins,
             Some(&route_ctx),
+            200,
             &binary_headers,
         ));
 
@@ -22293,6 +22311,7 @@ mod tests {
             &proxy,
             &plugins,
             Some(&ctx),
+            200,
             &json_headers,
         ));
 
@@ -22303,6 +22322,7 @@ mod tests {
             &buffered_proxy,
             &plugins,
             Some(&ctx),
+            200,
             &binary_headers,
         ));
 
@@ -22313,6 +22333,7 @@ mod tests {
             &proxy,
             &plugins,
             None,
+            200,
             &binary_headers,
         ));
 
@@ -22326,6 +22347,7 @@ mod tests {
             &proxy,
             &always,
             Some(&ctx),
+            200,
             &binary_headers,
         ));
     }

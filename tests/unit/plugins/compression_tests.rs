@@ -316,29 +316,94 @@ async fn test_skips_non_compressible_content_type() {
 fn test_response_buffering_is_narrowed_by_content_type() {
     let plugin = make_plugin(json!({}));
     let ctx = make_ctx(Some("gzip"));
+    let headers = HashMap::new();
 
     assert!(plugin.should_buffer_response_body(&ctx));
-    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/html")));
     assert!(plugin.should_buffer_response_body_for_content_type(
         &ctx,
-        Some("application/json; charset=utf-8")
+        Some("text/html"),
+        200,
+        &headers
     ));
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("image/png")));
-    assert!(
-        !plugin
-            .should_buffer_response_body_for_content_type(&ctx, Some("application/octet-stream"))
-    );
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json; charset=utf-8"),
+        200,
+        &headers
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &headers
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("image/png"),
+        200,
+        &headers
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/octet-stream"),
+        200,
+        &headers
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &headers));
+}
+
+#[test]
+fn test_response_buffering_skips_range_responses() {
+    // A range response with a compressible content-type must not be pinned onto
+    // the buffered path: `after_proxy` will skip compressing it, so buffering
+    // would just delay/collect the body (and can trip the response body limit on
+    // large ranged downloads) instead of streaming it. Mirrors the `after_proxy`
+    // 206/Content-Range skip so the proxy can downgrade buffer -> stream.
+    let plugin = make_plugin(json!({}));
+    let ctx = make_ctx(Some("gzip"));
+
+    // 206 Partial Content (even without an explicit Content-Range header).
+    let no_range = HashMap::new();
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/html"),
+        206,
+        &no_range
+    ));
+
+    // A Content-Range header on a non-206 status also opts out.
+    let mut range_headers = HashMap::new();
+    range_headers.insert("content-range".to_string(), "bytes 0-99/5000".to_string());
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/html"),
+        200,
+        &range_headers
+    ));
+
+    // A plain 200 with a compressible type still buffers (control).
+    let plain = HashMap::new();
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/html"),
+        200,
+        &plain
+    ));
 }
 
 #[test]
 fn test_response_buffering_still_requires_accept_encoding() {
     let plugin = make_plugin(json!({}));
     let ctx = make_ctx(None);
+    let headers = HashMap::new();
 
     assert!(!plugin.should_buffer_response_body(&ctx));
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers
+    ));
 }
 
 #[tokio::test]

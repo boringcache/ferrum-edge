@@ -4705,6 +4705,7 @@ async fn proxy_to_backend_h3_refined_response(
         proxy,
         plugins,
         Some(ctx),
+        response_status,
         &response_headers,
     ) {
         let result = stream_h3_open_response_to_client(

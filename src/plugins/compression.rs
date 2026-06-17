@@ -542,7 +542,18 @@ impl Plugin for CompressionPlugin {
         &self,
         ctx: &RequestContext,
         content_type: Option<&str>,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
     ) -> bool {
+        // Mirror the `after_proxy` skip checks that are knowable from the
+        // response headers so we never pin a body onto the buffered path that
+        // we are going to decline to compress. Range responses (`206` or any
+        // `Content-Range`) are skipped there to preserve byte-offset semantics,
+        // so they must stream instead of being fully collected (which would also
+        // risk tripping the response body size limit on large ranged downloads).
+        if response_status == 206 || response_headers.contains_key("content-range") {
+            return false;
+        }
         self.should_buffer_response_body(ctx)
             && content_type.is_some_and(|ct| self.is_compressible_content_type(ct))
     }

@@ -1650,6 +1650,7 @@ where
         proxy,
         plugins,
         if has_retry { None } else { Some(&*ctx) },
+        status,
         &response_headers,
     );
 
