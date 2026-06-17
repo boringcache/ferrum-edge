@@ -65,7 +65,8 @@ use crate::grpc::dp_client::{DpGrpcTlsConfig, GrpcJwtSecret};
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{AppProtocol, MeshService, MultiClusterConfig, Workload};
 use crate::modes::mesh::config_consumer::common::{
-    BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs as common_next_backoff_secs,
+    BACKOFF_INITIAL_SECS, MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE, jittered_backoff,
+    next_backoff_secs as common_next_backoff_secs,
 };
 
 /// Backoff bounds shared with [`super::federation`] and
@@ -1416,7 +1417,8 @@ async fn fetch_remote_slice_endpoints(
             MeshConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
                 req.metadata_mut().insert("authorization", token.clone());
                 Ok(req)
-            });
+            })
+            .max_decoding_message_size(MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE);
         let request = tonic::Request::new(MeshSubscribeRequest {
             node_id: node_id.to_string(),
             ferrum_version: crate::FERRUM_VERSION.to_string(),

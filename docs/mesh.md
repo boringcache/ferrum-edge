@@ -322,7 +322,7 @@ The Ferrum-native protocol uses the `MeshConfigSync.MeshSubscribe` gRPC streamin
 - **Authentication**: JWT HS256 in gRPC `authorization` metadata, using `FERRUM_CP_DP_GRPC_JWT_SECRET`.
 - **Transport security**: same TLS configuration as CP/DP mode (see [cp_dp_mode.md](cp_dp_mode.md)).
 - **No-op suppression**: `MeshSlice::content_eq()` skips updates that do not change mesh-relevant fields (ignoring the transport version stamp).
-- **Config message size**: native `MeshSubscribe` and xDS ADS clients accept inbound gRPC config messages up to 16 MiB. Larger control-plane responses fail closed and the last accepted slice keeps serving.
+- **Config message size**: native `MeshSubscribe` (including cross-cluster remote-discovery fetches) and xDS ADS clients accept inbound gRPC config messages up to 16 MiB. Larger control-plane responses fail closed and the last accepted slice keeps serving.
 
 ### xDS ADS
 
