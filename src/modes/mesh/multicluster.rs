@@ -474,16 +474,18 @@ fn tag_remote_workloads(
     cluster_name: &str,
     network: Option<&str>,
 ) {
+    let entry_network = network.filter(|n| !n.is_empty());
     for workload in &mut endpoints.workloads {
-        if workload.cluster.is_none() {
-            workload.cluster = Some(cluster_name.to_string());
-        }
-        if workload.network.is_none()
-            && let Some(network) = network
-            && !network.is_empty()
-        {
-            workload.network = Some(network.to_string());
-        }
+        // Stamp the ADMITTED remote-cluster entry's provenance, OVERWRITING any
+        // value the remote payload carried. The dedup keys downstream
+        // (`WorkloadEndpointKey` in the merge and the `seen` set in
+        // `service_discovery::mesh`) key on `cluster`/`network`, and the cluster
+        // name is unique per declared remote entry — so two distinct entries
+        // returning the same SPIFFE/address/port workload must each carry their
+        // OWN provenance. Only filling when absent let a shared (or identical)
+        // payload label collapse them and silently drop the later endpoint.
+        workload.cluster = Some(cluster_name.to_string());
+        workload.network = entry_network.map(|network| network.to_string());
         workload.locality = Some(default_remote_locality(cluster_name, network));
     }
 }
@@ -1739,6 +1741,48 @@ mod tests {
             endpoints.workloads[1].locality.as_deref(),
             Some("remote-west/net2")
         );
+    }
+
+    #[test]
+    fn tag_remote_workloads_overwrites_payload_provenance_with_entry() {
+        // codex: a remote payload may carry its OWN cluster/network labels (or
+        // labels shared with another remote entry). The dedup key is keyed on
+        // cluster/network, so the admitted entry's provenance must OVERWRITE the
+        // payload's — otherwise two distinct remote entries returning the same
+        // SPIFFE/address/port workload with identical payload labels collapse to
+        // one endpoint.
+        let mut wl = workload(
+            "spiffe://remote.local/ns/default/sa/a",
+            "reviews",
+            "10.2.0.1",
+            None,
+        );
+        wl.cluster = Some("payload-cluster".to_string());
+        wl.network = Some("payload-net".to_string());
+        let mut endpoints = RemoteClusterEndpoints {
+            workloads: vec![wl],
+            services: vec![],
+        };
+        tag_remote_workloads(&mut endpoints, "east", Some("net1"));
+        assert_eq!(endpoints.workloads[0].cluster.as_deref(), Some("east"));
+        assert_eq!(endpoints.workloads[0].network.as_deref(), Some("net1"));
+
+        // An entry with no declared network clears the payload network so the
+        // provenance reflects the entry identity, not a stale payload label.
+        let mut wl2 = workload(
+            "spiffe://remote.local/ns/default/sa/a",
+            "reviews",
+            "10.2.0.1",
+            None,
+        );
+        wl2.network = Some("payload-net".to_string());
+        let mut endpoints2 = RemoteClusterEndpoints {
+            workloads: vec![wl2],
+            services: vec![],
+        };
+        tag_remote_workloads(&mut endpoints2, "east", None);
+        assert_eq!(endpoints2.workloads[0].cluster.as_deref(), Some("east"));
+        assert_eq!(endpoints2.workloads[0].network, None);
     }
 
     #[test]

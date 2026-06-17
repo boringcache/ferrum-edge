@@ -218,10 +218,19 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
                 if address.is_empty() {
                     continue;
                 }
+                // Include the cross-cluster provenance (`cluster`/`network`) in
+                // the dedup key. In an overlapping-CIDR multi-network mesh two
+                // clusters can legitimately advertise the same
+                // `spiffe_id`+`address`+`port` on different networks; keying only
+                // on those three collapses the second endpoint and its distinct
+                // `mesh.cluster`/`mesh.network` target tags, so locality/failover
+                // never sees it.
                 let key = (
                     address.as_str(),
                     selected_port.port,
                     workload.spiffe_id.as_str(),
+                    workload.cluster.as_deref(),
+                    workload.network.as_deref(),
                 );
                 if !seen.insert(key) {
                     continue;
