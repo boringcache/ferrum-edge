@@ -665,6 +665,9 @@ impl MeshRuntimeConfig {
                         addr: self.inbound_listen_addr,
                     },
                 ];
+                // No-op for Sidecar (UDP egress deferred): the helper is
+                // Ambient-gated and returns None here, emitting a one-time warn
+                // when the capture flag is set. Called so that warn fires.
                 listeners.extend(self.udp_capture_listener());
                 listeners
             }
@@ -700,15 +703,44 @@ impl MeshRuntimeConfig {
         }
     }
 
-    /// The optional UDP TPROXY capture listener (F3 §3.3 Stage 3), emitted only
-    /// in the captured topologies (Sidecar / Ambient) that also run the
-    /// outbound :15001 capture listener — UDP egress capture is an outbound
-    /// concern, and NodeWaypoint/ServiceWaypoint have no outbound capture
-    /// listener (and UDP stays mesh-wide-only there per the per-pod-scope
-    /// notes). Returns at most one listener, gated on
-    /// `FERRUM_MESH_CAPTURE_UDP_ENABLED` (default-off via
-    /// [`crate::capture::udp_capture_settings_from_env`]), bound on the
-    /// **dual-stack IPv6 wildcard** (`[::]`, independent of
+    /// The optional UDP TPROXY capture listener (F3 §3.3), emitted only in the
+    /// **Ambient** topology — the one that actually **relays** captured UDP
+    /// (datagram-over-HBONE egress, Stage 4). UDP egress materialization is
+    /// Ambient-only (`materialize_mesh_outbound_udp_upstreams` gates `Ambient =>
+    /// HBONE, _ => return`), so emitting this listener for **Sidecar** (whose UDP
+    /// egress is deferred — no `:15008` HBONE listener) would divert the pod's UDP
+    /// into a listener with no relay and **black-hole every captured datagram**
+    /// (codex r1 P2). Gating it to Ambient leaves Sidecar UDP **un-captured**
+    /// (it passes through) rather than captured-then-dropped. NodeWaypoint/
+    /// ServiceWaypoint also have no outbound capture listener (and UDP stays
+    /// mesh-wide-only there per the per-pod-scope notes).
+    ///
+    /// **End-to-end status (codex r3 P1 — tracked in #1808): this listener + the
+    /// Stage-4 HBONE relay are the datagram-over-mesh *transport*, but Ambient
+    /// currently has NO UDP capture *producer* feeding this listener** — the
+    /// node-agent host-netns path emits no UDP TPROXY rules (the same per-pod-scope
+    /// blocker that defers F4.3 / #1803) and eBPF capture is `connect()`-hooked /
+    /// TCP-only. So end-to-end UDP capture→relay is **not yet active in production**
+    /// on Ambient: the relay/transport is implemented and unit-tested, and the first
+    /// working end-to-end path lands via the deferred **Sidecar mesh-mTLS datagram
+    /// relay** (which pairs with the *existing* injector pod-netns producer — #1808),
+    /// or a future Ambient UDP producer. This PR is intentionally the transport half.
+    ///
+    /// NOTE: the injector/init TPROXY-rule emission for a Sidecar pod is gated to
+    /// MATCH this runtime listener gate (codex r2 P1): the injector only produces
+    /// Sidecar pods, and `injector::sidecar_udp_capture_supported()` (a central
+    /// deferral switch) now suppresses the init container's UDP TPROXY rules, the
+    /// sidecar's runtime-enable env, AND the transparent-bind capability while
+    /// Sidecar UDP egress is deferred — so an injected Sidecar with the flag set
+    /// neither binds a UDP listener (here) nor diverts UDP (init container), and
+    /// UDP passes through un-captured instead of being black-holed. (The low-level
+    /// `crate::capture::udp_tproxy_commands_for_family` still gates only on
+    /// `host_netns`; the topology decision lives in the injector, which is the only
+    /// pod-netns emitter.)
+    ///
+    /// Returns at most one listener, gated on `FERRUM_MESH_CAPTURE_UDP_ENABLED`
+    /// (default-off via [`crate::capture::udp_capture_settings_from_env`]), bound
+    /// on the **dual-stack IPv6 wildcard** (`[::]`, independent of
     /// `FERRUM_MESH_OUTBOUND_LISTEN_ADDR`'s family) on the Stage-2 UDP capture
     /// port (`FERRUM_MESH_CAPTURE_UDP_PORT`): TPROXY leaves each datagram's
     /// original (non-local) destination intact, so a specific-IP bind would miss
@@ -731,6 +763,26 @@ impl MeshRuntimeConfig {
             }
         };
         if !settings.udp_capture_enabled {
+            return None;
+        }
+        // Ambient-only: only Ambient relays captured UDP (Stage 4 egress). For a
+        // non-Ambient captured topology (Sidecar) with the flag on, emit a loud
+        // ONE-TIME warning and DO NOT emit the listener — capturing UDP we cannot
+        // relay would black-hole it; leaving it un-captured lets it pass through.
+        // `listener_plan()` is called many times (serving, predicates, tests), so
+        // the warn is gated behind a `Once` to avoid log spam.
+        if self.topology != MeshTopology::Ambient {
+            static SIDECAR_UDP_DEFER_WARN: std::sync::Once = std::sync::Once::new();
+            SIDECAR_UDP_DEFER_WARN.call_once(|| {
+                warn!(
+                    topology = ?self.topology,
+                    "FERRUM_MESH_CAPTURE_UDP_ENABLED is set but UDP egress is only supported on \
+                     the Ambient topology (datagram-over-HBONE over :15008). Sidecar UDP egress \
+                     is deferred (no :15008 HBONE listener), so the UDP capture listener is NOT \
+                     emitted on this topology — UDP egress passes through un-captured rather than \
+                     being captured and dropped. Disable the flag to silence this warning."
+                );
+            });
             return None;
         }
         // Bind the capture port on the DUAL-STACK IPv6 WILDCARD (`[::]`), not the
@@ -860,6 +912,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     // HBONE routes; Sidecar (SVID-mTLS) lands in a follow-up.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_tcp_upstreams(&mut config, runtime, mesh_slice);
+    materialize_mesh_outbound_udp_upstreams(&mut config, runtime, mesh_slice);
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
     project_mesh_source_locality(&mut config, runtime, mesh_slice);
     // Project slice-filtered ServiceEntries back into the prepared mesh
@@ -1948,16 +2001,13 @@ pub(crate) fn service_tcp_stream_ports(
 
 /// UDP service ports of an in-mesh service, with `protocol_overrides` applied:
 /// the third leg of the HTTP-family / raw-TCP-stream / UDP port partition.
-/// UDP capture/egress is not yet wired (REDIRECT / `SO_ORIGINAL_DST` does not
-/// apply to the UDP model), so this currently materializes nothing — it exists
-/// so a `protocol: UDP` port partitions cleanly out of the other two lanes
-/// instead of being mis-routed as HTTP, and so the later F3 §3.3 datapath stage
-/// has a single forward-derivation source. Mirrors [`service_http_family_ports`]
-/// and [`service_tcp_stream_ports`].
-// Inert in this schema-only stage: the UDP capture/egress materializer that
-// consumes this arrives in a later F3 §3.3 stage. Exercised today only by the
-// partition unit test.
-#[allow(dead_code)]
+/// Consumed by the Ambient UDP egress materializer
+/// (`materialize_mesh_outbound_udp_upstreams`, F3 §3.3 Stage 4) and the route
+/// table's `mesh_udp_egress` index — a captured UDP datagram whose orig-dst
+/// matches `(service VIP, UDP service port)` is tunnelled over a `udp`-marked
+/// HBONE CONNECT. Mirrors [`service_http_family_ports`] and
+/// [`service_tcp_stream_ports`]; the SINGLE forward-derivation source the
+/// materializer, the route table, and the capability enrollment share.
 pub(crate) fn service_udp_stream_ports(
     service: &crate::modes::mesh::config::MeshService,
 ) -> Vec<&crate::modes::mesh::config::ServicePort> {
@@ -2084,6 +2134,17 @@ fn mesh_outbound_upstream_id(namespace: &str, name: &str, port: u16) -> String {
 /// fan-out between its HTTP and TCP lanes. Same non-route prefix rationale.
 pub(crate) fn mesh_outbound_tcp_upstream_id(namespace: &str, name: &str, port: u16) -> String {
     format!("__mesh-out-tcp-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
+}
+
+/// Upstream id for a materialized UDP egress port, one per UDP service port
+/// (F3 §3.3 Stage 4). A DISTINCT id space from both
+/// [`mesh_outbound_upstream_id`] (HTTP per-port) and
+/// [`mesh_outbound_tcp_upstream_id`] (raw-TCP per-port) so a service exposing
+/// the same port number across the three lanes (via `protocol_overrides` skew)
+/// can never conflate LB counters / passive health / DR fan-out. Same non-route
+/// prefix rationale (never enters the route table or `config.proxies`).
+pub(crate) fn mesh_outbound_udp_upstream_id(namespace: &str, name: &str, port: u16) -> String {
+    format!("__mesh-out-udp-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
 
 /// Upstream id for a raw-TCP egress upstream addressed by a DIRECT pod IP
@@ -3308,6 +3369,118 @@ fn materialize_mesh_outbound_tcp_upstreams(
     }
 }
 
+/// Materialize per-port UDP egress upstreams for the UDP service ports of
+/// in-mesh services (F3 §3.3 Stage 4). **Ambient-only.**
+///
+/// Like raw-TCP egress, NO route proxy enters the config: a UDP datagram has no
+/// Host header to route by. Instead the captured datagram's original
+/// destination (recovered from the TPROXY `IP_RECVORIGDSTADDR` cmsg, NOT
+/// `SO_ORIGINAL_DST` which is TCP-only) is matched STRICTLY against
+/// `(cluster_ip, UDP service port)` by the route table's `mesh_udp_egress`
+/// index and tunnelled over a `udp`-marked HBONE CONNECT to the LB-selected
+/// workload's app port (length-delimited datagrams — see
+/// `crate::proxy::mesh_udp_frame`). The destination's inbound relay unframes the
+/// tunnel into a local `UdpSocket` to the CONNECT authority.
+///
+/// **Sidecar UDP egress is intentionally DEFERRED**: Sidecar peers expose no
+/// `:15008` HBONE listener (they speak plain SVID-mTLS HTTP on `:15006`), so a
+/// datagram tunnel there would need a `MeshMtlsConnectionPool` datagram variant.
+/// The materializer therefore gates `Ambient => Hbone, _ => return`; a non-Ambient
+/// topology materializes nothing and UDP stays outside the mesh (documented
+/// follow-up). Headless / VIP-less UDP services also materialize nothing (a UDP
+/// datagram carries no Host, so captured dials are matched strictly by VIP).
+fn materialize_mesh_outbound_udp_upstreams(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
+    // Ambient-only: HBONE datagram tunnel over `:15008`. Sidecar UDP egress is
+    // deferred (no `:15008`; needs a mesh-mTLS datagram tunnel).
+    let transport = match runtime.topology {
+        MeshTopology::Ambient => MeshEgressTransport::Hbone,
+        _ => return,
+    };
+    let multi_cluster = mesh_slice.multi_cluster.as_ref();
+    let now = chrono::Utc::now();
+    let mut materialized = 0usize;
+    for service in &mesh_slice.services {
+        let udp_ports = service_udp_stream_ports(service);
+        if udp_ports.is_empty() {
+            continue;
+        }
+        if service.cluster_ips.is_empty() {
+            warn!(
+                service = %service.name,
+                namespace = %service.namespace,
+                udp_ports = udp_ports.len(),
+                "In-mesh service declares UDP ports but carries no cluster_ips; UDP egress maps \
+                 captured original destinations to services strictly by service VIP (a datagram \
+                 has no Host header and a bare port number is ambiguous), so these ports cannot \
+                 be egress-routed. Headless services are expected here; otherwise populate \
+                 cluster_ips."
+            );
+            continue;
+        }
+        for service_port in &udp_ports {
+            let protocol = service
+                .protocol_overrides
+                .get(&service_port.port)
+                .copied()
+                .unwrap_or(service_port.protocol);
+            let targets = build_outbound_mesh_targets(
+                transport,
+                runtime,
+                service,
+                service_port,
+                protocol,
+                &mesh_slice.workloads,
+                multi_cluster,
+                false,
+            );
+            if targets.is_empty() {
+                debug!(
+                    service = %service.name,
+                    namespace = %service.namespace,
+                    service_port = service_port.port,
+                    "Skipping UDP mesh service port with no reachable local-cluster workload targets"
+                );
+                continue;
+            }
+            let upstream_id =
+                mesh_outbound_udp_upstream_id(&service.namespace, &service.name, service_port.port);
+            let service_fqdn = format!(
+                "{}.{}.svc.{}",
+                service.name,
+                service.namespace,
+                runtime.cluster_domain.trim_matches('.')
+            );
+            let upstream = mesh_outbound_route_upstream(
+                &upstream_id,
+                &service.namespace,
+                &service_fqdn,
+                targets,
+                now,
+            );
+            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+                *existing = upstream;
+            } else {
+                config.upstreams.push(upstream);
+            }
+            materialized += 1;
+        }
+    }
+
+    if materialized > 0 {
+        info!(
+            udp_upstreams = materialized,
+            topology = ?runtime.topology,
+            "Materialized mesh UDP egress upstreams for in-mesh services (datagrams tunnelled over \
+             a udp-marked HBONE CONNECT, selected by captured original destination against service \
+             VIPs)"
+        );
+    }
+}
+
 /// Reserved id prefix for the synthesized raw-TCP egress relay proxies. Like
 /// the upstream id, deliberately NOT under `__mesh-outbound-` so it can never
 /// be misclassified as a direction-scoped route id — these proxies never
@@ -3339,7 +3512,7 @@ pub(crate) fn mesh_outbound_tcp_relay_proxy(
 ) -> Proxy {
     let id = format!("{MESH_OUTBOUND_TCP_RELAY_PROXY_ID_PREFIX}{namespace}-{name}-{port}")
         .replace(['/', '.'], "-");
-    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id)
+    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id, BackendScheme::Tcp)
 }
 
 /// Build the synthesized relay proxy backing one DIRECT-pod-IP raw-TCP egress
@@ -3359,24 +3532,54 @@ pub(crate) fn mesh_outbound_tcp_bywl_relay_proxy(
         "{MESH_OUTBOUND_TCP_BYWL_RELAY_PROXY_ID_PREFIX}{namespace}-{name}-{port}-{canonical_ip}"
     )
     .replace(['/', '.', ':'], "-");
-    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id)
+    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id, BackendScheme::Tcp)
 }
 
-/// Shared body for the raw-TCP egress relay proxies (VIP and by-workload). The
-/// only fields that vary between the two are the `id` and the `upstream_id` it
-/// dispatches through — everything else (the `BackendScheme::Tcp` capability
-/// gate, the connect/read/write budgets, the stream idle default) is identical,
-/// so both relay flavors stay byte-for-byte consistent in the capability key /
-/// pool-config dimensions.
-fn mesh_outbound_tcp_relay_proxy_with_id(id: String, namespace: &str, upstream_id: &str) -> Proxy {
+/// Reserved id prefix for the synthesized UDP egress relay proxies (F3 §3.3
+/// Stage 4). Same non-route-prefix rationale as the raw-TCP relay proxies; a
+/// DISTINCT prefix so a TCP relay proxy and a UDP relay proxy for the same
+/// service port never collide in the capability registry / pool-config keys.
+pub(crate) const MESH_OUTBOUND_UDP_RELAY_PROXY_ID_PREFIX: &str = "__mesh-out-udp-relay-";
+
+/// Build the synthesized relay proxy backing one UDP egress entry (F3 §3.3
+/// Stage 4). Same deterministic shape and capability/pool-config contract as
+/// [`mesh_outbound_tcp_relay_proxy`] (shares the builder body), but uses
+/// `BackendScheme::Udp` — which the capability probe gate recognizes for HBONE
+/// probing (a UDP egress target still rides an HBONE CONNECT, so its HBONE
+/// support must be proven) while keeping the plain-HTTP/h2c probes off it. The
+/// id is forward-derived, never parsed.
+pub(crate) fn mesh_outbound_udp_relay_proxy(
+    namespace: &str,
+    name: &str,
+    port: u16,
+    upstream_id: &str,
+) -> Proxy {
+    let id = format!("{MESH_OUTBOUND_UDP_RELAY_PROXY_ID_PREFIX}{namespace}-{name}-{port}")
+        .replace(['/', '.'], "-");
+    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id, BackendScheme::Udp)
+}
+
+/// Shared body for the mesh egress relay proxies (raw-TCP VIP/by-workload and
+/// UDP). The fields that vary between flavors are the `id`, the `upstream_id` it
+/// dispatches through, and the `scheme` (`Tcp` for raw-TCP, `Udp` for UDP — both
+/// keep the plain-HTTP/h2c probes away from the app port while still letting the
+/// HBONE probe run); everything else (the connect/read/write budgets, the stream
+/// idle default) is identical, so the flavors stay byte-for-byte consistent in
+/// the capability key / pool-config dimensions.
+fn mesh_outbound_tcp_relay_proxy_with_id(
+    id: String,
+    namespace: &str,
+    upstream_id: &str,
+    scheme: BackendScheme,
+) -> Proxy {
     let now = chrono::Utc::now();
     Proxy {
-        name: Some(format!("mesh raw-tcp egress {id}")),
+        name: Some(format!("mesh egress {id}")),
         id,
         namespace: namespace.to_string(),
         hosts: Vec::new(),
         listen_path: None,
-        backend_scheme: Some(BackendScheme::Tcp),
+        backend_scheme: Some(scheme),
         dispatch_kind: Default::default(),
         backend_host: String::new(),
         backend_port: 0,
@@ -3767,7 +3970,11 @@ fn apply_destination_rules(
     // equals T leak onto this upstream — each sibling upstream must carry
     // exactly its own port's policy.
     // The raw-TCP per-port upstreams (`__mesh-out-tcp-upstream-*`) join the
-    // same map: identical owner-port semantics, distinct id space.
+    // same map: identical owner-port semantics, distinct id space. The Ambient
+    // UDP per-port upstreams (`__mesh-out-udp-upstream-*`, F3 §3.3 Stage 4) join
+    // too — a `portLevelSettings` entry on a UDP Service port (e.g. `port: 53,
+    // targetPort: 5353`) must map to its UDP upstream or its traffic policy is
+    // silently dropped (codex r3).
     let multi_cluster = mesh_slice.multi_cluster.as_ref();
     let mut outbound_upstream_owner_port: std::collections::HashMap<String, u16> = mesh_slice
         .services
@@ -3784,6 +3991,12 @@ fn apply_destination_rules(
                 .chain(service_tcp_stream_ports(svc).into_iter().map(|sp| {
                     (
                         mesh_outbound_tcp_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        sp.port,
+                    )
+                }))
+                .chain(service_udp_stream_ports(svc).into_iter().map(|sp| {
+                    (
+                        mesh_outbound_udp_upstream_id(&svc.namespace, &svc.name, sp.port),
                         sp.port,
                     )
                 }))
@@ -4129,6 +4342,34 @@ fn apply_destination_rules(
                 // recomputes overlays for the new subset set against the
                 // final upstream-level TLS.
                 upstream.resolved_subset_tls.clear();
+            }
+
+            // Top-level `trafficPolicy.connectTimeout` for a UDP egress upstream
+            // (codex r6 P2). The top-level timeout is applied to `config.proxies`
+            // below, but a UDP egress upstream (`__mesh-out-udp-upstream-*`) is
+            // referenced by NO config proxy — it materializes a synthesized relay
+            // proxy in the router table that dials via
+            // `hbone_pool::get_datagram_tunnel`, which reads the connect timeout
+            // from `dispatch_port_overrides` (projected from `port_overrides`) and
+            // otherwise falls back to the relay proxy's hardcoded default. Seed the
+            // top-level value onto each materialized target port carrying no
+            // per-port `portLevelSettings.connectTimeout`, so the UDP relay honors
+            // the operator's top-level connectTimeout instead of the 5s default.
+            // Per-port entries written above already win (only unset slots are
+            // seeded); other lanes are unaffected — raw-TCP relay proxies do not
+            // read `dispatch_port_overrides`, and HTTP upstreams reach config
+            // proxies. Keyed by the materialized TARGET port (`get_datagram_tunnel`
+            // looks the override up by the dialed app port, not the service port).
+            if let Some(timeout_ms) = connect_timeout_ms
+                && upstream.id.starts_with("__mesh-out-udp-upstream-")
+            {
+                let target_ports: Vec<u16> = upstream.targets.iter().map(|t| t.port).collect();
+                for port in target_ports {
+                    let slot = upstream.port_overrides.entry(port).or_default();
+                    if slot.connect_timeout_ms.is_none() {
+                        slot.connect_timeout_ms = Some(timeout_ms);
+                    }
+                }
             }
 
             // Per-subset `connectionPool.tcp.connectTimeout` overrides the DR
@@ -9706,6 +9947,8 @@ mod tests {
             "FERRUM_SHUTDOWN_DRAIN_SECONDS",
             "FERRUM_MESH_CA_BACKEND",
             "FERRUM_MESH_ALLOW_NO_CA",
+            "FERRUM_MESH_CAPTURE_UDP_ENABLED",
+            "FERRUM_MESH_CAPTURE_UDP_PORT",
         ];
 
         for key in keys {
@@ -11178,6 +11421,104 @@ mod tests {
     }
 
     #[test]
+    fn mesh_outbound_udp_upstreams_materialize_ambient_only() {
+        // UDP egress (F3 §3.3 Stage 4): Ambient materializes one per-port UDP
+        // upstream with `mesh.hbone`-tagged, identity-pinned targets dialing the
+        // resolved targetPort; NO route proxy (datagrams carry no Host). Distinct
+        // id space from the TCP/HTTP lanes.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let mut svc = http_mesh_service("dns", 53, spiffe);
+        svc.ports[0].protocol = AppProtocol::Udp;
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(5353));
+        svc.cluster_ips = vec!["10.96.0.10".to_string()];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+            services: vec![svc],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_udp_upstreams(&mut config, &ambient_runtime(), &slice);
+        assert!(
+            config.proxies.is_empty(),
+            "UDP egress materializes upstreams only, never route proxies"
+        );
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-udp-upstream-default-dns-53")
+            .expect("per-port UDP upstream");
+        assert_eq!(
+            upstream.name.as_deref(),
+            Some("dns.default.svc.cluster.local"),
+            "FQDN-named so DestinationRules match"
+        );
+        let target = &upstream.targets[0];
+        assert_eq!(target.host, "10.0.0.9");
+        assert_eq!(target.port, 5353, "targets dial the resolved targetPort");
+        assert_eq!(
+            target.tags.get("mesh.hbone").map(String::as_str),
+            Some("true"),
+            "UDP egress rides the HBONE transport"
+        );
+        assert_eq!(
+            target.tags.get("mesh.protocol").map(String::as_str),
+            Some("udp"),
+        );
+        assert_eq!(
+            target.tags.get("mesh.spiffe_id").map(String::as_str),
+            Some(spiffe),
+            "destination identity stays pinned"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_udp_upstreams_skip_for_sidecar() {
+        // Sidecar UDP egress is DEFERRED (no `:15008` HBONE listener) — the
+        // materializer gates Ambient-only, so a Sidecar topology materializes NO
+        // UDP upstream and UDP stays outside the mesh.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let mut svc = http_mesh_service("dns", 53, spiffe);
+        svc.ports[0].protocol = AppProtocol::Udp;
+        svc.cluster_ips = vec!["10.96.0.10".to_string()];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+            services: vec![svc],
+            ..MeshSlice::default()
+        };
+        let runtime = test_mesh_runtime_config();
+        assert_eq!(runtime.topology, MeshTopology::Sidecar);
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_udp_upstreams(&mut config, &runtime, &slice);
+        assert!(
+            config.upstreams.is_empty(),
+            "Sidecar UDP egress is deferred; no UDP upstream materializes"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_udp_upstreams_skip_vipless() {
+        // VIP-less (headless) UDP service: a datagram carries no Host and a bare
+        // port is ambiguous, so no `__mesh-out-udp-upstream-*` materializes.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let mut headless = http_mesh_service("dns", 53, spiffe);
+        headless.ports[0].protocol = AppProtocol::Udp;
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+            services: vec![headless],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_udp_upstreams(&mut config, &ambient_runtime(), &slice);
+        assert!(
+            config.upstreams.is_empty(),
+            "VIP-less UDP service is not egress-routable"
+        );
+    }
+
+    #[test]
     fn mesh_outbound_tcp_upstreams_skip_vipless_for_the_vip_path() {
         // VIP-less (headless) service: a raw stream carries no Host and a bare
         // port number is ambiguous, so the captured original destination cannot
@@ -11384,6 +11725,143 @@ mod tests {
         assert!(
             !upstream.port_overrides.contains_key(&6379),
             "per-port policy must not remain under the service port"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_udp_upstream_receives_port_level_dr() {
+        // DestinationRule portLevelSettings authored on a UDP SERVICE port
+        // (`port: 53, targetPort: 5353`) fan onto the targets' dial port via the
+        // shared owner-port map — the UDP per-port upstreams join that map
+        // alongside the HTTP/TCP ones (codex r3). Ambient-only: the UDP egress
+        // materializer stamps HBONE and only runs under Ambient topology.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let mut svc = http_mesh_service("dns", 53, spiffe);
+        svc.ports[0].protocol = AppProtocol::Udp;
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(5353));
+        svc.cluster_ips = vec!["10.96.0.10".to_string()];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+            services: vec![svc],
+            destination_rules: vec![MeshDestinationRule {
+                name: "dns".to_string(),
+                namespace: "default".to_string(),
+                host: "dns.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::from([(
+                    53u16,
+                    MeshTrafficPolicy {
+                        connect_timeout_ms: Some(4321),
+                        ..MeshTrafficPolicy::default()
+                    },
+                )]),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_udp_upstreams(&mut config, &ambient_runtime(), &slice);
+        apply_destination_rules(&mut config, &ambient_runtime(), &slice)
+            .expect("destination rules apply");
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-udp-upstream-default-dns-53")
+            .expect("UDP upstream");
+        assert_eq!(
+            upstream
+                .port_overrides
+                .get(&5353)
+                .and_then(|slot| slot.connect_timeout_ms),
+            Some(4321),
+            "UDP-port portLevelSettings must land on the dial port"
+        );
+        assert!(
+            !upstream.port_overrides.contains_key(&53),
+            "per-port policy must not remain under the service port"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_udp_upstream_receives_top_level_dr_connect_timeout() {
+        // A DestinationRule top-level `trafficPolicy.connectTimeout` (no
+        // portLevelSettings) must reach the UDP egress relay too (codex r6 P2).
+        // The top-level timeout is normally applied to `config.proxies`, but a UDP
+        // egress upstream is referenced by no config proxy; apply_destination_rules
+        // seeds it onto the materialized dial port's override so the synthesized
+        // relay proxy's `dispatch_port_overrides` (read by `get_datagram_tunnel`)
+        // honors it. Per-port settings still win on a port they configure.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let make_slice = |traffic_policy: Option<MeshTrafficPolicy>,
+                          port_level_settings: HashMap<u16, MeshTrafficPolicy>|
+         -> MeshSlice {
+            let mut svc = http_mesh_service("dns", 53, spiffe);
+            svc.ports[0].protocol = AppProtocol::Udp;
+            svc.ports[0].target_port = Some(ServiceTargetPort::Number(5353));
+            svc.cluster_ips = vec!["10.96.0.10".to_string()];
+            MeshSlice {
+                namespace: "default".to_string(),
+                workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+                services: vec![svc],
+                destination_rules: vec![MeshDestinationRule {
+                    name: "dns".to_string(),
+                    namespace: "default".to_string(),
+                    host: "dns.default.svc.cluster.local".to_string(),
+                    traffic_policy,
+                    port_level_settings,
+                    subsets: Vec::new(),
+                }],
+                ..MeshSlice::default()
+            }
+        };
+        let dial_timeout = |slice: &MeshSlice| -> Option<u64> {
+            let mut config = GatewayConfig::default();
+            materialize_mesh_outbound_udp_upstreams(&mut config, &ambient_runtime(), slice);
+            apply_destination_rules(&mut config, &ambient_runtime(), slice)
+                .expect("destination rules apply");
+            config
+                .upstreams
+                .iter()
+                .find(|u| u.id == "__mesh-out-udp-upstream-default-dns-53")
+                .expect("UDP upstream")
+                .port_overrides
+                .get(&5353)
+                .and_then(|slot| slot.connect_timeout_ms)
+        };
+
+        // Top-level only: seeded onto the dial port (5353), not the service port.
+        let top_level_only = make_slice(
+            Some(MeshTrafficPolicy {
+                connect_timeout_ms: Some(7777),
+                ..MeshTrafficPolicy::default()
+            }),
+            HashMap::new(),
+        );
+        assert_eq!(
+            dial_timeout(&top_level_only),
+            Some(7777),
+            "top-level connectTimeout must seed the UDP dial port"
+        );
+
+        // Per-port portLevelSettings WINS over the top-level on the same port.
+        let both = make_slice(
+            Some(MeshTrafficPolicy {
+                connect_timeout_ms: Some(7777),
+                ..MeshTrafficPolicy::default()
+            }),
+            HashMap::from([(
+                53u16,
+                MeshTrafficPolicy {
+                    connect_timeout_ms: Some(4321),
+                    ..MeshTrafficPolicy::default()
+                },
+            )]),
+        );
+        assert_eq!(
+            dial_timeout(&both),
+            Some(4321),
+            "per-port portLevelSettings must win over the top-level seed"
         );
     }
 
@@ -15935,6 +16413,73 @@ mod tests {
                         && listener.kind == MeshListenerKind::HboneTermination
                         && listener.addr.port() == 15008
                 }));
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_listener_plan_ambient_emits_udp_capture_when_enabled() {
+        // Ambient relays captured UDP (Stage 4 egress), so with the capture flag
+        // on it MUST emit the PlaintextUdpCapture listener (dual-stack `[::]`).
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "ambient"),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let plan = runtime.listener_plan();
+                assert!(
+                    plan.iter().any(|listener| {
+                        listener.kind == MeshListenerKind::PlaintextUdpCapture
+                            && listener.direction == MeshTrafficDirection::Outbound
+                    }),
+                    "Ambient must emit the UDP capture listener when capture is enabled"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_listener_plan_sidecar_omits_udp_capture_when_enabled() {
+        // Regression for codex r1 P2: Sidecar UDP egress is deferred (no
+        // `:15008`), so even with the capture flag on the Sidecar plan must NOT
+        // emit the PlaintextUdpCapture listener — capturing UDP it cannot relay
+        // would black-hole every datagram. Leaving it un-emitted lets UDP pass
+        // through un-captured.
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                // Sidecar is the default topology; set it explicitly for clarity.
+                ("FERRUM_MESH_TOPOLOGY", "sidecar"),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let plan = runtime.listener_plan();
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|listener| { listener.kind == MeshListenerKind::PlaintextUdpCapture }),
+                    "Sidecar must NOT emit the UDP capture listener (UDP egress deferred)"
+                );
+                // The standard Sidecar listeners are still present.
+                assert_eq!(plan.len(), 2);
             },
         );
     }
