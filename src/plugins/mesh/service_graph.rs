@@ -116,7 +116,7 @@ pub struct ServiceGraphRegistry {
 impl Default for ServiceGraphRegistry {
     fn default() -> Self {
         Self {
-            edges: DashMap::new(),
+            edges: DashMap::with_shard_amount(super::observability_shard_amount()),
             snapshot: ArcSwap::from_pointee(ServiceGraphSnapshot::default()),
             last_snapshot_unix_ms: AtomicU64::new(0),
             snapshot_worker_started: AtomicBool::new(false),
