@@ -202,6 +202,48 @@ impl RemoteEndpointSnapshot {
     }
 }
 
+/// Outcome of a [`RemoteEndpointStore::install`] call.
+///
+/// `install` returns more than a simple `bool` so the poll loop can tell a
+/// *live* poll (endpoints changed, or an unchanged-but-still-registered dedup
+/// whose `fetched_at` was refreshed) apart from a poll that landed after the
+/// cluster's generation was retired (removed / trust withdrawn). Only the first
+/// two are a genuinely successful poll worth recording in the success / age
+/// metrics; a [`RemoteInstallOutcome::Retired`] no-op must NOT mark the cluster
+/// freshly-polled, or `/metrics` would advertise a healthy remote cluster whose
+/// endpoints were intentionally dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteInstallOutcome {
+    /// Endpoints changed and were committed (the apply task was woken).
+    Installed,
+    /// Generation still matches but the endpoints were identical to what is
+    /// stored, so only the poll timestamp was refreshed (F2 dedup). Still a
+    /// successful live poll.
+    Deduped,
+    /// The task's cluster generation was retired mid-flight (the cluster was
+    /// removed or its trust was withdrawn): a true no-op. Nothing was installed
+    /// and the cluster is no longer live.
+    Retired,
+}
+
+impl RemoteInstallOutcome {
+    /// Whether endpoints were actually committed (used for "installed" logging
+    /// and revision/first-ready bookkeeping).
+    fn installed(self) -> bool {
+        matches!(self, RemoteInstallOutcome::Installed)
+    }
+
+    /// Whether this poll reflects a live, registered cluster — i.e. it should
+    /// refresh the success / last-success / endpoint-age metrics. A retired
+    /// generation is excluded.
+    fn is_live_poll(self) -> bool {
+        matches!(
+            self,
+            RemoteInstallOutcome::Installed | RemoteInstallOutcome::Deduped
+        )
+    }
+}
+
 /// Lock-free shared state populated by the discovery poller and consumed by the
 /// slice-apply path. Mirrors [`super::federation::FederationStore`].
 #[derive(Clone)]
@@ -308,17 +350,19 @@ impl RemoteEndpointStore {
     /// "no reconcile on unchanged endpoints" optimization without the
     /// steady-state per-poll deep-clone the previous in-`rcu` refresh incurred.
     ///
-    /// Returns `true` only when this call actually changed the endpoint set (a
-    /// real install), so callers can avoid logging "installed" on a deduped
-    /// (timestamp-only refresh) or retired-cluster no-op.
-    fn install(&self, entry: RemoteClusterEntry, task_generation: u64) -> bool {
+    /// Returns a [`RemoteInstallOutcome`] distinguishing a real install, a
+    /// dedup (timestamp-only refresh of a still-registered cluster), and a
+    /// retired-generation no-op (cluster removed / trust withdrawn). Callers use
+    /// this both to avoid logging "installed" on a no-op and to avoid recording
+    /// a successful-poll metric for a cluster whose endpoints were dropped.
+    fn install(&self, entry: RemoteClusterEntry, task_generation: u64) -> RemoteInstallOutcome {
         let name = entry.cluster_name.clone();
         // Fast-path generation check: bail out early if the task's cluster slot
         // was already retired, avoiding the swap for stale tasks. This is
         // re-validated below — it is only an optimization, not the authoritative
         // check.
         if !self.cluster_generation_matches(&name, task_generation) {
-            return false;
+            return RemoteInstallOutcome::Retired;
         }
         // No-op dedup: endpoints identical to what is stored. Refresh only the
         // poll timestamp (so `age_seconds` tracks polls) via the entry's shared
@@ -341,12 +385,18 @@ impl RemoteEndpointStore {
             if let Some(existing) = current.clusters.get(&name)
                 && existing.endpoints == entry.endpoints
             {
+                // Re-check the generation immediately before the timestamp
+                // refresh: if the cluster was retired between the fast-path
+                // check and here, this poll lands on an entry about to be
+                // dropped and is NOT a live refresh — report it as retired so
+                // the success metric is not bumped for a removed cluster.
                 if self.cluster_generation_matches(&name, task_generation) {
                     existing
                         .fetched_at
                         .store(entry.fetched_at_unix_seconds(), Ordering::Relaxed);
+                    return RemoteInstallOutcome::Deduped;
                 }
-                return false;
+                return RemoteInstallOutcome::Retired;
             }
         }
         // First sight or CHANGED endpoints: full install via a CAS loop so two
@@ -361,35 +411,37 @@ impl RemoteEndpointStore {
         // generation, and skips — never reintroducing endpoints for a removed
         // cluster. Without the in-closure recheck, a stale task could insert
         // after `remove` had already cleared the cluster (the F6 race, widened
-        // to the trust-withdrawal case). `installed` is computed fresh on every
+        // to the trust-withdrawal case). `outcome` is computed fresh on every
         // closure iteration so a CAS retry never carries a stale verdict.
-        let mut installed = false;
+        let mut outcome = RemoteInstallOutcome::Retired;
         self.inner.rcu(|current| {
-            installed = false;
             if !self.cluster_generation_matches(&name, task_generation) {
+                outcome = RemoteInstallOutcome::Retired;
                 return Arc::clone(current);
             }
             // Re-confirm the endpoints still differ: a concurrent poll for the
             // same cluster may have installed identical endpoints between our
             // pre-check above and this CAS attempt. If so, this is a no-op (the
-            // timestamp refresh raced ahead) — do not wake the apply task.
+            // timestamp refresh raced ahead) — do not wake the apply task, but
+            // it is still a live (deduped) poll since the generation matches.
             if current
                 .clusters
                 .get(&name)
                 .is_some_and(|existing| existing.endpoints == entry.endpoints)
             {
+                outcome = RemoteInstallOutcome::Deduped;
                 return Arc::clone(current);
             }
             let mut next = (**current).clone();
             next.clusters.insert(name.clone(), entry.clone());
-            installed = true;
+            outcome = RemoteInstallOutcome::Installed;
             Arc::new(next)
         });
-        if installed {
+        if outcome.installed() {
             self.first_ready.store(true, Ordering::Release);
             self.revision_tx.send_modify(|revision| *revision += 1);
         }
-        installed
+        outcome
     }
 
     /// Whether `task_generation` still matches the cluster's registered
@@ -819,6 +871,14 @@ impl RemoteDiscoveryManager {
             running.handle.abort();
             if remove_endpoints {
                 self.store.remove(cluster_name);
+                // Prune the success / last-success / endpoint-age series so a
+                // removed (or trust-withdrawn) cluster does not linger as a
+                // freshly-polled, endpoint-less entry on `/metrics`. Keyed by
+                // (cluster, trust_domain) to match the metric maps.
+                crate::plugins::mesh::prometheus_helpers::clear_mesh_remote_discovery_metrics(
+                    cluster_name,
+                    running.target.trust_domain.as_str(),
+                );
             }
         }
     }
@@ -1097,8 +1157,8 @@ async fn remote_discovery_loop(
                 let log_trust_domain = entry.trust_domain.clone();
                 let log_network = entry.network.clone();
                 let log_fetched_at = entry.fetched_at_unix_seconds();
-                let installed = store.install(entry, task_generation);
-                if installed {
+                let outcome = store.install(entry, task_generation);
+                if outcome.installed() {
                     info!(
                         cluster = %ctx.cluster_name,
                         trust_domain = %log_trust_domain,
@@ -1121,11 +1181,19 @@ async fn remote_discovery_loop(
                         "Remote-cluster poll succeeded with no endpoint change; not re-installing"
                     );
                 }
-                crate::plugins::mesh::prometheus_helpers::record_mesh_remote_discovery_poll_success(
-                    &ctx.cluster_name,
-                    ctx.trust_domain.as_str(),
-                    now,
-                );
+                // Only mark the cluster freshly-polled when the poll reflects a
+                // live, still-registered cluster. A retired-generation no-op
+                // (the cluster was removed / trust withdrawn while this poll was
+                // in flight) must not refresh the success / last-success /
+                // endpoint-age gauges, or `/metrics` would advertise a healthy
+                // remote cluster whose endpoints were intentionally dropped.
+                if outcome.is_live_poll() {
+                    crate::plugins::mesh::prometheus_helpers::record_mesh_remote_discovery_poll_success(
+                        &ctx.cluster_name,
+                        ctx.trust_domain.as_str(),
+                        now,
+                    );
+                }
                 backoff_secs = REMOTE_BACKOFF_INITIAL_SECS;
                 let elapsed = attempt_started_at.elapsed();
                 (true, ctx.config.poll_interval.saturating_sub(elapsed))
@@ -2247,6 +2315,76 @@ mod tests {
         manager.shutdown();
     }
 
+    /// codex finding: removing a cluster (trust withdrawal / reconcile drop)
+    /// must also prune its remote-discovery success / last-success / endpoint-age
+    /// metrics, not just its cached endpoints — otherwise a stale, endpoint-less
+    /// cluster keeps advertising a fresh poll on unauthenticated `/metrics`.
+    #[tokio::test]
+    async fn manager_clears_remote_discovery_metrics_on_removal() {
+        // Unique cluster/trust-domain so the shared global metric maps don't
+        // collide with other tests rendering the same output.
+        let suffix = format!("{}-{}", std::process::id(), line!());
+        let cluster = format!("metricclear-{suffix}");
+        let trust_domain_str = format!("td-{suffix}.example");
+        let trust_domain = td(&trust_domain_str);
+
+        let store = RemoteEndpointStore::new();
+        let config = RemoteDiscoveryConfig {
+            poll_interval: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(1),
+            jwt_secret: None,
+            node_id: "dp-1".to_string(),
+            namespace: "default".to_string(),
+            tls_config: RemoteDiscoveryTlsConfig::default(),
+        };
+        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |ctx| {
+            Arc::new(MissingSecretSource {
+                cluster_name: ctx.cluster_name.clone(),
+            })
+        });
+        let mc = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: cluster.clone(),
+                trust_domain: trust_domain.clone(),
+                network: None,
+                control_plane_url: Some("https://cp.remote.example:15010".to_string()),
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        let mut trusted = std::collections::HashSet::new();
+        trusted.insert(trust_domain.clone());
+
+        manager.reconcile(Some(&mc), trusted);
+        assert_eq!(manager.running_cluster_names(), vec![cluster.clone()]);
+
+        // Simulate a successful poll having recorded the cluster's metrics.
+        crate::plugins::mesh::prometheus_helpers::record_mesh_remote_discovery_poll_success(
+            &cluster,
+            &trust_domain_str,
+            1,
+        );
+        let mut before = String::new();
+        crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(&mut before);
+        assert!(
+            before.contains(&format!("cluster=\"{cluster}\"")),
+            "precondition: success metric should be present before removal: {before}"
+        );
+
+        // Withdraw trust → reconcile removes the cluster (stop_cluster with
+        // remove_endpoints = true), which must also clear the metric series.
+        manager.reconcile(Some(&mc), std::collections::HashSet::new());
+        assert!(manager.running_cluster_names().is_empty());
+
+        let mut after = String::new();
+        crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(&mut after);
+        assert!(
+            !after.contains(&format!("cluster=\"{cluster}\"")),
+            "removing a cluster must prune its remote-discovery metric series: {after}"
+        );
+        manager.shutdown();
+    }
+
     /// Codex F7.2 round-3: a target that keeps the same cluster name + trust
     /// domain but changes its poll identity (`network` AND `control_plane_url`)
     /// is a DIFFERENT poll target. `reconcile` must stop the old poller and
@@ -2640,9 +2778,10 @@ mod tests {
 
         // First poll at t=100 installs and bumps the revision.
         let gen1 = store.register_cluster("west");
-        assert!(
+        assert_eq!(
             store.install(entry_at(100), gen1),
-            "first install changes endpoints → returns true"
+            RemoteInstallOutcome::Installed,
+            "first install changes endpoints → Installed"
         );
         assert!(rx.has_changed().unwrap(), "first install bumps revision");
         rx.mark_unchanged();
@@ -2657,11 +2796,12 @@ mod tests {
 
         // Second poll at t=160: SAME endpoints, NEWER timestamp. Must refresh
         // the stored timestamp but NOT wake the apply task and NOT report a
-        // change.
+        // change. Still a live (deduped) poll, not a retired no-op.
         let gen2 = store.register_cluster("west");
-        assert!(
-            !store.install(entry_at(160), gen2),
-            "no-op poll (same endpoints) returns false even though it refreshed the timestamp"
+        assert_eq!(
+            store.install(entry_at(160), gen2),
+            RemoteInstallOutcome::Deduped,
+            "no-op poll (same endpoints) is Deduped even though it refreshed the timestamp"
         );
         assert!(
             !rx.has_changed().unwrap(),
@@ -2711,7 +2851,7 @@ mod tests {
         };
 
         let gen1 = store.register_cluster("west");
-        assert!(store.install(entry_at(100), gen1));
+        assert!(store.install(entry_at(100), gen1).installed());
 
         // Capture the live snapshot Arc and a handle to the shared atomic.
         let snapshot_before = store.snapshot();
@@ -2720,7 +2860,10 @@ mod tests {
 
         // No-op poll: identical endpoints, newer timestamp.
         let gen2 = store.register_cluster("west");
-        assert!(!store.install(entry_at(160), gen2));
+        assert_eq!(
+            store.install(entry_at(160), gen2),
+            RemoteInstallOutcome::Deduped
+        );
 
         // (1) The published snapshot Arc is unchanged → no clone+swap happened.
         let snapshot_after = store.snapshot();
@@ -2762,12 +2905,17 @@ mod tests {
         };
         // Install once, then retire the cluster.
         let stale_gen = store.register_cluster("west");
-        assert!(store.install(entry_at(100), stale_gen));
+        assert!(store.install(entry_at(100), stale_gen).installed());
         store.remove("west");
         assert!(store.snapshot().is_empty(), "remove clears the cluster");
         // The stale task's next (no-op) poll must be dropped, not refresh a
-        // resurrected entry.
-        assert!(!store.install(entry_at(160), stale_gen));
+        // resurrected entry, and must report Retired (NOT Deduped) so the
+        // success metric is not bumped for a removed cluster.
+        assert_eq!(
+            store.install(entry_at(160), stale_gen),
+            RemoteInstallOutcome::Retired,
+            "a no-op poll on a retired generation must report Retired, not Deduped"
+        );
         assert!(
             store.snapshot().is_empty(),
             "retired cluster must not be reinstated by a no-op timestamp refresh"
