@@ -19,8 +19,8 @@ use tracing::{debug, error, warn};
 use super::{
     ClientRequestBody, LoadBalancerConnectionGuard, ProxyBody, ProxyState, backend_dispatch,
     build_response, build_response_from_normalized_reject,
-    finalize_reject_response_with_after_proxy_hooks, log_rejected_request, record_request,
-    tcp_proxy,
+    finalize_reject_response_with_after_proxy_hooks, inbound_hbone_relay_destination_allowed,
+    log_rejected_request, record_request, tcp_proxy,
 };
 use crate::config::EnvConfig;
 use crate::config::env_config::OperatingMode;
@@ -843,6 +843,50 @@ pub(super) async fn handle_hbone_udp_request(
             reject.http_status.as_u16(),
             start_time,
             "hbone_udp_no_destination",
+            plugin_execution_ns,
+        )
+        .await;
+        record_request(state, reject.http_status.as_u16());
+        return build_response_from_normalized_reject(reject);
+    }
+
+    // Re-run the open-relay guard on the EFFECTIVE (post-override) destination
+    // (codex r6 P2). `build_inbound_hbone_relay_proxy` ran
+    // `inbound_hbone_relay_destination_allowed` on the ORIGINAL CONNECT authority
+    // when it synthesized the relay proxy, but a `before_proxy` route-override
+    // plugin (e.g. a global `mesh_route_dispatch` — the synthesized relay proxy
+    // has an unknown id, so it inherits the global plugin chain) can rewrite
+    // `app_host`/`app_port` above via `apply_route_overrides_with_upstreams` +
+    // `select_upstream_target`. Without re-checking, an authenticated peer could
+    // ride a route override to open a local `UdpSocket` to a host/port outside
+    // the loopback / slice-declared-workload allowlist. The un-overridden relay
+    // destination was already guarded at build time, so this is a no-op for it.
+    if !inbound_hbone_relay_destination_allowed(app_host, app_port, epoch.config.mesh.as_deref()) {
+        warn!(
+            proxy_id = %proxy.id,
+            app_host,
+            app_port,
+            "Rejected datagram-over-HBONE CONNECT whose effective destination is outside the open-relay guard"
+        );
+        ctx.metadata.insert(
+            "mesh_authz.deny_policy".to_string(),
+            "hbone_udp_relay_destination_denied".to_string(),
+        );
+        let reject = finalize_reject_response_with_after_proxy_hooks(
+            plugins,
+            ctx,
+            StatusCode::FORBIDDEN,
+            br#"{"error":"HBONE UDP relay destination not allowed"}"#,
+            HashMap::new(),
+            false,
+        )
+        .await;
+        log_rejected_request(
+            plugins,
+            ctx,
+            reject.http_status.as_u16(),
+            start_time,
+            "hbone_udp_relay_destination_denied",
             plugin_execution_ns,
         )
         .await;

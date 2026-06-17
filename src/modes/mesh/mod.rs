@@ -4344,6 +4344,34 @@ fn apply_destination_rules(
                 upstream.resolved_subset_tls.clear();
             }
 
+            // Top-level `trafficPolicy.connectTimeout` for a UDP egress upstream
+            // (codex r6 P2). The top-level timeout is applied to `config.proxies`
+            // below, but a UDP egress upstream (`__mesh-out-udp-upstream-*`) is
+            // referenced by NO config proxy — it materializes a synthesized relay
+            // proxy in the router table that dials via
+            // `hbone_pool::get_datagram_tunnel`, which reads the connect timeout
+            // from `dispatch_port_overrides` (projected from `port_overrides`) and
+            // otherwise falls back to the relay proxy's hardcoded default. Seed the
+            // top-level value onto each materialized target port carrying no
+            // per-port `portLevelSettings.connectTimeout`, so the UDP relay honors
+            // the operator's top-level connectTimeout instead of the 5s default.
+            // Per-port entries written above already win (only unset slots are
+            // seeded); other lanes are unaffected — raw-TCP relay proxies do not
+            // read `dispatch_port_overrides`, and HTTP upstreams reach config
+            // proxies. Keyed by the materialized TARGET port (`get_datagram_tunnel`
+            // looks the override up by the dialed app port, not the service port).
+            if let Some(timeout_ms) = connect_timeout_ms
+                && upstream.id.starts_with("__mesh-out-udp-upstream-")
+            {
+                let target_ports: Vec<u16> = upstream.targets.iter().map(|t| t.port).collect();
+                for port in target_ports {
+                    let slot = upstream.port_overrides.entry(port).or_default();
+                    if slot.connect_timeout_ms.is_none() {
+                        slot.connect_timeout_ms = Some(timeout_ms);
+                    }
+                }
+            }
+
             // Per-subset `connectionPool.tcp.connectTimeout` overrides the DR
             // top-level connectTimeout for proxies bound to that subset (Istio:
             // a subset trafficPolicy field-overrides the DR top-level for that
@@ -11752,6 +11780,88 @@ mod tests {
         assert!(
             !upstream.port_overrides.contains_key(&53),
             "per-port policy must not remain under the service port"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_udp_upstream_receives_top_level_dr_connect_timeout() {
+        // A DestinationRule top-level `trafficPolicy.connectTimeout` (no
+        // portLevelSettings) must reach the UDP egress relay too (codex r6 P2).
+        // The top-level timeout is normally applied to `config.proxies`, but a UDP
+        // egress upstream is referenced by no config proxy; apply_destination_rules
+        // seeds it onto the materialized dial port's override so the synthesized
+        // relay proxy's `dispatch_port_overrides` (read by `get_datagram_tunnel`)
+        // honors it. Per-port settings still win on a port they configure.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let make_slice = |traffic_policy: Option<MeshTrafficPolicy>,
+                          port_level_settings: HashMap<u16, MeshTrafficPolicy>|
+         -> MeshSlice {
+            let mut svc = http_mesh_service("dns", 53, spiffe);
+            svc.ports[0].protocol = AppProtocol::Udp;
+            svc.ports[0].target_port = Some(ServiceTargetPort::Number(5353));
+            svc.cluster_ips = vec!["10.96.0.10".to_string()];
+            MeshSlice {
+                namespace: "default".to_string(),
+                workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+                services: vec![svc],
+                destination_rules: vec![MeshDestinationRule {
+                    name: "dns".to_string(),
+                    namespace: "default".to_string(),
+                    host: "dns.default.svc.cluster.local".to_string(),
+                    traffic_policy,
+                    port_level_settings,
+                    subsets: Vec::new(),
+                }],
+                ..MeshSlice::default()
+            }
+        };
+        let dial_timeout = |slice: &MeshSlice| -> Option<u64> {
+            let mut config = GatewayConfig::default();
+            materialize_mesh_outbound_udp_upstreams(&mut config, &ambient_runtime(), slice);
+            apply_destination_rules(&mut config, &ambient_runtime(), slice)
+                .expect("destination rules apply");
+            config
+                .upstreams
+                .iter()
+                .find(|u| u.id == "__mesh-out-udp-upstream-default-dns-53")
+                .expect("UDP upstream")
+                .port_overrides
+                .get(&5353)
+                .and_then(|slot| slot.connect_timeout_ms)
+        };
+
+        // Top-level only: seeded onto the dial port (5353), not the service port.
+        let top_level_only = make_slice(
+            Some(MeshTrafficPolicy {
+                connect_timeout_ms: Some(7777),
+                ..MeshTrafficPolicy::default()
+            }),
+            HashMap::new(),
+        );
+        assert_eq!(
+            dial_timeout(&top_level_only),
+            Some(7777),
+            "top-level connectTimeout must seed the UDP dial port"
+        );
+
+        // Per-port portLevelSettings WINS over the top-level on the same port.
+        let both = make_slice(
+            Some(MeshTrafficPolicy {
+                connect_timeout_ms: Some(7777),
+                ..MeshTrafficPolicy::default()
+            }),
+            HashMap::from([(
+                53u16,
+                MeshTrafficPolicy {
+                    connect_timeout_ms: Some(4321),
+                    ..MeshTrafficPolicy::default()
+                },
+            )]),
+        );
+        assert_eq!(
+            dial_timeout(&both),
+            Some(4321),
+            "per-port portLevelSettings must win over the top-level seed"
         );
     }
 
