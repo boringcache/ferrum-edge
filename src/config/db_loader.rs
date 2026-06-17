@@ -1468,11 +1468,12 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         upstream_id: &str,
     ) -> Result<(), anyhow::Error> {
-        let upstream_row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT namespace, api_spec_id FROM upstreams WHERE id = ? LIMIT 1"))
-                .bind(upstream_id)
-                .fetch_optional(&mut **tx)
-                .await?;
+        let upstream_row: Option<AnyRow> = sqlx::query(
+            &self.q("SELECT namespace, api_spec_id FROM upstreams WHERE id = ? LIMIT 1"),
+        )
+        .bind(upstream_id)
+        .fetch_optional(&mut **tx)
+        .await?;
         let Some(upstream_row) = upstream_row else {
             return Ok(());
         };
