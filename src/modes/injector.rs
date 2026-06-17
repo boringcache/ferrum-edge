@@ -1072,6 +1072,22 @@ const fn sidecar_udp_capture_supported() -> bool {
     true
 }
 
+/// Whether an injected Sidecar should ACTUALLY receive the pod-side UDP capture
+/// surfaces (init TPROXY rules + runtime-enable env + `NET_ADMIN`). Beyond the
+/// operator's `udp_capture_enabled` flag and the central
+/// [`sidecar_udp_capture_supported`] switch, this REQUIRES `CaptureMode::Iptables`
+/// (codex r1): the UDP TPROXY producer is the iptables init container, which
+/// `build_sidecar_patch_for_namespace` only adds in `CaptureMode::Iptables`; the
+/// eBPF path is TCP-only with no UDP producer, and `Explicit` mode installs no
+/// init container at all. In those modes, enabling the flag would bind a
+/// transparent UDP listener with NOTHING feeding it (UDP never captured/relayed
+/// despite the opt-in), so gate the three surfaces on the iptables producer.
+fn sidecar_udp_capture_active(config: &InjectorConfig) -> bool {
+    config.udp_capture_enabled
+        && sidecar_udp_capture_supported()
+        && config.capture_mode == CaptureMode::Iptables
+}
+
 fn sidecar_env(config: &InjectorConfig, pod: &Value, namespace: &str) -> Vec<Value> {
     let mut env = vec![
         json!({"name": "FERRUM_MODE", "value": "mesh"}),
@@ -1087,7 +1103,7 @@ fn sidecar_env(config: &InjectorConfig, pod: &Value, namespace: &str) -> Vec<Val
     // the same `sidecar_udp_capture_supported()` switch the rule emission uses so
     // the three pod-side surfaces stay consistent; all gated behind the operator's
     // `udp_capture_enabled` flag (default-off).
-    if config.udp_capture_enabled && sidecar_udp_capture_supported() {
+    if sidecar_udp_capture_active(config) {
         env.push(json!({"name": "FERRUM_MESH_CAPTURE_UDP_ENABLED", "value": "true"}));
         env.push(json!({
             "name": "FERRUM_MESH_CAPTURE_UDP_PORT",
@@ -1128,7 +1144,7 @@ fn sidecar_container(config: &InjectorConfig, pod: &Value, namespace: &str) -> V
     // same `sidecar_udp_capture_supported()` switch as the listener + rules so the
     // capability appears together with them; otherwise keep the drop-ALL,
     // zero-capability posture.
-    let capabilities = if config.udp_capture_enabled && sidecar_udp_capture_supported() {
+    let capabilities = if sidecar_udp_capture_active(config) {
         json!({"drop": ["ALL"], "add": ["NET_ADMIN"]})
     } else {
         json!({"drop": ["ALL"]})
@@ -1229,7 +1245,7 @@ fn capture_config(config: &InjectorConfig, pod: &Value) -> Result<CaptureConfig,
     // datagram over a mesh-mTLS CONNECT. Routed through the same
     // `sidecar_udp_capture_supported()` switch as the runtime-enable env and the
     // transparent-bind capability so the three pod-side surfaces stay consistent.
-    capture.udp_capture_enabled = config.udp_capture_enabled && sidecar_udp_capture_supported();
+    capture.udp_capture_enabled = sidecar_udp_capture_active(config);
     capture.udp_outbound_port = config.udp_outbound_port;
     capture.tproxy_mark = config.tproxy_mark;
 

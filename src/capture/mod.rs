@@ -1199,17 +1199,22 @@ fn udp_tproxy_commands_for_family(
         .map(|sel| format!("{sel} {outbound_dst_scope} {mark_jump}"))
         .collect();
 
-    // The inbound catch-all is itself an unqualified `-j TPROXY` diversion, so it
-    // is suppressed for a cross-family-unselected family too (codex r5 finding #2)
-    // — capturing nothing inbound for the unselected family rather than diverting
-    // all its inbound UDP into the marked routing void.
-    let emit_inbound_catch_all = !suppress_catch_all;
+    // INBOUND UDP capture is DISABLED (codex r1, #1808). The capture listener +
+    // egress datapath relay ONLY outbound (pod→mesh) UDP: `handle_captured_datagram`
+    // resolves outbound `mesh_udp_egress` entries by service VIP and DROPS anything
+    // non-routable. The inbound catch-all (`--dst-type LOCAL`) would divert UDP
+    // destined for the pod's OWN app IP into that egress-only listener, black-holing
+    // inbound UDP for UDP-serving pods. So emit NO inbound chain/jump/rules until an
+    // inbound UDP relay exists; teardown still reaps any prior inbound chain. (The
+    // cross-family `suppress_catch_all` logic now governs only the OUTBOUND catch-all
+    // above; inbound is off regardless of family selection.)
+    let emit_inbound = false;
 
     // If this family emits NO TPROXY rule at all (e.g. a pure-CIDR cross-family
     // skip with no port includes), produce NO UDP state for it — no chains, no
     // PREROUTING jumps, no routing — preserving the original cross-family behavior
     // (codex r4) while letting port includes survive (codex r5).
-    if outbound_tproxy_rules.is_empty() && !emit_inbound_catch_all {
+    if outbound_tproxy_rules.is_empty() && !emit_inbound {
         return Vec::new();
     }
 
@@ -1235,7 +1240,6 @@ fn udp_tproxy_commands_for_family(
     let mut commands = vec![
         "command -v ip >/dev/null 2>&1 || { echo \"iproute2 (ip) is required for UDP TPROXY transparent routing\" >&2; exit 1; }"
             .to_string(),
-        idempotent_new_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"),
         idempotent_new_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTBOUND"),
         // OUTPUT MARK chain (codex r6): captures the pod's OWN locally-generated
         // UDP egress, which never traverses PREROUTING (Linux routes locally-
@@ -1254,7 +1258,6 @@ fn udp_tproxy_commands_for_family(
         // reaps it by name (mark-independent), exactly like the OUTBOUND/INBOUND
         // chains and the priority-keyed fwmark `ip rule`.
         idempotent_new_chain(binary, "mangle", "FERRUM_MESH_UDP_REINJECT"),
-        flush_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"),
         flush_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTBOUND"),
         flush_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTPUT_MARK"),
         flush_chain(binary, "mangle", "FERRUM_MESH_UDP_REINJECT"),
@@ -1361,23 +1364,33 @@ fn udp_tproxy_commands_for_family(
         ));
     }
 
-    // Inbound exclusions before the catch-all TPROXY (RETURN must precede it,
-    // mirroring the TCP inbound chain).
-    for port in &config.exclude_inbound_ports {
-        commands.push(idempotent_append(
+    // Inbound UDP chain — created, flushed, populated, and (below) jumped from
+    // PREROUTING ONLY when `emit_inbound` is set, which is currently never (#1808
+    // relays outbound only; see `emit_inbound`). Co-located here so all inbound
+    // wiring lives behind one gate. Teardown reaps the chain UNCONDITIONALLY so a
+    // pod upgraded from a prior version that DID install it is cleaned up.
+    if emit_inbound {
+        commands.push(idempotent_new_chain(
             binary,
             "mangle",
             "FERRUM_MESH_UDP_INBOUND",
-            &format!("-p udp --dport {port} -j RETURN"),
         ));
-    }
-    // Inbound catch-all is scoped to a LOCAL destination (the pod's own IP) so it
-    // captures ONLY genuinely-inbound UDP — never pod egress that fell through the
-    // OUTBOUND chain (e.g. an excluded-CIDR RETURN). This is the complement of the
-    // OUTBOUND chain's `! --dst-type LOCAL` and is how the two PREROUTING chains
-    // stay direction-disjoint without knowing the pod IP (codex r2). Suppressed
-    // for a cross-family-unselected family (codex r5 finding #2).
-    if emit_inbound_catch_all {
+        commands.push(flush_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"));
+        // Inbound exclusions before the catch-all TPROXY (RETURN must precede it,
+        // mirroring the TCP inbound chain).
+        for port in &config.exclude_inbound_ports {
+            commands.push(idempotent_append(
+                binary,
+                "mangle",
+                "FERRUM_MESH_UDP_INBOUND",
+                &format!("-p udp --dport {port} -j RETURN"),
+            ));
+        }
+        // Inbound catch-all scoped to a LOCAL destination (the pod's own IP) so it
+        // captures ONLY genuinely-inbound UDP — never pod egress that fell through
+        // the OUTBOUND chain. The complement of the OUTBOUND chain's
+        // `! --dst-type LOCAL`, keeping the two PREROUTING chains direction-disjoint
+        // without knowing the pod IP (codex r2).
         commands.push(idempotent_append(
             binary,
             "mangle",
@@ -1484,12 +1497,17 @@ fn udp_tproxy_commands_for_family(
         "PREROUTING",
         "-p udp -j FERRUM_MESH_UDP_OUTBOUND",
     ));
-    commands.push(idempotent_append(
-        binary,
-        "mangle",
-        "PREROUTING",
-        "-p udp -j FERRUM_MESH_UDP_INBOUND",
-    ));
+    // The INBOUND jump is emitted ONLY when `emit_inbound` is set (currently never
+    // — #1808 relays outbound only). Without it, inbound-to-pod UDP is never
+    // diverted into the egress-only listener and flows normally to the pod's app.
+    if emit_inbound {
+        commands.push(idempotent_append(
+            binary,
+            "mangle",
+            "PREROUTING",
+            "-p udp -j FERRUM_MESH_UDP_INBOUND",
+        ));
+    }
     // (3) The OUTPUT jump into the MARK-only chain (codex r6). This is the path for
     // the pod's OWN locally-generated UDP egress (OUTPUT -> POSTROUTING never hits
     // PREROUTING). The chain MARKs (does NOT TPROXY — TPROXY is invalid in OUTPUT
