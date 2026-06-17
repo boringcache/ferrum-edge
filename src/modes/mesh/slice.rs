@@ -597,6 +597,28 @@ impl MeshSlice {
         } else {
             request.labels.clone()
         };
+        // Candidate-any projection input for selector-scoped resources. When the
+        // labels are INFERRED from an ambiguous shared-SPIFFE match, keep a
+        // resource if it applies to ANY candidate workload (a superset), not
+        // just the (possibly empty) label intersection: the per-pod NodeWaypoint
+        // consumer re-filters against each pod's real labels, and the xDS DP
+        // re-filters against its local `FERRUM_MESH_WORKLOAD_LABELS` after
+        // reverse translation, so narrowing to the intersection here would drop
+        // selector AuthorizationPolicies / PeerAuthentications / RequestAuthen-
+        // tications those consumers still need and fail open. With concrete
+        // `request.labels` there is exactly one precise set. (The mesh_authz
+        // plugin tolerates the resulting superset at construction — see
+        // `validate_scope_filter_identity` — and its cold-path `retain` does the
+        // precise per-proxy narrowing.)
+        let policy_candidate_labels: Vec<&BTreeMap<String, String>> = if request.labels.is_empty() {
+            if candidate_label_sets.is_empty() {
+                vec![&effective_labels]
+            } else {
+                candidate_label_sets.iter().collect()
+            }
+        } else {
+            vec![&effective_labels]
+        };
         // Resolve the effective applicable Sidecar egress scope for this
         // workload. The returned scope is used downstream to narrow `services`,
         // `service_entries`, and `destination_rules`. Returns `None` when no
@@ -801,11 +823,9 @@ impl MeshSlice {
             .mesh_policies
             .iter()
             .filter(|policy| {
-                // `mesh_authz` validates and pre-filters against the slice's
-                // effective labels. Keep this CP-side projection on the same
-                // predicate so ambiguous shared-SPIFFE candidates cannot admit
-                // selector policies the DP later cannot construct deterministically.
-                policy_scope_applies_to_workload(policy, effective_namespace, &effective_labels)
+                policy_candidate_labels.iter().any(|labels| {
+                    policy_scope_applies_to_workload(policy, effective_namespace, *labels)
+                })
             })
             .cloned()
             .collect();
@@ -813,7 +833,9 @@ impl MeshSlice {
             .peer_authentications
             .iter()
             .filter(|peer_auth| {
-                peer_auth_applies_to_workload(peer_auth, effective_namespace, &effective_labels)
+                policy_candidate_labels.iter().any(|labels| {
+                    peer_auth_applies_to_workload(peer_auth, effective_namespace, *labels)
+                })
             })
             .cloned()
             .collect();
@@ -834,14 +856,20 @@ impl MeshSlice {
             .request_authentications
             .iter()
             .filter(|ra| {
-                scope_applies_to_workload(&ra.scope, effective_namespace, &effective_labels)
+                policy_candidate_labels.iter().any(|labels| {
+                    scope_applies_to_workload(&ra.scope, effective_namespace, *labels)
+                })
             })
             .cloned()
             .collect();
         let telemetry_resources: Vec<MeshTelemetryResource> = mesh
             .telemetry_resources
             .iter()
-            .filter(|t| scope_applies_to_workload(&t.scope, effective_namespace, &effective_labels))
+            .filter(|t| {
+                policy_candidate_labels
+                    .iter()
+                    .any(|labels| scope_applies_to_workload(&t.scope, effective_namespace, *labels))
+            })
             .cloned()
             .collect();
         let destination_rules: Vec<MeshDestinationRule> = mesh
@@ -3450,7 +3478,7 @@ mod tests {
     }
 
     #[test]
-    fn inferred_labels_filter_selector_scoped_single_winner_resources_by_intersection() {
+    fn inferred_labels_keep_candidate_matching_selector_resources_as_superset() {
         let workload_a = make_workload(
             "alpha",
             "shared",
@@ -3521,14 +3549,37 @@ mod tests {
         assert_eq!(
             slice.labels,
             BTreeMap::from([("app".into(), "shared".into())]),
-            "only labels common to every matching workload should be authoritative"
+            "only labels common to every matching workload should be authoritative for slice.labels"
         );
-        assert_eq!(slice.peer_authentications.len(), 1);
-        assert_eq!(slice.peer_authentications[0].name, "pa-alpha");
-        assert_eq!(slice.request_authentications.len(), 1);
-        assert_eq!(slice.request_authentications[0].name, "ra-alpha");
-        assert_eq!(slice.telemetry_resources.len(), 1);
-        assert_eq!(slice.telemetry_resources[0].name, "tel-alpha");
+        // Candidate-any superset: the `role=api` selector resources match the
+        // `api` candidate workload, so they are kept for the per-pod NodeWaypoint
+        // and xDS DP-local-label consumers to re-filter — even though
+        // slice.labels carries only the shared intersection. Narrowing them out
+        // here would fail open for those consumers (codex P1s).
+        assert_eq!(slice.peer_authentications.len(), 2);
+        assert!(
+            slice
+                .peer_authentications
+                .iter()
+                .any(|p| p.name == "pa-role-api"),
+            "candidate-matching selector PeerAuthentication kept as superset"
+        );
+        assert_eq!(slice.request_authentications.len(), 2);
+        assert!(
+            slice
+                .request_authentications
+                .iter()
+                .any(|r| r.name == "ra-role-api"),
+            "candidate-matching selector RequestAuthentication kept as superset"
+        );
+        assert_eq!(slice.telemetry_resources.len(), 2);
+        assert!(
+            slice
+                .telemetry_resources
+                .iter()
+                .any(|t| t.name == "tel-role-api"),
+            "candidate-matching selector Telemetry kept as superset"
+        );
     }
 
     #[test]
@@ -3663,7 +3714,7 @@ mod tests {
     }
 
     #[test]
-    fn from_gateway_config_excludes_candidate_only_selector_policies_for_ambiguous_spiffe_id() {
+    fn from_gateway_config_includes_selector_policies_for_ambiguous_spiffe_id() {
         let td = td();
         let spiffe_id = SpiffeId::from_parts(&td, "ns/alpha/sa/shared").unwrap();
         let mut web = make_workload(
@@ -3708,10 +3759,12 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, request);
 
         assert!(slice.labels.is_empty());
-        assert!(
-            slice.mesh_policies.is_empty(),
-            "candidate-specific selector policies must not be included when the effective shared-SPIFFE labels are empty"
+        assert_eq!(
+            slice.mesh_policies.len(),
+            1,
+            "a selector policy matching any shared-SPIFFE candidate is kept (superset) for per-pod / DP-local re-filtering even when the label intersection is empty"
         );
+        assert_eq!(slice.mesh_policies[0].name, "web-selector-policy");
     }
 
     #[test]
@@ -3785,7 +3838,11 @@ mod tests {
         assert_eq!(slice.labels.get("app"), Some(&"web".to_string()));
         assert_eq!(slice.labels.get("version"), Some(&"v1".to_string()));
         assert!(!slice.labels.contains_key("pod-template-hash"));
-        assert_eq!(slice.mesh_policies.len(), 1);
+        // slice.labels carries only the common intersection, but BOTH selector
+        // policies are kept (candidate-any superset): the per-pod / DP-local
+        // consumers re-filter, so a replica-specific policy must survive for the
+        // replica it targets rather than being dropped CP-side (codex P1).
+        assert_eq!(slice.mesh_policies.len(), 2);
         assert!(
             slice
                 .mesh_policies
@@ -3793,11 +3850,11 @@ mod tests {
                 .any(|policy| policy.name == "common-selector-policy")
         );
         assert!(
-            !slice
+            slice
                 .mesh_policies
                 .iter()
                 .any(|policy| policy.name == "replica-specific-policy"),
-            "candidate-only selector policies must not be included when they do not match effective shared-SPIFFE labels"
+            "candidate-matching selector policy kept as superset for per-pod / DP-local re-filtering"
         );
     }
 

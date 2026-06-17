@@ -837,13 +837,15 @@ async fn allow_then_deny_for_different_principal_lets_target_through() {
 }
 
 #[test]
-fn mesh_authz_construction_fails_when_selector_labels_set_but_workload_labels_missing() {
-    // The plugin's construction-time scope filter requires workload
-    // identity context. If a policy with a label-based selector is
-    // injected but the slice carries no labels for this workload, the
-    // plugin construction must error out — production catches the
-    // misconfiguration at startup, not silently degrades into an
-    // implicit-deny death-spiral.
+fn mesh_authz_construction_tolerates_selector_labels_without_proxy_labels() {
+    // Ambiguous shared-SPIFFE identity: the slice can carry a label-based
+    // selector policy as a candidate-any superset (so per-pod NodeWaypoint and
+    // xDS DP-local-label consumers can re-filter it) while resolving no proxy
+    // labels — the candidate label intersection was empty. Construction must NOT
+    // error on this (a hard error would reject the whole slice or drop authz
+    // entirely — issue #1708); it warns and the load-bearing cold-path `retain`
+    // drops the un-evaluable policy from enforcement (covered behaviorally by
+    // `mesh_authz_construction_filters_policies_for_workload_at_build_time`).
     let policy = policy_allow_principal(
         "labels-required",
         DEFAULT_NAMESPACE,
@@ -856,21 +858,16 @@ fn mesh_authz_construction_fails_when_selector_labels_set_but_workload_labels_mi
         CLIENT_SPIFFE,
     );
     // Bypass the prepare path so we feed mesh_policies directly into
-    // MeshAuthz::new — the construction-time validator must catch the
-    // missing-labels condition without help from the upstream prepare
-    // pipeline.
+    // MeshAuthz::new — exercising the construction-time validator without help
+    // from the upstream prepare pipeline.
     let config = json!({
         "mesh_policies": [policy],
         "namespace": DEFAULT_NAMESPACE,
         // labels: intentionally omitted
     });
-    let err = match MeshAuthz::new(&config) {
-        Err(e) => e,
-        Ok(_) => panic!("expected construction error"),
-    };
     assert!(
-        err.contains("no proxy labels are configured"),
-        "construction error should mention missing proxy labels, got {err:?}"
+        MeshAuthz::new(&config).is_ok(),
+        "construction must tolerate an unevaluable ambiguous selector policy, not error"
     );
 }
 
