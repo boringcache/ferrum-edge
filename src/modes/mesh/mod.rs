@@ -7527,6 +7527,14 @@ fn start_mesh_inbound_svid_rotation_republisher(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Republish once up front. A file/CA rotation can bump
+        // `backend_svid_rotation_tx` after this receiver was subscribed but
+        // before this task runs; the watch channel coalesces that into the
+        // baseline read below, so without an initial publish the inbound
+        // verifier could keep serving the OLD roots until the NEXT rotation or
+        // slice apply. Republishing the current bundle is idempotent, so doing
+        // it unconditionally here is safe and closes the subscribe→run race.
+        publish_runtime_svid_to_inbound_slot(&proxy_state, &inbound_slot, &trust_overlay_slot);
         let mut observed_revision = *revision_rx.borrow();
         loop {
             tokio::select! {
