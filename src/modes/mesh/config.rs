@@ -101,6 +101,21 @@ pub struct Workload {
     /// labels are scoped independently instead of collapsed to one merged scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_uid: Option<String>,
+    /// Runtime-only RESERVED remote-cluster provenance marker: `true` iff this
+    /// workload was ingested from a REMOTE cluster's discovery slice. Set by
+    /// [`crate::modes::mesh::multicluster::tag_remote_workloads`] at the DP-side
+    /// remote-poll ingestion point (which KNOWS the source is the remote slice),
+    /// NOT inferred from `cluster` name equality — an Istio WorkloadEntry
+    /// translation can stamp a `cluster` that doesn't equal the configured
+    /// `RemoteCluster.name`, which would leave a genuinely-remote endpoint
+    /// classified LOCAL. The service discoverer copies this provenance into the
+    /// un-spoofable `mesh.remote=true` target tag that strict local-first locality
+    /// LB keys on. `#[serde(skip)]` (NOT `serde(default)` with skip-if): it is a
+    /// DP-local ingestion artifact and must NEVER ride a wire/file payload — a
+    /// remote CP or operator file could otherwise forge it; the marker is only
+    /// ever set locally, after `fetch()`, by the remote-poll loop.
+    #[serde(skip)]
+    pub remote_provenance: bool,
 }
 
 /// A port advertised by a workload.
@@ -1752,15 +1767,13 @@ pub struct MeshTrafficPolicy {
     /// Optional `DestinationRule.trafficPolicy.connectionPool.http` block.
     /// When present, the K8s translator has parsed at least one of the
     /// supported HTTP connection-pool knobs (`maxRequestsPerConnection`,
-    /// `idleTimeout`, `http2MaxRequests`, `h2UpgradePolicy`, `maxRetries`);
-    /// the mesh apply layer projects these onto the matching upstream's
-    /// `port_overrides[port]` slot (top-level fan-out applies to every
-    /// target port; per-port `portLevelSettings` overrides per-port). Old
-    /// DPs reading new slices see this as a no-op via the serde default.
-    /// The only currently-deferred Istio HTTP knob,
-    /// `http1MaxPendingRequests`, is intentionally absent — the K8s
-    /// translator emits a warning when an operator sets it and otherwise
-    /// drops it (it needs a Ferrum-side pending-request gauge).
+    /// `idleTimeout`, `http2MaxRequests`, `h2UpgradePolicy`, `maxRetries`,
+    /// `http1MaxPendingRequests`); the mesh apply layer projects these onto
+    /// the matching upstream's `port_overrides[port]` slot (top-level fan-out
+    /// applies to every target port; per-port `portLevelSettings` overrides
+    /// per-port). Old DPs reading new slices see this as a no-op via the
+    /// serde default. There are no longer any deferred `connectionPool.http`
+    /// knobs at top-level/`portLevelSettings` scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_pool_http: Option<MeshConnectionPoolHttp>,
 }
@@ -1812,6 +1825,18 @@ pub struct MeshConnectionPoolHttp {
     /// positive when set (zero/negative rejected at translate time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
+    /// Mapped from `http1MaxPendingRequests`. The maximum number of requests
+    /// that may be simultaneously *waiting on connection capacity* for a
+    /// backend destination on the HTTP/1.1 dispatch path. Projects onto
+    /// `Upstream.port_overrides[port].http1_max_pending_requests` and is
+    /// enforced as a per-`(host, port)` pending gate: when the queue is full a
+    /// new H1 request is shed with a 503 ("upstream overflow" in Envoy terms)
+    /// rather than queued unboundedly. HTTP/1.1-scoped: it does NOT gate
+    /// direct-H2 / gRPC / HTTP/3 / HBONE / mesh-mTLS dispatch (those use
+    /// `http2MaxRequests` → `h2_max_concurrent_streams` for concurrency).
+    /// Always positive when set (zero/negative rejected at translate time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http1_max_pending_requests: Option<u32>,
 }
 
 /// `DestinationRule.trafficPolicy.tls` settings mapped from Istio's
@@ -2668,7 +2693,23 @@ fn validate_mesh_config_internal(
             &dr.host,
             &mut errors,
         );
-        for port in dr.port_level_settings.keys() {
+        // `connectionPool.http.http1MaxPendingRequests` is enforced by the
+        // limiter as a per-`(host, port)` pending gate where `Some(0)` is
+        // hard-overflow (sheds EVERY H1 request). The K8s translator rejects
+        // 0/negative at parse time (`translate_http_uint32`), but the
+        // native/file slice path bypasses that translator, so apply the same
+        // positive-value check here — matching the repo invariant that
+        // native/file slices run the validation the K8s translator does.
+        // Walk every place a `connectionPool.http` block can ride a DR:
+        // top-level `trafficPolicy`, per-port `portLevelSettings`, and each
+        // `subsets[].trafficPolicy` (the translator rejects subset-scoped 0 too,
+        // before it drops the field from the unused subset overlay).
+        validate_dr_connection_pool_http(
+            &format!("MeshDestinationRule '{}'.trafficPolicy", dr.name),
+            dr.traffic_policy.as_ref(),
+            &mut errors,
+        );
+        for (port, policy) in &dr.port_level_settings {
             validate_non_zero_port(
                 format!(
                     "MeshDestinationRule '{}'.port_level_settings[{}]",
@@ -2677,11 +2718,27 @@ fn validate_mesh_config_internal(
                 *port,
                 &mut errors,
             );
+            validate_dr_connection_pool_http(
+                &format!(
+                    "MeshDestinationRule '{}'.port_level_settings[{}].trafficPolicy",
+                    dr.name, port
+                ),
+                Some(policy),
+                &mut errors,
+            );
         }
         for (i, subset) in dr.subsets.iter().enumerate() {
             validate_non_empty_string(
                 format!("MeshDestinationRule '{}'.subsets[{}].name", dr.name, i),
                 &subset.name,
+                &mut errors,
+            );
+            validate_dr_connection_pool_http(
+                &format!(
+                    "MeshDestinationRule '{}'.subsets[{}].trafficPolicy",
+                    dr.name, i
+                ),
+                subset.traffic_policy.as_ref(),
                 &mut errors,
             );
         }
@@ -2783,6 +2840,32 @@ fn validate_non_empty_string(context: String, value: &str, errors: &mut Vec<Stri
 fn validate_non_zero_port(context: String, port: u16, errors: &mut Vec<String>) {
     if port == 0 {
         errors.push(format!("{context}: port must be greater than 0"));
+    }
+}
+
+/// Validate a DestinationRule `connectionPool.http` block from the native/file
+/// mesh slice path, matching the positive-value checks the K8s translator
+/// (`translate_http_uint32`) enforces at parse time.
+///
+/// `http1MaxPendingRequests` is the load-bearing one: the
+/// [`crate::backend_pending_limit::BackendPendingLimiter`] treats `Some(0)` as a
+/// hard-overflow that sheds every HTTP/1.1 request, so an accidental `0` on a
+/// hand-authored native/file DR would silently blackhole all H1 traffic to the
+/// matched destination. The K8s translator rejects 0/negative; this keeps the
+/// native/file path equivalent (negatives are already impossible — the field
+/// deserializes as `u32` — so only the zero case needs rejecting here).
+fn validate_dr_connection_pool_http(
+    context: &str,
+    policy: Option<&MeshTrafficPolicy>,
+    errors: &mut Vec<String>,
+) {
+    let Some(http) = policy.and_then(|p| p.connection_pool_http.as_ref()) else {
+        return;
+    };
+    if http.http1_max_pending_requests == Some(0) {
+        errors.push(format!(
+            "{context}.connectionPool.http.http1MaxPendingRequests must be positive (0 would shed every HTTP/1.1 request)"
+        ));
     }
 }
 

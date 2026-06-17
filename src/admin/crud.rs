@@ -691,6 +691,12 @@ impl AdminResource for Upstream {
                 "At least one target is required (or configure service_discovery)".to_string(),
             ));
         }
+        // Reject mesh-projected fields on the admin write path. This is an
+        // operator-provided admission entry point, so the projected-field rejection
+        // is correct here (it is intentionally NOT in `validate_fields`, which also
+        // runs on the mesh slice-apply path and would false-error there).
+        self.validate_operator_provided_fields()
+            .map_err(ValidationError::Fields)?;
         self.validate_fields().map_err(ValidationError::Fields)
     }
 

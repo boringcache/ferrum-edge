@@ -10,6 +10,7 @@ mod adaptive_buffer;
 mod adaptive_concurrency;
 mod admin;
 mod backend_conn_limit;
+mod backend_pending_limit;
 mod capture;
 mod circuit_breaker;
 mod cli;

@@ -94,6 +94,7 @@ pub fn default_mesh_runtime() -> MeshRuntimeConfig {
         egress_stream_enabled: false,
         egress_stream_allow_plaintext: false,
         request_auth_require_exp: true,
+        locality_lb_strict: false,
     }
 }
 
@@ -140,6 +141,7 @@ pub fn workload_for(
         locality: None,
         service_account: Some(service_account),
         pod_uid: None,
+        remote_provenance: false,
     }
 }
 
@@ -328,6 +330,7 @@ pub fn http_proxy(id: &str, host: &str, backend_port: u16) -> Proxy {
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         circuit_breaker: None,
@@ -369,6 +372,7 @@ pub fn http_upstream(id: &str, host: &str, port: u16) -> Upstream {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,

@@ -1104,8 +1104,10 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     let mut global_shutdown_rx = global_shutdown;
 
     // Pre-allocate recvmmsg batch buffers (Linux only). On non-Linux, this is a no-op stub.
+    // `false`: plain UDP proxy listeners never enable `IP_RECVORIGDSTADDR`, so
+    // skip the per-datagram orig-dst cmsg scan (it would always yield `None`).
     #[cfg(target_os = "linux")]
-    let mut recv_batch = super::udp_batch::RecvMmsgBatch::new(recvmmsg_batch_size);
+    let mut recv_batch = super::udp_batch::RecvMmsgBatch::new(recvmmsg_batch_size, false);
     #[cfg(not(target_os = "linux"))]
     let _ = recvmmsg_batch_size; // suppress unused variable warning
 
