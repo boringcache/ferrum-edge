@@ -152,6 +152,61 @@ fn redact_url_matches_sensitive_query_keys_case_insensitively() {
     assert_eq!(pairs.get("Api_Key").map(String::as_str), Some("***"));
 }
 
+#[test]
+fn redact_url_hides_mongodb_keyfile_password_alias() {
+    // MongoDB's `tlsCertificateKeyFilePassword` carries the private key file's
+    // passphrase; it is recognized as a DB TLS URL option and logged via
+    // `redact_url` on the FERRUM_DB_TLS_MODE warning path, so it must be
+    // redacted even though it is not in the exact-key list.
+    let redacted = redact_url(concat!(
+        "mongodb://mongo.example.com:27017/ferrum?",
+        "tls=true&tlsCertificateKeyFile=/certs/client.pem&",
+        "tlsCertificateKeyFilePassword=keyfile-secret"
+    ));
+    assert!(
+        !redacted.contains("keyfile-secret"),
+        "key-file password leaked: {redacted}"
+    );
+
+    let parsed = url::Url::parse(&redacted).expect("redacted URL should parse");
+    let pairs: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(
+        pairs
+            .get("tlsCertificateKeyFilePassword")
+            .map(String::as_str),
+        Some("***")
+    );
+    // The certificate/key file *path* is not a secret and must be preserved so
+    // the redacted log remains actionable.
+    assert_eq!(
+        pairs.get("tlsCertificateKeyFile").map(String::as_str),
+        Some("/certs/client.pem")
+    );
+    assert_eq!(pairs.get("tls").map(String::as_str), Some("true"));
+}
+
+#[test]
+fn redact_url_redacts_credential_substring_aliases() {
+    // OAuth-style aliases reach the substring matcher after separator
+    // normalization.
+    let redacted = redact_url(concat!(
+        "postgres://db.example.com/ferrum?",
+        "Client-Secret=cs&access.token=at&Refresh_Token=rt&credential=cr&sslmode=require"
+    ));
+    for leaked in ["=cs", "=at", "=rt", "=cr"] {
+        assert!(!redacted.contains(leaked), "leaked {leaked}: {redacted}");
+    }
+
+    let parsed = url::Url::parse(&redacted).expect("redacted URL should parse");
+    let pairs: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(pairs.get("Client-Secret").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("access.token").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("Refresh_Token").map(String::as_str), Some("***"));
+    assert_eq!(pairs.get("credential").map(String::as_str), Some("***"));
+    // Non-secret TLS options remain untouched.
+    assert_eq!(pairs.get("sslmode").map(String::as_str), Some("require"));
+}
+
 // ---------------------------------------------------------------------------
 // extract_known_ids — tests
 // ---------------------------------------------------------------------------

@@ -781,29 +781,44 @@ fn redact_query_string(query: &str) -> String {
 }
 
 fn is_sensitive_url_query_key(key: &str) -> bool {
+    // Exact (separator-insensitive) matches for credential-bearing keys that do
+    // not contain one of the `SENSITIVE_SUBSTRINGS` below. Compared against the
+    // normalized key, so `api_key`, `api-key`, and `apiKey` all match `apikey`.
     const SENSITIVE_KEYS: &[&str] = &[
-        "access_token",
-        "api_key",
         "apikey",
-        "auth_token",
-        "client_secret",
-        "credential",
-        "credentials",
         "key",
         "pass",
-        "passwd",
-        "password",
-        "private_key",
-        "refresh_token",
-        "secret",
+        "privatekey",
         "sslkey",
-        "sslpassword",
-        "token",
         "user",
         "username",
     ];
 
+    // Driver query parameters frequently embed credentials under
+    // option-specific aliases (e.g. MongoDB's `tlsCertificateKeyFilePassword`,
+    // PostgreSQL's `sslpassword`, OAuth-style `client_secret`/`access_token`).
+    // Matching these credential-bearing substrings after normalization keeps
+    // such aliases redacted even when they are not in the exact-key list. Only
+    // unambiguously secret substrings are listed; path or identifier options
+    // like `tlsCertificateKeyFile` (a file path) must not be matched here, so
+    // `key`/`user` are intentionally excluded from the substring set.
+    const SENSITIVE_SUBSTRINGS: &[&str] = &["password", "passwd", "secret", "token", "credential"];
+
+    let normalized = normalize_query_key(key);
     SENSITIVE_KEYS
         .iter()
-        .any(|sensitive| key.eq_ignore_ascii_case(sensitive))
+        .any(|sensitive| normalized == *sensitive)
+        || SENSITIVE_SUBSTRINGS
+            .iter()
+            .any(|sensitive| normalized.contains(sensitive))
+}
+
+/// Normalize a query-parameter key for sensitivity matching: lowercase and
+/// strip `-`/`_`/`.` separators so aliases like `client-secret`, `client_secret`,
+/// and `clientSecret` all compare equal.
+fn normalize_query_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| !matches!(ch, '-' | '_' | '.'))
+        .flat_map(char::to_lowercase)
+        .collect()
 }
