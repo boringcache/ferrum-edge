@@ -486,6 +486,16 @@ async fn run_with_backend(
         config.node_name
     );
 
+    // Periodic re-drive of transiently-failed enrollments. Failed pods are not
+    // in `pod_states`, and the watcher/CNI arms only enroll on fresh events, so
+    // without this a transient eBPF attach/map failure (after cgroup+veth
+    // resolved) would become an indefinite capture gap until the next pod event.
+    // `retry_backed_off_pod_enrollments` is a cheap no-op when no failures are
+    // pending. Consume the immediate first tick that `interval` fires so the
+    // first real pass waits a full backoff window rather than firing instantly.
+    let mut retry_interval = tokio::time::interval(POD_ENROLLMENT_RETRY_BACKOFF);
+    retry_interval.tick().await;
+
     loop {
         if *shutdown_rx.borrow() {
             break;
@@ -567,6 +577,17 @@ async fn run_with_backend(
                         debug!("CNI work queue closed; CNI plugin path inactive for the remainder of this run");
                     }
                 }
+            }
+            _ = retry_interval.tick() => {
+                // Re-drive any pod whose transient enrollment failure has aged
+                // past the backoff window. Cheap no-op when none are pending.
+                retry_backed_off_pod_enrollments(
+                    backend.as_mut(),
+                    &pod_states,
+                    config,
+                    metrics.as_ref(),
+                    false,
+                );
             }
         }
     }
@@ -1253,14 +1274,87 @@ struct PodEnrollmentAttemptSignature {
     annotations_fingerprint: u64,
 }
 
+/// Owned snapshot of everything needed to rebuild a `PodEvent` and re-drive
+/// `handle_pod_added` for a pod whose enrollment failed transiently. A failed
+/// enrollment is suppressed for `POD_ENROLLMENT_RETRY_BACKOFF` to avoid the
+/// per-Apply churn that issue #1733 fixed, but failed pods are NOT inserted
+/// into `pod_states` (insertion only happens once `state.attached` is true), so
+/// they cannot be reconciled from `pod_states`. Without an owned record, a
+/// transient eBPF attach/map failure that lands *after* the cgroup and veth
+/// resolved would become an indefinite capture gap whenever no further pod
+/// event arrives for that pod. We keep this snapshot so the periodic retry loop
+/// in `run_with_backend` can rebuild the event and try again every ~30s until
+/// it succeeds (or the pod is removed / no longer matches enrollment).
+///
+/// `veth_iface_override` is intentionally not captured: production always sets
+/// it to `None` and relies on the live procfs/sysfs resolver, so the rebuilt
+/// `PodEvent` re-resolves the interface on each retry.
+#[derive(Debug, Clone)]
+struct RetryablePodEnrollment {
+    pod_uid: String,
+    pod_name: String,
+    namespace: String,
+    service_account: Option<String>,
+    labels: HashMap<String, String>,
+    annotations: HashMap<String, String>,
+    pod_ip: Option<String>,
+    pod_pid: Option<u32>,
+}
+
+impl RetryablePodEnrollment {
+    fn from_event(event: &PodEvent<'_>) -> Self {
+        Self {
+            pod_uid: event.pod_uid.to_string(),
+            pod_name: event.pod_name.to_string(),
+            namespace: event.namespace.to_string(),
+            service_account: event.service_account.map(ToOwned::to_owned),
+            labels: event.labels.clone(),
+            annotations: event.annotations.clone(),
+            pod_ip: event.pod_ip_str.map(ToOwned::to_owned),
+            pod_pid: event.pod_pid,
+        }
+    }
+
+    /// Reconstruct a borrowed `PodEvent` from this owned snapshot for replaying
+    /// through `handle_pod_added`. The returned event borrows from `self`, so
+    /// `self` must outlive the event.
+    fn as_event(&self) -> PodEvent<'_> {
+        PodEvent {
+            pod_uid: &self.pod_uid,
+            pod_name: &self.pod_name,
+            namespace: &self.namespace,
+            service_account: self.service_account.as_deref(),
+            labels: &self.labels,
+            annotations: &self.annotations,
+            pod_ip_str: self.pod_ip.as_deref(),
+            pod_pid: self.pod_pid,
+            // Production always re-resolves the veth on retry (see struct docs).
+            veth_iface_override: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FailedPodEnrollmentAttempt {
     signature: PodEnrollmentAttemptSignature,
     last_attempt: Instant,
+    /// Owned snapshot used to re-drive enrollment after the backoff window
+    /// expires. `Some` for every real failure recorded by `handle_pod_added`;
+    /// the periodic retry loop skips records that lack a snapshot.
+    snapshot: Option<RetryablePodEnrollment>,
+}
+
+/// Prefix shared by every `FAILED_POD_ENROLLMENT_ATTEMPTS` key belonging to a
+/// given `pod_states`. The map is a process-global static; including the
+/// `pod_states` pointer scopes records to the owning node-agent runtime so the
+/// periodic retry loop never re-drives another runtime's (or, under `cargo
+/// test`, another test's) pods.
+fn pod_state_key_prefix(pod_states: &DashMap<String, PodAttachmentState>) -> String {
+    format!("{:p}:", pod_states)
 }
 
 fn pod_state_key(pod_states: &DashMap<String, PodAttachmentState>, pod_uid: &str) -> String {
-    format!("{:p}:{pod_uid}", pod_states)
+    format!("{}{pod_uid}", pod_state_key_prefix(pod_states))
 }
 
 fn map_fingerprint(map: &HashMap<String, String>) -> u64 {
@@ -1309,12 +1403,17 @@ fn recently_failed_pod_enrollment(
     true
 }
 
-fn remember_failed_pod_enrollment(state_key: &str, signature: PodEnrollmentAttemptSignature) {
+fn remember_failed_pod_enrollment(
+    state_key: &str,
+    signature: PodEnrollmentAttemptSignature,
+    snapshot: RetryablePodEnrollment,
+) {
     FAILED_POD_ENROLLMENT_ATTEMPTS.insert(
         state_key.to_string(),
         FailedPodEnrollmentAttempt {
             signature,
             last_attempt: Instant::now(),
+            snapshot: Some(snapshot),
         },
     );
 }
@@ -1325,6 +1424,84 @@ fn forget_failed_pod_enrollment(state_key: &str) {
 
 fn forget_pod_enrollment_attempt(state_key: &str) {
     FAILED_POD_ENROLLMENT_ATTEMPTS.remove(state_key);
+}
+
+/// Re-drive enrollment for every pod that failed transiently and whose backoff
+/// window has elapsed.
+///
+/// Failed enrollments are remembered in `FAILED_POD_ENROLLMENT_ATTEMPTS` and
+/// suppressed for `POD_ENROLLMENT_RETRY_BACKOFF` so we don't churn on every
+/// Apply (issue #1733). But failed pods are never inserted into `pod_states`
+/// (insertion only happens once `state.attached` is true), so nothing
+/// reconciles them from `pod_states`. Before this loop, a transient eBPF
+/// attach/map failure that struck *after* the cgroup and veth resolved became
+/// an indefinite capture gap if no further pod/CNI event arrived for that pod.
+///
+/// This helper closes that gap. It collects the eligible `(state_key,
+/// snapshot)` pairs *first* (an owned `Vec`) so we never mutate
+/// `FAILED_POD_ENROLLMENT_ATTEMPTS` while iterating it, drops each stale record,
+/// then replays it via `handle_pod_added`. Dropping the record first is exactly
+/// what `recently_failed_pod_enrollment` does once the window has elapsed (clear
+/// then proceed), so the re-drive isn't suppressed by its own backoff entry. On
+/// repeated failure `handle_pod_added` re-remembers with a fresh `last_attempt`,
+/// so the pod keeps retrying roughly every `POD_ENROLLMENT_RETRY_BACKOFF` until
+/// it enrolls, is removed, or no longer matches enrollment criteria — strictly
+/// better-bounded than the pre-#1733 every-Apply churn.
+///
+/// `force` bypasses the elapsed-time gate; production passes `false`. Tests pass
+/// `true` to exercise the replay deterministically without real sleeps (the
+/// 30-second window is otherwise unreachable without wall-clock time).
+fn retry_backed_off_pod_enrollments(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    force: bool,
+) {
+    if FAILED_POD_ENROLLMENT_ATTEMPTS.is_empty() {
+        return;
+    }
+
+    // Only re-drive records owned by *this* `pod_states`. The map is a global
+    // static, so without scoping a node-agent runtime (or a sibling test) would
+    // replay another runtime's pods against the wrong state map.
+    let key_prefix = pod_state_key_prefix(pod_states);
+
+    // Collect (state_key, snapshot) first so we never hold DashMap shard guards
+    // across the replay (which itself mutates FAILED_POD_ENROLLMENT_ATTEMPTS via
+    // handle_pod_added). `force` bypasses the elapsed gate for tests.
+    let due: Vec<(String, RetryablePodEnrollment)> = FAILED_POD_ENROLLMENT_ATTEMPTS
+        .iter()
+        .filter(|entry| entry.key().starts_with(&key_prefix))
+        .filter(|entry| {
+            force || entry.value().last_attempt.elapsed() >= POD_ENROLLMENT_RETRY_BACKOFF
+        })
+        .filter_map(|entry| {
+            entry
+                .value()
+                .snapshot
+                .clone()
+                .map(|snapshot| (entry.key().clone(), snapshot))
+        })
+        .collect();
+
+    for (state_key, snapshot) in due {
+        // Drop the stale record before replaying. In production this is what
+        // `recently_failed_pod_enrollment` would do once the window elapsed
+        // (clear, then proceed); doing it here lets the re-drive proceed even
+        // under a forced (test) retry whose `last_attempt` is still fresh. If
+        // the re-drive fails again, `handle_pod_added` re-remembers with a fresh
+        // `last_attempt`; if it succeeds, the record stays cleared.
+        forget_failed_pod_enrollment(&state_key);
+        let event = snapshot.as_event();
+        debug!(
+            pod_uid = event.pod_uid,
+            pod_name = event.pod_name,
+            namespace = event.namespace,
+            "Re-driving backed-off pod enrollment after retry window"
+        );
+        handle_pod_added(backend, pod_states, config, metrics, &event);
+    }
 }
 
 /// Reject a `pod_uid` that could escape the registry directory. A pod UID is a
@@ -1522,6 +1699,13 @@ fn handle_pod_added(
         return;
     }
 
+    // Owned event snapshot stored alongside the failed-enrollment record so the
+    // periodic retry loop in `run_with_backend` can re-drive this enrollment
+    // once the backoff window expires, even if no further pod/CNI event arrives
+    // for this pod. Cheap to build but only needed on the cold failure paths
+    // below, so each `remember_failed_pod_enrollment` call clones it.
+    let enrollment_snapshot = RetryablePodEnrollment::from_event(event);
+
     let mut state = PodAttachmentState {
         pod_uid: pod_uid.to_string(),
         pod_name: pod_name.to_string(),
@@ -1596,7 +1780,11 @@ fn handle_pod_added(
                 );
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                 cleanup_partial_pod_enrollment(backend, pod_uid, &state);
-                remember_failed_pod_enrollment(&state_key, attempt_signature);
+                remember_failed_pod_enrollment(
+                    &state_key,
+                    attempt_signature,
+                    enrollment_snapshot.clone(),
+                );
                 return;
             };
 
@@ -1604,7 +1792,11 @@ fn handle_pod_added(
                 warn!(pod_uid, iface, error = %e, "Failed to attach tc program");
                 metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                 cleanup_partial_pod_enrollment(backend, pod_uid, &state);
-                remember_failed_pod_enrollment(&state_key, attempt_signature);
+                remember_failed_pod_enrollment(
+                    &state_key,
+                    attempt_signature,
+                    enrollment_snapshot.clone(),
+                );
                 return;
             }
             if let Some(ip) = pod_ip {
@@ -1616,7 +1808,11 @@ fn handle_pod_added(
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IP map");
                     metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                     cleanup_partial_pod_enrollment(backend, pod_uid, &state);
-                    remember_failed_pod_enrollment(&state_key, attempt_signature);
+                    remember_failed_pod_enrollment(
+                        &state_key,
+                        attempt_signature,
+                        enrollment_snapshot.clone(),
+                    );
                     return;
                 }
             }
@@ -1633,7 +1829,7 @@ fn handle_pod_added(
             );
         } else {
             cleanup_partial_pod_enrollment(backend, pod_uid, &state);
-            remember_failed_pod_enrollment(&state_key, attempt_signature);
+            remember_failed_pod_enrollment(&state_key, attempt_signature, enrollment_snapshot);
         }
     } else {
         warn!(
@@ -1641,7 +1837,7 @@ fn handle_pod_added(
             pod_name, "Could not resolve cgroup path, skipping attachment"
         );
         metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
-        remember_failed_pod_enrollment(&state_key, attempt_signature);
+        remember_failed_pod_enrollment(&state_key, attempt_signature, enrollment_snapshot);
         return;
     }
 
@@ -4019,6 +4215,161 @@ mod tests {
 
         assert!(pod_states.contains_key("pod-uid-1"));
         assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn retryable_pod_enrollment_reconstructs_equivalent_event() {
+        // The owned snapshot stored for a failed enrollment must rebuild a
+        // PodEvent that matches the original (minus the test-only veth override,
+        // which production never sets and the retry path always re-resolves).
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations = HashMap::from([(
+            "ferrum.io/include-outbound-ports".to_string(),
+            "8080".to_string(),
+        )]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "test-pod",
+            namespace: "ns-a",
+            service_account: Some("sa-a"),
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: Some(4242),
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        let snapshot = RetryablePodEnrollment::from_event(&event);
+        let rebuilt = snapshot.as_event();
+
+        assert_eq!(rebuilt.pod_uid, "pod-uid-1");
+        assert_eq!(rebuilt.pod_name, "test-pod");
+        assert_eq!(rebuilt.namespace, "ns-a");
+        assert_eq!(rebuilt.service_account, Some("sa-a"));
+        assert_eq!(rebuilt.labels, &labels);
+        assert_eq!(rebuilt.annotations, &annotations);
+        assert_eq!(rebuilt.pod_ip_str, Some("10.0.0.5"));
+        assert_eq!(rebuilt.pod_pid, Some(4242));
+        // Production re-resolves the veth on every retry, so the snapshot never
+        // carries the override.
+        assert_eq!(rebuilt.veth_iface_override, None);
+    }
+
+    #[test]
+    fn backed_off_pod_enrollment_is_retried_after_backoff_window() {
+        // A transient inbound-tc attach failure lands AFTER the pod's cgroup and
+        // veth have resolved. The pod is therefore never inserted into
+        // `pod_states`, so nothing reconciles it from `pod_states`; only the
+        // stored failed-enrollment snapshot + the periodic retry loop can
+        // recover it. Drive that failure, confirm the gap, clear the transient
+        // condition, then re-drive via the retry helper (force-bypassing the
+        // 30s window so the test stays deterministic with no real sleeps).
+        //
+        // We use the production veth resolver (via the test override guard)
+        // rather than `PodEvent::veth_iface_override`, because the stored retry
+        // snapshot always carries `veth_iface_override: None` (matching
+        // production, which re-resolves the veth on each retry). With the guard,
+        // both the initial attempt and the re-drive resolve the same synthetic
+        // interface, so the only failure is the injected attach_tc error.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        backend.fail_attach_tc = true;
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        // cgroup present => cgroup_path resolves; guard => veth resolves; so the
+        // only failure is the injected attach_tc error (strictly post-resolve).
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.5"),
+            pod_pid: None,
+            // None mirrors production and the retry snapshot; veth resolves via
+            // the override guard above.
+            veth_iface_override: None,
+        };
+
+        // First enrollment fails transiently at attach_tc.
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        assert!(
+            !pod_states.contains_key("pod-uid-1"),
+            "transiently-failed pod must not be inserted into pod_states"
+        );
+        assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 1);
+        let state_key = pod_state_key(&pod_states, "pod-uid-1");
+        assert!(
+            FAILED_POD_ENROLLMENT_ATTEMPTS
+                .get(&state_key)
+                .map(|r| r.snapshot.is_some())
+                .unwrap_or(false),
+            "a failed record carrying an owned snapshot must exist for the retry loop"
+        );
+
+        // The transient condition clears (e.g., the kernel/map is now writable).
+        backend.fail_attach_tc = false;
+
+        // The retry loop re-drives the stored snapshot. `force = true` bypasses
+        // the 30s elapsed gate that is otherwise unreachable without wall time.
+        retry_backed_off_pod_enrollments(&mut backend, &pod_states, &config, &metrics, true);
+
+        assert!(
+            pod_states.contains_key("pod-uid-1"),
+            "pod must enroll once the transient failure clears and the retry runs"
+        );
+        assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 1);
+        assert!(
+            !FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&state_key),
+            "successful re-drive must clear the failed-enrollment record"
+        );
+
+        // Clean up the global between tests sharing this static. Keying is by
+        // pod_states pointer, but be explicit so a reused address can't leak.
+        forget_failed_pod_enrollment(&state_key);
+    }
+
+    #[test]
+    fn retry_backed_off_pod_enrollments_is_noop_when_none_pending() {
+        // With no pending failures the retry pass must do nothing (no enroll, no
+        // error churn) — the empty-map fast path.
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+
+        retry_backed_off_pod_enrollments(&mut backend, &pod_states, &config, &metrics, true);
+
+        assert!(pod_states.is_empty());
+        assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 0);
     }
 
     #[test]
