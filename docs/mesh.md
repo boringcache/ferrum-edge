@@ -1596,10 +1596,17 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   delivers the datagram to a transparent listener socket **without rewriting its
   destination**, so the Stage 3 listener recovers the original destination
   per-datagram from the `IP_RECVORIGDSTADDR` cmsg. New `mangle`-table chains
-  `FERRUM_MESH_UDP_INBOUND` / `FERRUM_MESH_UDP_OUTBOUND` mirror the TCP
-  include/exclude/CIDR scoping with `-p udp ... -j TPROXY --on-port
+  mirror the TCP include/exclude/CIDR scoping with `-p udp ... -j TPROXY --on-port
   <FERRUM_MESH_CAPTURE_UDP_PORT> --tproxy-mark <FERRUM_MESH_TPROXY_MARK>/<mask>`,
-  jumped from `mangle PREROUTING`. These dst-based PREROUTING chains are
+  jumped from `mangle PREROUTING`. **Capture is EGRESS-ONLY (#1808):** only
+  `FERRUM_MESH_UDP_OUTBOUND` (plus the `FERRUM_MESH_UDP_OUTPUT_MARK` /
+  `FERRUM_MESH_UDP_REINJECT` locally-generated-egress loop) is emitted. The
+  `FERRUM_MESH_UDP_INBOUND` catch-all is **gated off** (`emit_inbound = false`)
+  because there is no inbound UDP relay yet — the egress-only capture listener
+  would divert pod-app-bound (`--dst-type LOCAL`) UDP and drop it, so inbound-to-pod
+  UDP is left uncaptured and flows normally to the app. Teardown still reaps any
+  prior inbound chain (mark-independent), so an upgrade from a build that installed
+  it is cleaned up. These dst-based PREROUTING chains are
   **PREROUTING-only**, so — unlike the TCP `nat OUTPUT` outbound chain — they carry
   **no proxy-UID `-m owner --uid-owner` self-exclusion** (owner-match is
   OUTPUT-context only). The pod's **own** locally-generated UDP egress (which never

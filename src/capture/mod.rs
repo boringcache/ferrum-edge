@@ -2780,16 +2780,17 @@ mod tests {
         let plan = IptablesPlan::for_config(&config);
         let cmds = &plan.v4_commands;
 
-        // New mangle-table chains are created.
-        assert!(
-            cmds.iter()
-                .any(|c| c.contains("-t mangle") && c.contains("-N FERRUM_MESH_UDP_INBOUND")),
-            "missing UDP inbound mangle chain: {cmds:?}"
-        );
+        // New mangle-table chains are created. Inbound UDP capture is DISABLED
+        // (#1808, no inbound relay), so NO inbound chain/rule/jump is emitted at all
+        // (asserted directly below).
         assert!(
             cmds.iter()
                 .any(|c| c.contains("-t mangle") && c.contains("-N FERRUM_MESH_UDP_OUTBOUND")),
             "missing UDP outbound mangle chain: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")),
+            "inbound UDP capture is disabled (#1808): no inbound chain/rule/jump must be emitted: {cmds:?}"
         );
 
         // Catch-all TPROXY jump on both directions, on the UDP port with the mark.
@@ -2803,24 +2804,12 @@ mod tests {
                 && c.contains(&tproxy_arg)),
             "missing outbound UDP TPROXY jump: {cmds:?}"
         );
-        assert!(
-            cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
-                && c.contains("-p udp")
-                && c.contains(&tproxy_arg)),
-            "missing inbound UDP TPROXY jump: {cmds:?}"
-        );
 
         // mangle PREROUTING jumps for both dst-based chains, plus the reinject chain
         // jump. TPROXY is PREROUTING-only, so the OUTPUT path is MARK-only (codex
         // r6): a `mangle OUTPUT -j FERRUM_MESH_UDP_OUTPUT_MARK` jump MUST exist, but
         // the OUTPUT chain must NEVER jump into a `-j TPROXY` chain (which would be
         // invalid).
-        assert!(
-            cmds.iter().any(|c| c.contains("-t mangle")
-                && c.contains("PREROUTING")
-                && c.contains("-j FERRUM_MESH_UDP_INBOUND")),
-            "missing mangle PREROUTING -> UDP inbound jump: {cmds:?}"
-        );
         assert!(
             cmds.iter().any(|c| c.contains("-t mangle")
                 && c.contains("PREROUTING")
@@ -2902,7 +2891,12 @@ mod tests {
         let plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
         let cmds = &plan.v4_commands;
 
-        for chain in ["FERRUM_MESH_UDP_INBOUND", "FERRUM_MESH_UDP_OUTBOUND"] {
+        // Inbound is disabled (#1808), so only the egress-side chains are emitted.
+        for chain in [
+            "FERRUM_MESH_UDP_OUTBOUND",
+            "FERRUM_MESH_UDP_OUTPUT_MARK",
+            "FERRUM_MESH_UDP_REINJECT",
+        ] {
             let flush = cmds
                 .iter()
                 .position(|c| c.contains("-t mangle") && c.contains(&format!("-F {chain}")))
@@ -2975,33 +2969,27 @@ mod tests {
     );
 
     #[test]
-    fn udp_prerouting_jumps_outbound_before_inbound_catch_all() {
-        // codex r2 finding 2: both UDP chains ride `mangle PREROUTING` (TPROXY is
-        // PREROUTING-only). The OUTBOUND jump must come BEFORE the INBOUND jump so
-        // egress is matched/routed first — otherwise the inbound catch-all
-        // (NF_ACCEPT) swallows pod egress and the outbound rules are bypassed.
+    fn udp_prerouting_emits_outbound_jump_and_no_inbound() {
+        // The OUTBOUND chain is jumped from `mangle PREROUTING` (TPROXY is
+        // PREROUTING-only). Inbound UDP capture is DISABLED (#1808, no inbound
+        // relay), so NO inbound PREROUTING jump is emitted — inbound-to-pod UDP is
+        // never diverted and flows normally to the pod's app.
         let plan = IptablesPlan::for_config(&udp_enabled_iptables_config());
         let cmds = &plan.v4_commands;
 
-        let outbound_jump = cmds
-            .iter()
-            .position(|c| {
+        assert!(
+            cmds.iter().any(|c| {
                 c.contains("-t mangle")
                     && c.contains("PREROUTING")
                     && c.contains("-j FERRUM_MESH_UDP_OUTBOUND")
-            })
-            .expect("PREROUTING -> UDP outbound jump");
-        let inbound_jump = cmds
-            .iter()
-            .position(|c| {
-                c.contains("-t mangle")
-                    && c.contains("PREROUTING")
-                    && c.contains("-j FERRUM_MESH_UDP_INBOUND")
-            })
-            .expect("PREROUTING -> UDP inbound jump");
+            }),
+            "missing PREROUTING -> UDP outbound jump: {cmds:?}"
+        );
         assert!(
-            outbound_jump < inbound_jump,
-            "outbound PREROUTING jump must precede the inbound catch-all jump: {cmds:?}"
+            !cmds
+                .iter()
+                .any(|c| c.contains("-j FERRUM_MESH_UDP_INBOUND")),
+            "inbound UDP capture is disabled (#1808): no PREROUTING -> inbound jump: {cmds:?}"
         );
     }
 
@@ -3020,19 +3008,11 @@ mod tests {
                 && c.contains("-j TPROXY")),
             "outbound UDP TPROXY must be scoped to a non-local destination: {cmds:?}"
         );
+        // Inbound UDP capture is DISABLED (#1808, no inbound relay): no inbound
+        // chain/rule is emitted at all, so there is no inbound TPROXY to scope.
         assert!(
-            cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
-                && c.contains("-m addrtype --dst-type LOCAL")
-                && c.contains("-j TPROXY")),
-            "inbound UDP catch-all TPROXY must be scoped to a LOCAL destination: {cmds:?}"
-        );
-        // The inbound catch-all must NOT be an unscoped blanket `-p udp -j TPROXY`
-        // (that is what swallowed egress).
-        assert!(
-            !cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
-                && c.contains("-j TPROXY")
-                && !c.contains("--dst-type LOCAL")),
-            "inbound UDP TPROXY must never be an unscoped blanket match: {cmds:?}"
+            !cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")),
+            "inbound UDP capture is disabled (#1808): no inbound chain/rule must be emitted: {cmds:?}"
         );
     }
 
@@ -3166,20 +3146,11 @@ mod tests {
             );
         }
 
-        // Inbound exclude RETURN must precede the inbound catch-all TPROXY.
-        let return_pos = cmds
-            .iter()
-            .position(|c| {
-                c.contains("FERRUM_MESH_UDP_INBOUND") && c.contains("-p udp --dport 5353 -j RETURN")
-            })
-            .expect("UDP inbound exclude RETURN");
-        let tproxy_pos = cmds
-            .iter()
-            .position(|c| c.contains("FERRUM_MESH_UDP_INBOUND") && c.contains("-j TPROXY"))
-            .expect("UDP inbound TPROXY");
+        // Inbound UDP capture is DISABLED (#1808, no inbound relay): even with
+        // `exclude_inbound_ports` set, NO inbound chain/rule is emitted at all.
         assert!(
-            return_pos < tproxy_pos,
-            "UDP inbound RETURN must precede the inbound TPROXY: {cmds:?}"
+            !cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")),
+            "inbound UDP capture is disabled (#1808): exclude_inbound_ports must emit no inbound rule: {cmds:?}"
         );
     }
 
@@ -3260,17 +3231,11 @@ mod tests {
                     && c.contains("-j FERRUM_MESH_UDP_OUTBOUND")
             })
             .expect("PREROUTING -> outbound jump");
-        let inbound_jump = cmds
-            .iter()
-            .position(|c| {
-                c.contains("-t mangle")
-                    && c.contains("PREROUTING")
-                    && c.contains("-j FERRUM_MESH_UDP_INBOUND")
-            })
-            .expect("PREROUTING -> inbound jump");
+        // Inbound capture is disabled (#1808), so only the outbound dst-based chain
+        // is jumped; the reinject jump must still precede it.
         assert!(
-            reinject_jump < outbound_jump && reinject_jump < inbound_jump,
-            "reinject PREROUTING jump must precede the dst-based chain jumps: {cmds:?}"
+            reinject_jump < outbound_jump,
+            "reinject PREROUTING jump must precede the outbound chain jump: {cmds:?}"
         );
 
         // (d) Host-netns (node-agent) path emits NO UDP rules at all — including no
@@ -3811,9 +3776,10 @@ mod tests {
             "IPv4 inbound catch-all must stay suppressed for the unselected family: {:?}",
             plan.v4_commands
         );
-        // The IPv6 family keeps its CIDR-qualified outbound rule AND its inbound
-        // catch-all (it IS the selected family). The port include also fans onto
-        // IPv6 (port includes are family-agnostic).
+        // The IPv6 family keeps its CIDR-qualified OUTBOUND rule (it IS the selected
+        // family). The port include also fans onto IPv6 (port includes are
+        // family-agnostic). Inbound UDP capture is DISABLED (#1808), so NO inbound
+        // catch-all is emitted for the selected family either.
         assert!(
             plan.v6_commands
                 .iter()
@@ -3823,12 +3789,11 @@ mod tests {
             plan.v6_commands
         );
         assert!(
-            plan.v6_commands
+            !plan
+                .v6_commands
                 .iter()
-                .any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
-                    && c.contains("-m addrtype --dst-type LOCAL")
-                    && c.contains("-j TPROXY")),
-            "IPv6 selected-family inbound catch-all missing: {:?}",
+                .any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")),
+            "inbound UDP capture is disabled (#1808): no inbound chain even for the selected family: {:?}",
             plan.v6_commands
         );
     }
@@ -3913,28 +3878,16 @@ mod tests {
                     && c.contains("-j FERRUM_MESH_UDP_OUTBOUND")
             })
             .expect("PREROUTING -> UDP outbound jump");
-        let inbound_jump = cmds
-            .iter()
-            .position(|c| {
-                c.contains("-t mangle")
-                    && c.contains("PREROUTING")
-                    && c.contains("-j FERRUM_MESH_UDP_INBOUND")
-            })
-            .expect("PREROUTING -> UDP inbound jump");
 
+        // Inbound capture is disabled (#1808), so only the outbound PREROUTING jump
+        // exists; the routing plumbing must precede it.
         assert!(
-            route_add < outbound_jump && route_add < inbound_jump,
-            "fwmark `ip rule add` must precede BOTH PREROUTING jumps: {cmds:?}"
+            route_add < outbound_jump,
+            "fwmark `ip rule add` must precede the PREROUTING jump: {cmds:?}"
         );
         assert!(
-            local_route_add < outbound_jump && local_route_add < inbound_jump,
-            "`ip route add local` must precede BOTH PREROUTING jumps: {cmds:?}"
-        );
-        // And the outbound jump still precedes the inbound catch-all jump (codex r2
-        // ordering preserved by the reorder).
-        assert!(
-            outbound_jump < inbound_jump,
-            "outbound PREROUTING jump must still precede the inbound jump: {cmds:?}"
+            local_route_add < outbound_jump,
+            "`ip route add local` must precede the PREROUTING jump: {cmds:?}"
         );
     }
 
