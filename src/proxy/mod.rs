@@ -18497,6 +18497,7 @@ async fn proxy_to_backend_hbone(
                             state.max_request_body_size_bytes,
                         ),
                         None,
+                        None,
                     );
                 }
                 return (
@@ -18514,6 +18515,7 @@ async fn proxy_to_backend_hbone(
                             None,
                             state.max_request_body_size_bytes,
                         ),
+                        None,
                         None,
                     );
                 }
@@ -18550,6 +18552,7 @@ async fn proxy_to_backend_hbone(
                             None,
                             state.max_request_body_size_bytes,
                         ),
+                        None,
                         None,
                     );
                 }
