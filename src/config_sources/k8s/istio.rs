@@ -1320,11 +1320,16 @@ fn translate_connection_pool_http(
 ) -> Result<Option<crate::modes::mesh::config::MeshConnectionPoolHttp>, K8sTranslateError> {
     use crate::modes::mesh::config::MeshConnectionPoolHttp;
 
+    // `maxRequestsPerConnection: 0` is Istio's explicit "unlimited" value and is
+    // advertised as supported by the Ferrum schema/OpenAPI, so accept it here
+    // (`allow_zero = true`); the projected `Proxy.pool_max_requests_per_connection`
+    // validator likewise permits `0`.
     let max_requests_per_connection = match http.get("maxRequestsPerConnection") {
         Some(v) => Some(translate_http_uint32(
             object,
             "maxRequestsPerConnection",
             v,
+            true,
         )?),
         None => None,
     };
@@ -1333,7 +1338,7 @@ fn translate_connection_pool_http(
         None => None,
     };
     let http2_max_requests = match http.get("http2MaxRequests") {
-        Some(v) => Some(translate_http_uint32(object, "http2MaxRequests", v)?),
+        Some(v) => Some(translate_http_uint32(object, "http2MaxRequests", v, false)?),
         None => None,
     };
     let h2_upgrade_policy = match http.get("h2UpgradePolicy") {
@@ -1346,7 +1351,7 @@ fn translate_connection_pool_http(
     // not what an operator setting an Envoy outstanding-retry budget means);
     // fail closed at translate time rather than silently disabling retries.
     let max_retries = match http.get("maxRetries") {
-        Some(v) => Some(translate_http_uint32(object, "maxRetries", v)?),
+        Some(v) => Some(translate_http_uint32(object, "maxRetries", v, false)?),
         None => None,
     };
 
@@ -1437,13 +1442,18 @@ fn translate_h2_upgrade_policy(
     }
 }
 
-/// Parse a `connectionPool.http.*` `uint32`-typed field. Rejects negative
-/// values, zero (every supported field's semantics require at least one),
-/// and values > `u32::MAX`.
+/// Parse a uint32 `connectionPool.http.*` knob. Negative and non-integer
+/// values are always rejected. `allow_zero` controls the lower bound: most
+/// knobs (`http2MaxRequests`, `maxRetries`) reject `0` as ambiguous, but
+/// `maxRequestsPerConnection` accepts `0` as Istio's documented "unlimited"
+/// sentinel (Istio default; the Ferrum schema/OpenAPI advertise `0` as the
+/// supported unlimited value for `Proxy.pool_max_requests_per_connection`),
+/// so blocking it here would reject a config the schema claims to accept.
 fn translate_http_uint32(
     object: &K8sObject,
     field: &str,
     value: &Value,
+    allow_zero: bool,
 ) -> Result<u32, K8sTranslateError> {
     let raw = value.as_i64().ok_or_else(|| {
         invalid_resource(
@@ -1451,10 +1461,16 @@ fn translate_http_uint32(
             format!("trafficPolicy.connectionPool.http.{field} must be an integer"),
         )
     })?;
-    if raw <= 0 {
+    let lower_bound_violated = if allow_zero { raw < 0 } else { raw <= 0 };
+    if lower_bound_violated {
+        let requirement = if allow_zero {
+            "must be non-negative"
+        } else {
+            "must be positive"
+        };
         return Err(invalid_resource(
             object,
-            format!("trafficPolicy.connectionPool.http.{field} must be positive, got {raw}"),
+            format!("trafficPolicy.connectionPool.http.{field} {requirement}, got {raw}"),
         ));
     }
     if raw > i64::from(u32::MAX) {
@@ -15091,9 +15107,36 @@ extensionProviders:
         .expect_err("negative maxRequestsPerConnection must fail");
         assert!(
             err.to_string()
-                .contains("maxRequestsPerConnection must be positive"),
+                .contains("maxRequestsPerConnection must be non-negative"),
             "unexpected: {err}"
         );
+    }
+
+    #[test]
+    fn destination_rule_accepts_zero_max_requests_per_connection() {
+        // Istio's documented "unlimited" sentinel for maxRequestsPerConnection
+        // is `0`; the Ferrum schema/OpenAPI advertise `0` as supported, so the
+        // translator must accept it (unlike `http2MaxRequests`/`maxRetries`,
+        // which reject zero) and carry it through to the overlay.
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {"http": {"maxRequestsPerConnection": 0}}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("zero maxRequestsPerConnection (Istio unlimited) must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let dr = &mesh.destination_rules[0];
+        let tp = dr.traffic_policy.as_ref().expect("traffic policy");
+        let http = tp.connection_pool_http.as_ref().expect("http overlay");
+        assert_eq!(http.max_requests_per_connection, Some(0));
     }
 
     #[test]
