@@ -28,19 +28,13 @@ pub fn tonic_tls_config(tls: &DpGrpcTlsConfig) -> tonic::transport::ClientTlsCon
     client_tls
 }
 
-/// Whether a live stream on a *fallback* CP should race a primary-CP retry timer.
+/// Whether a live stream on a *fallback* CP should race a primary-CP retry future.
 ///
-/// Shared by the xDS and native `MeshSubscribe` clients so both honor
-/// `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` identically: only retry the primary
-/// when (a) we are currently connected to a fallback CP, (b) the operator
-/// configured a non-zero retry interval, and (c) a first slice has already been
-/// installed — so we never abandon the only reachable CP before we have config.
-pub fn should_race_primary_retry(
-    is_fallback: bool,
-    primary_retry_secs: u64,
-    has_first_slice: bool,
-) -> bool {
-    is_fallback && primary_retry_secs > 0 && has_first_slice
+/// The caller's retry future is responsible for waiting until the first slice is
+/// installed before sleeping the configured interval, so a fallback stream that
+/// delivers the first slice and stays healthy can still fail back to primary.
+pub fn should_race_primary_retry(is_fallback: bool, primary_retry_secs: u64) -> bool {
+    is_fallback && primary_retry_secs > 0
 }
 
 pub async fn sleep_or_shutdown(
