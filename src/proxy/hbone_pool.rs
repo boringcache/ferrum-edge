@@ -589,6 +589,7 @@ impl HboneConnectionPool {
             expected_peer,
             &pool_config,
             keepalive_override,
+            None,
         )
         .await?;
         let baggage = baggage_header_for_source(&source_identity);
@@ -642,13 +643,24 @@ impl HboneConnectionPool {
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
         let (source_identity, _fingerprint) = self.current_svid_identity_cached()?;
         let pool_config = self.pool_config.for_proxy(proxy);
-        // DR keepalive override resolved for the destination's APP port, not the
-        // transport `hbone_port` (mirrors the WS byte-tunnel path).
-        let keepalive_override = proxy
+        // Per-port DestinationRule overrides (`portLevelSettings`) are stored on
+        // the UDP upstream's `port_overrides` and precomputed onto
+        // `dispatch_port_overrides`. Resolve them for the destination's APP port
+        // (the DR keying port), NOT the transport `hbone_port`, mirroring the
+        // WS byte-tunnel path and the byte-stream inbound relay's
+        // `effective_connect_timeout_ms` (codex r5 P2):
+        // - `tcpKeepalive` flows into the dial's socket keepalive;
+        // - `connectTimeout` bounds the WHOLE dial (TCP + TLS + H2 handshake)
+        //   AND the CONNECT-stream response wait.
+        let port_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&app_port))
-            .and_then(|o| o.tcp_keepalive.as_ref());
+            .and_then(|m| m.get(&app_port));
+        let keepalive_override = port_override.and_then(|o| o.tcp_keepalive.as_ref());
+        let effective_connect_timeout_ms = port_override
+            .and_then(|o| o.connect_timeout_ms)
+            .unwrap_or(proxy.backend_connect_timeout_ms);
+        let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
@@ -658,11 +670,12 @@ impl HboneConnectionPool {
             expected_peer,
             &pool_config,
             keepalive_override,
+            Some(connect_timeout),
         )
         .await?;
         let baggage = baggage_header_for_source(&source_identity);
         tokio::time::timeout(
-            Duration::from_millis(proxy.backend_connect_timeout_ms),
+            connect_timeout,
             open_h2_connect_stream(
                 sender,
                 app_host,
@@ -676,7 +689,7 @@ impl HboneConnectionPool {
             authority: authority_for_host_port(app_host, app_port),
             message: format!(
                 "timed out after {}ms waiting for datagram-over-HBONE CONNECT response",
-                proxy.backend_connect_timeout_ms
+                effective_connect_timeout_ms
             ),
         })?
     }
@@ -1063,6 +1076,7 @@ impl HboneConnectionPool {
             expected_peer,
             pool_config,
             keepalive_override,
+            None,
         )
         .await
     }
@@ -1244,6 +1258,12 @@ pub(crate) async fn dial_h2_connect_sender(
     expected_peer: Option<&crate::identity::SpiffeId>,
     pool_config: &PoolConfig,
     keepalive_override: Option<&crate::config::types::TcpKeepaliveCfg>,
+    // Per-port DestinationRule `connectTimeout` override (resolved by the caller
+    // for the destination APP port, the DR keying port — NOT the transport dial
+    // port). `None` keeps the proxy-level `backend_connect_timeout_ms`. Bounds
+    // the WHOLE dial (TCP + TLS + H2 handshake), mirroring the byte-stream
+    // inbound relay's `effective_connect_timeout_ms` (codex r5 P2).
+    connect_timeout_override: Option<Duration>,
 ) -> Result<SendRequest<Bytes>, HbonePoolError> {
     let resolved_ip = dns_cache
         .resolve(
@@ -1258,7 +1278,10 @@ pub(crate) async fn dial_h2_connect_sender(
         })?;
     let sock_addr = std::net::SocketAddr::new(resolved_ip, dial_port);
     let addr = sock_addr.to_string();
-    let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+    let effective_connect_timeout_ms = connect_timeout_override
+        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(proxy.backend_connect_timeout_ms);
+    let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
     let connect_started = Instant::now();
 
     let tcp = tokio::time::timeout(
@@ -1268,7 +1291,7 @@ pub(crate) async fn dial_h2_connect_sender(
     .await
     .map_err(|_| HbonePoolError::ConnectTimeout {
         addr: addr.clone(),
-        timeout_ms: proxy.backend_connect_timeout_ms,
+        timeout_ms: effective_connect_timeout_ms,
     })?
     .map_err(|source| HbonePoolError::Connect {
         addr: addr.clone(),
@@ -1301,14 +1324,14 @@ pub(crate) async fn dial_h2_connect_sender(
     else {
         return Err(HbonePoolError::ConnectTimeout {
             addr,
-            timeout_ms: proxy.backend_connect_timeout_ms,
+            timeout_ms: effective_connect_timeout_ms,
         });
     };
     let tls_stream = tokio::time::timeout(remaining, connector.connect(server_name, tcp))
         .await
         .map_err(|_| HbonePoolError::ConnectTimeout {
             addr: addr.clone(),
-            timeout_ms: proxy.backend_connect_timeout_ms,
+            timeout_ms: effective_connect_timeout_ms,
         })?
         .map_err(|e| HbonePoolError::TlsHandshake {
             host: target_host.to_string(),
@@ -1330,14 +1353,14 @@ pub(crate) async fn dial_h2_connect_sender(
     else {
         return Err(HbonePoolError::ConnectTimeout {
             addr,
-            timeout_ms: proxy.backend_connect_timeout_ms,
+            timeout_ms: effective_connect_timeout_ms,
         });
     };
     let (sender, mut connection) = tokio::time::timeout(remaining, builder.handshake(tls_stream))
         .await
         .map_err(|_| HbonePoolError::ConnectTimeout {
             addr,
-            timeout_ms: proxy.backend_connect_timeout_ms,
+            timeout_ms: effective_connect_timeout_ms,
         })?
         .map_err(|e| HbonePoolError::H2Handshake {
             host: target_host.to_string(),

@@ -11468,6 +11468,25 @@ async fn handle_proxy_request_inner(
         other => other,
     };
 
+    // Datagram-over-HBONE CONNECTs MUST always traverse the guarded inbound
+    // relay-synthesis path, never an LB-backed HTTP/TCP route. The UDP handler
+    // dials a local `UdpSocket` straight at the route's backend addr+port, so a
+    // `udp`-marked CONNECT whose `:authority` happens to match a materialized
+    // HTTP/TCP route would open a socket to that route's destination WITHOUT the
+    // open-relay destination guard (`inbound_hbone_relay_destination_allowed`)
+    // that `build_inbound_hbone_relay_proxy` applies. Forcing a route miss here
+    // funnels every UDP CONNECT through that guard (which bounds the authority to
+    // a loopback / slice-known workload addr+port) or a fail-closed 404 — the
+    // same destination check the byte-stream relay's synthesis path enforces
+    // (codex r5 P2). The byte-stream HBONE relay deliberately keeps matched-route
+    // dispatch (VirtualService `mesh_route_dispatch` overrides ride it), so this
+    // is scoped to the UDP variant only.
+    let route_match = if is_udp_hbone_connect {
+        None
+    } else {
+        route_match
+    };
+
     let (proxy, strip_len) = match route_match {
         Some(rm) => {
             // Materialize headers now — path param injection writes to ctx.headers,

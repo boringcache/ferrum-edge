@@ -1540,13 +1540,24 @@ impl RouterCache {
                         sp.port,
                     );
                     let decision = if upstream_ids.contains(upstream_id.as_str()) {
-                        let relay_proxy =
-                            Arc::new(crate::modes::mesh::mesh_outbound_udp_relay_proxy(
-                                &service.namespace,
-                                &service.name,
-                                sp.port,
-                                &upstream_id,
-                            ));
+                        let mut relay_proxy = crate::modes::mesh::mesh_outbound_udp_relay_proxy(
+                            &service.namespace,
+                            &service.name,
+                            sp.port,
+                            &upstream_id,
+                        );
+                        // Project the UDP upstream's DestinationRule per-port
+                        // overrides (`portLevelSettings`: connectTimeout,
+                        // tcpKeepalive, ...) onto the synthesized relay proxy's
+                        // `dispatch_port_overrides`. `resolve_dispatch_port_overrides`
+                        // only populates configured `config.proxies`, not these
+                        // router-synthesized egress relay proxies, so without this
+                        // the UDP egress dial (`hbone_pool::get_datagram_tunnel`,
+                        // which reads `dispatch_port_overrides`) would ignore the
+                        // DR (codex r5 P2).
+                        relay_proxy.dispatch_port_overrides =
+                            dispatch_port_overrides_for_upstream(config, &upstream_id);
+                        let relay_proxy = Arc::new(relay_proxy);
                         let service_fqdn = config
                             .upstreams
                             .iter()
@@ -1811,6 +1822,32 @@ impl RouterCache {
             mesh_udp_egress,
         }
     }
+}
+
+/// Project an upstream's DestinationRule per-port overrides (`port_overrides`)
+/// into the `dispatch_port_overrides` shape carried on a `Proxy`. Mirrors
+/// `GatewayConfig::resolve_dispatch_port_overrides` for a single upstream, used
+/// to populate router-synthesized mesh egress relay proxies (which are NOT in
+/// `config.proxies`, so the GatewayConfig-level pass never touches them).
+/// Returns `None` when the upstream is absent or declares no port overrides.
+fn dispatch_port_overrides_for_upstream(
+    config: &GatewayConfig,
+    upstream_id: &str,
+) -> Option<std::collections::HashMap<u16, crate::config::types::ResolvedPortOverride>> {
+    let upstream = config.upstreams.iter().find(|u| u.id == upstream_id)?;
+    if upstream.port_overrides.is_empty() {
+        return None;
+    }
+    let resolved: std::collections::HashMap<u16, crate::config::types::ResolvedPortOverride> =
+        upstream
+            .port_overrides
+            .iter()
+            .filter_map(|(port, ovr)| {
+                crate::config::types::ResolvedPortOverride::from_upstream_override(ovr)
+                    .map(|resolved| (*port, resolved))
+            })
+            .collect();
+    (!resolved.is_empty()).then_some(resolved)
 }
 
 impl IndexedExactPathRoutes {
