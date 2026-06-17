@@ -4688,6 +4688,17 @@ impl Upstream {
                     .as_ref()
                     .and_then(|policy| policy.hash_on.as_ref())
                 {
+                    // Bound the length the same way upstream-level `hash_on` is
+                    // (MAX_HASH_ON_LENGTH): the value is persisted, cloned into
+                    // the LB cache, and read per request, so an unbounded
+                    // `header:`+megabytes string must be rejected at admission.
+                    if let Err(e) = validate_string_field(
+                        &format!("subsets[{i}].traffic_policy.hash_on"),
+                        hash_on,
+                        MAX_HASH_ON_LENGTH,
+                    ) {
+                        errors.push(e);
+                    }
                     let trimmed = hash_on.trim();
                     if !trimmed.is_empty()
                         && trimmed != "ip"
