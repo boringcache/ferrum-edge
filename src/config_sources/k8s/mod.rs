@@ -947,6 +947,9 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time, never set by route translation.
+        pool_http1_max_pending_requests: None,
         upstream_id: spec.upstream_id,
         upstream_subset: None,
         api_spec_id: None,
@@ -2142,6 +2145,7 @@ pub(crate) fn upstream_for_route(
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,

@@ -56,6 +56,7 @@ fn runtime() -> MeshRuntimeConfig {
         egress_stream_enabled: false,
         egress_stream_allow_plaintext: false,
         request_auth_require_exp: true,
+        locality_lb_strict: false,
     }
 }
 
@@ -81,6 +82,7 @@ fn upstream() -> Upstream {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -428,6 +430,7 @@ fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
                             ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade,
                         ),
                         max_retries: Some(2),
+                        http1_max_pending_requests: Some(128),
                     }),
                     ..MeshTrafficPolicy::default()
                 }),
@@ -507,6 +510,7 @@ fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out(
                         http2_max_requests: Some(250),
                         h2_upgrade_policy: None,
                         max_retries: None,
+                        http1_max_pending_requests: None,
                     }),
                     ..MeshTrafficPolicy::default()
                 }),
@@ -548,6 +552,7 @@ fn destination_rule_connection_pool_http_only_per_port_no_fan_out() {
                 http2_max_requests: Some(20),
                 h2_upgrade_policy: None,
                 max_retries: None,
+                http1_max_pending_requests: None,
             }),
             ..MeshTrafficPolicy::default()
         },
