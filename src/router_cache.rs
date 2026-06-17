@@ -176,7 +176,7 @@ pub(crate) struct HostRouteTable {
     /// host/path tiers, since they are (host, path)-keyed and every sibling
     /// shares its service's hosts + `/`). After a representative matches on
     /// the outbound capture listener,
-    /// [`HostRouteTable::select_mesh_outbound_port_route`] swaps in the
+    /// [`HostRouteTable::select_mesh_outbound_port_route_with_authz_port`] swaps in the
     /// sibling whose service port equals the connection's captured original
     /// destination port. Built at route-table construction; empty outside
     /// mesh mode.
@@ -335,7 +335,7 @@ pub(crate) enum MeshInboundPortSelectError {
     PortNotMaterialized,
 }
 
-/// Why [`HostRouteTable::select_mesh_outbound_port_route`] refused to pick a
+/// Why [`HostRouteTable::select_mesh_outbound_port_route_with_authz_port`] refused to pick a
 /// per-port sibling. Both cases fail closed at the request handler — captured
 /// traffic is never forwarded to a port the client did not dial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,23 +371,43 @@ impl HostRouteTable {
     ///   even for single-port groups — the client dialed a port the mesh does
     ///   not route, and forwarding it to a different port's backend would be a
     ///   misroute.
+    #[cfg(test)]
     pub(crate) fn select_mesh_outbound_port_route(
         &self,
         current: RouteMatch,
         orig_dst_port: Option<u16>,
     ) -> Result<RouteMatch, MeshOutboundPortSelectError> {
+        self.select_mesh_outbound_port_route_with_authz_port(current, orig_dst_port)
+            .map(|(route_match, _)| route_match)
+    }
+
+    /// Swap a matched mesh outbound representative route for the sibling
+    /// matching the connection's captured original-destination port, plus the
+    /// service port that authorization policy should see as
+    /// `destination.port` when the selected route belongs to a mesh outbound
+    /// service group.
+    pub(crate) fn select_mesh_outbound_port_route_with_authz_port(
+        &self,
+        current: RouteMatch,
+        orig_dst_port: Option<u16>,
+    ) -> Result<(RouteMatch, Option<u16>), MeshOutboundPortSelectError> {
         let Some(group) = self.mesh_outbound_ports.get(&current.proxy.id) else {
-            return Ok(current);
+            return Ok((current, None));
         };
         match orig_dst_port {
-            None if group.declared_http_ports == 1 => Ok(current),
+            None if group.declared_http_ports == 1 => {
+                Ok((current, group.ports.first().map(|(port, _)| *port)))
+            }
             None => Err(MeshOutboundPortSelectError::OrigDstUnavailable),
             Some(port) => match group.ports.iter().find(|(p, _)| *p == port) {
-                Some((_, proxy)) => Ok(RouteMatch {
-                    proxy: Arc::clone(proxy),
-                    path_params: current.path_params,
-                    matched_prefix_len: current.matched_prefix_len,
-                }),
+                Some((selected_port, proxy)) => Ok((
+                    RouteMatch {
+                        proxy: Arc::clone(proxy),
+                        path_params: current.path_params,
+                        matched_prefix_len: current.matched_prefix_len,
+                    },
+                    Some(*selected_port),
+                )),
                 None => Err(MeshOutboundPortSelectError::PortNotMaterialized),
             },
         }

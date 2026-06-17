@@ -623,6 +623,12 @@ pub struct RequestContext {
     /// port to disambiguate multi-port services; the address is reserved for
     /// the raw-TCP egress follow-up.
     pub orig_dst: Option<std::net::SocketAddr>,
+    /// Mesh outbound service port selected by the router after host/path
+    /// routing and optional original-destination disambiguation. Used by
+    /// `mesh_authz` for Istio `destination.port` when an outbound request has
+    /// no captured original destination, such as direct dials to a single-port
+    /// service in dev/non-Linux setups. `None` outside mesh outbound routes.
+    pub mesh_outbound_destination_authz_port: Option<u16>,
     /// Authorization destination port for a matched Sidecar `ingress[]` route
     /// (F6 §6.2): the operator-declared LISTENER port (e.g. `8443`), stamped by
     /// the request handler from `select_mesh_inbound_port_route` when the matched
@@ -705,6 +711,7 @@ impl RequestContext {
             node_waypoint_policy_scope: None,
             mesh_direction: None,
             orig_dst: None,
+            mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
         }
     }
@@ -770,6 +777,7 @@ impl RequestContext {
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
             mesh_direction: self.mesh_direction,
             orig_dst: self.orig_dst,
+            mesh_outbound_destination_authz_port: self.mesh_outbound_destination_authz_port,
             mesh_inbound_listener_authz_port: self.mesh_inbound_listener_authz_port,
         }
     }
