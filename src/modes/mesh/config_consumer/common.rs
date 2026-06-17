@@ -7,6 +7,13 @@ pub use crate::util::backoff::{BACKOFF_INITIAL_SECS, jittered_backoff, next_back
 #[cfg(test)]
 pub(crate) use crate::util::backoff::{BACKOFF_MAX_SECS, jittered_backoff_with_entropy};
 
+/// Maximum inbound gRPC message size for mesh config streams.
+///
+/// The bound is explicit so large-but-valid slices do not depend on tonic's
+/// default, while malformed or oversized control-plane responses still fail
+/// closed before unbounded allocation.
+pub const MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
 pub fn tonic_tls_config(tls: &DpGrpcTlsConfig) -> tonic::transport::ClientTlsConfig {
     let mut client_tls = tonic::transport::ClientTlsConfig::new();
 
