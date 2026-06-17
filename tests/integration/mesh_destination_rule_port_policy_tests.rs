@@ -430,6 +430,7 @@ fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
                             ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade,
                         ),
                         max_retries: Some(2),
+                        http1_max_pending_requests: Some(128),
                     }),
                     ..MeshTrafficPolicy::default()
                 }),
@@ -509,6 +510,7 @@ fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out(
                         http2_max_requests: Some(250),
                         h2_upgrade_policy: None,
                         max_retries: None,
+                        http1_max_pending_requests: None,
                     }),
                     ..MeshTrafficPolicy::default()
                 }),
@@ -550,6 +552,7 @@ fn destination_rule_connection_pool_http_only_per_port_no_fan_out() {
                 http2_max_requests: Some(20),
                 h2_upgrade_policy: None,
                 max_retries: None,
+                http1_max_pending_requests: None,
             }),
             ..MeshTrafficPolicy::default()
         },

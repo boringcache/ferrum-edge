@@ -635,11 +635,30 @@ pub(crate) fn record_backend_outcome_no_conn_end(
     );
 }
 
+/// Whether an outcome's `error_class` carries NO signal about backend health,
+/// so circuit-breaker / passive-health / least-latency / adaptive-concurrency
+/// accounting must treat it as neutral (no failure ding, no permit shrink, no
+/// latency sample):
+///
+/// * `ClientDisconnect` / `RequestBodyTooLarge` — client/gateway-side terminals;
+///   the client gave up or over-sent, which says nothing about the backend.
+/// * `DispatchPolicyRejected` — a gateway-side dispatch-policy shed BEFORE the
+///   backend was dialed (backend-TLS-SNI reject, or the
+///   `http1MaxPendingRequests` in-flight-overflow 503). The request never
+///   reached the backend, so the synthetic 503 must not trip the backend's
+///   circuit breaker / passive health, nor shrink its adaptive-concurrency
+///   permit — those would penalize a backend that was never contacted and let
+///   an overflow burst falsely eject a healthy target. Without this, default
+///   CB/AC failure classification (which counts 503) would do exactly that.
 #[inline]
 pub(crate) fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> bool {
     matches!(
         error_class,
-        Some(ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge)
+        Some(
+            ErrorClass::ClientDisconnect
+                | ErrorClass::RequestBodyTooLarge
+                | ErrorClass::DispatchPolicyRejected
+        )
     )
 }
 

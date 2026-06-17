@@ -93,6 +93,12 @@ pub enum MeshListenerKind {
     PlaintextCapture,
     MtlsTermination,
     HboneTermination,
+    /// UDP TPROXY capture listener (F3 §3.3 Stage 3). Plaintext; bound to the
+    /// Stage-2 `FERRUM_MESH_CAPTURE_UDP_PORT`. Receives TPROXY-diverted UDP
+    /// datagrams, recovers per-datagram orig-dst from the `IP_RECVORIGDSTADDR`
+    /// cmsg, and (Stage 3) drops them — the egress relay is Stage 4. Only
+    /// emitted when `FERRUM_MESH_CAPTURE_UDP_ENABLED` is set (default-off).
+    PlaintextUdpCapture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -646,30 +652,38 @@ impl MeshRuntimeConfig {
 
     pub fn listener_plan(&self) -> Vec<MeshListener> {
         match self.topology {
-            MeshTopology::Sidecar => vec![
-                MeshListener {
-                    direction: MeshTrafficDirection::Outbound,
-                    kind: MeshListenerKind::PlaintextCapture,
-                    addr: self.outbound_listen_addr,
-                },
-                MeshListener {
-                    direction: MeshTrafficDirection::Inbound,
-                    kind: MeshListenerKind::MtlsTermination,
-                    addr: self.inbound_listen_addr,
-                },
-            ],
-            MeshTopology::Ambient => vec![
-                MeshListener {
-                    direction: MeshTrafficDirection::Outbound,
-                    kind: MeshListenerKind::PlaintextCapture,
-                    addr: self.outbound_listen_addr,
-                },
-                MeshListener {
-                    direction: MeshTrafficDirection::Inbound,
-                    kind: MeshListenerKind::HboneTermination,
-                    addr: self.hbone_listen_addr,
-                },
-            ],
+            MeshTopology::Sidecar => {
+                let mut listeners = vec![
+                    MeshListener {
+                        direction: MeshTrafficDirection::Outbound,
+                        kind: MeshListenerKind::PlaintextCapture,
+                        addr: self.outbound_listen_addr,
+                    },
+                    MeshListener {
+                        direction: MeshTrafficDirection::Inbound,
+                        kind: MeshListenerKind::MtlsTermination,
+                        addr: self.inbound_listen_addr,
+                    },
+                ];
+                listeners.extend(self.udp_capture_listener());
+                listeners
+            }
+            MeshTopology::Ambient => {
+                let mut listeners = vec![
+                    MeshListener {
+                        direction: MeshTrafficDirection::Outbound,
+                        kind: MeshListenerKind::PlaintextCapture,
+                        addr: self.outbound_listen_addr,
+                    },
+                    MeshListener {
+                        direction: MeshTrafficDirection::Inbound,
+                        kind: MeshListenerKind::HboneTermination,
+                        addr: self.hbone_listen_addr,
+                    },
+                ];
+                listeners.extend(self.udp_capture_listener());
+                listeners
+            }
             MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint => {
                 vec![MeshListener {
                     direction: MeshTrafficDirection::Inbound,
@@ -684,6 +698,61 @@ impl MeshRuntimeConfig {
                 addr: self.egress_listen_addr,
             }],
         }
+    }
+
+    /// The optional UDP TPROXY capture listener (F3 §3.3 Stage 3), emitted only
+    /// in the captured topologies (Sidecar / Ambient) that also run the
+    /// outbound :15001 capture listener — UDP egress capture is an outbound
+    /// concern, and NodeWaypoint/ServiceWaypoint have no outbound capture
+    /// listener (and UDP stays mesh-wide-only there per the per-pod-scope
+    /// notes). Returns at most one listener, gated on
+    /// `FERRUM_MESH_CAPTURE_UDP_ENABLED` (default-off via
+    /// [`crate::capture::udp_capture_settings_from_env`]), bound on the
+    /// **dual-stack IPv6 wildcard** (`[::]`, independent of
+    /// `FERRUM_MESH_OUTBOUND_LISTEN_ADDR`'s family) on the Stage-2 UDP capture
+    /// port (`FERRUM_MESH_CAPTURE_UDP_PORT`): TPROXY leaves each datagram's
+    /// original (non-local) destination intact, so a specific-IP bind would miss
+    /// them — only a wildcard `IP_TRANSPARENT` socket receives the captured
+    /// non-local dests. A dual-stack `[::]` socket captures **both** v4-mapped
+    /// and v6 datagrams from one listener (codex r3 P2 — a v4-only bind
+    /// black-holes the v6 half when IPv6 capture rules are present); the bind
+    /// falls back to the v4 wildcard on hosts without IPv6. A disabled flag yields no
+    /// listener — the capture path stays inert. A *parse error* warn-skips here
+    /// (this helper is infallible because read-only predicates call it too), but
+    /// `serve_mesh_runtime` validates the same env with `?` before binding, so on
+    /// the serving path a malformed setting fails startup rather than reaching
+    /// this branch (codex r2 P2).
+    fn udp_capture_listener(&self) -> Option<MeshListener> {
+        let settings = match crate::capture::udp_capture_settings_from_env() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Skipping mesh UDP capture listener: {e}");
+                return None;
+            }
+        };
+        if !settings.udp_capture_enabled {
+            return None;
+        }
+        // Bind the capture port on the DUAL-STACK IPv6 WILDCARD (`[::]`), not the
+        // configured outbound IP (codex r1 P2) and not a family-following v4/v6
+        // choice (codex r3 P2). TPROXY (`--on-port` only, no `--on-ip`) diverts
+        // the datagram to this socket WITHOUT rewriting its destination, so each
+        // captured datagram still carries the pod's real service/cluster-IP
+        // destination, never the listener's IP; only a wildcard `IP_TRANSPARENT`
+        // socket receives those non-local dests. A single dual-stack `[::]`
+        // socket (V6ONLY disabled at bind time) claims BOTH v4-mapped and v6
+        // captured datagrams — a v4-only `0.0.0.0` bind would black-hole the v6
+        // half whenever IPv6 capture rules (`ip6tables` TPROXY) are present. The
+        // listener bind falls back to the v4 wildcard on IPv6-less hosts.
+        let addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            settings.udp_outbound_port,
+        );
+        Some(MeshListener {
+            direction: MeshTrafficDirection::Outbound,
+            kind: MeshListenerKind::PlaintextUdpCapture,
+            addr,
+        })
     }
 
     /// Whether this topology runs an inbound **TLS-terminating** listener (mTLS
@@ -1351,6 +1420,10 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         api_spec_id: None,
@@ -1611,6 +1684,10 @@ fn east_west_service_proxy(
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
         api_spec_id: None,
@@ -2707,6 +2784,10 @@ fn mesh_inbound_loopback_proxy_to(
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         api_spec_id: None,
@@ -2785,6 +2866,10 @@ pub(crate) fn mesh_inbound_hbone_relay_proxy(host: &str, port: u16) -> Proxy {
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         api_spec_id: None,
@@ -3325,6 +3410,10 @@ fn mesh_outbound_tcp_relay_proxy_with_id(id: String, namespace: &str, upstream_i
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
         api_spec_id: None,
@@ -3513,6 +3602,10 @@ fn mesh_outbound_route_proxy(
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
         api_spec_id: None,
@@ -4273,6 +4366,9 @@ fn apply_connection_pool_http_to_port_override(
     }
     if let Some(max_retries) = http.max_retries {
         slot.max_retries = Some(max_retries);
+    }
+    if let Some(pending) = http.http1_max_pending_requests {
+        slot.http1_max_pending_requests = Some(pending);
     }
 }
 
@@ -5346,6 +5442,10 @@ fn egress_gateway_proxy(
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
         api_spec_id: None,
@@ -5435,6 +5535,10 @@ fn stream_egress_gateway_proxy(
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
         api_spec_id: None,
@@ -5786,6 +5890,15 @@ fn mesh_outbound_registry_listen_ports(runtime: &MeshRuntimeConfig) -> Vec<u16> 
         .listener_plan()
         .into_iter()
         .filter(|listener| listener.direction == MeshTrafficDirection::Outbound)
+        // Exclude the UDP TPROXY capture port (codex r1 P3): the outbound
+        // registry enforces HTTP/stream egress that arrived through the TCP
+        // `PlaintextCapture` listener, but the UDP capture socket is a
+        // separate UDP-only sink. TCP and UDP can coexist on the same numeric
+        // port, so including the UDP capture port here would make a regular
+        // TCP/HTTP listener on that number be treated as mesh captured egress
+        // and rejected against the registry even though it never arrived via
+        // the TCP capture listener.
+        .filter(|listener| listener.kind != MeshListenerKind::PlaintextUdpCapture)
         .filter_map(|listener| {
             let port = listener.addr.port();
             (port != 0).then_some(port)
@@ -6247,6 +6360,18 @@ async fn serve_mesh_runtime(
     initial_applied_mesh_slice: Option<Arc<MeshSlice>>,
     mut mesh_background_handles: Vec<JoinHandle<()>>,
 ) -> Result<(), anyhow::Error> {
+    // Fail closed on malformed UDP capture settings (codex r2 P2 / r3 P2),
+    // BEFORE binding the DNS proxy or spawning any mesh background task. The
+    // `udp_capture_listener()` helper feeding `listener_plan()` is infallible
+    // (read-only predicates call it too), so it can only warn-and-skip a parse
+    // error — which would silently drop the capture listener while the Stage-2
+    // TPROXY rules still divert UDP to a now-unbound port. Validating here, at
+    // the very top of the serving path, makes an operator config error abort
+    // mesh startup cleanly instead of leaking a bound DNS socket / spawned tasks
+    // (which a later `?` would have left running for in-process retries/tests).
+    crate::capture::udp_capture_settings_from_env()
+        .map_err(|e| anyhow::anyhow!("Invalid mesh UDP capture settings: {e}"))?;
+
     let dns_cache = DnsCache::new(DnsConfig {
         global_overrides: env_config.dns_overrides.clone(),
         resolver_addresses: env_config.dns_resolver_address.clone(),
@@ -6914,6 +7039,20 @@ async fn serve_mesh_runtime(
                 .await
             } else if records_mesh_mtls_metric {
                 proxy::start_mesh_proxy_listener_with_tls_and_signal(
+                    addr,
+                    state,
+                    shutdown,
+                    tls_config,
+                    Some(direction),
+                    Some(started_tx),
+                )
+                .await
+            } else if matches!(kind, MeshListenerKind::PlaintextUdpCapture) {
+                // UDP TPROXY capture listener (F3 §3.3 Stage 3) — plaintext,
+                // distinct from the TCP capture/HTTP path: it binds a transparent
+                // UDP socket, recovers per-datagram orig-dst from cmsg, and drops
+                // (egress is Stage 4). `tls_config` is always None here.
+                proxy::start_mesh_udp_capture_listener_with_signal(
                     addr,
                     state,
                     shutdown,
@@ -8500,7 +8639,9 @@ fn listener_tls_config(
     frontend_tls: Option<Arc<rustls::ServerConfig>>,
 ) -> Option<Arc<rustls::ServerConfig>> {
     match listener.kind {
-        MeshListenerKind::PlaintextCapture => None,
+        // Both plaintext listeners (TCP outbound capture and the UDP TPROXY
+        // capture listener) terminate no TLS.
+        MeshListenerKind::PlaintextCapture | MeshListenerKind::PlaintextUdpCapture => None,
         MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination => frontend_tls,
     }
 }
