@@ -9,6 +9,7 @@
 use async_trait::async_trait;
 use regex::{Regex, RegexSet};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, warn};
 
@@ -300,13 +301,17 @@ impl AiPromptShield {
     /// Detect PII in the given text segments. Returns names of detected pattern types.
     /// Uses a single `RegexSet` DFA pass per text fragment, O(text_len)
     /// regardless of pattern count.
-    fn detect_pii(&self, texts: &[&str]) -> Vec<String> {
+    ///
+    /// Generic over `AsRef<str>` so callers can pass borrowed `&str` slices
+    /// (`ScanMode::Content`) or owned/`Cow` text (`ScanMode::All`, which must
+    /// collect stringified JSON numbers that have no backing `&str`).
+    fn detect_pii<S: AsRef<str>>(&self, texts: &[S]) -> Vec<String> {
         if self.patterns.is_empty() {
             return Vec::new();
         }
         let mut hit = vec![false; self.patterns.len()];
         for text in texts {
-            for idx in self.detection_set.matches(text).into_iter() {
+            for idx in self.detection_set.matches(text.as_ref()).into_iter() {
                 hit[idx] = true;
             }
         }
@@ -320,6 +325,25 @@ impl AiPromptShield {
                 }
             })
             .collect()
+    }
+
+    /// Fallback PII scan for a `ScanMode::All` body that failed to parse as
+    /// JSON. The decoded walker (`collect_json_strings`) needs a parsed
+    /// `Value`; a malformed JSON body has none, so without this the request
+    /// short-circuited to `Continue` and raw PII in a broken body failed open.
+    ///
+    /// For `Reject`/`Warn` the documented all-mode contract is "scans the
+    /// entire body", so we scan the raw bytes as text — this is the same
+    /// coverage the original raw-body scan provided and cannot decode JSON
+    /// escapes, which is acceptable for an already-malformed body. For
+    /// `Redact` we return no detections: an unparseable body cannot be
+    /// re-serialized after redaction, so reporting PII we cannot remove would
+    /// be misleading; the request is forwarded unchanged as before.
+    fn detect_pii_raw_fallback(&self, body: &str) -> Vec<String> {
+        if self.action == ShieldAction::Redact {
+            return Vec::new();
+        }
+        self.detect_pii(std::slice::from_ref(&body))
     }
 
     /// Parse the body as JSON, apply mode-appropriate redaction, and return
@@ -521,11 +545,14 @@ impl Plugin for AiPromptShield {
             match serde_json::from_str::<Value>(body) {
                 Ok(json) => {
                     let is_streaming = json.get("stream").and_then(|s| s.as_bool()) == Some(true);
-                    let mut texts = Vec::new();
+                    let mut texts: Vec<Cow<'_, str>> = Vec::new();
                     collect_json_strings(&json, &mut texts);
                     (self.detect_pii(&texts), is_streaming)
                 }
-                Err(_) => return PluginResult::Continue,
+                // Malformed JSON in all-mode: handled below for non-redact
+                // actions by falling back to a raw-body scan so PII in an
+                // unparseable body cannot fail open.
+                Err(_) => (self.detect_pii_raw_fallback(body), false),
             }
         } else {
             match serde_json::from_str::<Value>(body) {
@@ -717,22 +744,41 @@ fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option
         .map_err(|_| format!("ai_prompt_shield: '{field}' is too large for this platform"))
 }
 
-/// Collect every decoded JSON string value for `ScanMode::All` detection.
+/// Collect every decoded JSON token for `ScanMode::All` detection so the
+/// decoded walker matches the coverage of the original raw-body scan.
+///
 /// Serde has already resolved `\uXXXX` and other JSON string escapes here, so
 /// detection sees the same text the backend LLM will receive after parsing.
-fn collect_json_strings<'a>(value: &'a Value, texts: &mut Vec<&'a str>) {
+///
+/// Collected, mirroring the raw-body scan this replaced:
+/// - String values (borrowed `&str`).
+/// - Object keys (borrowed `&str`) — e.g. `{"a@b.com":"allowed"}`, whose key
+///   the raw scan caught but a values-only walk would drop.
+/// - Numeric scalars, stringified to owned `String` — e.g. a numeric SSN
+///   `{"ssn":123456789}` or credit-card number, which a `&str`-only walk
+///   cannot see. Numbers are the load-bearing scalar case for PII.
+///
+/// Booleans and null are intentionally skipped: their canonical forms
+/// (`true`/`false`/`null`) carry no PII, so collecting them would only add
+/// noise. The walker yields `Cow<str>` (`Borrowed` for strings/keys,
+/// `Owned` for stringified numbers) so number text can be included without
+/// allocating for the common string case.
+fn collect_json_strings<'a>(value: &'a Value, texts: &mut Vec<Cow<'a, str>>) {
     match value {
-        Value::String(s) => texts.push(s.as_str()),
+        Value::String(s) => texts.push(Cow::Borrowed(s.as_str())),
+        Value::Number(n) => texts.push(Cow::Owned(n.to_string())),
         Value::Array(items) => {
             for item in items {
                 collect_json_strings(item, texts);
             }
         }
         Value::Object(map) => {
-            for value in map.values() {
+            for (key, value) in map {
+                texts.push(Cow::Borrowed(key.as_str()));
                 collect_json_strings(value, texts);
             }
         }
+        // Bool / Null carry no PII; deliberately dropped.
         _ => {}
     }
 }

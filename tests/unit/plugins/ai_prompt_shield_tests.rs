@@ -472,6 +472,146 @@ async fn test_scan_all_mode_redacts_json_escaped_pii() {
     assert!(!content.contains("a@b.com"));
 }
 
+// ─── ScanMode::All — decoded-walker coverage parity with raw scan ──────
+// The decoded walker (collect_json_strings) must catch PII the original
+// raw-body scan caught: object keys and numeric scalars.
+
+#[tokio::test]
+async fn test_scan_all_mode_detects_pii_in_object_key() {
+    // PII hidden in an object KEY, not a value. A values-only walk drops it;
+    // the raw scan it replaced caught it.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["email"],
+        "scan_fields": "all"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4",
+        "a@b.com": "allowed"
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_scan_all_mode_detects_numeric_ssn() {
+    // A numeric (non-string) SSN. A &str-only walk cannot see JSON numbers;
+    // the raw scan matched the 9 digits.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ssn"],
+        "scan_fields": "all"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4",
+        "ssn": 123456789i64
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_scan_all_mode_detects_numeric_credit_card() {
+    // A numeric credit-card value. Same numeric-scalar gap as the SSN case.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["credit_card"],
+        "scan_fields": "all"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4",
+        "card": 4111111111111111i64
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+// ─── ScanMode::All — malformed-JSON fallback (no fail-open) ────────────
+
+#[tokio::test]
+async fn test_scan_all_mode_rejects_malformed_json_with_raw_pii() {
+    // Malformed JSON body containing raw PII. The decoded walker needs a
+    // parsed Value; without a raw-body fallback this short-circuited to
+    // Continue and the PII failed open.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["email"],
+        "scan_fields": "all"
+    }))
+    .unwrap();
+    // Missing closing brace/quote → serde_json parse failure.
+    let raw_body = r#"{"model":"gpt-4","note":"contact a@b.com"#;
+    assert!(
+        serde_json::from_str::<serde_json::Value>(raw_body).is_err(),
+        "test payload must be malformed JSON"
+    );
+    let mut ctx = make_post_ctx_with_raw_body(raw_body);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_scan_all_mode_warns_on_malformed_json_with_raw_pii() {
+    // Warn action: malformed body with raw PII still scanned, passes through
+    // with a warning recorded rather than failing open silently.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["email"],
+        "scan_fields": "all",
+        "action": "warn"
+    }))
+    .unwrap();
+    let raw_body = r#"{"model":"gpt-4","note":"contact a@b.com"#;
+    let mut ctx = make_post_ctx_with_raw_body(raw_body);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert!(
+        ctx.metadata.contains_key("ai_shield_warnings"),
+        "warn action should record a warning for raw PII in malformed JSON"
+    );
+}
+
+#[tokio::test]
+async fn test_scan_all_mode_redact_passes_malformed_json_unchanged() {
+    // Redact action: an unparseable body cannot be re-serialized after
+    // redaction, so we forward it unchanged (Continue) rather than report PII
+    // we cannot remove. Body must be left untouched.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+    let raw_body = r#"{"model":"gpt-4","note":"contact a@b.com"#;
+    let mut ctx = make_post_ctx_with_raw_body(raw_body);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.metadata.get("request_body").map(String::as_str),
+        Some(raw_body),
+        "redact must leave a malformed body untouched"
+    );
+}
+
+#[tokio::test]
+async fn test_scan_all_mode_malformed_json_without_pii_continues() {
+    // Control: malformed JSON with no PII must still pass through cleanly.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["email"],
+        "scan_fields": "all"
+    }))
+    .unwrap();
+    let raw_body = r#"{"model":"gpt-4","note":"hello there"#;
+    let mut ctx = make_post_ctx_with_raw_body(raw_body);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
 #[tokio::test]
 async fn test_scan_content_only_mode() {
     let plugin = AiPromptShield::new(&json!({
