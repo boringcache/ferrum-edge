@@ -915,77 +915,6 @@ fn record_cross_protocol_client_acquire_failure(
     );
 }
 
-/// Acquire one `http1MaxPendingRequests` in-flight slot for an H3→HTTP plain
-/// attempt, applying the SAME gate as the H1/H2 reqwest path
-/// (`resolve_backend_http1_max_pending_requests` filtered by
-/// `reqwest_dispatch_is_http1_only`). Returns `Ok(slot)` (the RAII guard, held
-/// only for the dispatch → response-headers window) — `Ok(None)` when no cap
-/// applies — or `Err(())` when the destination is at its in-flight cap and the
-/// caller must shed with a 503 ("upstream overflow"). The cap is consulted only
-/// when the dispatch is known HTTP/1.1, so an h2-capable reqwest dispatch is
-/// never 503'd by an `http1*` knob.
-fn acquire_cross_protocol_pending_slot(
-    state: &ProxyState,
-    dispatch_proxy: &Proxy,
-    current_target: Option<&UpstreamTarget>,
-    effective_host: &str,
-) -> Result<Option<crate::backend_pending_limit::BackendPendingGuard>, ()> {
-    let pending_dispatch_port = current_target
-        .map(|t| t.port)
-        .unwrap_or(dispatch_proxy.backend_port);
-    let pending_cap = crate::proxy::resolve_backend_http1_max_pending_requests(
-        dispatch_proxy,
-        pending_dispatch_port,
-    )
-    .filter(|_| {
-        crate::proxy::reqwest_dispatch_is_http1_only(state, dispatch_proxy, current_target)
-    });
-    match state.backend_pending_limit.try_acquire(
-        effective_host,
-        pending_dispatch_port,
-        pending_cap,
-    ) {
-        Ok(slot) => Ok(slot),
-        Err(limit) => {
-            warn!(
-                proxy_id = %dispatch_proxy.id,
-                backend_host = %effective_host,
-                backend_port = pending_dispatch_port,
-                pending_requests = limit.current,
-                max_pending_requests = limit.cap,
-                "Shedding H3→HTTP/1.1 request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
-            );
-            Err(())
-        }
-    }
-}
-
-/// Write the 503 "upstream overflow" response when an H3→HTTP plain attempt is
-/// shed by the `http1MaxPendingRequests` gate. Tags the outcome
-/// `DispatchPolicyRejected` (a no-backend-signal class), matching the H1/H2
-/// reqwest path's overflow shed so it stays neutral to backend health/CB/AC.
-async fn cross_protocol_pending_overflow_outcome<S>(
-    stream: &mut RequestStream<S, Bytes>,
-    backend_start: Instant,
-    bytes_sent: u64,
-    current_url: &str,
-) -> Result<CrossProtocolOutcome, anyhow::Error>
-where
-    S: RecvStream + SendStream<Bytes>,
-{
-    let mut outcome = write_error(
-        stream,
-        StatusCode::SERVICE_UNAVAILABLE,
-        r#"{"error":"Upstream pending request queue full"}"#,
-        backend_start,
-        bytes_sent,
-    )
-    .await?;
-    outcome.backend_target = Some(strip_query_from_backend_url(current_url));
-    outcome.error_class = Some(ErrorClass::DispatchPolicyRejected);
-    Ok(outcome)
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_plain<S>(
     state: &ProxyState,
@@ -1191,54 +1120,12 @@ where
                         Err(outcome) => return Ok(outcome),
                     };
 
-                    // Per-attempt `http1MaxPendingRequests` gate (finding 4):
-                    // enforce the same in-flight cap the H1/H2 reqwest path takes
-                    // (`proxy_to_backend` / `proxy_to_backend_retry`). Acquired
-                    // only when the dispatch is known HTTP/1.1; released the
-                    // instant `send()` returns (the explicit `drop` below) so it
-                    // spans this attempt's dispatch → response-headers window.
-                    let pending_slot = match acquire_cross_protocol_pending_slot(
-                        state,
-                        dispatch_proxy,
-                        current_target.as_deref(),
-                        effective_host,
-                    ) {
-                        Ok(slot) => slot,
-                        Err(()) => {
-                            record_cross_protocol_backend_admission_outcome(
-                                &mut backend_admission_permits,
-                                503,
-                                false,
-                                Some(ErrorClass::DispatchPolicyRejected),
-                                backend_admission_start.elapsed(),
-                            );
-                            // Balance the `record_cross_protocol_connection_start`
-                            // above (conn_end = true). `DispatchPolicyRejected`
-                            // is a no-backend-signal class, so this shed stays
-                            // neutral to backend CB / passive health / AC.
-                            record_backend_outcome(
-                                state,
-                                dispatch_proxy,
-                                &epoch.load_balancer,
-                                upstream_balancer,
-                                current_target.as_deref(),
-                                current_cb_target_key.as_deref(),
-                                503,
-                                false,
-                                Some(ErrorClass::DispatchPolicyRejected),
-                                cb_retry_probe_slot_available,
-                                false,
-                                backend_start.elapsed(),
-                            );
-                            return cross_protocol_pending_overflow_outcome(
-                                stream,
-                                backend_start,
-                                bytes_sent,
-                                &current_url,
-                            )
-                            .await;
-                        }
-                    };
+                    // NOTE: `http1MaxPendingRequests` enforcement on this H3→HTTP
+                    // bridge is DEFERRED to #1816. The H1/H2 reqwest path checks the
+                    // pending cap BEFORE backend admission; replicating that ordering
+                    // here (acquire the slot before `run_cross_protocol_backend_admission_or_reject`,
+                    // per-attempt) is a non-trivial retry-loop restructure, tracked in
+                    // #1816 alongside the SD per-port / route-rebuild follow-ups.
                     let send_result = build_plain_request_builder(
                         &client,
                         state,
@@ -1254,12 +1141,6 @@ where
                     .body(buffered_body.clone())
                     .send()
                     .await;
-                    // Release this attempt's in-flight slot the instant `send()`
-                    // resolves — BEFORE response-body collection — so it spans
-                    // only dispatch → response-headers. A no-cap / non-H1 attempt
-                    // holds `None`, so the drop is a no-op.
-                    drop(pending_slot);
-
                     match send_result {
                         Ok(response) => {
                             let attempt_result = crate::retry::BackendResponse {
@@ -1584,52 +1465,10 @@ where
                     Err(outcome) => return Ok(outcome),
                 };
 
-                // Per-attempt `http1MaxPendingRequests` gate (finding 4). The
-                // guard is held across the streamed-upload send below and
-                // released the instant `send_future` resolves (the explicit
-                // `drop(pending_slot)` after the send loop).
-                let pending_slot = match acquire_cross_protocol_pending_slot(
-                    state,
-                    dispatch_proxy,
-                    current_target.as_deref(),
-                    effective_host,
-                ) {
-                    Ok(slot) => slot,
-                    Err(()) => {
-                        record_cross_protocol_backend_admission_outcome(
-                            &mut backend_admission_permits,
-                            503,
-                            false,
-                            Some(ErrorClass::DispatchPolicyRejected),
-                            backend_admission_start.elapsed(),
-                        );
-                        // Balance the `record_cross_protocol_connection_start`
-                        // above (conn_end = true); neutral to backend health
-                        // (`DispatchPolicyRejected` is a no-backend-signal class).
-                        record_backend_outcome(
-                            state,
-                            dispatch_proxy,
-                            &epoch.load_balancer,
-                            upstream_balancer,
-                            current_target.as_deref(),
-                            current_cb_target_key.as_deref(),
-                            503,
-                            false,
-                            Some(ErrorClass::DispatchPolicyRejected),
-                            cb_retry_probe_slot_available,
-                            false,
-                            backend_start.elapsed(),
-                        );
-                        crate::http3::stream_util::halt_request_body(stream);
-                        return cross_protocol_pending_overflow_outcome(
-                            stream,
-                            backend_start,
-                            0,
-                            &current_url,
-                        )
-                        .await;
-                    }
-                };
+                // NOTE: `http1MaxPendingRequests` enforcement on this H3→HTTP bridge
+                // is DEFERRED to #1816 (see the buffered arm above) — replicating the
+                // H1/H2 "pending cap before backend admission" ordering here is a
+                // retry-loop restructure tracked there.
                 let req_builder = build_plain_request_builder(
                     &client,
                     state,
@@ -1831,13 +1670,6 @@ where
                         }
                     }
                 };
-                // Release this attempt's `http1MaxPendingRequests` slot the
-                // instant `send_future` resolved (response headers / dial
-                // failure) — BEFORE response-body streaming — so it spans only
-                // the dispatch → response-headers window, matching the H1/H2
-                // path. A no-cap / non-H1 attempt holds `None`, so this is a
-                // no-op.
-                drop(pending_slot);
                 // Final safety net: regardless of how the reader exited
                 // (notified, naturally, oversized, recv error, or dropped
                 // because the halt_notify never reached an uncancellable
@@ -4485,12 +4317,11 @@ mod tests {
     use std::time::Instant;
 
     use super::{
-        acquire_cross_protocol_pending_slot, apply_buffered_grpc_plugin_reject,
-        apply_buffered_plain_plugin_reject, apply_h3_grpc_reject_metadata,
-        build_plain_request_builder, cross_protocol_header_write_disconnect_outcome,
-        inspected_emitted_response_limit_exceeded, normalize_h3_grpc_reject,
-        record_cross_protocol_client_acquire_failure, record_cross_protocol_connection_start,
-        reject_body_as_h3_grpc_message,
+        apply_buffered_grpc_plugin_reject, apply_buffered_plain_plugin_reject,
+        apply_h3_grpc_reject_metadata, build_plain_request_builder,
+        cross_protocol_header_write_disconnect_outcome, inspected_emitted_response_limit_exceeded,
+        normalize_h3_grpc_reject, record_cross_protocol_client_acquire_failure,
+        record_cross_protocol_connection_start, reject_body_as_h3_grpc_message,
         release_cross_protocol_circuit_breaker_probe_on_admission_reject,
         sanitize_h3_grpc_message_for_header, should_finish_h3_stream_without_trailers,
         should_skip_cross_protocol_backend_header,
@@ -5411,93 +5242,6 @@ mod tests {
             effective_sd.backend_connect_timeout_ms, 1_500,
             "the bridge must apply the SD top-level fallback on a runtime-resolved port"
         );
-    }
-
-    /// #1806 codex r1 finding 4: the H3→HTTP plain bridge enforces the
-    /// `http1MaxPendingRequests` in-flight gate (`acquire_cross_protocol_pending_slot`),
-    /// matching the H1/H2 reqwest path. A plaintext-`http` backend is always
-    /// HTTP/1.1 over reqwest, so the cap applies; a second concurrent acquire at
-    /// cap 1 is shed (the bridge returns 503 "upstream overflow"); the slot frees
-    /// on drop.
-    #[tokio::test]
-    async fn h3_plain_bridge_pending_gate_applies_for_http1() {
-        let state = minimal_proxy_state();
-        // `minimal_proxy()` defaults to DispatchKind::HttpPool (plaintext) →
-        // `reqwest_dispatch_is_http1_only` is true, so the gate applies.
-        let mut proxy = minimal_proxy();
-        proxy.backend_port = 8080;
-        proxy.dispatch_port_overrides = Some(HashMap::from([(
-            8080u16,
-            crate::config::types::ResolvedPortOverride {
-                http1_max_pending_requests: Some(1),
-                ..Default::default()
-            },
-        )]));
-        let target = target_for_test(8080);
-
-        let first =
-            acquire_cross_protocol_pending_slot(&state, &proxy, Some(&target), "backend.example")
-                .expect("first under-cap acquire succeeds");
-        assert!(first.is_some(), "an applicable cap must hand out a guard");
-
-        // Second concurrent acquire at cap 1 is shed.
-        acquire_cross_protocol_pending_slot(&state, &proxy, Some(&target), "backend.example")
-            .expect_err("a second concurrent acquire at cap 1 must be shed");
-
-        // Releasing the first frees the slot for reuse.
-        drop(first);
-        let reacquired =
-            acquire_cross_protocol_pending_slot(&state, &proxy, Some(&target), "backend.example")
-                .expect("slot frees after drop");
-        assert!(reacquired.is_some());
-    }
-
-    /// #1806 codex r1 finding 4: the pending gate consults the SELECTED target's
-    /// port (and the SD top-level fallback), so a retry that rotated to a
-    /// different port gets THAT port's cap. A port with no cap is uncapped.
-    #[tokio::test]
-    async fn h3_plain_bridge_pending_gate_keyed_by_selected_port_with_sd_fallback() {
-        let state = minimal_proxy_state();
-        let mut proxy = minimal_proxy();
-        proxy.backend_port = 8080;
-        proxy.dispatch_port_overrides = Some(HashMap::from([(
-            8080u16,
-            crate::config::types::ResolvedPortOverride {
-                http1_max_pending_requests: Some(1),
-                ..Default::default()
-            },
-        )]));
-        // SD top-level fallback caps any port WITHOUT an explicit per-port entry.
-        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
-            http1_max_pending_requests: Some(1),
-            ..Default::default()
-        });
-
-        // Port 8080 (explicit cap 1): a second acquire is shed.
-        let target_8080 = target_for_test(8080);
-        let _g = acquire_cross_protocol_pending_slot(
-            &state,
-            &proxy,
-            Some(&target_8080),
-            "backend.example",
-        )
-        .expect("first acquire on 8080")
-        .expect("guard present");
-        acquire_cross_protocol_pending_slot(&state, &proxy, Some(&target_8080), "backend.example")
-            .expect_err("8080 at its explicit cap 1 must shed");
-
-        // Port 9090 (no per-port entry) inherits the SD fallback cap 1.
-        let target_9090 = target_for_test(9090);
-        let _g2 = acquire_cross_protocol_pending_slot(
-            &state,
-            &proxy,
-            Some(&target_9090),
-            "backend.example",
-        )
-        .expect("first acquire on 9090")
-        .expect("guard present (SD fallback cap)");
-        acquire_cross_protocol_pending_slot(&state, &proxy, Some(&target_9090), "backend.example")
-            .expect_err("9090 must inherit the SD fallback cap 1 and shed the second");
     }
 
     /// Count occurrences of a header (lowercase compare) in a built

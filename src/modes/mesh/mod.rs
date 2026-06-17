@@ -1220,16 +1220,21 @@ fn reconcile_mesh_upstream_timestamps(candidate: &mut GatewayConfig, previous: &
 /// a cold-path comparison (slice apply only), so correctness/robustness wins over
 /// avoiding the clone.
 ///
-/// `dispatch_port_override_fallback` is the ONE `#[serde(skip)]` field that is
-/// NOT a pure function of the serialized content (#1806 codex r2 finding 3): it
-/// is derived from the matching *DestinationRule*, so a DR-only edit to an SD
-/// upstream's top-level `connectionPool.http` changes it while the serialized
-/// `Upstream` content is byte-identical. Without comparing it explicitly, the
-/// reconcile would preserve the old `updated_at`, `ConfigDelta` would see no
-/// change, and the route table (which holds the `Arc<Proxy>` carrying the
-/// projected fallback) would be reused — leaving live requests on the STALE
-/// fallback until some unrelated timestamp change forced a rebuild. So we fold it
-/// into the equality explicitly.
+/// `dispatch_port_override_fallback` is a `#[serde(skip)]` field that is NOT a
+/// pure function of the serialized content (#1806): it is derived from the
+/// matching *DestinationRule*, so a DR-only edit to an SD upstream's top-level
+/// `connectionPool.http` changes it while the serialized `Upstream` content is
+/// byte-identical. Comparing it here bumps the upstream's `updated_at` so the LB
+/// cache (and `ConfigDelta`) reflect the change.
+///
+/// NOTE (#1816): immediate route-TABLE rebuild on a DR-only edit is DEFERRED.
+/// `ProxyState::delta_routes_changed` keys on PROXY add/modify/remove, and the
+/// route table holds the `Arc<Proxy>` carrying the projected fallback — a
+/// shared characteristic of ALL `#[serde(skip)]` DR-derived proxy fields (incl.
+/// the established per-port `dispatch_port_overrides`), not unique to the
+/// fallback. Until #1816 wires a proxy-side route-rebuild signal for these
+/// derived fields, an SD `connectionPool.http` edit applies on the next route
+/// rebuild (proxy change / full reload).
 fn upstream_content_eq(a: &Upstream, b: &Upstream) -> bool {
     fn content_value(upstream: &Upstream) -> serde_json::Value {
         let mut normalized = upstream.clone();

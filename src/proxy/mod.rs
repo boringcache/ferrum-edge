@@ -27564,17 +27564,17 @@ mod tests {
         assert_eq!(fallback.h2_max_concurrent_streams, Some(64));
     }
 
-    /// #1806 codex r2 finding 2: an SD upstream whose Service uses a NAMED
-    /// `targetPort` stores the explicit per-port `connectionPool.http` entry under
-    /// the DECLARED service port (named targetPorts can't be remapped at apply
-    /// time), while the LB-selected target carries the RESOLVED workload port. The
-    /// dispatch-time per-port lookup (by resolved port) therefore MISSES, so only
-    /// the top-level fallback is consulted at runtime — and it must NOT override an
-    /// explicit per-port value. The projection overlays the explicit per-port
-    /// `connectionPool.http` onto the fallback so the per-port value still wins
-    /// regardless of the resolved dial port.
+    /// #1806 (narrowed; follow-up #1816): an SD upstream whose Service uses a
+    /// NAMED `targetPort` stores the explicit per-port `connectionPool.http` entry
+    /// under the DECLARED service port (named targetPorts can't be remapped at
+    /// apply time), while the LB-selected target carries the RESOLVED workload
+    /// port. When the resolved port MATCHES the service port the per-port entry
+    /// wins (field-merged over the top-level fallback); when it does NOT (the
+    /// named-targetPort case) the per-port lookup MISSES and the TOP-LEVEL fallback
+    /// applies instead — applying the explicit per-port value to a named-targetPort
+    /// SD upstream is a DEFERRED accepted limitation (#1816). This test pins both.
     #[test]
-    fn sd_named_target_port_per_port_connection_pool_http_wins_over_top_level_fallback() {
+    fn sd_named_target_port_falls_back_to_top_level_connection_pool_http() {
         use crate::config::types::{Upstream, UpstreamPortOverride};
         // SD upstream: service port 80 carries an explicit per-port
         // `http1MaxPendingRequests: 1` (and `maxRetries: 5`); the top-level
@@ -27634,40 +27634,54 @@ mod tests {
         config.resolve_dispatch_port_overrides();
         let proxy = &config.proxies[0];
 
-        // The dispatch-time per-port lookup is by the RESOLVED workload port
-        // (8080), which has no entry, so only the fallback is consulted.
-        let target = target_for_test(8080);
-        let effective = resolve_effective_proxy_for_target(proxy, Some(&target));
-        // The explicit per-port pending cap (1) WINS over the top-level (32).
+        // Case A — resolved port == service port (80): the per-port entry IS found,
+        // so the explicit per-port values WIN (field-merged over the fallback).
+        let matched = target_for_test(80);
+        let eff_matched = resolve_effective_proxy_for_target(proxy, Some(&matched));
         assert_eq!(
-            effective.pool_http1_max_pending_requests,
+            eff_matched.pool_http1_max_pending_requests,
             Some(1),
-            "explicit per-port http1MaxPendingRequests must win over the top-level fallback"
+            "resolved port == service port: the per-port cap wins"
         );
-        // The pending-gate resolver reads the same effective value.
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(proxy, 80),
+            Some(1),
+            "pending gate sees the per-port cap when the resolved port matches"
+        );
+
+        // Case B — named targetPort resolves to a DIFFERENT workload port (8080)
+        // with no per-port entry: the per-port lookup MISSES, so the TOP-LEVEL
+        // fallback applies. Applying the explicit per-port value here is the
+        // DEFERRED accepted limitation (#1816).
+        let resolved = target_for_test(8080);
+        let eff_resolved = resolve_effective_proxy_for_target(proxy, Some(&resolved));
+        assert_eq!(
+            eff_resolved.pool_http1_max_pending_requests,
+            Some(32),
+            "named-targetPort SD: top-level fallback applies on the resolved port (#1816)"
+        );
         assert_eq!(
             resolve_backend_http1_max_pending_requests(proxy, 8080),
-            Some(1),
-            "the pending gate must see the per-port cap, not the top-level fallback"
+            Some(32),
+            "pending gate sees the top-level fallback on the resolved (named) port (#1816)"
         );
-        // The per-port `maxRetries` (5) WINS over the top-level (2) on the same
-        // resolved port.
+        // `maxRetries` on the resolved (named) port comes from the top-level (2).
         let mut with_retry = proxy.clone();
         with_retry.retry = Some(crate::config::types::RetryConfig {
             max_retries: 10,
             ..Default::default()
         });
-        let capped = cap_proxy_retry_for_target(Arc::new(with_retry), Some(&target));
+        let capped = cap_proxy_retry_for_target(Arc::new(with_retry), Some(&resolved));
         assert_eq!(
             capped.retry.as_ref().map(|r| r.max_retries),
-            Some(5),
-            "explicit per-port maxRetries must win over the top-level fallback cap"
+            Some(2),
+            "named-targetPort SD: maxRetries comes from the top-level fallback (#1816)"
         );
-        // The top-level-only field is still inherited (no per-port value to win).
+        // The top-level-only field is inherited on the resolved port.
         assert_eq!(
-            effective.pool_idle_timeout_seconds,
+            eff_resolved.pool_idle_timeout_seconds,
             Some(120),
-            "a top-level-only field with no per-port value is still inherited"
+            "a top-level-only field is inherited on the resolved port"
         );
     }
 
