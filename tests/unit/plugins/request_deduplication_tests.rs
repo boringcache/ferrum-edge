@@ -479,6 +479,98 @@ async fn test_response_buffering_releases_event_stream_content_type() {
     assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
 }
 
+/// A keyed request that streams a `text/event-stream` response never reaches
+/// `on_final_response_body` (the proxy hands the body off incrementally), so the
+/// `after_proxy` hook must release the in-flight marker. Otherwise the key stays
+/// in-flight until `inflight_ttl` cleanup and a duplicate key is answered with
+/// 409 long after the stream has ended.
+#[tokio::test]
+async fn test_after_proxy_releases_inflight_for_event_stream_response() {
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("idempotency-key".to_string(), "sse-key".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    // The fresh key is now marked in-flight.
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert!(ctx.metadata.contains_key("_dedup_key"));
+
+    // Backend returned an SSE response → `after_proxy` releases the marker.
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    let result = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+    // The dedup key is dropped so a later `on_final_response_body` is a no-op
+    // (the streamed body was never buffered for caching).
+    assert!(!ctx.metadata.contains_key("_dedup_key"));
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &HashMap::new(), b"data: x\n\n")
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+
+    // A duplicate request with the same key is now treated as fresh, not 409.
+    let mut dup_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut dup_headers = HashMap::new();
+    dup_headers.insert("idempotency-key".to_string(), "sse-key".to_string());
+    let result = plugin.before_proxy(&mut dup_ctx, &mut dup_headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "duplicate after a streamed SSE response should be fresh, not 409, got {result:?}"
+    );
+}
+
+/// `after_proxy` only releases the marker for streaming responses; a buffered
+/// (non-SSE) response keeps the marker so `on_final_response_body` can transition
+/// it to the cached `Completed` entry.
+#[tokio::test]
+async fn test_after_proxy_keeps_inflight_for_buffered_response() {
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("idempotency-key".to_string(), "json-key".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let result = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    // Still in-flight and the dedup key is preserved for caching.
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert!(ctx.metadata.contains_key("_dedup_key"));
+
+    // `on_final_response_body` then transitions the marker to a cached entry.
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, b"{}")
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+}
+
 #[test]
 fn test_tracked_keys_count() {
     let config = json!({});
