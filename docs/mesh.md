@@ -1671,20 +1671,30 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   collision-free — Ferrum uses no other packet marks; the `1337` proxy UID is a
   socket-owner match, a disjoint namespace from `skb->mark`.
 - **Default OFF.** The flag defaults off and, when off, emits **no**
-  `mangle`/TPROXY/routing rules and binds **no** listener. When on, the capture
-  rules (Stage 2) and the consuming UDP listener (Stage 3) come up together
-  behind the **same** `FERRUM_MESH_CAPTURE_UDP_ENABLED` flag, so an upgraded
-  injector never redirects UDP into a void. For **injected** pods the webhook
-  propagates `FERRUM_MESH_CAPTURE_UDP_ENABLED`, `FERRUM_MESH_CAPTURE_UDP_PORT`,
-  and `FERRUM_MESH_TPROXY_MARK` into the sidecar env from the **same** injector
-  config that drives the init container's TPROXY rules (these are not in
-  `SIDECAR_ENV_KEYS`, which only copy the injector's own runtime env), so the
-  sidecar runtime binds the very port the rules divert to instead of defaulting
-  to disabled/default-port and black-holing captured UDP. **Fail-closed on
-  malformed settings:** when the flag is set but a UDP capture var is malformed,
-  mesh startup aborts (`serve_mesh_runtime` validates the env before binding any
-  listener) rather than silently omitting the listener while the Stage-2 rules
-  still divert UDP to a now-unbound port.
+  `mangle`/TPROXY/routing rules and binds **no** listener. **The injector
+  produces only Sidecar pods, and Sidecar UDP egress is DEFERRED (Stage 4 is
+  Ambient-only), so the injector installs NO UDP TPROXY rules and does NOT set the
+  sidecar's UDP-enable env regardless of `FERRUM_MESH_CAPTURE_UDP_ENABLED`** — a
+  single central deferral switch (`injector::sidecar_udp_capture_supported()`)
+  suppresses the init container's rule emission, the runtime-enable env, and the
+  transparent-bind capability together. This matches the mesh-runtime listener
+  gate (Sidecar binds no UDP listener), so an injected Sidecar with the flag set
+  neither diverts UDP nor binds a listener: **UDP passes through un-captured**
+  instead of being diverted to an unbound port and black-holed (the worse failure
+  the round-1 Ambient-only listener gate would otherwise have introduced for
+  injected Sidecars). When Sidecar UDP egress lands, this re-enables — the rules
+  (Stage 2) and the consuming listener come up together behind the **same** flag,
+  and the webhook would propagate `FERRUM_MESH_CAPTURE_UDP_ENABLED`,
+  `FERRUM_MESH_CAPTURE_UDP_PORT`, and `FERRUM_MESH_TPROXY_MARK` from the **same**
+  injector config that drives the init container's TPROXY rules (these are not in
+  `SIDECAR_ENV_KEYS`, which only copy the injector's own runtime env). The
+  **node-agent / ambient host-netns** path is unaffected: it already installs no
+  UDP TPROXY rules (`CaptureConfig::host_netns` short-circuits
+  `udp_tproxy_commands_for_family`) and ambient's UDP relay is eBPF/HBONE.
+  **Fail-closed on malformed settings:** on the **Ambient** runtime, when the flag
+  is set but a UDP capture var is malformed, mesh startup aborts
+  (`serve_mesh_runtime` validates the env before binding any listener) rather than
+  silently omitting the listener while diverted UDP hits a now-unbound port.
 - **Stages 3–4 — consuming UDP listener + datagram-over-HBONE egress (Ambient).**
   When `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`, **only the Ambient topology** —
   the one that actually **relays** captured UDP (Stage 4 egress) — emits the
@@ -1694,9 +1704,11 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   relay and **black-hole every captured datagram**; instead, a non-Ambient
   topology with the flag set logs a **one-time warning** and emits **no** capture
   listener, leaving UDP **un-captured** (it passes through) rather than
-  captured-then-dropped. (The injector/init TPROXY-rule emission for a Sidecar
-  pod is gated separately — a tracked follow-up; this is the mesh-runtime listener
-  gate.) On Ambient the listener is bound on the **dual-stack IPv6 wildcard**
+  captured-then-dropped. (The injector/init TPROXY-rule emission for a Sidecar pod
+  is gated to MATCH this — see "Default OFF" above: the injector installs no UDP
+  rules and sets no UDP-enable env while Sidecar UDP egress is deferred, so the
+  init container and the runtime agree.) On Ambient the listener is bound on the
+  **dual-stack IPv6 wildcard**
   (`[::]`, independent of the TCP outbound listener family) and the Stage-2
   `FERRUM_MESH_CAPTURE_UDP_PORT` (default `15011`) — a
   wildcard bind because TPROXY (`--on-port` only, no `--on-ip`) leaves each

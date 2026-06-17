@@ -93,6 +93,24 @@ fn is_ipv6_unavailable_error(e: &anyhow::Error) -> bool {
     })
 }
 
+/// Canonicalize an IPv4-mapped-IPv6 `SocketAddr` (`::ffff:a.b.c.d`) to its plain
+/// IPv4 form, leaving genuine IPv6 and plain IPv4 addresses untouched.
+///
+/// The dual-stack `[::]` capture socket reports an IPv4 sender as a V4-mapped
+/// `SocketAddr::V6` (`::ffff:a.b.c.d`), but the orig-dst recovered from the
+/// per-datagram cmsg for that SAME packet is a `SocketAddr::V4`. Left as-is, the
+/// reply path builds an AF_INET socket from the V4 orig-dst and then
+/// `send_to(client)` with a V6-mapped client — a family mismatch that fails the
+/// send, so the pod never sees a reply (codex r2 P1). Canonicalizing the client
+/// here (at capture, BEFORE the session key is built) makes the client family
+/// match the orig-dst family for the reply socket AND keeps the session key
+/// consistent (key + reply agree). `IpAddr::to_canonical()` unmaps only
+/// V4-mapped V6; a real IPv6 client keeps its V6 address.
+#[cfg(target_os = "linux")]
+fn canonicalize_socket_addr(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
 /// Start the mesh UDP capture listener (Linux).
 ///
 /// Binds a transparent UDP socket on `cfg.addr`, enables per-datagram orig-dst
@@ -344,6 +362,17 @@ pub async fn start_mesh_udp_capture_listener(
 #[cfg(target_os = "linux")]
 const EGRESS_CHANNEL_DEPTH: usize = 1024;
 
+/// Fallback write deadline for a single framed tunnel `write_all`, used ONLY when
+/// the per-session idle timeout is disabled (`udp_idle_timeout_seconds == 0`). A
+/// stalled HBONE peer (stopped reading / exhausted h2 flow-control) must not let
+/// the framed `write_all` stay pending forever and leak the egress task; bounding
+/// the write tears the session down instead. When an idle timeout IS configured,
+/// that window is reused as the write deadline (a write blocked longer than the
+/// idle window is itself a dead session), so this only covers the
+/// idle-disabled case.
+#[cfg(target_os = "linux")]
+const EGRESS_TUNNEL_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Monotonic, process-wide generator of per-session identity tokens. Stamped on
 /// every admitted session and re-checked at teardown so a task only ever removes
 /// ITS OWN map entry. Wraparound is a non-issue: a `u64` at any realistic admit
@@ -404,6 +433,12 @@ fn handle_captured_datagram(
 ) -> bool {
     use tracing::debug;
 
+    // Canonicalize an IPv4-mapped-V6 client (`::ffff:a.b.c.d`, how the dual-stack
+    // `[::]` socket reports v4 senders) to its V4 form so it matches the V4
+    // orig-dst family on the reply path AND keys the session consistently (codex
+    // r2 P1). Genuine IPv6 clients are unchanged.
+    let client = canonicalize_socket_addr(client);
+
     let Some(orig_dst) = orig_dst else {
         // No orig-dst cmsg ⇒ we cannot tell where the pod dialed, so there is
         // nothing to route and nothing meaningful to key on. Drop.
@@ -414,6 +449,11 @@ fn handle_captured_datagram(
         );
         return false;
     };
+    // Canonicalize the orig-dst too: it normally arrives as `SocketAddr::V4`, but
+    // canonicalizing keeps the reply socket's bind family aligned with the
+    // canonicalized client unconditionally (the reply socket is built from
+    // `key.orig_dst`), so `send_to(client)` never trips a family mismatch.
+    let orig_dst = canonicalize_socket_addr(orig_dst);
 
     let key = CaptureSessionKey { client, orig_dst };
 
@@ -790,16 +830,35 @@ async fn run_udp_egress_session(
 
     let (mut tunnel_read, mut tunnel_write) = tokio::io::split(tunnel);
     let idle = udp_session_idle_timeout(proxy);
+    // Single framed-write deadline: reuse the idle window when configured (a write
+    // blocked longer than the whole idle window is a dead session anyway), else a
+    // fixed fallback so a stalled tunnel write can never hang forever (codex r2
+    // P2). Always `Some` — a write is always bounded.
+    let write_deadline = idle.unwrap_or(EGRESS_TUNNEL_WRITE_DEADLINE);
+
+    // Shared last-activity clock (monotonic millis — never rewinds under NTP
+    // slew). Bumped on a delivered datagram in EITHER direction (client→egress
+    // sends AND return-path tunnel→client replies) and read by the single idle
+    // watchdog, so a one-way reply stream (client quiet, dest streaming back) does
+    // NOT time out mid-flow (codex r2 P2 — mirrors `relay_hbone_udp`).
+    let last_activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        crate::socket_opts::monotonic_now_ms(),
+    ));
 
     // Return path: read framed datagrams off the tunnel and reply to the client
-    // from the transparent socket. Runs concurrently with the egress loop.
+    // from the transparent socket. Activity here keeps the session alive.
     let return_client = key.client;
     let return_socket = reply_socket.clone();
+    let return_activity = last_activity.clone();
     let return_path = async move {
         let mut buf = bytes::BytesMut::with_capacity(super::mesh_udp_frame::MAX_FRAME_PAYLOAD);
         loop {
             match super::mesh_udp_frame::read_datagram(&mut tunnel_read, &mut buf).await {
                 Ok(Some(payload)) => {
+                    return_activity.store(
+                        crate::socket_opts::monotonic_now_ms(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     // Best-effort reply; a send error (client gone) ends the
                     // return path, which tears the session down.
                     if let Err(e) = return_socket.send_to(&payload, return_client).await {
@@ -818,42 +877,76 @@ async fn run_udp_egress_session(
     };
 
     // Egress loop: drain captured datagrams, frame each, write onto the tunnel.
-    // An idle timeout (no captured datagram within the window) ends the session.
+    // Idle expiry is enforced by the shared watchdog (NOT a per-`recv` timeout,
+    // which would ignore return-path activity); each framed `write_all` is bounded
+    // by `write_deadline` so a stalled HBONE peer tears the session down instead
+    // of leaking this task (codex r2 P2).
+    let egress_activity = last_activity.clone();
     let egress_loop = async move {
         use tokio::io::AsyncWriteExt;
         let mut frame =
             bytes::BytesMut::with_capacity(2 + super::mesh_udp_frame::MAX_FRAME_PAYLOAD);
-        loop {
-            let next = match idle {
-                Some(d) => match tokio::time::timeout(d, rx.recv()).await {
-                    Ok(v) => v,
-                    Err(_) => {
-                        debug!("Mesh UDP egress: session idle timeout; ending");
-                        None
-                    }
-                },
-                None => rx.recv().await,
-            };
-            let Some(payload) = next else { break };
+        while let Some(payload) = rx.recv().await {
+            egress_activity.store(
+                crate::socket_opts::monotonic_now_ms(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             frame.clear();
             if super::mesh_udp_frame::encode_datagram(&mut frame, &payload).is_err() {
                 // A captured datagram cannot exceed MAX_FRAME_PAYLOAD, so this is
                 // unreachable for real traffic; skip rather than tear down.
                 continue;
             }
-            if let Err(e) = tunnel_write.write_all(&frame).await {
-                debug!(error = %e, "Mesh UDP egress: tunnel write failed; ending session");
-                break;
+            match tokio::time::timeout(write_deadline, tunnel_write.write_all(&frame)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    debug!(error = %e, "Mesh UDP egress: tunnel write failed; ending session");
+                    break;
+                }
+                Err(_) => {
+                    // The HBONE peer stopped reading / flow-control is exhausted;
+                    // the write stalled past the deadline. Tear the session down
+                    // rather than leak a task pinned on a never-completing write.
+                    debug!(
+                        write_deadline_ms = write_deadline.as_millis() as u64,
+                        "Mesh UDP egress: tunnel write stalled past deadline; ending session"
+                    );
+                    break;
+                }
             }
         }
         // Half-close the tunnel write side (h2 end-stream) on the way out.
         let _ = tunnel_write.shutdown().await;
     };
 
-    // Either side completing ends the session.
+    // Idle watchdog: ends the session when neither direction has been active for
+    // `idle`. `None` disables it (the future never resolves, so the two relay arms
+    // drive). Polls at a fraction of the window (clamped 100ms..1s) so an expiry
+    // fires within ~one poll of the deadline (mirrors `relay_hbone_udp`).
+    let watchdog = async move {
+        let Some(idle) = idle else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        let idle_ms = idle.as_millis().min(u64::MAX as u128) as u64;
+        let poll_ms = (idle_ms / 4).clamp(100, 1_000);
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(poll_ms));
+        loop {
+            interval.tick().await;
+            let last = last_activity.load(std::sync::atomic::Ordering::Relaxed);
+            if crate::socket_opts::monotonic_now_ms().saturating_sub(last) > idle_ms {
+                debug!("Mesh UDP egress: session idle timeout; ending");
+                break;
+            }
+        }
+    };
+
+    // Any arm completing ends the session (and, on return, the caller's
+    // `remove_session_if_owned` frees the slot + decrements `active_sessions`).
     tokio::select! {
         _ = return_path => {}
         _ = egress_loop => {}
+        _ = watchdog => {}
     }
 }
 
@@ -1236,6 +1329,33 @@ mod tests {
         remove_session_if_owned(&sessions, &active, &k, new_id);
         assert_eq!(sessions.len(), 0);
         assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn canonicalize_unmaps_v4_mapped_clients_only() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        // An IPv4-mapped-V6 client (how the dual-stack `[::]` socket reports a v4
+        // sender) canonicalizes to its plain V4 form, port preserved — so it
+        // matches the V4 orig-dst family on the reply path (codex r2 P1).
+        let mapped: SocketAddr = "[::ffff:10.0.0.5]:40000".parse().unwrap();
+        let canon = canonicalize_socket_addr(mapped);
+        assert_eq!(
+            canon,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 40000)
+        );
+        assert!(canon.is_ipv4(), "v4-mapped client must canonicalize to V4");
+
+        // A plain V4 address is unchanged.
+        let v4: SocketAddr = "10.0.0.6:50000".parse().unwrap();
+        assert_eq!(canonicalize_socket_addr(v4), v4);
+
+        // A genuine IPv6 client is left untouched (NOT a v4-mapped address).
+        let v6 = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            40000,
+        );
+        assert_eq!(canonicalize_socket_addr(v6), v6);
+        assert!(canonicalize_socket_addr(v6).is_ipv6());
     }
 
     fn admission_name(a: &SessionAdmission) -> &'static str {

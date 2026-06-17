@@ -715,10 +715,17 @@ impl MeshRuntimeConfig {
     /// ServiceWaypoint also have no outbound capture listener (and UDP stays
     /// mesh-wide-only there per the per-pod-scope notes).
     ///
-    /// NOTE: the injector/init TPROXY-rule emission for a Sidecar pod is a
-    /// SEPARATE concern (`crate::capture::udp_tproxy_commands_for_family` gates
-    /// only on `host_netns`, not topology) — gating those rules to Ambient is a
-    /// tracked follow-up. This is the mesh-runtime listener gate.
+    /// NOTE: the injector/init TPROXY-rule emission for a Sidecar pod is gated to
+    /// MATCH this runtime listener gate (codex r2 P1): the injector only produces
+    /// Sidecar pods, and `injector::sidecar_udp_capture_supported()` (a central
+    /// deferral switch) now suppresses the init container's UDP TPROXY rules, the
+    /// sidecar's runtime-enable env, AND the transparent-bind capability while
+    /// Sidecar UDP egress is deferred — so an injected Sidecar with the flag set
+    /// neither binds a UDP listener (here) nor diverts UDP (init container), and
+    /// UDP passes through un-captured instead of being black-holed. (The low-level
+    /// `crate::capture::udp_tproxy_commands_for_family` still gates only on
+    /// `host_netns`; the topology decision lives in the injector, which is the only
+    /// pod-netns emitter.)
     ///
     /// Returns at most one listener, gated on `FERRUM_MESH_CAPTURE_UDP_ENABLED`
     /// (default-off via [`crate::capture::udp_capture_settings_from_env`]), bound
