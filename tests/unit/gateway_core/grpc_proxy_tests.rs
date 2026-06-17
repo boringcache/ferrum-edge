@@ -382,9 +382,7 @@ fn test_grpc_buffered_body_capacity_hint_defaults_without_content_length() {
 
 #[tokio::test]
 async fn test_proxy_grpc_request_from_bytes_error_on_unreachable_backend() {
-    // proxy_grpc_request returns (result, body_bytes).
-    // When stream_response=true the returned body is Bytes::new() (no clone needed).
-    // We verify the buffered path (proxy_grpc_request_from_bytes) errors gracefully
+    // Verify the buffered path (proxy_grpc_request_from_bytes) errors gracefully
     // on an unreachable backend; this also confirms no panic in either code path.
     use bytes::Bytes;
 
