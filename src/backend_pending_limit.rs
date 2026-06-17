@@ -69,7 +69,10 @@
 //!   can never both squeak past `cap - 1`.
 //! - [`BackendPendingGuard`]'s `Drop` decrements exactly once on every dispatch
 //!   exit (success, early return, error, task cancellation), so an in-flight
-//!   slot can never leak and wedge a destination.
+//!   slot can never leak and wedge a destination. When the count returns to
+//!   zero, the guard also evicts the idle counter entry. That keeps wildcard
+//!   upstreams, whose concrete host can come from request authority, from
+//!   accumulating unbounded zero-count keys over the gateway lifetime.
 //!
 //! The implementation is deliberately a counting gate (a `CachePadded` atomic
 //! with a try-increment CAS), not a `tokio::sync::Semaphore`: a semaphore would
@@ -118,7 +121,13 @@ fn write_pending_key(buf: &mut String, host: &str, port: u16) {
 /// destination — matching how the cap is materialized per upstream destination
 /// port rather than per proxy.
 pub struct BackendPendingLimiter {
-    inner: Arc<DashMap<String, Arc<CachePadded<AtomicU64>>>>,
+    inner: Arc<DashMap<String, Arc<BackendPendingCounter>>>,
+}
+
+#[derive(Debug)]
+struct BackendPendingCounter {
+    key: String,
+    count: CachePadded<AtomicU64>,
 }
 
 impl Default for BackendPendingLimiter {
@@ -150,7 +159,7 @@ impl BackendPendingLimiter {
     /// into a reused thread-local buffer, so the hit path allocates nothing),
     /// falling back to the owned-key entry API only on the (cold) first request
     /// to a new destination.
-    fn counter_for(&self, host: &str, port: u16) -> Arc<CachePadded<AtomicU64>> {
+    fn counter_for(&self, host: &str, port: u16) -> Arc<BackendPendingCounter> {
         PENDING_KEY_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
             buf.clear();
@@ -162,7 +171,12 @@ impl BackendPendingLimiter {
             // Cold path: a new destination — allocate the owned key once.
             self.inner
                 .entry(buf.clone())
-                .or_insert_with(|| Arc::new(CachePadded::new(AtomicU64::new(0))))
+                .or_insert_with(|| {
+                    Arc::new(BackendPendingCounter {
+                        key: buf.clone(),
+                        count: CachePadded::new(AtomicU64::new(0)),
+                    })
+                })
                 .clone()
         })
     }
@@ -194,7 +208,7 @@ impl BackendPendingLimiter {
         let counter = self.counter_for(host, port);
         let cap_u64 = u64::from(cap);
         loop {
-            let current = counter.load(Ordering::Relaxed);
+            let current = counter.count.load(Ordering::Relaxed);
             if current >= cap_u64 {
                 return Err(BackendPendingLimitExceeded {
                     current,
@@ -203,13 +217,18 @@ impl BackendPendingLimiter {
             }
             // compare-exchange-weak in a CAS loop: two concurrent acquirers can
             // never both pass `cap - 1`.
-            match counter.compare_exchange_weak(
+            match counter.count.compare_exchange_weak(
                 current,
                 current + 1,
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Ok(Some(BackendPendingGuard { counter })),
+                Ok(_) => {
+                    return Ok(Some(BackendPendingGuard {
+                        counters: Arc::clone(&self.inner),
+                        counter,
+                    }));
+                }
                 Err(_) => continue,
             }
         }
@@ -225,9 +244,14 @@ impl BackendPendingLimiter {
             write_pending_key(&mut buf, host, port);
             self.inner
                 .get(buf.as_str())
-                .map(|c| c.load(Ordering::Relaxed))
+                .map(|c| c.count.load(Ordering::Relaxed))
                 .unwrap_or(0)
         })
+    }
+
+    #[cfg(test)]
+    fn resident_counters(&self) -> usize {
+        self.inner.len()
     }
 }
 
@@ -238,7 +262,8 @@ impl BackendPendingLimiter {
 /// lifetime.
 #[derive(Debug)]
 pub struct BackendPendingGuard {
-    counter: Arc<CachePadded<AtomicU64>>,
+    counters: Arc<DashMap<String, Arc<BackendPendingCounter>>>,
+    counter: Arc<BackendPendingCounter>,
 }
 
 impl Drop for BackendPendingGuard {
@@ -247,7 +272,11 @@ impl Drop for BackendPendingGuard {
         // silently mask a double-release / missing-acquire bug. The test suite
         // asserts the count returns to zero so any guard-lifetime regression
         // surfaces immediately.
-        self.counter.fetch_sub(1, Ordering::AcqRel);
+        if self.counter.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.counters.remove_if(&self.counter.key, |_, current| {
+                Arc::ptr_eq(current, &self.counter) && current.count.load(Ordering::Acquire) == 0
+            });
+        }
     }
 }
 
@@ -286,6 +315,11 @@ mod tests {
             limiter.current("backend", 8080),
             0,
             "no-cap path must not touch the counter map"
+        );
+        assert_eq!(
+            limiter.resident_counters(),
+            0,
+            "no-cap path must not create resident counters"
         );
     }
 
@@ -348,6 +382,46 @@ mod tests {
             .try_acquire("h", 7777, Some(1))
             .expect("slot freed after drop")
             .expect("guard present");
+    }
+
+    #[test]
+    fn drop_removes_idle_counter_entry() {
+        let limiter = BackendPendingLimiter::new();
+        {
+            let _g = limiter
+                .try_acquire("ephemeral.example.com", 80, Some(1))
+                .expect("slot acquired")
+                .expect("guard present");
+            assert_eq!(limiter.resident_counters(), 1);
+        }
+
+        assert_eq!(limiter.current("ephemeral.example.com", 80), 0);
+        assert_eq!(
+            limiter.resident_counters(),
+            0,
+            "idle counters must be evicted so wildcard hosts cannot grow the map forever"
+        );
+    }
+
+    #[test]
+    fn unique_hosts_do_not_leave_resident_zero_count_entries() {
+        let limiter = BackendPendingLimiter::new();
+
+        for i in 0..1_000 {
+            let host = format!("a{i}.example.com");
+            let guard = limiter
+                .try_acquire(&host, 80, Some(1))
+                .expect("slot acquired")
+                .expect("guard present");
+            drop(guard);
+            assert_eq!(limiter.current(&host, 80), 0);
+        }
+
+        assert_eq!(
+            limiter.resident_counters(),
+            0,
+            "completed unique wildcard hosts must not leave resident limiter keys"
+        );
     }
 
     #[test]
