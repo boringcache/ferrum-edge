@@ -27556,6 +27556,113 @@ mod tests {
         assert_eq!(fallback.h2_max_concurrent_streams, Some(64));
     }
 
+    /// #1806 codex r2 finding 2: an SD upstream whose Service uses a NAMED
+    /// `targetPort` stores the explicit per-port `connectionPool.http` entry under
+    /// the DECLARED service port (named targetPorts can't be remapped at apply
+    /// time), while the LB-selected target carries the RESOLVED workload port. The
+    /// dispatch-time per-port lookup (by resolved port) therefore MISSES, so only
+    /// the top-level fallback is consulted at runtime — and it must NOT override an
+    /// explicit per-port value. The projection overlays the explicit per-port
+    /// `connectionPool.http` onto the fallback so the per-port value still wins
+    /// regardless of the resolved dial port.
+    #[test]
+    fn sd_named_target_port_per_port_connection_pool_http_wins_over_top_level_fallback() {
+        use crate::config::types::{Upstream, UpstreamPortOverride};
+        // SD upstream: service port 80 carries an explicit per-port
+        // `http1MaxPendingRequests: 1` (and `maxRetries: 5`); the top-level
+        // `connectionPool.http` sets DIFFERENT values plus an unrelated field. At
+        // runtime the named targetPort resolves to workload port 8080.
+        let mut upstream = Upstream {
+            id: "u1".to_string(),
+            namespace: "ferrum".to_string(),
+            name: Some("u1".to_string()),
+            targets: Vec::new(),
+            algorithm: Default::default(),
+            hash_on: None,
+            hash_on_cookie_config: None,
+            health_checks: None,
+            service_discovery: None,
+            subsets: None,
+            // Per-port entry keyed by the DECLARED service port (80), as the mesh
+            // translator stores named-targetPort `portLevelSettings`.
+            port_overrides: HashMap::from([(
+                80u16,
+                UpstreamPortOverride {
+                    http1_max_pending_requests: Some(1),
+                    max_retries: Some(5),
+                    ..Default::default()
+                },
+            )]),
+            source_locality: None,
+            locality_lb_strict: false,
+            locality_lb_setting: None,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            backend_tls_sni: None,
+            backend_tls_san_allow_list: Vec::new(),
+            resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: Some(UpstreamPortOverride {
+                // Top-level overlay: a CONFLICTING pending cap + retries (must NOT
+                // override the per-port values) and an inherited-only idleTimeout.
+                http1_max_pending_requests: Some(32),
+                max_retries: Some(2),
+                http_idle_timeout_ms: Some(120_000),
+                ..Default::default()
+            }),
+            api_spec_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        upstream.normalize_fields();
+
+        let proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        let mut config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream],
+            ..GatewayConfig::default()
+        };
+        config.resolve_dispatch_port_overrides();
+        let proxy = &config.proxies[0];
+
+        // The dispatch-time per-port lookup is by the RESOLVED workload port
+        // (8080), which has no entry, so only the fallback is consulted.
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(proxy, Some(&target));
+        // The explicit per-port pending cap (1) WINS over the top-level (32).
+        assert_eq!(
+            effective.pool_http1_max_pending_requests,
+            Some(1),
+            "explicit per-port http1MaxPendingRequests must win over the top-level fallback"
+        );
+        // The pending-gate resolver reads the same effective value.
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(proxy, 8080),
+            Some(1),
+            "the pending gate must see the per-port cap, not the top-level fallback"
+        );
+        // The per-port `maxRetries` (5) WINS over the top-level (2) on the same
+        // resolved port.
+        let mut with_retry = proxy.clone();
+        with_retry.retry = Some(crate::config::types::RetryConfig {
+            max_retries: 10,
+            ..Default::default()
+        });
+        let capped = cap_proxy_retry_for_target(Arc::new(with_retry), Some(&target));
+        assert_eq!(
+            capped.retry.as_ref().map(|r| r.max_retries),
+            Some(5),
+            "explicit per-port maxRetries must win over the top-level fallback cap"
+        );
+        // The top-level-only field is still inherited (no per-port value to win).
+        assert_eq!(
+            effective.pool_idle_timeout_seconds,
+            Some(120),
+            "a top-level-only field with no per-port value is still inherited"
+        );
+    }
+
     /// Plaintext-only `Static` listener (no TLS configured) must NOT require
     /// TLS, so the accept loop can correctly route to the plaintext handler.
     #[test]

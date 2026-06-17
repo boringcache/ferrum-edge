@@ -1217,6 +1217,17 @@ fn reconcile_mesh_upstream_timestamps(candidate: &mut GatewayConfig, previous: &
 /// upstreams with equal serialized content always resolve it identically. This is
 /// a cold-path comparison (slice apply only), so correctness/robustness wins over
 /// avoiding the clone.
+///
+/// `dispatch_port_override_fallback` is the ONE `#[serde(skip)]` field that is
+/// NOT a pure function of the serialized content (#1806 codex r2 finding 3): it
+/// is derived from the matching *DestinationRule*, so a DR-only edit to an SD
+/// upstream's top-level `connectionPool.http` changes it while the serialized
+/// `Upstream` content is byte-identical. Without comparing it explicitly, the
+/// reconcile would preserve the old `updated_at`, `ConfigDelta` would see no
+/// change, and the route table (which holds the `Arc<Proxy>` carrying the
+/// projected fallback) would be reused — leaving live requests on the STALE
+/// fallback until some unrelated timestamp change forced a rebuild. So we fold it
+/// into the equality explicitly.
 fn upstream_content_eq(a: &Upstream, b: &Upstream) -> bool {
     fn content_value(upstream: &Upstream) -> serde_json::Value {
         let mut normalized = upstream.clone();
@@ -1226,6 +1237,11 @@ fn upstream_content_eq(a: &Upstream, b: &Upstream) -> bool {
         normalized.created_at = epoch;
         normalized.updated_at = epoch;
         serde_json::to_value(&normalized).unwrap_or(serde_json::Value::Null)
+    }
+    // The DR-derived `#[serde(skip)]` fallback overlay is invisible to the
+    // serialized comparison, so compare it explicitly first.
+    if a.dispatch_port_override_fallback != b.dispatch_port_override_fallback {
+        return false;
     }
     let a_value = content_value(a);
     // A serialization failure yields `Null`; never treat two failed (`Null`)
@@ -17122,6 +17138,95 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["reviews"],
             "a real upstream change must be reported modified so its LB rebuilds"
+        );
+    }
+
+    /// #1806 codex r2 finding 3: a DR-only change to an SD upstream's top-level
+    /// `connectionPool.http` alters the DERIVED `dispatch_port_override_fallback`
+    /// while the SERIALIZED `Upstream` content stays byte-identical (the field is
+    /// `#[serde(skip)]`). `upstream_content_eq` must NOT treat the two as equal —
+    /// otherwise the reconcile would restore the old `updated_at`, `ConfigDelta`
+    /// would report no change, and the route table (which carries the projected
+    /// fallback on its `Arc<Proxy>`) would be reused with the STALE fallback. The
+    /// upstream must keep its fresh timestamp and be reported modified.
+    #[test]
+    fn reconcile_mesh_upstream_timestamps_fallback_only_change_keeps_modified_delta() {
+        use crate::config::types::UpstreamPortOverride;
+
+        let first_now = chrono::Utc::now();
+        let mut accepted = GatewayConfig::default();
+        let mut accepted_upstream = reconcile_test_upstream("reviews", 8080, first_now);
+        accepted_upstream.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+            http1_max_pending_requests: Some(8),
+            ..Default::default()
+        });
+        accepted.upstreams.push(accepted_upstream);
+
+        // Re-apply with a CHANGED top-level fallback (DR edit) and a fresh
+        // timestamp; every SERIALIZED field is identical to the accepted upstream.
+        let second_now = first_now + chrono::Duration::seconds(5);
+        let mut candidate = GatewayConfig::default();
+        let mut candidate_upstream = reconcile_test_upstream("reviews", 8080, second_now);
+        candidate_upstream.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+            http1_max_pending_requests: Some(16),
+            ..Default::default()
+        });
+        candidate.upstreams.push(candidate_upstream);
+
+        // Sanity: the only difference is the `#[serde(skip)]` fallback overlay.
+        assert_ne!(
+            candidate.upstreams[0].dispatch_port_override_fallback,
+            accepted.upstreams[0].dispatch_port_override_fallback
+        );
+
+        reconcile_mesh_upstream_timestamps(&mut candidate, &accepted);
+
+        // The fallback differs, so the fresh timestamp must be preserved.
+        assert_ne!(
+            candidate.upstreams[0].updated_at, accepted.upstreams[0].updated_at,
+            "a fallback-only DR change must keep its fresh timestamp (not be reconciled away)"
+        );
+        let delta = crate::config_delta::ConfigDelta::compute(&accepted, &candidate);
+        assert_eq!(
+            delta
+                .modified_upstreams
+                .iter()
+                .map(|u| u.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["reviews"],
+            "a DR-only fallback change must be reported modified so the route table rebuilds with the fresh fallback"
+        );
+    }
+
+    /// A genuine no-op re-apply of an SD upstream with an UNCHANGED top-level
+    /// fallback must still reconcile to an empty delta — the explicit fallback
+    /// comparison must not over-trigger on equal overlays.
+    #[test]
+    fn reconcile_mesh_upstream_timestamps_equal_fallback_yields_empty_delta() {
+        use crate::config::types::UpstreamPortOverride;
+
+        let first_now = chrono::Utc::now();
+        let fallback = Some(UpstreamPortOverride {
+            http1_max_pending_requests: Some(8),
+            ..Default::default()
+        });
+        let mut accepted = GatewayConfig::default();
+        let mut accepted_upstream = reconcile_test_upstream("reviews", 8080, first_now);
+        accepted_upstream.dispatch_port_override_fallback = fallback.clone();
+        accepted.upstreams.push(accepted_upstream);
+
+        let second_now = first_now + chrono::Duration::seconds(5);
+        let mut candidate = GatewayConfig::default();
+        let mut candidate_upstream = reconcile_test_upstream("reviews", 8080, second_now);
+        candidate_upstream.dispatch_port_override_fallback = fallback;
+        candidate.upstreams.push(candidate_upstream);
+
+        reconcile_mesh_upstream_timestamps(&mut candidate, &accepted);
+
+        let delta = crate::config_delta::ConfigDelta::compute(&accepted, &candidate);
+        assert!(
+            delta.modified_upstreams.is_empty(),
+            "an unchanged fallback must reconcile to an empty delta"
         );
     }
 

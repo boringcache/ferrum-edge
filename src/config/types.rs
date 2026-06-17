@@ -597,6 +597,48 @@ impl ResolvedPortOverride {
             .http1_max_pending_requests
             .or(fallback.http1_max_pending_requests);
     }
+
+    /// Overlay the `connectionPool.http` fields from an explicit per-port
+    /// `portLevelSettings` entry onto this top-level fallback overlay so the
+    /// per-port value WINS (the inverse of [`Self::seed_connection_pool_http_from_fallback`]).
+    ///
+    /// Used when projecting an SD upstream's top-level `connectionPool.http`
+    /// fallback (#1806 codex r2 finding 2). For an SD upstream whose Service uses
+    /// a NAMED `targetPort`, the per-port entry is keyed by the DECLARED service
+    /// port (named targetPorts can't be remapped at apply time — they resolve to
+    /// a workload port at runtime), while the LB-selected target carries the
+    /// RESOLVED workload port. So the dispatch-time per-port lookup (by resolved
+    /// port) MISSES and only the fallback is consulted — which would let the
+    /// top-level overlay WRONGLY override an explicit per-port value, violating
+    /// the "portLevelSettings wins" layering. Baking the explicit per-port
+    /// `connectionPool.http` into the projected fallback here makes runtime
+    /// resolution honor the per-port value regardless of the resolved dial port.
+    ///
+    /// A mesh outbound HTTP upstream owns exactly ONE service port (its id encodes
+    /// it; the apply-time owner-gate keeps only the owning service port's
+    /// `portLevelSettings` entry — see `apply_destination_rules` in
+    /// `src/modes/mesh/mod.rs`), so every resolved dial port maps back to that one
+    /// service port and a single overlaid fallback is correct for all of them.
+    pub fn overlay_connection_pool_http_from(&mut self, per_port: &ResolvedPortOverride) {
+        if let Some(v) = per_port.http_max_requests_per_connection {
+            self.http_max_requests_per_connection = Some(v);
+        }
+        if let Some(v) = per_port.http_idle_timeout_ms {
+            self.http_idle_timeout_ms = Some(v);
+        }
+        if let Some(v) = per_port.h2_max_concurrent_streams {
+            self.h2_max_concurrent_streams = Some(v);
+        }
+        if let Some(v) = per_port.h2_upgrade_policy {
+            self.h2_upgrade_policy = Some(v);
+        }
+        if let Some(v) = per_port.max_retries {
+            self.max_retries = Some(v);
+        }
+        if let Some(v) = per_port.http1_max_pending_requests {
+            self.http1_max_pending_requests = Some(v);
+        }
+    }
 }
 
 /// Project an upstream's service-discovery TOP-LEVEL `connectionPool.http`
@@ -614,10 +656,27 @@ impl ResolvedPortOverride {
 pub(crate) fn dispatch_port_override_fallback_from_upstream(
     upstream: &Upstream,
 ) -> Option<ResolvedPortOverride> {
-    upstream
+    let mut fallback = upstream
         .dispatch_port_override_fallback
         .as_ref()
-        .and_then(ResolvedPortOverride::from_upstream_override)
+        .and_then(ResolvedPortOverride::from_upstream_override)?;
+    // An explicit per-port `portLevelSettings.connectionPool.http` field WINS
+    // over the top-level overlay (#1806 codex r2 finding 2). For an SD upstream
+    // with a NAMED `targetPort`, the per-port entry is keyed by the declared
+    // service port while the LB-selected target carries the resolved workload
+    // port, so the dispatch-time per-port lookup (by resolved port) MISSES and
+    // only this fallback is consulted at runtime. Overlay the upstream's explicit
+    // per-port `connectionPool.http` fields onto the fallback here so the per-port
+    // value still wins regardless of the resolved dial port. A mesh outbound HTTP
+    // upstream owns exactly one service port (its `port_overrides` therefore hold
+    // at most that one entry), so this single overlaid fallback is correct for
+    // every resolved dial port the targets present.
+    for ovr in upstream.port_overrides.values() {
+        if let Some(resolved) = ResolvedPortOverride::from_upstream_override(ovr) {
+            fallback.overlay_connection_pool_http_from(&resolved);
+        }
+    }
+    Some(fallback)
 }
 
 /// A named subset of upstream targets identified by label selectors.

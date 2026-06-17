@@ -113,7 +113,7 @@ use crate::plugins::{
     RequestContext, ResponseStreamAction, ResponseStreamInspector,
 };
 use crate::proxy::ProxyState;
-use crate::proxy::backend_dispatch::{record_backend_outcome, record_backend_outcome_no_conn_end};
+use crate::proxy::backend_dispatch::record_backend_outcome;
 use crate::proxy::grpc_proxy::{self, GrpcResponseKind, proxy_grpc_request_from_bytes};
 use crate::proxy::headers::{
     is_backend_response_strip_header, parse_connection_listed_headers,
@@ -797,6 +797,17 @@ async fn collect_reqwest_response_body_with_limit(
 /// port gets that port's TLS/ALPN/idle client). Returns `Ok(Ok(client))` on
 /// success, `Ok(Err(outcome))` when the caller should return the written
 /// error, or `Err(_)` only on a stream-write failure.
+///
+/// Both callers run backend admission AND
+/// `record_cross_protocol_connection_start` for the selected target BEFORE this
+/// helper, so a client-build/pool failure here must take the FULL normal outcome
+/// path, exactly like the `http1MaxPendingRequests` overflow shed below: (1)
+/// record the backend-admission outcome (so the 502 connection failure feeds
+/// adaptive concurrency and the permits are released), and (2) END the
+/// least-connections connection via `record_backend_outcome` (conn_end = true)
+/// to BALANCE the connection-start. Using `record_backend_outcome_no_conn_end`
+/// instead would leave the connection-start unended — permanently inflating the
+/// target's active-connection count — and drop the admission permits unrecorded.
 #[allow(clippy::too_many_arguments)]
 async fn get_cross_protocol_client<S>(
     state: &ProxyState,
@@ -807,6 +818,8 @@ async fn get_cross_protocol_client<S>(
     current_cb_target_key: Option<&str>,
     cb_is_half_open_probe: bool,
     backend_start: Instant,
+    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    backend_admission_elapsed: Duration,
     stream: &mut RequestStream<S, Bytes>,
 ) -> Result<Result<reqwest::Client, CrossProtocolOutcome>, anyhow::Error>
 where
@@ -819,19 +832,17 @@ where
                 proxy_id = %dispatch_proxy.id,
                 "cross-protocol H3→HTTP: failed to get client from pool: {}", e
             );
-            record_backend_outcome_no_conn_end(
+            record_cross_protocol_client_acquire_failure(
                 state,
                 dispatch_proxy,
-                &epoch.load_balancer,
+                epoch,
                 upstream_balancer,
                 current_target,
                 current_cb_target_key,
-                502,
-                true,
-                None,
                 cb_is_half_open_probe,
-                false,
-                backend_start.elapsed(),
+                backend_start,
+                backend_admission_permits,
+                backend_admission_elapsed,
             );
             let mut outcome = write_error(
                 stream,
@@ -845,6 +856,63 @@ where
             Ok(Err(outcome))
         }
     }
+}
+
+/// Record the observability accounting for an H3→HTTP plain-bridge client-acquire
+/// (pool/build) failure, BEFORE the Bad-Gateway response is written. Stream-free
+/// so the accounting is unit-testable in isolation.
+///
+/// Both callers run backend admission AND
+/// `record_cross_protocol_connection_start` for the selected target BEFORE the
+/// client acquire, so this failure must take the FULL normal outcome path,
+/// exactly like the `http1MaxPendingRequests` overflow shed: (1) record the
+/// backend-admission outcome (so the 502 connection failure feeds adaptive
+/// concurrency and the permits are released), and (2) END the least-connections
+/// connection via `record_backend_outcome` (conn_end = true) to BALANCE the
+/// connection-start. Using `record_backend_outcome_no_conn_end` instead would
+/// leave the connection-start unended — permanently inflating the target's
+/// active-connection count — and drop the admission permits unrecorded.
+#[allow(clippy::too_many_arguments)]
+fn record_cross_protocol_client_acquire_failure(
+    state: &ProxyState,
+    dispatch_proxy: &Proxy,
+    epoch: &RequestEpoch,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
+    current_target: Option<&UpstreamTarget>,
+    current_cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
+    backend_start: Instant,
+    backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
+    backend_admission_elapsed: Duration,
+) {
+    // Feed the 502 connection failure to adaptive concurrency and release the
+    // admission permits acquired by the caller for this attempt.
+    record_cross_protocol_backend_admission_outcome(
+        backend_admission_permits,
+        502,
+        true,
+        None,
+        backend_admission_elapsed,
+    );
+    // END the least-connections connection (conn_end = true) to balance the
+    // `record_cross_protocol_connection_start` the caller issued for this target,
+    // and feed the 502 connection failure to the backend circuit breaker /
+    // passive health / adaptive concurrency — mirroring the H1/H2 reqwest path's
+    // connection-start/connection-end balance and the pending-overflow shed.
+    record_backend_outcome(
+        state,
+        dispatch_proxy,
+        &epoch.load_balancer,
+        upstream_balancer,
+        current_target,
+        current_cb_target_key,
+        502,
+        true,
+        None,
+        cb_is_half_open_probe,
+        false,
+        backend_start.elapsed(),
+    );
 }
 
 /// Acquire one `http1MaxPendingRequests` in-flight slot for an H3→HTTP plain
@@ -1113,6 +1181,8 @@ where
                         current_cb_target_key.as_deref(),
                         cb_retry_probe_slot_available,
                         backend_start,
+                        &mut backend_admission_permits,
+                        backend_admission_start.elapsed(),
                         stream,
                     )
                     .await?
@@ -1504,6 +1574,8 @@ where
                     current_cb_target_key.as_deref(),
                     cb_is_half_open_probe,
                     backend_start,
+                    &mut backend_admission_permits,
+                    backend_admission_start.elapsed(),
                     stream,
                 )
                 .await?
@@ -4355,7 +4427,8 @@ mod tests {
         acquire_cross_protocol_pending_slot, apply_buffered_grpc_plugin_reject,
         apply_buffered_plain_plugin_reject, apply_h3_grpc_reject_metadata,
         build_plain_request_builder, cross_protocol_header_write_disconnect_outcome,
-        normalize_h3_grpc_reject, reject_body_as_h3_grpc_message,
+        normalize_h3_grpc_reject, record_cross_protocol_client_acquire_failure,
+        record_cross_protocol_connection_start, reject_body_as_h3_grpc_message,
         release_cross_protocol_circuit_breaker_probe_on_admission_reject,
         sanitize_h3_grpc_message_for_header, should_finish_h3_stream_without_trailers,
         should_skip_cross_protocol_backend_header,
@@ -5132,6 +5205,94 @@ mod tests {
             locality: None,
             path: None,
         }
+    }
+
+    /// #1806 codex r2 finding 1: both H3→HTTP plain-bridge callers run backend
+    /// admission AND `record_cross_protocol_connection_start` for the selected
+    /// target BEFORE acquiring the reqwest client. A client-build/pool failure
+    /// must therefore END the least-connections connection (balancing the start —
+    /// no active-count leak) AND feed the 502 connection failure to the backend
+    /// outcome path. Previously this path used `record_backend_outcome_no_conn_end`
+    /// and skipped the admission outcome, permanently inflating the target's
+    /// active-connection count and never feeding the 502 to adaptive concurrency.
+    #[tokio::test]
+    async fn client_acquire_failure_balances_connection_start_and_records_outcome() {
+        let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "consumers": [],
+            "plugin_configs": [],
+            "proxies": [{
+                "id": "lc-proxy",
+                "listen_path": "/",
+                "backend_scheme": "http",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "upstream_id": "lc-upstream"
+            }],
+            "upstreams": [{
+                "id": "lc-upstream",
+                "targets": [{"host": "10.0.0.1", "port": 8080}],
+                "algorithm": "least_connections"
+            }]
+        }))
+        .expect("test config should deserialize");
+        config.normalize_fields();
+        let dns_cache = DnsCache::new(DnsConfig::default());
+        let (state, _) = ProxyState::new(config, dns_cache, EnvConfig::default(), None, None)
+            .expect("test proxy state should build");
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+
+        let selection = crate::proxy::backend_dispatch::select_upstream_target(
+            proxy,
+            &state,
+            &epoch,
+            "192.0.2.10",
+            &HashMap::new(),
+            None,
+        );
+        let balancer = selection
+            .balancer
+            .clone()
+            .expect("least-connections upstream proxy should resolve a balancer");
+        let target = selection
+            .target
+            .clone()
+            .expect("a target should be selected");
+
+        let active = || {
+            balancer
+                .active_connections
+                .iter()
+                .map(|entry| entry.value().load(std::sync::atomic::Ordering::Relaxed))
+                .sum::<i64>()
+        };
+
+        // The caller issues the connection-start before the client acquire.
+        record_cross_protocol_connection_start(Some(&balancer), Some(target.as_ref()));
+        assert_eq!(active(), 1, "connection-start increments the gauge");
+
+        // No admission permits in this minimal setup, but the outcome path must
+        // still balance the connection-start (conn_end = true).
+        let mut permits = None;
+        record_cross_protocol_client_acquire_failure(
+            &state,
+            proxy,
+            &epoch,
+            Some(&balancer),
+            Some(target.as_ref()),
+            None,
+            false,
+            Instant::now(),
+            &mut permits,
+            std::time::Duration::ZERO,
+        );
+
+        assert_eq!(
+            active(),
+            0,
+            "client-acquire failure must END the connection to balance the start (no active-count leak)"
+        );
     }
 
     /// #1806: the H3→HTTP plain bridge resolves the per-target effective proxy
