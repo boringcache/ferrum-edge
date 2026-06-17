@@ -1134,6 +1134,33 @@ fn materialize_east_west_gateway_proxies(
         }
     }
 
+    // SNI hosts already claimed by explicit EastWestGateway entries (same
+    // namespace as the materialized explicit proxies above). The auto-materializer
+    // yields to these so an operator's explicit route is never rejected as an
+    // overlapping host on the shared listen port.
+    let explicit_sni_hosts: std::collections::HashSet<String> = config
+        .mesh
+        .as_ref()
+        .and_then(|mesh| mesh.multi_cluster.as_ref())
+        .map(|multi_cluster| {
+            multi_cluster
+                .east_west_gateways
+                .iter()
+                .filter(|gateway| gateway.namespace == runtime.namespace)
+                // Hosts are lowercased during materialization and compared
+                // case-insensitively by `validate_stream_proxies`, so key the
+                // override set on the lowercased SNI to catch a mixed-case
+                // explicit entry that would still collide post-normalization.
+                .flat_map(|gateway| {
+                    gateway
+                        .sni_hosts
+                        .iter()
+                        .map(|host| host.to_ascii_lowercase())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Materialize SNI-routed TCP passthrough proxies for each local mesh
     // service so that inbound cross-cluster traffic on the east-west listen
     // port reaches the correct workload. Each service gets one proxy (SNI host
@@ -1143,6 +1170,7 @@ fn materialize_east_west_gateway_proxies(
         runtime.east_west_listen_port,
         &runtime.namespace,
         &runtime.cluster_domain,
+        &explicit_sni_hosts,
     );
 
     if !proxies.is_empty() {
@@ -1258,6 +1286,7 @@ fn build_east_west_service_proxies_and_upstreams(
     listen_port: u16,
     namespace: &str,
     cluster_domain: &str,
+    explicit_sni_hosts: &std::collections::HashSet<String>,
 ) -> (Vec<Proxy>, Vec<Upstream>) {
     let mut proxies = Vec::new();
     let mut upstreams = Vec::new();
@@ -1287,6 +1316,23 @@ fn build_east_west_service_proxies_and_upstreams(
             "{}.{}.svc.{}",
             service.name, service.namespace, cluster_domain
         );
+
+        // An explicit `EastWestGateway.sni_hosts` entry takes precedence over the
+        // auto-materialized local-service proxy: materializing both yields two
+        // TCP passthrough proxies claiming the same SNI on the shared east-west
+        // listen port, which `validate_stream_proxies` rejects as overlapping
+        // hosts — silently dropping the operator's explicit route. Skip the
+        // auto proxy (and its upstream) so the override survives.
+        if explicit_sni_hosts.contains(&sni_hostname.to_ascii_lowercase()) {
+            debug!(
+                service = %service.name,
+                namespace = %service.namespace,
+                sni = %sni_hostname,
+                "Skipping east-west auto-materialization; an explicit EastWestGateway already owns this SNI host"
+            );
+            continue;
+        }
+
         let upstream_id = mesh_east_west_service_upstream_id(&service.namespace, &service.name);
 
         let upstream = Upstream {
@@ -15739,6 +15785,110 @@ mod tests {
                 assert_eq!(upstream.targets.len(), 1);
                 assert_eq!(upstream.targets[0].host, "10.0.0.5");
                 assert_eq!(upstream.targets[0].port, 9080);
+            },
+        );
+    }
+
+    #[test]
+    fn east_west_explicit_sni_override_suppresses_auto_service_proxy() {
+        // codex finding: an explicit EastWestGateway.sni_hosts entry for a local
+        // service FQDN must win over the auto-materialized local-service proxy.
+        // Materializing both yields two TCP passthrough proxies on the same SNI +
+        // listen port, which validate_stream_proxies rejects as overlapping hosts
+        // — silently dropping the operator's explicit route.
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_NAMESPACE", "default"),
+                ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
+                ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "15443"),
+                ("FERRUM_MESH_CLUSTER_DOMAIN", "cluster.local."),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                let config = GatewayConfig {
+                    mesh: Some(Box::new(MeshConfig {
+                        // Explicit gateway claiming the reviews service FQDN
+                        // (mixed-case, to exercise the case-insensitive match).
+                        multi_cluster: Some(MultiClusterConfig {
+                            east_west_gateways: vec![EastWestGateway {
+                                name: "explicit-reviews".to_string(),
+                                namespace: "default".to_string(),
+                                host: "gw.remote.example".to_string(),
+                                port: 443,
+                                sni_hosts: vec!["Reviews.Default.SVC.Cluster.Local".to_string()],
+                                trust_domain: Some(TrustDomain::new("remote.test").unwrap()),
+                                network: Some("network-a".to_string()),
+                            }],
+                            ..MultiClusterConfig::default()
+                        }),
+                        services: vec![MeshService {
+                            cluster_ips: Vec::new(),
+                            name: "reviews".to_string(),
+                            namespace: "default".to_string(),
+                            ports: vec![ServicePort {
+                                port: 9080,
+                                protocol: AppProtocol::Http,
+                                name: Some("http".to_string()),
+                                target_port: None,
+                            }],
+                            workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                                spiffe_id: SpiffeId::new(
+                                    "spiffe://cluster.local/ns/default/sa/reviews",
+                                )
+                                .unwrap(),
+                            }],
+                            protocol_overrides: HashMap::new(),
+                        }],
+                        workloads: vec![{
+                            let mut wl = workload("reviews", "reviews");
+                            wl.addresses = vec!["10.0.0.5".to_string()];
+                            wl
+                        }],
+                        ..MeshConfig::default()
+                    })),
+                    ..GatewayConfig::default()
+                };
+
+                let prepared =
+                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+
+                // The explicit gateway proxy owns the SNI.
+                let explicit = prepared
+                    .proxies
+                    .iter()
+                    .find(|p| p.id == "__mesh-east-west-default-explicit-reviews")
+                    .expect("explicit east-west proxy");
+                assert_eq!(explicit.hosts, vec!["reviews.default.svc.cluster.local"]);
+
+                // The auto-materialized local-service proxy is suppressed.
+                assert!(
+                    prepared
+                        .proxies
+                        .iter()
+                        .all(|p| p.id != "__mesh-ew-svc-default-reviews"),
+                    "auto service proxy must yield to the explicit SNI override"
+                );
+                // No two proxies share the canonical SNI on the listen port.
+                let claimants = prepared
+                    .proxies
+                    .iter()
+                    .filter(|p| {
+                        p.listen_port == Some(15443)
+                            && p.hosts
+                                .iter()
+                                .any(|h| h == "reviews.default.svc.cluster.local")
+                    })
+                    .count();
+                assert_eq!(claimants, 1, "exactly one proxy may claim the SNI");
             },
         );
     }
