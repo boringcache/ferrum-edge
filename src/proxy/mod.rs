@@ -15809,13 +15809,19 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     proxy: &'a Proxy,
     upstream_target: Option<&UpstreamTarget>,
 ) -> std::borrow::Cow<'a, Proxy> {
-    let Some(overrides) = proxy.dispatch_port_overrides.as_ref() else {
-        return std::borrow::Cow::Borrowed(proxy);
-    };
     let Some(target) = upstream_target else {
         return std::borrow::Cow::Borrowed(proxy);
     };
-    let Some(override_config) = overrides.get(&target.port) else {
+    // Per-port override for the LB-selected target port wins; when the port has
+    // no explicit `portLevelSettings` entry, fall back to the service-discovery
+    // top-level `connectionPool.http` overlay (see
+    // `Proxy.dispatch_port_override_fallback`). Either may be absent.
+    let override_config = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&target.port))
+        .or(proxy.dispatch_port_override_fallback.as_ref());
+    let Some(override_config) = override_config else {
         return std::borrow::Cow::Borrowed(proxy);
     };
 
@@ -15966,11 +15972,17 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
 /// `Proxy.dispatch_port_overrides` (no `ArcSwap` load, no allocation unless a
 /// clone is actually needed to reduce the count).
 ///
-/// NOTE on the H3 frontend: the pre-existing H1/H2 dispatch path is where DR
-/// per-port effective-proxy overrides (all of them, not just this cap) are
-/// applied; the standalone H3 frontend (`src/http3/server.rs`) applies NONE of
-/// them. That is pre-existing and moot for mesh (TCP-only capture; H3 is out of
-/// mesh scope) — see `docs/mesh.md` "Dispatch-path coverage".
+/// NOTE on the H3 frontend: the H3→HTTP cross-protocol **plain** bridge now
+/// applies the per-port effective-proxy overrides via
+/// `resolve_effective_proxy_for_target` (idleTimeout / http2MaxRequests / TLS /
+/// h2UpgradePolicy / connectTimeout, plus the service-discovery top-level
+/// fallback). This `maxRetries` cap is NOT yet applied on the H3 frontend
+/// (`cap_proxy_retry_for_target` runs once in `handle_proxy_request_inner` on
+/// the H1/H2 path; the standalone H3 frontend, `src/http3/server.rs`, defers
+/// it), and the native-H3 backend pool and the gRPC bridge flavor likewise
+/// remain effective-proxy-override follow-ups. All moot for mesh (TCP-only
+/// capture; H3 is out of mesh scope) — see `docs/mesh.md` "Dispatch-path
+/// coverage".
 pub(crate) fn cap_proxy_retry_for_target(
     proxy: Arc<Proxy>,
     upstream_target: Option<&UpstreamTarget>,
@@ -15979,15 +15991,21 @@ pub(crate) fn cap_proxy_retry_for_target(
     let Some(existing) = proxy.retry.as_ref() else {
         return proxy;
     };
-    let Some(overrides) = proxy.dispatch_port_overrides.as_ref() else {
-        return proxy;
-    };
     let Some(target) = upstream_target else {
         return proxy;
     };
     // Cap from the SELECTED dispatch target's port override. Retries stay in
     // this port's lane (see docstring), so this cap governs the whole sequence.
-    let Some(cap) = overrides.get(&target.port).and_then(|o| o.max_retries) else {
+    // A port with no explicit `portLevelSettings` entry falls back to the
+    // service-discovery top-level `connectionPool.http.maxRetries` overlay
+    // (`Proxy.dispatch_port_override_fallback`); an explicit per-port entry wins.
+    let cap = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&target.port))
+        .or(proxy.dispatch_port_override_fallback.as_ref())
+        .and_then(|o| o.max_retries);
+    let Some(cap) = cap else {
         return proxy;
     };
     if existing.max_retries <= cap {
@@ -27111,6 +27129,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -27167,6 +27186,7 @@ mod tests {
                 backend_tls_sni: None,
                 backend_tls_san_allow_list: Vec::new(),
                 resolved_subset_tls: HashMap::new(),
+                dispatch_port_override_fallback: None,
                 api_spec_id: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
@@ -27179,6 +27199,192 @@ mod tests {
                 .dispatch_port_overrides
                 .is_none()
         );
+    }
+
+    // ── #1806: service-discovery top-level connectionPool.http fallback ───
+    //
+    // SD upstreams cannot fan the top-level `connectionPool.http` overlay onto
+    // a known apply-time port set (targets resolve at runtime), so the overlay
+    // is carried on `Proxy.dispatch_port_override_fallback` and applied by the
+    // LB-selected target port at dispatch. An explicit per-port override for
+    // the selected port still wins.
+
+    #[test]
+    fn resolve_effective_proxy_applies_sd_fallback_by_selected_port() {
+        // SD top-level overlay only: any selected port with no explicit per-port
+        // entry picks up the fallback (here `http2MaxRequests` →
+        // `pool_http2_max_concurrent_streams`).
+        let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        assert!(proxy.dispatch_port_overrides.is_none());
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            h2_max_concurrent_streams: Some(64),
+            ..Default::default()
+        });
+
+        // Port 9090 has no explicit per-port entry → fallback applies (owned).
+        let target = target_for_test(9090);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Owned(_)),
+            "SD top-level fallback must produce an owned clone on the selected port"
+        );
+        assert_eq!(effective.pool_http2_max_concurrent_streams, Some(64));
+
+        // A different selected port ALSO gets the fallback (it is not keyed to a
+        // specific port — that is the whole point for runtime-resolved SD ports).
+        let other = target_for_test(7070);
+        let effective_other = resolve_effective_proxy_for_target(&proxy, Some(&other));
+        assert_eq!(effective_other.pool_http2_max_concurrent_streams, Some(64));
+
+        // No target → cannot resolve a port → borrowed, fallback not applied.
+        let none = resolve_effective_proxy_for_target(&proxy, None);
+        assert!(matches!(none, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn resolve_effective_proxy_per_port_wins_over_sd_fallback() {
+        // Both a per-port entry (port 8080) and the SD fallback are present.
+        // The selected port's explicit per-port entry must win; a different
+        // selected port falls back to the top-level overlay.
+        let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080u16,
+            crate::config::types::ResolvedPortOverride {
+                h2_max_concurrent_streams: Some(10),
+                ..Default::default()
+            },
+        )]));
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            h2_max_concurrent_streams: Some(64),
+            ..Default::default()
+        });
+
+        // Selected port 8080 → per-port entry wins (10, not the fallback 64).
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert_eq!(
+            effective.pool_http2_max_concurrent_streams,
+            Some(10),
+            "explicit per-port portLevelSettings must win over the SD top-level fallback"
+        );
+
+        // Selected port 9090 has no per-port entry → fallback (64).
+        let other = target_for_test(9090);
+        let effective_other = resolve_effective_proxy_for_target(&proxy, Some(&other));
+        assert_eq!(effective_other.pool_http2_max_concurrent_streams, Some(64));
+    }
+
+    #[test]
+    fn cap_proxy_retry_applies_sd_fallback_max_retries() {
+        // SD top-level `maxRetries` fallback caps the per-request retry count on
+        // whatever port the target resolves to (no explicit per-port entry).
+        let mut inner = (*proxy_with_max_retries_override(None)).clone();
+        inner.dispatch_port_overrides = None;
+        inner.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            max_retries: Some(2),
+            ..Default::default()
+        });
+        inner.retry = Some(crate::config::types::RetryConfig {
+            max_retries: 5,
+            ..Default::default()
+        });
+        let proxy = Arc::new(inner);
+        let target = target_for_test(9090);
+        let capped = cap_proxy_retry_for_target(proxy, Some(&target));
+        assert_eq!(
+            capped.retry.as_ref().unwrap().max_retries,
+            2,
+            "SD top-level maxRetries fallback must cap an existing larger policy"
+        );
+    }
+
+    #[test]
+    fn cap_proxy_retry_per_port_wins_over_sd_fallback() {
+        // Explicit per-port `maxRetries` (port 8080) wins over the SD fallback
+        // for that port; a different port uses the fallback.
+        let mut inner = (*proxy_with_max_retries_overrides(&[(8080, 4)])).clone();
+        inner.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            max_retries: Some(1),
+            ..Default::default()
+        });
+        inner.retry = Some(crate::config::types::RetryConfig {
+            max_retries: 9,
+            ..Default::default()
+        });
+        let proxy = Arc::new(inner);
+
+        // Port 8080 → per-port cap 4 wins over the fallback cap 1.
+        let target = target_for_test(8080);
+        let capped = cap_proxy_retry_for_target(proxy.clone(), Some(&target));
+        assert_eq!(
+            capped.retry.as_ref().unwrap().max_retries,
+            4,
+            "explicit per-port maxRetries must win over the SD fallback"
+        );
+
+        // Port 9090 → no per-port entry → fallback cap 1.
+        let other = target_for_test(9090);
+        let capped_other = cap_proxy_retry_for_target(proxy, Some(&other));
+        assert_eq!(capped_other.retry.as_ref().unwrap().max_retries, 1);
+    }
+
+    #[test]
+    fn resolve_dispatch_port_overrides_projects_sd_fallback_onto_proxies() {
+        // Cold-path projection: a service-discovery upstream's
+        // `dispatch_port_override_fallback` lands on the referencing proxy's
+        // `dispatch_port_override_fallback`, independently of the per-port map.
+        use crate::config::types::{Upstream, UpstreamPortOverride};
+        let mut upstream = Upstream {
+            id: "u1".to_string(),
+            namespace: "ferrum".to_string(),
+            name: Some("u1".to_string()),
+            targets: Vec::new(),
+            algorithm: Default::default(),
+            hash_on: None,
+            hash_on_cookie_config: None,
+            health_checks: None,
+            service_discovery: None,
+            subsets: None,
+            port_overrides: HashMap::new(),
+            source_locality: None,
+            locality_lb_strict: false,
+            locality_lb_setting: None,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            backend_tls_sni: None,
+            backend_tls_san_allow_list: Vec::new(),
+            resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: Some(UpstreamPortOverride {
+                max_retries: Some(2),
+                h2_max_concurrent_streams: Some(64),
+                ..Default::default()
+            }),
+            api_spec_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        // The fallback projects even when the per-port map is empty (the SD case).
+        assert!(upstream.port_overrides.is_empty());
+        upstream.normalize_fields();
+
+        let proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        let mut config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream],
+            ..GatewayConfig::default()
+        };
+        config.resolve_dispatch_port_overrides();
+        // No per-port entries → dispatch_port_overrides stays None ...
+        assert!(config.proxies[0].dispatch_port_overrides.is_none());
+        // ... but the top-level fallback is projected onto the proxy.
+        let fallback = config.proxies[0]
+            .dispatch_port_override_fallback
+            .as_ref()
+            .expect("SD top-level fallback must project onto the referencing proxy");
+        assert_eq!(fallback.max_retries, Some(2));
+        assert_eq!(fallback.h2_max_concurrent_streams, Some(64));
     }
 
     /// Plaintext-only `Static` listener (no TLS configured) must NOT require

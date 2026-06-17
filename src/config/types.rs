@@ -1179,6 +1179,21 @@ pub struct Upstream {
     /// `Upstream.subsets[].traffic_policy.tls`.
     #[serde(skip)]
     pub resolved_subset_tls: HashMap<String, ResolvedSubsetTrafficPolicy>,
+    /// Top-level (non-`portLevelSettings`) DestinationRule `connectionPool.http`
+    /// overlay for a **service-discovery** upstream.
+    ///
+    /// Non-SD upstreams fan the top-level `connectionPool.http` block out onto
+    /// every served `port_overrides` entry at apply time. SD upstreams cannot —
+    /// their target ports are resolved at runtime, not at apply — so the
+    /// top-level overlay is captured here instead and applied by the
+    /// LB-**selected** target port at dispatch. `resolve_dispatch_port_overrides`
+    /// projects this onto `Proxy.dispatch_port_override_fallback`, which the
+    /// HTTP-family dispatch resolvers (`resolve_effective_proxy_for_target` /
+    /// `cap_proxy_retry_for_target`) consult only when the selected port has no
+    /// explicit per-port override — so an explicit `portLevelSettings` entry
+    /// still wins. Not serialized — derived from the matching DestinationRule.
+    #[serde(default, skip)]
+    pub dispatch_port_override_fallback: Option<UpstreamPortOverride>,
     /// ID of the `ApiSpec` that created this upstream via the spec-import admin API.
     /// `None` for hand-crafted upstreams. Used to scope cascading DELETE when a
     /// spec is removed. NOT loaded by the gateway runtime — admin-only metadata.
@@ -1738,6 +1753,23 @@ pub struct Proxy {
     /// `apply_destination_rules` has written into `Upstream.port_overrides`.
     #[serde(skip)]
     pub dispatch_port_overrides: Option<HashMap<u16, ResolvedPortOverride>>,
+    /// Top-level (non-`portLevelSettings`) DestinationRule `connectionPool.http`
+    /// overlay for a **service-discovery** upstream, projected from
+    /// `Upstream.dispatch_port_override_fallback` by
+    /// `GatewayConfig::resolve_dispatch_port_overrides()`.
+    ///
+    /// SD upstreams have no apply-time port set to fan the top-level overlay
+    /// onto (targets resolve at runtime), so `dispatch_port_overrides` is empty
+    /// for the discovered ports. The HTTP-family dispatch resolvers
+    /// (`resolve_effective_proxy_for_target` / `cap_proxy_retry_for_target`)
+    /// fall back to this overlay when the LB-selected target port has no
+    /// explicit per-port override — so an explicit `portLevelSettings` entry for
+    /// that port still wins. `None` for the common (non-SD, or SD without a
+    /// top-level `connectionPool.http`) case, so the hot path skips it with a
+    /// single field read. `#[serde(skip)]` (derived-only) like
+    /// `dispatch_port_overrides`; DB/file loaders start it `None`.
+    #[serde(skip)]
+    pub dispatch_port_override_fallback: Option<ResolvedPortOverride>,
     #[serde(default)]
     pub dns_override: Option<String>,
     #[serde(default)]
@@ -2578,12 +2610,26 @@ impl GatewayConfig {
             .filter(|(_, m)| !m.is_empty())
             .collect();
 
+        // Service-discovery top-level `connectionPool.http` fallback, applied by
+        // the LB-selected port at dispatch when that port has no explicit
+        // per-port override. Keyed by upstream id, separate from the per-port
+        // map above so an explicit `portLevelSettings` entry still wins.
+        let fallback_by_upstream: HashMap<&str, ResolvedPortOverride> = self
+            .upstreams
+            .iter()
+            .filter_map(|u| {
+                u.dispatch_port_override_fallback
+                    .as_ref()
+                    .and_then(ResolvedPortOverride::from_upstream_override)
+                    .map(|resolved| (u.id.as_str(), resolved))
+            })
+            .collect();
+
         for proxy in &mut self.proxies {
-            proxy.dispatch_port_overrides = proxy
-                .upstream_id
-                .as_deref()
-                .and_then(|uid| by_upstream.get(uid))
-                .cloned();
+            let uid = proxy.upstream_id.as_deref();
+            proxy.dispatch_port_overrides = uid.and_then(|uid| by_upstream.get(uid)).cloned();
+            proxy.dispatch_port_override_fallback =
+                uid.and_then(|uid| fallback_by_upstream.get(uid)).cloned();
         }
     }
 

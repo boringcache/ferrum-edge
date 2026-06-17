@@ -1455,6 +1455,7 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -1567,6 +1568,7 @@ fn build_east_west_service_proxies_and_upstreams(
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -1719,6 +1721,7 @@ fn east_west_service_proxy(
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -2827,6 +2830,7 @@ fn mesh_inbound_loopback_proxy_to(
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -2909,6 +2913,7 @@ pub(crate) fn mesh_inbound_hbone_relay_proxy(host: &str, port: u16) -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -3595,6 +3600,7 @@ fn mesh_outbound_tcp_relay_proxy_with_id(
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -3787,6 +3793,7 @@ fn mesh_outbound_route_proxy(
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -3873,6 +3880,7 @@ fn mesh_outbound_route_upstream(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,
@@ -4110,18 +4118,32 @@ fn apply_destination_rules(
             // by this upstream so a single DR `trafficPolicy.connectionPool`
             // block applies uniformly across the upstream. Per-port
             // `portLevelSettings.connectionPool.http` overrides per-port
-            // below. Service-discovery upstreams skip the fan-out because
-            // their target ports aren't known at apply time (the per-port loop
-            // below still applies if the operator explicitly listed
-            // `portLevelSettings`). Mirrors the T1-D fan-out for
+            // below. Mirrors the T1-D fan-out for
             // `connectionPool.tcp.{maxConnections,tcpKeepalive}`.
+            //
+            // Service-discovery upstreams cannot fan out: their target ports
+            // resolve at runtime, not at apply time. Instead the top-level
+            // overlay is accumulated on `dispatch_port_override_fallback`, which
+            // `resolve_dispatch_port_overrides` projects onto the proxy and the
+            // HTTP-family dispatch resolvers apply by the LB-selected port (an
+            // explicit `portLevelSettings` entry for that port still wins). This
+            // does NOT materialize discovery targets (the rejected PR #1602
+            // rework) — it only carries the cap into runtime port resolution.
+            // The overlay is applied additively (same `apply_*` helper as the
+            // fan-out) so a later matching DR layers over an earlier one.
             if let Some(ref tp) = dr.traffic_policy
                 && let Some(ref http) = tp.connection_pool_http
-                && !has_service_discovery
             {
-                for port in &upstream_target_ports {
-                    let override_slot = upstream.port_overrides.entry(*port).or_default();
-                    apply_connection_pool_http_to_port_override(override_slot, http);
+                if has_service_discovery {
+                    let fallback = upstream
+                        .dispatch_port_override_fallback
+                        .get_or_insert_default();
+                    apply_connection_pool_http_to_port_override(fallback, http);
+                } else {
+                    for port in &upstream_target_ports {
+                        let override_slot = upstream.port_overrides.entry(*port).or_default();
+                        apply_connection_pool_http_to_port_override(override_slot, http);
+                    }
                 }
             }
 
@@ -5507,6 +5529,7 @@ fn build_egress_upstream(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,
@@ -5665,6 +5688,7 @@ fn egress_gateway_proxy(
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -5758,6 +5782,7 @@ fn stream_egress_gateway_proxy(
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -13601,6 +13626,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -16917,6 +16943,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: loaded_at,
             updated_at: loaded_at,
@@ -16984,6 +17011,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,

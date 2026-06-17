@@ -5579,6 +5579,7 @@ fn row_to_proxy(
         // Populated by `GatewayConfig::resolve_dispatch_port_overrides()` after
         // upstreams are loaded and any mesh DR overrides applied.
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })
@@ -5812,6 +5813,7 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         // `apply_destination_rules`; SQL backends do not persist them, so SQL
         // rows always start with an empty map.
         resolved_subset_tls: std::collections::HashMap::new(),
+        dispatch_port_override_fallback: None,
         // See row_to_proxy for the rationale: preserve here so admin reads
         // get the real owning spec id; runtime callers strip via
         // strip_api_spec_id_from_runtime_config.

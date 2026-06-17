@@ -819,6 +819,20 @@ async fn dispatch_plain<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    // Honor DestinationRule per-port `connectionPool.http` effective-proxy
+    // overrides for the LB-selected target, mirroring the H1/H2 plain dispatch
+    // path (`proxy_to_backend`). Resolving here means the shared reqwest client
+    // (`get_client`) is built from the per-port `idleTimeout` /
+    // `http2MaxRequests` / TLS / `h2UpgradePolicy`-driven ALPN, and the
+    // per-request `connectTimeout` (`build_plain_request_builder`) is rebased —
+    // so every `connectionPool.http` knob applies on the H3→HTTP plain bridge,
+    // including the service-discovery top-level fallback. Borrowed (zero-alloc)
+    // when no override applies; cloned only when a port override differs from
+    // the proxy default. The per-port TLS (and its SNI) is also resolved here,
+    // so the SNI-requires-direct-H2 reject below sees the effective posture.
+    let effective_proxy = crate::proxy::resolve_effective_proxy_for_target(proxy, upstream_target);
+    let proxy: &Proxy = effective_proxy.as_ref();
+
     if proxy.resolved_tls.sni.is_some() {
         warn!(
             proxy_id = %proxy.id,
@@ -4021,7 +4035,7 @@ mod tests {
         should_skip_cross_protocol_backend_header,
     };
     use crate::config::EnvConfig;
-    use crate::config::types::{CircuitBreakerConfig, GatewayConfig, Proxy};
+    use crate::config::types::{CircuitBreakerConfig, GatewayConfig, Proxy, UpstreamTarget};
     use crate::dns::{DnsCache, DnsConfig};
     use crate::plugins::{Plugin, PluginResult, RequestContext, security_headers::SecurityHeaders};
     use crate::proxy::ProxyState;
@@ -4780,6 +4794,61 @@ mod tests {
                 .can_execute(&proxy.id, target_key, &config)
                 .is_ok(),
             "neutral client-fault release must allow the next half-open probe"
+        );
+    }
+
+    fn target_for_test(port: u16) -> UpstreamTarget {
+        UpstreamTarget {
+            host: "backend.example".to_string(),
+            port,
+            weight: 1,
+            tags: HashMap::new(),
+            locality: None,
+            path: None,
+        }
+    }
+
+    /// #1806: the H3→HTTP plain bridge resolves the per-target effective proxy
+    /// (the same `resolve_effective_proxy_for_target` the H1/H2 plain path uses)
+    /// before building its reqwest client and request, so every
+    /// `connectionPool.http` DR override applies on the bridge. This asserts the
+    /// resolution `dispatch_plain` performs at entry: a per-port override wins
+    /// for its port; a port with no explicit entry picks up the
+    /// service-discovery top-level fallback.
+    #[test]
+    fn h3_plain_bridge_resolves_effective_proxy_for_selected_target() {
+        let mut proxy = minimal_proxy();
+        proxy.backend_connect_timeout_ms = 5_000;
+        proxy.upstream_id = Some("u1".to_string());
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080u16,
+            crate::config::types::ResolvedPortOverride {
+                connect_timeout_ms: Some(750),
+                h2_max_concurrent_streams: Some(32),
+                ..Default::default()
+            },
+        )]));
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            connect_timeout_ms: Some(1_500),
+            ..Default::default()
+        });
+
+        // Selected port 8080 → explicit per-port override applied.
+        let target = target_for_test(8080);
+        let effective = crate::proxy::resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert_eq!(
+            effective.backend_connect_timeout_ms, 750,
+            "the bridge must apply the per-port connectTimeout that build_plain_request_builder reads"
+        );
+        assert_eq!(effective.pool_http2_max_concurrent_streams, Some(32));
+
+        // A port with no explicit entry → service-discovery top-level fallback.
+        let sd_target = target_for_test(9090);
+        let effective_sd =
+            crate::proxy::resolve_effective_proxy_for_target(&proxy, Some(&sd_target));
+        assert_eq!(
+            effective_sd.backend_connect_timeout_ms, 1_500,
+            "the bridge must apply the SD top-level fallback on a runtime-resolved port"
         );
     }
 
