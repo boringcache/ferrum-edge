@@ -6688,6 +6688,13 @@ async fn serve_mesh_runtime(
         ) {
             mesh_background_handles.push(handle);
         }
+        if let Some(handle) = node_waypoint::spawn_idle_identity_gc_task(
+            resolver.clone(),
+            env_config.mesh_node_waypoint_idle_gc_interval_secs,
+            shutdown_tx.subscribe(),
+        ) {
+            mesh_background_handles.push(handle);
+        }
         // Spawn the SOCK_OPS ringbuf consumer. When the kernel program
         // is not pinned (no node-agent on this host, kernel < 5.7, or
         // build without the ebpf feature), the spawned task logs once
