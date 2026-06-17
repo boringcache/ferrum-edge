@@ -1043,7 +1043,12 @@ fn collect_decoded_json_strings<'a>(value: &'a Value, texts: &mut Vec<&'a str>) 
             }
         }
         Value::Object(map) => {
-            for value in map.values() {
+            for (key, value) in map {
+                // Scan object KEYS too, not just values: in `ScanMode::All` the
+                // previous raw-body scan covered the whole serialized body
+                // (including field names), so a blocked phrase / PII pattern in a
+                // key like `{"user@example.com": "ok"}` must still be detected.
+                texts.push(key.as_str());
                 collect_decoded_json_strings(value, texts);
             }
         }

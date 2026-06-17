@@ -257,6 +257,30 @@ async fn test_all_mode_decodes_json_escaped_pii_for_redaction() {
 }
 
 #[tokio::test]
+async fn test_all_mode_detects_blocked_phrase_in_object_key() {
+    // codex: ScanMode::All must scan object KEYS, not just string values — the
+    // previous raw-body scan covered the whole serialized body (field names
+    // included), so a blocked phrase hidden in a JSON key must still be caught.
+    let plugin = make_plugin(json!({
+        "blocked_phrases": ["harmful content"],
+        "scan_fields": "all",
+        "action": "reject"
+    }));
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let body = br#"{"choices":[{"message":{"harmful content":"ok"}}]}"#;
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "a blocked phrase in a JSON object key must be detected in scan-all mode"
+    );
+}
+
+#[tokio::test]
 async fn test_blocked_phrase_detection() {
     let config = json!({
         "blocked_phrases": ["harmful content"],
