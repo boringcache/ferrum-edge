@@ -842,6 +842,17 @@ pub struct EnvConfig {
     pub mesh_remote_discovery_poll_interval_seconds: u64,
     /// Per-poll timeout for the remote-cluster MeshSubscribe fetch, in seconds.
     pub mesh_remote_discovery_poll_timeout_seconds: u64,
+    /// Strict local-first locality load balancing. Default `false` (fail-open):
+    /// when a mesh upstream's source locality is absent/unresolved the
+    /// locality-aware LB returns local **and** remote endpoints together so
+    /// traffic keeps flowing. When `true` (fail-closed-to-local): with an absent
+    /// source locality the LB restricts selection to LOCAL-locality endpoints
+    /// (targets not tagged with the synthetic `remote-<cluster>` locality) and
+    /// will not widen to remote unless there are no local endpoints, in which
+    /// case it falls back to the full healthy pool with a one-time warning
+    /// rather than black-holing. Only affects mesh upstreams. Sourced from
+    /// `FERRUM_MESH_LOCALITY_LB_STRICT`.
+    pub mesh_locality_lb_strict: bool,
     /// Node-waypoint cgroup-inode lifecycle sweep interval (seconds).
     /// Identities enrolled with a cgroup v2 path are evicted when the
     /// cgroup is gone or its inode/fingerprint changes (pod restart,
@@ -1723,6 +1734,7 @@ impl Default for EnvConfig {
             mesh_federation_fail_open: false,
             mesh_remote_discovery_poll_interval_seconds: 0,
             mesh_remote_discovery_poll_timeout_seconds: 30,
+            mesh_locality_lb_strict: false,
             mesh_node_waypoint_cgroup_sweep_interval_secs: 30,
             mesh_node_waypoint_pod_registry_dir: "/run/ferrum/node-waypoint-pods".to_string(),
             mesh_svid_rotation_drain_seconds: 0,
@@ -2076,6 +2088,7 @@ impl EnvConfig {
             mesh_federation_fail_open: bool = "FERRUM_MESH_FEDERATION_FAIL_OPEN" => false;
             mesh_remote_discovery_poll_interval_seconds: u64 = "FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS" => 0u64;
             mesh_remote_discovery_poll_timeout_seconds: u64 = "FERRUM_MESH_REMOTE_DISCOVERY_POLL_TIMEOUT_SECONDS" => 30u64;
+            mesh_locality_lb_strict: bool = "FERRUM_MESH_LOCALITY_LB_STRICT" => false;
             mesh_node_waypoint_cgroup_sweep_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS" => 30u64;
             mesh_node_waypoint_pod_registry_dir: String = "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" => "/run/ferrum/node-waypoint-pods".to_string();
             mesh_svid_rotation_drain_seconds: u64 = "FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS" => 0u64;
@@ -2671,6 +2684,7 @@ impl EnvConfig {
             mesh_federation_fail_open,
             mesh_remote_discovery_poll_interval_seconds,
             mesh_remote_discovery_poll_timeout_seconds,
+            mesh_locality_lb_strict,
             mesh_node_waypoint_cgroup_sweep_interval_secs,
             mesh_node_waypoint_pod_registry_dir,
             mesh_svid_rotation_drain_seconds,
@@ -2925,6 +2939,20 @@ impl EnvConfig {
             && port != 0
         {
             ports.insert(port);
+        }
+        // Mesh UDP TPROXY capture listener port (F3 §3.3): when UDP capture is
+        // enabled the mesh runtime binds a real UDP socket on this port, so
+        // reserve it for stream-listener validation. Otherwise a mesh UDP/DTLS
+        // stream proxy or ServiceEntry declaring the same listen port passes
+        // validation and then races the capture listener at startup, failing one
+        // UDP bind and aborting startup (codex r4). Default-off, so non-capture
+        // deployments are unaffected; a malformed setting is handled fail-closed
+        // by the dedicated startup validation, so a parse error is ignored here.
+        if let Ok(udp) = crate::capture::udp_capture_settings_from_env()
+            && udp.udp_capture_enabled
+            && udp.udp_outbound_port != 0
+        {
+            ports.insert(udp.udp_outbound_port);
         }
         ports
     }

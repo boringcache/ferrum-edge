@@ -1442,14 +1442,10 @@ impl RouterCache {
         if let Some(mesh) = config.mesh.as_deref() {
             let upstream_ids: std::collections::HashSet<&str> =
                 config.upstreams.iter().map(|u| u.id.as_str()).collect();
-            let local_cluster = mesh
-                .multi_cluster
-                .as_ref()
-                .and_then(|mc| mc.local_cluster.as_deref());
             for spec in crate::modes::mesh::mesh_outbound_tcp_bywl_upstreams(
                 &mesh.services,
                 &mesh.workloads,
-                local_cluster,
+                mesh.multi_cluster.as_ref(),
             ) {
                 let decision = if upstream_ids.contains(spec.upstream_id.as_str()) {
                     let relay_proxy =
@@ -2297,6 +2293,7 @@ mod tests {
             pool_http3_connections_per_backend: None,
             h2_upgrade_policy: None,
             pool_max_requests_per_connection: None,
+            pool_http1_max_pending_requests: None,
             upstream_id: None,
             upstream_subset: None,
             api_spec_id: None,
@@ -3468,6 +3465,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         };
 
         // The single-target per-workload upstream the materializer would emit,

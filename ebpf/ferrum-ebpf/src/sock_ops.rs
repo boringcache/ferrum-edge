@@ -20,27 +20,31 @@
 //! ## GAP-2M accept-side cookie bridge
 //!
 //! The `ACTIVE_ESTABLISHED` and `PASSIVE_ESTABLISHED` callbacks also drive the
-//! node-waypoint cookie bridge (IPv4 only — see below). `connect4` stamps the
-//! original destination into `FERRUM_ORIG_DST4` keyed by the *connecting*
-//! socket's cookie, but the proxy resolves by the *accepted* socket's cookie.
-//! At active-established (local port now assigned) the connect-side record is
-//! re-keyed by `(netns cookie, connection 4-tuple)` into
-//! `FERRUM_ORIG_DST_BY_TUPLE4`; at passive-established the mirror tuple is
-//! looked up and the record re-stamped under the accept-side cookie. The netns
-//! cookie is essential: captured connections all target `127.0.0.1:15001`, so
-//! the 4-tuple alone collapses to loopback + an ephemeral port that can collide
-//! across pods in this one global map; the per-netns cookie keeps each pod's
-//! key distinct (no pod overwrites another's record → no identity
-//! misattribution) while staying identical across the two ends of a same-netns
-//! connection. See [`bridge_active_established`] / [`bridge_passive_established`].
-//! A byte-order / tuple / netns mismatch only leaves resolution fail-closed
-//! (unchanged from pre-GAP-2M), never misattributed.
+//! node-waypoint cookie bridge (IPv4 and IPv6). `connect4`/`connect6` stamp the
+//! original destination into `FERRUM_ORIG_DST4`/`FERRUM_ORIG_DST6` keyed by the
+//! *connecting* socket's cookie, but the proxy resolves by the *accepted*
+//! socket's cookie. At active-established (local port now assigned) the
+//! connect-side record is re-keyed by `(netns cookie, connection tuple)` into
+//! `FERRUM_ORIG_DST_BY_TUPLE4`/`FERRUM_ORIG_DST_BY_TUPLE6`; at passive-established
+//! the mirror tuple is looked up and the record re-stamped under the accept-side
+//! cookie. The netns cookie is essential: captured connections all target
+//! `127.0.0.1:15001` / `[::1]:15001`, so the tuple alone collapses to loopback +
+//! an ephemeral port that can collide across pods in this one global map; the
+//! per-netns cookie keeps each pod's key distinct (no pod overwrites another's
+//! record → no identity misattribution) while staying identical across the two
+//! ends of a same-netns connection. See [`bridge_active_established`] /
+//! [`bridge_passive_established`]. A byte-order / tuple / netns mismatch only
+//! leaves resolution fail-closed (unchanged from pre-GAP-2M), never
+//! misattributed.
 //!
-//! IPv6 is intentionally not bridged: aya's SockOpsContext `local_ip6`/
-//! `remote_ip6` accessors copy the whole `[u32; 4]` out of the ctx, which the
-//! BPF verifier rejects as a modified-ctx-ptr dereference. IPv6 node-waypoint
-//! cookie resolution therefore stays fail-closed (its pre-GAP-2M behavior)
-//! until a verifier-safe per-element v6 read is wired.
+//! The IPv6 address fields are read element-by-element via a **volatile**
+//! per-`u32` ctx load ([`read_ctx_u32`]) at the four explicit `local_ip6` /
+//! `remote_ip6` offsets. aya's SockOpsContext `local_ip6`/`remote_ip6`
+//! accessors copy the whole `[u32; 4]` out of the ctx, which the BPF verifier
+//! rejects as a modified-ctx-ptr dereference; the per-element volatile loads
+//! fold the constant offset into each access (the same technique `connect6`
+//! already uses for the `bpf_sock_addr` v6 fields), so IPv6 node-waypoint cookie
+//! resolution now resolves on the same footing as IPv4.
 //!
 //! ## RST attribution caveat
 //!
@@ -55,24 +59,24 @@ use aya_ebpf::macros::sock_ops;
 use aya_ebpf::programs::SockOpsContext;
 use aya_ebpf::EbpfContext;
 use ferrum_ebpf_common::{
-    sock_ops_peer_port_host_order, ConnTuple4, OrigDstKey, SockOpsRecord,
+    sock_ops_peer_port_host_order, ConnTuple4, ConnTuple6, OrigDstKey, SockOpsRecord,
     SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT, SOCK_OPS_EVENT_ACCEPT_ESTABLISHED,
     SOCK_OPS_EVENT_CONNECT, SOCK_OPS_EVENT_FIN, SOCK_OPS_EVENT_RST, SOCK_OPS_EVENT_RTT_SAMPLE,
     SOCK_OPS_EVENT_SYN_TO_ACK_LATENCY, SOCK_OPS_STATS_EVENTS_DROPPED,
 };
 
 use crate::maps::{
-    FERRUM_ORIG_DST4, FERRUM_ORIG_DST6, FERRUM_ORIG_DST_BY_TUPLE4, FERRUM_SOCK_OPS_CONNECT_TS,
-    FERRUM_SOCK_OPS_EVENTS, FERRUM_SOCK_OPS_STATS,
+    FERRUM_ORIG_DST4, FERRUM_ORIG_DST6, FERRUM_ORIG_DST_BY_TUPLE4, FERRUM_ORIG_DST_BY_TUPLE6,
+    FERRUM_SOCK_OPS_CONNECT_TS, FERRUM_SOCK_OPS_EVENTS, FERRUM_SOCK_OPS_STATS,
 };
 
-// Address family from <bits/socket.h>; `bpf_sock_ops.family` carries it. The
-// GAP-2M cookie bridge handles IPv4 only: aya's SockOpsContext IPv6 accessors
-// (local_ip6/remote_ip6) emit a whole-`[u32; 4]` ctx copy the BPF verifier
-// rejects ("dereference of modified ctx ptr"), so IPv6 node-waypoint cookie
-// resolution stays fail-closed (unchanged from pre-GAP-2M) pending a
-// verifier-safe per-element v6 read.
+// Address families from <bits/socket.h>; `bpf_sock_ops.family` carries the
+// value. The GAP-2M cookie bridge handles both: IPv4 reads the `local_ip4` /
+// `remote_ip4` ctx words, IPv6 reads the four `local_ip6` / `remote_ip6` ctx
+// words element-by-element with verifier-safe volatile loads (see
+// `read_ctx_u32`). Any other family is ignored by the bridge.
 const AF_INET: u32 = 2;
+const AF_INET6: u32 = 10;
 
 // Operation discriminants — values from `include/uapi/linux/bpf.h`
 // (`bpf_sock_ops_op`). aya-ebpf does not re-export these, so we mirror them
@@ -126,7 +130,7 @@ fn handle_sock_ops(ctx: &SockOpsContext) {
         BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB => {
             let _ = ctx.set_cb_flags(ALL_SOCK_OPS_CB_FLAGS);
             // GAP-2M: the connecting socket now has its local port; re-key its
-            // connect-side orig-dst record by the connection 4-tuple.
+            // connect-side orig-dst record by the connection tuple (v4 or v6).
             bridge_active_established(ctx);
             if let Some(syn_to_ack_us) = drain_connect_ts(ctx) {
                 emit(SockOpsRecord {
@@ -273,6 +277,16 @@ const SK_OPS_LOCAL_IP4_OFF: usize = 28;
 const SK_OPS_REMOTE_PORT_OFF: usize = 64;
 const SK_OPS_LOCAL_PORT_OFF: usize = 68;
 
+// IPv6 address words. `struct bpf_sock_ops` lays them out immediately after the
+// v4 addresses: `__u32 remote_ip6[4]` at 32 (words 32/36/40/44) and
+// `__u32 local_ip6[4]` at 48 (words 48/52/56/60), with `remote_port` / `local_port`
+// following at 64 / 68 (shared with the v4 path). Each word is read with the same
+// per-element volatile `read_ctx_u32` load so the verifier rewrites it as a
+// standalone ctx access (a whole-`[u32; 4]` copy is rejected). The kernel stores
+// these in network byte order, matching the v4 `*_ip4` words.
+const SK_OPS_REMOTE_IP6_OFF: [usize; 4] = [32, 36, 40, 44];
+const SK_OPS_LOCAL_IP6_OFF: [usize; 4] = [48, 52, 56, 60];
+
 /// Read one `u32` `bpf_sock_ops` ctx field with a **volatile** load.
 ///
 /// Volatile loads cannot be widened or coalesced by LLVM, so each field stays a
@@ -286,18 +300,43 @@ fn read_ctx_u32(ctx: &SockOpsContext, byte_off: usize) -> u32 {
     unsafe { core::ptr::read_volatile((ctx.as_ptr() as *const u8).add(byte_off) as *const u32) }
 }
 
+/// Read a 128-bit `bpf_sock_ops` IPv6 address as four independent `u32` ctx
+/// loads. Reading `local_ip6` / `remote_ip6` as a whole `[u32; 4]` makes LLVM
+/// take the array base into a register and dereference it, which the verifier
+/// rejects ("dereference of modified ctx ptr"); each [`read_ctx_u32`] folds its
+/// constant offset into a standalone volatile load the verifier accepts. The
+/// returned words stay in **network byte order** (how the kernel stores them),
+/// matching `OrigDst6::addr` / the connect6-stamped record and the v4 `*_ip4`
+/// words — so the tuple key bytes are identical on both ends of a connection.
+#[inline(always)]
+fn read_ctx_ip6(ctx: &SockOpsContext, offsets: [usize; 4]) -> [u32; 4] {
+    [
+        read_ctx_u32(ctx, offsets[0]),
+        read_ctx_u32(ctx, offsets[1]),
+        read_ctx_u32(ctx, offsets[2]),
+        read_ctx_u32(ctx, offsets[3]),
+    ]
+}
+
 /// GAP-2M (active side). The connecting (client) socket has reached
 /// ESTABLISHED, so its ephemeral local port is now assigned. Look up the
 /// connect-side original-destination record (stamped by `connect4`/`connect6`
-/// under this socket's cookie) and re-key it by the connection 4-tuple so the
-/// proxy's accept-side socket can recover it in
-/// [`bridge_passive_established`]. All steps are best-effort: a miss leaves
-/// node-waypoint resolution fail-closed, exactly as before GAP-2M.
+/// under this socket's cookie) and re-key it by the connection tuple so the
+/// proxy's accept-side socket can recover it in [`bridge_passive_established`].
+/// All steps are best-effort: a miss leaves node-waypoint resolution
+/// fail-closed, exactly as before GAP-2M. Dispatches by address family; any
+/// non-IP family is ignored.
 #[inline(always)]
 fn bridge_active_established(ctx: &SockOpsContext) {
-    if ctx.family() != AF_INET {
-        return;
+    match ctx.family() {
+        AF_INET => bridge_active_established_v4(ctx),
+        AF_INET6 => bridge_active_established_v6(ctx),
+        _ => {}
     }
+}
+
+#[inline(always)]
+fn bridge_active_established_v4(ctx: &SockOpsContext) {
     let cookie = socket_cookie(ctx);
     // Active side: the local socket addr/port is the client, the rewritten
     // remote addr/port is the loopback capture endpoint (the server). The netns
@@ -314,17 +353,44 @@ fn bridge_active_established(ctx: &SockOpsContext) {
     }
 }
 
+/// IPv6 mirror of [`bridge_active_established_v4`]. Identical key discipline:
+/// the netns cookie discriminates pods sharing the `[::1]:15001` loopback tuple,
+/// the v6 addresses are read element-by-element (network byte order, like the v4
+/// `*_ip4` words), and the ports use the same host-order normalization. A miss
+/// leaves resolution fail-closed.
+#[inline(always)]
+fn bridge_active_established_v6(ctx: &SockOpsContext) {
+    let cookie = socket_cookie(ctx);
+    if let Some(orig) = unsafe { FERRUM_ORIG_DST6.get(&OrigDstKey { cookie }) }.copied() {
+        let tuple = ConnTuple6::new(
+            socket_netns_cookie(ctx),
+            read_ctx_ip6(ctx, SK_OPS_LOCAL_IP6_OFF),
+            read_ctx_u32(ctx, SK_OPS_LOCAL_PORT_OFF) as u16,
+            read_ctx_ip6(ctx, SK_OPS_REMOTE_IP6_OFF),
+            sock_ops_peer_port_host_order(read_ctx_u32(ctx, SK_OPS_REMOTE_PORT_OFF)),
+        );
+        let _ = FERRUM_ORIG_DST_BY_TUPLE6.insert(&tuple, &orig, 0);
+    }
+}
+
 /// GAP-2M (passive side). The accepted (server-side) socket now exists with
 /// the cookie the node-waypoint proxy reads via `getsockopt(SO_COOKIE)`.
-/// Recover the original-destination record by the mirror connection 4-tuple
-/// and re-stamp it under this accept-side cookie, so the proxy's existing
+/// Recover the original-destination record by the mirror connection tuple and
+/// re-stamp it under this accept-side cookie, so the proxy's existing
 /// `FERRUM_ORIG_DST4`/`FERRUM_ORIG_DST6` lookup resolves the source identity.
-/// The tuple entry is consumed on a hit.
+/// The tuple entry is consumed on a hit. Dispatches by address family; any
+/// non-IP family is ignored.
 #[inline(always)]
 fn bridge_passive_established(ctx: &SockOpsContext) {
-    if ctx.family() != AF_INET {
-        return;
+    match ctx.family() {
+        AF_INET => bridge_passive_established_v4(ctx),
+        AF_INET6 => bridge_passive_established_v6(ctx),
+        _ => {}
     }
+}
+
+#[inline(always)]
+fn bridge_passive_established_v4(ctx: &SockOpsContext) {
     let cookie = socket_cookie(ctx);
     // Passive side mirrors the active tuple: the remote socket addr/port is the
     // client, the local addr/port is the loopback server. The netns cookie is
@@ -339,6 +405,26 @@ fn bridge_passive_established(ctx: &SockOpsContext) {
     if let Some(orig) = unsafe { FERRUM_ORIG_DST_BY_TUPLE4.get(&tuple) }.copied() {
         let _ = FERRUM_ORIG_DST4.insert(&OrigDstKey { cookie }, &orig, 0);
         let _ = FERRUM_ORIG_DST_BY_TUPLE4.remove(&tuple);
+    }
+}
+
+/// IPv6 mirror of [`bridge_passive_established_v4`]. The tuple swaps client and
+/// server exactly as the v4 path does, reads the v6 addresses element-by-element
+/// in the same byte order, and re-stamps `FERRUM_ORIG_DST6` under the accept-side
+/// cookie. A miss leaves resolution fail-closed.
+#[inline(always)]
+fn bridge_passive_established_v6(ctx: &SockOpsContext) {
+    let cookie = socket_cookie(ctx);
+    let tuple = ConnTuple6::new(
+        socket_netns_cookie(ctx),
+        read_ctx_ip6(ctx, SK_OPS_REMOTE_IP6_OFF),
+        sock_ops_peer_port_host_order(read_ctx_u32(ctx, SK_OPS_REMOTE_PORT_OFF)),
+        read_ctx_ip6(ctx, SK_OPS_LOCAL_IP6_OFF),
+        read_ctx_u32(ctx, SK_OPS_LOCAL_PORT_OFF) as u16,
+    );
+    if let Some(orig) = unsafe { FERRUM_ORIG_DST_BY_TUPLE6.get(&tuple) }.copied() {
+        let _ = FERRUM_ORIG_DST6.insert(&OrigDstKey { cookie }, &orig, 0);
+        let _ = FERRUM_ORIG_DST_BY_TUPLE6.remove(&tuple);
     }
 }
 

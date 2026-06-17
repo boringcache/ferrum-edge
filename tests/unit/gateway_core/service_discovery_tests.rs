@@ -43,6 +43,7 @@ fn make_upstream(
         subsets: None,
         port_overrides: std::collections::HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -91,6 +92,7 @@ fn mesh_workload(id: &str, service_name: &str, address: &str, port: u16) -> Work
         locality: None,
         service_account: None,
         pod_uid: None,
+        remote_provenance: false,
     }
 }
 
