@@ -811,9 +811,11 @@ impl MeshSlice {
             .mesh_policies
             .iter()
             .filter(|policy| {
-                policy_candidate_labels.iter().any(|labels| {
-                    policy_scope_applies_to_workload(policy, effective_namespace, *labels)
-                })
+                // `mesh_authz` validates and pre-filters against the slice's
+                // effective labels. Keep this CP-side projection on the same
+                // predicate so ambiguous shared-SPIFFE candidates cannot admit
+                // selector policies the DP later cannot construct deterministically.
+                policy_scope_applies_to_workload(policy, effective_namespace, &effective_labels)
             })
             .cloned()
             .collect();
@@ -3671,7 +3673,7 @@ mod tests {
     }
 
     #[test]
-    fn from_gateway_config_includes_selector_policies_for_ambiguous_spiffe_id() {
+    fn from_gateway_config_excludes_candidate_only_selector_policies_for_ambiguous_spiffe_id() {
         let td = td();
         let spiffe_id = SpiffeId::from_parts(&td, "ns/alpha/sa/shared").unwrap();
         let mut web = make_workload(
@@ -3716,8 +3718,10 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, request);
 
         assert!(slice.labels.is_empty());
-        assert_eq!(slice.mesh_policies.len(), 1);
-        assert_eq!(slice.mesh_policies[0].name, "web-selector-policy");
+        assert!(
+            slice.mesh_policies.is_empty(),
+            "candidate-specific selector policies must not be included when the effective shared-SPIFFE labels are empty"
+        );
     }
 
     #[test]
@@ -3791,7 +3795,7 @@ mod tests {
         assert_eq!(slice.labels.get("app"), Some(&"web".to_string()));
         assert_eq!(slice.labels.get("version"), Some(&"v1".to_string()));
         assert!(!slice.labels.contains_key("pod-template-hash"));
-        assert_eq!(slice.mesh_policies.len(), 2);
+        assert_eq!(slice.mesh_policies.len(), 1);
         assert!(
             slice
                 .mesh_policies
@@ -3799,10 +3803,11 @@ mod tests {
                 .any(|policy| policy.name == "common-selector-policy")
         );
         assert!(
-            slice
+            !slice
                 .mesh_policies
                 .iter()
-                .any(|policy| policy.name == "replica-specific-policy")
+                .any(|policy| policy.name == "replica-specific-policy"),
+            "candidate-only selector policies must not be included when they do not match effective shared-SPIFFE labels"
         );
     }
 
