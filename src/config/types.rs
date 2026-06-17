@@ -562,6 +562,62 @@ impl ResolvedPortOverride {
             && self.max_retries.is_none()
             && self.http1_max_pending_requests.is_none()
     }
+
+    /// Field-by-field seed of the `connectionPool.http` fields from a
+    /// service-discovery TOP-LEVEL fallback overlay onto this (per-port) entry.
+    ///
+    /// For each of the six `connectionPool.http` fields, the per-port value wins
+    /// when set; otherwise the fallback's value is inherited. This mirrors the
+    /// NON-SD apply-time layering EXACTLY: there, the top-level
+    /// `connectionPool.http` is fanned onto the port slot FIRST and a partial
+    /// per-port `portLevelSettings.connectionPool.http` then overlays only the
+    /// fields it sets (see `apply_connection_pool_http_to_port_override` in
+    /// `src/modes/mesh/mod.rs`). SD upstreams cannot fan out at apply time, so
+    /// the top-level overlay is carried separately on
+    /// `Proxy.dispatch_port_override_fallback` and merged HERE at dispatch — so
+    /// an unrelated per-port field (e.g. `connectTimeout`/`tls`) no longer wipes
+    /// an inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`.
+    ///
+    /// Only the six `connectionPool.http` fields are merged; the fallback only
+    /// ever carries those (it is built solely from the DR top-level
+    /// `connectionPool.http` block), so non-`connectionPool.http` fields
+    /// (`connect_timeout_ms`/`algorithm`/`tls`/`max_connections`/… ) are left as
+    /// this per-port entry already has them.
+    pub fn seed_connection_pool_http_from_fallback(&mut self, fallback: &ResolvedPortOverride) {
+        self.http_max_requests_per_connection = self
+            .http_max_requests_per_connection
+            .or(fallback.http_max_requests_per_connection);
+        self.http_idle_timeout_ms = self.http_idle_timeout_ms.or(fallback.http_idle_timeout_ms);
+        self.h2_max_concurrent_streams = self
+            .h2_max_concurrent_streams
+            .or(fallback.h2_max_concurrent_streams);
+        self.h2_upgrade_policy = self.h2_upgrade_policy.or(fallback.h2_upgrade_policy);
+        self.max_retries = self.max_retries.or(fallback.max_retries);
+        self.http1_max_pending_requests = self
+            .http1_max_pending_requests
+            .or(fallback.http1_max_pending_requests);
+    }
+}
+
+/// Project an upstream's service-discovery TOP-LEVEL `connectionPool.http`
+/// overlay (`Upstream.dispatch_port_override_fallback`) into the resolved
+/// [`ResolvedPortOverride`] shape carried on a referencing `Proxy`
+/// (`Proxy.dispatch_port_override_fallback`).
+///
+/// Returns `None` for the common non-SD case (no top-level overlay) and for an
+/// overlay that resolves empty. Shared by config-build projection
+/// ([`GatewayConfig::resolve_dispatch_port_overrides`]) and the route-override
+/// path (`apply_route_overrides_inner` in `src/plugins/mod.rs`) so a route that
+/// swaps the destination upstream recomputes (or clears) the fallback exactly
+/// like `dispatch_port_overrides`, never leaking one upstream's overlay onto a
+/// different destination.
+pub(crate) fn dispatch_port_override_fallback_from_upstream(
+    upstream: &Upstream,
+) -> Option<ResolvedPortOverride> {
+    upstream
+        .dispatch_port_override_fallback
+        .as_ref()
+        .and_then(ResolvedPortOverride::from_upstream_override)
 }
 
 /// A named subset of upstream targets identified by label selectors.
@@ -2618,9 +2674,7 @@ impl GatewayConfig {
             .upstreams
             .iter()
             .filter_map(|u| {
-                u.dispatch_port_override_fallback
-                    .as_ref()
-                    .and_then(ResolvedPortOverride::from_upstream_override)
+                dispatch_port_override_fallback_from_upstream(u)
                     .map(|resolved| (u.id.as_str(), resolved))
             })
             .collect();

@@ -15812,18 +15812,36 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     let Some(target) = upstream_target else {
         return std::borrow::Cow::Borrowed(proxy);
     };
-    // Per-port override for the LB-selected target port wins; when the port has
-    // no explicit `portLevelSettings` entry, fall back to the service-discovery
-    // top-level `connectionPool.http` overlay (see
-    // `Proxy.dispatch_port_override_fallback`). Either may be absent.
-    let override_config = proxy
+    // Per-port override for the LB-selected target port and the service-discovery
+    // top-level `connectionPool.http` overlay (`Proxy.dispatch_port_override_fallback`)
+    // are FIELD-MERGED, not wholesale-replaced: a per-port `connectionPool.http`
+    // field wins when set, otherwise the top-level overlay's value is inherited —
+    // so an unrelated per-port field (`connectTimeout`/`tls`) no longer wipes the
+    // inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`. This
+    // matches the NON-SD apply-time layering exactly (top-level fan-out, then a
+    // partial per-port overlay; see `apply_connection_pool_http_to_port_override`
+    // in `src/modes/mesh/mod.rs`). Either side may be absent; the owned merge only
+    // fires when BOTH are present (the rare SD-with-explicit-port case).
+    let per_port = proxy
         .dispatch_port_overrides
         .as_ref()
-        .and_then(|overrides| overrides.get(&target.port))
-        .or(proxy.dispatch_port_override_fallback.as_ref());
-    let Some(override_config) = override_config else {
+        .and_then(|overrides| overrides.get(&target.port));
+    let fallback = proxy.dispatch_port_override_fallback.as_ref();
+    let merged: Option<std::borrow::Cow<'_, crate::config::types::ResolvedPortOverride>> =
+        match (per_port, fallback) {
+            (Some(per_port), Some(fallback)) => {
+                let mut owned = per_port.clone();
+                owned.seed_connection_pool_http_from_fallback(fallback);
+                Some(std::borrow::Cow::Owned(owned))
+            }
+            (Some(per_port), None) => Some(std::borrow::Cow::Borrowed(per_port)),
+            (None, Some(fallback)) => Some(std::borrow::Cow::Borrowed(fallback)),
+            (None, None) => None,
+        };
+    let Some(override_config) = merged else {
         return std::borrow::Cow::Borrowed(proxy);
     };
+    let override_config = override_config.as_ref();
 
     // Compare each candidate override against the proxy's current value and
     // build an owned clone only when at least one field actually differs.
@@ -15996,15 +16014,23 @@ pub(crate) fn cap_proxy_retry_for_target(
     };
     // Cap from the SELECTED dispatch target's port override. Retries stay in
     // this port's lane (see docstring), so this cap governs the whole sequence.
-    // A port with no explicit `portLevelSettings` entry falls back to the
-    // service-discovery top-level `connectionPool.http.maxRetries` overlay
-    // (`Proxy.dispatch_port_override_fallback`); an explicit per-port entry wins.
+    // FIELD-level fallback: the per-port `maxRetries` wins when set, otherwise
+    // the service-discovery top-level `connectionPool.http.maxRetries` overlay
+    // (`Proxy.dispatch_port_override_fallback`) is inherited — so a per-port
+    // entry that sets only an unrelated field (e.g. `connectTimeout`) does not
+    // wipe the inherited top-level cap. Mirrors the field-merge in
+    // `resolve_effective_proxy_for_target` and the non-SD apply-time layering.
     let cap = proxy
         .dispatch_port_overrides
         .as_ref()
         .and_then(|overrides| overrides.get(&target.port))
-        .or(proxy.dispatch_port_override_fallback.as_ref())
-        .and_then(|o| o.max_retries);
+        .and_then(|o| o.max_retries)
+        .or_else(|| {
+            proxy
+                .dispatch_port_override_fallback
+                .as_ref()
+                .and_then(|o| o.max_retries)
+        });
     let Some(cap) = cap else {
         return proxy;
     };
@@ -16052,6 +16078,14 @@ pub(crate) fn resolve_backend_max_connections(proxy: &Proxy, dispatch_port: u16)
 /// `dispatch_port` is the port the dial will actually use: the LB-selected
 /// `UpstreamTarget.port` for upstream proxies, or `proxy.backend_port` for a
 /// direct-backend proxy with no upstream.
+///
+/// FIELD-level fallback (#1806 codex r1): when the per-port entry carries no
+/// `http1_max_pending_requests`, inherit the service-discovery top-level
+/// `connectionPool.http.http1MaxPendingRequests` overlay
+/// (`Proxy.dispatch_port_override_fallback`) — so an SD upstream that sets ONLY a
+/// top-level cap (no per-port entry) is still capped, and a per-port entry that
+/// sets an unrelated field does not wipe the inherited cap. Mirrors how
+/// `resolve_effective_proxy_for_target` consumes the fallback.
 pub(crate) fn resolve_backend_http1_max_pending_requests(
     proxy: &Proxy,
     dispatch_port: u16,
@@ -16061,6 +16095,12 @@ pub(crate) fn resolve_backend_http1_max_pending_requests(
         .as_ref()
         .and_then(|overrides| overrides.get(&dispatch_port))
         .and_then(|override_config| override_config.http1_max_pending_requests)
+        .or_else(|| {
+            proxy
+                .dispatch_port_override_fallback
+                .as_ref()
+                .and_then(|fallback| fallback.http1_max_pending_requests)
+        })
 }
 
 /// Whether the reqwest-backed backend client for this (effective) proxy is
@@ -27272,6 +27312,135 @@ mod tests {
         let other = target_for_test(9090);
         let effective_other = resolve_effective_proxy_for_target(&proxy, Some(&other));
         assert_eq!(effective_other.pool_http2_max_concurrent_streams, Some(64));
+    }
+
+    #[test]
+    fn resolve_effective_proxy_field_merges_sd_fallback_with_partial_per_port() {
+        // codex r1 #1806: a partial per-port `portLevelSettings` entry that sets
+        // ONLY an unrelated field (here `connectTimeout`) must NOT wipe the
+        // inherited top-level `connectionPool.http` overlay
+        // (`idleTimeout`/`http2MaxRequests`/`maxRetries`/`http1MaxPendingRequests`).
+        // The per-port field wins where set; otherwise the fallback is inherited —
+        // exactly the non-SD apply-time layering
+        // (`apply_connection_pool_http_to_port_override`).
+        let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080u16,
+            crate::config::types::ResolvedPortOverride {
+                // Per-port sets connectTimeout + ONE http field
+                // (h2_max_concurrent_streams) — the rest must come from the
+                // fallback.
+                connect_timeout_ms: Some(750),
+                h2_max_concurrent_streams: Some(10),
+                ..Default::default()
+            },
+        )]));
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            h2_max_concurrent_streams: Some(64),
+            http_idle_timeout_ms: Some(120_000),
+            http1_max_pending_requests: Some(32),
+            ..Default::default()
+        });
+
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        // Per-port connectTimeout applied.
+        assert_eq!(effective.backend_connect_timeout_ms, 750);
+        // Per-port http2MaxRequests wins over the fallback (10, not 64).
+        assert_eq!(
+            effective.pool_http2_max_concurrent_streams,
+            Some(10),
+            "per-port http2MaxRequests must win over the inherited fallback"
+        );
+        // idleTimeout NOT set per-port → inherited from the fallback (120s).
+        assert_eq!(
+            effective.pool_idle_timeout_seconds,
+            Some(120),
+            "an unrelated per-port field must not wipe the inherited top-level idleTimeout"
+        );
+        // http1MaxPendingRequests NOT set per-port → inherited from the fallback.
+        assert_eq!(
+            effective.pool_http1_max_pending_requests,
+            Some(32),
+            "an unrelated per-port field must not wipe the inherited top-level http1MaxPendingRequests"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_http1_max_pending_inherits_sd_fallback() {
+        // codex r1 #1806 finding 2: an SD upstream with ONLY a top-level
+        // `http1MaxPendingRequests` (no per-port entry) must still be capped.
+        let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            http1_max_pending_requests: Some(16),
+            ..Default::default()
+        });
+        assert!(proxy.dispatch_port_overrides.is_none());
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&proxy, 9090),
+            Some(16),
+            "SD top-level http1MaxPendingRequests must cap a runtime-resolved port with no per-port entry"
+        );
+
+        // codex r1 #1806 finding 3: a partial per-port entry (sets only an
+        // unrelated field) must inherit the fallback cap, not wipe it.
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080u16,
+            crate::config::types::ResolvedPortOverride {
+                connect_timeout_ms: Some(750),
+                ..Default::default()
+            },
+        )]));
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&proxy, 8080),
+            Some(16),
+            "a per-port entry without http1MaxPendingRequests must inherit the SD fallback cap"
+        );
+
+        // An explicit per-port cap still wins for its own port.
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080u16,
+            crate::config::types::ResolvedPortOverride {
+                http1_max_pending_requests: Some(4),
+                ..Default::default()
+            },
+        )]));
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&proxy, 8080),
+            Some(4),
+            "explicit per-port http1MaxPendingRequests must win over the SD fallback"
+        );
+    }
+
+    #[test]
+    fn cap_proxy_retry_field_merges_partial_per_port_with_sd_fallback() {
+        // codex r1 #1806 finding 3: a per-port entry that sets only an unrelated
+        // field must inherit the SD top-level `maxRetries` cap, not lose it.
+        let mut inner = (*proxy_with_max_retries_override(None)).clone();
+        inner.dispatch_port_overrides = Some(HashMap::from([(
+            8080u16,
+            crate::config::types::ResolvedPortOverride {
+                // Sets ONLY connectTimeout — no maxRetries.
+                connect_timeout_ms: Some(750),
+                ..Default::default()
+            },
+        )]));
+        inner.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            max_retries: Some(2),
+            ..Default::default()
+        });
+        inner.retry = Some(crate::config::types::RetryConfig {
+            max_retries: 5,
+            ..Default::default()
+        });
+        let proxy = Arc::new(inner);
+        let target = target_for_test(8080);
+        let capped = cap_proxy_retry_for_target(proxy, Some(&target));
+        assert_eq!(
+            capped.retry.as_ref().unwrap().max_retries,
+            2,
+            "a partial per-port entry must inherit the SD top-level maxRetries cap"
+        );
     }
 
     #[test]
