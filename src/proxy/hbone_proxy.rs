@@ -1016,6 +1016,17 @@ async fn resolve_local_udp_dest(
     Ok(SocketAddr::new(ip, port))
 }
 
+/// Fallback write deadline for a single framed app→tunnel `write_all` in
+/// [`relay_hbone_udp`], used ONLY when the idle window is disabled
+/// (`udp_idle_timeout_seconds == 0`). A stalled HBONE peer (stopped reading /
+/// exhausted h2 flow-control) must not let the app→tunnel `write_all` stay
+/// pending forever and pin the spawned relay task; bounding the write tears the
+/// relay down instead. When an idle window IS configured, that window is reused
+/// as the write deadline (a write blocked longer than the whole idle window is a
+/// dead session anyway), so this only covers the idle-disabled case. Mirrors the
+/// egress-side `EGRESS_TUNNEL_WRITE_DEADLINE` in `mesh_udp_capture.rs` (codex r3).
+const HBONE_UDP_WRITE_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Two-way datagram relay between an upgraded `udp`-CONNECT tunnel (framed) and a
 /// connected local `UdpSocket` (raw datagrams). Tunnel → unframe → `send`; `recv`
 /// → frame → tunnel. Either direction ending (EOF, error) ends the relay; on
@@ -1028,6 +1039,11 @@ async fn resolve_local_udp_dest(
 /// telemetry/StatsD streaming tunnel→app while the app never replies) would time
 /// out after `udp_idle_timeout_seconds` even though the tunnel is actively
 /// delivering datagrams (codex r1 P2).
+///
+/// Each app→tunnel framed `write_all` is bounded by a write deadline (the idle
+/// window when configured, else [`HBONE_UDP_WRITE_DEADLINE`]) so a stalled HBONE
+/// peer cannot pin this task forever even with the idle watchdog disabled (codex
+/// r3).
 async fn relay_hbone_udp<S>(tunnel: S, socket: tokio::net::UdpSocket, idle: Option<Duration>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1039,6 +1055,12 @@ where
     let socket = Arc::new(socket);
     let (mut tunnel_read, mut tunnel_write) = split(tunnel);
     let max = crate::proxy::mesh_udp_frame::MAX_FRAME_PAYLOAD;
+    // Single framed-write deadline: reuse the idle window when configured, else a
+    // fixed fallback so a stalled tunnel write can never hang forever (codex r3).
+    // A write is ALWAYS bounded, even when the idle watchdog is disabled (`idle ==
+    // None`) — which is exactly the case where an unbounded write would leak the
+    // task.
+    let write_deadline = idle.unwrap_or(HBONE_UDP_WRITE_DEADLINE);
 
     // Shared last-activity clock (monotonic millis — never rewinds under NTP
     // slew). Bumped on a delivered datagram in either direction; read by the
@@ -1085,8 +1107,14 @@ where
             if crate::proxy::mesh_udp_frame::encode_datagram(&mut frame, &recv_buf[..n]).is_err() {
                 continue;
             }
-            if tunnel_write.write_all(&frame).await.is_err() {
-                break;
+            // Bound the write: a stalled HBONE peer (stopped reading / h2
+            // flow-control exhausted) must not pin this task forever, especially
+            // when the idle watchdog is disabled (codex r3). On stall, tear the
+            // relay down cleanly (break → tunnel half-close below).
+            match tokio::time::timeout(write_deadline, tunnel_write.write_all(&frame)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => break,
+                Err(_) => break, // write stalled past the deadline
             }
         }
         let _ = tunnel_write.shutdown().await;

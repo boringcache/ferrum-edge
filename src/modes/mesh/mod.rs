@@ -3959,7 +3959,11 @@ fn apply_destination_rules(
     // equals T leak onto this upstream — each sibling upstream must carry
     // exactly its own port's policy.
     // The raw-TCP per-port upstreams (`__mesh-out-tcp-upstream-*`) join the
-    // same map: identical owner-port semantics, distinct id space.
+    // same map: identical owner-port semantics, distinct id space. The Ambient
+    // UDP per-port upstreams (`__mesh-out-udp-upstream-*`, F3 §3.3 Stage 4) join
+    // too — a `portLevelSettings` entry on a UDP Service port (e.g. `port: 53,
+    // targetPort: 5353`) must map to its UDP upstream or its traffic policy is
+    // silently dropped (codex r3).
     let multi_cluster = mesh_slice.multi_cluster.as_ref();
     let mut outbound_upstream_owner_port: std::collections::HashMap<String, u16> = mesh_slice
         .services
@@ -3976,6 +3980,12 @@ fn apply_destination_rules(
                 .chain(service_tcp_stream_ports(svc).into_iter().map(|sp| {
                     (
                         mesh_outbound_tcp_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        sp.port,
+                    )
+                }))
+                .chain(service_udp_stream_ports(svc).into_iter().map(|sp| {
+                    (
+                        mesh_outbound_udp_upstream_id(&svc.namespace, &svc.name, sp.port),
                         sp.port,
                     )
                 }))
@@ -11675,6 +11685,61 @@ mod tests {
         );
         assert!(
             !upstream.port_overrides.contains_key(&6379),
+            "per-port policy must not remain under the service port"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_udp_upstream_receives_port_level_dr() {
+        // DestinationRule portLevelSettings authored on a UDP SERVICE port
+        // (`port: 53, targetPort: 5353`) fan onto the targets' dial port via the
+        // shared owner-port map — the UDP per-port upstreams join that map
+        // alongside the HTTP/TCP ones (codex r3). Ambient-only: the UDP egress
+        // materializer stamps HBONE and only runs under Ambient topology.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let mut svc = http_mesh_service("dns", 53, spiffe);
+        svc.ports[0].protocol = AppProtocol::Udp;
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(5353));
+        svc.cluster_ips = vec!["10.96.0.10".to_string()];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+            services: vec![svc],
+            destination_rules: vec![MeshDestinationRule {
+                name: "dns".to_string(),
+                namespace: "default".to_string(),
+                host: "dns.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::from([(
+                    53u16,
+                    MeshTrafficPolicy {
+                        connect_timeout_ms: Some(4321),
+                        ..MeshTrafficPolicy::default()
+                    },
+                )]),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_udp_upstreams(&mut config, &ambient_runtime(), &slice);
+        apply_destination_rules(&mut config, &ambient_runtime(), &slice)
+            .expect("destination rules apply");
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-udp-upstream-default-dns-53")
+            .expect("UDP upstream");
+        assert_eq!(
+            upstream
+                .port_overrides
+                .get(&5353)
+                .and_then(|slot| slot.connect_timeout_ms),
+            Some(4321),
+            "UDP-port portLevelSettings must land on the dial port"
+        );
+        assert!(
+            !upstream.port_overrides.contains_key(&53),
             "per-port policy must not remain under the service port"
         );
     }

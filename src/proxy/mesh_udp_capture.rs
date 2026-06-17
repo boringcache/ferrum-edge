@@ -359,8 +359,28 @@ pub async fn start_mesh_udp_capture_listener(
 /// slow session starve every other captured flow). Sized generously so a brief
 /// tunnel-dial stall (the channel buffers datagrams until the tunnel is ready)
 /// does not shed a normal burst.
+///
+/// This datagram-count bound is paired with [`EGRESS_CHANNEL_MAX_QUEUED_BYTES`]:
+/// 1024 datagrams of up to 65535 bytes each would let many stalled-dial sessions
+/// buffer ~64 MiB apiece, a memory-exhaustion DoS, so the BYTE cap (not the count
+/// alone) is what bounds per-session memory (codex r3).
 #[cfg(target_os = "linux")]
 const EGRESS_CHANNEL_DEPTH: usize = 1024;
+
+/// Maximum total bytes queued in a per-session egress channel. The mpsc bounds
+/// datagram COUNT; this bounds their aggregate SIZE so a slow/stalled HBONE
+/// dial+write cannot let each admitted session buffer `EGRESS_CHANNEL_DEPTH ×
+/// up-to-65535` bytes (a memory-exhaustion DoS). Together with
+/// `FERRUM_UDP_MAX_SESSIONS` this bounds worst-case queued memory to
+/// `max_sessions × EGRESS_CHANNEL_MAX_QUEUED_BYTES`. A datagram that would push
+/// the session over this cap is DROPPED (UDP-appropriate), tracked lock-free via
+/// the per-session `queued_bytes` atomic (bumped on enqueue, decremented as the
+/// egress task drains), so the cap check stays cheap on the recv-loop hot path.
+/// Mirrors the plain UDP proxy's `PENDING_SESSION_MAX_QUEUED_BYTES`; sized larger
+/// (256 KiB) because this carries an established session's traffic, not just a
+/// connection-setup flight.
+#[cfg(target_os = "linux")]
+const EGRESS_CHANNEL_MAX_QUEUED_BYTES: usize = 256 * 1024;
 
 /// Fallback write deadline for a single framed tunnel `write_all`, used ONLY when
 /// the per-session idle timeout is disabled (`udp_idle_timeout_seconds == 0`). A
@@ -389,7 +409,15 @@ static NEXT_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// sends the h2 end-stream).
 #[cfg(target_os = "linux")]
 struct CaptureSession {
-    last_activity: u64,
+    /// SHARED monotonic-millis activity clock (codex r3). The same `Arc` is held
+    /// by the egress + return-path tasks, which bump it on a delivered datagram
+    /// in EITHER direction, and read by the independent idle sweep. Without the
+    /// share, the sweep clock (refreshed only on client→egress datagrams) and the
+    /// task watchdog clock (bidirectional) disagree, so a session where the
+    /// client goes quiet while the destination keeps replying would have its map
+    /// entry reaped by the sweep mid-flow while the task is still alive. One
+    /// shared atomic keeps both clocks in lockstep.
+    last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Unique identity token for THIS session, stamped at admit from
     /// [`NEXT_SESSION_ID`]. The egress task removes its own map entry only when
     /// the stored token still matches (`remove_if`), so a replacement session
@@ -403,6 +431,12 @@ struct CaptureSession {
     /// always `Some` for a live session. Kept as `Option` only so the unit
     /// tests can exercise the keying/cap logic without a live tunnel.
     tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
+    /// SHARED count of bytes currently queued in the egress channel (codex r3).
+    /// Bumped by the recv loop on a successful enqueue, decremented by the egress
+    /// task as it drains each datagram, so a per-session BYTE cap
+    /// ([`EGRESS_CHANNEL_MAX_QUEUED_BYTES`]) can be enforced on the hot path
+    /// without walking the channel. The `Arc` is shared with the egress task.
+    queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Record a captured datagram against its session and forward it toward mesh
@@ -485,9 +519,14 @@ fn handle_captured_datagram(
             entry,
             rx,
             session_id,
+            last_activity,
+            queued_bytes,
         } => {
             // Spawn the per-session egress task (tunnel dial + return path); the
             // session's `tx` (already inserted by the bookkeeping above) feeds it.
+            // The shared `last_activity`/`queued_bytes` atomics keep the task's
+            // bidirectional clock + byte-drain accounting in sync with the sweep
+            // and recv loop.
             spawn_udp_egress_session(
                 state.clone(),
                 sessions.clone(),
@@ -496,6 +535,8 @@ fn handle_captured_datagram(
                 session_id,
                 entry,
                 rx,
+                last_activity,
+                queued_bytes,
             );
             true
         }
@@ -512,11 +553,16 @@ enum SessionAdmission {
     /// A NEW routable flow was admitted: the caller must spawn the egress task
     /// driven by `rx`, relaying to `entry`'s LB-selected workload. `session_id`
     /// is the unique token stamped on the inserted map entry, handed to the task
-    /// so its teardown only removes its own entry (`remove_if`).
+    /// so its teardown only removes its own entry (`remove_if`). `last_activity`
+    /// and `queued_bytes` are the SHARED atomics stored on the map entry, handed
+    /// to the task so its bidirectional clock and byte-drain accounting update the
+    /// same atomics the sweep / recv-loop read (codex r3).
     Admitted {
         entry: std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>,
         rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
         session_id: u64,
+        last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     },
     /// The datagram was dropped (not routable, or the session cap was reached).
     Dropped,
@@ -558,17 +604,13 @@ where
     match sessions.entry(key) {
         Entry::Occupied(mut occupied) => {
             let session = occupied.get_mut();
-            session.last_activity = now;
+            // Refresh the SHARED clock (the sweep + watchdog both read it).
+            session.last_activity.store(now, Ordering::Relaxed);
             if let Some(tx) = session.tx.as_ref() {
-                // Drop-on-full: UDP backpressure is "drop", and we must never
-                // block the bounded recv-loop drain.
-                if tx.try_send(bytes::Bytes::copy_from_slice(data)).is_err() {
-                    debug!(
-                        client = %key.client,
-                        orig_dst = %key.orig_dst,
-                        "Mesh UDP capture: egress channel full or closed; dropping datagram"
-                    );
-                }
+                // Drop-on-full by datagram COUNT (the channel bound) OR by queued
+                // BYTES (the per-session memory cap) — UDP backpressure is "drop",
+                // and we must never block the bounded recv-loop drain.
+                enqueue_egress_datagram(tx, &session.queued_bytes, data, key.client, key.orig_dst);
             }
             SessionAdmission::Refreshed
         }
@@ -597,23 +639,74 @@ where
             }
 
             let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(EGRESS_CHANNEL_DEPTH);
-            // The bounded channel was just created with depth >= 1 and `rx` is
-            // alive (returned below), so this enqueue of the first datagram
-            // cannot fail.
-            let _ = tx.try_send(bytes::Bytes::copy_from_slice(data));
+            // SHARED atomics: the activity clock and the queued-byte counter both
+            // live on the map entry AND are handed to the egress task, so the
+            // sweep, the recv loop, and the task all read/write the same state.
+            let last_activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now));
+            let queued_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            // The first datagram fits trivially (empty channel, depth >= 1, byte
+            // cap >> one datagram), so account it and enqueue; `rx` is alive
+            // (returned below) so the send cannot fail.
+            enqueue_egress_datagram(&tx, &queued_bytes, data, key.client, key.orig_dst);
             // Stamp a unique identity token so teardown removes only THIS entry.
             let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
             vacant.insert(CaptureSession {
-                last_activity: now,
+                last_activity: last_activity.clone(),
                 session_id,
                 tx: Some(tx),
+                queued_bytes: queued_bytes.clone(),
             });
             SessionAdmission::Admitted {
                 entry,
                 rx,
                 session_id,
+                last_activity,
+                queued_bytes,
             }
         }
+    }
+}
+
+/// Enqueue one captured datagram onto a session's egress channel, dropping it
+/// (UDP-appropriate) if either the channel's datagram-COUNT bound or the
+/// per-session queued-BYTE cap ([`EGRESS_CHANNEL_MAX_QUEUED_BYTES`]) would be
+/// exceeded (codex r3). Lock-free: a single relaxed `fetch_add` reserves the
+/// byte budget, handed back on a full/closed channel; the egress task decrements
+/// `queued_bytes` as it drains, so the counter tracks the live queue depth in
+/// bytes. Kept cheap so the recv-loop hot path stays allocation-light beyond the
+/// unavoidable payload copy into `Bytes`.
+#[cfg(target_os = "linux")]
+fn enqueue_egress_datagram(
+    tx: &tokio::sync::mpsc::Sender<bytes::Bytes>,
+    queued_bytes: &std::sync::atomic::AtomicUsize,
+    data: &[u8],
+    client: SocketAddr,
+    orig_dst: SocketAddr,
+) {
+    use std::sync::atomic::Ordering;
+    use tracing::debug;
+
+    // Reserve the byte budget first; if it would overflow the cap, hand it back
+    // and drop (do NOT enqueue, or the byte counter and channel would diverge).
+    let prev = queued_bytes.fetch_add(data.len(), Ordering::Relaxed);
+    if prev.saturating_add(data.len()) > EGRESS_CHANNEL_MAX_QUEUED_BYTES {
+        queued_bytes.fetch_sub(data.len(), Ordering::Relaxed);
+        debug!(
+            client = %client,
+            orig_dst = %orig_dst,
+            "Mesh UDP capture: egress queued-byte cap reached; dropping datagram"
+        );
+        return;
+    }
+    if tx.try_send(bytes::Bytes::copy_from_slice(data)).is_err() {
+        // Channel full (count bound) or closed (task gone): undo the byte
+        // reservation so the counter does not leak, and drop.
+        queued_bytes.fetch_sub(data.len(), Ordering::Relaxed);
+        debug!(
+            client = %client,
+            orig_dst = %orig_dst,
+            "Mesh UDP capture: egress channel full or closed; dropping datagram"
+        );
     }
 }
 
@@ -629,6 +722,7 @@ where
 /// map entry, so it is cleaned up by the idle sweep — the channel just goes
 /// undrained and fills, which drop-on-full handles harmlessly).
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn spawn_udp_egress_session(
     state: std::sync::Arc<super::ProxyState>,
     sessions: std::sync::Arc<
@@ -639,9 +733,11 @@ fn spawn_udp_egress_session(
     session_id: u64,
     entry: std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>,
     rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
     tokio::spawn(async move {
-        run_udp_egress_session(&state, &entry, key, rx).await;
+        run_udp_egress_session(&state, &entry, key, rx, last_activity, queued_bytes).await;
         // Session teardown: remove the map entry and decrement the live count so
         // a finished/failed flow frees its slot immediately (the idle sweep is a
         // backstop for sessions whose task is still alive but quiescent).
@@ -687,6 +783,8 @@ async fn run_udp_egress_session(
     entry: &std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>,
     key: CaptureSessionKey,
     mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
     use super::LoadBalancerConnectionGuard;
     use crate::load_balancer::LoadBalancerCache;
@@ -837,13 +935,16 @@ async fn run_udp_egress_session(
     let write_deadline = idle.unwrap_or(EGRESS_TUNNEL_WRITE_DEADLINE);
 
     // Shared last-activity clock (monotonic millis — never rewinds under NTP
-    // slew). Bumped on a delivered datagram in EITHER direction (client→egress
-    // sends AND return-path tunnel→client replies) and read by the single idle
-    // watchdog, so a one-way reply stream (client quiet, dest streaming back) does
-    // NOT time out mid-flow (codex r2 P2 — mirrors `relay_hbone_udp`).
-    let last_activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+    // slew), passed in from the map entry so the idle SWEEP, the recv loop, and
+    // this task's watchdog all read/write the SAME atomic (codex r3). Bumped on a
+    // delivered datagram in EITHER direction (client→egress sends AND return-path
+    // tunnel→client replies), so a one-way reply stream (client quiet, dest
+    // streaming back) does NOT time out mid-flow AND is not reaped by the sweep
+    // (codex r2 P2 + r3 — mirrors `relay_hbone_udp`).
+    last_activity.store(
         crate::socket_opts::monotonic_now_ms(),
-    ));
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // Return path: read framed datagrams off the tunnel and reply to the client
     // from the transparent socket. Activity here keeps the session alive.
@@ -882,11 +983,19 @@ async fn run_udp_egress_session(
     // by `write_deadline` so a stalled HBONE peer tears the session down instead
     // of leaking this task (codex r2 P2).
     let egress_activity = last_activity.clone();
+    // Moved into the egress loop: it is the sole drainer, so it owns releasing
+    // the byte reservations. (The recv loop only ever ADDS to this counter.)
+    let egress_queued_bytes = queued_bytes;
     let egress_loop = async move {
         use tokio::io::AsyncWriteExt;
         let mut frame =
             bytes::BytesMut::with_capacity(2 + super::mesh_udp_frame::MAX_FRAME_PAYLOAD);
         while let Some(payload) = rx.recv().await {
+            // This datagram has left the queue: release its byte reservation so
+            // the per-session queued-byte cap tracks the live queue depth (codex
+            // r3). Released for EVERY dequeued datagram regardless of the
+            // write outcome below.
+            egress_queued_bytes.fetch_sub(payload.len(), std::sync::atomic::Ordering::Relaxed);
             egress_activity.store(
                 crate::socket_opts::monotonic_now_ms(),
                 std::sync::atomic::Ordering::Relaxed,
@@ -1019,8 +1128,14 @@ fn spawn_capture_session_cleanup(
                     // accumulator is safe; one `fetch_sub` after keeps it lock-free.
                     let mut reaped: u64 = 0;
                     sessions.retain(|_, session| {
-                        let keep = now.saturating_sub(session.last_activity)
-                            <= CAPTURE_SESSION_IDLE_TIMEOUT_MS;
+                        // Read the SHARED activity clock (codex r3): the egress +
+                        // return-path tasks bump it on a delivered datagram in
+                        // EITHER direction, so a session whose client is quiet but
+                        // whose destination keeps replying is NOT reaped mid-flow
+                        // (the watchdog and this sweep now agree on liveness).
+                        let last = session.last_activity.load(Ordering::Relaxed);
+                        let keep =
+                            now.saturating_sub(last) <= CAPTURE_SESSION_IDLE_TIMEOUT_MS;
                         if !keep {
                             reaped += 1;
                         }
@@ -1256,6 +1371,63 @@ mod tests {
         );
         assert!(matches!(refreshed, SessionAdmission::Refreshed));
         assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn egress_enqueue_caps_queued_bytes_not_just_count() {
+        // Regression for codex r3: the per-session egress queue is bounded by
+        // BYTES, not just datagram count. With the receiver held (nothing
+        // drains), enqueues are accepted until the byte budget is exhausted, then
+        // dropped — and the byte counter never exceeds the cap nor leaks on a
+        // dropped datagram.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (tx, _rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(EGRESS_CHANNEL_DEPTH);
+        let queued = AtomicUsize::new(0);
+        let client: SocketAddr = "10.0.0.5:40000".parse().unwrap();
+        let dst: SocketAddr = "10.96.0.10:53".parse().unwrap();
+
+        // 1 KiB datagrams: the BYTE cap (256 KiB) bites long before the 1024-
+        // datagram COUNT cap, proving the byte bound is what limits memory.
+        let chunk = vec![0u8; 1024];
+        let cap_in_chunks = EGRESS_CHANNEL_MAX_QUEUED_BYTES / chunk.len();
+        for _ in 0..cap_in_chunks {
+            enqueue_egress_datagram(&tx, &queued, &chunk, client, dst);
+        }
+        assert_eq!(
+            queued.load(Ordering::Relaxed),
+            EGRESS_CHANNEL_MAX_QUEUED_BYTES,
+            "queued bytes should fill exactly to the cap"
+        );
+
+        // The next datagram would exceed the cap: dropped, counter unchanged.
+        enqueue_egress_datagram(&tx, &queued, &chunk, client, dst);
+        assert_eq!(
+            queued.load(Ordering::Relaxed),
+            EGRESS_CHANNEL_MAX_QUEUED_BYTES,
+            "an over-cap datagram must be dropped and must not bump the counter"
+        );
+        assert!(
+            queued.load(Ordering::Relaxed) <= EGRESS_CHANNEL_MAX_QUEUED_BYTES,
+            "the byte counter must never exceed the cap"
+        );
+    }
+
+    #[test]
+    fn egress_enqueue_releases_bytes_when_channel_closed() {
+        // If the egress task is gone (receiver dropped), an enqueue fails and the
+        // byte reservation is handed back so the counter does not leak (codex r3).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(EGRESS_CHANNEL_DEPTH);
+        drop(rx); // task gone
+        let queued = AtomicUsize::new(0);
+        let client: SocketAddr = "10.0.0.5:40000".parse().unwrap();
+        let dst: SocketAddr = "10.96.0.10:53".parse().unwrap();
+        enqueue_egress_datagram(&tx, &queued, b"hello", client, dst);
+        assert_eq!(
+            queued.load(Ordering::Relaxed),
+            0,
+            "a closed-channel enqueue must release its byte reservation"
+        );
     }
 
     #[test]
