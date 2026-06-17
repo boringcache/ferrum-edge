@@ -715,6 +715,17 @@ impl MeshRuntimeConfig {
     /// ServiceWaypoint also have no outbound capture listener (and UDP stays
     /// mesh-wide-only there per the per-pod-scope notes).
     ///
+    /// **End-to-end status (codex r3 P1 — tracked in #1808): this listener + the
+    /// Stage-4 HBONE relay are the datagram-over-mesh *transport*, but Ambient
+    /// currently has NO UDP capture *producer* feeding this listener** — the
+    /// node-agent host-netns path emits no UDP TPROXY rules (the same per-pod-scope
+    /// blocker that defers F4.3 / #1803) and eBPF capture is `connect()`-hooked /
+    /// TCP-only. So end-to-end UDP capture→relay is **not yet active in production**
+    /// on Ambient: the relay/transport is implemented and unit-tested, and the first
+    /// working end-to-end path lands via the deferred **Sidecar mesh-mTLS datagram
+    /// relay** (which pairs with the *existing* injector pod-netns producer — #1808),
+    /// or a future Ambient UDP producer. This PR is intentionally the transport half.
+    ///
     /// NOTE: the injector/init TPROXY-rule emission for a Sidecar pod is gated to
     /// MATCH this runtime listener gate (codex r2 P1): the injector only produces
     /// Sidecar pods, and `injector::sidecar_udp_capture_supported()` (a central

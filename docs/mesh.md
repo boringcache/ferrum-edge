@@ -1776,6 +1776,18 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   datapath (including return-source spoofing on a transparent socket) is
   **unit/dest-tested**; a live netns root e2e is deferred to the §3.1 capture-live
   verification stage (Stage 7).
+- **Not yet end-to-end in production (#1808).** Stage 4 is the datagram-over-mesh
+  **transport** — the Ambient HBONE relay plus the reusable framing codec,
+  materialization, capability enrollment, and dest-side unframe. But **Ambient
+  currently has no UDP capture *producer*** feeding the listener: the node-agent
+  host-netns path emits no UDP TPROXY rules (the same per-pod-scope blocker that
+  defers F4.3 / #1803) and eBPF capture is `connect()`-hooked / TCP-only; and the
+  only working UDP producer — the injector pod-netns TPROXY (Sidecar, Stage 2) —
+  pairs with the **deferred Sidecar mesh-mTLS datagram relay**. So no production
+  path feeds the relay yet. The first working end-to-end UDP path lands via that
+  Sidecar relay (reusing this codec, dialing peer `:15006`) wired to the existing
+  Sidecar producer — tracked in **#1808**; an Ambient UDP producer is blocked
+  alongside F4.3. This stage deliberately ships the transport half.
 - **Locally-generated pod UDP egress: OUTPUT-MARK → lo-reroute → PREROUTING-TPROXY
   loop.** TPROXY runs **only in `PREROUTING`**, never for locally-generated (OUTPUT)
   packets — jumping into a `-j TPROXY` chain from `mangle OUTPUT` is invalid and can
