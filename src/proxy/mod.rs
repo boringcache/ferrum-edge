@@ -9839,6 +9839,7 @@ async fn run_accept_loop(
                                         stream,
                                         remote_addr,
                                         &state,
+                                        &epoch,
                                         &entry,
                                         dst,
                                     )
