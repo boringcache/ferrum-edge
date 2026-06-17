@@ -65,13 +65,30 @@ mod inner {
     const MONGO_ERR_INDEX_OPTIONS_CONFLICT: i32 = 85;
     const MONGO_ERR_INDEX_KEY_SPECS_CONFLICT: i32 = 86;
 
-    fn mongo_rfc3339_utc(ts: DateTime<Utc>) -> String {
-        let mut s = ts.to_rfc3339();
-        if s.ends_with("+00:00") {
-            s.truncate(s.len() - "+00:00".len());
-            s.push('Z');
-        }
-        s
+    /// Build an ordering-safe `$gte` lower bound for the string-typed
+    /// `updated_at` field.
+    ///
+    /// Resource `updated_at` values are persisted as RFC 3339 strings via
+    /// chrono's serde impl, which uses `SecondsFormat::AutoSi`: it emits a
+    /// `Z`-suffixed string with **variable** fractional precision (no fraction
+    /// for whole seconds, otherwise 3/6/9 digits). Plain RFC 3339 string
+    /// comparison is therefore not chronologically faithful at the sub-second
+    /// boundary — `.` (0x2E) sorts before `Z` (0x5A), so a whole-second bound
+    /// like `2025-06-15T15:06:40Z` lexicographically *excludes* the
+    /// chronologically-newer `2025-06-15T15:06:40.123Z`.
+    ///
+    /// To keep `$gte` correct across all stored fractional widths, floor the
+    /// bound to its whole second and emit it with no fractional part and no
+    /// zone suffix (`%Y-%m-%dT%H:%M:%S`). Such a string is a prefix of every
+    /// AutoSi representation of that same second (and of any later instant), so
+    /// it lexicographically precedes them all and the boundary second is fully
+    /// included. Instants strictly before the bound's second still sort lower
+    /// and remain excluded. A sub-second bound is rounded down to the start of
+    /// its second — over-inclusive by at most one second, the same safe
+    /// direction as the incremental poll's explicit 1s margin (never drop
+    /// newer rows).
+    fn mongo_updated_at_lower_bound(ts: DateTime<Utc>) -> String {
+        ts.format("%Y-%m-%dT%H:%M:%S").to_string()
     }
 
     fn is_mongo_command_error_with_code(err: &mongodb::error::Error, code: i32) -> bool {
@@ -1521,10 +1538,12 @@ mod inner {
             let poll_timestamp = Utc::now();
 
             // Safety margin: 1 second before `since` to avoid missing boundary writes.
-            // Resource `updated_at` values are stored as UTC RFC 3339 strings
-            // with a `Z` suffix, so use the same byte format for the watermark.
+            // Resource `updated_at` values are stored as variable-precision
+            // RFC 3339 strings (chrono `AutoSi`), so use a whole-second-floor
+            // lower bound that orders correctly against every fractional width.
+            // See `mongo_updated_at_lower_bound`.
             let since_with_margin = since - chrono::Duration::seconds(1);
-            let since_str = mongo_rfc3339_utc(since_with_margin);
+            let since_str = mongo_updated_at_lower_bound(since_with_margin);
             let filter = doc! { "namespace": namespace, "updated_at": { "$gte": &since_str } };
 
             // Load changed resources.
@@ -3564,7 +3583,13 @@ mod inner {
                 );
             }
             if let Some(ref since) = filter.updated_since {
-                filter_doc.insert("updated_at", doc! { "$gte": mongo_rfc3339_utc(*since) });
+                // `updated_at` is a variable-precision RFC 3339 string; use a
+                // whole-second-floor bound so `$gte` does not drop same-second
+                // sub-second rows. See `mongo_updated_at_lower_bound`.
+                filter_doc.insert(
+                    "updated_at",
+                    doc! { "$gte": mongo_updated_at_lower_bound(*since) },
+                );
             }
             if let Some(ref tag) = filter.has_tag {
                 // Native array membership query (multikey index used).
@@ -4136,16 +4161,83 @@ mod inner {
             );
         }
 
+        /// How a `DateTime<Utc>` is actually persisted into `updated_at`:
+        /// chrono's serde impl (`SecondsFormat::AutoSi`). Mirrors what
+        /// `bson::to_document` writes for resource/api-spec docs, so the bound
+        /// tests below compare against the real stored bytes.
+        fn stored_updated_at(ts: DateTime<Utc>) -> String {
+            serde_json::to_string(&ts)
+                .expect("serialize timestamp")
+                .trim_matches('"')
+                .to_string()
+        }
+
         #[test]
-        fn mongo_rfc3339_utc_matches_stored_utc_suffix() {
-            let ts = DateTime::parse_from_rfc3339("2026-05-18T01:00:00.123Z")
+        fn mongo_updated_at_lower_bound_floors_to_whole_second() {
+            let whole = DateTime::parse_from_rfc3339("2026-05-18T01:00:00Z")
+                .expect("timestamp")
+                .with_timezone(&Utc);
+            let fractional = DateTime::parse_from_rfc3339("2026-05-18T01:00:00.123Z")
                 .expect("timestamp")
                 .with_timezone(&Utc);
 
-            let formatted = mongo_rfc3339_utc(ts);
+            assert_eq!(mongo_updated_at_lower_bound(whole), "2026-05-18T01:00:00");
+            assert_eq!(
+                mongo_updated_at_lower_bound(fractional),
+                "2026-05-18T01:00:00"
+            );
+            // No zone suffix or fractional part — it must be a prefix of every
+            // AutoSi stored representation of the same (or a later) second.
+            assert!(!mongo_updated_at_lower_bound(fractional).ends_with('Z'));
+            assert!(!mongo_updated_at_lower_bound(fractional).contains('.'));
+        }
 
-            assert_eq!(formatted, "2026-05-18T01:00:00.123Z");
-            assert!(!formatted.ends_with("+00:00"));
+        #[test]
+        fn mongo_updated_at_lower_bound_includes_same_second_sub_second_rows() {
+            // Regression: `GET /api-specs?updated_since=...T01:00:00Z` must not
+            // omit a row stored at `...T01:00:00.123Z`. A naive `Z`-suffixed
+            // bound excludes it because `.` (0x2E) sorts before `Z` (0x5A).
+            let bound_instant = DateTime::parse_from_rfc3339("2026-05-18T01:00:00Z")
+                .expect("timestamp")
+                .with_timezone(&Utc);
+            let bound = mongo_updated_at_lower_bound(bound_instant);
+
+            // Stored values at or after the bound, across every AutoSi width.
+            for stored_instant in [
+                "2026-05-18T01:00:00Z",           // exact second, no fraction
+                "2026-05-18T01:00:00.123Z",       // millis
+                "2026-05-18T01:00:00.123456Z",    // micros
+                "2026-05-18T01:00:00.000000001Z", // nanos
+                "2026-05-18T01:00:01Z",           // next second
+                "2026-05-18T01:01:00.5Z",         // later minute, fractional
+            ] {
+                let stored = stored_updated_at(
+                    DateTime::parse_from_rfc3339(stored_instant)
+                        .expect("stored timestamp")
+                        .with_timezone(&Utc),
+                );
+                assert!(
+                    stored.as_str() >= bound.as_str(),
+                    "stored {stored} must be >= bound {bound} (chronologically >= bound)"
+                );
+            }
+
+            // Strictly-earlier instants must remain excluded.
+            for stored_instant in [
+                "2026-05-18T00:59:59.999999999Z",
+                "2026-05-18T00:59:59Z",
+                "2026-05-17T23:59:59.5Z",
+            ] {
+                let stored = stored_updated_at(
+                    DateTime::parse_from_rfc3339(stored_instant)
+                        .expect("stored timestamp")
+                        .with_timezone(&Utc),
+                );
+                assert!(
+                    stored.as_str() < bound.as_str(),
+                    "stored {stored} must be < bound {bound} (chronologically < bound)"
+                );
+            }
         }
 
         #[test]
