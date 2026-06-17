@@ -868,72 +868,119 @@ async fn run_udp_egress_session(
         return;
     }
 
-    // UDP egress is Ambient-only: the materializer stamps `mesh.hbone` (Sidecar
-    // UDP is deferred), so a target must carry the HBONE tag.
-    if !crate::proxy::hbone_pool::target_hbone_enabled(&target) {
-        warn!(
-            service = %entry.service_fqdn,
-            target_host = %target.host,
-            "Mesh UDP egress target is not HBONE-tagged (Sidecar UDP egress is not supported); \
-             ending session"
-        );
-        return;
-    }
-    // HBONE capability must be proven (the enrollment pass + widened probe gate
-    // keep these records alive; the dispatch gate fails closed until proven).
-    if !state
-        .backend_capabilities
-        .get(proxy, Some(&target))
-        .is_some_and(|record| record.hbone.is_supported())
-    {
-        debug!(
-            service = %entry.service_fqdn,
-            target_host = %target.host,
-            target_port = target.port,
-            "Mesh UDP egress target has no proven HBONE capability yet; ending session \
-             (retry after the next capability refresh)"
-        );
-        return;
-    }
-    // Pinned peer identity: present-but-corrupt fails closed.
-    let expected_peer = match crate::proxy::hbone_pool::target_expected_peer_spiffe(&target) {
-        Ok(peer) => peer,
-        Err(err) => {
-            warn!(
-                service = %entry.service_fqdn,
-                target_host = %target.host,
-                error = %err,
-                "Mesh UDP egress target carries a corrupt pinned identity; refusing dial"
-            );
-            return;
-        }
-    };
-    let hbone_port = crate::proxy::hbone_pool::target_hbone_port(&target);
-
-    // ── Open the udp-marked datagram-over-HBONE tunnel ─────────────────────
-    let tunnel = match state
-        .hbone_pool
-        .get_datagram_tunnel(
-            proxy,
-            &target.host,
-            hbone_port,
-            &target.host,
-            target.port,
-            expected_peer.as_ref(),
-        )
-        .await
-    {
-        Ok(tunnel) => tunnel,
-        Err(err) => {
-            warn!(
+    // ── Dual-transport datagram tunnel (mirrors the raw-TCP egress branch in
+    // `mesh_tcp_egress::handle_mesh_tcp_egress`) ───────────────────────────────
+    // The materializer stamps exactly one transport tag per target (mutually
+    // exclusive). Ambient relays the datagram tunnel over a fresh HBONE CONNECT
+    // (`:15008`, capability-probe-gated); Sidecar relays it over a fresh
+    // mesh-mTLS CONNECT (`:15006`, NO capability registry — a slice-declared
+    // sidecar speaks mesh-mTLS by construction). Both stamp the `udp` marker so
+    // the destination's transport-agnostic inbound relay unframes the tunnel into
+    // a local `UdpSocket` (`is_udp_hbone_connect` → `handle_hbone_udp_request`).
+    // A target with neither tag fails closed (materializer bug).
+    let tunnel = if crate::proxy::hbone_pool::target_hbone_enabled(&target) {
+        // HBONE capability must be proven (the enrollment pass + widened probe
+        // gate keep these records alive; the dispatch gate fails closed until
+        // proven).
+        if !state
+            .backend_capabilities
+            .get(proxy, Some(&target))
+            .is_some_and(|record| record.hbone.is_supported())
+        {
+            debug!(
                 service = %entry.service_fqdn,
                 target_host = %target.host,
                 target_port = target.port,
-                error = %err,
-                "Mesh UDP egress datagram tunnel failed; ending session"
+                "Mesh UDP egress target has no proven HBONE capability yet; ending session \
+                 (retry after the next capability refresh)"
             );
             return;
         }
+        // Pinned peer identity: present-but-corrupt fails closed. An absent tag
+        // keeps trust-domain-only verification for operator-supplied targets.
+        let expected_peer = match crate::proxy::hbone_pool::target_expected_peer_spiffe(&target) {
+            Ok(peer) => peer,
+            Err(err) => {
+                warn!(
+                    service = %entry.service_fqdn,
+                    target_host = %target.host,
+                    error = %err,
+                    "Mesh UDP egress target carries a corrupt pinned identity; refusing dial"
+                );
+                return;
+            }
+        };
+        let hbone_port = crate::proxy::hbone_pool::target_hbone_port(&target);
+        match state
+            .hbone_pool
+            .get_datagram_tunnel(
+                proxy,
+                &target.host,
+                hbone_port,
+                &target.host,
+                target.port,
+                expected_peer.as_ref(),
+            )
+            .await
+        {
+            Ok(tunnel) => tunnel,
+            Err(err) => {
+                warn!(
+                    service = %entry.service_fqdn,
+                    target_host = %target.host,
+                    target_port = target.port,
+                    error = %err,
+                    "Mesh UDP egress datagram-over-HBONE tunnel failed; ending session"
+                );
+                return;
+            }
+        }
+    } else if crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(&target) {
+        // `mesh.mtls` targets are only ever produced by the materializer, which
+        // always stamps the destination identity — a missing/corrupt pin is a
+        // config-corruption signal and fails closed rather than dialing unpinned.
+        // No capability registry: a slice-declared sidecar peer speaks mesh-mTLS
+        // by construction (mirrors the raw-TCP mesh-mTLS branch).
+        let expected_peer =
+            match crate::proxy::mesh_mtls_pool::target_mesh_mtls_expected_peer(&target) {
+                Ok(peer) => peer,
+                Err(err) => {
+                    warn!(
+                        service = %entry.service_fqdn,
+                        target_host = %target.host,
+                        error = %err,
+                        "Mesh UDP egress mesh.mtls target carries no/invalid pinned identity; \
+                         refusing dial"
+                    );
+                    return;
+                }
+            };
+        let mtls_port = crate::proxy::mesh_mtls_pool::target_mesh_mtls_port(&target);
+        match state
+            .mesh_mtls_pool
+            .open_datagram_tunnel(proxy, &target.host, target.port, mtls_port, &expected_peer)
+            .await
+        {
+            Ok(tunnel) => tunnel,
+            Err(err) => {
+                warn!(
+                    service = %entry.service_fqdn,
+                    target_host = %target.host,
+                    target_port = target.port,
+                    error = %err,
+                    "Mesh UDP egress sidecar mesh-mTLS datagram tunnel failed; ending session"
+                );
+                return;
+            }
+        }
+    } else {
+        warn!(
+            service = %entry.service_fqdn,
+            target_host = %target.host,
+            "Mesh UDP egress target carries neither mesh.hbone nor mesh.mtls; ending session \
+             (materializer bug?)"
+        );
+        return;
     };
 
     // ── Return-path socket: a transparent UDP socket bound NON-LOCALLY to the
@@ -960,7 +1007,7 @@ async fn run_udp_egress_session(
         client = %key.client,
         target_host = %target.host,
         target_port = target.port,
-        "Mesh UDP egress session established (datagram-over-HBONE)"
+        "Mesh UDP egress session established (datagram-over-mesh CONNECT)"
     );
 
     let (mut tunnel_read, mut tunnel_write) = tokio::io::split(tunnel);
@@ -1574,6 +1621,53 @@ mod tests {
         );
         assert_eq!(canonicalize_socket_addr(v6), v6);
         assert!(canonicalize_socket_addr(v6).is_ipv6());
+    }
+
+    #[test]
+    fn egress_transport_branch_selects_by_tag() {
+        // The dual-transport branch in `run_udp_egress_session` (#1808, mirroring
+        // raw-TCP egress) keys off the target's transport tag, which the
+        // materializer stamps mutually-exclusively: an Ambient `mesh.hbone` target
+        // takes the HBONE datagram branch; a Sidecar `mesh.mtls` target takes the
+        // mesh-mTLS datagram branch; a target with neither tag ends the session.
+        // These are the exact predicates the branch evaluates, in order.
+        use crate::config::types::UpstreamTarget;
+        let target_with = |tags: &[(&str, &str)]| UpstreamTarget {
+            host: "10.0.0.9".to_string(),
+            port: 53,
+            weight: 1,
+            tags: tags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            locality: None,
+            path: None,
+        };
+
+        let hbone = target_with(&[(crate::proxy::hbone_pool::HBONE_TARGET_TAG, "true")]);
+        assert!(crate::proxy::hbone_pool::target_hbone_enabled(&hbone));
+        assert!(
+            !crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(&hbone),
+            "an Ambient mesh.hbone target must NOT take the mesh-mTLS branch"
+        );
+
+        let mtls = target_with(&[(crate::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG, "true")]);
+        // The HBONE predicate is evaluated FIRST, so a mesh.mtls target must fall
+        // through it to reach the mesh-mTLS branch.
+        assert!(
+            !crate::proxy::hbone_pool::target_hbone_enabled(&mtls),
+            "a Sidecar mesh.mtls target must fall through the HBONE branch"
+        );
+        assert!(crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(
+            &mtls
+        ));
+
+        // Neither tag → both predicates false → the fail-closed `else` arm.
+        let untagged = target_with(&[]);
+        assert!(!crate::proxy::hbone_pool::target_hbone_enabled(&untagged));
+        assert!(!crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(
+            &untagged
+        ));
     }
 
     fn admission_name(a: &SessionAdmission) -> &'static str {

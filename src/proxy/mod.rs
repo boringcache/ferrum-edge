@@ -4442,9 +4442,13 @@ impl ProxyState {
         // enrollment `retain_keys` evicts their HBONE records and every Ambient
         // UDP dial 502s `hbone_required` forever. Built from the SAME
         // deterministic UDP relay proxy the route table / dispatch use, so probe
-        // and dispatch capability keys agree. UDP egress is Ambient-only, so all
-        // its targets carry `mesh.hbone` (there is no Sidecar UDP target to
-        // skip); the predicate is kept for consistency with the TCP passes.
+        // and dispatch capability keys agree. UDP egress is now dual-transport
+        // (#1808): Ambient `mesh.hbone` UDP targets ARE enrolled (HBONE capability
+        // registry), Sidecar `mesh.mtls` UDP targets are SKIPPED below — they
+        // dispatch over a mesh-mTLS CONNECT with NO capability probe (a
+        // slice-declared sidecar speaks mesh-mTLS by construction), and probing
+        // them would dial a non-existent `:15008` HBONE listener and record a
+        // spurious unsupported verdict (mirrors the raw-TCP passes).
         for service in &mesh.services {
             for sp in crate::modes::mesh::service_udp_stream_ports(service) {
                 let upstream_id = crate::modes::mesh::mesh_outbound_udp_upstream_id(

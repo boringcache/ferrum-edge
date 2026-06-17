@@ -2949,19 +2949,24 @@ impl EnvConfig {
         // deployments are unaffected; a malformed setting is handled fail-closed
         // by the dedicated startup validation, so a parse error is ignored here.
         //
-        // AMBIENT-ONLY (codex r7): the capture listener only binds on the Ambient
-        // topology (`MeshRuntimeConfig::udp_capture_listener()` returns `None`
-        // otherwise — Sidecar/non-Ambient UDP egress is deferred). Reserving the
-        // port on a non-Ambient topology would reject a valid UDP/DTLS stream
-        // proxy or ServiceEntry on that port even though nothing ever binds it, so
-        // gate the reservation on the SAME `FERRUM_MESH_TOPOLOGY == ambient`
-        // condition the listener uses (read here the way the mesh runtime parses
-        // it; unset/other ⇒ no listener ⇒ no reservation).
+        // AMBIENT or SIDECAR only: the capture listener binds on the two
+        // topologies that relay captured UDP (`MeshRuntimeConfig::udp_capture_listener()`
+        // returns `None` for any other — Ambient relays over HBONE :15008,
+        // Sidecar over mesh-mTLS :15006). Reserving the port on a topology that
+        // never binds it would reject a valid UDP/DTLS stream proxy or
+        // ServiceEntry on that port, so gate the reservation on the SAME
+        // `FERRUM_MESH_TOPOLOGY ∈ {ambient, sidecar}` condition the listener uses
+        // (read here the way the mesh runtime parses it; unset/other ⇒ no listener
+        // ⇒ no reservation).
         if let Ok(udp) = crate::capture::udp_capture_settings_from_env()
             && udp.udp_capture_enabled
             && udp.udp_outbound_port != 0
-            && crate::config::conf_file::resolve_ferrum_var("FERRUM_MESH_TOPOLOGY")
-                .is_some_and(|t| t.trim().eq_ignore_ascii_case("ambient"))
+            && crate::config::conf_file::resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").is_some_and(
+                |t| {
+                    let t = t.trim();
+                    t.eq_ignore_ascii_case("ambient") || t.eq_ignore_ascii_case("sidecar")
+                },
+            )
         {
             ports.insert(udp.udp_outbound_port);
         }
