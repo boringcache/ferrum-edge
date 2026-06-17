@@ -60,6 +60,7 @@ fn create_mesh_proxy(backend_port: u16) -> Proxy {
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         circuit_breaker: None,

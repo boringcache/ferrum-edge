@@ -90,6 +90,7 @@ fn runtime() -> MeshRuntimeConfig {
         egress_stream_enabled: false,
         egress_stream_allow_plaintext: false,
         request_auth_require_exp: true,
+        locality_lb_strict: false,
     }
 }
 
@@ -115,6 +116,7 @@ fn matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -595,6 +597,7 @@ fn multi_port_upstream(id: &str, host_fqdn: &str) -> Upstream {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -745,6 +748,7 @@ fn port_level_locality_lb_drives_distribute_at_dispatch() {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: Some("us-west/us-west-1/a".to_string()),
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,

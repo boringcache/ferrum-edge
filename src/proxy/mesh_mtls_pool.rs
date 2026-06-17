@@ -486,6 +486,7 @@ impl MeshMtlsConnectionPool {
             Some(expected_peer),
             &pool_config,
             keepalive_override,
+            None,
         )
         .await?;
         tokio::time::timeout(
@@ -568,6 +569,7 @@ impl MeshMtlsConnectionPool {
             Some(expected_peer),
             &pool_config,
             keepalive_override,
+            None,
         )
         .await?;
         tokio::time::timeout(
