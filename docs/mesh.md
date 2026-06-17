@@ -1663,11 +1663,12 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   — the exact half-installed black-hole this design avoids. Emitting routing first
   means a routing failure aborts the `set -e` script before any capture is wired
   (the chains/rules are inert until the jumps are appended last); the node-agent's
-  sequential runner gets the same ordering. The mark (default `0xFE3`, 4067) is **Ferrum-owned
+  sequential runner gets the same ordering. The mark (default `0x733`, 1843) is **Ferrum-owned
   and deliberately NOT Istio's conventional TPROXY mark `0x539`**: Ferrum's
   higher-priority fwmark rule (priority `100`) matches the mark and steers it to
   the Ferrum table, so defaulting to `0x539` would hijack a co-resident Istio's
-  marked packets into Ferrum's table and break Istio traffic. Within Ferrum it is
+  marked packets into Ferrum's table and break Istio traffic. It also avoids common masked CNI mark classes
+  such as `0xF00/0xF00`; within Ferrum it is
   collision-free — Ferrum uses no other packet marks; the `1337` proxy UID is a
   socket-owner match, a disjoint namespace from `skb->mark`.
 - **Default OFF.** The consuming UDP listener arrives in **Stage 3**; an upgraded
