@@ -1870,10 +1870,12 @@ async fn process_new_session_datagram(
     }
 
     let mesh_enforcement_snapshot = mesh_outbound_enforcement.load_full();
+    let mut preselected_backend_target = None;
     if let Some(enforcement) = mesh_enforcement_snapshot.as_ref() {
         use crate::modes::mesh::outbound_enforcement::{Decision, PROTOCOL_UDP, PROTOCOL_UDP_DTLS};
         let (backend_host, backend_port) =
             resolve_backend_target(&view.proxy, &epoch.load_balancer)?;
+        preselected_backend_target = Some((backend_host.clone(), backend_port));
         let protocol_label = if matches!(view.proxy.effective_scheme(), BackendScheme::Dtls) {
             PROTOCOL_UDP_DTLS
         } else {
@@ -1922,6 +1924,7 @@ async fn process_new_session_datagram(
         listener_shutdown,
         global_shutdown,
         overload,
+        preselected_backend_target,
     )
     .await?;
     reservation.disarm();
@@ -3107,6 +3110,7 @@ async fn create_session(
     listener_shutdown: &watch::Receiver<bool>,
     global_shutdown: Option<&watch::Receiver<bool>>,
     overload: &Arc<crate::overload::OverloadState>,
+    preselected_backend_target: Option<(String, u16)>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     let UdpSessionEpochView {
         proxy,
@@ -3164,8 +3168,8 @@ async fn create_session(
         }
     }
 
-    // Resolve backend target
-    let (backend_host, backend_port) = resolve_backend_target(&proxy, &epoch.load_balancer)?;
+    let (backend_host, backend_port) =
+        resolve_or_reuse_backend_target(preselected_backend_target, &proxy, &epoch.load_balancer)?;
 
     // Circuit breaker check — reject before creating backend socket if open.
     // When admitted, capture whether this is a half-open probe so downstream
@@ -4025,6 +4029,17 @@ fn resolve_backend_target(
     }
 }
 
+fn resolve_or_reuse_backend_target(
+    preselected: Option<(String, u16)>,
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+) -> Result<(String, u16), anyhow::Error> {
+    match preselected {
+        Some(target) => Ok(target),
+        None => resolve_backend_target(proxy, lb_snapshot),
+    }
+}
+
 /// Coarse-grained epoch millisecond timestamp updated periodically.
 /// Avoids calling `SystemTime::now()` on every datagram in the hot path.
 /// Resolution is ~100ms which is more than sufficient for session idle timeout
@@ -4071,10 +4086,12 @@ mod tests {
         STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED, UdpDisconnectContext, UdpSession,
         build_dtls_stream_summary, build_udp_stream_summary, cached_backend_dtls_config,
         dtls_disconnect_cause, dtls_disconnect_direction, emit_udp_stream_disconnect,
-        reserve_udp_session_slot, udp_session_shard_amount,
+        reserve_udp_session_slot, resolve_or_reuse_backend_target, udp_session_shard_amount,
     };
     use crate::config::types::{BackendScheme, BackendTlsConfig, Proxy};
+    use crate::load_balancer::LoadBalancerCache;
     use crate::plugins::{Plugin, StreamTransactionSummary};
+    use crate::proxy::GatewayConfig;
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -4762,6 +4779,33 @@ backend_tls_verify_server_cert: false
             udp_session_shard_amount(0),
             crate::util::sharding::pool_shard_amount(0)
         );
+    }
+
+    #[test]
+    fn preselected_udp_backend_target_is_reused() {
+        let config = GatewayConfig::default();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let proxy: Proxy = serde_yaml::from_str(
+            r#"
+id: udp-proxy
+backend_scheme: udp
+backend_host: direct.local
+backend_port: 5353
+listen_port: 5300
+"#,
+        )
+        .unwrap();
+
+        let (host, port) = resolve_or_reuse_backend_target(
+            Some(("admitted.local".to_string(), 5354)),
+            &proxy,
+            &snapshot,
+        )
+        .unwrap();
+
+        assert_eq!(host, "admitted.local");
+        assert_eq!(port, 5354);
     }
 
     #[test]
