@@ -891,6 +891,7 @@ mod tests {
             locality: None,
             service_account: Some(service_account.to_string()),
             pod_uid: None,
+            remote_provenance: false,
         }
     }
 

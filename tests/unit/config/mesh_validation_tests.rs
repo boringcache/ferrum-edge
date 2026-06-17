@@ -4,8 +4,8 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, ConditionMatch, EastWestGateway, IngressListenerUnsupported, JwtHeader,
-    MeshConfig, MeshDestinationRule, MeshEndpoint, MeshJwtRule, MeshPolicy,
-    MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar, MeshSidecarEgress,
+    MAX_MESH_REMOTE_CLUSTERS, MeshConfig, MeshDestinationRule, MeshEndpoint, MeshJwtRule,
+    MeshPolicy, MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar, MeshSidecarEgress,
     MeshSidecarIngress, MeshSubset, MeshTrafficPolicy, MtlsMode, MultiClusterConfig, ParsedCidr,
     PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster, RequestMatch,
     Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet,
@@ -34,6 +34,7 @@ fn fresh_workload() -> Workload {
         locality: None,
         service_account: None,
         pod_uid: None,
+        remote_provenance: false,
     }
 }
 
@@ -871,6 +872,34 @@ fn multi_cluster_remote_cluster_requires_federated_trust_bundle_when_bundles_are
 }
 
 #[test]
+fn multi_cluster_rejects_too_many_remote_clusters() {
+    let remote_clusters: Vec<RemoteCluster> = (0..=MAX_MESH_REMOTE_CLUSTERS)
+        .map(|index| RemoteCluster {
+            name: format!("cluster-{index}"),
+            trust_domain: TrustDomain::new(format!("remote-{index}.test")).unwrap(),
+            network: None,
+            control_plane_url: None,
+            federation_endpoint: None,
+        })
+        .collect();
+    let mesh = MeshConfig {
+        multi_cluster: Some(MultiClusterConfig {
+            remote_clusters,
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors
+            .iter()
+            .any(|err| err.contains("remote_clusters") && err.contains("max")),
+        "expected remote cluster cap error, got: {errors:?}"
+    );
+}
+
+#[test]
 fn multi_cluster_rejects_duplicate_east_west_sni_hosts_on_same_backend_port() {
     let mesh = MeshConfig {
         multi_cluster: Some(MultiClusterConfig {
@@ -924,6 +953,7 @@ fn gateway_config_validate_mesh_fields_dispatches() {
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                remote_provenance: false,
             }],
             ..Default::default()
         })),

@@ -52,6 +52,19 @@ pub struct RecvMmsgBatch {
     /// IPv6 replies (notably link-local `fe80::/10`) egress the correct
     /// interface zone on send; for IPv4 it's informational.
     local_addrs: Vec<Option<crate::socket_opts::PktinfoLocal>>,
+    /// Per-slot original (pre-`TPROXY`) destination address parsed from the
+    /// IP(v6)_RECVORIGDSTADDR cmsg. `None` unless the socket has
+    /// `IP_RECVORIGDSTADDR` / `IPV6_RECVORIGDSTADDR` enabled (the mesh UDP
+    /// capture listener does; plain UDP proxy listeners do not). This is how a
+    /// TPROXY-captured datagram recovers the `service:port` the pod dialed,
+    /// since TPROXY delivers without rewriting the destination.
+    orig_dsts: Vec<Option<SocketAddr>>,
+    /// Whether to parse the IP(v6)_RECVORIGDSTADDR cmsg per datagram. Enabled
+    /// ONLY for the mesh UDP capture listener (which sets `IP_RECVORIGDSTADDR`);
+    /// plain UDP proxy listeners leave it `false` so they do not pay an
+    /// ancillary-data scan on every datagram for a value that is always `None`
+    /// there (codex r2 P2).
+    parse_orig_dst: bool,
     /// Maximum datagrams per recvmmsg call.
     capacity: usize,
     /// Number of datagrams received in the last `recv()` call.
@@ -74,7 +87,12 @@ impl RecvMmsgBatch {
     ///
     /// Allocates `capacity * 65535` bytes for datagram buffers plus bookkeeping
     /// arrays. This is a one-time allocation at listener startup.
-    pub fn new(capacity: usize) -> Self {
+    ///
+    /// `parse_orig_dst` opts this batch into per-datagram
+    /// `IP_RECVORIGDSTADDR` cmsg parsing; pass `true` only for the mesh UDP
+    /// capture listener and `false` for plain UDP proxy listeners (which never
+    /// enable the socket option and so would scan ancillary data for nothing).
+    pub fn new(capacity: usize, parse_orig_dst: bool) -> Self {
         let capacity = capacity.max(1);
         // cmsg buffer must hold UDP_GRO (u16) + IP_PKTINFO / IPV6_PKTINFO in the
         // same allocation; sized for the v6 worst case so both families fit.
@@ -95,6 +113,8 @@ impl RecvMmsgBatch {
             cmsg_bufs: (0..capacity).map(|_| vec![0u8; cmsg_space]).collect(),
             gro_segments: vec![None; capacity],
             local_addrs: vec![None; capacity],
+            orig_dsts: vec![None; capacity],
+            parse_orig_dst,
             capacity,
             count: 0,
         }
@@ -135,6 +155,16 @@ impl RecvMmsgBatch {
     pub fn local_addr(&self, i: usize) -> Option<crate::socket_opts::PktinfoLocal> {
         debug_assert!(i < self.count);
         self.local_addrs[i]
+    }
+
+    /// Returns the original (pre-`TPROXY`) destination address for slot `i`,
+    /// parsed from the IP(v6)_RECVORIGDSTADDR cmsg. `None` when the socket does
+    /// not have `IP_RECVORIGDSTADDR` / `IPV6_RECVORIGDSTADDR` enabled or the
+    /// datagram carried no such cmsg. The mesh UDP capture listener keys each
+    /// session by `(client, orig-dst)` from this value.
+    pub fn orig_dst(&self, i: usize) -> Option<SocketAddr> {
+        debug_assert!(i < self.count);
+        self.orig_dsts[i]
     }
 
     /// Receive up to `max_count` datagrams in a single `recvmmsg` syscall.
@@ -201,6 +231,9 @@ impl RecvMmsgBatch {
         }
 
         let received = ret as usize;
+        // Hoisted (Copy bool) so the per-datagram loop never re-reads the field
+        // and so plain UDP proxy listeners skip the orig-dst cmsg scan entirely.
+        let parse_orig_dst = self.parse_orig_dst;
         for i in 0..received {
             self.result_lens[i] = self.msgs[i].msg_len;
             self.result_addrs[i] = sockaddr_storage_to_std(&self.raw_addrs[i])?;
@@ -212,6 +245,16 @@ impl RecvMmsgBatch {
             // `None` otherwise (non-Linux, pktinfo disabled, or connected socket).
             self.local_addrs[i] =
                 crate::socket_opts::extract_pktinfo_local_addr(&self.msgs[i].msg_hdr);
+            // Parse IP(v6)_RECVORIGDSTADDR cmsg to recover the original
+            // (pre-TPROXY) destination. Only the mesh UDP capture socket enables
+            // `IP_RECVORIGDSTADDR`, so gate the scan on `parse_orig_dst`: plain
+            // UDP proxy listeners would always get `None` and must not pay the
+            // ancillary-data walk per datagram on the hot path (codex r2 P2).
+            self.orig_dsts[i] = if parse_orig_dst {
+                crate::socket_opts::extract_origdst(&self.msgs[i].msg_hdr)
+            } else {
+                None
+            };
         }
         self.count = received;
         Ok(received)
