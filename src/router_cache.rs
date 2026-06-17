@@ -33,6 +33,7 @@ thread_local! {
 const ROUTER_CACHE_EVICTION_SAMPLE_LIMIT: usize = 256;
 const ROUTER_CACHE_EVICTION_MAX_REMOVALS: usize = 64;
 const ROUTER_CACHE_EVICTION_ROTATION_WINDOWS: usize = 16;
+const ROTATION_WINDOWS_U64: u64 = ROUTER_CACHE_EVICTION_ROTATION_WINDOWS as u64;
 
 /// How [`RouterCache::search_route_table`] treats direction-scoped materialized
 /// mesh routes (`__mesh-inbound-*` / `__mesh-outbound-*`). The inbound and
@@ -692,9 +693,17 @@ pub struct RouterCache {
     /// Resolved DashMap shard count used by the lookup caches.
     #[cfg(test)]
     cache_shard_amount: usize,
-    /// Monotonic counters for eviction tracking per partition.
+    /// Monotonic counters for eviction tracking per partition (entries removed).
     prefix_eviction_counter: AtomicU64,
     regex_eviction_counter: AtomicU64,
+    /// Monotonic counters of eviction *attempts* per partition. These advance by
+    /// one per eviction pass (regardless of how many entries were removed) and
+    /// drive the rotating sample window in `frequency_aware_evict`. Counting
+    /// attempts rather than removals keeps the window stepping by `sample_size`
+    /// every pass; a removal-derived cursor would step by a multiple of the
+    /// rotation-window count and collapse the offset back to zero.
+    prefix_eviction_attempts: AtomicU64,
+    regex_eviction_attempts: AtomicU64,
     /// Frequency sketch shared by both cache partitions.
     /// Tracks access frequency for frequency-aware eviction (least-frequent-of-sample).
     frequency_sketch: CountMinSketch,
@@ -769,6 +778,8 @@ impl RouterCache {
             cache_shard_amount: shards,
             prefix_eviction_counter: AtomicU64::new(0),
             regex_eviction_counter: AtomicU64::new(0),
+            prefix_eviction_attempts: AtomicU64::new(0),
+            regex_eviction_attempts: AtomicU64::new(0),
             frequency_sketch: CountMinSketch::new(sketch_width, age_threshold),
             route_generation: AtomicU64::new(1),
         }
@@ -1177,7 +1188,12 @@ impl RouterCache {
     /// entries. This protects hot cache entries from eviction while keeping the
     /// eviction cost bounded by constants, not cache capacity.
     fn evict_prefix_sample(&self) {
-        let cursor = self.prefix_eviction_counter.load(Ordering::Relaxed);
+        // Advance the sample window by eviction *attempt*, not by entries
+        // removed, so successive passes step through a rotating window instead
+        // of re-sampling the same shard-ordered prefix every time.
+        let cursor = self
+            .prefix_eviction_attempts
+            .fetch_add(1, Ordering::Relaxed);
         let removed = frequency_aware_evict(
             &self.prefix_cache,
             &self.frequency_sketch,
@@ -1197,7 +1213,10 @@ impl RouterCache {
 
     /// Evict low-frequency entries from the regex cache using frequency-guided sampling.
     fn evict_regex_sample(&self) {
-        let cursor = self.regex_eviction_counter.load(Ordering::Relaxed);
+        // Advance the sample window by eviction *attempt*, not by entries
+        // removed, so successive passes step through a rotating window instead
+        // of re-sampling the same shard-ordered prefix every time.
+        let cursor = self.regex_eviction_attempts.fetch_add(1, Ordering::Relaxed);
         let removed = frequency_aware_evict(
             &self.regex_cache,
             &self.frequency_sketch,
@@ -1952,6 +1971,26 @@ fn subtract_cache_entries(counter: &AtomicUsize, removed: usize) {
     });
 }
 
+/// Compute the DashMap iteration offset for an eviction pass.
+///
+/// The sample start rotates across `ROTATION_WINDOWS` consecutive windows of
+/// `sample_size` entries, so successive passes walk 0, `sample_size`,
+/// `2*sample_size`, ... and wrap after `ROTATION_WINDOWS` passes. This spreads
+/// eviction pressure across the shard-ordered map instead of always re-sampling
+/// the same first entries (which would repeatedly evict whatever happens to land
+/// in the first window and never consider cold entries deeper in the map).
+///
+/// `cursor` MUST be an eviction-*attempt* count (advances by one per pass). A
+/// removal-derived cursor advances by `target_removals` (a multiple of
+/// `ROTATION_WINDOWS` for the default capacities), so `cursor % ROTATION_WINDOWS`
+/// would stay 0 and the window would never move. Taking the cursor modulo the
+/// window count before scaling also keeps the offset bounded — multiplying first
+/// could overflow on long runs.
+fn eviction_sample_skip(cursor: u64, sample_size: usize) -> usize {
+    let rotation = (cursor % ROTATION_WINDOWS_U64) as usize;
+    rotation.saturating_mul(sample_size)
+}
+
 /// Evict entries from a DashMap using frequency-guided sampling.
 ///
 /// Samples a bounded rotating window of entries, estimates each entry's access
@@ -1973,12 +2012,7 @@ fn frequency_aware_evict<V>(
     }
 
     let target_removals = (sample_size / 4).clamp(1, ROUTER_CACHE_EVICTION_MAX_REMOVALS);
-    let skip_window = sample_size.saturating_mul(ROUTER_CACHE_EVICTION_ROTATION_WINDOWS);
-    let skip = if skip_window > 0 {
-        (cursor as usize).wrapping_mul(sample_size) % skip_window
-    } else {
-        0
-    };
+    let skip = eviction_sample_skip(cursor, sample_size);
 
     // Collect a bounded sample of (key, frequency) pairs. DashMap iteration is
     // shard ordered, so each eviction advances through a small rotating window
@@ -2310,6 +2344,90 @@ mod tests {
         assert!(
             map.len() >= 1_000 - ROUTER_CACHE_EVICTION_MAX_REMOVALS,
             "eviction should not scan and remove the whole map"
+        );
+    }
+
+    #[test]
+    fn eviction_sample_skip_rotates_and_wraps() {
+        // The window must advance by `sample_size` for each successive attempt
+        // and wrap after `ROTATION_WINDOWS` passes. This pins the regression
+        // where the cursor (derived from removal counts) collapsed the offset to
+        // a constant 0, so the same first entries were sampled every pass.
+        let sample_size = ROUTER_CACHE_EVICTION_SAMPLE_LIMIT;
+        let offsets: Vec<usize> = (0..(ROUTER_CACHE_EVICTION_ROTATION_WINDOWS as u64 + 2))
+            .map(|cursor| eviction_sample_skip(cursor, sample_size))
+            .collect();
+
+        // First ROTATION_WINDOWS offsets are strictly increasing multiples.
+        for (i, offset) in offsets
+            .iter()
+            .take(ROUTER_CACHE_EVICTION_ROTATION_WINDOWS)
+            .enumerate()
+        {
+            assert_eq!(*offset, i * sample_size, "attempt {i} offset");
+        }
+        // Distinct windows within one rotation cycle (the broken cursor produced
+        // all-zero offsets here).
+        let unique: std::collections::HashSet<usize> = offsets
+            .iter()
+            .take(ROUTER_CACHE_EVICTION_ROTATION_WINDOWS)
+            .copied()
+            .collect();
+        assert_eq!(
+            unique.len(),
+            ROUTER_CACHE_EVICTION_ROTATION_WINDOWS,
+            "each pass within a cycle must target a distinct window"
+        );
+        // Wraps back to 0 after a full cycle.
+        assert_eq!(offsets[ROUTER_CACHE_EVICTION_ROTATION_WINDOWS], 0);
+        assert_eq!(
+            offsets[ROUTER_CACHE_EVICTION_ROTATION_WINDOWS + 1],
+            sample_size
+        );
+    }
+
+    #[test]
+    fn successive_evictions_advance_sample_window() {
+        // Drive several real eviction passes through `evict_prefix_sample` and
+        // assert the attempt counter advances by one per pass (which is what
+        // makes `eviction_sample_skip` rotate). A removal-derived cursor would
+        // advance by `target_removals` and leave the window pinned.
+        let config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("p", "/")],
+            ..GatewayConfig::default()
+        };
+        // Tiny capacity so each cache-miss insert trips eviction quickly.
+        let cache = RouterCache::new(&config, 8);
+
+        // Generate enough distinct paths to force multiple eviction passes.
+        for i in 0..200 {
+            let _ = cache.find_proxy(None, &format!("/p/{i}"));
+        }
+
+        let attempts = cache.prefix_eviction_attempts.load(Ordering::Relaxed);
+        assert!(
+            attempts >= 2,
+            "expected multiple eviction passes, got {attempts}"
+        );
+        // The attempt counter advances by exactly one per pass, so the rotation
+        // cursor visits distinct windows across passes (the regression pinned it
+        // to a single window because the cursor stepped by removal count).
+        let sample_size = cache
+            .max_cache_entries
+            .min(ROUTER_CACHE_EVICTION_SAMPLE_LIMIT);
+        let skips: std::collections::HashSet<usize> = (0..attempts)
+            .map(|c| eviction_sample_skip(c, sample_size))
+            .collect();
+        assert!(
+            skips.len() >= 2,
+            "successive eviction attempts should rotate the sample window, \
+             attempts={attempts} skips={skips:?}"
+        );
+        // Cache stays bounded near capacity.
+        assert!(
+            cache.cache_len() <= cache.max_cache_entries + ROUTER_CACHE_EVICTION_MAX_REMOVALS,
+            "cache should stay bounded, len={}",
+            cache.cache_len()
         );
     }
 
