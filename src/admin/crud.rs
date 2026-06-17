@@ -1297,7 +1297,8 @@ impl AdminResource for Proxy {
         existing: Option<&Self>,
         action: WriteAction<'_>,
     ) -> DbResult<()> {
-        if matches!(action, WriteAction::Update { .. })
+        if db.db_type() == "mongodb"
+            && matches!(action, WriteAction::Update { .. })
             && let Some(old_proxy) = existing
             && let Some(old_upstream_id) = old_proxy.upstream_id.as_deref()
             && resource.upstream_id.as_deref() != Some(old_upstream_id)

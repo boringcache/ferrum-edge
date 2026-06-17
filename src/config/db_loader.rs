@@ -1252,6 +1252,13 @@ impl DatabaseStore {
         };
 
         let mut tx = self.pool().begin().await?;
+        let old_upstream_id: Option<String> =
+            sqlx::query(&self.q("SELECT upstream_id FROM proxies WHERE id = ? AND namespace = ?"))
+                .bind(&proxy.id)
+                .bind(&proxy.namespace)
+                .fetch_optional(&mut *tx)
+                .await?
+                .and_then(|row| row.try_get::<String, _>("upstream_id").ok());
         self.ensure_proxy_route_unique_tx(&mut tx, proxy, Some(&proxy.id))
             .await?;
 
@@ -1330,6 +1337,13 @@ impl DatabaseStore {
         // Clean up orphaned proxy_group plugin configs (no remaining associations)
         self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
 
+        if let Some(old_upstream_id) = old_upstream_id.as_deref()
+            && proxy.upstream_id.as_deref() != Some(old_upstream_id)
+        {
+            self.cleanup_orphaned_upstream_tx(&mut tx, old_upstream_id)
+                .await?;
+        }
+
         tx.commit().await?;
 
         self.check_slow_query("update_proxy", start);
@@ -1404,27 +1418,7 @@ impl DatabaseStore {
 
         // If the proxy had an upstream, check if it's now orphaned and delete it
         if let Some(ref uid) = upstream_id {
-            let ref_rows: Vec<AnyRow> = sqlx::query(
-                &self.q("SELECT id FROM proxies WHERE upstream_id = ? AND namespace = ? LIMIT 1"),
-            )
-            .bind(uid)
-            .bind(&proxy_namespace)
-            .fetch_all(&mut *tx)
-            .await?;
-            let dispatch_ref = if ref_rows.is_empty() {
-                self.find_mesh_route_dispatch_upstream_ref_tx(&mut tx, uid, &proxy_namespace)
-                    .await?
-            } else {
-                None
-            };
-            if ref_rows.is_empty() && dispatch_ref.is_none() {
-                info!("Cascade-deleting orphaned upstream {}", uid);
-                sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ? AND namespace = ?"))
-                    .bind(uid)
-                    .bind(&proxy_namespace)
-                    .execute(&mut *tx)
-                    .await?;
-            }
+            self.cleanup_orphaned_upstream_tx(&mut tx, uid).await?;
         }
 
         tx.commit().await?;
@@ -1462,6 +1456,52 @@ impl DatabaseStore {
             sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ? AND namespace = ?"))
                 .bind(id)
                 .bind(namespace)
+                .execute(&mut **tx)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_orphaned_upstream_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        upstream_id: &str,
+    ) -> Result<(), anyhow::Error> {
+        let upstream_row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT namespace, api_spec_id FROM upstreams WHERE id = ? LIMIT 1"))
+                .bind(upstream_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        let Some(upstream_row) = upstream_row else {
+            return Ok(());
+        };
+        let namespace: String = upstream_row.try_get("namespace")?;
+        let api_spec_id: Option<String> = upstream_row.try_get("api_spec_id")?;
+        if api_spec_id.is_some() {
+            return Ok(());
+        }
+
+        let ref_rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT id FROM proxies WHERE upstream_id = ? AND namespace = ? LIMIT 1"),
+        )
+        .bind(upstream_id)
+        .bind(&namespace)
+        .fetch_all(&mut **tx)
+        .await?;
+
+        let dispatch_ref = if ref_rows.is_empty() {
+            self.find_mesh_route_dispatch_upstream_ref_tx(tx, upstream_id, &namespace)
+                .await?
+        } else {
+            None
+        };
+
+        if ref_rows.is_empty() && dispatch_ref.is_none() {
+            info!("Cleaning up orphaned upstream {}", upstream_id);
+            sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ? AND namespace = ?"))
+                .bind(upstream_id)
+                .bind(&namespace)
                 .execute(&mut **tx)
                 .await?;
         }
@@ -2203,45 +2243,9 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
-        let namespace: Option<String> =
-            sqlx::query(&self.q("SELECT namespace FROM upstreams WHERE id = ?"))
-                .bind(old_upstream_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .map(|row| row.try_get::<String, _>("namespace"))
-                .transpose()?;
-        let Some(namespace) = namespace else {
-            tx.rollback().await?;
-            self.check_slow_query("cleanup_orphaned_upstream", start);
-            return Ok(());
-        };
 
-        let ref_rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT id FROM proxies WHERE upstream_id = ? AND namespace = ? LIMIT 1"),
-        )
-        .bind(old_upstream_id)
-        .bind(&namespace)
-        .fetch_all(&mut *tx)
-        .await?;
-
-        let dispatch_ref = if ref_rows.is_empty() {
-            self.find_mesh_route_dispatch_upstream_ref_tx(&mut tx, old_upstream_id, &namespace)
-                .await?
-        } else {
-            None
-        };
-
-        if ref_rows.is_empty() && dispatch_ref.is_none() {
-            info!(
-                "Cleaning up orphaned upstream {} after proxy reassignment",
-                old_upstream_id
-            );
-            sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ? AND namespace = ?"))
-                .bind(old_upstream_id)
-                .bind(&namespace)
-                .execute(&mut *tx)
-                .await?;
-        }
+        self.cleanup_orphaned_upstream_tx(&mut tx, old_upstream_id)
+            .await?;
 
         tx.commit().await?;
 
