@@ -1531,7 +1531,8 @@ fn handle_pod_added(
             drop(state);
             handle_pod_removed(backend, pod_states, config, metrics, pod_uid);
         } else {
-            reconcile_existing_pod_ip(backend, config, metrics, pod_uid, pod_ip, &mut state);
+            let stale_pod_ip =
+                reconcile_existing_pod_ip(backend, config, metrics, pod_uid, pod_ip, &mut state);
             reconcile_existing_pod_include_ports(
                 backend,
                 metrics,
@@ -1549,6 +1550,17 @@ fn handle_pod_added(
                 &mut state,
             );
             debug!(pod_uid, pod_name, "Pod already enrolled, reconciled state");
+            drop(state);
+            if let Some(ip) = stale_pod_ip {
+                remove_pod_ip_if_unowned(
+                    backend,
+                    pod_states,
+                    metrics,
+                    pod_uid,
+                    ip,
+                    "pod IP changed",
+                );
+            }
             return;
         }
     }
@@ -1714,12 +1726,10 @@ fn reconcile_existing_pod_ip(
     pod_uid: &str,
     pod_ip: Option<std::net::Ipv4Addr>,
     state: &mut PodAttachmentState,
-) {
-    let Some(new_ip) = pod_ip else {
-        return;
-    };
+) -> Option<std::net::Ipv4Addr> {
+    let new_ip = pod_ip?;
     if state.pod_ip == Some(new_ip) {
-        return;
+        return None;
     }
 
     let info = PodInfo {
@@ -1729,14 +1739,9 @@ fn reconcile_existing_pod_ip(
     if let Err(e) = backend.update_pod_ip(new_ip, &info) {
         warn!(pod_uid, %new_ip, error = %e, "Failed to update pod IP map for existing pod");
         metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
-        return;
+        return None;
     }
-    if let Some(old_ip) = state.pod_ip
-        && let Err(e) = backend.remove_pod_ip(old_ip)
-    {
-        warn!(pod_uid, %old_ip, error = %e, "Failed to remove stale pod IP from map");
-        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
-    }
+    let old_ip = state.pod_ip;
     state.pod_ip = Some(new_ip);
     // Keep the in-netns capture registry's pod IP in sync (line 2 of the entry)
     // so the mesh proxy reopens its in-netns listener with the new
@@ -1748,6 +1753,42 @@ fn reconcile_existing_pod_ip(
     ) {
         publish_pod_registry(dir, pod_uid, cgroup, Some(new_ip));
     }
+    old_ip
+}
+
+fn remove_pod_ip_if_unowned(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+    pod_uid: &str,
+    ip: std::net::Ipv4Addr,
+    removal_reason: &'static str,
+) {
+    if let Some(owner_pod_uid) = other_pod_owning_ip(pod_states, pod_uid, ip) {
+        debug!(
+            pod_uid,
+            owner_pod_uid,
+            %ip,
+            removal_reason,
+            "Skipping pod IP map removal; IP is owned by another tracked pod"
+        );
+        return;
+    }
+    if let Err(e) = backend.remove_pod_ip(ip) {
+        warn!(pod_uid, %ip, error = %e, removal_reason, "Failed to remove pod IP from map");
+        metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn other_pod_owning_ip(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    pod_uid: &str,
+    ip: std::net::Ipv4Addr,
+) -> Option<String> {
+    pod_states.iter().find_map(|entry| {
+        (entry.key().as_str() != pod_uid && entry.value().pod_ip == Some(ip))
+            .then(|| entry.key().clone())
+    })
 }
 
 /// Re-evaluate the `includeOutboundPorts` annotations of an already-enrolled
@@ -2068,10 +2109,8 @@ pub fn handle_pod_removed(
         if let Err(e) = backend.detach_pod(pod_uid) {
             warn!(pod_uid, error = %e, "Failed to detach BPF programs");
         }
-        if let Some(ip) = state.pod_ip
-            && let Err(e) = backend.remove_pod_ip(ip)
-        {
-            warn!(pod_uid, %ip, error = %e, "Failed to remove pod IP from map");
+        if let Some(ip) = state.pod_ip {
+            remove_pod_ip_if_unowned(backend, pod_states, metrics, pod_uid, ip, "pod removed");
         }
         // Pair with `apply_include_outbound_ports` — only annotated pods ever
         // carried entries. Use the stashed cgroup ids (pod inode + descendant
@@ -3883,6 +3922,61 @@ mod tests {
     }
 
     #[test]
+    fn handle_pod_removed_keeps_ip_owned_by_another_pod() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 5);
+
+        for pod_uid in ["pod-uid-old", "pod-uid-new"] {
+            pod_states.insert(
+                pod_uid.to_string(),
+                PodAttachmentState {
+                    pod_uid: pod_uid.to_string(),
+                    pod_name: pod_uid.to_string(),
+                    namespace: "default".to_string(),
+                    pod_ip: Some(ip),
+                    cgroup_path: Some(format!("/sys/fs/cgroup/kubepods/{pod_uid}")),
+                    veth_iface: Some(format!("veth-{pod_uid}")),
+                    attached: true,
+                    include_ports_cgroup_ids: Vec::new(),
+                    include_ports_policy: None,
+                    workload_identity_cgroup_ids: Vec::new(),
+                },
+            );
+        }
+        backend
+            .update_pod_ip(
+                ip,
+                &PodInfo {
+                    proxy_port: 15001,
+                    cgroup_id: 0,
+                },
+            )
+            .unwrap();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-old");
+
+        assert!(!pod_states.contains_key("pod-uid-old"));
+        assert!(pod_states.contains_key("pod-uid-new"));
+        assert!(
+            backend.pod_ips.contains_key(&ip),
+            "delayed delete for old pod must not clobber recycled IP owned by new pod"
+        );
+    }
+
+    #[test]
     fn handle_pod_removed_noop_for_unknown() {
         let mut backend = MockEbpfBackend::default();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
@@ -4490,6 +4584,76 @@ mod tests {
         assert_eq!(pod_states.get("pod-uid-1").unwrap().pod_ip, Some(ip));
         assert!(backend.pod_ips.contains_key(&ip));
         assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn handle_pod_added_keeps_old_ip_when_another_pod_owns_it() {
+        let mut backend = MockEbpfBackend::default();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let old_ip = std::net::Ipv4Addr::new(10, 0, 0, 5);
+        let new_ip = std::net::Ipv4Addr::new(10, 0, 0, 8);
+
+        for (pod_uid, veth) in [("pod-uid-1", "veth-a"), ("pod-uid-2", "veth-b")] {
+            pod_states.insert(
+                pod_uid.to_string(),
+                PodAttachmentState {
+                    pod_uid: pod_uid.to_string(),
+                    pod_name: pod_uid.to_string(),
+                    namespace: "default".to_string(),
+                    pod_ip: Some(old_ip),
+                    cgroup_path: None,
+                    veth_iface: Some(veth.to_string()),
+                    attached: true,
+                    include_ports_cgroup_ids: Vec::new(),
+                    include_ports_policy: None,
+                    workload_identity_cgroup_ids: Vec::new(),
+                },
+            );
+        }
+        backend
+            .update_pod_ip(
+                old_ip,
+                &PodInfo {
+                    proxy_port: 15001,
+                    cgroup_id: 0,
+                },
+            )
+            .unwrap();
+
+        let event = PodEvent {
+            pod_uid: "pod-uid-1",
+            pod_name: "existing",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.8"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-a"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert_eq!(pod_states.get("pod-uid-1").unwrap().pod_ip, Some(new_ip));
+        assert_eq!(pod_states.get("pod-uid-2").unwrap().pod_ip, Some(old_ip));
+        assert!(
+            backend.pod_ips.contains_key(&old_ip),
+            "old IP should stay mapped because pod-uid-2 still owns it"
+        );
+        assert!(backend.pod_ips.contains_key(&new_ip));
     }
 
     #[tokio::test]
