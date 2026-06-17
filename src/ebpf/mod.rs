@@ -538,6 +538,10 @@ pub struct MockEbpfBackend {
     pub fail_update_capture_config: bool,
     pub fail_attach_sock_ops: bool,
     pub sock_ops_attached_cgroup_root: Option<String>,
+    /// When non-zero, the next N `update_workload_identity` calls return an
+    /// error (decrementing the counter), letting tests exercise partial-write
+    /// retry behaviour where some pod cgroups enroll and others fail.
+    pub fail_workload_identity_writes: usize,
 }
 
 impl EbpfBackend for MockEbpfBackend {
@@ -628,6 +632,12 @@ impl EbpfBackend for MockEbpfBackend {
         cgroup_id: u64,
         identity: &WorkloadIdentity,
     ) -> Result<(), String> {
+        if self.fail_workload_identity_writes > 0 {
+            self.fail_workload_identity_writes -= 1;
+            return Err(format!(
+                "injected workload identity write failure for cgroup {cgroup_id}"
+            ));
+        }
         self.operations
             .push(format!("update_workload_identity:{cgroup_id}"));
         self.workload_identities.insert(cgroup_id, *identity);

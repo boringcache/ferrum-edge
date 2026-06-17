@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use futures_util::StreamExt;
@@ -52,9 +52,6 @@ const POD_ENROLLMENT_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 static FAILED_POD_ENROLLMENT_ATTEMPTS: LazyLock<DashMap<String, FailedPodEnrollmentAttempt>> =
     LazyLock::new(DashMap::new);
-static WORKLOAD_IDENTITY_RECONCILE_FINGERPRINTS: LazyLock<
-    DashMap<String, CgroupTreeChangeFingerprint>,
-> = LazyLock::new(DashMap::new);
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -1246,14 +1243,6 @@ struct FailedPodEnrollmentAttempt {
     last_attempt: Instant,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CgroupTreeChangeFingerprint {
-    root_inode: Option<u64>,
-    root_modified_nanos: Option<u128>,
-    child_count: usize,
-    child_hash: u64,
-}
-
 fn pod_state_key(pod_states: &DashMap<String, PodAttachmentState>, pod_uid: &str) -> String {
     format!("{:p}:{pod_uid}", pod_states)
 }
@@ -1320,72 +1309,6 @@ fn forget_failed_pod_enrollment(state_key: &str) {
 
 fn forget_pod_enrollment_attempt(state_key: &str) {
     FAILED_POD_ENROLLMENT_ATTEMPTS.remove(state_key);
-    WORKLOAD_IDENTITY_RECONCILE_FINGERPRINTS.remove(state_key);
-}
-
-fn cgroup_tree_change_fingerprint(cgroup_path: &str) -> Option<CgroupTreeChangeFingerprint> {
-    let path = std::path::Path::new(cgroup_path);
-    let metadata = std::fs::metadata(path).ok()?;
-    if !metadata.is_dir() {
-        return None;
-    }
-
-    let mut children = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(true) {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let inode = std::fs::metadata(entry.path())
-                .ok()
-                .and_then(|metadata| metadata_inode(&metadata));
-            children.push((name, inode));
-        }
-    }
-    children.sort_unstable();
-
-    let mut hasher = DefaultHasher::new();
-    for child in &children {
-        child.hash(&mut hasher);
-    }
-
-    Some(CgroupTreeChangeFingerprint {
-        root_inode: metadata_inode(&metadata),
-        root_modified_nanos: metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos()),
-        child_count: children.len(),
-        child_hash: hasher.finish(),
-    })
-}
-
-#[cfg(unix)]
-fn metadata_inode(metadata: &std::fs::Metadata) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-
-    Some(metadata.ino())
-}
-
-#[cfg(not(unix))]
-fn metadata_inode(_metadata: &std::fs::Metadata) -> Option<u64> {
-    None
-}
-
-fn workload_identity_tree_unchanged(state_key: &str, cgroup_path: &str) -> bool {
-    let Some(fingerprint) = cgroup_tree_change_fingerprint(cgroup_path) else {
-        return false;
-    };
-    if WORKLOAD_IDENTITY_RECONCILE_FINGERPRINTS
-        .get(state_key)
-        .is_some_and(|previous| previous.value() == &fingerprint)
-    {
-        return true;
-    }
-    WORKLOAD_IDENTITY_RECONCILE_FINGERPRINTS.insert(state_key.to_string(), fingerprint);
-    false
 }
 
 /// Reject a `pod_uid` that could escape the registry directory. A pod UID is a
@@ -1552,7 +1475,6 @@ fn handle_pod_added(
             reconcile_existing_pod_workload_identity(
                 backend,
                 config,
-                &state_key,
                 pod_uid,
                 namespace,
                 event.service_account,
@@ -1709,9 +1631,6 @@ fn handle_pod_added(
 
     if state.attached {
         forget_failed_pod_enrollment(&state_key);
-        if let Some(cgroup_path_value) = state.cgroup_path.as_deref() {
-            let _ = workload_identity_tree_unchanged(&state_key, cgroup_path_value);
-        }
         pod_states.insert(pod_uid.to_string(), state);
         // Publish to the in-netns capture registry only AFTER enrollment fully
         // succeeded (programs attached, pod-IP + identity written), so a failed
@@ -1995,7 +1914,6 @@ fn reconcile_existing_pod_include_ports(
 fn reconcile_existing_pod_workload_identity(
     backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
-    state_key: &str,
     pod_uid: &str,
     namespace: &str,
     service_account: Option<&str>,
@@ -2004,16 +1922,30 @@ fn reconcile_existing_pod_workload_identity(
     let Some(cgroup_path) = state.cgroup_path.clone() else {
         return;
     };
-    if !state.workload_identity_cgroup_ids.is_empty()
-        && workload_identity_tree_unchanged(state_key, &cgroup_path)
-    {
-        return;
-    }
     let current = cgroup::collect_cgroup_tree_inodes(std::path::Path::new(&cgroup_path));
     if current.is_empty() {
         return;
     }
     let current_set: HashSet<u64> = current.iter().copied().collect();
+
+    // Fast path: skip the SVID build + per-leaf map churn when the observed
+    // cgroup tree exactly matches what we have already written. We compare the
+    // full descendant inode set (the same depth-bounded BFS the writes use),
+    // not a shallow direct-children fingerprint, so deeply-nested container
+    // cgroup churn is still observed; and we compare against the *written* set
+    // (`workload_identity_cgroup_ids`, which only holds ids the backend
+    // accepted), not a separately-seeded baseline, so an earlier partial write
+    // is retried instead of being permanently skipped. The tree walk above is
+    // retained deliberately: a cheaper signal cannot detect either case
+    // without failing closed for an un-enrolled container cgroup.
+    if current_set.len() == state.workload_identity_cgroup_ids.len()
+        && state
+            .workload_identity_cgroup_ids
+            .iter()
+            .all(|cgroup_id| current_set.contains(cgroup_id))
+    {
+        return;
+    }
 
     // Drop entries no longer present in the tree (e.g. a restarted container's
     // old leaf cgroup) from both the BPF map and our tracking set.
@@ -3780,7 +3712,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn reconcile_skips_workload_identity_walk_when_cgroup_fingerprint_unchanged() {
+    fn reconcile_skips_workload_identity_writes_when_cgroup_set_unchanged() {
         let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
@@ -3833,7 +3765,7 @@ mod tests {
             .count();
         assert_eq!(
             identity_ops_after_unchanged_apply, identity_ops_after_enroll,
-            "unchanged Apply must skip the deep cgroup-tree identity reconcile"
+            "unchanged Apply must skip the workload identity writes"
         );
 
         let container2 = pod_cgroup.join("crio-bbbb.scope");
@@ -3848,6 +3780,146 @@ mod tests {
         assert!(
             identity_ops_after_changed_apply > identity_ops_after_unchanged_apply,
             "new container cgroup must still trigger workload identity reconciliation"
+        );
+    }
+
+    /// Regression: a container cgroup created *below an intermediate child*
+    /// (a grandchild of the pod cgroup) must still trigger reconciliation even
+    /// though the pod cgroup's direct children are unchanged. A shallow
+    /// direct-children fingerprint would miss this and leave the new container
+    /// without a `FERRUM_WORKLOAD_IDENTITY` entry (fail-closed).
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_workload_identity_detects_nested_grandchild_cgroup() {
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "33333333-3333-3333-3333-333333333333";
+        let pod_cgroup = cgroup_root.path().join(format!("kubepods/pod{pod_uid}"));
+        // Container lives under an intermediate `burstable` QoS child, so the
+        // pod cgroup's only direct child stays `burstable` across both Applies.
+        let intermediate = pod_cgroup.join("burstable");
+        std::fs::create_dir_all(intermediate.join("crio-aaaa.scope")).unwrap();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: Some("api"),
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.6"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        let ops_after_enroll = backend
+            .operations
+            .iter()
+            .filter(|op| op.starts_with("update_workload_identity:"))
+            .count();
+
+        // Add a second container as another grandchild. Pod's direct children
+        // ({burstable}) are unchanged, but the full descendant set grew.
+        std::fs::create_dir_all(intermediate.join("crio-bbbb.scope")).unwrap();
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        let ops_after_grandchild = backend
+            .operations
+            .iter()
+            .filter(|op| op.starts_with("update_workload_identity:"))
+            .count();
+        assert!(
+            ops_after_grandchild > ops_after_enroll,
+            "a deeply-nested (grandchild) container cgroup must trigger reconciliation"
+        );
+    }
+
+    /// Regression: when enrollment writes some cgroups but the backend rejects
+    /// one (e.g. a transient BPF map error), the missing entry must be retried
+    /// on the next Apply with an unchanged tree, instead of being permanently
+    /// skipped by a baseline that was seeded from the partial write.
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_workload_identity_retries_partial_write() {
+        use std::os::unix::fs::MetadataExt;
+
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend {
+            // Fail exactly the first identity write (the pod cgroup root); the
+            // container leaf write that follows succeeds.
+            fail_workload_identity_writes: 1,
+            ..MockEbpfBackend::default()
+        };
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let pod_uid = "44444444-4444-4444-4444-444444444444";
+        let pod_cgroup = cgroup_root.path().join(format!("kubepods/pod{pod_uid}"));
+        let container = pod_cgroup.join("crio-aaaa.scope");
+        std::fs::create_dir_all(&container).unwrap();
+        let pod_ino = std::fs::metadata(&pod_cgroup).unwrap().ino();
+        let container_ino = std::fs::metadata(&container).unwrap().ino();
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "test-pod",
+            namespace: "default",
+            service_account: Some("api"),
+            labels: &labels,
+            annotations: &HashMap::new(),
+            pod_ip_str: Some("10.0.0.7"),
+            pod_pid: None,
+            veth_iface_override: Some("veth-mock"),
+        };
+
+        // Enrollment: the pod-root write fails, the container write succeeds.
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        assert!(
+            backend.workload_identities.contains_key(&container_ino),
+            "container cgroup should enroll despite the pod-root write failing"
+        );
+        assert!(
+            !backend.workload_identities.contains_key(&pod_ino),
+            "pod-root cgroup write was injected to fail on first enrollment"
+        );
+
+        // Next Apply over the same (unchanged) tree must retry the missing
+        // pod-root write rather than treating the tree as fully enrolled.
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        assert!(
+            backend.workload_identities.contains_key(&pod_ino),
+            "partial workload-identity write must be retried on the next Apply"
         );
     }
 
