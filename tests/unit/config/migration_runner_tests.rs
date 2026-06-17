@@ -36,6 +36,7 @@ const EXPECTED_INDEX_NAMES: &[&str] = &[
     "idx_consumers_ns_updated",
     "idx_plugin_configs_ns_updated",
     "idx_upstreams_ns_updated",
+    "idx_audit_events_namespace_ts_id",
     // Covering indexes for the incremental-poll deletion diff.
     "idx_proxies_ns_id",
     "idx_consumers_ns_id",
