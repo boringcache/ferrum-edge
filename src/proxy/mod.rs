@@ -1879,6 +1879,20 @@ fn streaming_dispatch_should_defer(
         && !status_is_passively_unhealthy
 }
 
+fn grpc_streaming_dispatch_should_defer(
+    proxy: &Proxy,
+    response_status: u16,
+    body_already_ended: bool,
+) -> bool {
+    // gRPC streaming terminal failures are classified at response-body
+    // completion (including reset/timeout/trailer-derived backend failures).
+    // Do not apply the passive-unhealthy-2xx eager shortcut here: the gRPC eager
+    // branch records only the HTTP status to the circuit breaker and then skips
+    // terminal CB accounting, so a passive-only unhealthy 2xx could otherwise be
+    // banked as success and mask the real stream failure.
+    streaming_dispatch_should_defer(proxy, response_status, body_already_ended, false, false)
+}
+
 /// Whether `response_status` is in the dispatched target's effective passive
 /// `unhealthy_status_codes`, resolved with the SAME precedence as the
 /// passive-health reporter ([`backend_dispatch::passive_health_for_target`]) so
@@ -12982,18 +12996,10 @@ async fn handle_proxy_request_inner(
                     // A rotated retry already recorded (and released) the prior
                     // target's breaker — never record again here.
                     true
-                } else if streaming_dispatch_should_defer(
+                } else if grpc_streaming_dispatch_should_defer(
                     &proxy,
                     grpc_backend_dispatch_status,
                     grpc_body_ended,
-                    // gRPC requests are always POST — never a body-suppressed HEAD.
-                    false,
-                    streaming_response_status_is_passively_unhealthy(
-                        &epoch.load_balancer,
-                        &proxy,
-                        grpc_final_upstream_target.as_deref(),
-                        grpc_backend_dispatch_status,
-                    ),
                 ) {
                     false
                 } else if grpc_body_ended
@@ -20759,6 +20765,45 @@ mod tests {
     use async_trait::async_trait;
     use http::header::HeaderValue;
     use serde_json::json;
+
+    fn streaming_dispatch_test_proxy() -> Proxy {
+        serde_json::from_value(json!({
+            "id": "p",
+            "hosts": ["p.example.com"],
+            "backend_host": "127.0.0.1",
+            "backend_port": 50051,
+            "circuit_breaker": {
+                "failure_status_codes": [500]
+            }
+        }))
+        .expect("valid proxy")
+    }
+
+    #[test]
+    fn grpc_streaming_defers_passive_unhealthy_2xx_until_body_terminal() {
+        let proxy = streaming_dispatch_test_proxy();
+
+        assert!(
+            streaming_dispatch_should_defer(&proxy, 206, false, false, false),
+            "ordinary open 2xx streaming responses defer terminal accounting"
+        );
+        assert!(
+            !streaming_dispatch_should_defer(&proxy, 206, false, false, true),
+            "direct HTTP/2 streaming keeps passively-unhealthy 2xx eager"
+        );
+        assert!(
+            grpc_streaming_dispatch_should_defer(&proxy, 206, false),
+            "gRPC streaming must not eagerly bank passive-only unhealthy 2xx as CB success"
+        );
+        assert!(
+            !grpc_streaming_dispatch_should_defer(&proxy, 500, false),
+            "configured CB failures remain header-time-final"
+        );
+        assert!(
+            !grpc_streaming_dispatch_should_defer(&proxy, 200, true),
+            "already-ended gRPC responses remain header-time-final"
+        );
+    }
 
     /// F3 §3.4: the direct-pod-IP / headless per-workload raw-TCP egress
     /// upstreams are referenced by NO config proxy, so without a dedicated
