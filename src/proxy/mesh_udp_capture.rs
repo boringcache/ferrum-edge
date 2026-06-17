@@ -32,13 +32,6 @@ use std::net::SocketAddr as StdSocketAddr;
 
 use tokio::sync::watch;
 
-/// Idle timeout for a captured UDP session, in milliseconds. Stage 3 only
-/// tracks sessions for DoS accounting (no backend leg yet), so a fixed bound
-/// mirroring the plain-UDP default (60s) is sufficient; Stage 4's egress relay
-/// will adopt the per-proxy `udp_idle_timeout_seconds`.
-#[cfg(target_os = "linux")]
-const CAPTURE_SESSION_IDLE_TIMEOUT_MS: u64 = 60_000;
-
 /// Configuration for the mesh UDP capture listener.
 pub struct MeshUdpCaptureConfig {
     /// Address+port to bind. The port is the Stage-2 TPROXY listener port
@@ -437,6 +430,14 @@ struct CaptureSession {
     /// ([`EGRESS_CHANNEL_MAX_QUEUED_BYTES`]) can be enforced on the hot path
     /// without walking the channel. The `Arc` is shared with the egress task.
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-session idle window in milliseconds, derived from the relay proxy's
+    /// `udp_idle_timeout_seconds` at admit (`0` = idle disabled). The cleanup
+    /// sweep reaps a session only after THIS window of inactivity (codex r7):
+    /// the egress task's own watchdog already honors `udp_idle_timeout_seconds`,
+    /// so the independent sweep must use the same window — a fixed 60s window
+    /// would cut a long-lived quiet flow (idle configured > 60s) or a flow whose
+    /// idle is disabled before the task's watchdog (or the operator) intends.
+    idle_timeout_ms: u64,
 }
 
 /// Record a captured datagram against its session and forward it toward mesh
@@ -498,12 +499,21 @@ fn handle_captured_datagram(
     // captured datagram whose orig-dst matches no declared `(VIP, UDP port)`
     // pair — or matches a declared-but-`CloseNotRoutable` pair — drops here,
     // holding no slot and spawning no task (fail closed, never guessed).
+    // Capture the admission epoch alongside the routability decision so the
+    // spawned session task reuses the SAME snapshot for LB/upstream selection
+    // (codex r7 P2): a config reload landing between admission and session setup
+    // must not pair an old route-table entry with a new load-balancer/upstream
+    // snapshot. The closure (and its epoch load) runs ONLY on the Vacant/admit
+    // path, so the refresh hot path keeps its zero-epoch-load cost.
+    let mut admission_epoch: Option<std::sync::Arc<crate::request_epoch::RequestEpoch>> = None;
     let resolve_entry = || {
         let epoch = state.request_epoch.load();
-        match epoch.route_table.mesh_udp_egress_decision(orig_dst) {
-            Some(crate::router_cache::MeshTcpEgressDecision::Relay(entry)) => Some(entry.clone()),
-            _ => None,
-        }
+        let entry = match epoch.route_table.mesh_udp_egress_decision(orig_dst) {
+            Some(crate::router_cache::MeshTcpEgressDecision::Relay(entry)) => entry.clone(),
+            _ => return None,
+        };
+        admission_epoch = Some(epoch);
+        Some(entry)
     };
 
     match admit_or_refresh_session(
@@ -527,6 +537,13 @@ fn handle_captured_datagram(
             // The shared `last_activity`/`queued_bytes` atomics keep the task's
             // bidirectional clock + byte-drain accounting in sync with the sweep
             // and recv loop.
+            // Reuse the epoch captured at admission for the session's one-shot
+            // LB/upstream selection (codex r7 P2). `admission_epoch` is always
+            // `Some` on the Admitted path (the routability closure set it);
+            // fall back to a fresh load only defensively.
+            let epoch = admission_epoch
+                .take()
+                .unwrap_or_else(|| state.request_epoch.load());
             spawn_udp_egress_session(
                 state.clone(),
                 sessions.clone(),
@@ -537,6 +554,7 @@ fn handle_captured_datagram(
                 rx,
                 last_activity,
                 queued_bytes,
+                epoch,
             );
             true
         }
@@ -650,11 +668,20 @@ where
             enqueue_egress_datagram(&tx, &queued_bytes, data, key.client, key.orig_dst);
             // Stamp a unique identity token so teardown removes only THIS entry.
             let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+            // Per-session idle window for the cleanup sweep, from the relay
+            // proxy's `udp_idle_timeout_seconds` (`0` = disabled). Mirrors the
+            // egress task's own watchdog source so the sweep and the watchdog
+            // agree on liveness (codex r7).
+            let idle_timeout_ms = entry
+                .relay_proxy
+                .udp_idle_timeout_seconds
+                .saturating_mul(1000);
             vacant.insert(CaptureSession {
                 last_activity: last_activity.clone(),
                 session_id,
                 tx: Some(tx),
                 queued_bytes: queued_bytes.clone(),
+                idle_timeout_ms,
             });
             SessionAdmission::Admitted {
                 entry,
@@ -735,9 +762,10 @@ fn spawn_udp_egress_session(
     rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
 ) {
     tokio::spawn(async move {
-        run_udp_egress_session(&state, &entry, key, rx, last_activity, queued_bytes).await;
+        run_udp_egress_session(&state, &entry, key, rx, last_activity, queued_bytes, epoch).await;
         // Session teardown: remove the map entry and decrement the live count so
         // a finished/failed flow frees its slot immediately (the idle sweep is a
         // backstop for sessions whose task is still alive but quiescent).
@@ -785,13 +813,19 @@ async fn run_udp_egress_session(
     mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
 ) {
     use super::LoadBalancerConnectionGuard;
     use crate::load_balancer::LoadBalancerCache;
     use tracing::{debug, warn};
 
+    // The admission epoch is reused here (codex r7 P2) so route resolution (done
+    // at admission) and LB/upstream selection below see ONE coherent config
+    // snapshot — a reload between the two can't pair an old route entry with a new
+    // LB/upstream view. It is needed only for this one-shot setup and is dropped
+    // right after selection (below) rather than pinning the generation for the
+    // session's lifetime.
     let proxy = entry.relay_proxy.as_ref();
-    let epoch = state.request_epoch.load();
 
     // ── Fail-closed egress gates (mirrors handle_mesh_tcp_egress) ──────────
     let Some(selection) = LoadBalancerCache::select_target_from(
@@ -820,6 +854,9 @@ async fn run_udp_egress_session(
         .balancers()
         .get(&entry.upstream_id)
         .cloned();
+    // Setup-only snapshot: release the epoch now so a long-lived UDP session does
+    // not pin an old config generation in memory (codex r7 P2).
+    drop(epoch);
     let _lb_guard =
         LoadBalancerConnectionGuard::new(Some(std::sync::Arc::clone(&target)), balancer);
 
@@ -1101,9 +1138,10 @@ fn udp_session_idle_timeout(proxy: &crate::config::types::Proxy) -> Option<std::
     (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
-/// Spawn the idle-session sweep for the capture listener. Removes sessions
-/// whose `last_activity` is older than [`CAPTURE_SESSION_IDLE_TIMEOUT_MS`] on a
-/// fixed interval; exits when the per-listener shutdown fires.
+/// Spawn the idle-session sweep for the capture listener. Reaps each session
+/// after its own `idle_timeout_ms` of inactivity (derived from the relay proxy's
+/// `udp_idle_timeout_seconds`; `0` = disabled = never idle-reaped) on a fixed
+/// interval; exits when the per-listener shutdown fires.
 #[cfg(target_os = "linux")]
 fn spawn_capture_session_cleanup(
     sessions: std::sync::Arc<
@@ -1134,8 +1172,16 @@ fn spawn_capture_session_cleanup(
                         // whose destination keeps replying is NOT reaped mid-flow
                         // (the watchdog and this sweep now agree on liveness).
                         let last = session.last_activity.load(Ordering::Relaxed);
-                        let keep =
-                            now.saturating_sub(last) <= CAPTURE_SESSION_IDLE_TIMEOUT_MS;
+                        // Honor the session's CONFIGURED idle window (codex r7):
+                        // `idle_timeout_ms == 0` means the per-proxy idle is
+                        // DISABLED, so the sweep does not idle-reap it (the egress
+                        // task's teardown + the session cap bound it, matching the
+                        // task watchdog which also never fires when idle is
+                        // disabled). A fixed 60s window would otherwise cut a
+                        // long-lived quiet flow whose idle is configured > 60s or
+                        // disabled, before the watchdog/operator intends.
+                        let keep = session.idle_timeout_ms == 0
+                            || now.saturating_sub(last) <= session.idle_timeout_ms;
                         if !keep {
                             reaped += 1;
                         }

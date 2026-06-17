@@ -2948,9 +2948,20 @@ impl EnvConfig {
         // UDP bind and aborting startup (codex r4). Default-off, so non-capture
         // deployments are unaffected; a malformed setting is handled fail-closed
         // by the dedicated startup validation, so a parse error is ignored here.
+        //
+        // AMBIENT-ONLY (codex r7): the capture listener only binds on the Ambient
+        // topology (`MeshRuntimeConfig::udp_capture_listener()` returns `None`
+        // otherwise — Sidecar/non-Ambient UDP egress is deferred). Reserving the
+        // port on a non-Ambient topology would reject a valid UDP/DTLS stream
+        // proxy or ServiceEntry on that port even though nothing ever binds it, so
+        // gate the reservation on the SAME `FERRUM_MESH_TOPOLOGY == ambient`
+        // condition the listener uses (read here the way the mesh runtime parses
+        // it; unset/other ⇒ no listener ⇒ no reservation).
         if let Ok(udp) = crate::capture::udp_capture_settings_from_env()
             && udp.udp_capture_enabled
             && udp.udp_outbound_port != 0
+            && crate::config::conf_file::resolve_ferrum_var("FERRUM_MESH_TOPOLOGY")
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case("ambient"))
         {
             ports.insert(udp.udp_outbound_port);
         }
