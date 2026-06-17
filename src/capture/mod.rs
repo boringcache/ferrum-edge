@@ -1397,6 +1397,23 @@ fn udp_tproxy_commands_for_family(
             "FERRUM_MESH_UDP_INBOUND",
             &format!("-p udp -m addrtype --dst-type LOCAL {tproxy_jump}"),
         ));
+    } else {
+        // REAP a stale inbound chain/jump from a PRIOR in-place install (codex r2):
+        // a setup rerun (sidecar restart/upgrade) whose previous version emitted the
+        // inbound catch-all must actively remove it HERE — the cleanup script runs
+        // only on teardown, so without this an `emit_inbound = false` reapply would
+        // leave the old `PREROUTING -> FERRUM_MESH_UDP_INBOUND` jump diverting
+        // inbound-to-pod UDP into the egress-only listener (black-hole). Delete the
+        // jump BEFORE the chain it targets; all idempotent (`|| true`), a no-op on a
+        // fresh pod.
+        commands.push(idempotent_delete(
+            binary,
+            "mangle",
+            "PREROUTING",
+            "-p udp -j FERRUM_MESH_UDP_INBOUND",
+        ));
+        commands.push(flush_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"));
+        commands.push(delete_chain(binary, "mangle", "FERRUM_MESH_UDP_INBOUND"));
     }
 
     // Transparent-routing plumbing: raw `ip` commands (NOT iptables). The fwmark
@@ -2789,8 +2806,11 @@ mod tests {
             "missing UDP outbound mangle chain: {cmds:?}"
         );
         assert!(
-            !cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")),
-            "inbound UDP capture is disabled (#1808): no inbound chain/rule/jump must be emitted: {cmds:?}"
+            !cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
+                && !c.contains("-D ")
+                && !c.contains("-F ")
+                && !c.contains("-X ")),
+            "inbound UDP capture disabled (#1808): only idempotent reap deletes (-D/-F/-X) may reference the inbound chain: {cmds:?}"
         );
 
         // Catch-all TPROXY jump on both directions, on the UDP port with the mark.
@@ -2988,8 +3008,8 @@ mod tests {
         assert!(
             !cmds
                 .iter()
-                .any(|c| c.contains("-j FERRUM_MESH_UDP_INBOUND")),
-            "inbound UDP capture is disabled (#1808): no PREROUTING -> inbound jump: {cmds:?}"
+                .any(|c| c.contains("-j FERRUM_MESH_UDP_INBOUND") && !c.contains("-D ")),
+            "inbound UDP capture disabled (#1808): no PREROUTING -> inbound jump (only the idempotent -D reap): {cmds:?}"
         );
     }
 
@@ -3011,8 +3031,11 @@ mod tests {
         // Inbound UDP capture is DISABLED (#1808, no inbound relay): no inbound
         // chain/rule is emitted at all, so there is no inbound TPROXY to scope.
         assert!(
-            !cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")),
-            "inbound UDP capture is disabled (#1808): no inbound chain/rule must be emitted: {cmds:?}"
+            !cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
+                && !c.contains("-D ")
+                && !c.contains("-F ")
+                && !c.contains("-X ")),
+            "inbound UDP capture disabled (#1808): only idempotent reap deletes (-D/-F/-X) may reference the inbound chain: {cmds:?}"
         );
     }
 
@@ -3149,8 +3172,11 @@ mod tests {
         // Inbound UDP capture is DISABLED (#1808, no inbound relay): even with
         // `exclude_inbound_ports` set, NO inbound chain/rule is emitted at all.
         assert!(
-            !cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")),
-            "inbound UDP capture is disabled (#1808): exclude_inbound_ports must emit no inbound rule: {cmds:?}"
+            !cmds.iter().any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
+                && !c.contains("-D ")
+                && !c.contains("-F ")
+                && !c.contains("-X ")),
+            "inbound UDP capture disabled (#1808): exclude_inbound_ports emits no inbound rule (reap deletes only): {cmds:?}"
         );
     }
 
@@ -3792,8 +3818,11 @@ mod tests {
             !plan
                 .v6_commands
                 .iter()
-                .any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")),
-            "inbound UDP capture is disabled (#1808): no inbound chain even for the selected family: {:?}",
+                .any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")
+                    && !c.contains("-D ")
+                    && !c.contains("-F ")
+                    && !c.contains("-X ")),
+            "inbound UDP capture disabled (#1808): no inbound chain even for the selected family (reap deletes only): {:?}",
             plan.v6_commands
         );
     }
