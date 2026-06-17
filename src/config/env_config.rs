@@ -2957,19 +2957,37 @@ impl EnvConfig {
         // deployments are unaffected; a malformed setting is handled fail-closed
         // by the dedicated startup validation, so a parse error is ignored here.
         //
-        // AMBIENT-ONLY (codex r7): the capture listener only binds on the Ambient
-        // topology (`MeshRuntimeConfig::udp_capture_listener()` returns `None`
-        // otherwise — Sidecar/non-Ambient UDP egress is deferred). Reserving the
-        // port on a non-Ambient topology would reject a valid UDP/DTLS stream
-        // proxy or ServiceEntry on that port even though nothing ever binds it, so
-        // gate the reservation on the SAME `FERRUM_MESH_TOPOLOGY == ambient`
-        // condition the listener uses (read here the way the mesh runtime parses
-        // it; unset/other ⇒ no listener ⇒ no reservation).
-        if let Ok(udp) = crate::capture::udp_capture_settings_from_env()
+        // AMBIENT or SIDECAR only: the capture listener binds on the two
+        // topologies that relay captured UDP (`MeshRuntimeConfig::udp_capture_listener()`
+        // returns `None` for any other — Ambient relays over HBONE :15008,
+        // Sidecar over mesh-mTLS :15006). Reserving the port on a topology that
+        // never binds it would reject a valid UDP/DTLS stream proxy or
+        // ServiceEntry on that port, so gate the reservation on the SAME
+        // `FERRUM_MESH_TOPOLOGY ∈ {ambient, sidecar}` condition the listener uses
+        // (read here the way the mesh runtime parses it). UNSET defaults to
+        // `sidecar` in `MeshRuntimeConfig::from_env_config` — which now binds the
+        // capture listener — so treat unset the SAME as `sidecar` here (codex r1):
+        // an unset-topology Sidecar pod with the flag set must reserve the port too,
+        // or a UDP/DTLS stream proxy/ServiceEntry on it passes validation then races
+        // the bind. Any OTHER explicit topology binds no listener ⇒ no reservation.
+        // MESH MODE ONLY (codex r2): `reserved_gateway_ports()` is shared by
+        // file/database/CP/DP validation, where no mesh capture listener ever binds
+        // (`MeshRuntimeConfig::listener_plan()` runs only in mesh mode). Reserving
+        // the mesh-only UDP capture port outside mesh mode would wrongly reject a
+        // valid UDP/DTLS stream proxy or ServiceEntry on it. Within mesh mode, an
+        // UNSET `FERRUM_MESH_TOPOLOGY` defaults to `sidecar` (which now binds the
+        // listener), so treat unset as `sidecar`; any OTHER explicit topology binds
+        // no listener ⇒ no reservation.
+        let udp_capture_topology =
+            crate::config::conf_file::resolve_ferrum_var("FERRUM_MESH_TOPOLOGY")
+                .unwrap_or_else(|| "sidecar".to_string());
+        let udp_capture_topology = udp_capture_topology.trim();
+        if self.mode == OperatingMode::Mesh
+            && let Ok(udp) = crate::capture::udp_capture_settings_from_env()
             && udp.udp_capture_enabled
             && udp.udp_outbound_port != 0
-            && crate::config::conf_file::resolve_ferrum_var("FERRUM_MESH_TOPOLOGY")
-                .is_some_and(|t| t.trim().eq_ignore_ascii_case("ambient"))
+            && (udp_capture_topology.eq_ignore_ascii_case("ambient")
+                || udp_capture_topology.eq_ignore_ascii_case("sidecar"))
         {
             ports.insert(udp.udp_outbound_port);
         }
