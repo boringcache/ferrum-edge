@@ -63,7 +63,9 @@ use tracing::{debug, info, warn};
 
 use crate::grpc::dp_client::{DpGrpcTlsConfig, GrpcJwtSecret};
 use crate::identity::{SpiffeId, TrustDomain};
-use crate::modes::mesh::config::{AppProtocol, MeshService, MultiClusterConfig, Workload};
+use crate::modes::mesh::config::{
+    AppProtocol, MAX_MESH_REMOTE_CLUSTERS, MeshService, MultiClusterConfig, Workload,
+};
 use crate::modes::mesh::config_consumer::common::{
     BACKOFF_INITIAL_SECS, MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE, jittered_backoff,
     next_backoff_secs as common_next_backoff_secs,
@@ -1038,42 +1040,55 @@ fn poll_targets_for_multi_cluster(
     multi_cluster: &MultiClusterConfig,
     trust_bundle_domains: &std::collections::HashSet<TrustDomain>,
 ) -> Vec<RemoteClusterPollTarget> {
-    multi_cluster
-        .remote_clusters
-        .iter()
-        .filter_map(|remote| {
-            let url = remote.control_plane_url.as_deref()?.trim();
-            if url.is_empty() {
-                return None;
-            }
-            if !trust_bundle_domains.contains(&remote.trust_domain) {
-                warn!(
-                    cluster = %remote.name,
-                    trust_domain = %remote.trust_domain,
-                    "Skipping remote-cluster discovery: no federated trust bundle for the remote \
-                     trust domain (cross-cluster discovery is fail-closed). Configure trust \
-                     federation for this cluster first."
-                );
-                return None;
-            }
-            if let Err(err) = validate_control_plane_url(url) {
-                warn!(
-                    cluster = %remote.name,
-                    error = %err,
-                    "Dropping remote-cluster control_plane_url that failed validation"
-                );
-                return None;
-            }
-            Some(RemoteClusterPollTarget {
-                cluster_name: remote.name.clone(),
-                trust_domain: remote.trust_domain.clone(),
-                network: remote.network.clone(),
-                // Normalize grpc:// → http:// and grpcs:// → https:// so the
-                // dialer and TLS-selection logic always see canonical schemes.
-                control_plane_url: normalize_control_plane_url(url),
-            })
-        })
-        .collect()
+    let mut targets = Vec::with_capacity(
+        multi_cluster
+            .remote_clusters
+            .len()
+            .min(MAX_MESH_REMOTE_CLUSTERS),
+    );
+    for remote in &multi_cluster.remote_clusters {
+        let Some(url) = remote.control_plane_url.as_deref().map(str::trim) else {
+            continue;
+        };
+        if url.is_empty() {
+            continue;
+        }
+        if !trust_bundle_domains.contains(&remote.trust_domain) {
+            warn!(
+                cluster = %remote.name,
+                trust_domain = %remote.trust_domain,
+                "Skipping remote-cluster discovery: no federated trust bundle for the remote \
+                 trust domain (cross-cluster discovery is fail-closed). Configure trust \
+                 federation for this cluster first."
+            );
+            continue;
+        }
+        if let Err(err) = validate_control_plane_url(url) {
+            warn!(
+                cluster = %remote.name,
+                error = %err,
+                "Dropping remote-cluster control_plane_url that failed validation"
+            );
+            continue;
+        }
+        if targets.len() >= MAX_MESH_REMOTE_CLUSTERS {
+            warn!(
+                cluster = %remote.name,
+                max_remote_clusters = MAX_MESH_REMOTE_CLUSTERS,
+                "Skipping remote-cluster discovery beyond remote-cluster target cap"
+            );
+            continue;
+        }
+        targets.push(RemoteClusterPollTarget {
+            cluster_name: remote.name.clone(),
+            trust_domain: remote.trust_domain.clone(),
+            network: remote.network.clone(),
+            // Normalize grpc:// → http:// and grpcs:// → https:// so the
+            // dialer and TLS-selection logic always see canonical schemes.
+            control_plane_url: normalize_control_plane_url(url),
+        });
+    }
+    targets
 }
 
 /// Normalize a `control_plane_url` for dialing.
@@ -2493,6 +2508,36 @@ mod tests {
         let targets = poll_targets_for_multi_cluster(&mc, &trusted);
         assert_eq!(targets.len(), 1, "only the federated cluster is dialed");
         assert_eq!(targets[0].cluster_name, "trusted");
+    }
+
+    #[test]
+    fn poll_targets_cap_remote_discovery_clusters() {
+        let remote_clusters: Vec<RemoteCluster> = (0..=MAX_MESH_REMOTE_CLUSTERS)
+            .map(|index| RemoteCluster {
+                name: format!("cluster-{index}"),
+                trust_domain: td(&format!("remote-{index}.test")),
+                network: None,
+                control_plane_url: Some(format!("https://cp-{index}.remote.example:15010")),
+                federation_endpoint: None,
+            })
+            .collect();
+        let trusted: std::collections::HashSet<TrustDomain> = remote_clusters
+            .iter()
+            .map(|remote| remote.trust_domain.clone())
+            .collect();
+        let mc = MultiClusterConfig {
+            remote_clusters,
+            ..MultiClusterConfig::default()
+        };
+
+        let targets = poll_targets_for_multi_cluster(&mc, &trusted);
+
+        assert_eq!(targets.len(), MAX_MESH_REMOTE_CLUSTERS);
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.cluster_name != format!("cluster-{MAX_MESH_REMOTE_CLUSTERS}"))
+        );
     }
 
     #[tokio::test]
