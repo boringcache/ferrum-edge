@@ -221,7 +221,7 @@ The inbound listener terminates mTLS from peer sidecars and forwards plaintext t
 - **Ingress is handled for both.** Sidecar inbound builds materialized loopback routes (`:15006` → `127.0.0.1:<appPort>`). Ambient/Waypoint inbound is **transparent** — an authenticated HBONE CONNECT that matches no route is relayed directly to its `:authority` (the original destination), so no route materialization is needed. The relay is guarded: the destination must be a local target — a loopback address on an application port declared by the slice, or an in-mesh workload address+port the slice declares — so an authenticated peer can never use the terminator as an open proxy to arbitrary hosts or undeclared localhost listeners, and a peerless CONNECT is rejected (403) before any dial. This transparent-relay path is **transport-agnostic** — gated on inbound direction + the H2 CONNECT shape, not on topology — so the Sidecar `:15006` listener also relays a **bare** authenticated H2 CONNECT (the raw-TCP egress destination side) through the very same guard, alongside its materialized HTTP loopback routes.
 - **Egress is materialized for both**, per transport: **Ambient outbound** builds per-service HBONE routes (a host-routed `/` proxy per in-mesh Service → `mesh.hbone`-tagged upstreams dialing the destination's `:15008`); **Sidecar outbound** builds per-service SVID-mTLS routes (`mesh.mtls`-tagged upstreams dialing the destination sidecar's inbound `:15006` with plain HTTP/2 over mutual TLS — never HBONE). Either way the upstream targets carry the destination workload's SPIFFE id (`mesh.spiffe_id`), which the outbound handshake **pins**: the peer must present exactly that SVID, not merely one from an allowed trust domain. Sidecar egress yields to the local workload's own inbound loopback route (the route table holds one proxy per host+path), so a service's own-sidecar traffic stays local. Non-convention transport ports are configured with `FERRUM_MESH_EGRESS_HBONE_PORT` / `FERRUM_MESH_EGRESS_MTLS_PORT`.
   - **Multi-port egress (original-destination routing, both topologies).** One route + one upstream is materialized **per HTTP-family service port** (per-port upstreams keep load-balancer counters, hash rings, passive health, and pool keys isolated per app port). The route table groups a service's per-port siblings under one lowest-port representative — host tiers are (host, path)-keyed and every sibling shares its service's hosts + `/` — and the request path swaps in the sibling whose service port matches the connection's captured pre-NAT original destination, read once per accepted connection on the outbound capture listener via `SO_ORIGINAL_DST` (Linux netfilter; covers the injector's iptables REDIRECT capture). Sibling groups are derived from the prepared config's `mesh` block (each service's expected per-port route ids and **declared** HTTP-port count), never by parsing route ids. **Fail-closed:** a service *declaring* multiple HTTP-family ports with no captured original destination (non-Linux, direct dial, eBPF-rewritten capture) — even when only some ports materialized siblings — and any captured dial to a port the slice does not route are rejected with 502; captured traffic is never forwarded to a port the client did not dial. Single-HTTP-port services keep their orig-dst-free behavior, so direct dials and dev setups are unaffected. **Ambient** multi-port is transparent end-to-end (its inbound is the HBONE relay that dials the CONNECT authority's app port). **Sidecar** multi-port egress additionally rewrites the request `:authority` to `<host>:<service port>` (the per-port target carries its owning service port; the original client Host still rides `x-forwarded-host`): the destination sidecar's `:15006` dials are direct — never NATed — so the authority port is the channel its per-port **inbound** siblings disambiguate by. Single-port destinations keep the client authority byte-for-byte. Interop is fail-closed in both skew directions: a pre-disambiguation destination materialized nothing for multi-port services (404, never misrouted), and a pre-disambiguation source materialized no multi-port egress routes. Apps behind a multi-port Sidecar service observe `Host: <fqdn>:<port>`, and destination-side VirtualService `authority` exact-matchers should account for the explicit port.
-  - **Raw-TCP egress (original-destination routing, both captured topologies).** Stream-family service ports (`tcp`, `tls`, and the DB protocols — anything not HTTP-family) materialize **per-port upstreams only**, no route proxies: a raw stream has no Host header to route by. Instead the accept loop on the outbound capture listener matches the captured original destination **strictly against `(service VIP, service port)`** — `MeshService.cluster_ips`, populated from `Service.spec.clusterIPs` by the Kubernetes translator (file-source operators set `cluster_ips` directly) — and relays the raw byte stream through an HTTP/2 CONNECT tunnel to the LB-selected workload's app port. The tunnel transport follows the topology (the upstream target carries exactly one transport tag): **Ambient** relays over the shared HBONE pool (dial the peer's `:15008`, capability-probe-gated); **Sidecar** relays over a **fresh mesh-mTLS H2 CONNECT tunnel** (dial the peer's `:15006`, one connection per captured stream — no capability registry, because a slice-declared sidecar peer speaks mesh-mTLS by construction). Either way the dial is identity-pinned (`mesh.spiffe_id`), and the destination's inbound relay is **transport-agnostic**: its terminator recognizes an authenticated H2 CONNECT — HBONE-marked on `:15008` or bare on `:15006` — and relays it to the CONNECT `:authority` via the same machinery, so no destination-side changes are involved. Port-number-only matching is deliberately unsupported: two services may share a port number, and a captured dial to a non-mesh destination must never be tunnelled into the mesh on a coincidence. A captured destination matching a declared pair whose upstream did not materialize is **closed** (never guessed); anything else falls through to the HTTP path unchanged. **Direct pod-IP / headless dials are also routed:** a client that resolved a **headless** service itself (or otherwise dials a backing **pod IP** directly) bypasses the VIP table, so a second strict index — keyed by `(backing workload IP, resolved target port)` — routes that captured original destination to a **single-target upstream pinned to that exact workload's identity** over the topology transport. It is consulted only when the VIP lookup misses, uses the same exact-match / fail-closed rules (a declared-but-unroutable workload pair is closed, never guessed), and is built from the same forward-derived source as the per-workload upstreams (each stream-family service port × backing local-cluster workload × workload address that parses as an IP; DNS-name addresses are skipped, and the container/target port resolves with the same `targetPort` rule as the VIP path). HTTP-family headless services already route by Host, so this closes the **raw-TCP-only** headless gap; a VIP-less service with no backing workload addresses is still unroutable (warned at materialization). Per-port `DestinationRule` traffic policy applies to the TCP upstreams (VIP and per-workload alike) exactly as to the HTTP ones; passive-health/outlier recording is absent on the raw relay (no response status to classify), matching the stream-proxy paths. **UDP is now modeled as a distinct L4 transport** (`AppProtocol::Udp`): a `protocol: UDP` port — on a Kubernetes Service **or** an Istio `ServiceEntry` — partitions out of both HTTP-family routing and the raw-TCP stream lane (previously it was silently mis-classified as HTTP). The L4 `protocol: UDP` field **wins over any L7 `appProtocol`/port-name hint** (e.g. `appProtocol: http` or a name like `http3` on a UDP port still classifies as UDP — the hint describes what rides over the transport, not the transport itself). UDP egress does **not** ride this raw-TCP datapath (`SO_ORIGINAL_DST` REDIRECT does not apply to UDP); UDP uses a separate **TPROXY** capture model (see "UDP TPROXY capture" under Capture Modes) — capture-rule emission landed in F3 §3.3 **Stage 2**, the consuming listener in **Stage 3**, and **datagram-over-HBONE egress in Stage 4**. UDP egress now materializes **per-port upstreams** (Ambient only — distinct `__mesh-out-udp-upstream-*` id space) consulted via the route table's `mesh_udp_egress` `(VIP, UDP port)` index; a captured datagram is tunnelled over a `udp`-marked HBONE CONNECT and the destination unframes it into a local `UdpSocket` (see "UDP TPROXY capture"). Still **no route proxy** (datagrams carry no Host), and **Sidecar UDP egress is deferred** (no `:15008` HBONE listener). The EgressGateway ServiceEntry materializer still explicitly **skips** UDP ports (external-UDP egress out of scope; a one-time deferred warning flags it), so no premature EgressGateway UDP listener is emitted.
+  - **Raw-TCP egress (original-destination routing, both captured topologies).** Stream-family service ports (`tcp`, `tls`, and the DB protocols — anything not HTTP-family) materialize **per-port upstreams only**, no route proxies: a raw stream has no Host header to route by. Instead the accept loop on the outbound capture listener matches the captured original destination **strictly against `(service VIP, service port)`** — `MeshService.cluster_ips`, populated from `Service.spec.clusterIPs` by the Kubernetes translator (file-source operators set `cluster_ips` directly) — and relays the raw byte stream through an HTTP/2 CONNECT tunnel to the LB-selected workload's app port. The tunnel transport follows the topology (the upstream target carries exactly one transport tag): **Ambient** relays over the shared HBONE pool (dial the peer's `:15008`, capability-probe-gated); **Sidecar** relays over a **fresh mesh-mTLS H2 CONNECT tunnel** (dial the peer's `:15006`, one connection per captured stream — no capability registry, because a slice-declared sidecar peer speaks mesh-mTLS by construction). Either way the dial is identity-pinned (`mesh.spiffe_id`), and the destination's inbound relay is **transport-agnostic**: its terminator recognizes an authenticated H2 CONNECT — HBONE-marked on `:15008` or bare on `:15006` — and relays it to the CONNECT `:authority` via the same machinery, so no destination-side changes are involved. Port-number-only matching is deliberately unsupported: two services may share a port number, and a captured dial to a non-mesh destination must never be tunnelled into the mesh on a coincidence. A captured destination matching a declared pair whose upstream did not materialize is **closed** (never guessed); anything else falls through to the HTTP path unchanged. **Direct pod-IP / headless dials are also routed:** a client that resolved a **headless** service itself (or otherwise dials a backing **pod IP** directly) bypasses the VIP table, so a second strict index — keyed by `(backing workload IP, resolved target port)` — routes that captured original destination to a **single-target upstream pinned to that exact workload's identity** over the topology transport. It is consulted only when the VIP lookup misses, uses the same exact-match / fail-closed rules (a declared-but-unroutable workload pair is closed, never guessed), and is built from the same forward-derived source as the per-workload upstreams (each stream-family service port × backing local-cluster workload × workload address that parses as an IP; DNS-name addresses are skipped, and the container/target port resolves with the same `targetPort` rule as the VIP path). HTTP-family headless services already route by Host, so this closes the **raw-TCP-only** headless gap; a VIP-less service with no backing workload addresses is still unroutable (warned at materialization). Per-port `DestinationRule` traffic policy applies to the TCP upstreams (VIP and per-workload alike) exactly as to the HTTP ones; passive-health/outlier recording is absent on the raw relay (no response status to classify), matching the stream-proxy paths. **UDP is now modeled as a distinct L4 transport** (`AppProtocol::Udp`): a `protocol: UDP` port — on a Kubernetes Service **or** an Istio `ServiceEntry` — partitions out of both HTTP-family routing and the raw-TCP stream lane (previously it was silently mis-classified as HTTP). The L4 `protocol: UDP` field **wins over any L7 `appProtocol`/port-name hint** (e.g. `appProtocol: http` or a name like `http3` on a UDP port still classifies as UDP — the hint describes what rides over the transport, not the transport itself). UDP egress does **not** ride this raw-TCP datapath (`SO_ORIGINAL_DST` REDIRECT does not apply to UDP); UDP uses a separate **TPROXY** capture model (see "UDP TPROXY capture" under Capture Modes) — capture-rule emission landed in F3 §3.3 **Stage 2**, the consuming listener in **Stage 3**, and **datagram-over-mesh egress in Stage 4** (dual-transport, mirroring raw-TCP egress). UDP egress materializes **per-port upstreams** (distinct `__mesh-out-upstream-*` id space → `__mesh-out-udp-upstream-*`) consulted via the route table's `mesh_udp_egress` `(VIP, UDP port)` index; a captured datagram is tunnelled over a `udp`-marked mesh CONNECT — **Ambient over HBONE (`:15008`), Sidecar over mesh-mTLS (`:15006`)** — and the destination unframes it into a local `UdpSocket` (see "UDP TPROXY capture"). Still **no route proxy** (datagrams carry no Host). The **first working end-to-end UDP path is Sidecar** (its injector pod-netns TPROXY producer feeds the listener); the **Ambient UDP producer is still deferred** (host-netns can't per-pod-scope UDP — same blocker as F4.3, so Ambient ships only the transport half). The EgressGateway ServiceEntry materializer still explicitly **skips** UDP ports (external-UDP egress out of scope; a one-time deferred warning flags it), so no premature EgressGateway UDP listener is emitted.
   - **WebSocket egress (both captured topologies).** A WebSocket upgrade to an in-mesh `mesh.mtls`/`mesh.hbone`-tagged destination rides the topology's secured transport on a **fresh** mesh H2 connection instead of the pre-mesh plaintext/TLS dial that ignored the mesh tag. The two topologies use **different inbound primitives**, because Sidecar materializes inbound routes while Ambient/Waypoint do not:
     - **Sidecar (`mesh.mtls`)** speaks an **RFC 8441 Extended CONNECT** (`:method=CONNECT` + `:protocol=websocket`) over SVID-mTLS to the peer's `:15006`. The Extended CONNECT carries the forwardable WebSocket handshake headers (`Sec-WebSocket-Protocol`, etc.; the HTTP/1.1-only framing headers `Upgrade`/`Connection`/`Sec-WebSocket-Key`/`Sec-WebSocket-Version` and `Sec-WebSocket-Extensions` are not sent) plus the preserved client `:path`+query, and the resulting H2 stream body IS the raw WebSocket frame transport — there is no inner HTTP/1.1 upgrade handshake. The destination sidecar's `:15006` listener (`auto`, advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`) detects the Extended CONNECT WebSocket and bridges it to the local app over a plain HTTP/1.1 upgrade — the same machinery a client-originated WebSocket uses (a WebSocket Extended CONNECT carries `:protocol`, so it is never confused with the bare CONNECT byte-relay). A multi-port Sidecar destination's `:authority` is rewritten to the owning service port (`mesh.mtls_authority_port`) just like HTTP egress.
     - **Ambient / Waypoint (`mesh.hbone`)** opens a **bare HBONE CONNECT byte tunnel** (the same primitive raw-TCP egress uses) to the destination workload's app addr:port on the peer's `:15008`, then speaks the WebSocket as an **inner HTTP/1.1 upgrade THROUGH the tunnel**. Ambient/Waypoint materialize **no inbound routes**, and the transparent HBONE relay that handles a route-miss CONNECT is gated on a **bare** CONNECT (it requires the `:protocol` extension to be *absent*), so an Extended CONNECT carrying `:protocol=websocket` to `:15008` would 404 before any WebSocket handler runs. Routing the byte tunnel to the app addr:port lets the relay byte-copy the upgrade straight to the loopback app, which performs the WS handshake — **no destination-side change**. The SERVICE `:authority`+`:path` the app routes on ride the inner H1 `Host`/request-target (mirroring the HTTP HBONE relay, which forwards the client Host over the relay).
@@ -918,11 +918,11 @@ In NodeWaypoint topology one HBONE listener serves many pods. The node-agent enr
 - Inode or fingerprint changed → pod restarted under the same UID; identity (and its per-pod policy scope) is evicted so a fresh enrollment is required before traffic for the new instance is honoured. The fingerprint prevents missed restarts when the filesystem reuses the old inode number.
 - Path gone → pod removed; identity and policy scope are evicted.
 
-The same sweep also reclaims identities enrolled **without** a cgroup path — which is what the production lazy hash-join enrollment produces (it has no cgroup to bind, and nothing calls the explicit removal API for it). For those, the sweep evicts an identity only when its pod UID is no longer referenced by a live cookie record **and** its identity `Arc` has no other holder (`strong_count == 1`): a removed/restarted pod's accept-side cookies age out of the mirrored `FERRUM_ORIG_DST4/6` view within a poll interval, so the orphaned identity (and its per-pod policy scope) is reclaimed instead of accumulating across pod churn. Prompt aging-out depends on the `sock_ops` program **removing the orig-dst record on TCP close** (not just on LRU pressure): without that, a closed connection's cookie would linger in the LRU map on a low-churn node and keep the dead pod's record mirrored indefinitely. The `strong_count` guard protects in-flight connections: the HTTP/HBONE accept path stores the resolved identity `Arc` on the connection for its whole lifetime and re-queries the per-pod scope on every request, so a connection whose cookie the BPF LRU evicted mid-flight still pins its identity (`strong_count > 1`) and keeps its scope until it closes — without the guard the cookie-only signal would wrongly drop the scope and downgrade later streams to mesh-wide. TCP streams resolve their scope once at accept and never re-query, so they are unaffected regardless. An evicted-but-still-live idle pod simply re-enrolls on its next connection. cgroup-bound identities are left to the cgroup-binding pass above and are never touched by this idle pass.
+An independent idle identity GC task (`FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS`, default 30s) reclaims identities enrolled **without** a cgroup path — which is what the production lazy hash-join enrollment produces (it has no cgroup to bind, and nothing calls the explicit removal API for it). For those, the idle GC evicts an identity only when its pod UID is no longer referenced by a live cookie record **and** its identity `Arc` has no other holder (`strong_count == 1`): a removed/restarted pod's accept-side cookies age out of the mirrored `FERRUM_ORIG_DST4/6` view within a poll interval, so the orphaned identity (and its per-pod policy scope) is reclaimed instead of accumulating across pod churn. Prompt aging-out depends on the `sock_ops` program **removing the orig-dst record on TCP close** (not just on LRU pressure): without that, a closed connection's cookie would linger in the LRU map on a low-churn node and keep the dead pod's record mirrored indefinitely. The `strong_count` guard protects in-flight connections: the HTTP/HBONE accept path stores the resolved identity `Arc` on the connection for its whole lifetime and re-queries the per-pod scope on every request, so a connection whose cookie the BPF LRU evicted mid-flight still pins its identity (`strong_count > 1`) and keeps its scope until it closes — without the guard the cookie-only signal would wrongly drop the scope and downgrade later streams to mesh-wide. TCP streams resolve their scope once at accept and never re-query, so they are unaffected regardless. An evicted-but-still-live idle pod simply re-enrolls on its next connection. cgroup-bound identities are left to the cgroup-binding pass above and are never touched by this idle pass.
 
-Set the sweep interval to `0` to disable. The sweep is best-effort GC, not a security boundary: the accept-path check on unknown socket cookies remains fail-closed regardless of sweep cadence.
+Set `FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS=0` to disable only the cgroup-inode stat sweep. Set `FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS=0` to disable lazy identity GC. Both tasks are best-effort GC, not security boundaries: the accept-path check on unknown socket cookies remains fail-closed regardless of sweep cadence.
 
-Picking an interval is a tradeoff between eviction lag (worst-case time a stale identity remains after pod removal/restart) and per-sweep stat cost. Each enrolled cgroup-bound identity costs one `stat(2)` per sweep — on the order of tens of microseconds on a warm dentry cache, so even at thousands of pods per node a sweep finishes in a few milliseconds and the work runs on a dedicated background task off the accept path. Shorten the interval to tighten the eviction window on heavy pod churn; lengthen it (or set `0`) if the operator already drives identity removal explicitly from the node-agent and treats the sweep as a defence-in-depth backstop.
+Picking the cgroup interval is a tradeoff between eviction lag (worst-case time a stale cgroup-bound identity remains after pod removal/restart) and per-sweep stat cost. Each enrolled cgroup-bound identity costs one `stat(2)` per sweep — on the order of tens of microseconds on a warm dentry cache, so even at thousands of pods per node a sweep finishes in a few milliseconds and the work runs on a dedicated background task off the accept path. Shorten the interval to tighten the eviction window on heavy pod churn; lengthen it (or set `0`) if the operator already drives cgroup-bound identity removal explicitly from the node-agent and treats the sweep as a defence-in-depth backstop. Keep the idle GC interval enabled unless another component explicitly removes lazy identities; otherwise the lazy identity map can grow across pod churn.
 
 ## Transparent DNS Proxy
 
@@ -1472,7 +1472,7 @@ Datadog export groups spans by trace in the Agent v0.3 payload shape and sends t
 - `enabled`: toggle (default true). When false, the access log plugin is not injected.
 - `filter`: optional `AccessLogFilter` with `status_code_min`, `status_code_max`, `min_latency_ms`, and `errors_only`.
 
-The access log is injected as a `stdout_logging` global under the reserved id `__mesh_access_log` (carrying the `filter` above). Like every auto-injected global, an operator-managed global of the **same plugin type** overrides it: if you define your own global `stdout_logging`, the `__mesh_access_log` injection is suppressed so transactions are not logged twice, and the Telemetry CRD's `accessLogging.filter` is **not** applied on top of your plugin. To keep the mesh-managed filter, leave access logging to the injected plugin (do not also define a global `stdout_logging`), or fold the equivalent `filter` into your own global `stdout_logging` config.
+The access log is injected as a `stdout_logging` global under the reserved id `__mesh_access_log` (carrying the `filter` above). When the `GatewayConfig` handed to mesh preparation already contains an operator-managed global plugin of the **same plugin type**, that operator plugin overrides the mesh injection: if you define your own global `stdout_logging`, the `__mesh_access_log` injection is suppressed so transactions are not logged twice, and the Telemetry CRD's `accessLogging.filter` is **not** applied on top of your plugin. Native/xDS `MeshSlice` feeds do not currently carry operator `plugin_configs`, so slice-only runtimes receive the mesh-managed access log unless access logging is disabled by Telemetry. To keep the mesh-managed filter, leave access logging to the injected plugin (do not also define a global `stdout_logging` in a prepared config), or fold the equivalent `filter` into your own global `stdout_logging` config.
 
 ## Kubernetes Injector
 
@@ -1589,7 +1589,7 @@ The container runs as `FERRUM_MESH_PROXY_UID` (default 1337) with `allowPrivileg
 | `iptables` | Inject init container with `NET_ADMIN`/`NET_RAW` capabilities that sets up iptables rules to redirect traffic through the sidecar (inbound to 15006, outbound to 15001) |
 | `ebpf` | eBPF-based capture handled by a node-level agent (requires kernel 5.7+). The injector does not inject a privileged init container for this mode -- the node agent's DaemonSet manages eBPF program attachment. Capture planning infrastructure (`EbpfPlan` with iptables fallback for pre-5.7 kernels) is available in `src/capture/mod.rs` for the node agent path. **Build requirement:** real eBPF attachment needs a binary built with the Cargo `ebpf` feature (`cargo build --features ebpf`, Linux only; Docker `--build-arg FEATURES=cloud-secrets,ebpf`). The **default published image uses a no-op mock backend** (`MockEbpfBackend`) that attaches nothing and sets `ferrum_mesh_node_topology_degraded` — see [Maturity and Support Status](#maturity-and-support-status) |
 
-#### UDP TPROXY capture (F3 §3.3, flag-gated, Stages 2–4 — capture rules + listener + datagram-over-HBONE egress)
+#### UDP TPROXY capture (F3 §3.3, flag-gated, Stages 2–4 — capture rules + listener + datagram-over-mesh egress, dual-transport)
 
 TCP mesh capture uses iptables `REDIRECT` in the `nat` table: REDIRECT rewrites the
 packet's destination to the proxy port, and the proxy recovers the pre-NAT
@@ -1602,10 +1602,17 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   delivers the datagram to a transparent listener socket **without rewriting its
   destination**, so the Stage 3 listener recovers the original destination
   per-datagram from the `IP_RECVORIGDSTADDR` cmsg. New `mangle`-table chains
-  `FERRUM_MESH_UDP_INBOUND` / `FERRUM_MESH_UDP_OUTBOUND` mirror the TCP
-  include/exclude/CIDR scoping with `-p udp ... -j TPROXY --on-port
+  mirror the TCP include/exclude/CIDR scoping with `-p udp ... -j TPROXY --on-port
   <FERRUM_MESH_CAPTURE_UDP_PORT> --tproxy-mark <FERRUM_MESH_TPROXY_MARK>/<mask>`,
-  jumped from `mangle PREROUTING`. These dst-based PREROUTING chains are
+  jumped from `mangle PREROUTING`. **Capture is EGRESS-ONLY (#1808):** only
+  `FERRUM_MESH_UDP_OUTBOUND` (plus the `FERRUM_MESH_UDP_OUTPUT_MARK` /
+  `FERRUM_MESH_UDP_REINJECT` locally-generated-egress loop) is emitted. The
+  `FERRUM_MESH_UDP_INBOUND` catch-all is **gated off** (`emit_inbound = false`)
+  because there is no inbound UDP relay yet — the egress-only capture listener
+  would divert pod-app-bound (`--dst-type LOCAL`) UDP and drop it, so inbound-to-pod
+  UDP is left uncaptured and flows normally to the app. Teardown still reaps any
+  prior inbound chain (mark-independent), so an upgrade from a build that installed
+  it is cleaned up. These dst-based PREROUTING chains are
   **PREROUTING-only**, so — unlike the TCP `nat OUTPUT` outbound chain — they carry
   **no proxy-UID `-m owner --uid-owner` self-exclusion** (owner-match is
   OUTPUT-context only). The pod's **own** locally-generated UDP egress (which never
@@ -1681,42 +1688,42 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   socket-owner match, a disjoint namespace from `skb->mark`.
 - **Default OFF.** The flag defaults off and, when off, emits **no**
   `mangle`/TPROXY/routing rules and binds **no** listener. **The injector
-  produces only Sidecar pods, and Sidecar UDP egress is DEFERRED (Stage 4 is
-  Ambient-only), so the injector installs NO UDP TPROXY rules and does NOT set the
-  sidecar's UDP-enable env regardless of `FERRUM_MESH_CAPTURE_UDP_ENABLED`** — a
-  single central deferral switch (`injector::sidecar_udp_capture_supported()`)
-  suppresses the init container's rule emission, the runtime-enable env, and the
-  transparent-bind capability together. This matches the mesh-runtime listener
-  gate (Sidecar binds no UDP listener), so an injected Sidecar with the flag set
-  neither diverts UDP nor binds a listener: **UDP passes through un-captured**
-  instead of being diverted to an unbound port and black-holed (the worse failure
-  the round-1 Ambient-only listener gate would otherwise have introduced for
-  injected Sidecars). When Sidecar UDP egress lands, this re-enables — the rules
-  (Stage 2) and the consuming listener come up together behind the **same** flag,
-  and the webhook would propagate `FERRUM_MESH_CAPTURE_UDP_ENABLED`,
+  produces only Sidecar pods, and Sidecar UDP egress is now ENABLED (#1808), so
+  when the operator sets `FERRUM_MESH_CAPTURE_UDP_ENABLED` the injector installs
+  the UDP TPROXY rules AND sets the sidecar's UDP-enable env** — a single central
+  switch (`injector::sidecar_udp_capture_supported()`, now `true`) enables the
+  init container's rule emission, the runtime-enable env, and the
+  transparent-bind capability (`NET_ADMIN`) together. This matches the
+  mesh-runtime listener gate (Sidecar binds the UDP listener), so an injected
+  Sidecar with the flag set both diverts UDP into the capture port and binds the
+  listener — **the first working end-to-end UDP path**. The rules (Stage 2) and
+  the consuming listener come up together behind the **same** flag, and the
+  webhook propagates `FERRUM_MESH_CAPTURE_UDP_ENABLED`,
   `FERRUM_MESH_CAPTURE_UDP_PORT`, and `FERRUM_MESH_TPROXY_MARK` from the **same**
   injector config that drives the init container's TPROXY rules (these are not in
   `SIDECAR_ENV_KEYS`, which only copy the injector's own runtime env). The
-  **node-agent / ambient host-netns** path is unaffected: it already installs no
-  UDP TPROXY rules (`CaptureConfig::host_netns` short-circuits
-  `udp_tproxy_commands_for_family`) and ambient's UDP relay is eBPF/HBONE.
-  **Fail-closed on malformed settings:** on the **Ambient** runtime, when the flag
-  is set but a UDP capture var is malformed, mesh startup aborts
-  (`serve_mesh_runtime` validates the env before binding any listener) rather than
-  silently omitting the listener while diverted UDP hits a now-unbound port.
-- **Stages 3–4 — consuming UDP listener + datagram-over-HBONE egress (Ambient).**
-  When `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`, **only the Ambient topology** —
-  the one that actually **relays** captured UDP (Stage 4 egress) — emits the
+  **node-agent / ambient host-netns** path is unaffected: it installs no UDP
+  TPROXY rules (`CaptureConfig::host_netns` short-circuits
+  `udp_tproxy_commands_for_family`) and ambient's UDP *producer* stays deferred
+  (F4.3 / #1803). **Fail-closed on malformed settings:** on a capture-relay
+  runtime (Ambient or Sidecar), when the flag is set but a UDP capture var is
+  malformed, mesh startup aborts (`serve_mesh_runtime` validates the env before
+  binding any listener) rather than silently omitting the listener while diverted
+  UDP hits a now-unbound port.
+- **Stages 3–4 — consuming UDP listener + datagram-over-mesh egress (Ambient OR Sidecar).**
+  When `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`, the **two topologies that relay
+  captured UDP** — Ambient (HBONE) and Sidecar (mesh-mTLS) — emit the
   **`PlaintextUdpCapture` mesh listener**. UDP egress materialization is
-  Ambient-only, so emitting this listener for **Sidecar** (UDP egress deferred —
-  no `:15008` HBONE listener) would divert the pod's UDP into a listener with no
-  relay and **black-hole every captured datagram**; instead, a non-Ambient
-  topology with the flag set logs a **one-time warning** and emits **no** capture
-  listener, leaving UDP **un-captured** (it passes through) rather than
-  captured-then-dropped. (The injector/init TPROXY-rule emission for a Sidecar pod
-  is gated to MATCH this — see "Default OFF" above: the injector installs no UDP
-  rules and sets no UDP-enable env while Sidecar UDP egress is deferred, so the
-  init container and the runtime agree.) On Ambient the listener is bound on the
+  dual-transport on exactly those two, so emitting this listener for a topology
+  with no UDP relay (EastWestGateway / EgressGateway / waypoints) would divert the
+  pod's UDP into a listener with no relay and **black-hole every captured
+  datagram**; instead, such a topology with the flag set logs a **one-time
+  warning** and emits **no** capture listener, leaving UDP **un-captured** (it
+  passes through) rather than captured-then-dropped. (The injector/init
+  TPROXY-rule emission for a Sidecar pod is gated to MATCH this — see "Default
+  OFF" above: the injector installs the UDP rules and sets the UDP-enable env
+  whenever the operator enables capture, so the init container and the runtime
+  agree.) On a capture-relay topology the listener is bound on the
   **dual-stack IPv6 wildcard**
   (`[::]`, independent of the TCP outbound listener family) and the Stage-2
   `FERRUM_MESH_CAPTURE_UDP_PORT` (default `15011`) — a
@@ -1738,17 +1745,22 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   getsockopt — the orig-dst rides ancillary data), drains datagrams via
   `recvmmsg` (always, since the orig-dst lives in the cmsg `recv_from` cannot
   surface), and keys a lightweight session by **`(client SocketAddr, orig-dst
-  SocketAddr)`**. **Stage 4 — datagram-over-HBONE egress (Ambient-only).** Each
+  SocketAddr)`**. **Stage 4 — datagram-over-mesh egress (dual-transport).** Each
   captured datagram's recovered original destination is matched **strictly
   against `(service VIP, UDP service port)`** by the route table's
   `mesh_udp_egress` index (a UDP analogue of the raw-TCP VIP table,
   forward-derived from the prepared mesh block: UDP service ports ×
   `cluster_ips`). A routable match relays the datagram over a **`udp`-marked
-  HTTP/2 CONNECT tunnel** to the LB-selected workload's app port — the same HBONE
-  transport raw-TCP egress rides (`:15008`, capability-probe-gated,
-  identity-pinned `mesh.spiffe_id`), but the tunnel carries **length-delimited
-  datagrams** (`[u16 big-endian len][payload]`, `src/proxy/mesh_udp_frame.rs`)
-  rather than a raw byte stream. Concurrency is a **per-session mpsc+task** model:
+  HTTP/2 CONNECT tunnel** to the LB-selected workload's app port via a
+  **dual-transport branch mirroring raw-TCP egress** (the target carries exactly
+  one transport tag): **Ambient `mesh.hbone`** rides the HBONE pool
+  (`:15008`, capability-probe-gated, identity-pinned `mesh.spiffe_id` →
+  `HboneConnectionPool::get_datagram_tunnel`); **Sidecar `mesh.mtls`** rides a
+  fresh mesh-mTLS H2 CONNECT (`:15006`/`mesh.mtls_port`, REQUIRED pinned
+  `mesh.spiffe_id`, NO capability registry →
+  `MeshMtlsConnectionPool::open_datagram_tunnel`). Either way the tunnel carries
+  **length-delimited datagrams** (`[u16 big-endian len][payload]`,
+  `src/proxy/mesh_udp_frame.rs`) rather than a raw byte stream. Concurrency is a **per-session mpsc+task** model:
   the recv loop only does the route lookup + a (drop-on-full) channel send (UDP
   backpressure is "drop"), and the per-session task opens the tunnel, frames each
   datagram, and writes it. **Return path:** the per-session task reads framed
@@ -1760,16 +1772,19 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   recognizes the `udp` marker, **unframes the tunnel into a local `UdpSocket`** to
   the CONNECT `:authority` (the open-relay guard bounds the authority to a
   loopback / slice-known workload addr+port exactly as for the byte-stream relay),
-  and frames replies back. A captured datagram matching **no** declared mesh UDP
-  destination — or a declared pair whose upstream did not materialize — is
+  and frames replies back. The destination's inbound relay is **transport-agnostic**:
+  `is_udp_hbone_connect` matches the `udp` marker regardless of which listener the
+  CONNECT arrived on (Ambient `:15008` or Sidecar `:15006`), funnelling through the
+  same `build_inbound_hbone_relay_proxy` + `handle_hbone_udp_request`, so no
+  destination-side change is involved. A captured datagram matching **no** declared
+  mesh UDP destination — or a declared pair whose upstream did not materialize — is
   **dropped** (fail closed; UDP has no fall-through HTTP path and a non-mesh
   destination must never be tunnelled in on a port coincidence). **Scope:**
-  egress is **Ambient-only** (the materializer gates `Ambient => HBONE, _ =>
-  return`); **Sidecar UDP egress is deferred** (a Sidecar peer exposes no
-  `:15008` HBONE listener, so it would need a mesh-mTLS datagram tunnel — a
-  documented follow-up). **Both skew directions fail closed:** a destination that
-  predates Stage 4 has no `udp` branch, so a `udp` CONNECT to it 404s (its
-  `is_hbone_connect` rejects the `udp` marker). DoS bounds are reused from the
+  egress is **dual-transport** (the materializer gates `Ambient => HBONE, Sidecar
+  => SidecarMtls, _ => return`); other topologies materialize no UDP egress.
+  **Both skew directions fail closed:** a destination that predates Stage 4 has no
+  `udp` branch, so a `udp` CONNECT to it 404s (its `is_hbone_connect` rejects the
+  `udp` marker). DoS bounds are reused from the
   plain UDP proxy: a bounded session map (`FERRUM_UDP_MAX_SESSIONS`, enforced with
   a lock-free atomic count so a spoofed-source flood never walks every DashMap
   shard), an idle-expiry sweep (`FERRUM_UDP_CLEANUP_INTERVAL_SECONDS`), and the
@@ -1781,22 +1796,20 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   `node_waypoint_policy_scope: None` (UDP has no per-source-pod cookie — see the
   UDP/DTLS limitation above). **Linux-only** (`IP_TRANSPARENT` + recvmsg cmsg);
   on other platforms the listener is a no-op stub. With the flag off there is no
-  listener and no capture rules. The full source-capture→HBONE→unframe→app→return
+  listener and no capture rules. The full source-capture→tunnel→unframe→app→return
   datapath (including return-source spoofing on a transparent socket) is
   **unit/dest-tested**; a live netns root e2e is deferred to the §3.1 capture-live
   verification stage (Stage 7).
-- **Not yet end-to-end in production (#1808).** Stage 4 is the datagram-over-mesh
-  **transport** — the Ambient HBONE relay plus the reusable framing codec,
-  materialization, capability enrollment, and dest-side unframe. But **Ambient
-  currently has no UDP capture *producer*** feeding the listener: the node-agent
-  host-netns path emits no UDP TPROXY rules (the same per-pod-scope blocker that
-  defers F4.3 / #1803) and eBPF capture is `connect()`-hooked / TCP-only; and the
-  only working UDP producer — the injector pod-netns TPROXY (Sidecar, Stage 2) —
-  pairs with the **deferred Sidecar mesh-mTLS datagram relay**. So no production
-  path feeds the relay yet. The first working end-to-end UDP path lands via that
-  Sidecar relay (reusing this codec, dialing peer `:15006`) wired to the existing
-  Sidecar producer — tracked in **#1808**; an Ambient UDP producer is blocked
-  alongside F4.3. This stage deliberately ships the transport half.
+- **End-to-end status (#1808): Sidecar is the FIRST working end-to-end UDP path.**
+  The Sidecar mesh-mTLS datagram relay (`open_datagram_tunnel`) pairs the
+  reusable Stage-4 codec / materialization / dest-side unframe with the **existing
+  injector pod-netns TPROXY producer** (Stage 2): capture→frame→mesh-mTLS
+  CONNECT (`:15006`)→peer→unframe→local `UdpSocket`→return. **Ambient still has no
+  UDP capture *producer*** feeding its listener — the node-agent host-netns path
+  emits no UDP TPROXY rules (the same per-pod-scope blocker that defers F4.3 /
+  #1803) and eBPF capture is `connect()`-hooked / TCP-only — so Ambient ships only
+  the transport half (HBONE relay + codec, awaiting a producer). An Ambient UDP
+  producer is blocked alongside F4.3.
 - **Locally-generated pod UDP egress: OUTPUT-MARK → lo-reroute → PREROUTING-TPROXY
   loop.** TPROXY runs **only in `PREROUTING`**, never for locally-generated (OUTPUT)
   packets — jumping into a `-j TPROXY` chain from `mangle OUTPUT` is invalid and can
@@ -1912,7 +1925,7 @@ Mesh mode automatically injects these global plugins with reserved IDs:
 | `__mesh_request_auth` | `jwks_auth` | (default) | JWT validation from MeshRequestAuthentication rules |
 | `__mesh_access_log` | `stdout_logging` | (default) | Access logging with optional Telemetry API filters |
 
-An operator-managed global plugin of the same type takes precedence over mesh-injected plugins (explicit override). See [plugin_execution_order.md](plugin_execution_order.md) for the full lifecycle phase matrix.
+Reserved mesh-managed plugin IDs are updated in place on each slice apply. If a prepared `GatewayConfig` already contains an operator-managed global plugin of the same plugin type but a different ID, that operator plugin takes precedence and the corresponding mesh injection is suppressed. Native/xDS `MeshSlice` feeds do not currently transport operator `plugin_configs`; this override hook applies only to prepared configs that enter mesh preparation with plugin configs already present. See [plugin_execution_order.md](plugin_execution_order.md) for the full lifecycle phase matrix.
 
 ## Gateway-to-Mesh Bridge
 
@@ -2330,7 +2343,8 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN` | `false` | Computes and reports the applicable `Sidecar` egress scope while leaving the slice unchanged. Use with `/mesh/egress-scope` before enabling enforcement |
 | `FERRUM_MESH_SIDECAR_IDENTITY_NARROWING` | `false` | When `true` and `FERRUM_MESH_SIDECAR_ENFORCED=true`, filters `workloads` to SPIFFE identities referenced by services admitted by the applicable Sidecar. Default-off for rollout; trust-bundle mTLS validation and HBONE trust-domain aliasing do not depend on this list |
 | `FERRUM_MESH_EGRESS_STREAM_ENABLED` | `false` | Opt-in for **TCP** stream egress proxy materialization in `EgressGateway` topology. When enabled, each per-port TCP listener **terminates SVID-mTLS and runs `mesh_authz`** at accept (same authn/z as HTTP egress, reusing the mesh-inbound `ServerConfig` + SPIFFE peer verifier; client certs required). UDP ServiceEntry ports are classified but **not yet materialized** (deferred with a warning — the UDP capture/egress + DTLS datapath is unimplemented), so this flag produces no UDP listener today. Default-off because protocol-aware mediation is absent and the mTLS datapath is not yet live-e2e verified. Set `FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT=true` to restore the legacy plaintext + unauthenticated listener. HTTP-family egress is unaffected |
-| `FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS` | `30` | NodeWaypoint cgroup-inode lifecycle sweep interval. Set to `0` to disable |
+| `FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS` | `30` | NodeWaypoint cgroup-inode lifecycle sweep interval for cgroup-bound identities. Set to `0` to disable only cgroup stats |
+| `FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS` | `30` | NodeWaypoint lazy identity GC interval for identities enrolled without a cgroup binding. Set to `0` only when another component explicitly removes lazy identities |
 | `FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP` | `true` | Whether the auto-injected mesh `RequestAuthentication` (`jwks_auth`) plugin requires the JWT `exp` claim. Secure default `true` rejects `exp`-less tokens. Set `false` only for issuers that legitimately omit `exp`; a present-but-expired `exp` is always rejected regardless |
 | `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED` | `false` | Opt in to live reload of the PeerAuthentication-derived inbound mTLS mode, client CA verifier, and federated SVID bundle slot on slice apply. Does not rotate frontend cert/key material (use `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`) |
 | `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` | `0` | Seconds to wait after a backend client SVID rotation before force-draining old-generation backend pool entries. `0` keeps existing connections until normal idle/health cleanup |

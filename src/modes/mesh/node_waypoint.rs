@@ -65,8 +65,10 @@
 //! restarted under the same UID) or whose path is gone (pod removed), so a
 //! fresh enrollment from the control plane / eBPF side is required before
 //! traffic for the new pod instance is honoured. Identities enrolled without
-//! a cgroup path are kept indefinitely — the sweep is a best-effort
-//! garbage-collection pass, not a security invariant. The fail-closed
+//! a cgroup path are reclaimed by an independent idle-identity GC task driven
+//! by `FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS`; disabling cgroup
+//! stats does not disable lazy-enrollment churn cleanup. Both passes are
+//! best-effort garbage collection, not security invariants. The fail-closed
 //! invariant on the accept path is unchanged: an unknown cookie or pod is
 //! still rejected before traffic enters the plugin chain.
 #![allow(dead_code)]
@@ -525,35 +527,19 @@ impl NodeWaypointIdentityResolver {
         self.identities_by_pod_uid.remove(pod_uid);
     }
 
-    /// Periodic identity reclamation, in two passes over the enrolled set:
-    ///
-    /// 1. **cgroup-binding** — for identities enrolled with a cgroup path/inode
-    ///    (`upsert_identity_with_cgroup`), re-stat the path and evict when it is
-    ///    gone or its inode/fingerprint no longer matches the enrolled value
-    ///    (pod removed, or restarted under the same UID).
-    /// 2. **idle-unreferenced** — for identities *without* a cgroup binding (the
-    ///    production lazy hash-join enrollment binds none, and nothing calls
-    ///    `remove_identity` for them), evict those whose `pod_uid` is no longer
-    ///    referenced by any live cookie record *and* whose identity `Arc` has no
-    ///    other holder (`strong_count == 1`). A dead pod's accept-side cookies
-    ///    age out of `cookie_records` (mirrored from the BPF LRU by the orig-dst
-    ///    bridge), so this reclaims churned pods that would otherwise stay cached
-    ///    forever and bloat the rebuilt per-pod scope maps. The `strong_count`
-    ///    guard is load-bearing: HTTP/HBONE connections store the resolved
-    ///    identity `Arc` for their whole lifetime and re-query the per-pod scope
-    ///    on every request, so if the BPF LRU evicts a live connection's cookie
-    ///    the cookie-reference check alone would wrongly drop its scope and
-    ///    downgrade later streams to mesh-wide — holding an `Arc` ref keeps the
-    ///    pod un-evictable until the connection closes. An evicted-but-still-live
-    ///    idle pod simply re-enrolls on its next connection (fail-closed safe).
-    ///
-    /// Per-pod policy scope is derived from the current slice via the identity's
-    /// SPIFFE (`policy_scope_for_pod`), not stored per pod, so evicting an
-    /// identity from `identities_by_pod_uid` is sufficient — there is no
-    /// separate per-pod scope map to clear, and a stale PolicyScopeCache from a
-    /// previous incarnation can never apply to a newly enrolled pod with the
-    /// same UID.
+    /// Run both identity lifecycle passes once and return a combined report.
+    /// Production starts cgroup-bound and idle-unreferenced reclamation from
+    /// separate tasks so operators can disable cgroup stat sweeps without also
+    /// disabling lazy-enrollment garbage collection.
     pub fn sweep_cgroup_stale_identities(&self) -> CgroupSweepReport {
+        let mut report = self.sweep_cgroup_bound_stale_identities();
+        report.evicted_idle_unreferenced = self.sweep_idle_unreferenced_identities();
+        report
+    }
+
+    /// Evict cgroup-bound identities when their enrolled cgroup path is gone
+    /// or its inode/fingerprint no longer matches the enrolled value.
+    fn sweep_cgroup_bound_stale_identities(&self) -> CgroupSweepReport {
         #[derive(Clone, Copy)]
         enum CgroupExpectation {
             Fingerprint(CgroupFingerprint),
@@ -660,6 +646,28 @@ impl NodeWaypointIdentityResolver {
             }
         }
 
+        self.cgroup_sweep_passes.fetch_add(1, Ordering::Relaxed);
+        if report.evicted_inode_changed > 0 {
+            self.cgroup_sweep_inode_changed
+                .fetch_add(report.evicted_inode_changed as u64, Ordering::Relaxed);
+        }
+        if report.evicted_path_missing > 0 {
+            self.cgroup_sweep_path_missing
+                .fetch_add(report.evicted_path_missing as u64, Ordering::Relaxed);
+        }
+        report
+    }
+
+    /// Evict identities without a cgroup binding when no live cookie record and
+    /// no open HTTP/HBONE connection still references the pod. This is the
+    /// churn-reclamation path for lazy hash-join enrollment, which binds no
+    /// cgroup and has no explicit removal API in production.
+    ///
+    /// Per-pod policy scope is slice-driven (`policy_scope_for_pod`), not stored
+    /// on the identity, so evicting an identity from `identities_by_pod_uid` is
+    /// sufficient. A stale PolicyScopeCache from a previous incarnation can
+    /// never apply to a newly enrolled pod with the same UID.
+    fn sweep_idle_unreferenced_identities(&self) -> usize {
         // Idle-unreferenced pass (see method docs): reclaim non-cgroup-bound
         // (lazily-enrolled) identities whose pod is no longer referenced by any
         // live cookie record. Snapshot candidates first so filesystem-free
@@ -687,6 +695,7 @@ impl NodeWaypointIdentityResolver {
             referenced.dedup();
             referenced
         };
+        let mut evicted = 0;
         for pod_uid in idle_candidates {
             if referenced.binary_search(&pod_uid).is_ok() {
                 continue;
@@ -714,24 +723,15 @@ impl NodeWaypointIdentityResolver {
                     Arc::strong_count(identity) == 1
                 });
             if removed.is_some() {
-                report.evicted_idle_unreferenced += 1;
+                evicted += 1;
             }
         }
 
-        self.cgroup_sweep_passes.fetch_add(1, Ordering::Relaxed);
-        if report.evicted_inode_changed > 0 {
-            self.cgroup_sweep_inode_changed
-                .fetch_add(report.evicted_inode_changed as u64, Ordering::Relaxed);
-        }
-        if report.evicted_path_missing > 0 {
-            self.cgroup_sweep_path_missing
-                .fetch_add(report.evicted_path_missing as u64, Ordering::Relaxed);
-        }
-        if report.evicted_idle_unreferenced > 0 {
+        if evicted > 0 {
             self.idle_unreferenced_evicted
-                .fetch_add(report.evicted_idle_unreferenced as u64, Ordering::Relaxed);
+                .fetch_add(evicted as u64, Ordering::Relaxed);
         }
-        report
+        evicted
     }
 
     pub fn cgroup_sweep_snapshot(&self) -> CgroupSweepSnapshot {
@@ -1130,10 +1130,10 @@ fn read_cgroup_fingerprint(_path: &Path) -> std::io::Result<CgroupFingerprint> {
     ))
 }
 
-/// Spawn a periodic sweep task that re-stats every enrolled cgroup path
-/// and evicts stale identities. `interval_secs == 0` disables the sweep
-/// and returns `None` so callers don't need to track an unused task
-/// handle. The task exits when `shutdown` is notified.
+/// Spawn a periodic sweep task that re-stats every enrolled cgroup path and
+/// evicts stale cgroup-bound identities. `interval_secs == 0` disables only
+/// this cgroup sweep and returns `None` so callers don't need to track an
+/// unused task handle. The task exits when `shutdown` is notified.
 pub fn spawn_cgroup_sweep_task(
     resolver: Arc<NodeWaypointIdentityResolver>,
     interval_secs: u64,
@@ -1153,19 +1153,61 @@ pub fn spawn_cgroup_sweep_task(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let report = resolver.sweep_cgroup_stale_identities();
-                    if report.total_evicted() > 0 {
+                    let report = resolver.sweep_cgroup_bound_stale_identities();
+                    if report.evicted_inode_changed > 0 || report.evicted_path_missing > 0 {
                         info!(
                             evicted_inode_changed = report.evicted_inode_changed,
                             evicted_path_missing = report.evicted_path_missing,
-                            evicted_idle_unreferenced = report.evicted_idle_unreferenced,
-                            "Node-waypoint identity sweep evicted stale identities"
+                            "Node-waypoint cgroup sweep evicted stale identities"
                         );
                     }
                 }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         info!("Node-waypoint cgroup sweep task shutting down");
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    Some(handle)
+}
+
+/// Spawn a periodic GC task for lazily-enrolled identities that have no cgroup
+/// binding. This is intentionally independent from the cgroup-inode sweep: an
+/// operator may disable cgroup stat sweeps while still needing bounded memory
+/// under ordinary pod churn.
+pub fn spawn_idle_identity_gc_task(
+    resolver: Arc<NodeWaypointIdentityResolver>,
+    interval_secs: u64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
+    if interval_secs == 0 {
+        info!(
+            "Node-waypoint idle identity GC disabled (FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS=0)"
+        );
+        return None;
+    }
+    let period = Duration::from_secs(interval_secs);
+    let handle = tokio::spawn(async move {
+        let mut ticker = interval(period);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        info!(interval_secs, "Node-waypoint idle identity GC task started");
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let evicted_idle_unreferenced = resolver.sweep_idle_unreferenced_identities();
+                    if evicted_idle_unreferenced > 0 {
+                        info!(
+                            evicted_idle_unreferenced,
+                            "Node-waypoint idle identity GC evicted stale identities"
+                        );
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        info!("Node-waypoint idle identity GC task shutting down");
                         return;
                     }
                 }
@@ -1760,6 +1802,37 @@ mod tests {
         let report = resolver.sweep_cgroup_stale_identities();
         assert_eq!(report.evicted_idle_unreferenced, 1);
         assert!(!resolver.identities_by_pod_uid.contains_key(&pod_uid));
+    }
+
+    #[test]
+    fn cgroup_bound_sweep_does_not_reclaim_unbound_idle_identity() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let pod_uid = parse_pod_uid("99999999-9999-9999-9999-999999999999").unwrap();
+        resolver.upsert_identity(NodeWaypointIdentity::new(
+            pod_uid,
+            spiffe("spiffe://td/ns/default/sa/web"),
+        ));
+
+        let report = resolver.sweep_cgroup_bound_stale_identities();
+        assert_eq!(report.total_evicted(), 0);
+        assert!(resolver.identities_by_pod_uid.contains_key(&pod_uid));
+
+        let evicted = resolver.sweep_idle_unreferenced_identities();
+        assert_eq!(evicted, 1);
+        assert!(!resolver.identities_by_pod_uid.contains_key(&pod_uid));
+    }
+
+    #[tokio::test]
+    async fn cgroup_sweep_disabled_does_not_disable_idle_identity_gc_task() {
+        let resolver = Arc::new(NodeWaypointIdentityResolver::new(0));
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        assert!(spawn_cgroup_sweep_task(resolver.clone(), 0, shutdown_rx.clone()).is_none());
+
+        let handle = spawn_idle_identity_gc_task(resolver, 30, shutdown_rx)
+            .expect("idle identity GC should be independently spawnable");
+        handle.abort();
+        let _ = handle.await;
     }
 
     #[test]

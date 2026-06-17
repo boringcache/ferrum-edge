@@ -2936,6 +2936,9 @@ mod inner {
                 Err(e) => return Err(e.into()),
             }
             self.api_specs()
+                .create_index(IndexModel::builder().keys(doc! { "proxy_id": 1 }).build())
+                .await?;
+            self.api_specs()
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "updated_at": 1 })
@@ -2987,7 +2990,21 @@ mod inner {
             self.audit_events()
                 .create_index(
                     IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "action": 1 })
+                        .build(),
+                )
+                .await?;
+            self.audit_events()
+                .create_index(
+                    IndexModel::builder()
                         .keys(doc! { "resource_type": 1 })
+                        .build(),
+                )
+                .await?;
+            self.audit_events()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "resource_id": 1 })
                         .build(),
                 )
                 .await?;

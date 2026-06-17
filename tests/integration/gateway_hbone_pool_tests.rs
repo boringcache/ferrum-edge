@@ -66,7 +66,7 @@ fn bundle_for(id: SpiffeId, leaf_der: Vec<u8>, key_der: Vec<u8>, root_der: Vec<u
     SvidBundle {
         spiffe_id: id.clone(),
         cert_chain_der: vec![leaf_der],
-        private_key_pkcs8_der: key_der,
+        private_key_pkcs8_der: key_der.into(),
         trust_bundles: TrustBundleSet::local_only(TrustBundle {
             trust_domain: id.trust_domain().clone(),
             x509_authorities: vec![root_der],

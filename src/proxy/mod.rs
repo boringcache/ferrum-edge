@@ -4442,9 +4442,13 @@ impl ProxyState {
         // enrollment `retain_keys` evicts their HBONE records and every Ambient
         // UDP dial 502s `hbone_required` forever. Built from the SAME
         // deterministic UDP relay proxy the route table / dispatch use, so probe
-        // and dispatch capability keys agree. UDP egress is Ambient-only, so all
-        // its targets carry `mesh.hbone` (there is no Sidecar UDP target to
-        // skip); the predicate is kept for consistency with the TCP passes.
+        // and dispatch capability keys agree. UDP egress is now dual-transport
+        // (#1808): Ambient `mesh.hbone` UDP targets ARE enrolled (HBONE capability
+        // registry), Sidecar `mesh.mtls` UDP targets are SKIPPED below — they
+        // dispatch over a mesh-mTLS CONNECT with NO capability probe (a
+        // slice-declared sidecar speaks mesh-mTLS by construction), and probing
+        // them would dial a non-existent `:15008` HBONE listener and record a
+        // spurious unsupported verdict (mirrors the raw-TCP passes).
         for service in &mesh.services {
             for sp in crate::modes::mesh::service_udp_stream_ports(service) {
                 let upstream_id = crate::modes::mesh::mesh_outbound_udp_upstream_id(
@@ -11371,9 +11375,14 @@ async fn handle_proxy_request_inner(
             let representative_id = Arc::clone(&rm.proxy);
             match epoch
                 .route_table
-                .select_mesh_outbound_port_route(rm, ctx.orig_dst.map(|addr| addr.port()))
-            {
-                Ok(rm) => Some(rm),
+                .select_mesh_outbound_port_route_with_authz_port(
+                    rm,
+                    ctx.orig_dst.map(|addr| addr.port()),
+                ) {
+                Ok((rm, authz_port)) => {
+                    ctx.mesh_outbound_destination_authz_port = authz_port;
+                    Some(rm)
+                }
                 Err(reason) => {
                     debug!(
                         proxy_id = %representative_id.id,
@@ -12363,8 +12372,8 @@ async fn handle_proxy_request_inner(
         //     retry, so retry alone is NOT a reason to buffer.
         //   * The REQUEST body still has to be collected up-front when
         //     retry is configured (caller side), so the retry loop can
-        //     replay it. `proxy_grpc_request` preserves the collected
-        //     request bytes regardless of the `stream_response` flag.
+        //     replay the collected request bytes regardless of the
+        //     `stream_response` flag.
         //   * Streaming IS unsafe when a plugin (or explicit
         //     `response_body_mode = Buffer`) requires the full response
         //     body in memory to make an admission decision.
@@ -12390,9 +12399,9 @@ async fn handle_proxy_request_inner(
         // `proxy_grpc_request_streaming` streams BOTH the request AND the
         // response, which means the request body is consumed on the wire
         // and cannot be replayed — incompatible with retry. Gate it on
-        // `!grpc_has_retry` so retry-enabled streaming proxies still flow
-        // via `proxy_grpc_request` (collects request body up-front,
-        // streams response frame-by-frame).
+        // `!grpc_has_retry` so retry-enabled streaming proxies still use the
+        // buffered-request path (collects request body up-front, streams
+        // response frame-by-frame).
         let grpc_can_use_streaming_fast_path = grpc_should_stream && !grpc_has_retry;
         // Deferred circuit-breaker probe recorder for the fully-streaming fast
         // path. Set only when that path is taken AND the request was admitted as
@@ -12502,8 +12511,7 @@ async fn handle_proxy_request_inner(
             // `Bytes::new()` here on the streaming branch silently fed the
             // retry loop an empty body whenever a body-hook proxy also had
             // `retry_on_connect_failure` enabled. Mirrors the same
-            // single-return contract documented in
-            // `proxy_grpc_request`.
+            // single-return contract used by the buffered-request gRPC path.
             backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
                 backend_admission_plugins.as_ref(),
                 &ctx,
@@ -25723,7 +25731,7 @@ mod tests {
         crate::identity::SvidBundle {
             spiffe_id,
             cert_chain_der: vec![vec![42]],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles,
         }
     }
