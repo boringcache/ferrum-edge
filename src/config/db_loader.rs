@@ -1258,7 +1258,7 @@ impl DatabaseStore {
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
         sqlx::query(
-            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&proxy.name)
         .bind(&hosts_json)
@@ -1307,6 +1307,7 @@ impl DatabaseStore {
         .bind(proxy.udp_max_response_amplification_factor.map(|v| v as f64))
         .bind(Utc::now().to_rfc3339())
         .bind(&proxy.id)
+        .bind(&proxy.namespace)
         .execute(&mut *tx)
         .await?;
 
@@ -1343,7 +1344,7 @@ impl DatabaseStore {
         // cascade-delete that upstream if it becomes orphaned. Also capture the
         // api_spec row, if this proxy owns one, before the FK cascade removes it.
         let proxy_row: Option<AnyRow> =
-            sqlx::query(&self.q("SELECT upstream_id FROM proxies WHERE id = ?"))
+            sqlx::query(&self.q("SELECT upstream_id, namespace FROM proxies WHERE id = ?"))
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -1353,6 +1354,7 @@ impl DatabaseStore {
             return Ok(false);
         };
         let upstream_id: Option<String> = proxy_row.try_get::<String, _>("upstream_id").ok();
+        let proxy_namespace: String = proxy_row.try_get("namespace")?;
 
         let spec_row: Option<AnyRow> =
             sqlx::query(&self.q("SELECT id, namespace FROM api_specs WHERE proxy_id = ?"))
@@ -1374,8 +1376,9 @@ impl DatabaseStore {
             .execute(&mut *tx)
             .await?;
 
-        let result = sqlx::query(&self.q("DELETE FROM proxies WHERE id = ?"))
+        let result = sqlx::query(&self.q("DELETE FROM proxies WHERE id = ? AND namespace = ?"))
             .bind(id)
+            .bind(&proxy_namespace)
             .execute(&mut *tx)
             .await?;
 
@@ -1401,21 +1404,24 @@ impl DatabaseStore {
 
         // If the proxy had an upstream, check if it's now orphaned and delete it
         if let Some(ref uid) = upstream_id {
-            let ref_rows: Vec<AnyRow> =
-                sqlx::query(&self.q("SELECT id FROM proxies WHERE upstream_id = ? LIMIT 1"))
-                    .bind(uid)
-                    .fetch_all(&mut *tx)
-                    .await?;
+            let ref_rows: Vec<AnyRow> = sqlx::query(
+                &self.q("SELECT id FROM proxies WHERE upstream_id = ? AND namespace = ? LIMIT 1"),
+            )
+            .bind(uid)
+            .bind(&proxy_namespace)
+            .fetch_all(&mut *tx)
+            .await?;
             let dispatch_ref = if ref_rows.is_empty() {
-                self.find_mesh_route_dispatch_upstream_ref_tx(&mut tx, uid)
+                self.find_mesh_route_dispatch_upstream_ref_tx(&mut tx, uid, &proxy_namespace)
                     .await?
             } else {
                 None
             };
             if ref_rows.is_empty() && dispatch_ref.is_none() {
                 info!("Cascade-deleting orphaned upstream {}", uid);
-                sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ?"))
+                sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ? AND namespace = ?"))
                     .bind(uid)
+                    .bind(&proxy_namespace)
                     .execute(&mut *tx)
                     .await?;
             }
@@ -1435,21 +1441,27 @@ impl DatabaseStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     ) -> Result<(), anyhow::Error> {
-        let orphaned_ids: Vec<String> = sqlx::query(&self.q(
-            "SELECT pc.id FROM plugin_configs pc \
+        let orphaned_configs: Vec<(String, String)> = sqlx::query(&self.q(
+            "SELECT pc.id, pc.namespace FROM plugin_configs pc \
                  WHERE pc.scope = 'proxy_group' \
                  AND NOT EXISTS (SELECT 1 FROM proxy_plugins pp WHERE pp.plugin_config_id = pc.id)",
         ))
         .fetch_all(&mut **tx)
         .await?
         .iter()
-        .filter_map(|row| row.try_get::<String, _>("id").ok())
+        .filter_map(|row| {
+            Some((
+                row.try_get::<String, _>("id").ok()?,
+                row.try_get::<String, _>("namespace").ok()?,
+            ))
+        })
         .collect();
 
-        for id in &orphaned_ids {
+        for (id, namespace) in &orphaned_configs {
             info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
-            sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ?"))
+            sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ? AND namespace = ?"))
                 .bind(id)
+                .bind(namespace)
                 .execute(&mut **tx)
                 .await?;
         }
@@ -1557,7 +1569,7 @@ impl DatabaseStore {
         self.delete_consumer_credential_index_tx(&mut tx, &consumer.id)
             .await?;
         sqlx::query(&self.q(
-            "UPDATE consumers SET username=?, custom_id=?, credentials=?, acl_groups=?, updated_at=? WHERE id=?",
+            "UPDATE consumers SET username=?, custom_id=?, credentials=?, acl_groups=?, updated_at=? WHERE id=? AND namespace=?",
         ))
         .bind(&consumer.username)
         .bind(&consumer.custom_id)
@@ -1565,6 +1577,7 @@ impl DatabaseStore {
         .bind(&acl_groups_json)
         .bind(Utc::now().to_rfc3339())
         .bind(&consumer.id)
+        .bind(&consumer.namespace)
         .execute(&mut *tx)
         .await?;
         self.insert_consumer_credential_index_tx(&mut tx, consumer)
@@ -1578,10 +1591,23 @@ impl DatabaseStore {
     pub async fn delete_consumer(&self, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
+        let namespace: Option<String> =
+            sqlx::query(&self.q("SELECT namespace FROM consumers WHERE id = ?"))
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|row| row.try_get::<String, _>("namespace"))
+                .transpose()?;
+        let Some(namespace) = namespace else {
+            tx.rollback().await?;
+            self.check_slow_query("delete_consumer", start);
+            return Ok(false);
+        };
         self.delete_consumer_credential_index_tx(&mut tx, id)
             .await?;
-        let result = sqlx::query(&self.q("DELETE FROM consumers WHERE id = ?"))
+        let result = sqlx::query(&self.q("DELETE FROM consumers WHERE id = ? AND namespace = ?"))
             .bind(id)
+            .bind(&namespace)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -1645,7 +1671,7 @@ impl DatabaseStore {
             PluginScope::Global => "global",
         };
         sqlx::query(
-            &self.q("UPDATE plugin_configs SET plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE plugin_configs SET plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&pc.plugin_name)
         .bind(&config_json)
@@ -1655,6 +1681,7 @@ impl DatabaseStore {
         .bind(pc.priority_override.map(|v| v as i32))
         .bind(Utc::now().to_rfc3339())
         .bind(&pc.id)
+        .bind(&pc.namespace)
         .execute(&self.pool())
         .await?;
 
@@ -1665,6 +1692,18 @@ impl DatabaseStore {
     pub async fn delete_plugin_config(&self, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
+        let namespace: Option<String> =
+            sqlx::query(&self.q("SELECT namespace FROM plugin_configs WHERE id = ?"))
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|row| row.try_get::<String, _>("namespace"))
+                .transpose()?;
+        let Some(namespace) = namespace else {
+            tx.rollback().await?;
+            self.check_slow_query("delete_plugin_config", start);
+            return Ok(false);
+        };
 
         let affected_proxy_rows: Vec<AnyRow> =
             sqlx::query(&self.q("SELECT proxy_id FROM proxy_plugins WHERE plugin_config_id = ?"))
@@ -1684,20 +1723,23 @@ impl DatabaseStore {
 
         if !affected_proxy_ids.is_empty() {
             let updated_at = Utc::now().to_rfc3339();
-            let sql = self.q("UPDATE proxies SET updated_at = ? WHERE id = ?");
+            let sql = self.q("UPDATE proxies SET updated_at = ? WHERE id = ? AND namespace = ?");
             for proxy_id in affected_proxy_ids {
                 sqlx::query(&sql)
                     .bind(&updated_at)
                     .bind(proxy_id)
+                    .bind(&namespace)
                     .execute(&mut *tx)
                     .await?;
             }
         }
 
-        let result = sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ?"))
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        let result =
+            sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ? AND namespace = ?"))
+                .bind(id)
+                .bind(&namespace)
+                .execute(&mut *tx)
+                .await?;
 
         tx.commit().await?;
 
@@ -2036,7 +2078,7 @@ impl DatabaseStore {
         let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(upstream)?;
 
         sqlx::query(
-            &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, subsets=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, backend_tls_sni=?, backend_tls_san_allow_list=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, subsets=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, backend_tls_sni=?, backend_tls_san_allow_list=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&upstream.name)
         .bind(&targets_json)
@@ -2054,6 +2096,7 @@ impl DatabaseStore {
         .bind(&backend_tls_san_allow_list_json)
         .bind(Utc::now().to_rfc3339())
         .bind(&upstream.id)
+        .bind(&upstream.namespace)
         .execute(&self.pool())
         .await?;
 
@@ -2083,11 +2126,13 @@ impl DatabaseStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         upstream_id: &str,
+        namespace: &str,
     ) -> Result<Option<PluginConfig>, anyhow::Error> {
         let plugins = self.mesh_route_dispatch_plugin_configs_tx(tx).await?;
-        Ok(plugins
-            .into_iter()
-            .find(|plugin| mesh_route_dispatch_references_upstream_id(plugin, upstream_id)))
+        Ok(plugins.into_iter().find(|plugin| {
+            plugin.namespace == namespace
+                && mesh_route_dispatch_references_upstream_id(plugin, upstream_id)
+        }))
     }
 
     /// Delete an upstream only if it is not referenced by any proxy.
@@ -2097,13 +2142,27 @@ impl DatabaseStore {
     pub async fn delete_upstream(&self, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
+        let namespace: Option<String> =
+            sqlx::query(&self.q("SELECT namespace FROM upstreams WHERE id = ?"))
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|row| row.try_get::<String, _>("namespace"))
+                .transpose()?;
+        let Some(namespace) = namespace else {
+            tx.rollback().await?;
+            self.check_slow_query("delete_upstream", start);
+            return Ok(false);
+        };
 
         // Check reference within the transaction to prevent races
-        let ref_rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT id FROM proxies WHERE upstream_id = ? LIMIT 1"))
-                .bind(id)
-                .fetch_all(&mut *tx)
-                .await?;
+        let ref_rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT id FROM proxies WHERE upstream_id = ? AND namespace = ? LIMIT 1"),
+        )
+        .bind(id)
+        .bind(&namespace)
+        .fetch_all(&mut *tx)
+        .await?;
         if !ref_rows.is_empty() {
             tx.rollback().await?;
             anyhow::bail!(
@@ -2112,7 +2171,7 @@ impl DatabaseStore {
             );
         }
         if let Some(plugin) = self
-            .find_mesh_route_dispatch_upstream_ref_tx(&mut tx, id)
+            .find_mesh_route_dispatch_upstream_ref_tx(&mut tx, id, &namespace)
             .await?
         {
             tx.rollback().await?;
@@ -2123,8 +2182,9 @@ impl DatabaseStore {
             );
         }
 
-        let result = sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ?"))
+        let result = sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ? AND namespace = ?"))
             .bind(id)
+            .bind(&namespace)
             .execute(&mut *tx)
             .await?;
 
@@ -2143,15 +2203,29 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
-
-        let ref_rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT id FROM proxies WHERE upstream_id = ? LIMIT 1"))
+        let namespace: Option<String> =
+            sqlx::query(&self.q("SELECT namespace FROM upstreams WHERE id = ?"))
                 .bind(old_upstream_id)
-                .fetch_all(&mut *tx)
-                .await?;
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|row| row.try_get::<String, _>("namespace"))
+                .transpose()?;
+        let Some(namespace) = namespace else {
+            tx.rollback().await?;
+            self.check_slow_query("cleanup_orphaned_upstream", start);
+            return Ok(());
+        };
+
+        let ref_rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT id FROM proxies WHERE upstream_id = ? AND namespace = ? LIMIT 1"),
+        )
+        .bind(old_upstream_id)
+        .bind(&namespace)
+        .fetch_all(&mut *tx)
+        .await?;
 
         let dispatch_ref = if ref_rows.is_empty() {
-            self.find_mesh_route_dispatch_upstream_ref_tx(&mut tx, old_upstream_id)
+            self.find_mesh_route_dispatch_upstream_ref_tx(&mut tx, old_upstream_id, &namespace)
                 .await?
         } else {
             None
@@ -2162,8 +2236,9 @@ impl DatabaseStore {
                 "Cleaning up orphaned upstream {} after proxy reassignment",
                 old_upstream_id
             );
-            sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ?"))
+            sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ? AND namespace = ?"))
                 .bind(old_upstream_id)
+                .bind(&namespace)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -3093,11 +3168,12 @@ impl DatabaseStore {
             .q("SELECT 1 FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ? LIMIT 1");
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
-        let touch_proxy_sql = self.q("UPDATE proxies SET updated_at = ? WHERE id = ?");
+        let touch_proxy_sql =
+            self.q("UPDATE proxies SET updated_at = ? WHERE id = ? AND namespace = ?");
         for chunk in proxies.chunks(Self::BATCH_CHUNK_SIZE) {
             let mut tx = self.pool().begin().await?;
             let mut seen = HashSet::new();
-            let mut touched_proxy_ids: HashSet<&str> = HashSet::new();
+            let mut touched_proxies: HashSet<(&str, &str)> = HashSet::new();
             for proxy in chunk {
                 for assoc in &proxy.plugins {
                     if !seen.insert((proxy.id.as_str(), assoc.plugin_config_id.as_str())) {
@@ -3117,15 +3193,16 @@ impl DatabaseStore {
                         .bind(&assoc.plugin_config_id)
                         .execute(&mut *tx)
                         .await?;
-                    touched_proxy_ids.insert(proxy.id.as_str());
+                    touched_proxies.insert((proxy.id.as_str(), proxy.namespace.as_str()));
                 }
             }
-            if !touched_proxy_ids.is_empty() {
+            if !touched_proxies.is_empty() {
                 let touch_ts = Utc::now().to_rfc3339();
-                for proxy_id in touched_proxy_ids {
+                for (proxy_id, namespace) in touched_proxies {
                     sqlx::query(&touch_proxy_sql)
                         .bind(&touch_ts)
                         .bind(proxy_id)
+                        .bind(namespace)
                         .execute(&mut *tx)
                         .await?;
                 }
