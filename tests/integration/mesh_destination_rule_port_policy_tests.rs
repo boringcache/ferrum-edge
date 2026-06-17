@@ -554,18 +554,19 @@ fn destination_rule_top_level_connection_pool_http_on_sd_upstream_goes_to_fallba
 }
 
 #[test]
-fn destination_rule_named_target_port_per_port_connection_pool_http_wins_over_fallback() {
+fn destination_rule_named_target_port_sd_falls_back_to_top_level_connection_pool_http() {
     use ferrum_edge::config::types::{DnsSdConfig, SdProvider, ServiceDiscoveryConfig};
     use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
 
-    // #1806 codex r2 finding 2: an SD upstream whose Service uses a NAMED
+    // #1806 (narrowed; follow-up #1816): an SD upstream whose Service uses a NAMED
     // `targetPort` keeps the per-port `portLevelSettings` entry under the DECLARED
     // service port (80) — named targetPorts can't be remapped at apply time — while
-    // the discovered target carries the RESOLVED workload port (8080). A top-level
-    // `connectionPool.http` overlay must NOT override the explicit per-port value
-    // for that service. The projection folds the explicit per-port
-    // `connectionPool.http` into the fallback so the per-port value still wins at
-    // runtime regardless of the resolved dial port.
+    // the discovered target carries the RESOLVED workload port (8080). The SD
+    // fallback carries the TOP-LEVEL `connectionPool.http` overlay ONLY (it does NOT
+    // fold per-port entries — folding cross-leaks between ports on a multi-port
+    // upstream). So for a named-targetPort SD upstream the per-port lookup misses the
+    // resolved port and the TOP-LEVEL value applies; honoring the explicit per-port
+    // value here is a DEFERRED accepted limitation (#1816).
     let mut sd_upstream = upstream();
     // Resolved workload target port differs from the declared service port (80).
     sd_upstream.targets[0].port = 8080;
@@ -622,23 +623,24 @@ fn destination_rule_named_target_port_per_port_connection_pool_http_wins_over_fa
 
     let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
 
-    // The projected proxy fallback carries the per-port-WINS merge: the explicit
-    // per-port maxRetries (5) overrides the top-level (2), and the top-level-only
-    // idleTimeout is still inherited. So a runtime dial to the resolved port 8080
-    // (no per-port entry) honors the explicit per-port maxRetries.
+    // The projected proxy fallback carries the TOP-LEVEL overlay ONLY (no per-port
+    // folding): the top-level maxRetries (2) and idleTimeout (45s). The explicit
+    // per-port maxRetries (5) keyed on the declared service port (80) is NOT folded,
+    // so for the resolved port 8080 the top-level value applies — named-targetPort
+    // per-port precedence is the DEFERRED accepted limitation (#1816).
     let proxy_fallback = prepared.proxies[0]
         .dispatch_port_override_fallback
         .as_ref()
         .expect("SD fallback must project onto the referencing proxy");
     assert_eq!(
         proxy_fallback.max_retries,
-        Some(5),
-        "explicit per-port maxRetries must win over the top-level fallback for a named-targetPort SD upstream"
+        Some(2),
+        "named-targetPort SD: the TOP-LEVEL fallback applies on the resolved port (per-port deferred to #1816)"
     );
     assert_eq!(
         proxy_fallback.http_idle_timeout_ms,
         Some(45_000),
-        "a top-level-only field is still inherited by the fallback"
+        "a top-level-only field is inherited by the fallback"
     );
 }
 

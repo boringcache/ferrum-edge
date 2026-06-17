@@ -1056,6 +1056,12 @@ where
                     // per-request SNI, so a port whose effective TLS sets one
                     // can't be honored on this bridge (mirrors
                     // `proxy_to_backend_retry`'s per-attempt check).
+                    // NOTE (#1816): this local dispatch-policy 502 currently runs
+                    // AFTER backend admission, so an admission plugin at its limit
+                    // can mask it with a 503. Moving the effective-proxy resolution +
+                    // these dispatch-policy rejects BEFORE admission (the H1/H2
+                    // ordering) is the same retry-loop restructure deferred for the
+                    // `http1MaxPendingRequests` pending-cap; tracked together in #1816.
                     if dispatch_proxy.resolved_tls.sni.is_some() {
                         warn!(
                             proxy_id = %dispatch_proxy.id,
