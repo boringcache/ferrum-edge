@@ -549,8 +549,7 @@ async fn run_with_backend(
             cni_work = cni_work_rx.recv(), if cni_work_open => {
                 match cni_work {
                     Some(work) => {
-                        let cni_request = work.request.clone();
-                        process_cni_work_item(
+                        let enrolled_uid = process_cni_work_item(
                             backend.as_mut(),
                             &pod_states,
                             config,
@@ -558,7 +557,7 @@ async fn run_with_backend(
                             &client,
                             work,
                         ).await;
-                        mark_relist_seen_from_cni_add(&mut init_seen, &pod_states, &cni_request);
+                        mark_relist_seen_from_cni_add(&mut init_seen, enrolled_uid.as_deref());
                     }
                     None => {
                         // Channel closed — listener task exited. Disable this
@@ -603,20 +602,10 @@ fn watcher_init_stale_uids(
 
 fn mark_relist_seen_from_cni_add(
     init_seen: &mut Option<HashSet<String>>,
-    pod_states: &DashMap<String, PodAttachmentState>,
-    request: &CniRpcRequest,
+    enrolled_uid: Option<&str>,
 ) {
-    let Some(seen) = init_seen else {
-        return;
-    };
-    if request.verb != RpcVerb::Add {
-        return;
-    }
-    let Some(pod_uid) = request.pod_uid.as_deref() else {
-        return;
-    };
-    if pod_states.contains_key(pod_uid) {
-        seen.insert(pod_uid.to_string());
+    if let (Some(seen), Some(uid)) = (init_seen.as_mut(), enrolled_uid) {
+        seen.insert(uid.to_string());
     }
 }
 
@@ -643,9 +632,9 @@ async fn process_cni_work_item(
     metrics: &NodeAgentMetrics,
     kube_client: &Client,
     work: CniWorkItem,
-) {
+) -> Option<String> {
     let CniWorkItem { request, respond } = work;
-    let response = apply_cni_request_with_kube_metadata(
+    let (response, enrolled_uid) = apply_cni_request_with_kube_metadata(
         backend,
         pod_states,
         config,
@@ -659,6 +648,7 @@ async fn process_cni_work_item(
     // applied the side-effect. The metric/log already reflect the
     // outcome from the server's side.
     let _ = respond.send(response);
+    enrolled_uid
 }
 
 async fn apply_cni_request_with_kube_metadata(
@@ -668,9 +658,12 @@ async fn apply_cni_request_with_kube_metadata(
     metrics: &NodeAgentMetrics,
     kube_client: &Client,
     request: &CniRpcRequest,
-) -> CniRpcResponse {
+) -> (CniRpcResponse, Option<String>) {
     if request.verb != RpcVerb::Add {
-        return apply_cni_request(backend, pod_states, config, metrics, request);
+        return (
+            apply_cni_request(backend, pod_states, config, metrics, request),
+            None,
+        );
     }
 
     let pod_api: Api<Pod> = Api::namespaced(kube_client.clone(), &request.pod_namespace);
@@ -683,7 +676,10 @@ async fn apply_cni_request_with_kube_metadata(
                 error = %err,
                 "CNI ADD could not fetch pod metadata; kube-rs watcher will reconcile"
             );
-            apply_cni_request(backend, pod_states, config, metrics, request)
+            (
+                apply_cni_request(backend, pod_states, config, metrics, request),
+                None,
+            )
         }
         Err(_elapsed) => {
             debug!(
@@ -692,7 +688,10 @@ async fn apply_cni_request_with_kube_metadata(
                 timeout_ms = CNI_METADATA_FETCH_TIMEOUT.as_millis(),
                 "CNI ADD pod metadata fetch timed out; kube-rs watcher will reconcile"
             );
-            apply_cni_request(backend, pod_states, config, metrics, request)
+            (
+                apply_cni_request(backend, pod_states, config, metrics, request),
+                None,
+            )
         }
     }
 }
@@ -704,21 +703,28 @@ fn apply_cni_add_from_pod(
     metrics: &NodeAgentMetrics,
     request: &CniRpcRequest,
     pod: &Pod,
-) -> CniRpcResponse {
+) -> (CniRpcResponse, Option<String>) {
     let Some(api_uid) = pod_uid(pod) else {
-        return CniRpcResponse::Rejected {
-            reason: "Kubernetes API pod is missing metadata.uid; kube-rs watcher will reconcile"
-                .to_string(),
-        };
+        return (
+            CniRpcResponse::Rejected {
+                reason:
+                    "Kubernetes API pod is missing metadata.uid; kube-rs watcher will reconcile"
+                        .to_string(),
+            },
+            None,
+        );
     };
     if let Some(request_uid) = request.pod_uid.as_deref()
         && request_uid != api_uid
     {
-        return CniRpcResponse::Rejected {
-            reason: format!(
-                "CNI pod UID {request_uid} does not match Kubernetes API pod UID {api_uid}; kube-rs watcher will reconcile"
-            ),
-        };
+        return (
+            CniRpcResponse::Rejected {
+                reason: format!(
+                    "CNI pod UID {request_uid} does not match Kubernetes API pod UID {api_uid}; kube-rs watcher will reconcile"
+                ),
+            },
+            None,
+        );
     }
 
     let labels: HashMap<String, String> = pod
@@ -765,7 +771,17 @@ fn apply_cni_add_from_pod(
         veth_iface_override: None,
     };
     handle_pod_added(backend, pod_states, config, metrics, &event);
-    CniRpcResponse::Ok
+    // Surface the UID that was actually inserted into `pod_states` (the
+    // Kubernetes API `metadata.uid`, which may differ from — or be present when
+    // the CRI omitted — `request.pod_uid`) so a CNI ADD during the watcher
+    // Init/InitDone relist window marks the enrolled pod seen and survives the
+    // stale sweep. `None` when enrollment did not land (e.g. attach failure).
+    let enrolled_uid = if pod_states.contains_key(api_uid.as_str()) {
+        Some(api_uid)
+    } else {
+        None
+    };
+    (CniRpcResponse::Ok, enrolled_uid)
 }
 
 /// Pure-function core of [`process_cni_work_item`] so tests can drive
@@ -4466,37 +4482,29 @@ mod tests {
         assert_eq!(metrics.pods_unenrolled.load(Ordering::Relaxed), 0);
     }
 
+    fn enrolled_pod_state(uid: &str) -> PodAttachmentState {
+        PodAttachmentState {
+            pod_uid: uid.to_string(),
+            pod_name: "alpha".to_string(),
+            namespace: "default".to_string(),
+            pod_ip: None,
+            cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid1".to_string()),
+            veth_iface: Some("veth123".to_string()),
+            attached: true,
+            include_ports_cgroup_ids: Vec::new(),
+            include_ports_policy: None,
+            workload_identity_cgroup_ids: Vec::new(),
+        }
+    }
+
     #[test]
     fn cni_add_during_relist_marks_tracked_pod_seen() {
-        use crate::cni::rpc::{CniRpcRequest, RpcVerb};
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
-        pod_states.insert(
-            "pod-uid-1".to_string(),
-            PodAttachmentState {
-                pod_uid: "pod-uid-1".to_string(),
-                pod_name: "alpha".to_string(),
-                namespace: "default".to_string(),
-                pod_ip: None,
-                cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid1".to_string()),
-                veth_iface: Some("veth123".to_string()),
-                attached: true,
-                include_ports_cgroup_ids: Vec::new(),
-                include_ports_policy: None,
-                workload_identity_cgroup_ids: Vec::new(),
-            },
-        );
+        pod_states.insert("pod-uid-1".to_string(), enrolled_pod_state("pod-uid-1"));
         let mut init_seen = Some(HashSet::new());
-        let req = CniRpcRequest {
-            verb: RpcVerb::Add,
-            pod_namespace: "default".to_string(),
-            pod_name: "alpha".to_string(),
-            pod_uid: Some("pod-uid-1".to_string()),
-            container_id: "ctr-1".to_string(),
-            netns_path: Some("/var/run/netns/cni-1".to_string()),
-            args: HashMap::new(),
-        };
 
-        mark_relist_seen_from_cni_add(&mut init_seen, &pod_states, &req);
+        // The CNI apply path reports the UID it actually enrolled.
+        mark_relist_seen_from_cni_add(&mut init_seen, Some("pod-uid-1"));
 
         let seen = init_seen.take().expect("relist in progress");
         assert!(
@@ -4507,35 +4515,12 @@ mod tests {
 
     #[test]
     fn unrelated_cni_add_during_relist_does_not_mask_stale_pod() {
-        use crate::cni::rpc::{CniRpcRequest, RpcVerb};
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
-        pod_states.insert(
-            "pod-uid-1".to_string(),
-            PodAttachmentState {
-                pod_uid: "pod-uid-1".to_string(),
-                pod_name: "alpha".to_string(),
-                namespace: "default".to_string(),
-                pod_ip: None,
-                cgroup_path: Some("/sys/fs/cgroup/kubepods/poduid1".to_string()),
-                veth_iface: Some("veth123".to_string()),
-                attached: true,
-                include_ports_cgroup_ids: Vec::new(),
-                include_ports_policy: None,
-                workload_identity_cgroup_ids: Vec::new(),
-            },
-        );
+        pod_states.insert("pod-uid-1".to_string(), enrolled_pod_state("pod-uid-1"));
         let mut init_seen = Some(HashSet::new());
-        let req = CniRpcRequest {
-            verb: RpcVerb::Add,
-            pod_namespace: "default".to_string(),
-            pod_name: "beta".to_string(),
-            pod_uid: Some("pod-uid-2".to_string()),
-            container_id: "ctr-2".to_string(),
-            netns_path: Some("/var/run/netns/cni-2".to_string()),
-            args: HashMap::new(),
-        };
 
-        mark_relist_seen_from_cni_add(&mut init_seen, &pod_states, &req);
+        // A CNI ADD that enrolled a *different* pod marks only that UID.
+        mark_relist_seen_from_cni_add(&mut init_seen, Some("pod-uid-2"));
 
         let seen = init_seen.take().expect("relist in progress");
         assert_eq!(
@@ -4543,6 +4528,77 @@ mod tests {
             vec!["pod-uid-1".to_string()],
             "unrelated CNI ADD must not protect a stale watcher entry"
         );
+    }
+
+    #[test]
+    fn cni_add_with_metadata_free_request_marks_enrolled_api_uid_seen() {
+        // Codex finding: when the CRI omits K8S_POD_UID, the pod still enrolls
+        // under the Kubernetes API metadata.uid. The relist-preservation must
+        // mark *that* UID so InitDone does not tear the CNI fast-path enrollment
+        // back down. `apply_cni_add_from_pod` surfaces the enrolled UID even
+        // though `request.pod_uid` is None.
+        use crate::cni::rpc::{CniRpcRequest, RpcVerb};
+        use k8s_openapi::api::core::v1::{Pod, PodSpec, PodStatus};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podapi-uid-x")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let pod = Pod {
+            metadata: ObjectMeta {
+                name: Some("alpha".to_string()),
+                namespace: Some("default".to_string()),
+                uid: Some("api-uid-x".to_string()),
+                labels: Some(
+                    [("ferrum.io/mesh".to_string(), "enabled".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+            spec: Some(PodSpec::default()),
+            status: Some(PodStatus {
+                pod_ip: Some("10.0.0.9".to_string()),
+                ..Default::default()
+            }),
+        };
+        // CRI omitted the pod UID.
+        let req = CniRpcRequest {
+            verb: RpcVerb::Add,
+            pod_namespace: "default".to_string(),
+            pod_name: "alpha".to_string(),
+            pod_uid: None,
+            container_id: "ctr-1".to_string(),
+            netns_path: Some("/var/run/netns/cni-1".to_string()),
+            args: HashMap::new(),
+        };
+
+        let (response, enrolled_uid) =
+            apply_cni_add_from_pod(&mut backend, &pod_states, &config, &metrics, &req, &pod);
+        assert!(matches!(response, CniRpcResponse::Ok));
+        assert_eq!(enrolled_uid.as_deref(), Some("api-uid-x"));
+        assert!(pod_states.contains_key("api-uid-x"));
+
+        // And it survives the InitDone sweep once marked.
+        let mut init_seen = Some(HashSet::new());
+        mark_relist_seen_from_cni_add(&mut init_seen, enrolled_uid.as_deref());
+        let seen = init_seen.take().expect("relist in progress");
+        assert!(watcher_init_stale_uids(&pod_states, &seen).is_empty());
     }
 
     /// `apply_cni_request` ADD without a pod_uid maps to `Rejected` (we
