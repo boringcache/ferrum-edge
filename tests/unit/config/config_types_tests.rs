@@ -1741,6 +1741,173 @@ fn retry_proxy_allows_mesh_transport_target_outside_selected_subset() {
     assert!(config.validate_upstream_references().is_ok());
 }
 
+#[test]
+fn retry_proxy_rejects_boolish_truthy_mesh_transport_tags() {
+    // Runtime treats `1`/`yes`/`on` as truthy for mesh.hbone/mesh.mtls, so the
+    // validator must too (otherwise these pass admission then 502 at runtime).
+    for value in ["1", "yes", "YES", "on", "True"] {
+        let mut upstream = make_upstream("mesh-upstream");
+        upstream.targets[0]
+            .tags
+            .insert("mesh.hbone".to_string(), value.to_string());
+        let mut proxy = make_proxy("p1", "/api");
+        proxy.upstream_id = Some("mesh-upstream".into());
+        proxy.retry = Some(RetryConfig::default());
+        let mut config = empty_config();
+        config.upstreams = vec![upstream];
+        config.proxies = vec![proxy];
+
+        let err = config.validate_upstream_references().unwrap_err();
+        assert!(
+            err.iter()
+                .any(|msg| msg.contains("enables retry") && msg.contains("mesh.hbone")),
+            "expected retry/mesh.hbone conflict for tag value {value:?}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn retry_proxy_rejects_mesh_service_discovery_upstream() {
+    // Mesh service-discovery upstreams have empty static targets at admission
+    // but later publish HBONE-required targets, so retry conflicts even though
+    // no static target carries a mesh tag.
+    let mut upstream = make_upstream("mesh-sd-upstream");
+    upstream.targets.clear();
+    upstream.service_discovery = Some(ferrum_edge::config::types::ServiceDiscoveryConfig {
+        provider: ferrum_edge::config::types::SdProvider::Mesh,
+        dns_sd: None,
+        kubernetes: None,
+        consul: None,
+        mesh: Some(ferrum_edge::config::types::MeshSdConfig {
+            service_name: "reviews".to_string(),
+            namespace: None,
+            port: None,
+            poll_interval_seconds: 30,
+        }),
+        default_weight: 1,
+    });
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-sd-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter()
+            .any(|msg| msg.contains("enables retry") && msg.contains("mesh.hbone")),
+        "expected retry/mesh service-discovery conflict, got {err:?}"
+    );
+}
+
+#[test]
+fn retry_proxy_rejects_mesh_route_dispatch_override_upstream() {
+    // A plain default upstream but a mesh_route_dispatch rule that overrides the
+    // upstream to a mesh-tagged one must be rejected: matched requests would
+    // 502 at runtime.
+    let plain = make_upstream("plain-upstream");
+    let mut mesh = make_upstream("mesh-upstream");
+    mesh.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+
+    let dispatch = PluginConfig {
+        id: "route-dispatch".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "mesh_route_dispatch".into(),
+        config: serde_json::json!({
+            "rules": [
+                { "match": {}, "destination": { "upstream_id": "mesh-upstream" } }
+            ]
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("p1".into()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("plain-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "route-dispatch".into(),
+    }];
+
+    let mut config = empty_config();
+    config.upstreams = vec![plain, mesh];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![dispatch];
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter().any(|msg| msg.contains("enables retry")
+            && msg.contains("mesh-upstream")
+            && msg.contains("mesh.hbone")),
+        "expected retry/route-override conflict, got {err:?}"
+    );
+}
+
+#[test]
+fn retry_proxy_allows_mesh_target_when_status_retries_miss_allowed_methods() {
+    // Status-code retries that only apply to methods this proxy cannot serve can
+    // never trigger at runtime, so they must not block a mesh-tagged upstream.
+    let mut upstream = make_upstream("mesh-upstream");
+    upstream.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-upstream".into());
+    proxy.allowed_methods = Some(vec!["GET".to_string()]);
+    proxy.retry = Some(RetryConfig {
+        max_retries: 3,
+        retryable_status_codes: vec![503],
+        retryable_methods: vec!["POST".to_string()],
+        retry_on_connect_failure: false,
+        ..RetryConfig::default()
+    });
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "status retries for non-served methods should not block mesh targets"
+    );
+}
+
+#[test]
+fn retry_proxy_rejects_mesh_target_when_status_retries_hit_allowed_methods() {
+    // The same config but with an overlapping method (GET) is rejected.
+    let mut upstream = make_upstream("mesh-upstream");
+    upstream.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-upstream".into());
+    proxy.allowed_methods = Some(vec!["GET".to_string()]);
+    proxy.retry = Some(RetryConfig {
+        max_retries: 3,
+        retryable_status_codes: vec![503],
+        retryable_methods: vec!["GET".to_string()],
+        retry_on_connect_failure: false,
+        ..RetryConfig::default()
+    });
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter()
+            .any(|msg| msg.contains("enables retry") && msg.contains("mesh.hbone")),
+        "expected retry/mesh conflict when status retries overlap allowed_methods, got {err:?}"
+    );
+}
+
 // ---- priority_override validation tests ----
 
 #[test]

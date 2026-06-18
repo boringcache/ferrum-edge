@@ -12,7 +12,9 @@ use crate::admin::audit::{self, AuditActor, AuditEvent};
 use crate::admin::jwt_auth::AdminRole;
 use crate::config::db_backend::{DatabaseBackend, PaginatedResult};
 use crate::config::types::{
-    Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, validate_resource_id,
+    Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
+    mesh_transport_retry_conflict_message, proxy_retry_is_effective,
+    upstream_required_mesh_transport, validate_resource_id,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 
@@ -489,6 +491,43 @@ pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
     Ok(errors)
 }
 
+/// Collect the distinct upstream IDs a proxy's enabled `mesh_route_dispatch`
+/// plugin instances can route matched traffic to (via
+/// `route_override_upstream_id`), excluding the proxy's own default
+/// `upstream_id`. Used by [`Proxy::after_validate`] to extend the
+/// retry/mesh-transport conflict check to route overrides on single-resource
+/// admin writes.
+async fn mesh_route_dispatch_override_upstream_ids(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxy: &Proxy,
+) -> DbResult<Vec<String>> {
+    let mut overrides: Vec<String> = Vec::new();
+    for assoc in &proxy.plugins {
+        let Some(plugin) = db.get_plugin_config(&assoc.plugin_config_id).await? else {
+            continue;
+        };
+        if plugin.namespace != namespace
+            || !plugin.enabled
+            || plugin.plugin_name != "mesh_route_dispatch"
+        {
+            continue;
+        }
+        let Ok(dispatch) = MeshRouteDispatchConfig::from_value(&plugin.config) else {
+            continue;
+        };
+        for rule in &dispatch.rules {
+            if let Some(override_uid) = rule.destination.upstream_id.as_deref()
+                && override_uid != proxy.upstream_id.as_deref().unwrap_or("")
+                && !overrides.iter().any(|existing| existing == override_uid)
+            {
+                overrides.push(override_uid.to_string());
+            }
+        }
+    }
+    Ok(overrides)
+}
+
 fn plugin_config_audit_body(resource: &PluginConfig) -> Value {
     let mut body = json!(resource);
     if let Some(config) = body.get_mut("config") {
@@ -807,6 +846,21 @@ impl AdminResource for Upstream {
                     errors.push(format!(
                         "upstream '{}' cannot remove subset '{}' while proxy '{}' references it",
                         resource.id, subset_name, proxy.id
+                    ));
+                }
+                // Reject adding a mesh transport requirement to an upstream that
+                // a retry-enabled proxy already targets: at runtime retry forces
+                // the HBONE / SVID-mTLS transport off and those requests fail
+                // closed with 502 (issue #1669). Mirrors the full-config and
+                // proxy-write checks for the reverse write order.
+                if proxy_retry_is_effective(proxy.retry.as_ref(), proxy.allowed_methods.as_deref())
+                    && let Some(conflict) =
+                        upstream_required_mesh_transport(resource, proxy.upstream_subset.as_deref())
+                {
+                    errors.push(mesh_transport_retry_conflict_message(
+                        &proxy.id,
+                        &resource.id,
+                        &conflict,
                     ));
                 }
             }
@@ -1215,6 +1269,26 @@ impl AdminResource for Proxy {
                             )]));
                         }
                     }
+                    // A retry-enabled proxy whose selected upstream targets
+                    // require a mesh transport (`mesh.hbone` / `mesh.mtls`)
+                    // would fail closed with 502 at runtime (issue #1669).
+                    // Reject the combination at admission, matching the
+                    // full-config `validate_upstream_references` check.
+                    if proxy_retry_is_effective(
+                        resource.retry.as_ref(),
+                        resource.allowed_methods.as_deref(),
+                    ) && let Some(conflict) = upstream_required_mesh_transport(
+                        &upstream,
+                        resource.upstream_subset.as_deref(),
+                    ) {
+                        return Err(AfterValidateError::BadRequest(vec![
+                            mesh_transport_retry_conflict_message(
+                                &resource.id,
+                                upstream_id,
+                                &conflict,
+                            ),
+                        ]));
+                    }
                 }
                 Ok(None) => {
                     return Err(AfterValidateError::BadRequest(vec![format!(
@@ -1223,6 +1297,36 @@ impl AdminResource for Proxy {
                     )]));
                 }
                 Err(error) => return Err(AfterValidateError::Db(error)),
+            }
+        }
+
+        // Route-level upstream overrides (`mesh_route_dispatch`) can route
+        // matched traffic to a different upstream than `proxy.upstream_id`.
+        // Reject when a retry-enabled proxy's override destination requires a
+        // mesh transport, mirroring the full-config check.
+        if proxy_retry_is_effective(resource.retry.as_ref(), resource.allowed_methods.as_deref()) {
+            for override_uid in mesh_route_dispatch_override_upstream_ids(db, namespace, resource)
+                .await
+                .map_err(AfterValidateError::Db)?
+            {
+                match db.get_upstream(&override_uid).await {
+                    Ok(Some(upstream)) if upstream.namespace == namespace => {
+                        if let Some(conflict) = upstream_required_mesh_transport(&upstream, None) {
+                            return Err(AfterValidateError::BadRequest(vec![
+                                mesh_transport_retry_conflict_message(
+                                    &resource.id,
+                                    &override_uid,
+                                    &conflict,
+                                ),
+                            ]));
+                        }
+                    }
+                    // Missing / cross-namespace override upstreams are reported
+                    // by the dedicated mesh_route_dispatch reference validator;
+                    // skip them here.
+                    Ok(_) => {}
+                    Err(error) => return Err(AfterValidateError::Db(error)),
+                }
             }
         }
 

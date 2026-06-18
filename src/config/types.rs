@@ -2307,6 +2307,129 @@ fn contains_encoded_slash(path: &str) -> bool {
     false
 }
 
+/// Whether a proxy's retry policy can actually trigger for at least one request
+/// the proxy can admit.
+///
+/// Mirrors the runtime gates so config validation does not reject combinations
+/// that can never retry:
+/// - `max_retries == 0` never retries.
+/// - `retry_on_connect_failure` is method-agnostic (a connect failure never
+///   reaches the HTTP layer), so it makes retry effective for *any* admitted
+///   method.
+/// - Status-code retries only fire for methods listed in `retryable_methods`,
+///   and method admission (`allowed_methods`) runs before backend dispatch. So
+///   status retries are only effective when `retryable_methods` overlaps the
+///   methods the proxy is allowed to serve.
+pub(crate) fn proxy_retry_is_effective(
+    retry: Option<&RetryConfig>,
+    allowed_methods: Option<&[String]>,
+) -> bool {
+    let Some(retry) = retry else {
+        return false;
+    };
+    if retry.max_retries == 0 {
+        return false;
+    }
+    if retry.retry_on_connect_failure {
+        return true;
+    }
+    if retry.retryable_status_codes.is_empty() || retry.retryable_methods.is_empty() {
+        return false;
+    }
+    match allowed_methods {
+        // `allowed_methods == None` means "allow all", so any retryable method
+        // can be admitted.
+        None => true,
+        Some(allowed) => retry.retryable_methods.iter().any(|retryable| {
+            allowed
+                .iter()
+                .any(|served| served.eq_ignore_ascii_case(retryable))
+        }),
+    }
+}
+
+/// The mesh transport an upstream's selected targets require, if any.
+///
+/// Returns the conflicting transport tag (`"mesh.hbone"` / `"mesh.mtls"`)
+/// together with a human-readable detail describing which target (or
+/// service-discovery provider) triggered it. Uses the *runtime* tag predicates
+/// ([`crate::proxy::hbone_pool::target_hbone_enabled`] /
+/// [`crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled`]) so it matches the
+/// boolish truthiness (`true`/`yes`/`on`/`1`) the dispatch path actually honors.
+///
+/// Mesh service-discovery upstreams (`service_discovery.provider = Mesh`) are
+/// treated as HBONE-requiring even with no static targets, because discovered
+/// targets are stamped `mesh.hbone=true` by the mesh discoverer.
+pub(crate) fn upstream_required_mesh_transport(
+    upstream: &Upstream,
+    selected_subset: Option<&str>,
+) -> Option<MeshTransportConflict> {
+    // Mesh service-discovery upstreams publish HBONE-required targets
+    // dynamically; their static `targets` list is typically empty at admission.
+    if upstream
+        .service_discovery
+        .as_ref()
+        .is_some_and(|sd| sd.provider == SdProvider::Mesh)
+    {
+        return Some(MeshTransportConflict {
+            transport: "mesh.hbone",
+            detail: "mesh service discovery".to_string(),
+        });
+    }
+
+    let subset = selected_subset.and_then(|subset_name| {
+        upstream
+            .subsets
+            .as_ref()
+            .and_then(|subsets| subsets.iter().find(|subset| subset.name == subset_name))
+    });
+    let target_selected = |target: &UpstreamTarget| match subset {
+        Some(subset) => subset
+            .labels
+            .iter()
+            .all(|(key, value)| target.tags.get(key).is_some_and(|tag| tag == value)),
+        None => true,
+    };
+
+    for target in upstream.targets.iter().filter(|t| target_selected(t)) {
+        let transport = if crate::proxy::hbone_pool::target_hbone_enabled(target) {
+            Some("mesh.hbone")
+        } else if crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(target) {
+            Some("mesh.mtls")
+        } else {
+            None
+        };
+        if let Some(transport) = transport {
+            return Some(MeshTransportConflict {
+                transport,
+                detail: format!("target '{}:{}'", target.host, target.port),
+            });
+        }
+    }
+    None
+}
+
+/// A mesh-transport requirement that conflicts with an effective retry policy.
+pub(crate) struct MeshTransportConflict {
+    /// The conflicting transport tag (`"mesh.hbone"` / `"mesh.mtls"`).
+    transport: &'static str,
+    /// Human-readable source of the requirement (a target or `mesh service
+    /// discovery`).
+    detail: String,
+}
+
+/// Build the canonical retry/mesh-transport conflict error message.
+pub(crate) fn mesh_transport_retry_conflict_message(
+    proxy_id: &str,
+    upstream_id: &str,
+    conflict: &MeshTransportConflict,
+) -> String {
+    format!(
+        "Proxy '{}' enables retry but upstream_id '{}' {} requires {} dispatch; retry over required mesh transports is not supported",
+        proxy_id, upstream_id, conflict.detail, conflict.transport
+    )
+}
+
 impl GatewayConfig {
     /// Validate that all proxy (host, listen_path) combinations are unique.
     ///
@@ -2854,6 +2977,12 @@ impl GatewayConfig {
     /// In database mode the DB enforces this via foreign key constraints.
     /// In file mode there's no DB, so this catches dangling references
     /// at config load time.
+    ///
+    /// This also rejects retry-enabled proxies whose effective upstream targets
+    /// require a mesh transport (`mesh.hbone` / `mesh.mtls`). At runtime the
+    /// dispatch path forces those transports off whenever retry is effective and
+    /// then fails closed with a 502 (see issue #1669), so the combination is a
+    /// silent reachability gap that we reject at admission instead.
     pub fn validate_upstream_references(&self) -> Result<(), Vec<String>> {
         let upstreams_by_id: HashMap<&str, &Upstream> =
             self.upstreams.iter().map(|u| (u.id.as_str(), u)).collect();
@@ -2874,51 +3003,17 @@ impl GatewayConfig {
                                 ));
                             }
                         }
-                        let retry_can_trigger = proxy.retry.as_ref().is_some_and(|retry| {
-                            retry.max_retries > 0
-                                && (retry.retry_on_connect_failure
-                                    || (!retry.retryable_status_codes.is_empty()
-                                        && !retry.retryable_methods.is_empty()))
-                        });
-                        if retry_can_trigger {
-                            let selected_subset =
-                                proxy.upstream_subset.as_deref().and_then(|subset_name| {
-                                    upstream.subsets.as_ref().and_then(|subsets| {
-                                        subsets.iter().find(|subset| subset.name == subset_name)
-                                    })
-                                });
-                            let target_selected = |target: &UpstreamTarget| match selected_subset {
-                                Some(subset) => subset.labels.iter().all(|(key, value)| {
-                                    target.tags.get(key).is_some_and(|tag| tag == value)
-                                }),
-                                None => true,
-                            };
-                            for target in upstream.targets.iter().filter(|t| target_selected(t)) {
-                                let required_transport = if target
-                                    .tags
-                                    .get("mesh.hbone")
-                                    .is_some_and(|value| value.eq_ignore_ascii_case("true"))
-                                {
-                                    Some("mesh.hbone")
-                                } else if target
-                                    .tags
-                                    .get("mesh.mtls")
-                                    .is_some_and(|value| value.eq_ignore_ascii_case("true"))
-                                {
-                                    Some("mesh.mtls")
-                                } else {
-                                    None
-                                };
-                                if let Some(required_transport) = required_transport {
-                                    errors.push(format!(
-                                        "Proxy '{}' enables retry but upstream_id '{}' target '{}:{}' requires {} dispatch; retry over required mesh transports is not supported",
-                                        proxy.id,
-                                        uid,
-                                        target.host,
-                                        target.port,
-                                        required_transport
-                                    ));
-                                }
+                        if proxy_retry_is_effective(
+                            proxy.retry.as_ref(),
+                            proxy.allowed_methods.as_deref(),
+                        ) {
+                            if let Some(required) = upstream_required_mesh_transport(
+                                upstream,
+                                proxy.upstream_subset.as_deref(),
+                            ) {
+                                errors.push(mesh_transport_retry_conflict_message(
+                                    &proxy.id, uid, &required,
+                                ));
                             }
                         }
                     }
@@ -2930,6 +3025,26 @@ impl GatewayConfig {
                     }
                 }
             }
+
+            // Route-level upstream overrides (mesh_route_dispatch) can send
+            // matched traffic to a *different* upstream than `proxy.upstream_id`.
+            // A retry-enabled proxy whose default upstream is plain but whose
+            // route rules target a mesh-tagged upstream would otherwise load and
+            // then 502 those matched requests. Validate the override
+            // destinations against the same conflict check.
+            if proxy_retry_is_effective(proxy.retry.as_ref(), proxy.allowed_methods.as_deref()) {
+                for override_uid in self.mesh_route_dispatch_override_upstream_ids(proxy) {
+                    if let Some(upstream) = upstreams_by_id.get(override_uid.as_str())
+                        && let Some(required) = upstream_required_mesh_transport(upstream, None)
+                    {
+                        errors.push(mesh_transport_retry_conflict_message(
+                            &proxy.id,
+                            override_uid.as_str(),
+                            &required,
+                        ));
+                    }
+                }
+            }
         }
 
         if errors.is_empty() {
@@ -2937,6 +3052,42 @@ impl GatewayConfig {
         } else {
             Err(errors)
         }
+    }
+
+    /// Collect the distinct upstream IDs that this proxy's enabled
+    /// `mesh_route_dispatch` plugin instances can route matched traffic to via
+    /// `route_override_upstream_id`. Returns an empty vec when the proxy has no
+    /// such plugin or none of its rules override the upstream.
+    fn mesh_route_dispatch_override_upstream_ids(&self, proxy: &Proxy) -> Vec<String> {
+        let mut overrides: Vec<String> = Vec::new();
+        for assoc in &proxy.plugins {
+            let Some(plugin) = self
+                .plugin_configs
+                .iter()
+                .find(|pc| pc.id == assoc.plugin_config_id)
+            else {
+                continue;
+            };
+            if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+                continue;
+            }
+            let Ok(dispatch) =
+                crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value(
+                    &plugin.config,
+                )
+            else {
+                continue;
+            };
+            for rule in &dispatch.rules {
+                if let Some(override_uid) = rule.destination.upstream_id.as_deref()
+                    && override_uid != proxy.upstream_id.as_deref().unwrap_or("")
+                    && !overrides.iter().any(|existing| existing == override_uid)
+                {
+                    overrides.push(override_uid.to_string());
+                }
+            }
+        }
+        overrides
     }
 
     /// Validate plugin resource invariants and proxy/plugin associations.
