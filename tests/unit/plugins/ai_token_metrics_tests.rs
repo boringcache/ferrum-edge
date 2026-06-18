@@ -149,6 +149,16 @@ fn test_pre_header_decision_never_buffers_native_grpc() {
     // gRPC-Web is NOT native gRPC and stays on the normal (buffered) path.
     let grpc_web = ctx_with_content_type("POST", "application/grpc-web");
     assert!(default_plugin.should_buffer_response_body(&grpc_web));
+
+    // Bogus suffixes that share the `application/grpc` prefix but are NOT native
+    // gRPC (the dispatcher routes these as plain HTTP via the canonical
+    // delimiter-aware classifier). They must stay on the buffered path so a JSON
+    // LLM response from a tolerant upstream is still parsed for token usage; a
+    // naive prefix check would wrongly opt them out of buffering.
+    let grpc_foo = ctx_with_content_type("POST", "application/grpcfoo");
+    assert!(default_plugin.should_buffer_response_body(&grpc_foo));
+    let grpc_evil = ctx_with_content_type("POST", "application/grpc-evil");
+    assert!(default_plugin.should_buffer_response_body(&grpc_evil));
 }
 
 #[test]

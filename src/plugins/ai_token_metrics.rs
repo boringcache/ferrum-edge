@@ -360,22 +360,20 @@ fn optional_f64(config: &Value, field: &'static str) -> Result<Option<f64>, Stri
 }
 
 /// Whether the request carries a native gRPC `content-type` (`application/grpc`,
-/// excluding `application/grpc-web`). Matched case-insensitively without
-/// allocating, so it is safe on the buffering decision hot path.
+/// optionally with a `+subtype`/`;param`/OWS suffix; excluding
+/// `application/grpc-web` and bogus suffixes like `application/grpcfoo`).
+///
+/// Delegates to the canonical, delimiter-aware
+/// [`crate::proxy::backend_dispatch::is_native_grpc_content_type`] classifier so
+/// the buffering decision stays aligned with the dispatch path: a value the
+/// dispatcher routes as plain HTTP (e.g. `application/grpcfoo`) must NOT be
+/// treated as native gRPC here, otherwise a JSON LLM response from a tolerant
+/// upstream would be opted out of buffering and its token usage skipped. Operates
+/// on raw bytes with no allocation, so it is safe on the decision hot path.
 fn is_native_grpc_request(ctx: &RequestContext) -> bool {
     ctx.headers.get("content-type").is_some_and(|content_type| {
-        let trimmed = content_type.trim_start();
-        starts_with_ignore_ascii_case(trimmed, "application/grpc")
-            && !starts_with_ignore_ascii_case(trimmed, "application/grpc-web")
+        crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
     })
-}
-
-/// Case-insensitive ASCII prefix check that avoids the `to_ascii_lowercase`
-/// allocation a naive comparison would incur on the request hot path.
-#[inline]
-fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
-    haystack.len() >= prefix.len()
-        && haystack.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
 #[async_trait]
