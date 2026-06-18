@@ -1305,6 +1305,8 @@ impl Plugin for AiSemanticCache {
         &self,
         ctx: &RequestContext,
         content_type: Option<&str>,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
             && !content_type.is_some_and(is_event_stream_content_type)
