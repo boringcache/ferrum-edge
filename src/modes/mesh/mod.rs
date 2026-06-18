@@ -73,6 +73,7 @@ const DEFAULT_DNS_ENABLED: bool = false;
 const DEFAULT_DNS_MAX_CONCURRENT_QUERIES: usize = 1024;
 const DEFAULT_EGRESS_LISTEN_ADDR: &str = "0.0.0.0:15090";
 const MESH_CA_INITIAL_SVID_TIMEOUT: Duration = Duration::from_secs(30);
+const INTERNAL_MESH_CA_FAILURE_BACKOFF_INITIAL_SECS: u64 = 5;
 
 pub const MESH_SPIFFE_IDENTITY_PLUGIN_ID: &str = "__mesh_spiffe_identity";
 pub const MESH_AUTHZ_PLUGIN_ID: &str = "__mesh_authz";
@@ -911,7 +912,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     // Outbound (egress) runs after inbound and before `apply_destination_rules`
     // so the materialized outbound upstreams pick up port-level DR policy
     // (re-keyed there to the resolved dial port). Topology-aware: Ambient emits
-    // HBONE routes; Sidecar (SVID-mTLS) lands in a follow-up.
+    // HBONE routes; Sidecar emits SVID-mTLS routes.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_tcp_upstreams(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_udp_upstreams(&mut config, runtime, mesh_slice);
@@ -1410,6 +1411,50 @@ fn materialize_east_west_gateway_proxies(
         }
     }
 
+    // SNI hosts already claimed by explicit EastWestGateway entries (same
+    // namespace as the materialized explicit proxies above). The auto-materializer
+    // yields to these so an operator's explicit route is never rejected as an
+    // overlapping host on the shared listen port. Hosts are lowercased during
+    // materialization and compared case-insensitively + wildcard-aware by
+    // `validate_stream_proxies` (`hosts_overlap`), so the override set is
+    // lowercased and the skip below uses the SAME overlap semantics — an exact
+    // membership test would miss a wildcard explicit entry like
+    // `*.ns.svc.cluster.local` that still owns the concrete auto host.
+    //
+    // The set must reflect only the gateways that ACTUALLY materialized a proxy.
+    // The loop above collapses entries by generated proxy id (`find().map() ->
+    // overwrite`), so two same-namespace gateways sharing a `name` leave only the
+    // last one's proxy bound. Collecting SNI hosts from the raw list would also
+    // keep the overwritten entry's hosts, suppressing an auto local-service proxy
+    // that no surviving explicit proxy actually owns — silently dropping that
+    // service from east-west routing. Dedup by the same generated id (last wins)
+    // so an overwritten entry's hosts never suppress autos.
+    let explicit_sni_hosts: Vec<String> = config
+        .mesh
+        .as_ref()
+        .and_then(|mesh| mesh.multi_cluster.as_ref())
+        .map(|multi_cluster| {
+            let mut hosts_by_proxy_id: HashMap<String, Vec<String>> = HashMap::new();
+            for gateway in multi_cluster
+                .east_west_gateways
+                .iter()
+                .filter(|gateway| gateway.namespace == runtime.namespace)
+            {
+                // Last write wins, mirroring the materialization loop's
+                // overwrite-by-id behavior above.
+                hosts_by_proxy_id.insert(
+                    mesh_east_west_proxy_id(&gateway.namespace, &gateway.name),
+                    gateway
+                        .sni_hosts
+                        .iter()
+                        .map(|host| host.to_ascii_lowercase())
+                        .collect(),
+                );
+            }
+            hosts_by_proxy_id.into_values().flatten().collect()
+        })
+        .unwrap_or_default();
+
     // Materialize SNI-routed TCP passthrough proxies for each local mesh
     // service so that inbound cross-cluster traffic on the east-west listen
     // port reaches the correct workload. Each service gets one proxy (SNI host
@@ -1419,6 +1464,7 @@ fn materialize_east_west_gateway_proxies(
         runtime.east_west_listen_port,
         &runtime.namespace,
         &runtime.cluster_domain,
+        &explicit_sni_hosts,
     );
 
     if !proxies.is_empty() {
@@ -1539,6 +1585,7 @@ fn build_east_west_service_proxies_and_upstreams(
     listen_port: u16,
     namespace: &str,
     cluster_domain: &str,
+    explicit_sni_hosts: &[String],
 ) -> (Vec<Proxy>, Vec<Upstream>) {
     let mut proxies = Vec::new();
     let mut upstreams = Vec::new();
@@ -1560,10 +1607,38 @@ fn build_east_west_service_proxies_and_upstreams(
             continue;
         }
 
+        let cluster_domain = cluster_domain.trim_matches('.');
         let sni_hostname = format!(
             "{}.{}.svc.{}",
             service.name, service.namespace, cluster_domain
         );
+
+        // An explicit `EastWestGateway.sni_hosts` entry takes precedence over the
+        // auto-materialized local-service proxy: materializing both yields two
+        // TCP passthrough proxies claiming the same SNI on the shared east-west
+        // listen port, which `validate_stream_proxies` rejects as overlapping
+        // hosts — silently dropping the operator's explicit route. Skip the auto
+        // proxy (and its upstream) so the override survives. Use the SAME
+        // wildcard-aware `hosts_overlap` semantics validation uses (an exact
+        // match would miss a wildcard explicit entry); guard on non-empty so an
+        // absent explicit list (a catch-all under `hosts_overlap`) never
+        // suppresses every auto proxy.
+        let auto_sni_lower = sni_hostname.to_ascii_lowercase();
+        if !explicit_sni_hosts.is_empty()
+            && crate::config::types::hosts_overlap(
+                std::slice::from_ref(&auto_sni_lower),
+                explicit_sni_hosts,
+            )
+        {
+            debug!(
+                service = %service.name,
+                namespace = %service.namespace,
+                sni = %sni_hostname,
+                "Skipping east-west auto-materialization; an explicit EastWestGateway already owns this SNI host"
+            );
+            continue;
+        }
+
         let upstream_id = mesh_east_west_service_upstream_id(&service.namespace, &service.name);
 
         let upstream = Upstream {
@@ -1614,11 +1689,10 @@ fn build_east_west_service_proxies_and_upstreams(
 }
 
 /// Match a service's `WorkloadRef`s to slice `Workload`s one-to-one by index (so
-/// replicas sharing a SPIFFE id yield distinct workloads), then drop
-/// remote-cluster endpoints. Shared scaffold for the east-west and Ambient
-/// outbound target builders, which differ only in per-target port/tag policy. A
-/// remote-cluster match still consumes its index (mirroring the original inline
-/// loops) so a local replica isn't pulled into a remote ref's slot.
+/// replicas sharing a SPIFFE id yield distinct workloads), while filtering
+/// remote-cluster endpoints before consuming a ref slot. Shared scaffold for
+/// the east-west and Ambient outbound target builders, which differ only in
+/// per-target port/tag policy.
 fn matched_local_service_workloads<'a>(
     service: &crate::modes::mesh::config::MeshService,
     workloads: &'a [crate::modes::mesh::config::Workload],
@@ -1639,19 +1713,15 @@ fn matched_local_service_workloads<'a>(
                     && workload.spiffe_id == workload_ref.spiffe_id
                     && workload.namespace == service.namespace
                     && (workload.service_name == service.name || !has_matching_service_metadata)
+                    && !crate::modes::mesh::multicluster::workload_is_remote(
+                        workload,
+                        multi_cluster,
+                    )
             })
         else {
             continue;
         };
         used_workload_indices.insert(workload_index);
-        // Shared remote-provenance predicate (single source of truth with the
-        // SD materialization path) so "remote" never means two different things.
-        // Provenance-based and does NOT require `MultiClusterConfig.local_cluster`:
-        // with `local_cluster` omitted, a workload is remote iff its stamped
-        // cluster matches a configured remote cluster.
-        if crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster) {
-            continue;
-        }
         matched.push(workload);
     }
 
@@ -4381,6 +4451,7 @@ fn apply_destination_rules(
                             });
                             SubsetTrafficPolicy {
                                 load_balancer_algorithm: mesh_lb_to_ferrum(&sp.load_balancer),
+                                hash_on: mesh_hash_on_to_ferrum(&sp.load_balancer),
                                 tls: sp.tls.clone(),
                                 connect_timeout_ms: sp.connect_timeout_ms,
                                 passive_health_check,
@@ -6308,14 +6379,10 @@ fn merge_tracing_config(
     if next.disable_span_reporting.is_some() {
         current.disable_span_reporting = next.disable_span_reporting;
     }
-    if !next.custom_tags.is_empty() {
-        current.custom_tags.clone_from(&next.custom_tags);
-    }
-    if !next.custom_header_tags.is_empty() {
-        current
-            .custom_header_tags
-            .clone_from(&next.custom_header_tags);
-    }
+    current.custom_tags.extend(next.custom_tags.clone());
+    current
+        .custom_header_tags
+        .extend(next.custom_header_tags.clone());
     if !next.providers.is_empty() {
         current.providers.clone_from(&next.providers);
     }
@@ -6946,19 +7013,19 @@ async fn serve_mesh_runtime(
              egress); keep it enabled only with compensating network controls."
         );
     }
-    let mesh_ca_trust_overlay_slot = empty_mesh_inbound_trust_overlay_slot();
+    let mesh_runtime_trust_overlay_slot = empty_mesh_inbound_trust_overlay_slot();
     let mesh_ca_svid_slot = start_mesh_ca_backend_svid_source(
         &proxy_state,
         &runtime,
         &env_config,
-        mesh_ca_trust_overlay_slot.clone(),
+        mesh_runtime_trust_overlay_slot.clone(),
         &mut mesh_background_handles,
         shutdown_tx.subscribe(),
     )
     .await?;
-    let mesh_ca_trust_overlay_slot = mesh_ca_svid_slot
-        .as_ref()
-        .map(|_| mesh_ca_trust_overlay_slot);
+    let mesh_runtime_trust_overlay_slot = (mesh_ca_svid_slot.is_some()
+        || gateway_svid_material_configured(&env_config))
+    .then_some(mesh_runtime_trust_overlay_slot);
 
     for host in proxy_state.plugin_cache.collect_warmup_hostnames() {
         hostnames.push((host, None, None));
@@ -7072,18 +7139,28 @@ async fn serve_mesh_runtime(
         initial_applied_mesh_slice.as_deref(),
         mesh_ca_svid_slot.as_ref(),
     );
-    if mesh_ca_svid_slot.is_some()
-        && let Some(slice) = initial_applied_mesh_slice.as_deref()
-    {
+    if let Some(slice) = initial_applied_mesh_slice.as_deref() {
         publish_staged_spiffe_bundle(
             &proxy_state,
             stage_gateway_runtime_spiffe_bundle(
                 &proxy_state,
-                mesh_ca_svid_slot.as_ref(),
-                mesh_ca_trust_overlay_slot.as_ref(),
+                mesh_inbound_spiffe_slot.as_ref(),
+                mesh_runtime_trust_overlay_slot.as_ref(),
                 slice,
             ),
         );
+    }
+    if let (Some(inbound_slot), Some(trust_overlay_slot)) = (
+        mesh_inbound_spiffe_slot.clone(),
+        mesh_runtime_trust_overlay_slot.clone(),
+    ) {
+        mesh_background_handles.push(start_mesh_inbound_svid_rotation_republisher(
+            proxy_state.clone(),
+            inbound_slot,
+            trust_overlay_slot,
+            proxy_state.backend_svid_rotation_tx.subscribe(),
+            shutdown_tx.subscribe(),
+        ));
     }
     let frontend_tls = load_mesh_frontend_tls(
         &env_config,
@@ -7270,7 +7347,7 @@ async fn serve_mesh_runtime(
             server_identity: mesh_frontend_identity,
             last_snapshot: initial_inbound_tls_snapshot,
             spiffe_bundle_slot: mesh_inbound_spiffe_slot,
-            runtime_trust_overlay_slot: mesh_ca_trust_overlay_slot,
+            runtime_trust_overlay_slot: mesh_runtime_trust_overlay_slot,
             production: mesh_production_mode,
         },
         shutdown_tx.subscribe(),
@@ -7963,8 +8040,12 @@ async fn run_internal_mesh_svid_rotation_loop(
     trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    let mut retry_after_failure = None;
+    let mut failure_backoff_secs = INTERNAL_MESH_CA_FAILURE_BACKOFF_INITIAL_SECS;
     loop {
-        let next_tick = {
+        let next_tick = if let Some(delay) = retry_after_failure.take() {
+            delay
+        } else {
             let snapshot = proxy_state.gateway_svid_bundle.load_full();
             snapshot
                 .as_ref()
@@ -7995,7 +8076,7 @@ async fn run_internal_mesh_svid_rotation_loop(
             continue;
         }
 
-        if let Err(error) = issue_and_install_mesh_ca_svid(
+        match issue_and_install_mesh_ca_svid(
             &proxy_state,
             ca.as_ref(),
             &spiffe_id,
@@ -8006,14 +8087,26 @@ async fn run_internal_mesh_svid_rotation_loop(
         )
         .await
         {
-            crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
-                &spiffe_id, "internal",
-            );
-            warn!(
-                error = %error,
-                spiffe_id = %spiffe_id,
-                "internal mesh CA SVID rotation failed; keeping current identity"
-            );
+            Ok(()) => {
+                failure_backoff_secs = INTERNAL_MESH_CA_FAILURE_BACKOFF_INITIAL_SECS;
+            }
+            Err(error) => {
+                let retry_delay = crate::util::backoff::jittered_backoff(failure_backoff_secs);
+                let retry_after_ms = retry_delay.as_millis();
+                retry_after_failure = Some(retry_delay);
+                failure_backoff_secs = failure_backoff_secs
+                    .saturating_mul(2)
+                    .min(crate::util::backoff::BACKOFF_MAX_SECS);
+                crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
+                    &spiffe_id, "internal",
+                );
+                warn!(
+                    error = %error,
+                    spiffe_id = %spiffe_id,
+                    retry_after_ms,
+                    "internal mesh CA SVID rotation failed; keeping current identity"
+                );
+            }
         }
     }
 }
@@ -8099,6 +8192,64 @@ fn publish_runtime_svid_to_inbound_slot(
     inbound_slot.store(Arc::new(Some(bundle)));
 }
 
+fn start_mesh_inbound_svid_rotation_republisher(
+    proxy_state: ProxyState,
+    inbound_slot: tls::SharedBundleSlot,
+    trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
+    mut revision_rx: tokio::sync::watch::Receiver<u64>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // Snapshot the rotation revision *before* the initial publish, then
+        // republish once up front. A file/CA rotation can bump
+        // `backend_svid_rotation_tx` after this receiver was subscribed but
+        // before this task runs; the initial publish covers that case because
+        // `publish_runtime_svid_to_inbound_slot` re-reads `gateway_file_svid_bundle`
+        // live under `gateway_svid_update_lock`, so it picks up any already
+        // installed bundle.
+        //
+        // The ordering matters for the narrow window where a rotation lands
+        // *between* the baseline read and the publish (or just after it).
+        // The loop dedups on the `observed_revision` integer compare below;
+        // if the baseline were taken AFTER the publish it could capture a
+        // bump whose bundle the publish had NOT yet read, and then
+        // `next_revision == observed_revision` would skip the follow-up
+        // republish, pinning the inbound verifier to OLD roots until the next
+        // rotation or slice apply. Reading the baseline first guarantees any
+        // rotation that could change the bundle is either already reflected in
+        // the publish or strictly greater than `observed_revision` (forcing a
+        // republish). The publish is idempotent, so the occasional redundant
+        // republish is harmless.
+        let mut observed_revision = *revision_rx.borrow();
+        publish_runtime_svid_to_inbound_slot(&proxy_state, &inbound_slot, &trust_overlay_slot);
+        loop {
+            tokio::select! {
+                changed = revision_rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+            let next_revision = *revision_rx.borrow();
+            if next_revision == observed_revision {
+                continue;
+            }
+            observed_revision = next_revision;
+            publish_runtime_svid_to_inbound_slot(&proxy_state, &inbound_slot, &trust_overlay_slot);
+            debug!(
+                svid_revision = next_revision,
+                "Refreshed mesh inbound SPIFFE peer-verifier bundle after gateway SVID rotation"
+            );
+        }
+    })
+}
+
 struct MeshInboundTlsReloadState {
     server_identity: Option<Arc<tls::MeshServerIdentity>>,
     last_snapshot: Option<MeshInboundTlsReloadSnapshot>,
@@ -8122,9 +8273,10 @@ struct MeshInboundTlsReloadState {
 }
 
 /// Build the optional SPIFFE inbound trust-bundle slot from file-backed SVID
-/// material or a CA-backed runtime SVID slot. File material is merged with the
-/// slice's federated trust bundles immediately; runtime slots receive the
-/// accepted slice overlay through `stage_gateway_runtime_spiffe_bundle`.
+/// material or a CA-backed runtime SVID slot. Runtime-backed slots receive the
+/// accepted slice overlay through `stage_gateway_runtime_spiffe_bundle` so SVID
+/// rotations can refresh the inbound verifier without waiting for another
+/// slice apply.
 /// Returns `None` when no gateway SVID material is configured (the inbound
 /// listener then keeps the operator client-CA chain verification it has always
 /// used). It also returns `None` (logged) when file SVID material *is*
@@ -8239,6 +8391,32 @@ fn retain_svid_local_trust_only(bundle: &mut crate::identity::SvidBundle) {
     bundle.trust_bundles.federated.clear();
 }
 
+fn merge_trust_bundle_authorities(
+    target: &mut crate::identity::TrustBundle,
+    overlay: &crate::identity::TrustBundle,
+) {
+    for authority in &overlay.x509_authorities {
+        if !target
+            .x509_authorities
+            .iter()
+            .any(|existing| existing == authority)
+        {
+            target.x509_authorities.push(authority.clone());
+        }
+    }
+    for authority in &overlay.jwt_authorities {
+        if !target.jwt_authorities.iter().any(|existing| {
+            existing.key_id == authority.key_id
+                && existing.public_key_pem == authority.public_key_pem
+        }) {
+            target.jwt_authorities.push(authority.clone());
+        }
+    }
+    if target.refresh_hint_seconds.is_none() {
+        target.refresh_hint_seconds = overlay.refresh_hint_seconds;
+    }
+}
+
 fn merge_trust_overlay_into_svid_bundle(
     bundle: &mut crate::identity::SvidBundle,
     runtime: &crate::identity::TrustBundleSet,
@@ -8246,8 +8424,8 @@ fn merge_trust_overlay_into_svid_bundle(
     // CP-pushed slice trust is authoritative for inbound federation. Drop raw
     // federated bundles from the SVID source before adding accepted slice
     // bundles. The local bundle stays anchored to the gateway SVID's own trust
-    // domain (we do not let the slice override the local roots the SVID itself
-    // chains to).
+    // domain, but same-domain slice authorities are additive so a CP can stage
+    // CA-root rotation without replacing the freshly loaded SVID roots.
     retain_svid_local_trust_only(bundle);
     for (trust_domain, federated) in &runtime.federated {
         bundle
@@ -8256,22 +8434,24 @@ fn merge_trust_overlay_into_svid_bundle(
             .entry(trust_domain.clone())
             .or_insert_with(|| federated.clone());
     }
+    if runtime.local.trust_domain == bundle.trust_bundles.local.trust_domain {
+        merge_trust_bundle_authorities(&mut bundle.trust_bundles.local, &runtime.local);
+        return;
+    }
     // If the slice's local bundle is for a different trust domain than the
     // SVID's, treat it as a federated peer trust domain so cross-trust peers
     // still validate.
-    if runtime.local.trust_domain != bundle.trust_bundles.local.trust_domain {
-        bundle
-            .trust_bundles
-            .federated
-            .entry(runtime.local.trust_domain.clone())
-            .or_insert_with(|| runtime.local.clone());
-    }
+    bundle
+        .trust_bundles
+        .federated
+        .entry(runtime.local.trust_domain.clone())
+        .or_insert_with(|| runtime.local.clone());
 }
 
-/// Rebuild the inbound SPIFFE trust-bundle from the gateway SVID files plus the
-/// current slice's federated bundles, returning it STAGED (not yet stored into
-/// the live slot). The caller publishes it into the live slot only after the
-/// candidate proxy config is accepted, so a rejected slice cannot leave new
+/// Rebuild the inbound SPIFFE trust-bundle from the gateway SVID material plus
+/// the current slice's federated bundles, returning it STAGED (not yet stored
+/// into the live slot). The caller publishes it into the live slot only after
+/// the candidate proxy config is accepted, so a rejected slice cannot leave new
 /// federated trust domains active for inbound handshakes. A rebuild failure
 /// returns `None` (logged) and the caller leaves the previous trust bundles in
 /// place — this never fails the slice.
@@ -8283,6 +8463,14 @@ fn stage_mesh_inbound_spiffe_bundle(
     slice: &MeshSlice,
 ) -> Option<StagedSpiffeBundle> {
     let slot = slot?;
+    if runtime_trust_overlay_slot.is_some() {
+        return stage_gateway_runtime_spiffe_bundle(
+            proxy_state,
+            Some(slot),
+            runtime_trust_overlay_slot,
+            slice,
+        );
+    }
     if !gateway_svid_material_configured(env_config) {
         return stage_gateway_runtime_spiffe_bundle(
             proxy_state,
@@ -8999,10 +9187,11 @@ enum StagedSpiffeBundle {
         slot: tls::SharedBundleSlot,
         bundle: Arc<Option<crate::identity::SvidBundle>>,
     },
-    /// CA-backed SVID path: update the dedicated runtime inbound verifier slot
+    /// Runtime-backed SVID path: update the dedicated inbound verifier slot
     /// from the latest raw SVID plus the accepted slice trust overlay. The
-    /// SVID itself is intentionally not captured at staging time because a CA
-    /// rotation can complete while the candidate slice is still being planned.
+    /// SVID itself is intentionally not captured at staging time because a
+    /// file/CA rotation can complete while the candidate slice is still being
+    /// planned.
     RuntimeSlot {
         slot: tls::SharedBundleSlot,
         trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
@@ -14836,6 +15025,65 @@ mod tests {
     }
 
     #[test]
+    fn dr_subset_consistent_hash_projects_hash_key() {
+        // A subset-level consistentHash policy must carry both the algorithm
+        // and the hash key onto the Ferrum subset policy; otherwise the hot
+        // path builds a subset hash ring but still hashes on the upstream-level
+        // key or client IP.
+        let mut config = GatewayConfig {
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: vec![MeshSubset {
+                    name: "v1".to_string(),
+                    labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::ConsistentHash(
+                            crate::modes::mesh::config::MeshConsistentHash {
+                                http_header_name: Some("x-subset-session".to_string()),
+                                http_cookie_name: None,
+                                use_source_ip: false,
+                            },
+                        )),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let subset_policy = config.upstreams[0]
+            .subsets
+            .as_ref()
+            .expect("subsets")
+            .iter()
+            .find(|subset| subset.name == "v1")
+            .and_then(|subset| subset.traffic_policy.as_ref())
+            .expect("v1 subset traffic policy");
+        assert_eq!(
+            subset_policy.load_balancer_algorithm,
+            Some(LoadBalancerAlgorithm::ConsistentHashing)
+        );
+        assert_eq!(
+            subset_policy.hash_on.as_deref(),
+            Some("header:x-subset-session")
+        );
+    }
+
+    #[test]
     fn dr_later_rule_top_level_connect_timeout_overrides_earlier_subset() {
         // Two DestinationRules match the same upstream. The earlier-sorted rule
         // defines subset v1 with its own connectTimeout; the later-sorted rule
@@ -15648,7 +15896,7 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_tracing_merge_replaces_tags_and_providers_across_scopes() {
+    fn telemetry_tracing_merge_combines_tags_and_replaces_providers_across_scopes() {
         let mesh_slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
@@ -15720,12 +15968,21 @@ mod tests {
             tracing.custom_tags.get("env").map(String::as_str),
             Some("prod")
         );
-        assert!(!tracing.custom_tags.contains_key("mesh"));
+        assert_eq!(
+            tracing.custom_tags.get("mesh").map(String::as_str),
+            Some("ferrum")
+        );
         assert_eq!(
             tracing.custom_tags.get("region").map(String::as_str),
             Some("us-east")
         );
-        assert!(!tracing.custom_header_tags.contains_key("mesh-tenant"));
+        assert_eq!(
+            tracing
+                .custom_header_tags
+                .get("mesh-tenant")
+                .map(String::as_str),
+            Some("x-mesh-tenant")
+        );
         assert_eq!(
             tracing.custom_header_tags.get("tenant").map(String::as_str),
             Some("x-tenant")
@@ -16738,6 +16995,7 @@ mod tests {
                 ("FERRUM_NAMESPACE", "default"),
                 ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
                 ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "15443"),
+                ("FERRUM_MESH_CLUSTER_DOMAIN", "cluster.local."),
             ],
             || {
                 let env = EnvConfig::from_env().expect("mesh env config");
@@ -16803,6 +17061,191 @@ mod tests {
                 assert_eq!(upstream.targets.len(), 1);
                 assert_eq!(upstream.targets[0].host, "10.0.0.5");
                 assert_eq!(upstream.targets[0].port, 9080);
+            },
+        );
+    }
+
+    #[test]
+    fn east_west_explicit_sni_override_suppresses_auto_service_proxy() {
+        // codex finding: an explicit EastWestGateway.sni_hosts entry for a local
+        // service FQDN must win over the auto-materialized local-service proxy.
+        // Materializing both yields two TCP passthrough proxies on the same SNI +
+        // listen port, which validate_stream_proxies rejects as overlapping hosts
+        // — silently dropping the operator's explicit route.
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_NAMESPACE", "default"),
+                ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
+                ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "15443"),
+                ("FERRUM_MESH_CLUSTER_DOMAIN", "cluster.local."),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                let config = GatewayConfig {
+                    mesh: Some(Box::new(MeshConfig {
+                        // Explicit gateway claiming the reviews service FQDN
+                        // (mixed-case, to exercise the case-insensitive match).
+                        multi_cluster: Some(MultiClusterConfig {
+                            east_west_gateways: vec![EastWestGateway {
+                                name: "explicit-reviews".to_string(),
+                                namespace: "default".to_string(),
+                                host: "gw.remote.example".to_string(),
+                                port: 443,
+                                sni_hosts: vec!["Reviews.Default.SVC.Cluster.Local".to_string()],
+                                trust_domain: Some(TrustDomain::new("remote.test").unwrap()),
+                                network: Some("network-a".to_string()),
+                            }],
+                            ..MultiClusterConfig::default()
+                        }),
+                        services: vec![MeshService {
+                            cluster_ips: Vec::new(),
+                            name: "reviews".to_string(),
+                            namespace: "default".to_string(),
+                            ports: vec![ServicePort {
+                                port: 9080,
+                                protocol: AppProtocol::Http,
+                                name: Some("http".to_string()),
+                                target_port: None,
+                            }],
+                            workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                                spiffe_id: SpiffeId::new(
+                                    "spiffe://cluster.local/ns/default/sa/reviews",
+                                )
+                                .unwrap(),
+                            }],
+                            protocol_overrides: HashMap::new(),
+                        }],
+                        workloads: vec![{
+                            let mut wl = workload("reviews", "reviews");
+                            wl.addresses = vec!["10.0.0.5".to_string()];
+                            wl
+                        }],
+                        ..MeshConfig::default()
+                    })),
+                    ..GatewayConfig::default()
+                };
+
+                let prepared =
+                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+
+                // The explicit gateway proxy owns the SNI.
+                let explicit = prepared
+                    .proxies
+                    .iter()
+                    .find(|p| p.id == "__mesh-east-west-default-explicit-reviews")
+                    .expect("explicit east-west proxy");
+                assert_eq!(explicit.hosts, vec!["reviews.default.svc.cluster.local"]);
+
+                // The auto-materialized local-service proxy is suppressed.
+                assert!(
+                    prepared
+                        .proxies
+                        .iter()
+                        .all(|p| p.id != "__mesh-ew-svc-default-reviews"),
+                    "auto service proxy must yield to the explicit SNI override"
+                );
+                // No two proxies share the canonical SNI on the listen port.
+                let claimants = prepared
+                    .proxies
+                    .iter()
+                    .filter(|p| {
+                        p.listen_port == Some(15443)
+                            && p.hosts
+                                .iter()
+                                .any(|h| h == "reviews.default.svc.cluster.local")
+                    })
+                    .count();
+                assert_eq!(claimants, 1, "exactly one proxy may claim the SNI");
+            },
+        );
+    }
+
+    #[test]
+    fn east_west_explicit_wildcard_sni_override_suppresses_auto_service_proxy() {
+        // codex follow-up: a WILDCARD explicit sni_hosts entry (e.g.
+        // `*.default.svc.cluster.local`) must also win. `validate_stream_proxies`
+        // uses wildcard-aware `hosts_overlap`, so an exact-membership skip would
+        // miss it and emit both passthrough proxies on the shared port → slice
+        // rejected. The skip uses the same overlap semantics.
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_NAMESPACE", "default"),
+                ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
+                ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "15443"),
+                ("FERRUM_MESH_CLUSTER_DOMAIN", "cluster.local"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                let config = GatewayConfig {
+                    mesh: Some(Box::new(MeshConfig {
+                        multi_cluster: Some(MultiClusterConfig {
+                            east_west_gateways: vec![EastWestGateway {
+                                name: "explicit-wildcard".to_string(),
+                                namespace: "default".to_string(),
+                                host: "gw.remote.example".to_string(),
+                                port: 443,
+                                sni_hosts: vec!["*.default.svc.cluster.local".to_string()],
+                                trust_domain: Some(TrustDomain::new("remote.test").unwrap()),
+                                network: Some("network-a".to_string()),
+                            }],
+                            ..MultiClusterConfig::default()
+                        }),
+                        services: vec![MeshService {
+                            cluster_ips: Vec::new(),
+                            name: "reviews".to_string(),
+                            namespace: "default".to_string(),
+                            ports: vec![ServicePort {
+                                port: 9080,
+                                protocol: AppProtocol::Http,
+                                name: Some("http".to_string()),
+                                target_port: None,
+                            }],
+                            workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                                spiffe_id: SpiffeId::new(
+                                    "spiffe://cluster.local/ns/default/sa/reviews",
+                                )
+                                .unwrap(),
+                            }],
+                            protocol_overrides: HashMap::new(),
+                        }],
+                        workloads: vec![{
+                            let mut wl = workload("reviews", "reviews");
+                            wl.addresses = vec!["10.0.0.5".to_string()];
+                            wl
+                        }],
+                        ..MeshConfig::default()
+                    })),
+                    ..GatewayConfig::default()
+                };
+
+                let prepared =
+                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+
+                assert!(
+                    prepared
+                        .proxies
+                        .iter()
+                        .all(|p| p.id != "__mesh-ew-svc-default-reviews"),
+                    "auto service proxy must yield to the explicit wildcard SNI override"
+                );
             },
         );
     }
@@ -17554,6 +17997,51 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn matched_local_service_workloads_skips_remote_without_consuming_ref_slot() {
+        let spiffe = SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews").unwrap();
+        let mut remote = workload("reviews-remote", "reviews");
+        remote.spiffe_id = spiffe.clone();
+        remote.service_name = "reviews".to_string();
+        remote.addresses = vec!["172.16.0.5".to_string()];
+        remote.cluster = Some("cluster-b".to_string());
+
+        let mut local = workload("reviews-local", "reviews");
+        local.spiffe_id = spiffe.clone();
+        local.service_name = "reviews".to_string();
+        local.addresses = vec!["10.0.0.5".to_string()];
+        local.cluster = Some("cluster-a".to_string());
+
+        let service = MeshService {
+            cluster_ips: Vec::new(),
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 9080,
+                protocol: AppProtocol::Http,
+                name: None,
+                target_port: None,
+            }],
+            workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
+            protocol_overrides: HashMap::new(),
+        };
+
+        let workloads = vec![remote, local];
+        // main's `matched_local_service_workloads` keys remoteness on the
+        // provenance predicate (Option<&MultiClusterConfig>), not a bare
+        // local-cluster string. With local_cluster = "cluster-a", the cluster-b
+        // replica classifies remote and must be skipped WITHOUT consuming the
+        // shared-SPIFFE ref slot (the #1704 fix), so the cluster-a local wins.
+        let multi_cluster = crate::modes::mesh::config::MultiClusterConfig {
+            local_cluster: Some("cluster-a".to_string()),
+            ..Default::default()
+        };
+        let matched = matched_local_service_workloads(&service, &workloads, Some(&multi_cluster));
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].addresses, vec!["10.0.0.5"]);
     }
 
     #[test]
@@ -19010,7 +19498,7 @@ mod tests {
             trust_bundles: Some(config::TrustBundleSet {
                 local: config::TrustBundle {
                     trust_domain: td.clone(),
-                    x509_authorities: vec![engine.encode(b"old-local-root")],
+                    x509_authorities: vec![engine.encode(b"slice-extra-local-root")],
                     jwt_authorities: Vec::new(),
                     refresh_hint_seconds: None,
                 },
@@ -19039,8 +19527,8 @@ mod tests {
         let bundle = active.as_ref().as_ref().expect("inbound bundle");
         assert_eq!(
             bundle.trust_bundles.local.x509_authorities,
-            vec![vec![9]],
-            "runtime CA local roots must come from the rotated SVID, not the stale slice overlay"
+            vec![vec![9], b"slice-extra-local-root".to_vec()],
+            "runtime CA local roots must keep the rotated SVID root and add accepted slice roots"
         );
         assert!(
             bundle
@@ -19053,6 +19541,173 @@ mod tests {
             !bundle.trust_bundles.federated.contains_key(&stale_td),
             "raw SPIRE federated roots must not remain in the inbound verifier"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inbound_svid_rotation_republisher_refreshes_file_backed_verifier_roots() {
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+        use base64::Engine;
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let inbound_slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        let overlay_slot = empty_mesh_inbound_trust_overlay_slot();
+        let td = TrustDomain::new("td.file-rotation").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+
+        let svid_bundle = |local_roots: Vec<Vec<u8>>| SvidBundle {
+            spiffe_id: id.clone(),
+            cert_chain_der: vec![vec![1, 2, 3]],
+            private_key_pkcs8_der: Vec::new().into(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td.clone(),
+                x509_authorities: local_roots,
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        };
+
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![1]]));
+        let engine = base64::engine::general_purpose::STANDARD;
+        let slice = MeshSlice {
+            version: "file-rotation-overlay".to_string(),
+            trust_bundles: Some(config::TrustBundleSet {
+                local: config::TrustBundle {
+                    trust_domain: td.clone(),
+                    x509_authorities: Vec::new(),
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                federated: vec![config::TrustBundle {
+                    trust_domain: TrustDomain::new("partner.file-rotation").unwrap(),
+                    x509_authorities: vec![engine.encode(b"partner-root")],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: Some(300),
+                }],
+            }),
+            ..MeshSlice::default()
+        };
+        let staged = stage_gateway_runtime_spiffe_bundle(
+            &state,
+            Some(&inbound_slot),
+            Some(&overlay_slot),
+            &slice,
+        );
+        publish_staged_spiffe_bundle(&state, staged);
+
+        let (revision_tx, revision_rx) = tokio::sync::watch::channel(0u64);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let republisher = start_mesh_inbound_svid_rotation_republisher(
+            state.clone(),
+            inbound_slot.clone(),
+            overlay_slot.clone(),
+            revision_rx,
+            shutdown_rx,
+        );
+        tokio::task::yield_now().await;
+
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![9]]));
+        revision_tx.send_replace(1);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let active = inbound_slot.load_full();
+                if active.as_ref().as_ref().is_some_and(|bundle| {
+                    bundle.trust_bundles.local.x509_authorities == vec![vec![9]]
+                }) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rotation republisher refreshed inbound verifier roots");
+
+        let active = inbound_slot.load_full();
+        let bundle = active.as_ref().as_ref().expect("inbound bundle");
+        assert!(
+            bundle
+                .trust_bundles
+                .federated
+                .contains_key(&TrustDomain::new("partner.file-rotation").unwrap()),
+            "accepted federated overlay must survive file-backed SVID republish"
+        );
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(1), republisher)
+            .await
+            .expect("republisher observed shutdown")
+            .expect("republisher task joined");
+    }
+
+    // Regression for the file-SVID rotation republish race (#1707 / #1728 P3):
+    // a rotation can install the new gateway bundle and bump
+    // `backend_svid_rotation_tx` after the republisher subscribed but before its
+    // task first runs. The initial publish must read the freshly installed
+    // bundle, and the baseline revision must be captured *before* that publish so
+    // a later interleaving cannot be deduped away. We model the pre-run rotation
+    // deterministically on a single-threaded executor: install the new bundle and
+    // bump the revision while the spawned task is still parked, then drive it. A
+    // correct republisher pins the verifier to the NEW roots without waiting for a
+    // second rotation; the pre-fix order (publish-then-baseline) could leave it on
+    // the old roots.
+    #[tokio::test(flavor = "current_thread")]
+    async fn inbound_svid_rotation_republisher_picks_up_pre_run_rotation() {
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let inbound_slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        let overlay_slot = empty_mesh_inbound_trust_overlay_slot();
+        let td = TrustDomain::new("td.pre-run-rotation").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+
+        let svid_bundle = |local_roots: Vec<Vec<u8>>| SvidBundle {
+            spiffe_id: id.clone(),
+            cert_chain_der: vec![vec![1, 2, 3]],
+            private_key_pkcs8_der: Vec::new().into(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td.clone(),
+                x509_authorities: local_roots,
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        };
+
+        // Old roots in place when the republisher subscribes.
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![1]]));
+        let (revision_tx, revision_rx) = tokio::sync::watch::channel(0u64);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let republisher = start_mesh_inbound_svid_rotation_republisher(
+            state.clone(),
+            inbound_slot.clone(),
+            overlay_slot.clone(),
+            revision_rx,
+            shutdown_rx,
+        );
+
+        // Rotation lands while the spawned task is still parked (no yield yet):
+        // new bundle installed AND the revision bumped before the task runs.
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![9]]));
+        revision_tx.send_replace(1);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let active = inbound_slot.load_full();
+                if active.as_ref().as_ref().is_some_and(|bundle| {
+                    bundle.trust_bundles.local.x509_authorities == vec![vec![9]]
+                }) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("republisher must pin the inbound verifier to the new roots");
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(1), republisher)
+            .await
+            .expect("republisher observed shutdown")
+            .expect("republisher task joined");
     }
 
     #[test]

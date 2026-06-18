@@ -147,6 +147,18 @@ fn http1_parser_max_buf_size(configured_header_limit: usize) -> usize {
 /// invoked on a backend response" path (response_headers came from upstream).
 pub(crate) const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 
+/// Marker recorded in `ctx.metadata` when the ORIGINAL backend response was a
+/// range/partial response (`206` or carrying `Content-Range`), captured before
+/// any `after_proxy` hook can mutate the response headers. A plugin whose
+/// `after_proxy` runs after a header-rewriting plugin (e.g. `compression` at
+/// order 4050 after `response_transformer` at 4000) can read this to preserve
+/// the original range decision even if an earlier hook stripped/renamed
+/// `Content-Range`. This matters because range responses are streamed (see
+/// `compression`'s `should_buffer_response_body_for_content_type`), so a plugin
+/// must not commit a body transform header (e.g. `Content-Encoding`) that its
+/// buffered-only `transform_response_body` will never actually apply.
+pub(crate) const RANGE_RESPONSE_METADATA_KEY: &str = "ferrum:range_response";
+
 fn record_node_waypoint_identity_drop(
     overload: &crate::overload::OverloadState,
     error: &NodeWaypointIdentityError,
@@ -887,6 +899,7 @@ pub(crate) fn refine_stream_response_for_content_type(
     proxy: &Proxy,
     plugins: &[Arc<dyn Plugin>],
     ctx: Option<&RequestContext>,
+    response_status: u16,
     response_headers: &HashMap<String, String>,
 ) -> bool {
     if stream_response {
@@ -907,10 +920,17 @@ pub(crate) fn refine_stream_response_for_content_type(
         return false;
     }
     // Keep buffering only while at least one plugin still needs the body for
-    // this content-type; otherwise stream it straight through.
-    !plugins
-        .iter()
-        .any(|plugin| plugin.should_buffer_response_body_for_content_type(ctx, content_type))
+    // this content-type; otherwise stream it straight through. Plugins also see
+    // the response status/headers so a plugin can release a response it will not
+    // transform (e.g. `compression` skips `206`/`Content-Range` range responses).
+    !plugins.iter().any(|plugin| {
+        plugin.should_buffer_response_body_for_content_type(
+            ctx,
+            content_type,
+            response_status,
+            response_headers,
+        )
+    })
 }
 
 /// Fix 5: decide whether a plain-HTTPS direct-H2 response body should skip
@@ -1373,8 +1393,65 @@ pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
             | retry::ErrorClass::ProtocolError
             | retry::ErrorClass::DnsLookupError
             | retry::ErrorClass::PortExhaustion
-            | retry::ErrorClass::ConnectionPoolError
     )
+}
+
+pub fn websocket_origin_allowed(allowed_origins: &[String], origin: &str) -> bool {
+    allowed_origins
+        .iter()
+        .any(|allowed| websocket_origin_matches(allowed, origin))
+}
+
+fn websocket_origin_matches(allowed: &str, origin: &str) -> bool {
+    if allowed.eq_ignore_ascii_case(origin) {
+        return true;
+    }
+
+    match (
+        normalized_websocket_origin(allowed),
+        normalized_websocket_origin(origin),
+    ) {
+        (Some(allowed), Some(origin)) => allowed.eq_ignore_ascii_case(&origin),
+        _ => false,
+    }
+}
+
+fn normalized_websocket_origin(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw).ok()?;
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        return None;
+    }
+    // RFC 6454 serialized origins are scheme://host[:port] and never carry
+    // userinfo. Fail closed on credentials so an Origin like
+    // `https://attacker@good.example` is not normalized down to the
+    // allow-listed `https://good.example` and waved through admission.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    let default_port = match parsed.scheme() {
+        "http" | "ws" => 80,
+        "https" | "wss" => 443,
+        _ => return None,
+    };
+    let host = parsed.host_str()?;
+
+    let mut normalized = String::with_capacity(raw.len());
+    normalized.push_str(&parsed.scheme().to_ascii_lowercase());
+    normalized.push_str("://");
+    if host.contains(':') && !host.starts_with('[') {
+        normalized.push('[');
+        normalized.push_str(&host.to_ascii_lowercase());
+        normalized.push(']');
+    } else {
+        normalized.push_str(&host.to_ascii_lowercase());
+    }
+    if let Some(port) = parsed.port()
+        && port != default_port
+    {
+        normalized.push(':');
+        normalized.push_str(&port.to_string());
+    }
+    Some(normalized)
 }
 
 /// Is this H3 backend response the kind that should downgrade the cached
@@ -7361,21 +7438,12 @@ async fn handle_websocket_request_authenticated(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
-        let has_port_override = backend_dispatch::has_effective_port_override(
+        let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
             &proxy,
             &epoch.load_balancer,
             upstream_id,
             target.port,
         );
-        let strategy = if has_port_override {
-            LoadBalancerCache::get_hash_on_strategy_for_port_from(
-                &epoch.load_balancer,
-                upstream_id,
-                target.port,
-            )
-        } else {
-            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id)
-        };
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
@@ -12215,11 +12283,7 @@ async fn handle_proxy_request_inner(
         // When allowed_ws_origins is non-empty, reject upgrades from unlisted origins.
         if !proxy.allowed_ws_origins.is_empty() {
             let origin = ctx.headers.get("origin").map(|s| s.as_str()).unwrap_or("");
-            if !proxy
-                .allowed_ws_origins
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(origin))
-            {
+            if !websocket_origin_allowed(&proxy.allowed_ws_origins, origin) {
                 warn!(
                     "WebSocket upgrade rejected: Origin '{}' not in allowed_ws_origins for proxy {}",
                     origin, proxy.id
@@ -14045,24 +14109,12 @@ async fn handle_proxy_request_inner(
                     && let (Some(upstream_id), Some(target)) =
                         (&proxy.upstream_id, &upstream_target)
                 {
-                    let has_port_override = backend_dispatch::has_effective_port_override(
+                    let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
                         &proxy,
                         &epoch.load_balancer,
                         upstream_id,
                         target.port,
                     );
-                    let strategy = if has_port_override {
-                        LoadBalancerCache::get_hash_on_strategy_for_port_from(
-                            &epoch.load_balancer,
-                            upstream_id,
-                            target.port,
-                        )
-                    } else {
-                        LoadBalancerCache::get_hash_on_strategy_from(
-                            &epoch.load_balancer,
-                            upstream_id,
-                        )
-                    };
                     if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
                         let upstream =
                             LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
@@ -14776,6 +14828,16 @@ async fn handle_proxy_request_inner(
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
+    // Record the ORIGINAL backend range decision before any `after_proxy` hook
+    // can rewrite the headers. A later plugin (e.g. `response_transformer`) may
+    // strip/rename `Content-Range`, which would otherwise let a body-transform
+    // plugin (`compression`) commit a transform header on a streamed range
+    // response whose body is never actually transformed. Only inserted for
+    // range responses, so the common path stays allocation-free.
+    if response_status == 206 || response_headers.contains_key("content-range") {
+        ctx.metadata
+            .insert(RANGE_RESPONSE_METADATA_KEY.to_string(), "true".to_string());
+    }
     let backend_resolved_ip = backend_resp.backend_resolved_ip;
     let backend_error_class = backend_resp.error_class;
     annotate_gateway_mesh_metadata(
@@ -15213,21 +15275,12 @@ async fn handle_proxy_request_inner(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
     {
-        let has_port_override = backend_dispatch::has_effective_port_override(
+        let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
             &proxy,
             &epoch.load_balancer,
             upstream_id,
             target.port,
         );
-        let strategy = if has_port_override {
-            LoadBalancerCache::get_hash_on_strategy_for_port_from(
-                &epoch.load_balancer,
-                upstream_id,
-                target.port,
-            )
-        } else {
-            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id)
-        };
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
@@ -17763,6 +17816,7 @@ async fn proxy_to_backend(
                 proxy,
                 plugins,
                 response_decision_ctx,
+                status,
                 &resp_headers,
             );
 
@@ -18499,6 +18553,18 @@ pub fn check_protocol_headers(
                         r#"{"error":"Content-Length header contains invalid non-numeric value"}"#,
                     );
                 }
+                if trimmed
+                    .iter()
+                    .try_fold(0usize, |acc, &digit| {
+                        acc.checked_mul(10)
+                            .and_then(|acc| acc.checked_add((digit - b'0') as usize))
+                    })
+                    .is_none()
+                {
+                    return Some(
+                        r#"{"error":"Content-Length header exceeds supported integer range"}"#,
+                    );
+                }
                 // 2b. All tokens must agree on the same value
                 match canonical {
                     None => canonical = Some(trimmed),
@@ -19108,6 +19174,7 @@ async fn proxy_to_backend_hbone(
         proxy,
         plugins,
         ctx,
+        status,
         &resp_headers,
     );
 
@@ -19611,6 +19678,7 @@ async fn proxy_to_backend_mesh_mtls(
         proxy,
         plugins,
         ctx,
+        status,
         &resp_headers,
     );
 
@@ -19896,6 +19964,7 @@ async fn proxy_to_backend_http2(
         proxy,
         plugins,
         ctx,
+        status,
         &resp_headers,
     );
 
@@ -20701,6 +20770,27 @@ async fn proxy_to_backend_http3(
             }
         }
     } else {
+        // RESIDUAL (range/SSE buffering downgrade): unlike the reqwest and
+        // direct-H2/HBONE backend paths — which call
+        // `refine_stream_response_for_content_type` once the response headers
+        // are known and downgrade a buffered decision to streaming for a
+        // `206`/`Content-Range` (or SSE) body — the H3 pool's `.request()` /
+        // `.request_with_target()` methods drain the whole body internally and
+        // only hand back already-buffered `response.body`, so the response
+        // content-type/status are not observable before the drain. A large
+        // ranged H3-backend download therefore stays buffered here and is
+        // capped by the pool's size limit (graceful `502 ResponseBodyTooLarge`,
+        // never an OOM) rather than streamed through. This is a
+        // graceful-degradation gap, NOT a correctness bug: the range mislabel /
+        // byte-offset corruption that motivated the marker is already prevented
+        // because the sole caller stamps `RANGE_RESPONSE_METADATA_KEY` from the
+        // pristine headers before its `after_proxy` phase (see the H1/H2 stamp
+        // in `handle_proxy_request_inner`), so `compression.after_proxy` declines
+        // to compress regardless. Closing this fully needs the H3 buffered pool
+        // call to expose pre-drain headers + `recv_stream` (as
+        // `request_streaming_incoming_body` already does) so the same
+        // header-time downgrade can run before draining; deferred to keep this
+        // hot-path/pool change out of a guard-hardening PR.
         let h3_result = if let Some(target) = upstream_target {
             let target_host = target.host.clone();
             let target_port = target.port;
@@ -21942,6 +22032,8 @@ mod tests {
             &self,
             _ctx: &RequestContext,
             content_type: Option<&str>,
+            _response_status: u16,
+            _response_headers: &HashMap<String, String>,
         ) -> bool {
             content_type == Some(self.buffer_content_type)
         }
@@ -23505,6 +23597,7 @@ mod tests {
             &proxy,
             &plugins,
             Some(&ctx),
+            200,
             &json_headers,
         ));
 
@@ -23514,6 +23607,7 @@ mod tests {
             &proxy,
             &plugins,
             Some(&ctx),
+            200,
             &binary_headers,
         ));
 
@@ -23542,6 +23636,7 @@ mod tests {
             &proxy,
             &relabel_plugins,
             Some(&ctx),
+            200,
             &binary_headers,
         ));
 
@@ -23570,6 +23665,7 @@ mod tests {
             &proxy,
             &route_relabel_plugins,
             Some(&route_ctx),
+            200,
             &binary_headers,
         ));
 
@@ -23579,6 +23675,7 @@ mod tests {
             &proxy,
             &plugins,
             Some(&ctx),
+            200,
             &json_headers,
         ));
 
@@ -23589,6 +23686,7 @@ mod tests {
             &buffered_proxy,
             &plugins,
             Some(&ctx),
+            200,
             &binary_headers,
         ));
 
@@ -23599,6 +23697,7 @@ mod tests {
             &proxy,
             &plugins,
             None,
+            200,
             &binary_headers,
         ));
 
@@ -23612,6 +23711,7 @@ mod tests {
             &proxy,
             &always,
             Some(&ctx),
+            200,
             &binary_headers,
         ));
     }
@@ -23631,7 +23731,6 @@ mod tests {
             retry::ErrorClass::ProtocolError,
             retry::ErrorClass::DnsLookupError,
             retry::ErrorClass::PortExhaustion,
-            retry::ErrorClass::ConnectionPoolError,
         ] {
             assert!(
                 is_h3_transport_error_class(class),
@@ -23659,12 +23758,17 @@ mod tests {
         // `ReadWriteTimeout` is excluded for the same capability reason:
         // a backend that stalls after accepting a request is slow or wedged,
         // but it has not proved that the native H3 pool itself is invalid.
+        //
+        // `ConnectionPoolError` is also excluded: local QUIC endpoint/config
+        // failures such as CID exhaustion or endpoint shutdown are gateway-side
+        // resource conditions, not evidence that the backend lost H3 support.
         for class in [
             retry::ErrorClass::ClientDisconnect,
             retry::ErrorClass::RequestBodyTooLarge,
             retry::ErrorClass::ResponseBodyTooLarge,
             retry::ErrorClass::GracefulRemoteClose,
             retry::ErrorClass::ReadWriteTimeout,
+            retry::ErrorClass::ConnectionPoolError,
             retry::ErrorClass::DispatchPolicyRejected,
             retry::ErrorClass::RequestError,
         ] {

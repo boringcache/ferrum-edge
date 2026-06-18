@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::admin::AdminState;
 use crate::admin::audit::{self, AuditActor, AuditEvent};
 use crate::admin::jwt_auth::AdminRole;
-use crate::config::db_backend::{DatabaseBackend, PaginatedResult};
+use crate::config::db_backend::{DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult};
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, RetryConfig, Upstream,
     first_effective_mesh_transport_conflict, mesh_transport_retry_conflict_message,
@@ -1499,9 +1499,7 @@ impl AdminResource for Proxy {
             {
                 Ok(true) => {}
                 Ok(false) => {
-                    return Ok(Some(
-                        "A proxy with overlapping hosts and listen_path already exists".to_string(),
-                    ));
+                    return Ok(Some(PROXY_ROUTE_CONFLICT_ERROR.to_string()));
                 }
                 Err(error) => return Err(error),
             }
@@ -1537,6 +1535,23 @@ impl AdminResource for Proxy {
         }
 
         Ok(None)
+    }
+
+    fn map_persist_db_error(
+        error: &anyhow::Error,
+        _action: WriteAction<'_>,
+    ) -> Response<Full<Bytes>> {
+        if error.to_string().contains(PROXY_ROUTE_CONFLICT_ERROR) {
+            return super::json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": PROXY_ROUTE_CONFLICT_ERROR}),
+            );
+        }
+
+        super::json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &super::db_error_response(error),
+        )
     }
 
     async fn after_validate(
@@ -1709,7 +1724,8 @@ impl AdminResource for Proxy {
         existing: Option<&Self>,
         action: WriteAction<'_>,
     ) -> DbResult<()> {
-        if matches!(action, WriteAction::Update { .. })
+        if db.db_type() == "mongodb"
+            && matches!(action, WriteAction::Update { .. })
             && let Some(old_proxy) = existing
             && let Some(old_upstream_id) = old_proxy.upstream_id.as_deref()
             && resource.upstream_id.as_deref() != Some(old_upstream_id)

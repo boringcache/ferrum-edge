@@ -237,6 +237,11 @@ pub struct SubsetTrafficPolicy {
     /// Override the upstream's load balancer algorithm for this subset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_balancer_algorithm: Option<LoadBalancerAlgorithm>,
+    /// Hash-key source for subset-scoped consistent hashing. Uses the same
+    /// format as [`Upstream::hash_on`]: `"ip"`, `"header:<name>"`, or
+    /// `"cookie:<name>"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_on: Option<String>,
     /// Override the upstream's backend TLS posture for targets selected via
     /// this subset (Istio `subsets[].trafficPolicy.tls`). The cold-path
     /// `apply_destination_rules` overlays this on the upstream-level TLS and
@@ -5209,6 +5214,51 @@ impl Upstream {
                         errors.push(format!(
                             "subsets[{}].labels value must not exceed {} characters",
                             i, MAX_TAG_LENGTH
+                        ));
+                    }
+                }
+                if let Some(hash_on) = subset
+                    .traffic_policy
+                    .as_ref()
+                    .and_then(|policy| policy.hash_on.as_ref())
+                {
+                    // Bound the length the same way upstream-level `hash_on` is
+                    // (MAX_HASH_ON_LENGTH): the value is persisted, cloned into
+                    // the LB cache, and read per request, so an unbounded
+                    // `header:`+megabytes string must be rejected at admission.
+                    if let Err(e) = validate_string_field(
+                        &format!("subsets[{i}].traffic_policy.hash_on"),
+                        hash_on,
+                        MAX_HASH_ON_LENGTH,
+                    ) {
+                        errors.push(e);
+                    }
+                    let trimmed = hash_on.trim();
+                    if !trimmed.is_empty()
+                        && trimmed != "ip"
+                        && !trimmed.starts_with("header:")
+                        && !trimmed.starts_with("cookie:")
+                    {
+                        errors.push(format!(
+                            "subsets[{}].traffic_policy.hash_on must be 'ip', \
+                             'header:<name>', or 'cookie:<name>' (got '{}')",
+                            i, trimmed
+                        ));
+                    }
+                    if let Some(name) = trimmed.strip_prefix("header:")
+                        && name.trim().is_empty()
+                    {
+                        errors.push(format!(
+                            "subsets[{}].traffic_policy.hash_on 'header:' requires a non-empty header name",
+                            i
+                        ));
+                    }
+                    if let Some(name) = trimmed.strip_prefix("cookie:")
+                        && name.trim().is_empty()
+                    {
+                        errors.push(format!(
+                            "subsets[{}].traffic_policy.hash_on 'cookie:' requires a non-empty cookie name",
+                            i
                         ));
                     }
                 }

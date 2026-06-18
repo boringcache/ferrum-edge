@@ -24,7 +24,9 @@ use crate::admin::api_specs::{
 use crate::admin::audit::{self, AuditActor};
 use crate::admin::spec_codec;
 use crate::admin::{AdminState, log_audit_enqueue_failure};
-use crate::config::db_backend::{ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, SortOrder};
+use crate::config::db_backend::{
+    ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, SortOrder,
+};
 use crate::config::types::{ApiSpec, PluginAssociation, Upstream};
 use crate::util::body_limit::is_length_limit_error;
 
@@ -91,7 +93,8 @@ fn classify_db_error(e: anyhow::Error) -> ApiSpecError {
 
 fn classify_db_error_str(msg: &str) -> ApiSpecError {
     let lower = msg.to_lowercase();
-    if lower.contains("unique constraint")
+    if msg.contains(PROXY_ROUTE_CONFLICT_ERROR)
+        || lower.contains("unique constraint")
         || lower.contains("duplicate key")
         || lower.contains("duplicate entry")
     {
@@ -2729,6 +2732,14 @@ mod tests {
     fn classify_duplicate_key_as_conflict() {
         assert!(matches!(
             classify_db_error_str("duplicate key value violates unique constraint"),
+            ApiSpecError::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn classify_proxy_route_conflict_as_conflict() {
+        assert!(matches!(
+            classify_db_error_str(PROXY_ROUTE_CONFLICT_ERROR),
             ApiSpecError::Conflict(_)
         ));
     }
