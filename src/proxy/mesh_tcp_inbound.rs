@@ -120,16 +120,32 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     };
 
     // Capture the opening client bytes when a first-bytes-aware plugin (stream
-    // WAF, `tcp_require_tls`) is configured, so it inspects the same plaintext
+    // WAF, `tcp_require_tls`) is configured, so it inspects the same opening
     // prefix it would see on the generic TCP proxy. The peek is non-destructive;
-    // the relay re-reads the same bytes. `PlaintextWire` marks them as
-    // L7-inspectable wire bytes (vs. encrypted passthrough), matching the
-    // generic proxy's plaintext-client branch.
+    // the relay re-reads the same bytes.
+    //
+    // The byte-kind mirrors the generic TCP proxy's wire classification: this
+    // handler NEVER terminates TLS (it relays the captured stream verbatim to
+    // loopback), so the two cases are plaintext-wire vs encrypted-wire, never
+    // `DecryptedApp`. For opaque-TLS app ports (`entry.tls_inspect`) the captured
+    // prefix is a real TLS ClientHello the gateway never decrypts, so it is only
+    // good for transport-shape checks (e.g. `tcp_require_tls` ClientHello shape)
+    // — `EncryptedWire`, matching the passthrough branch. Marking it
+    // `PlaintextWire` would tell a signature plugin like WAF `inspect_tcp` that
+    // ciphertext handshake bytes are L7-inspectable, producing false
+    // matches/blocks. Plain TCP stream ports really are plaintext wire bytes, so
+    // they stay `PlaintextWire` (L7-inspectable), matching the plaintext-client
+    // branch.
     let (first_bytes, first_bytes_kind) = if scan_first_bytes {
         let bytes =
             tcp_proxy::peek_tcp_first_bytes(&client_stream, peek_timeout, first_bytes_min_len)
                 .await;
-        (bytes, Some(StreamBytesKind::PlaintextWire))
+        let kind = if entry.tls_inspect {
+            StreamBytesKind::EncryptedWire
+        } else {
+            StreamBytesKind::PlaintextWire
+        };
+        (bytes, Some(kind))
     } else {
         (None, None)
     };
