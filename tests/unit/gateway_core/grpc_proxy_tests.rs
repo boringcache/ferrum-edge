@@ -28,6 +28,7 @@ fn test_proxy() -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: Default::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
@@ -47,6 +48,7 @@ fn test_proxy() -> Proxy {
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         api_spec_id: None,
@@ -381,9 +383,7 @@ fn test_grpc_buffered_body_capacity_hint_defaults_without_content_length() {
 
 #[tokio::test]
 async fn test_proxy_grpc_request_from_bytes_error_on_unreachable_backend() {
-    // proxy_grpc_request returns (result, body_bytes).
-    // When stream_response=true the returned body is Bytes::new() (no clone needed).
-    // We verify the buffered path (proxy_grpc_request_from_bytes) errors gracefully
+    // Verify the buffered path (proxy_grpc_request_from_bytes) errors gracefully
     // on an unreachable backend; this also confirms no panic in either code path.
     use bytes::Bytes;
 

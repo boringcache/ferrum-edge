@@ -73,6 +73,7 @@ const DEFAULT_DNS_ENABLED: bool = false;
 const DEFAULT_DNS_MAX_CONCURRENT_QUERIES: usize = 1024;
 const DEFAULT_EGRESS_LISTEN_ADDR: &str = "0.0.0.0:15090";
 const MESH_CA_INITIAL_SVID_TIMEOUT: Duration = Duration::from_secs(30);
+const INTERNAL_MESH_CA_FAILURE_BACKOFF_INITIAL_SECS: u64 = 5;
 
 pub const MESH_SPIFFE_IDENTITY_PLUGIN_ID: &str = "__mesh_spiffe_identity";
 pub const MESH_AUTHZ_PLUGIN_ID: &str = "__mesh_authz";
@@ -93,6 +94,12 @@ pub enum MeshListenerKind {
     PlaintextCapture,
     MtlsTermination,
     HboneTermination,
+    /// UDP TPROXY capture listener (F3 §3.3 Stage 3). Plaintext; bound to the
+    /// Stage-2 `FERRUM_MESH_CAPTURE_UDP_PORT`. Receives TPROXY-diverted UDP
+    /// datagrams, recovers per-datagram orig-dst from the `IP_RECVORIGDSTADDR`
+    /// cmsg, and (Stage 3) drops them — the egress relay is Stage 4. Only
+    /// emitted when `FERRUM_MESH_CAPTURE_UDP_ENABLED` is set (default-off).
+    PlaintextUdpCapture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +374,16 @@ pub struct MeshRuntimeConfig {
     /// from `FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP`. Present-but-expired tokens
     /// are always rejected regardless of this flag.
     pub request_auth_require_exp: bool,
+    /// Strict local-first locality load balancing. Default `false` preserves the
+    /// historical fail-open behavior: when an upstream's source locality is
+    /// absent/unresolved, the locality-aware LB returns mixed local + remote
+    /// endpoints. When `true`, an absent source locality fails closed to LOCAL
+    /// endpoints only (targets not tagged with the synthetic `remote-<cluster>`
+    /// locality); if there are no local endpoints the LB falls back to the full
+    /// healthy pool with a one-time warning. Stamped onto materialized upstreams
+    /// at slice apply so the load balancer reads it at cache-build time without a
+    /// per-request env lookup. Sourced from `FERRUM_MESH_LOCALITY_LB_STRICT`.
+    pub locality_lb_strict: bool,
 }
 
 impl MeshRuntimeConfig {
@@ -598,6 +615,7 @@ impl MeshRuntimeConfig {
             egress_stream_enabled: env_config.mesh_egress_stream_enabled,
             egress_stream_allow_plaintext: env_config.mesh_egress_stream_allow_plaintext,
             request_auth_require_exp: env_config.mesh_request_auth_require_exp,
+            locality_lb_strict: env_config.mesh_locality_lb_strict,
         })
     }
 
@@ -635,30 +653,41 @@ impl MeshRuntimeConfig {
 
     pub fn listener_plan(&self) -> Vec<MeshListener> {
         match self.topology {
-            MeshTopology::Sidecar => vec![
-                MeshListener {
-                    direction: MeshTrafficDirection::Outbound,
-                    kind: MeshListenerKind::PlaintextCapture,
-                    addr: self.outbound_listen_addr,
-                },
-                MeshListener {
-                    direction: MeshTrafficDirection::Inbound,
-                    kind: MeshListenerKind::MtlsTermination,
-                    addr: self.inbound_listen_addr,
-                },
-            ],
-            MeshTopology::Ambient => vec![
-                MeshListener {
-                    direction: MeshTrafficDirection::Outbound,
-                    kind: MeshListenerKind::PlaintextCapture,
-                    addr: self.outbound_listen_addr,
-                },
-                MeshListener {
-                    direction: MeshTrafficDirection::Inbound,
-                    kind: MeshListenerKind::HboneTermination,
-                    addr: self.hbone_listen_addr,
-                },
-            ],
+            MeshTopology::Sidecar => {
+                let mut listeners = vec![
+                    MeshListener {
+                        direction: MeshTrafficDirection::Outbound,
+                        kind: MeshListenerKind::PlaintextCapture,
+                        addr: self.outbound_listen_addr,
+                    },
+                    MeshListener {
+                        direction: MeshTrafficDirection::Inbound,
+                        kind: MeshListenerKind::MtlsTermination,
+                        addr: self.inbound_listen_addr,
+                    },
+                ];
+                // Sidecar relays captured UDP over a mesh-mTLS datagram tunnel
+                // (#1808), so the helper emits the `PlaintextUdpCapture` listener
+                // here when the capture flag is set (gated to Ambient | Sidecar).
+                listeners.extend(self.udp_capture_listener());
+                listeners
+            }
+            MeshTopology::Ambient => {
+                let mut listeners = vec![
+                    MeshListener {
+                        direction: MeshTrafficDirection::Outbound,
+                        kind: MeshListenerKind::PlaintextCapture,
+                        addr: self.outbound_listen_addr,
+                    },
+                    MeshListener {
+                        direction: MeshTrafficDirection::Inbound,
+                        kind: MeshListenerKind::HboneTermination,
+                        addr: self.hbone_listen_addr,
+                    },
+                ];
+                listeners.extend(self.udp_capture_listener());
+                listeners
+            }
             MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint => {
                 vec![MeshListener {
                     direction: MeshTrafficDirection::Inbound,
@@ -673,6 +702,112 @@ impl MeshRuntimeConfig {
                 addr: self.egress_listen_addr,
             }],
         }
+    }
+
+    /// The optional UDP TPROXY capture listener (F3 §3.3), emitted on the two
+    /// topologies that actually **relay** captured UDP — **Ambient** (datagram
+    /// over HBONE `:15008`) and **Sidecar** (datagram over mesh-mTLS `:15006`).
+    /// UDP egress materialization is dual-transport
+    /// (`materialize_mesh_outbound_udp_upstreams` gates `Ambient => HBONE,
+    /// Sidecar => SidecarMtls, _ => return`), so this listener is gated to the
+    /// SAME two topologies. Emitting it for a topology with NO UDP relay
+    /// (EastWestGateway / EgressGateway / waypoints) would divert the pod's UDP
+    /// into a listener with no relay and **black-hole every captured datagram**
+    /// (codex r1 P2); leaving those un-captured (UDP passes through) is the
+    /// fail-open-by-passthrough posture. NodeWaypoint / ServiceWaypoint also have
+    /// no outbound capture listener (and UDP stays mesh-wide-only there per the
+    /// per-pod-scope notes).
+    ///
+    /// **End-to-end status (tracked in #1808): the FIRST working end-to-end UDP
+    /// path is SIDECAR** — the injector's pod-netns TPROXY producer (re-enabled
+    /// via `injector::sidecar_udp_capture_supported()`) feeds this listener, the
+    /// egress datapath relays the datagram over a mesh-mTLS CONNECT, and the
+    /// destination unframes it into a local `UdpSocket`. **Ambient still has NO
+    /// UDP capture *producer*** feeding this listener — the node-agent host-netns
+    /// path emits no UDP TPROXY rules (the same per-pod-scope blocker that defers
+    /// F4.3 / #1803) and eBPF capture is `connect()`-hooked / TCP-only — so
+    /// Ambient end-to-end UDP capture→relay is **not yet active in production**
+    /// (its relay/transport is implemented and unit-tested, awaiting a producer).
+    ///
+    /// NOTE: the injector/init TPROXY-rule emission for a Sidecar pod is gated to
+    /// MATCH this runtime listener gate: `injector::sidecar_udp_capture_supported()`
+    /// (a central switch) now ENABLES the init container's UDP TPROXY rules, the
+    /// sidecar's runtime-enable env, AND the transparent-bind capability TOGETHER,
+    /// so an injected Sidecar with the flag set both binds a UDP listener (here)
+    /// AND diverts UDP into it (init container). (The low-level
+    /// `crate::capture::udp_tproxy_commands_for_family` still gates only on
+    /// `host_netns`; the topology decision lives in the injector, which is the only
+    /// pod-netns emitter.)
+    ///
+    /// Returns at most one listener, gated on `FERRUM_MESH_CAPTURE_UDP_ENABLED`
+    /// (default-off via [`crate::capture::udp_capture_settings_from_env`]), bound
+    /// on the **dual-stack IPv6 wildcard** (`[::]`, independent of
+    /// `FERRUM_MESH_OUTBOUND_LISTEN_ADDR`'s family) on the Stage-2 UDP capture
+    /// port (`FERRUM_MESH_CAPTURE_UDP_PORT`): TPROXY leaves each datagram's
+    /// original (non-local) destination intact, so a specific-IP bind would miss
+    /// them — only a wildcard `IP_TRANSPARENT` socket receives the captured
+    /// non-local dests. A dual-stack `[::]` socket captures **both** v4-mapped
+    /// and v6 datagrams from one listener (codex r3 P2 — a v4-only bind
+    /// black-holes the v6 half when IPv6 capture rules are present); the bind
+    /// falls back to the v4 wildcard on hosts without IPv6. A disabled flag yields no
+    /// listener — the capture path stays inert. A *parse error* warn-skips here
+    /// (this helper is infallible because read-only predicates call it too), but
+    /// `serve_mesh_runtime` validates the same env with `?` before binding, so on
+    /// the serving path a malformed setting fails startup rather than reaching
+    /// this branch (codex r2 P2).
+    fn udp_capture_listener(&self) -> Option<MeshListener> {
+        let settings = match crate::capture::udp_capture_settings_from_env() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Skipping mesh UDP capture listener: {e}");
+                return None;
+            }
+        };
+        if !settings.udp_capture_enabled {
+            return None;
+        }
+        // Only the two captured-and-relayed topologies emit the listener: Ambient
+        // (datagram over HBONE :15008) and Sidecar (datagram over mesh-mTLS
+        // :15006). For ANY OTHER topology with the flag on, emit a loud ONE-TIME
+        // warning and DO NOT emit the listener — capturing UDP we cannot relay
+        // would black-hole it; leaving it un-captured lets it pass through.
+        // `listener_plan()` is called many times (serving, predicates, tests), so
+        // the warn is gated behind a `Once` to avoid log spam.
+        if !matches!(self.topology, MeshTopology::Ambient | MeshTopology::Sidecar) {
+            static UDP_RELAY_UNSUPPORTED_WARN: std::sync::Once = std::sync::Once::new();
+            UDP_RELAY_UNSUPPORTED_WARN.call_once(|| {
+                warn!(
+                    topology = ?self.topology,
+                    "FERRUM_MESH_CAPTURE_UDP_ENABLED is set but UDP egress is only supported on \
+                     the Ambient (datagram-over-HBONE over :15008) and Sidecar \
+                     (datagram-over-mesh-mTLS over :15006) topologies. This topology has no UDP \
+                     relay, so the UDP capture listener is NOT emitted — UDP egress passes \
+                     through un-captured rather than being captured and dropped. Disable the flag \
+                     to silence this warning."
+                );
+            });
+            return None;
+        }
+        // Bind the capture port on the DUAL-STACK IPv6 WILDCARD (`[::]`), not the
+        // configured outbound IP (codex r1 P2) and not a family-following v4/v6
+        // choice (codex r3 P2). TPROXY (`--on-port` only, no `--on-ip`) diverts
+        // the datagram to this socket WITHOUT rewriting its destination, so each
+        // captured datagram still carries the pod's real service/cluster-IP
+        // destination, never the listener's IP; only a wildcard `IP_TRANSPARENT`
+        // socket receives those non-local dests. A single dual-stack `[::]`
+        // socket (V6ONLY disabled at bind time) claims BOTH v4-mapped and v6
+        // captured datagrams — a v4-only `0.0.0.0` bind would black-hole the v6
+        // half whenever IPv6 capture rules (`ip6tables` TPROXY) are present. The
+        // listener bind falls back to the v4 wildcard on IPv6-less hosts.
+        let addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            settings.udp_outbound_port,
+        );
+        Some(MeshListener {
+            direction: MeshTrafficDirection::Outbound,
+            kind: MeshListenerKind::PlaintextUdpCapture,
+            addr,
+        })
     }
 
     /// Whether this topology runs an inbound **TLS-terminating** listener (mTLS
@@ -777,11 +912,12 @@ fn prepare_normalized_gateway_config_for_mesh(
     // Outbound (egress) runs after inbound and before `apply_destination_rules`
     // so the materialized outbound upstreams pick up port-level DR policy
     // (re-keyed there to the resolved dial port). Topology-aware: Ambient emits
-    // HBONE routes; Sidecar (SVID-mTLS) lands in a follow-up.
+    // HBONE routes; Sidecar emits SVID-mTLS routes.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_tcp_upstreams(&mut config, runtime, mesh_slice);
+    materialize_mesh_outbound_udp_upstreams(&mut config, runtime, mesh_slice);
     apply_destination_rules(&mut config, runtime, mesh_slice)?;
-    project_mesh_source_locality(&mut config, mesh_slice);
+    project_mesh_source_locality(&mut config, runtime, mesh_slice);
     // Project slice-filtered ServiceEntries back into the prepared mesh
     // block so introspection consumers (admin diagnostics, projected-config
     // snapshots, future helpers) see the same `export_to` / sidecar-narrowed
@@ -925,15 +1061,53 @@ fn prepare_normalized_gateway_config_for_mesh(
     Ok(config)
 }
 
-fn project_mesh_source_locality(config: &mut GatewayConfig, mesh_slice: &MeshSlice) {
+fn project_mesh_source_locality(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
+    // When a projection actually changes an upstream's locality content we
+    // advance its `updated_at` so `ConfigDelta` (which detects upstream changes
+    // by `id` + `updated_at`) rebuilds the LB cache. We bump to a FRESH
+    // wall-clock timestamp (the same convention the mesh materializers use,
+    // `now`), NOT to `config.loaded_at`: `loaded_at` is derived from
+    // `slice.version` and is therefore STABLE across re-applies of the same
+    // slice version, so clobbering `updated_at` to it could collide with the
+    // previously-applied upstream's `updated_at` and hide a real same-version
+    // change. A fresh timestamp can never collide.
+    //
+    // NOTE on per-apply churn: this projection runs DURING preparation, where
+    // every upstream was just freshly materialized and therefore ALWAYS enters
+    // with `source_locality = None` — so on a re-apply with a resolved source
+    // locality this branch re-stamps `updated_at` on EVERY upstream, not only
+    // genuinely changed ones. Preventing that churn is NOT this function's job:
+    // the slice-apply boundary runs `reconcile_mesh_upstream_timestamps` against
+    // the previously-accepted config AFTER preparation, which restores the prior
+    // timestamp for any upstream whose FINAL (post-projection) content is
+    // unchanged. So a fresh bump here is safe: it is the correct timestamp for a
+    // genuinely changed upstream and is reconciled away for an unchanged one.
+    let bump = chrono::Utc::now();
+
+    // Stamp the operator's strict local-first locality preference onto every
+    // mesh upstream regardless of whether a source locality resolves: strict
+    // mode's whole point is to govern the *absent-source-locality* case, so the
+    // flag must reach upstreams that have no `source_locality` too. The load
+    // balancer reads this at cache-build time (no per-request env lookup).
+    let strict = runtime.locality_lb_strict;
+    for upstream in &mut config.upstreams {
+        if upstream.locality_lb_strict != strict {
+            upstream.locality_lb_strict = strict;
+            upstream.updated_at = bump;
+        }
+    }
+
     let Some(locality) = mesh_source_workload_locality(mesh_slice) else {
         return;
     };
-    let loaded_at = config.loaded_at;
     for upstream in &mut config.upstreams {
         if upstream.source_locality.as_deref() != Some(locality) {
             upstream.source_locality = Some(locality.to_string());
-            upstream.updated_at = loaded_at;
+            upstream.updated_at = bump;
         }
     }
 }
@@ -982,6 +1156,109 @@ fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
         }
     }
     matched_locality
+}
+
+/// Preserve materialized-mesh upstream timestamps across re-applies of the same
+/// content.
+///
+/// Mesh upstreams are FRESHLY MATERIALIZED on every slice apply: the
+/// materializers (`materialize_mesh_outbound_proxies`, the east-west / egress /
+/// inbound builders) each stamp `created_at`/`updated_at` with a per-apply
+/// `chrono::Utc::now()`, and `project_mesh_source_locality` then bumps
+/// `updated_at` again whenever it stamps `source_locality`/`locality_lb_strict`
+/// onto an upstream that entered the projection with `source_locality = None`
+/// (which a freshly materialized upstream ALWAYS does). `ConfigDelta` keys
+/// upstream identity on `id` and detects modification by `updated_at != old`
+/// (`src/config_delta.rs`), so without reconciliation EVERY mesh upstream would
+/// look "modified" on EVERY apply — and a "modified" upstream rebuilds a fresh
+/// `LoadBalancer` (`LoadBalancerCache::build_delta_inner`), discarding its
+/// round-robin counters, latency EWMAs, hash rings, and passive-health state.
+/// That means an unrelated mesh-only update (a federation/trust-bundle overlay
+/// refresh, or a remote-cluster scale event for a DIFFERENT service) would reset
+/// LB + health for every materialized upstream.
+///
+/// This step runs at the slice-apply boundary — the only place that has the
+/// PREVIOUSLY-ACCEPTED config — and copies the previous upstream's
+/// `created_at`/`updated_at` onto a candidate upstream whose CONTENT is identical
+/// (every field except the two timestamps; see [`upstream_content_eq`]). A
+/// candidate whose content genuinely changed (target set, locality, strict flag,
+/// DR-projected overrides, …) keeps its fresh timestamp, so a real change still
+/// rebuilds exactly that one LB. New upstream ids (not present in the previous
+/// config) are left untouched — `ConfigDelta` classifies them as ADDED, which
+/// builds a fresh LB regardless of timestamp. This makes a no-op re-apply produce
+/// an EMPTY upstream delta and preserves per-upstream LB/health state.
+fn reconcile_mesh_upstream_timestamps(candidate: &mut GatewayConfig, previous: &GatewayConfig) {
+    if candidate.upstreams.is_empty() || previous.upstreams.is_empty() {
+        return;
+    }
+    let previous_by_id: HashMap<&str, &Upstream> = previous
+        .upstreams
+        .iter()
+        .map(|upstream| (upstream.id.as_str(), upstream))
+        .collect();
+    for upstream in &mut candidate.upstreams {
+        if let Some(old) = previous_by_id.get(upstream.id.as_str())
+            && upstream_content_eq(upstream, old)
+        {
+            // Content-identical to the last accepted projection: preserve the
+            // prior timestamps so `ConfigDelta` sees no change and the LB +
+            // passive-health state for this upstream is reused as-is.
+            upstream.created_at = old.created_at;
+            upstream.updated_at = old.updated_at;
+        }
+    }
+}
+
+/// Whether two upstreams are identical in everything EXCEPT their
+/// `created_at`/`updated_at` timestamps.
+///
+/// Compares by serializing both sides with the timestamps normalized to a single
+/// value, so the comparison is automatically complete over the whole `Upstream`
+/// schema (it picks up future fields with no code change) and ignores the
+/// `#[serde(skip)]` `resolved_subset_tls` derived overlay — which is safe because
+/// that overlay is a pure function of `subsets[].traffic_policy.tls`, so two
+/// upstreams with equal serialized content always resolve it identically. This is
+/// a cold-path comparison (slice apply only), so correctness/robustness wins over
+/// avoiding the clone.
+///
+/// `dispatch_port_override_fallback` is a `#[serde(skip)]` field that is NOT a
+/// pure function of the serialized content (#1806): it is derived from the
+/// matching *DestinationRule*, so a DR-only edit to an SD upstream's top-level
+/// `connectionPool.http` changes it while the serialized `Upstream` content is
+/// byte-identical. Comparing it here bumps the upstream's `updated_at` so the LB
+/// cache (and `ConfigDelta`) reflect the change.
+///
+/// NOTE (#1816): immediate route-TABLE rebuild on a DR-only edit is DEFERRED.
+/// `ProxyState::delta_routes_changed` keys on PROXY add/modify/remove, and the
+/// route table holds the `Arc<Proxy>` carrying the projected fallback — a
+/// shared characteristic of ALL `#[serde(skip)]` DR-derived proxy fields (incl.
+/// the established per-port `dispatch_port_overrides`), not unique to the
+/// fallback. Until #1816 wires a proxy-side route-rebuild signal for these
+/// derived fields, an SD `connectionPool.http` edit applies on the next route
+/// rebuild (proxy change / full reload).
+fn upstream_content_eq(a: &Upstream, b: &Upstream) -> bool {
+    fn content_value(upstream: &Upstream) -> serde_json::Value {
+        let mut normalized = upstream.clone();
+        // Neutralize both timestamps so only the remaining fields drive equality.
+        let epoch =
+            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_else(chrono::Utc::now);
+        normalized.created_at = epoch;
+        normalized.updated_at = epoch;
+        serde_json::to_value(&normalized).unwrap_or(serde_json::Value::Null)
+    }
+    // The DR-derived `#[serde(skip)]` fallback overlay is invisible to the
+    // serialized comparison, so compare it explicitly first.
+    if a.dispatch_port_override_fallback != b.dispatch_port_override_fallback {
+        return false;
+    }
+    let a_value = content_value(a);
+    // A serialization failure yields `Null`; never treat two failed (`Null`)
+    // serializations as "equal" (that would silently preserve a stale timestamp
+    // and hide a real change), so bail to "changed" when either side is `Null`.
+    if a_value.is_null() {
+        return false;
+    }
+    a_value == content_value(b)
 }
 
 fn gateway_config_from_mesh_slice(
@@ -1134,6 +1411,50 @@ fn materialize_east_west_gateway_proxies(
         }
     }
 
+    // SNI hosts already claimed by explicit EastWestGateway entries (same
+    // namespace as the materialized explicit proxies above). The auto-materializer
+    // yields to these so an operator's explicit route is never rejected as an
+    // overlapping host on the shared listen port. Hosts are lowercased during
+    // materialization and compared case-insensitively + wildcard-aware by
+    // `validate_stream_proxies` (`hosts_overlap`), so the override set is
+    // lowercased and the skip below uses the SAME overlap semantics — an exact
+    // membership test would miss a wildcard explicit entry like
+    // `*.ns.svc.cluster.local` that still owns the concrete auto host.
+    //
+    // The set must reflect only the gateways that ACTUALLY materialized a proxy.
+    // The loop above collapses entries by generated proxy id (`find().map() ->
+    // overwrite`), so two same-namespace gateways sharing a `name` leave only the
+    // last one's proxy bound. Collecting SNI hosts from the raw list would also
+    // keep the overwritten entry's hosts, suppressing an auto local-service proxy
+    // that no surviving explicit proxy actually owns — silently dropping that
+    // service from east-west routing. Dedup by the same generated id (last wins)
+    // so an overwritten entry's hosts never suppress autos.
+    let explicit_sni_hosts: Vec<String> = config
+        .mesh
+        .as_ref()
+        .and_then(|mesh| mesh.multi_cluster.as_ref())
+        .map(|multi_cluster| {
+            let mut hosts_by_proxy_id: HashMap<String, Vec<String>> = HashMap::new();
+            for gateway in multi_cluster
+                .east_west_gateways
+                .iter()
+                .filter(|gateway| gateway.namespace == runtime.namespace)
+            {
+                // Last write wins, mirroring the materialization loop's
+                // overwrite-by-id behavior above.
+                hosts_by_proxy_id.insert(
+                    mesh_east_west_proxy_id(&gateway.namespace, &gateway.name),
+                    gateway
+                        .sni_hosts
+                        .iter()
+                        .map(|host| host.to_ascii_lowercase())
+                        .collect(),
+                );
+            }
+            hosts_by_proxy_id.into_values().flatten().collect()
+        })
+        .unwrap_or_default();
+
     // Materialize SNI-routed TCP passthrough proxies for each local mesh
     // service so that inbound cross-cluster traffic on the east-west listen
     // port reaches the correct workload. Each service gets one proxy (SNI host
@@ -1143,6 +1464,7 @@ fn materialize_east_west_gateway_proxies(
         runtime.east_west_listen_port,
         &runtime.namespace,
         &runtime.cluster_domain,
+        &explicit_sni_hosts,
     );
 
     if !proxies.is_empty() {
@@ -1202,6 +1524,7 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -1220,6 +1543,10 @@ fn east_west_gateway_proxy(gateway: &EastWestGateway, listen_port: u16) -> Proxy
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         api_spec_id: None,
@@ -1258,6 +1585,7 @@ fn build_east_west_service_proxies_and_upstreams(
     listen_port: u16,
     namespace: &str,
     cluster_domain: &str,
+    explicit_sni_hosts: &[String],
 ) -> (Vec<Proxy>, Vec<Upstream>) {
     let mut proxies = Vec::new();
     let mut upstreams = Vec::new();
@@ -1268,10 +1596,7 @@ fn build_east_west_service_proxies_and_upstreams(
         let targets = build_east_west_service_targets(
             service,
             &mesh_slice.workloads,
-            mesh_slice
-                .multi_cluster
-                .as_ref()
-                .and_then(|multi_cluster| multi_cluster.local_cluster.as_deref()),
+            mesh_slice.multi_cluster.as_ref(),
         );
         if targets.is_empty() {
             debug!(
@@ -1282,10 +1607,38 @@ fn build_east_west_service_proxies_and_upstreams(
             continue;
         }
 
+        let cluster_domain = cluster_domain.trim_matches('.');
         let sni_hostname = format!(
             "{}.{}.svc.{}",
             service.name, service.namespace, cluster_domain
         );
+
+        // An explicit `EastWestGateway.sni_hosts` entry takes precedence over the
+        // auto-materialized local-service proxy: materializing both yields two
+        // TCP passthrough proxies claiming the same SNI on the shared east-west
+        // listen port, which `validate_stream_proxies` rejects as overlapping
+        // hosts — silently dropping the operator's explicit route. Skip the auto
+        // proxy (and its upstream) so the override survives. Use the SAME
+        // wildcard-aware `hosts_overlap` semantics validation uses (an exact
+        // match would miss a wildcard explicit entry); guard on non-empty so an
+        // absent explicit list (a catch-all under `hosts_overlap`) never
+        // suppresses every auto proxy.
+        let auto_sni_lower = sni_hostname.to_ascii_lowercase();
+        if !explicit_sni_hosts.is_empty()
+            && crate::config::types::hosts_overlap(
+                std::slice::from_ref(&auto_sni_lower),
+                explicit_sni_hosts,
+            )
+        {
+            debug!(
+                service = %service.name,
+                namespace = %service.namespace,
+                sni = %sni_hostname,
+                "Skipping east-west auto-materialization; an explicit EastWestGateway already owns this SNI host"
+            );
+            continue;
+        }
+
         let upstream_id = mesh_east_west_service_upstream_id(&service.namespace, &service.name);
 
         let upstream = Upstream {
@@ -1304,6 +1657,7 @@ fn build_east_west_service_proxies_and_upstreams(
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            locality_lb_strict: false,
             locality_lb_setting: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
@@ -1312,6 +1666,7 @@ fn build_east_west_service_proxies_and_upstreams(
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -1334,15 +1689,14 @@ fn build_east_west_service_proxies_and_upstreams(
 }
 
 /// Match a service's `WorkloadRef`s to slice `Workload`s one-to-one by index (so
-/// replicas sharing a SPIFFE id yield distinct workloads), then drop
-/// remote-cluster endpoints. Shared scaffold for the east-west and Ambient
-/// outbound target builders, which differ only in per-target port/tag policy. A
-/// remote-cluster match still consumes its index (mirroring the original inline
-/// loops) so a local replica isn't pulled into a remote ref's slot.
+/// replicas sharing a SPIFFE id yield distinct workloads), while filtering
+/// remote-cluster endpoints before consuming a ref slot. Shared scaffold for
+/// the east-west and Ambient outbound target builders, which differ only in
+/// per-target port/tag policy.
 fn matched_local_service_workloads<'a>(
     service: &crate::modes::mesh::config::MeshService,
     workloads: &'a [crate::modes::mesh::config::Workload],
-    local_cluster: Option<&str>,
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
 ) -> Vec<&'a crate::modes::mesh::config::Workload> {
     let mut matched = Vec::new();
     let mut used_workload_indices = std::collections::HashSet::new();
@@ -1359,19 +1713,15 @@ fn matched_local_service_workloads<'a>(
                     && workload.spiffe_id == workload_ref.spiffe_id
                     && workload.namespace == service.namespace
                     && (workload.service_name == service.name || !has_matching_service_metadata)
+                    && !crate::modes::mesh::multicluster::workload_is_remote(
+                        workload,
+                        multi_cluster,
+                    )
             })
         else {
             continue;
         };
         used_workload_indices.insert(workload_index);
-        if local_cluster.is_some_and(|local_cluster| {
-            workload
-                .cluster
-                .as_deref()
-                .is_some_and(|cluster| cluster != local_cluster)
-        }) {
-            continue;
-        }
         matched.push(workload);
     }
 
@@ -1386,10 +1736,10 @@ fn matched_local_service_workloads<'a>(
 fn build_east_west_service_targets(
     service: &crate::modes::mesh::config::MeshService,
     workloads: &[crate::modes::mesh::config::Workload],
-    local_cluster: Option<&str>,
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
 ) -> Vec<UpstreamTarget> {
     let mut targets = Vec::new();
-    for workload in matched_local_service_workloads(service, workloads, local_cluster) {
+    for workload in matched_local_service_workloads(service, workloads, multi_cluster) {
         // Backend (container) port for this workload address: honor the first
         // service port's `targetPort` (Kubernetes' authoritative
         // service-port→container-port binding). A DECLARED targetPort is
@@ -1411,11 +1761,19 @@ fn build_east_west_service_targets(
         };
 
         for address in &workload.addresses {
+            // Copy the workload's operator-authored labels as target tags, but
+            // STRIP the reserved `mesh.*` namespace first: those keys are mesh
+            // provenance/transport markers the data plane owns (e.g. the
+            // `mesh.remote=true` strict-locality signal). Without this, a workload
+            // labelled `mesh.remote: "true"` would make a LOCAL east-west target
+            // masquerade as remote and be excluded by strict locality LB.
+            let mut tags = workload.selector.labels.clone();
+            crate::modes::mesh::multicluster::strip_reserved_mesh_tags(&mut tags);
             targets.push(UpstreamTarget {
                 host: address.clone(),
                 port: target_port,
                 weight: 1,
-                tags: workload.selector.labels.clone(),
+                tags,
                 locality: workload.locality.clone(),
                 path: None,
             });
@@ -1456,6 +1814,7 @@ fn east_west_service_proxy(
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -1474,6 +1833,10 @@ fn east_west_service_proxy(
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
         api_spec_id: None,
@@ -1734,16 +2097,13 @@ pub(crate) fn service_tcp_stream_ports(
 
 /// UDP service ports of an in-mesh service, with `protocol_overrides` applied:
 /// the third leg of the HTTP-family / raw-TCP-stream / UDP port partition.
-/// UDP capture/egress is not yet wired (REDIRECT / `SO_ORIGINAL_DST` does not
-/// apply to the UDP model), so this currently materializes nothing — it exists
-/// so a `protocol: UDP` port partitions cleanly out of the other two lanes
-/// instead of being mis-routed as HTTP, and so the later F3 §3.3 datapath stage
-/// has a single forward-derivation source. Mirrors [`service_http_family_ports`]
-/// and [`service_tcp_stream_ports`].
-// Inert in this schema-only stage: the UDP capture/egress materializer that
-// consumes this arrives in a later F3 §3.3 stage. Exercised today only by the
-// partition unit test.
-#[allow(dead_code)]
+/// Consumed by the Ambient UDP egress materializer
+/// (`materialize_mesh_outbound_udp_upstreams`, F3 §3.3 Stage 4) and the route
+/// table's `mesh_udp_egress` index — a captured UDP datagram whose orig-dst
+/// matches `(service VIP, UDP service port)` is tunnelled over a `udp`-marked
+/// HBONE CONNECT. Mirrors [`service_http_family_ports`] and
+/// [`service_tcp_stream_ports`]; the SINGLE forward-derivation source the
+/// materializer, the route table, and the capability enrollment share.
 pub(crate) fn service_udp_stream_ports(
     service: &crate::modes::mesh::config::MeshService,
 ) -> Vec<&crate::modes::mesh::config::ServicePort> {
@@ -1872,6 +2232,17 @@ pub(crate) fn mesh_outbound_tcp_upstream_id(namespace: &str, name: &str, port: u
     format!("__mesh-out-tcp-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
 
+/// Upstream id for a materialized UDP egress port, one per UDP service port
+/// (F3 §3.3 Stage 4). A DISTINCT id space from both
+/// [`mesh_outbound_upstream_id`] (HTTP per-port) and
+/// [`mesh_outbound_tcp_upstream_id`] (raw-TCP per-port) so a service exposing
+/// the same port number across the three lanes (via `protocol_overrides` skew)
+/// can never conflate LB counters / passive health / DR fan-out. Same non-route
+/// prefix rationale (never enters the route table or `config.proxies`).
+pub(crate) fn mesh_outbound_udp_upstream_id(namespace: &str, name: &str, port: u16) -> String {
+    format!("__mesh-out-udp-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
+}
+
 /// Upstream id for a raw-TCP egress upstream addressed by a DIRECT pod IP
 /// (headless / direct-dial path; F3 §3.4), one per
 /// (stream-family service port × backing workload IP). A captured raw-TCP dial
@@ -1968,7 +2339,7 @@ impl MeshTcpBywlUpstreamSpec<'_> {
 pub(crate) fn mesh_outbound_tcp_bywl_upstreams<'a>(
     services: &'a [crate::modes::mesh::config::MeshService],
     workloads: &'a [crate::modes::mesh::config::Workload],
-    local_cluster: Option<&str>,
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
 ) -> Vec<MeshTcpBywlUpstreamSpec<'a>> {
     let mut specs = Vec::new();
     for service in services {
@@ -1987,7 +2358,7 @@ pub(crate) fn mesh_outbound_tcp_bywl_upstreams<'a>(
             // upstream per `(IP, port)`.
             let mut seen: std::collections::HashSet<(std::net::IpAddr, u16)> =
                 std::collections::HashSet::new();
-            for workload in matched_local_service_workloads(service, workloads, local_cluster) {
+            for workload in matched_local_service_workloads(service, workloads, multi_cluster) {
                 // Same app-port resolution as `build_outbound_mesh_targets`:
                 // a DECLARED targetPort is authoritative (resolve or SKIP);
                 // only an ABSENT one falls back to the service port.
@@ -2649,6 +3020,7 @@ fn mesh_inbound_loopback_proxy_to(
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -2667,6 +3039,10 @@ fn mesh_inbound_loopback_proxy_to(
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         api_spec_id: None,
@@ -2721,6 +3097,7 @@ pub(crate) fn mesh_inbound_tcp_relay_proxy(route: &MeshInboundTcpRoute) -> Proxy
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -2739,6 +3116,10 @@ pub(crate) fn mesh_inbound_tcp_relay_proxy(route: &MeshInboundTcpRoute) -> Proxy
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         api_spec_id: None,
@@ -2799,6 +3180,7 @@ pub(crate) fn mesh_inbound_hbone_relay_proxy(host: &str, port: u16) -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -2817,6 +3199,10 @@ pub(crate) fn mesh_inbound_hbone_relay_proxy(host: &str, port: u16) -> Proxy {
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         api_spec_id: None,
@@ -2899,12 +3285,11 @@ fn materialize_mesh_outbound_proxies(
     let now = chrono::Utc::now();
     // Exclude remote-cluster endpoints: direct outbound HBONE targets a
     // destination service's LOCAL-cluster pods (remote clusters are reached via
-    // the east-west gateway, not a per-pod HBONE tunnel). Local workloads are
-    // `None` or `Some(local_cluster)`; remote ones carry a different cluster.
-    let local_cluster = mesh_slice
-        .multi_cluster
-        .as_ref()
-        .and_then(|mc| mc.local_cluster.as_deref());
+    // the east-west gateway, not a per-pod HBONE tunnel). Classification is by
+    // discovery provenance (`workload_is_remote`): a local workload is `None`,
+    // `Some(local_cluster)`, or a cluster the config does not list as remote;
+    // a remote one carries a configured remote cluster's name.
+    let multi_cluster = mesh_slice.multi_cluster.as_ref();
     let mut materialized = 0usize;
     for service in &mesh_slice.services {
         // HTTP-family routability is read from the SERVICE port protocol
@@ -2943,7 +3328,7 @@ fn materialize_mesh_outbound_proxies(
                 service_port,
                 protocol,
                 &mesh_slice.workloads,
-                local_cluster,
+                multi_cluster,
                 multi_port_service,
             );
             if targets.is_empty() {
@@ -3086,10 +3471,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
         MeshTopology::Sidecar => MeshEgressTransport::SidecarMtls,
         _ => return,
     };
-    let local_cluster = mesh_slice
-        .multi_cluster
-        .as_ref()
-        .and_then(|mc| mc.local_cluster.as_deref());
+    let multi_cluster = mesh_slice.multi_cluster.as_ref();
     let now = chrono::Utc::now();
     let mut materialized = 0usize;
     for service in &mesh_slice.services {
@@ -3123,7 +3505,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
                 service_port,
                 protocol,
                 &mesh_slice.workloads,
-                local_cluster,
+                multi_cluster,
                 false,
             );
             if targets.is_empty() {
@@ -3173,7 +3555,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
     // (`mesh_tcp_egress_by_workload`) and the accept-loop fallback enforce it.
     let mut bywl_materialized = 0usize;
     for spec in
-        mesh_outbound_tcp_bywl_upstreams(&mesh_slice.services, &mesh_slice.workloads, local_cluster)
+        mesh_outbound_tcp_bywl_upstreams(&mesh_slice.services, &mesh_slice.workloads, multi_cluster)
     {
         // One tagged target dialing the resolved container port, identity-pinned
         // to this workload — built with the SAME transport tag builders the VIP
@@ -3259,6 +3641,125 @@ fn materialize_mesh_outbound_tcp_upstreams(
     }
 }
 
+/// Materialize per-port UDP egress upstreams for the UDP service ports of
+/// in-mesh services (F3 §3.3 Stage 4). **Ambient-only.**
+///
+/// Like raw-TCP egress, NO route proxy enters the config: a UDP datagram has no
+/// Host header to route by. Instead the captured datagram's original
+/// destination (recovered from the TPROXY `IP_RECVORIGDSTADDR` cmsg, NOT
+/// `SO_ORIGINAL_DST` which is TCP-only) is matched STRICTLY against
+/// `(cluster_ip, UDP service port)` by the route table's `mesh_udp_egress`
+/// index and tunnelled over a `udp`-marked HBONE CONNECT to the LB-selected
+/// workload's app port (length-delimited datagrams — see
+/// `crate::proxy::mesh_udp_frame`). The destination's inbound relay unframes the
+/// tunnel into a local `UdpSocket` to the CONNECT authority.
+///
+/// **Dual-transport, mirroring raw-TCP egress**: Ambient relays the datagram
+/// tunnel over an HBONE CONNECT (`:15008`, `mesh.hbone`-tagged targets →
+/// `HboneConnectionPool::get_datagram_tunnel`); Sidecar relays it over a
+/// mesh-mTLS CONNECT (`:15006`, `mesh.mtls`-tagged targets →
+/// `MeshMtlsConnectionPool::open_datagram_tunnel`) — Sidecar peers expose no
+/// `:15008` HBONE listener (they speak plain SVID-mTLS HTTP on `:15006`). The
+/// materializer therefore gates `Ambient => Hbone, Sidecar => SidecarMtls, _ =>
+/// return`; other topologies (EastWestGateway / EgressGateway) materialize
+/// nothing and UDP stays outside the mesh. `build_outbound_mesh_targets` stamps
+/// the per-transport tag (`mesh.mtls` + pinned `mesh.spiffe_id` for Sidecar), so
+/// the egress datapath picks the right tunnel from the tag. Headless / VIP-less
+/// UDP services also materialize nothing (a UDP datagram carries no Host, so
+/// captured dials are matched strictly by VIP).
+fn materialize_mesh_outbound_udp_upstreams(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
+    // Dual-transport: Ambient → HBONE datagram tunnel (`:15008`); Sidecar →
+    // mesh-mTLS datagram tunnel (`:15006`). Other topologies materialize nothing.
+    let transport = match runtime.topology {
+        MeshTopology::Ambient => MeshEgressTransport::Hbone,
+        MeshTopology::Sidecar => MeshEgressTransport::SidecarMtls,
+        _ => return,
+    };
+    let multi_cluster = mesh_slice.multi_cluster.as_ref();
+    let now = chrono::Utc::now();
+    let mut materialized = 0usize;
+    for service in &mesh_slice.services {
+        let udp_ports = service_udp_stream_ports(service);
+        if udp_ports.is_empty() {
+            continue;
+        }
+        if service.cluster_ips.is_empty() {
+            warn!(
+                service = %service.name,
+                namespace = %service.namespace,
+                udp_ports = udp_ports.len(),
+                "In-mesh service declares UDP ports but carries no cluster_ips; UDP egress maps \
+                 captured original destinations to services strictly by service VIP (a datagram \
+                 has no Host header and a bare port number is ambiguous), so these ports cannot \
+                 be egress-routed. Headless services are expected here; otherwise populate \
+                 cluster_ips."
+            );
+            continue;
+        }
+        for service_port in &udp_ports {
+            let protocol = service
+                .protocol_overrides
+                .get(&service_port.port)
+                .copied()
+                .unwrap_or(service_port.protocol);
+            let targets = build_outbound_mesh_targets(
+                transport,
+                runtime,
+                service,
+                service_port,
+                protocol,
+                &mesh_slice.workloads,
+                multi_cluster,
+                false,
+            );
+            if targets.is_empty() {
+                debug!(
+                    service = %service.name,
+                    namespace = %service.namespace,
+                    service_port = service_port.port,
+                    "Skipping UDP mesh service port with no reachable local-cluster workload targets"
+                );
+                continue;
+            }
+            let upstream_id =
+                mesh_outbound_udp_upstream_id(&service.namespace, &service.name, service_port.port);
+            let service_fqdn = format!(
+                "{}.{}.svc.{}",
+                service.name,
+                service.namespace,
+                runtime.cluster_domain.trim_matches('.')
+            );
+            let upstream = mesh_outbound_route_upstream(
+                &upstream_id,
+                &service.namespace,
+                &service_fqdn,
+                targets,
+                now,
+            );
+            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+                *existing = upstream;
+            } else {
+                config.upstreams.push(upstream);
+            }
+            materialized += 1;
+        }
+    }
+
+    if materialized > 0 {
+        info!(
+            udp_upstreams = materialized,
+            topology = ?runtime.topology,
+            "Materialized mesh UDP egress upstreams for in-mesh services (datagrams tunnelled over \
+             a udp-marked mesh CONNECT — HBONE :15008 for Ambient, mesh-mTLS :15006 for Sidecar — \
+             selected by captured original destination against service VIPs)"
+        );
+    }
+}
+
 /// Reserved id prefix for the synthesized raw-TCP egress relay proxies. Like
 /// the upstream id, deliberately NOT under `__mesh-outbound-` so it can never
 /// be misclassified as a direction-scoped route id — these proxies never
@@ -3290,7 +3791,7 @@ pub(crate) fn mesh_outbound_tcp_relay_proxy(
 ) -> Proxy {
     let id = format!("{MESH_OUTBOUND_TCP_RELAY_PROXY_ID_PREFIX}{namespace}-{name}-{port}")
         .replace(['/', '.'], "-");
-    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id)
+    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id, BackendScheme::Tcp)
 }
 
 /// Build the synthesized relay proxy backing one DIRECT-pod-IP raw-TCP egress
@@ -3310,24 +3811,54 @@ pub(crate) fn mesh_outbound_tcp_bywl_relay_proxy(
         "{MESH_OUTBOUND_TCP_BYWL_RELAY_PROXY_ID_PREFIX}{namespace}-{name}-{port}-{canonical_ip}"
     )
     .replace(['/', '.', ':'], "-");
-    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id)
+    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id, BackendScheme::Tcp)
 }
 
-/// Shared body for the raw-TCP egress relay proxies (VIP and by-workload). The
-/// only fields that vary between the two are the `id` and the `upstream_id` it
-/// dispatches through — everything else (the `BackendScheme::Tcp` capability
-/// gate, the connect/read/write budgets, the stream idle default) is identical,
-/// so both relay flavors stay byte-for-byte consistent in the capability key /
-/// pool-config dimensions.
-fn mesh_outbound_tcp_relay_proxy_with_id(id: String, namespace: &str, upstream_id: &str) -> Proxy {
+/// Reserved id prefix for the synthesized UDP egress relay proxies (F3 §3.3
+/// Stage 4). Same non-route-prefix rationale as the raw-TCP relay proxies; a
+/// DISTINCT prefix so a TCP relay proxy and a UDP relay proxy for the same
+/// service port never collide in the capability registry / pool-config keys.
+pub(crate) const MESH_OUTBOUND_UDP_RELAY_PROXY_ID_PREFIX: &str = "__mesh-out-udp-relay-";
+
+/// Build the synthesized relay proxy backing one UDP egress entry (F3 §3.3
+/// Stage 4). Same deterministic shape and capability/pool-config contract as
+/// [`mesh_outbound_tcp_relay_proxy`] (shares the builder body), but uses
+/// `BackendScheme::Udp` — which the capability probe gate recognizes for HBONE
+/// probing (a UDP egress target still rides an HBONE CONNECT, so its HBONE
+/// support must be proven) while keeping the plain-HTTP/h2c probes off it. The
+/// id is forward-derived, never parsed.
+pub(crate) fn mesh_outbound_udp_relay_proxy(
+    namespace: &str,
+    name: &str,
+    port: u16,
+    upstream_id: &str,
+) -> Proxy {
+    let id = format!("{MESH_OUTBOUND_UDP_RELAY_PROXY_ID_PREFIX}{namespace}-{name}-{port}")
+        .replace(['/', '.'], "-");
+    mesh_outbound_tcp_relay_proxy_with_id(id, namespace, upstream_id, BackendScheme::Udp)
+}
+
+/// Shared body for the mesh egress relay proxies (raw-TCP VIP/by-workload and
+/// UDP). The fields that vary between flavors are the `id`, the `upstream_id` it
+/// dispatches through, and the `scheme` (`Tcp` for raw-TCP, `Udp` for UDP — both
+/// keep the plain-HTTP/h2c probes away from the app port while still letting the
+/// HBONE probe run); everything else (the connect/read/write budgets, the stream
+/// idle default) is identical, so the flavors stay byte-for-byte consistent in
+/// the capability key / pool-config dimensions.
+fn mesh_outbound_tcp_relay_proxy_with_id(
+    id: String,
+    namespace: &str,
+    upstream_id: &str,
+    scheme: BackendScheme,
+) -> Proxy {
     let now = chrono::Utc::now();
     Proxy {
-        name: Some(format!("mesh raw-tcp egress {id}")),
+        name: Some(format!("mesh egress {id}")),
         id,
         namespace: namespace.to_string(),
         hosts: Vec::new(),
         listen_path: None,
-        backend_scheme: Some(BackendScheme::Tcp),
+        backend_scheme: Some(scheme),
         dispatch_kind: Default::default(),
         backend_host: String::new(),
         backend_port: 0,
@@ -3343,6 +3874,7 @@ fn mesh_outbound_tcp_relay_proxy_with_id(id: String, namespace: &str, upstream_i
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -3361,6 +3893,10 @@ fn mesh_outbound_tcp_relay_proxy_with_id(id: String, namespace: &str, upstream_i
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
         api_spec_id: None,
@@ -3408,11 +3944,11 @@ fn build_outbound_mesh_targets(
     service_port: &crate::modes::mesh::config::ServicePort,
     protocol: AppProtocol,
     workloads: &[crate::modes::mesh::config::Workload],
-    local_cluster: Option<&str>,
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
     multi_port_service: bool,
 ) -> Vec<UpstreamTarget> {
     let mut targets = Vec::new();
-    for workload in matched_local_service_workloads(service, workloads, local_cluster) {
+    for workload in matched_local_service_workloads(service, workloads, multi_cluster) {
         // App (container) port the request is for. A DECLARED `targetPort` is
         // authoritative: resolve it, or SKIP this target (fail closed) rather
         // than fall back to the service port — an unresolved named targetPort
@@ -3531,6 +4067,7 @@ fn mesh_outbound_route_proxy(
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -3549,6 +4086,10 @@ fn mesh_outbound_route_proxy(
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
         api_spec_id: None,
@@ -3604,6 +4145,7 @@ fn mesh_outbound_route_upstream(
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -3612,6 +4154,7 @@ fn mesh_outbound_route_upstream(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,
@@ -3709,11 +4252,12 @@ fn apply_destination_rules(
     // equals T leak onto this upstream — each sibling upstream must carry
     // exactly its own port's policy.
     // The raw-TCP per-port upstreams (`__mesh-out-tcp-upstream-*`) join the
-    // same map: identical owner-port semantics, distinct id space.
-    let local_cluster = mesh_slice
-        .multi_cluster
-        .as_ref()
-        .and_then(|mc| mc.local_cluster.as_deref());
+    // same map: identical owner-port semantics, distinct id space. The Ambient
+    // UDP per-port upstreams (`__mesh-out-udp-upstream-*`, F3 §3.3 Stage 4) join
+    // too — a `portLevelSettings` entry on a UDP Service port (e.g. `port: 53,
+    // targetPort: 5353`) must map to its UDP upstream or its traffic policy is
+    // silently dropped (codex r3).
+    let multi_cluster = mesh_slice.multi_cluster.as_ref();
     let mut outbound_upstream_owner_port: std::collections::HashMap<String, u16> = mesh_slice
         .services
         .iter()
@@ -3732,6 +4276,12 @@ fn apply_destination_rules(
                         sp.port,
                     )
                 }))
+                .chain(service_udp_stream_ports(svc).into_iter().map(|sp| {
+                    (
+                        mesh_outbound_udp_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        sp.port,
+                    )
+                }))
                 .collect::<Vec<_>>()
         })
         .collect();
@@ -3740,7 +4290,7 @@ fn apply_destination_rules(
     // `portLevelSettings` entry authored on that port fans onto them exactly like
     // the VIP per-port upstreams (same forward-derivation source).
     for spec in
-        mesh_outbound_tcp_bywl_upstreams(&mesh_slice.services, &mesh_slice.workloads, local_cluster)
+        mesh_outbound_tcp_bywl_upstreams(&mesh_slice.services, &mesh_slice.workloads, multi_cluster)
     {
         outbound_upstream_owner_port.insert(spec.upstream_id, spec.service_port.port);
     }
@@ -3842,18 +4392,32 @@ fn apply_destination_rules(
             // by this upstream so a single DR `trafficPolicy.connectionPool`
             // block applies uniformly across the upstream. Per-port
             // `portLevelSettings.connectionPool.http` overrides per-port
-            // below. Service-discovery upstreams skip the fan-out because
-            // their target ports aren't known at apply time (the per-port loop
-            // below still applies if the operator explicitly listed
-            // `portLevelSettings`). Mirrors the T1-D fan-out for
+            // below. Mirrors the T1-D fan-out for
             // `connectionPool.tcp.{maxConnections,tcpKeepalive}`.
+            //
+            // Service-discovery upstreams cannot fan out: their target ports
+            // resolve at runtime, not at apply time. Instead the top-level
+            // overlay is accumulated on `dispatch_port_override_fallback`, which
+            // `resolve_dispatch_port_overrides` projects onto the proxy and the
+            // HTTP-family dispatch resolvers apply by the LB-selected port (an
+            // explicit `portLevelSettings` entry for that port still wins). This
+            // does NOT materialize discovery targets (the rejected PR #1602
+            // rework) — it only carries the cap into runtime port resolution.
+            // The overlay is applied additively (same `apply_*` helper as the
+            // fan-out) so a later matching DR layers over an earlier one.
             if let Some(ref tp) = dr.traffic_policy
                 && let Some(ref http) = tp.connection_pool_http
-                && !has_service_discovery
             {
-                for port in &upstream_target_ports {
-                    let override_slot = upstream.port_overrides.entry(*port).or_default();
-                    apply_connection_pool_http_to_port_override(override_slot, http);
+                if has_service_discovery {
+                    let fallback = upstream
+                        .dispatch_port_override_fallback
+                        .get_or_insert_default();
+                    apply_connection_pool_http_to_port_override(fallback, http);
+                } else {
+                    for port in &upstream_target_ports {
+                        let override_slot = upstream.port_overrides.entry(*port).or_default();
+                        apply_connection_pool_http_to_port_override(override_slot, http);
+                    }
                 }
             }
 
@@ -4061,6 +4625,7 @@ fn apply_destination_rules(
                             });
                             SubsetTrafficPolicy {
                                 load_balancer_algorithm: mesh_lb_to_ferrum(&sp.load_balancer),
+                                hash_on: mesh_hash_on_to_ferrum(&sp.load_balancer),
                                 tls: sp.tls.clone(),
                                 connect_timeout_ms: sp.connect_timeout_ms,
                                 passive_health_check,
@@ -4074,6 +4639,34 @@ fn apply_destination_rules(
                 // recomputes overlays for the new subset set against the
                 // final upstream-level TLS.
                 upstream.resolved_subset_tls.clear();
+            }
+
+            // Top-level `trafficPolicy.connectTimeout` for a UDP egress upstream
+            // (codex r6 P2). The top-level timeout is applied to `config.proxies`
+            // below, but a UDP egress upstream (`__mesh-out-udp-upstream-*`) is
+            // referenced by NO config proxy — it materializes a synthesized relay
+            // proxy in the router table that dials via
+            // `hbone_pool::get_datagram_tunnel`, which reads the connect timeout
+            // from `dispatch_port_overrides` (projected from `port_overrides`) and
+            // otherwise falls back to the relay proxy's hardcoded default. Seed the
+            // top-level value onto each materialized target port carrying no
+            // per-port `portLevelSettings.connectTimeout`, so the UDP relay honors
+            // the operator's top-level connectTimeout instead of the 5s default.
+            // Per-port entries written above already win (only unset slots are
+            // seeded); other lanes are unaffected — raw-TCP relay proxies do not
+            // read `dispatch_port_overrides`, and HTTP upstreams reach config
+            // proxies. Keyed by the materialized TARGET port (`get_datagram_tunnel`
+            // looks the override up by the dialed app port, not the service port).
+            if let Some(timeout_ms) = connect_timeout_ms
+                && upstream.id.starts_with("__mesh-out-udp-upstream-")
+            {
+                let target_ports: Vec<u16> = upstream.targets.iter().map(|t| t.port).collect();
+                for port in target_ports {
+                    let slot = upstream.port_overrides.entry(port).or_default();
+                    if slot.connect_timeout_ms.is_none() {
+                        slot.connect_timeout_ms = Some(timeout_ms);
+                    }
+                }
             }
 
             // Per-subset `connectionPool.tcp.connectTimeout` overrides the DR
@@ -4311,6 +4904,9 @@ fn apply_connection_pool_http_to_port_override(
     }
     if let Some(max_retries) = http.max_retries {
         slot.max_retries = Some(max_retries);
+    }
+    if let Some(pending) = http.http1_max_pending_requests {
+        slot.http1_max_pending_requests = Some(pending);
     }
 }
 
@@ -5199,6 +5795,7 @@ fn build_egress_upstream(
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -5207,6 +5804,7 @@ fn build_egress_upstream(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,
@@ -5242,11 +5840,17 @@ fn build_egress_upstream_targets(
                     None => Some(port_number),
                 }?;
 
+                // Copy the ServiceEntry endpoint's operator-authored labels as
+                // target tags, but STRIP the reserved `mesh.*` namespace first so a
+                // hand-authored `mesh.remote`/`mesh.hbone`/… label cannot forge a
+                // mesh provenance/transport marker the data plane owns.
+                let mut tags = ep.labels.clone();
+                crate::modes::mesh::multicluster::strip_reserved_mesh_tags(&mut tags);
                 Some(UpstreamTarget {
                     host: ep.address.clone(),
                     port: target_port,
                     weight: 1,
-                    tags: ep.labels.clone(),
+                    tags,
                     locality: None,
                     path: None,
                 })
@@ -5359,6 +5963,7 @@ fn egress_gateway_proxy(
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -5377,6 +5982,10 @@ fn egress_gateway_proxy(
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
         api_spec_id: None,
@@ -5448,6 +6057,7 @@ fn stream_egress_gateway_proxy(
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -5466,6 +6076,10 @@ fn stream_egress_gateway_proxy(
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_id: Some(upstream_id.to_string()),
         upstream_subset: None,
         api_spec_id: None,
@@ -5817,6 +6431,15 @@ fn mesh_outbound_registry_listen_ports(runtime: &MeshRuntimeConfig) -> Vec<u16> 
         .listener_plan()
         .into_iter()
         .filter(|listener| listener.direction == MeshTrafficDirection::Outbound)
+        // Exclude the UDP TPROXY capture port (codex r1 P3): the outbound
+        // registry enforces HTTP/stream egress that arrived through the TCP
+        // `PlaintextCapture` listener, but the UDP capture socket is a
+        // separate UDP-only sink. TCP and UDP can coexist on the same numeric
+        // port, so including the UDP capture port here would make a regular
+        // TCP/HTTP listener on that number be treated as mesh captured egress
+        // and rejected against the registry even though it never arrived via
+        // the TCP capture listener.
+        .filter(|listener| listener.kind != MeshListenerKind::PlaintextUdpCapture)
         .filter_map(|listener| {
             let port = listener.addr.port();
             (port != 0).then_some(port)
@@ -5930,14 +6553,10 @@ fn merge_tracing_config(
     if next.disable_span_reporting.is_some() {
         current.disable_span_reporting = next.disable_span_reporting;
     }
-    if !next.custom_tags.is_empty() {
-        current.custom_tags.clone_from(&next.custom_tags);
-    }
-    if !next.custom_header_tags.is_empty() {
-        current
-            .custom_header_tags
-            .clone_from(&next.custom_header_tags);
-    }
+    current.custom_tags.extend(next.custom_tags.clone());
+    current
+        .custom_header_tags
+        .extend(next.custom_header_tags.clone());
     if !next.providers.is_empty() {
         current.providers.clone_from(&next.providers);
     }
@@ -6084,7 +6703,10 @@ fn ensure_global_plugin(
         .any(|plugin| plugin.scope == PluginScope::Global && plugin.plugin_name == plugin_name)
     {
         // A user-managed global plugin of the same type is an explicit
-        // operator override. Reserved mesh-managed IDs still update above.
+        // operator override when plugin_configs are already present in the
+        // GatewayConfig handed to mesh preparation. Native/xDS MeshSlice feeds
+        // do not currently carry operator plugin_configs. Reserved
+        // mesh-managed IDs still update above.
     } else {
         config.plugin_configs.push(mesh_plugin);
     }
@@ -6278,6 +6900,18 @@ async fn serve_mesh_runtime(
     initial_applied_mesh_slice: Option<Arc<MeshSlice>>,
     mut mesh_background_handles: Vec<JoinHandle<()>>,
 ) -> Result<(), anyhow::Error> {
+    // Fail closed on malformed UDP capture settings (codex r2 P2 / r3 P2),
+    // BEFORE binding the DNS proxy or spawning any mesh background task. The
+    // `udp_capture_listener()` helper feeding `listener_plan()` is infallible
+    // (read-only predicates call it too), so it can only warn-and-skip a parse
+    // error — which would silently drop the capture listener while the Stage-2
+    // TPROXY rules still divert UDP to a now-unbound port. Validating here, at
+    // the very top of the serving path, makes an operator config error abort
+    // mesh startup cleanly instead of leaking a bound DNS socket / spawned tasks
+    // (which a later `?` would have left running for in-process retries/tests).
+    crate::capture::udp_capture_settings_from_env()
+        .map_err(|e| anyhow::anyhow!("Invalid mesh UDP capture settings: {e}"))?;
+
     let dns_cache = DnsCache::new(DnsConfig {
         global_overrides: env_config.dns_overrides.clone(),
         resolver_addresses: env_config.dns_resolver_address.clone(),
@@ -6349,6 +6983,13 @@ async fn serve_mesh_runtime(
         if let Some(handle) = node_waypoint::spawn_cgroup_sweep_task(
             resolver.clone(),
             env_config.mesh_node_waypoint_cgroup_sweep_interval_secs,
+            shutdown_tx.subscribe(),
+        ) {
+            mesh_background_handles.push(handle);
+        }
+        if let Some(handle) = node_waypoint::spawn_idle_identity_gc_task(
+            resolver.clone(),
+            env_config.mesh_node_waypoint_idle_gc_interval_secs,
             shutdown_tx.subscribe(),
         ) {
             mesh_background_handles.push(handle);
@@ -6546,19 +7187,19 @@ async fn serve_mesh_runtime(
              egress); keep it enabled only with compensating network controls."
         );
     }
-    let mesh_ca_trust_overlay_slot = empty_mesh_inbound_trust_overlay_slot();
+    let mesh_runtime_trust_overlay_slot = empty_mesh_inbound_trust_overlay_slot();
     let mesh_ca_svid_slot = start_mesh_ca_backend_svid_source(
         &proxy_state,
         &runtime,
         &env_config,
-        mesh_ca_trust_overlay_slot.clone(),
+        mesh_runtime_trust_overlay_slot.clone(),
         &mut mesh_background_handles,
         shutdown_tx.subscribe(),
     )
     .await?;
-    let mesh_ca_trust_overlay_slot = mesh_ca_svid_slot
-        .as_ref()
-        .map(|_| mesh_ca_trust_overlay_slot);
+    let mesh_runtime_trust_overlay_slot = (mesh_ca_svid_slot.is_some()
+        || gateway_svid_material_configured(&env_config))
+    .then_some(mesh_runtime_trust_overlay_slot);
 
     for host in proxy_state.plugin_cache.collect_warmup_hostnames() {
         hostnames.push((host, None, None));
@@ -6672,18 +7313,28 @@ async fn serve_mesh_runtime(
         initial_applied_mesh_slice.as_deref(),
         mesh_ca_svid_slot.as_ref(),
     );
-    if mesh_ca_svid_slot.is_some()
-        && let Some(slice) = initial_applied_mesh_slice.as_deref()
-    {
+    if let Some(slice) = initial_applied_mesh_slice.as_deref() {
         publish_staged_spiffe_bundle(
             &proxy_state,
             stage_gateway_runtime_spiffe_bundle(
                 &proxy_state,
-                mesh_ca_svid_slot.as_ref(),
-                mesh_ca_trust_overlay_slot.as_ref(),
+                mesh_inbound_spiffe_slot.as_ref(),
+                mesh_runtime_trust_overlay_slot.as_ref(),
                 slice,
             ),
         );
+    }
+    if let (Some(inbound_slot), Some(trust_overlay_slot)) = (
+        mesh_inbound_spiffe_slot.clone(),
+        mesh_runtime_trust_overlay_slot.clone(),
+    ) {
+        mesh_background_handles.push(start_mesh_inbound_svid_rotation_republisher(
+            proxy_state.clone(),
+            inbound_slot,
+            trust_overlay_slot,
+            proxy_state.backend_svid_rotation_tx.subscribe(),
+            shutdown_tx.subscribe(),
+        ));
     }
     let frontend_tls = load_mesh_frontend_tls(
         &env_config,
@@ -6806,27 +7457,47 @@ async fn serve_mesh_runtime(
         // F1: warn when discovery is enabled but the local workload locality
         // is absent. Without a source locality the priority-tier load balancer
         // has no source region to prefer, so `target_locality_ranks` stays
-        // empty and ALL candidates (local + remote) are returned together —
-        // failing open rather than local-first. This is not a bug in the LB
-        // itself; it is the expected behavior when no locality is configured.
-        // However it is surprising to operators who enabled discovery expecting
-        // local-first failover. Emit a startup WARN so the misconfiguration is
-        // visible.
+        // empty. The behavior in that case depends on FERRUM_MESH_LOCALITY_LB_STRICT:
+        // default (fail-open) returns ALL candidates (local + remote) together;
+        // strict (fail-closed-to-local) restricts to LOCAL endpoints, widening to
+        // remote only when no local endpoint is healthy. The warning text below is
+        // branched accordingly so it never tells a strict-mode operator that local
+        // and remote are selected together (which would be false). This is not a
+        // bug in the LB; it is the expected behavior when no locality is
+        // configured. Emit a startup WARN so the posture is visible to an operator
+        // who enabled discovery expecting local-first failover.
         if initial_applied_mesh_slice
             .as_deref()
             .is_none_or(|slice| mesh_source_workload_locality(slice).is_none())
         {
-            warn!(
-                poll_interval_seconds = env_config.mesh_remote_discovery_poll_interval_seconds,
-                "Cross-cluster endpoint discovery is enabled \
-                 (FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS > 0) but the local \
-                 workload source locality is not set (topology.kubernetes.io/region+zone \
-                 labels missing or SPIFFE-matched workload has no locality). \
-                 The locality-aware priority-tier load balancer requires a source locality \
-                 to prefer local endpoints over remote ones; without it, local and remote \
-                 endpoints are selected together (fails open, not local-first). \
-                 See docs/mesh.md \"Cross-Cluster Endpoint Discovery\" for the precondition."
-            );
+            if runtime.locality_lb_strict {
+                warn!(
+                    poll_interval_seconds = env_config.mesh_remote_discovery_poll_interval_seconds,
+                    "Cross-cluster endpoint discovery is enabled \
+                     (FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS > 0) but the local \
+                     workload source locality is not set (topology.kubernetes.io/region+zone \
+                     labels missing or SPIFFE-matched workload has no locality). \
+                     FERRUM_MESH_LOCALITY_LB_STRICT is on, so without a source locality the \
+                     load balancer restricts selection to LOCAL endpoints (fail-closed-to-local), \
+                     widening to remote endpoints only when no local endpoint is healthy. \
+                     Set the workload's topology.kubernetes.io/region+zone labels to enable \
+                     full local-first priority-tier failover. \
+                     See docs/mesh.md \"Cross-Cluster Endpoint Discovery\" for details."
+                );
+            } else {
+                warn!(
+                    poll_interval_seconds = env_config.mesh_remote_discovery_poll_interval_seconds,
+                    "Cross-cluster endpoint discovery is enabled \
+                     (FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS > 0) but the local \
+                     workload source locality is not set (topology.kubernetes.io/region+zone \
+                     labels missing or SPIFFE-matched workload has no locality). \
+                     The locality-aware priority-tier load balancer requires a source locality \
+                     to prefer local endpoints over remote ones; without it (and with strict \
+                     mode off), local and remote endpoints are selected together (fails open, \
+                     not local-first). \
+                     See docs/mesh.md \"Cross-Cluster Endpoint Discovery\" for the precondition."
+                );
+            }
         }
         let remote_discovery_manager = multicluster::RemoteDiscoveryManager::new(
             Some(remote_discovery_config),
@@ -6850,7 +7521,7 @@ async fn serve_mesh_runtime(
             server_identity: mesh_frontend_identity,
             last_snapshot: initial_inbound_tls_snapshot,
             spiffe_bundle_slot: mesh_inbound_spiffe_slot,
-            runtime_trust_overlay_slot: mesh_ca_trust_overlay_slot,
+            runtime_trust_overlay_slot: mesh_runtime_trust_overlay_slot,
             production: mesh_production_mode,
         },
         shutdown_tx.subscribe(),
@@ -6925,6 +7596,20 @@ async fn serve_mesh_runtime(
                 .await
             } else if records_mesh_mtls_metric {
                 proxy::start_mesh_proxy_listener_with_tls_and_signal(
+                    addr,
+                    state,
+                    shutdown,
+                    tls_config,
+                    Some(direction),
+                    Some(started_tx),
+                )
+                .await
+            } else if matches!(kind, MeshListenerKind::PlaintextUdpCapture) {
+                // UDP TPROXY capture listener (F3 §3.3 Stage 3) — plaintext,
+                // distinct from the TCP capture/HTTP path: it binds a transparent
+                // UDP socket, recovers per-datagram orig-dst from cmsg, and drops
+                // (egress is Stage 4). `tls_config` is always None here.
+                proxy::start_mesh_udp_capture_listener_with_signal(
                     addr,
                     state,
                     shutdown,
@@ -7529,8 +8214,12 @@ async fn run_internal_mesh_svid_rotation_loop(
     trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    let mut retry_after_failure = None;
+    let mut failure_backoff_secs = INTERNAL_MESH_CA_FAILURE_BACKOFF_INITIAL_SECS;
     loop {
-        let next_tick = {
+        let next_tick = if let Some(delay) = retry_after_failure.take() {
+            delay
+        } else {
             let snapshot = proxy_state.gateway_svid_bundle.load_full();
             snapshot
                 .as_ref()
@@ -7561,7 +8250,7 @@ async fn run_internal_mesh_svid_rotation_loop(
             continue;
         }
 
-        if let Err(error) = issue_and_install_mesh_ca_svid(
+        match issue_and_install_mesh_ca_svid(
             &proxy_state,
             ca.as_ref(),
             &spiffe_id,
@@ -7572,14 +8261,26 @@ async fn run_internal_mesh_svid_rotation_loop(
         )
         .await
         {
-            crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
-                &spiffe_id, "internal",
-            );
-            warn!(
-                error = %error,
-                spiffe_id = %spiffe_id,
-                "internal mesh CA SVID rotation failed; keeping current identity"
-            );
+            Ok(()) => {
+                failure_backoff_secs = INTERNAL_MESH_CA_FAILURE_BACKOFF_INITIAL_SECS;
+            }
+            Err(error) => {
+                let retry_delay = crate::util::backoff::jittered_backoff(failure_backoff_secs);
+                let retry_after_ms = retry_delay.as_millis();
+                retry_after_failure = Some(retry_delay);
+                failure_backoff_secs = failure_backoff_secs
+                    .saturating_mul(2)
+                    .min(crate::util::backoff::BACKOFF_MAX_SECS);
+                crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
+                    &spiffe_id, "internal",
+                );
+                warn!(
+                    error = %error,
+                    spiffe_id = %spiffe_id,
+                    retry_after_ms,
+                    "internal mesh CA SVID rotation failed; keeping current identity"
+                );
+            }
         }
     }
 }
@@ -7665,6 +8366,64 @@ fn publish_runtime_svid_to_inbound_slot(
     inbound_slot.store(Arc::new(Some(bundle)));
 }
 
+fn start_mesh_inbound_svid_rotation_republisher(
+    proxy_state: ProxyState,
+    inbound_slot: tls::SharedBundleSlot,
+    trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
+    mut revision_rx: tokio::sync::watch::Receiver<u64>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // Snapshot the rotation revision *before* the initial publish, then
+        // republish once up front. A file/CA rotation can bump
+        // `backend_svid_rotation_tx` after this receiver was subscribed but
+        // before this task runs; the initial publish covers that case because
+        // `publish_runtime_svid_to_inbound_slot` re-reads `gateway_file_svid_bundle`
+        // live under `gateway_svid_update_lock`, so it picks up any already
+        // installed bundle.
+        //
+        // The ordering matters for the narrow window where a rotation lands
+        // *between* the baseline read and the publish (or just after it).
+        // The loop dedups on the `observed_revision` integer compare below;
+        // if the baseline were taken AFTER the publish it could capture a
+        // bump whose bundle the publish had NOT yet read, and then
+        // `next_revision == observed_revision` would skip the follow-up
+        // republish, pinning the inbound verifier to OLD roots until the next
+        // rotation or slice apply. Reading the baseline first guarantees any
+        // rotation that could change the bundle is either already reflected in
+        // the publish or strictly greater than `observed_revision` (forcing a
+        // republish). The publish is idempotent, so the occasional redundant
+        // republish is harmless.
+        let mut observed_revision = *revision_rx.borrow();
+        publish_runtime_svid_to_inbound_slot(&proxy_state, &inbound_slot, &trust_overlay_slot);
+        loop {
+            tokio::select! {
+                changed = revision_rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+            let next_revision = *revision_rx.borrow();
+            if next_revision == observed_revision {
+                continue;
+            }
+            observed_revision = next_revision;
+            publish_runtime_svid_to_inbound_slot(&proxy_state, &inbound_slot, &trust_overlay_slot);
+            debug!(
+                svid_revision = next_revision,
+                "Refreshed mesh inbound SPIFFE peer-verifier bundle after gateway SVID rotation"
+            );
+        }
+    })
+}
+
 struct MeshInboundTlsReloadState {
     server_identity: Option<Arc<tls::MeshServerIdentity>>,
     last_snapshot: Option<MeshInboundTlsReloadSnapshot>,
@@ -7688,9 +8447,10 @@ struct MeshInboundTlsReloadState {
 }
 
 /// Build the optional SPIFFE inbound trust-bundle slot from file-backed SVID
-/// material or a CA-backed runtime SVID slot. File material is merged with the
-/// slice's federated trust bundles immediately; runtime slots receive the
-/// accepted slice overlay through `stage_gateway_runtime_spiffe_bundle`.
+/// material or a CA-backed runtime SVID slot. Runtime-backed slots receive the
+/// accepted slice overlay through `stage_gateway_runtime_spiffe_bundle` so SVID
+/// rotations can refresh the inbound verifier without waiting for another
+/// slice apply.
 /// Returns `None` when no gateway SVID material is configured (the inbound
 /// listener then keeps the operator client-CA chain verification it has always
 /// used). It also returns `None` (logged) when file SVID material *is*
@@ -7805,6 +8565,32 @@ fn retain_svid_local_trust_only(bundle: &mut crate::identity::SvidBundle) {
     bundle.trust_bundles.federated.clear();
 }
 
+fn merge_trust_bundle_authorities(
+    target: &mut crate::identity::TrustBundle,
+    overlay: &crate::identity::TrustBundle,
+) {
+    for authority in &overlay.x509_authorities {
+        if !target
+            .x509_authorities
+            .iter()
+            .any(|existing| existing == authority)
+        {
+            target.x509_authorities.push(authority.clone());
+        }
+    }
+    for authority in &overlay.jwt_authorities {
+        if !target.jwt_authorities.iter().any(|existing| {
+            existing.key_id == authority.key_id
+                && existing.public_key_pem == authority.public_key_pem
+        }) {
+            target.jwt_authorities.push(authority.clone());
+        }
+    }
+    if target.refresh_hint_seconds.is_none() {
+        target.refresh_hint_seconds = overlay.refresh_hint_seconds;
+    }
+}
+
 fn merge_trust_overlay_into_svid_bundle(
     bundle: &mut crate::identity::SvidBundle,
     runtime: &crate::identity::TrustBundleSet,
@@ -7812,8 +8598,8 @@ fn merge_trust_overlay_into_svid_bundle(
     // CP-pushed slice trust is authoritative for inbound federation. Drop raw
     // federated bundles from the SVID source before adding accepted slice
     // bundles. The local bundle stays anchored to the gateway SVID's own trust
-    // domain (we do not let the slice override the local roots the SVID itself
-    // chains to).
+    // domain, but same-domain slice authorities are additive so a CP can stage
+    // CA-root rotation without replacing the freshly loaded SVID roots.
     retain_svid_local_trust_only(bundle);
     for (trust_domain, federated) in &runtime.federated {
         bundle
@@ -7822,22 +8608,24 @@ fn merge_trust_overlay_into_svid_bundle(
             .entry(trust_domain.clone())
             .or_insert_with(|| federated.clone());
     }
+    if runtime.local.trust_domain == bundle.trust_bundles.local.trust_domain {
+        merge_trust_bundle_authorities(&mut bundle.trust_bundles.local, &runtime.local);
+        return;
+    }
     // If the slice's local bundle is for a different trust domain than the
     // SVID's, treat it as a federated peer trust domain so cross-trust peers
     // still validate.
-    if runtime.local.trust_domain != bundle.trust_bundles.local.trust_domain {
-        bundle
-            .trust_bundles
-            .federated
-            .entry(runtime.local.trust_domain.clone())
-            .or_insert_with(|| runtime.local.clone());
-    }
+    bundle
+        .trust_bundles
+        .federated
+        .entry(runtime.local.trust_domain.clone())
+        .or_insert_with(|| runtime.local.clone());
 }
 
-/// Rebuild the inbound SPIFFE trust-bundle from the gateway SVID files plus the
-/// current slice's federated bundles, returning it STAGED (not yet stored into
-/// the live slot). The caller publishes it into the live slot only after the
-/// candidate proxy config is accepted, so a rejected slice cannot leave new
+/// Rebuild the inbound SPIFFE trust-bundle from the gateway SVID material plus
+/// the current slice's federated bundles, returning it STAGED (not yet stored
+/// into the live slot). The caller publishes it into the live slot only after
+/// the candidate proxy config is accepted, so a rejected slice cannot leave new
 /// federated trust domains active for inbound handshakes. A rebuild failure
 /// returns `None` (logged) and the caller leaves the previous trust bundles in
 /// place — this never fails the slice.
@@ -7849,6 +8637,14 @@ fn stage_mesh_inbound_spiffe_bundle(
     slice: &MeshSlice,
 ) -> Option<StagedSpiffeBundle> {
     let slot = slot?;
+    if runtime_trust_overlay_slot.is_some() {
+        return stage_gateway_runtime_spiffe_bundle(
+            proxy_state,
+            Some(slot),
+            runtime_trust_overlay_slot,
+            slice,
+        );
+    }
     if !gateway_svid_material_configured(env_config) {
         return stage_gateway_runtime_spiffe_bundle(
             proxy_state,
@@ -8511,7 +9307,9 @@ fn listener_tls_config(
     frontend_tls: Option<Arc<rustls::ServerConfig>>,
 ) -> Option<Arc<rustls::ServerConfig>> {
     match listener.kind {
-        MeshListenerKind::PlaintextCapture => None,
+        // Both plaintext listeners (TCP outbound capture and the UDP TPROXY
+        // capture listener) terminate no TLS.
+        MeshListenerKind::PlaintextCapture | MeshListenerKind::PlaintextUdpCapture => None,
         MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination => frontend_tls,
     }
 }
@@ -8563,10 +9361,11 @@ enum StagedSpiffeBundle {
         slot: tls::SharedBundleSlot,
         bundle: Arc<Option<crate::identity::SvidBundle>>,
     },
-    /// CA-backed SVID path: update the dedicated runtime inbound verifier slot
+    /// Runtime-backed SVID path: update the dedicated inbound verifier slot
     /// from the latest raw SVID plus the accepted slice trust overlay. The
-    /// SVID itself is intentionally not captured at staging time because a CA
-    /// rotation can complete while the candidate slice is still being planned.
+    /// SVID itself is intentionally not captured at staging time because a
+    /// file/CA rotation can complete while the candidate slice is still being
+    /// planned.
     RuntimeSlot {
         slot: tls::SharedBundleSlot,
         trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
@@ -9002,9 +9801,24 @@ async fn apply_mesh_slice_generation(
         Some(federation_snapshot),
         Some(remote_snapshot),
     ) {
-        Ok(config) => {
-            let previous_loaded_at = proxy_state.config.load_full().loaded_at;
+        Ok(mut config) => {
+            let previous_config = proxy_state.config.load_full();
+            let previous_loaded_at = previous_config.loaded_at;
             let candidate_loaded_at = config.loaded_at;
+            // Materialized mesh upstreams are rebuilt with fresh per-apply
+            // timestamps every slice apply (the materializers stamp `Utc::now()`
+            // and `project_mesh_source_locality` re-bumps when it stamps the
+            // source locality onto the freshly materialized `source_locality =
+            // None`). Reconcile each candidate upstream's timestamps against the
+            // previously-accepted config so an upstream whose CONTENT is unchanged
+            // keeps its prior `updated_at`: otherwise `ConfigDelta` would flag
+            // every mesh upstream as modified on every apply and rebuild its
+            // `LoadBalancer` — resetting round-robin/EWMA/hash-ring/passive-health
+            // state on unrelated mesh-only updates (federation/trust overlays, a
+            // different service's remote scale event). A genuinely changed
+            // upstream keeps its fresh timestamp and still rebuilds exactly that
+            // one LB. Must run BEFORE `update_config` computes the delta.
+            reconcile_mesh_upstream_timestamps(&mut config, &previous_config);
             // GAP-2M.4: build node-waypoint per-pod policy scopes before
             // config apply, but publish them only after update_config accepts
             // the candidate. Pre-swapping scopes can pair old policies with a
@@ -9506,7 +10320,7 @@ mod tests {
             Some(crate::identity::SvidBundle {
                 spiffe_id: SpiffeId::from_parts(&trust_domain, "ns/test/sa/test").unwrap(),
                 cert_chain_der,
-                private_key_pkcs8_der: key.secret_der().to_vec(),
+                private_key_pkcs8_der: key.secret_der().to_vec().into(),
                 trust_bundles: crate::identity::TrustBundleSet::local_only(
                     crate::identity::TrustBundle {
                         trust_domain,
@@ -9561,6 +10375,8 @@ mod tests {
             "FERRUM_SHUTDOWN_DRAIN_SECONDS",
             "FERRUM_MESH_CA_BACKEND",
             "FERRUM_MESH_ALLOW_NO_CA",
+            "FERRUM_MESH_CAPTURE_UDP_ENABLED",
+            "FERRUM_MESH_CAPTURE_UDP_PORT",
         ];
 
         for key in keys {
@@ -10197,6 +11013,7 @@ mod tests {
             egress_stream_enabled: false,
             egress_stream_allow_plaintext: false,
             request_auth_require_exp: true,
+            locality_lb_strict: false,
         };
         let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
         let mesh_state = MeshRuntimeState::new();
@@ -10257,6 +11074,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         }
     }
 
@@ -10304,6 +11122,7 @@ mod tests {
             egress_stream_enabled: false,
             egress_stream_allow_plaintext: false,
             request_auth_require_exp: true,
+            locality_lb_strict: false,
         }
     }
 
@@ -10512,6 +11331,52 @@ mod tests {
             }],
             protocol_overrides: HashMap::new(),
         }
+    }
+
+    // ── East-west target tag hygiene (reserved mesh.* namespace) ──────────
+
+    /// codex r3 Finding C: `build_east_west_service_targets` copies the
+    /// workload's operator-authored `selector.labels` into `UpstreamTarget.tags`.
+    /// A workload labelled with the RESERVED provenance key `mesh.remote: "true"`
+    /// must NOT leak that label onto the target — otherwise strict locality LB
+    /// (whose `target_is_local` keys on this exact tag) would treat a
+    /// genuinely-LOCAL east-west endpoint as remote and exclude it. Only the
+    /// discoverer (from un-spoofable provenance) may stamp `mesh.remote`.
+    #[test]
+    fn east_west_targets_strip_reserved_mesh_labels() {
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let mut wl = workload_with_address("reviews", "reviews", "10.0.0.1");
+        // Operator/workload labels INCLUDING a forged reserved provenance marker
+        // and a forged transport marker, alongside a legitimate operator label.
+        wl.selector
+            .labels
+            .insert("version".to_string(), "v2".to_string());
+        wl.selector.labels.insert(
+            crate::modes::mesh::multicluster::MESH_REMOTE_TAG.to_string(),
+            crate::modes::mesh::multicluster::MESH_REMOTE_TAG_VALUE.to_string(),
+        );
+        wl.selector
+            .labels
+            .insert("mesh.hbone".to_string(), "true".to_string());
+
+        let service = http_mesh_service("reviews", 8080, spiffe);
+        let targets = build_east_west_service_targets(&service, std::slice::from_ref(&wl), None);
+        assert_eq!(targets.len(), 1, "one address → one target");
+        let tags = &targets[0].tags;
+        // The legitimate operator labels survive.
+        assert_eq!(tags.get("app").map(String::as_str), Some("reviews"));
+        assert_eq!(tags.get("version").map(String::as_str), Some("v2"));
+        // The forged reserved markers are stripped, so the LB's `target_is_local`
+        // (which keys on the exact `mesh.remote=true` tag) sees no remote marker
+        // and treats this genuinely-local endpoint as LOCAL.
+        assert!(
+            !tags.contains_key(crate::modes::mesh::multicluster::MESH_REMOTE_TAG),
+            "forged mesh.remote label must be stripped from the east-west target"
+        );
+        assert!(
+            !tags.contains_key("mesh.hbone"),
+            "forged mesh.hbone transport label must be stripped too"
+        );
     }
 
     // ── Ambient outbound (egress) HBONE materialization ───────────────────
@@ -10984,6 +11849,85 @@ mod tests {
     }
 
     #[test]
+    fn mesh_outbound_udp_upstreams_materialize_ambient_only() {
+        // UDP egress (F3 §3.3 Stage 4): Ambient materializes one per-port UDP
+        // upstream with `mesh.hbone`-tagged, identity-pinned targets dialing the
+        // resolved targetPort; NO route proxy (datagrams carry no Host). Distinct
+        // id space from the TCP/HTTP lanes.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let mut svc = http_mesh_service("dns", 53, spiffe);
+        svc.ports[0].protocol = AppProtocol::Udp;
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(5353));
+        svc.cluster_ips = vec!["10.96.0.10".to_string()];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+            services: vec![svc],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_udp_upstreams(&mut config, &ambient_runtime(), &slice);
+        assert!(
+            config.proxies.is_empty(),
+            "UDP egress materializes upstreams only, never route proxies"
+        );
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-udp-upstream-default-dns-53")
+            .expect("per-port UDP upstream");
+        assert_eq!(
+            upstream.name.as_deref(),
+            Some("dns.default.svc.cluster.local"),
+            "FQDN-named so DestinationRules match"
+        );
+        let target = &upstream.targets[0];
+        assert_eq!(target.host, "10.0.0.9");
+        assert_eq!(target.port, 5353, "targets dial the resolved targetPort");
+        assert_eq!(
+            target.tags.get("mesh.hbone").map(String::as_str),
+            Some("true"),
+            "UDP egress rides the HBONE transport"
+        );
+        assert_eq!(
+            target.tags.get("mesh.protocol").map(String::as_str),
+            Some("udp"),
+        );
+        assert_eq!(
+            target.tags.get("mesh.spiffe_id").map(String::as_str),
+            Some(spiffe),
+            "destination identity stays pinned"
+        );
+    }
+
+    // NOTE: Sidecar UDP egress used to be deferred (the materializer gated
+    // Ambient-only); #1808 made it dual-transport. The Sidecar-materializes case
+    // is now covered by `mesh_outbound_udp_materializes_sidecar_mtls_upstream`,
+    // and the no-relay-topology case by
+    // `mesh_outbound_udp_not_materialized_for_non_relay_topology`.
+
+    #[test]
+    fn mesh_outbound_udp_upstreams_skip_vipless() {
+        // VIP-less (headless) UDP service: a datagram carries no Host and a bare
+        // port is ambiguous, so no `__mesh-out-udp-upstream-*` materializes.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let mut headless = http_mesh_service("dns", 53, spiffe);
+        headless.ports[0].protocol = AppProtocol::Udp;
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+            services: vec![headless],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_udp_upstreams(&mut config, &ambient_runtime(), &slice);
+        assert!(
+            config.upstreams.is_empty(),
+            "VIP-less UDP service is not egress-routable"
+        );
+    }
+
+    #[test]
     fn mesh_outbound_tcp_upstreams_skip_vipless_for_the_vip_path() {
         // VIP-less (headless) service: a raw stream carries no Host and a bare
         // port number is ambiguous, so the captured original destination cannot
@@ -11190,6 +12134,223 @@ mod tests {
         assert!(
             !upstream.port_overrides.contains_key(&6379),
             "per-port policy must not remain under the service port"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_udp_materializes_sidecar_mtls_upstream() {
+        // Sidecar UDP egress (#1808) materializes a per-port upstream whose
+        // targets carry the `mesh.mtls` transport tag + the pinned destination
+        // identity (`mesh.spiffe_id`), under the DISTINCT `__mesh-out-udp-upstream-*`
+        // id space — the Sidecar counterpart of the Ambient HBONE UDP materializer.
+        // The egress datapath's transport branch then picks the mesh-mTLS datagram
+        // tunnel from that tag.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let mut svc = http_mesh_service("dns", 53, spiffe);
+        svc.ports[0].protocol = AppProtocol::Udp;
+        svc.cluster_ips = vec!["10.96.0.10".to_string()];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+            services: vec![svc],
+            ..MeshSlice::default()
+        };
+        // `test_mesh_runtime_config()` is the Sidecar topology.
+        let runtime = test_mesh_runtime_config();
+        assert_eq!(runtime.topology, MeshTopology::Sidecar);
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_udp_upstreams(&mut config, &runtime, &slice);
+
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-udp-upstream-default-dns-53")
+            .expect("Sidecar UDP upstream materialized under the distinct UDP id space");
+        let target = upstream
+            .targets
+            .first()
+            .expect("Sidecar UDP upstream has a target");
+        assert!(
+            crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(target),
+            "Sidecar UDP target must carry the mesh.mtls transport tag"
+        );
+        assert!(
+            !crate::proxy::hbone_pool::target_hbone_enabled(target),
+            "Sidecar UDP target must NOT carry the mesh.hbone tag (mutually exclusive)"
+        );
+        assert_eq!(
+            crate::proxy::mesh_mtls_pool::target_mesh_mtls_expected_peer(target)
+                .expect("Sidecar UDP target carries a pinned identity")
+                .as_str(),
+            spiffe,
+            "Sidecar UDP target must pin the destination workload identity"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_udp_not_materialized_for_non_relay_topology() {
+        // Only the two captured-and-relayed topologies (Ambient HBONE, Sidecar
+        // mesh-mTLS) materialize UDP egress; EastWestGateway (no UDP relay)
+        // materializes nothing (#1808 keeps the `_ => return` arm for the rest).
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let mut svc = http_mesh_service("dns", 53, spiffe);
+        svc.ports[0].protocol = AppProtocol::Udp;
+        svc.cluster_ips = vec!["10.96.0.10".to_string()];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+            services: vec![svc],
+            ..MeshSlice::default()
+        };
+        let runtime = MeshRuntimeConfig {
+            topology: MeshTopology::EastWestGateway,
+            ..test_mesh_runtime_config()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_udp_upstreams(&mut config, &runtime, &slice);
+        assert!(
+            !config
+                .upstreams
+                .iter()
+                .any(|u| u.id == "__mesh-out-udp-upstream-default-dns-53"),
+            "a topology with no UDP relay must materialize no UDP egress upstream"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_udp_upstream_receives_port_level_dr() {
+        // DestinationRule portLevelSettings authored on a UDP SERVICE port
+        // (`port: 53, targetPort: 5353`) fan onto the targets' dial port via the
+        // shared owner-port map — the UDP per-port upstreams join that map
+        // alongside the HTTP/TCP ones (codex r3). Ambient-only: the UDP egress
+        // materializer stamps HBONE and only runs under Ambient topology.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let mut svc = http_mesh_service("dns", 53, spiffe);
+        svc.ports[0].protocol = AppProtocol::Udp;
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(5353));
+        svc.cluster_ips = vec!["10.96.0.10".to_string()];
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+            services: vec![svc],
+            destination_rules: vec![MeshDestinationRule {
+                name: "dns".to_string(),
+                namespace: "default".to_string(),
+                host: "dns.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::from([(
+                    53u16,
+                    MeshTrafficPolicy {
+                        connect_timeout_ms: Some(4321),
+                        ..MeshTrafficPolicy::default()
+                    },
+                )]),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_udp_upstreams(&mut config, &ambient_runtime(), &slice);
+        apply_destination_rules(&mut config, &ambient_runtime(), &slice)
+            .expect("destination rules apply");
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.id == "__mesh-out-udp-upstream-default-dns-53")
+            .expect("UDP upstream");
+        assert_eq!(
+            upstream
+                .port_overrides
+                .get(&5353)
+                .and_then(|slot| slot.connect_timeout_ms),
+            Some(4321),
+            "UDP-port portLevelSettings must land on the dial port"
+        );
+        assert!(
+            !upstream.port_overrides.contains_key(&53),
+            "per-port policy must not remain under the service port"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_udp_upstream_receives_top_level_dr_connect_timeout() {
+        // A DestinationRule top-level `trafficPolicy.connectTimeout` (no
+        // portLevelSettings) must reach the UDP egress relay too (codex r6 P2).
+        // The top-level timeout is normally applied to `config.proxies`, but a UDP
+        // egress upstream is referenced by no config proxy; apply_destination_rules
+        // seeds it onto the materialized dial port's override so the synthesized
+        // relay proxy's `dispatch_port_overrides` (read by `get_datagram_tunnel`)
+        // honors it. Per-port settings still win on a port they configure.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let make_slice = |traffic_policy: Option<MeshTrafficPolicy>,
+                          port_level_settings: HashMap<u16, MeshTrafficPolicy>|
+         -> MeshSlice {
+            let mut svc = http_mesh_service("dns", 53, spiffe);
+            svc.ports[0].protocol = AppProtocol::Udp;
+            svc.ports[0].target_port = Some(ServiceTargetPort::Number(5353));
+            svc.cluster_ips = vec!["10.96.0.10".to_string()];
+            MeshSlice {
+                namespace: "default".to_string(),
+                workloads: vec![workload_with_address("dns", "dns", "10.0.0.9")],
+                services: vec![svc],
+                destination_rules: vec![MeshDestinationRule {
+                    name: "dns".to_string(),
+                    namespace: "default".to_string(),
+                    host: "dns.default.svc.cluster.local".to_string(),
+                    traffic_policy,
+                    port_level_settings,
+                    subsets: Vec::new(),
+                }],
+                ..MeshSlice::default()
+            }
+        };
+        let dial_timeout = |slice: &MeshSlice| -> Option<u64> {
+            let mut config = GatewayConfig::default();
+            materialize_mesh_outbound_udp_upstreams(&mut config, &ambient_runtime(), slice);
+            apply_destination_rules(&mut config, &ambient_runtime(), slice)
+                .expect("destination rules apply");
+            config
+                .upstreams
+                .iter()
+                .find(|u| u.id == "__mesh-out-udp-upstream-default-dns-53")
+                .expect("UDP upstream")
+                .port_overrides
+                .get(&5353)
+                .and_then(|slot| slot.connect_timeout_ms)
+        };
+
+        // Top-level only: seeded onto the dial port (5353), not the service port.
+        let top_level_only = make_slice(
+            Some(MeshTrafficPolicy {
+                connect_timeout_ms: Some(7777),
+                ..MeshTrafficPolicy::default()
+            }),
+            HashMap::new(),
+        );
+        assert_eq!(
+            dial_timeout(&top_level_only),
+            Some(7777),
+            "top-level connectTimeout must seed the UDP dial port"
+        );
+
+        // Per-port portLevelSettings WINS over the top-level on the same port.
+        let both = make_slice(
+            Some(MeshTrafficPolicy {
+                connect_timeout_ms: Some(7777),
+                ..MeshTrafficPolicy::default()
+            }),
+            HashMap::from([(
+                53u16,
+                MeshTrafficPolicy {
+                    connect_timeout_ms: Some(4321),
+                    ..MeshTrafficPolicy::default()
+                },
+            )]),
+        );
+        assert_eq!(
+            dial_timeout(&both),
+            Some(4321),
+            "per-port portLevelSettings must win over the top-level seed"
         );
     }
 
@@ -13123,6 +14284,7 @@ mod tests {
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            locality_lb_strict: false,
             locality_lb_setting: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
@@ -13131,6 +14293,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: now,
             updated_at: now,
@@ -14239,6 +15402,65 @@ mod tests {
     }
 
     #[test]
+    fn dr_subset_consistent_hash_projects_hash_key() {
+        // A subset-level consistentHash policy must carry both the algorithm
+        // and the hash key onto the Ferrum subset policy; otherwise the hot
+        // path builds a subset hash ring but still hashes on the upstream-level
+        // key or client IP.
+        let mut config = GatewayConfig {
+            upstreams: vec![destination_rule_test_upstream(
+                "u1",
+                "reviews.default.svc.cluster.local",
+            )],
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::new(),
+                subsets: vec![MeshSubset {
+                    name: "v1".to_string(),
+                    labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+                    traffic_policy: Some(MeshTrafficPolicy {
+                        load_balancer: Some(MeshLoadBalancer::ConsistentHash(
+                            crate::modes::mesh::config::MeshConsistentHash {
+                                http_header_name: Some("x-subset-session".to_string()),
+                                http_cookie_name: None,
+                                use_source_ip: false,
+                            },
+                        )),
+                        ..MeshTrafficPolicy::default()
+                    }),
+                }],
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let subset_policy = config.upstreams[0]
+            .subsets
+            .as_ref()
+            .expect("subsets")
+            .iter()
+            .find(|subset| subset.name == "v1")
+            .and_then(|subset| subset.traffic_policy.as_ref())
+            .expect("v1 subset traffic policy");
+        assert_eq!(
+            subset_policy.load_balancer_algorithm,
+            Some(LoadBalancerAlgorithm::ConsistentHashing)
+        );
+        assert_eq!(
+            subset_policy.hash_on.as_deref(),
+            Some("header:x-subset-session")
+        );
+    }
+
+    #[test]
     fn dr_later_rule_top_level_connect_timeout_overrides_earlier_subset() {
         // Two DestinationRules match the same upstream. The earlier-sorted rule
         // defines subset v1 with its own connectTimeout; the later-sorted rule
@@ -15051,7 +16273,7 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_tracing_merge_replaces_tags_and_providers_across_scopes() {
+    fn telemetry_tracing_merge_combines_tags_and_replaces_providers_across_scopes() {
         let mesh_slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
@@ -15123,12 +16345,21 @@ mod tests {
             tracing.custom_tags.get("env").map(String::as_str),
             Some("prod")
         );
-        assert!(!tracing.custom_tags.contains_key("mesh"));
+        assert_eq!(
+            tracing.custom_tags.get("mesh").map(String::as_str),
+            Some("ferrum")
+        );
         assert_eq!(
             tracing.custom_tags.get("region").map(String::as_str),
             Some("us-east")
         );
-        assert!(!tracing.custom_header_tags.contains_key("mesh-tenant"));
+        assert_eq!(
+            tracing
+                .custom_header_tags
+                .get("mesh-tenant")
+                .map(String::as_str),
+            Some("x-mesh-tenant")
+        );
         assert_eq!(
             tracing.custom_header_tags.get("tenant").map(String::as_str),
             Some("x-tenant")
@@ -15948,6 +17179,103 @@ mod tests {
     }
 
     #[test]
+    fn mesh_runtime_listener_plan_ambient_emits_udp_capture_when_enabled() {
+        // Ambient relays captured UDP (Stage 4 egress), so with the capture flag
+        // on it MUST emit the PlaintextUdpCapture listener (dual-stack `[::]`).
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "ambient"),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let plan = runtime.listener_plan();
+                assert!(
+                    plan.iter().any(|listener| {
+                        listener.kind == MeshListenerKind::PlaintextUdpCapture
+                            && listener.direction == MeshTrafficDirection::Outbound
+                    }),
+                    "Ambient must emit the UDP capture listener when capture is enabled"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_listener_plan_sidecar_emits_udp_capture_when_enabled() {
+        // #1808: Sidecar relays captured UDP over a mesh-mTLS datagram tunnel, so
+        // with the capture flag on the Sidecar plan DOES emit the
+        // PlaintextUdpCapture listener (the first working end-to-end UDP path).
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                // Sidecar is the default topology; set it explicitly for clarity.
+                ("FERRUM_MESH_TOPOLOGY", "sidecar"),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let plan = runtime.listener_plan();
+                assert!(
+                    plan.iter().any(|listener| {
+                        listener.kind == MeshListenerKind::PlaintextUdpCapture
+                            && listener.direction == MeshTrafficDirection::Outbound
+                    }),
+                    "Sidecar must emit the UDP capture listener when capture is enabled (#1808)"
+                );
+                // The two standard Sidecar listeners plus the UDP capture listener.
+                assert_eq!(plan.len(), 3);
+            },
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_listener_plan_east_west_omits_udp_capture_when_enabled() {
+        // A topology with NO UDP relay (EastWestGateway) must NOT emit the UDP
+        // capture listener even with the flag on — capturing UDP it cannot relay
+        // would black-hole it. Leaving it un-emitted lets UDP pass through.
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let plan = runtime.listener_plan();
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|listener| { listener.kind == MeshListenerKind::PlaintextUdpCapture }),
+                    "a no-UDP-relay topology must NOT emit the UDP capture listener"
+                );
+            },
+        );
+    }
+
+    #[test]
     fn mesh_runtime_listener_plan_uses_node_waypoint_hbone_only() {
         with_mesh_env(
             &[
@@ -16044,6 +17372,7 @@ mod tests {
                 ("FERRUM_NAMESPACE", "default"),
                 ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
                 ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "15443"),
+                ("FERRUM_MESH_CLUSTER_DOMAIN", "cluster.local."),
             ],
             || {
                 let env = EnvConfig::from_env().expect("mesh env config");
@@ -16109,6 +17438,191 @@ mod tests {
                 assert_eq!(upstream.targets.len(), 1);
                 assert_eq!(upstream.targets[0].host, "10.0.0.5");
                 assert_eq!(upstream.targets[0].port, 9080);
+            },
+        );
+    }
+
+    #[test]
+    fn east_west_explicit_sni_override_suppresses_auto_service_proxy() {
+        // codex finding: an explicit EastWestGateway.sni_hosts entry for a local
+        // service FQDN must win over the auto-materialized local-service proxy.
+        // Materializing both yields two TCP passthrough proxies on the same SNI +
+        // listen port, which validate_stream_proxies rejects as overlapping hosts
+        // — silently dropping the operator's explicit route.
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_NAMESPACE", "default"),
+                ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
+                ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "15443"),
+                ("FERRUM_MESH_CLUSTER_DOMAIN", "cluster.local."),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                let config = GatewayConfig {
+                    mesh: Some(Box::new(MeshConfig {
+                        // Explicit gateway claiming the reviews service FQDN
+                        // (mixed-case, to exercise the case-insensitive match).
+                        multi_cluster: Some(MultiClusterConfig {
+                            east_west_gateways: vec![EastWestGateway {
+                                name: "explicit-reviews".to_string(),
+                                namespace: "default".to_string(),
+                                host: "gw.remote.example".to_string(),
+                                port: 443,
+                                sni_hosts: vec!["Reviews.Default.SVC.Cluster.Local".to_string()],
+                                trust_domain: Some(TrustDomain::new("remote.test").unwrap()),
+                                network: Some("network-a".to_string()),
+                            }],
+                            ..MultiClusterConfig::default()
+                        }),
+                        services: vec![MeshService {
+                            cluster_ips: Vec::new(),
+                            name: "reviews".to_string(),
+                            namespace: "default".to_string(),
+                            ports: vec![ServicePort {
+                                port: 9080,
+                                protocol: AppProtocol::Http,
+                                name: Some("http".to_string()),
+                                target_port: None,
+                            }],
+                            workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                                spiffe_id: SpiffeId::new(
+                                    "spiffe://cluster.local/ns/default/sa/reviews",
+                                )
+                                .unwrap(),
+                            }],
+                            protocol_overrides: HashMap::new(),
+                        }],
+                        workloads: vec![{
+                            let mut wl = workload("reviews", "reviews");
+                            wl.addresses = vec!["10.0.0.5".to_string()];
+                            wl
+                        }],
+                        ..MeshConfig::default()
+                    })),
+                    ..GatewayConfig::default()
+                };
+
+                let prepared =
+                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+
+                // The explicit gateway proxy owns the SNI.
+                let explicit = prepared
+                    .proxies
+                    .iter()
+                    .find(|p| p.id == "__mesh-east-west-default-explicit-reviews")
+                    .expect("explicit east-west proxy");
+                assert_eq!(explicit.hosts, vec!["reviews.default.svc.cluster.local"]);
+
+                // The auto-materialized local-service proxy is suppressed.
+                assert!(
+                    prepared
+                        .proxies
+                        .iter()
+                        .all(|p| p.id != "__mesh-ew-svc-default-reviews"),
+                    "auto service proxy must yield to the explicit SNI override"
+                );
+                // No two proxies share the canonical SNI on the listen port.
+                let claimants = prepared
+                    .proxies
+                    .iter()
+                    .filter(|p| {
+                        p.listen_port == Some(15443)
+                            && p.hosts
+                                .iter()
+                                .any(|h| h == "reviews.default.svc.cluster.local")
+                    })
+                    .count();
+                assert_eq!(claimants, 1, "exactly one proxy may claim the SNI");
+            },
+        );
+    }
+
+    #[test]
+    fn east_west_explicit_wildcard_sni_override_suppresses_auto_service_proxy() {
+        // codex follow-up: a WILDCARD explicit sni_hosts entry (e.g.
+        // `*.default.svc.cluster.local`) must also win. `validate_stream_proxies`
+        // uses wildcard-aware `hosts_overlap`, so an exact-membership skip would
+        // miss it and emit both passthrough proxies on the shared port → slice
+        // rejected. The skip uses the same overlap semantics.
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_NAMESPACE", "default"),
+                ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
+                ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "15443"),
+                ("FERRUM_MESH_CLUSTER_DOMAIN", "cluster.local"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                let config = GatewayConfig {
+                    mesh: Some(Box::new(MeshConfig {
+                        multi_cluster: Some(MultiClusterConfig {
+                            east_west_gateways: vec![EastWestGateway {
+                                name: "explicit-wildcard".to_string(),
+                                namespace: "default".to_string(),
+                                host: "gw.remote.example".to_string(),
+                                port: 443,
+                                sni_hosts: vec!["*.default.svc.cluster.local".to_string()],
+                                trust_domain: Some(TrustDomain::new("remote.test").unwrap()),
+                                network: Some("network-a".to_string()),
+                            }],
+                            ..MultiClusterConfig::default()
+                        }),
+                        services: vec![MeshService {
+                            cluster_ips: Vec::new(),
+                            name: "reviews".to_string(),
+                            namespace: "default".to_string(),
+                            ports: vec![ServicePort {
+                                port: 9080,
+                                protocol: AppProtocol::Http,
+                                name: Some("http".to_string()),
+                                target_port: None,
+                            }],
+                            workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                                spiffe_id: SpiffeId::new(
+                                    "spiffe://cluster.local/ns/default/sa/reviews",
+                                )
+                                .unwrap(),
+                            }],
+                            protocol_overrides: HashMap::new(),
+                        }],
+                        workloads: vec![{
+                            let mut wl = workload("reviews", "reviews");
+                            wl.addresses = vec!["10.0.0.5".to_string()];
+                            wl
+                        }],
+                        ..MeshConfig::default()
+                    })),
+                    ..GatewayConfig::default()
+                };
+
+                let prepared =
+                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+
+                assert!(
+                    prepared
+                        .proxies
+                        .iter()
+                        .all(|p| p.id != "__mesh-ew-svc-default-reviews"),
+                    "auto service proxy must yield to the explicit wildcard SNI override"
+                );
             },
         );
     }
@@ -16342,8 +17856,15 @@ mod tests {
         source.locality = Some("us-east/us-east-1/a".to_string());
         let source_spiffe = source.spiffe_id.as_str().to_string();
         let mut config = GatewayConfig::default();
+        // `loaded_at` is derived from the slice version and is STABLE across
+        // re-applies of the same version. The projection must NOT clobber the
+        // upstream's `updated_at` with it (that would hide a real change from
+        // `ConfigDelta` on a same-version remote scale event); it bumps to a
+        // fresh wall-clock timestamp instead. Seed the upstream's `updated_at`
+        // to `loaded_at` so a buggy clobber-to-`loaded_at` would be a no-op and
+        // the assertion below would catch it.
         let loaded_at = config.loaded_at;
-        let now = chrono::Utc::now();
+        let before = chrono::Utc::now();
         config.upstreams.push(Upstream {
             id: "reviews".to_string(),
             namespace: "default".to_string(),
@@ -16364,6 +17885,7 @@ mod tests {
             subsets: None,
             port_overrides: HashMap::new(),
             source_locality: None,
+            locality_lb_strict: false,
             locality_lb_setting: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
@@ -16372,9 +17894,10 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: None,
             api_spec_id: None,
-            created_at: now,
-            updated_at: now,
+            created_at: loaded_at,
+            updated_at: loaded_at,
         });
         let mesh_slice = MeshSlice {
             namespace: "default".to_string(),
@@ -16384,13 +17907,262 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        project_mesh_source_locality(&mut config, &mesh_slice);
+        project_mesh_source_locality(&mut config, &test_mesh_runtime_config(), &mesh_slice);
 
         assert_eq!(
             config.upstreams[0].source_locality.as_deref(),
             Some("us-east/us-east-1/a")
         );
-        assert_eq!(config.upstreams[0].updated_at, loaded_at);
+        // The projection changed `source_locality`, so `updated_at` must have
+        // advanced to a FRESH timestamp (>= the pre-projection wall clock), NOT
+        // been clobbered back to the stable, slice-version-derived `loaded_at`.
+        assert!(
+            config.upstreams[0].updated_at >= before,
+            "updated_at must advance to a fresh timestamp on projection change"
+        );
+        assert_ne!(
+            config.upstreams[0].updated_at, loaded_at,
+            "updated_at must NOT be clobbered to the stable loaded_at (same-slice-version re-applies would hide the change from ConfigDelta)"
+        );
+    }
+
+    /// Build a minimal mesh-style upstream with one target on `port`, stamped
+    /// with `now` as both timestamps (mirrors the materializers).
+    fn reconcile_test_upstream(
+        id: &str,
+        port: u16,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Upstream {
+        Upstream {
+            id: id.to_string(),
+            namespace: "default".to_string(),
+            name: Some(id.to_string()),
+            targets: vec![UpstreamTarget {
+                host: "10.0.0.5".to_string(),
+                port,
+                weight: 1,
+                tags: HashMap::new(),
+                locality: Some("us-east/us-east-1/b".to_string()),
+                path: None,
+            }],
+            algorithm: LoadBalancerAlgorithm::RoundRobin,
+            hash_on: None,
+            hash_on_cookie_config: None,
+            health_checks: None,
+            service_discovery: None,
+            subsets: None,
+            port_overrides: HashMap::new(),
+            source_locality: None,
+            locality_lb_strict: false,
+            locality_lb_setting: None,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            backend_tls_sni: None,
+            backend_tls_san_allow_list: Vec::new(),
+            resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// An UNCHANGED mesh re-apply must produce no upstream delta even though the
+    /// upstream is freshly materialized (fresh `now` timestamp) and re-projected
+    /// from `source_locality = None`: `reconcile_mesh_upstream_timestamps`
+    /// restores the prior timestamp for content-identical upstreams so
+    /// `ConfigDelta` sees no change and the LB / passive-health state is reused.
+    #[test]
+    fn reconcile_mesh_upstream_timestamps_no_op_reapply_yields_empty_delta() {
+        let source = {
+            let mut w = workload("api", "api");
+            w.addresses = vec!["10.0.0.9".to_string()];
+            w.locality = Some("us-east/us-east-1/a".to_string());
+            w
+        };
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            workload_spiffe_id: Some(source.spiffe_id.as_str().to_string()),
+            workloads: vec![source],
+            ..MeshSlice::default()
+        };
+        let runtime = test_mesh_runtime_config();
+
+        // First apply: materialize (fresh now) + project source locality.
+        let first_now = chrono::Utc::now();
+        let mut accepted = GatewayConfig::default();
+        accepted
+            .upstreams
+            .push(reconcile_test_upstream("reviews", 8080, first_now));
+        project_mesh_source_locality(&mut accepted, &runtime, &mesh_slice);
+        // The projection stamped the source locality; no previous config to
+        // reconcile against on the first apply, so this becomes the baseline.
+        assert_eq!(
+            accepted.upstreams[0].source_locality.as_deref(),
+            Some("us-east/us-east-1/a")
+        );
+
+        // Second apply: a DIFFERENT fresh `now` (later wall clock), same content.
+        let second_now = first_now + chrono::Duration::seconds(5);
+        let mut candidate = GatewayConfig::default();
+        candidate
+            .upstreams
+            .push(reconcile_test_upstream("reviews", 8080, second_now));
+        project_mesh_source_locality(&mut candidate, &runtime, &mesh_slice);
+        // Pre-reconcile, the projection re-bumped `updated_at` (freshly
+        // materialized → entered with `source_locality = None`), so the raw
+        // candidate disagrees with the accepted config's timestamp.
+        assert_ne!(
+            candidate.upstreams[0].updated_at, accepted.upstreams[0].updated_at,
+            "freshly materialized + re-projected upstream must carry a fresh timestamp before reconcile"
+        );
+
+        reconcile_mesh_upstream_timestamps(&mut candidate, &accepted);
+
+        // After reconcile the content-identical upstream regained the prior
+        // timestamp, so `ConfigDelta` reports no modification.
+        assert_eq!(
+            candidate.upstreams[0].updated_at, accepted.upstreams[0].updated_at,
+            "reconcile must restore the prior timestamp for an unchanged upstream"
+        );
+        let delta = crate::config_delta::ConfigDelta::compute(&accepted, &candidate);
+        assert!(
+            delta.modified_upstreams.is_empty()
+                && delta.added_upstreams.is_empty()
+                && delta.removed_upstream_ids.is_empty(),
+            "an unchanged mesh re-apply must yield an empty upstream delta, got {} modified / {} added / {} removed",
+            delta.modified_upstreams.len(),
+            delta.added_upstreams.len(),
+            delta.removed_upstream_ids.len(),
+        );
+    }
+
+    /// A genuine upstream content change (here: a target port) across a re-apply
+    /// must NOT be reconciled away — `ConfigDelta` must still report it modified
+    /// so its LoadBalancer is rebuilt.
+    #[test]
+    fn reconcile_mesh_upstream_timestamps_real_change_keeps_modified_delta() {
+        let first_now = chrono::Utc::now();
+        let mut accepted = GatewayConfig::default();
+        accepted
+            .upstreams
+            .push(reconcile_test_upstream("reviews", 8080, first_now));
+
+        // Re-apply with a CHANGED target port and a fresh timestamp.
+        let second_now = first_now + chrono::Duration::seconds(5);
+        let mut candidate = GatewayConfig::default();
+        candidate
+            .upstreams
+            .push(reconcile_test_upstream("reviews", 9090, second_now));
+
+        reconcile_mesh_upstream_timestamps(&mut candidate, &accepted);
+
+        // Content differs, so the fresh timestamp is preserved (NOT reconciled).
+        assert_ne!(
+            candidate.upstreams[0].updated_at, accepted.upstreams[0].updated_at,
+            "a genuinely changed upstream must keep its fresh timestamp"
+        );
+        let delta = crate::config_delta::ConfigDelta::compute(&accepted, &candidate);
+        assert_eq!(
+            delta
+                .modified_upstreams
+                .iter()
+                .map(|u| u.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["reviews"],
+            "a real upstream change must be reported modified so its LB rebuilds"
+        );
+    }
+
+    /// #1806 codex r2 finding 3: a DR-only change to an SD upstream's top-level
+    /// `connectionPool.http` alters the DERIVED `dispatch_port_override_fallback`
+    /// while the SERIALIZED `Upstream` content stays byte-identical (the field is
+    /// `#[serde(skip)]`). `upstream_content_eq` must NOT treat the two as equal —
+    /// otherwise the reconcile would restore the old `updated_at`, `ConfigDelta`
+    /// would report no change, and the route table (which carries the projected
+    /// fallback on its `Arc<Proxy>`) would be reused with the STALE fallback. The
+    /// upstream must keep its fresh timestamp and be reported modified.
+    #[test]
+    fn reconcile_mesh_upstream_timestamps_fallback_only_change_keeps_modified_delta() {
+        use crate::config::types::UpstreamPortOverride;
+
+        let first_now = chrono::Utc::now();
+        let mut accepted = GatewayConfig::default();
+        let mut accepted_upstream = reconcile_test_upstream("reviews", 8080, first_now);
+        accepted_upstream.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+            http1_max_pending_requests: Some(8),
+            ..Default::default()
+        });
+        accepted.upstreams.push(accepted_upstream);
+
+        // Re-apply with a CHANGED top-level fallback (DR edit) and a fresh
+        // timestamp; every SERIALIZED field is identical to the accepted upstream.
+        let second_now = first_now + chrono::Duration::seconds(5);
+        let mut candidate = GatewayConfig::default();
+        let mut candidate_upstream = reconcile_test_upstream("reviews", 8080, second_now);
+        candidate_upstream.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+            http1_max_pending_requests: Some(16),
+            ..Default::default()
+        });
+        candidate.upstreams.push(candidate_upstream);
+
+        // Sanity: the only difference is the `#[serde(skip)]` fallback overlay.
+        assert_ne!(
+            candidate.upstreams[0].dispatch_port_override_fallback,
+            accepted.upstreams[0].dispatch_port_override_fallback
+        );
+
+        reconcile_mesh_upstream_timestamps(&mut candidate, &accepted);
+
+        // The fallback differs, so the fresh timestamp must be preserved.
+        assert_ne!(
+            candidate.upstreams[0].updated_at, accepted.upstreams[0].updated_at,
+            "a fallback-only DR change must keep its fresh timestamp (not be reconciled away)"
+        );
+        let delta = crate::config_delta::ConfigDelta::compute(&accepted, &candidate);
+        assert_eq!(
+            delta
+                .modified_upstreams
+                .iter()
+                .map(|u| u.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["reviews"],
+            "a DR-only fallback change must be reported modified so the route table rebuilds with the fresh fallback"
+        );
+    }
+
+    /// A genuine no-op re-apply of an SD upstream with an UNCHANGED top-level
+    /// fallback must still reconcile to an empty delta — the explicit fallback
+    /// comparison must not over-trigger on equal overlays.
+    #[test]
+    fn reconcile_mesh_upstream_timestamps_equal_fallback_yields_empty_delta() {
+        use crate::config::types::UpstreamPortOverride;
+
+        let first_now = chrono::Utc::now();
+        let fallback = Some(UpstreamPortOverride {
+            http1_max_pending_requests: Some(8),
+            ..Default::default()
+        });
+        let mut accepted = GatewayConfig::default();
+        let mut accepted_upstream = reconcile_test_upstream("reviews", 8080, first_now);
+        accepted_upstream.dispatch_port_override_fallback = fallback.clone();
+        accepted.upstreams.push(accepted_upstream);
+
+        let second_now = first_now + chrono::Duration::seconds(5);
+        let mut candidate = GatewayConfig::default();
+        let mut candidate_upstream = reconcile_test_upstream("reviews", 8080, second_now);
+        candidate_upstream.dispatch_port_override_fallback = fallback;
+        candidate.upstreams.push(candidate_upstream);
+
+        reconcile_mesh_upstream_timestamps(&mut candidate, &accepted);
+
+        let delta = crate::config_delta::ConfigDelta::compute(&accepted, &candidate);
+        assert!(
+            delta.modified_upstreams.is_empty(),
+            "an unchanged fallback must reconcile to an empty delta"
+        );
     }
 
     #[test]
@@ -16602,6 +18374,51 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn matched_local_service_workloads_skips_remote_without_consuming_ref_slot() {
+        let spiffe = SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews").unwrap();
+        let mut remote = workload("reviews-remote", "reviews");
+        remote.spiffe_id = spiffe.clone();
+        remote.service_name = "reviews".to_string();
+        remote.addresses = vec!["172.16.0.5".to_string()];
+        remote.cluster = Some("cluster-b".to_string());
+
+        let mut local = workload("reviews-local", "reviews");
+        local.spiffe_id = spiffe.clone();
+        local.service_name = "reviews".to_string();
+        local.addresses = vec!["10.0.0.5".to_string()];
+        local.cluster = Some("cluster-a".to_string());
+
+        let service = MeshService {
+            cluster_ips: Vec::new(),
+            name: "reviews".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 9080,
+                protocol: AppProtocol::Http,
+                name: None,
+                target_port: None,
+            }],
+            workloads: vec![crate::modes::mesh::config::WorkloadRef { spiffe_id: spiffe }],
+            protocol_overrides: HashMap::new(),
+        };
+
+        let workloads = vec![remote, local];
+        // main's `matched_local_service_workloads` keys remoteness on the
+        // provenance predicate (Option<&MultiClusterConfig>), not a bare
+        // local-cluster string. With local_cluster = "cluster-a", the cluster-b
+        // replica classifies remote and must be skipped WITHOUT consuming the
+        // shared-SPIFFE ref slot (the #1704 fix), so the cluster-a local wins.
+        let multi_cluster = crate::modes::mesh::config::MultiClusterConfig {
+            local_cluster: Some("cluster-a".to_string()),
+            ..Default::default()
+        };
+        let matched = matched_local_service_workloads(&service, &workloads, Some(&multi_cluster));
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].addresses, vec!["10.0.0.5"]);
     }
 
     #[test]
@@ -17969,7 +19786,7 @@ mod tests {
         let original = Arc::new(Some(SvidBundle {
             spiffe_id: id.clone(),
             cert_chain_der: vec![vec![1, 2, 3]],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td.clone(),
                 x509_authorities: vec![vec![4, 5, 6]],
@@ -17991,7 +19808,7 @@ mod tests {
         let replacement = Arc::new(Some(SvidBundle {
             spiffe_id: id,
             cert_chain_der: vec![vec![7, 8, 9]],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td,
                 x509_authorities: vec![vec![10, 11, 12]],
@@ -18031,7 +19848,7 @@ mod tests {
         let svid_bundle = |local_roots: Vec<Vec<u8>>| SvidBundle {
             spiffe_id: id.clone(),
             cert_chain_der: vec![vec![1, 2, 3]],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet {
                 local: TrustBundle {
                     trust_domain: td.clone(),
@@ -18058,7 +19875,7 @@ mod tests {
             trust_bundles: Some(config::TrustBundleSet {
                 local: config::TrustBundle {
                     trust_domain: td.clone(),
-                    x509_authorities: vec![engine.encode(b"old-local-root")],
+                    x509_authorities: vec![engine.encode(b"slice-extra-local-root")],
                     jwt_authorities: Vec::new(),
                     refresh_hint_seconds: None,
                 },
@@ -18087,8 +19904,8 @@ mod tests {
         let bundle = active.as_ref().as_ref().expect("inbound bundle");
         assert_eq!(
             bundle.trust_bundles.local.x509_authorities,
-            vec![vec![9]],
-            "runtime CA local roots must come from the rotated SVID, not the stale slice overlay"
+            vec![vec![9], b"slice-extra-local-root".to_vec()],
+            "runtime CA local roots must keep the rotated SVID root and add accepted slice roots"
         );
         assert!(
             bundle
@@ -18101,6 +19918,173 @@ mod tests {
             !bundle.trust_bundles.federated.contains_key(&stale_td),
             "raw SPIRE federated roots must not remain in the inbound verifier"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inbound_svid_rotation_republisher_refreshes_file_backed_verifier_roots() {
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+        use base64::Engine;
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let inbound_slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        let overlay_slot = empty_mesh_inbound_trust_overlay_slot();
+        let td = TrustDomain::new("td.file-rotation").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+
+        let svid_bundle = |local_roots: Vec<Vec<u8>>| SvidBundle {
+            spiffe_id: id.clone(),
+            cert_chain_der: vec![vec![1, 2, 3]],
+            private_key_pkcs8_der: Vec::new().into(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td.clone(),
+                x509_authorities: local_roots,
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        };
+
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![1]]));
+        let engine = base64::engine::general_purpose::STANDARD;
+        let slice = MeshSlice {
+            version: "file-rotation-overlay".to_string(),
+            trust_bundles: Some(config::TrustBundleSet {
+                local: config::TrustBundle {
+                    trust_domain: td.clone(),
+                    x509_authorities: Vec::new(),
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                federated: vec![config::TrustBundle {
+                    trust_domain: TrustDomain::new("partner.file-rotation").unwrap(),
+                    x509_authorities: vec![engine.encode(b"partner-root")],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: Some(300),
+                }],
+            }),
+            ..MeshSlice::default()
+        };
+        let staged = stage_gateway_runtime_spiffe_bundle(
+            &state,
+            Some(&inbound_slot),
+            Some(&overlay_slot),
+            &slice,
+        );
+        publish_staged_spiffe_bundle(&state, staged);
+
+        let (revision_tx, revision_rx) = tokio::sync::watch::channel(0u64);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let republisher = start_mesh_inbound_svid_rotation_republisher(
+            state.clone(),
+            inbound_slot.clone(),
+            overlay_slot.clone(),
+            revision_rx,
+            shutdown_rx,
+        );
+        tokio::task::yield_now().await;
+
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![9]]));
+        revision_tx.send_replace(1);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let active = inbound_slot.load_full();
+                if active.as_ref().as_ref().is_some_and(|bundle| {
+                    bundle.trust_bundles.local.x509_authorities == vec![vec![9]]
+                }) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rotation republisher refreshed inbound verifier roots");
+
+        let active = inbound_slot.load_full();
+        let bundle = active.as_ref().as_ref().expect("inbound bundle");
+        assert!(
+            bundle
+                .trust_bundles
+                .federated
+                .contains_key(&TrustDomain::new("partner.file-rotation").unwrap()),
+            "accepted federated overlay must survive file-backed SVID republish"
+        );
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(1), republisher)
+            .await
+            .expect("republisher observed shutdown")
+            .expect("republisher task joined");
+    }
+
+    // Regression for the file-SVID rotation republish race (#1707 / #1728 P3):
+    // a rotation can install the new gateway bundle and bump
+    // `backend_svid_rotation_tx` after the republisher subscribed but before its
+    // task first runs. The initial publish must read the freshly installed
+    // bundle, and the baseline revision must be captured *before* that publish so
+    // a later interleaving cannot be deduped away. We model the pre-run rotation
+    // deterministically on a single-threaded executor: install the new bundle and
+    // bump the revision while the spawned task is still parked, then drive it. A
+    // correct republisher pins the verifier to the NEW roots without waiting for a
+    // second rotation; the pre-fix order (publish-then-baseline) could leave it on
+    // the old roots.
+    #[tokio::test(flavor = "current_thread")]
+    async fn inbound_svid_rotation_republisher_picks_up_pre_run_rotation() {
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let inbound_slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        let overlay_slot = empty_mesh_inbound_trust_overlay_slot();
+        let td = TrustDomain::new("td.pre-run-rotation").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+
+        let svid_bundle = |local_roots: Vec<Vec<u8>>| SvidBundle {
+            spiffe_id: id.clone(),
+            cert_chain_der: vec![vec![1, 2, 3]],
+            private_key_pkcs8_der: Vec::new().into(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td.clone(),
+                x509_authorities: local_roots,
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        };
+
+        // Old roots in place when the republisher subscribes.
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![1]]));
+        let (revision_tx, revision_rx) = tokio::sync::watch::channel(0u64);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let republisher = start_mesh_inbound_svid_rotation_republisher(
+            state.clone(),
+            inbound_slot.clone(),
+            overlay_slot.clone(),
+            revision_rx,
+            shutdown_rx,
+        );
+
+        // Rotation lands while the spawned task is still parked (no yield yet):
+        // new bundle installed AND the revision bumped before the task runs.
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![9]]));
+        revision_tx.send_replace(1);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let active = inbound_slot.load_full();
+                if active.as_ref().as_ref().is_some_and(|bundle| {
+                    bundle.trust_bundles.local.x509_authorities == vec![vec![9]]
+                }) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("republisher must pin the inbound verifier to the new roots");
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(1), republisher)
+            .await
+            .expect("republisher observed shutdown")
+            .expect("republisher task joined");
     }
 
     #[test]
@@ -18810,7 +20794,7 @@ mod tests {
         let bundle = SvidBundle {
             spiffe_id: id,
             cert_chain_der: vec![vec![1, 2, 3]],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td,
                 x509_authorities: vec![vec![4, 5, 6]],
@@ -18842,7 +20826,7 @@ mod tests {
         let bundle = SvidBundle {
             spiffe_id: id,
             cert_chain_der: cert_chain_der.clone(),
-            private_key_pkcs8_der: key_pair.serialize_der(),
+            private_key_pkcs8_der: key_pair.serialize_der().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td,
                 x509_authorities: cert_chain_der,
