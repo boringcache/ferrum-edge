@@ -1831,16 +1831,18 @@ async fn handle_h3_request(
     let needs_response_buffering = has_retry || !should_stream_response;
 
     // --- Upstream target selection and circuit breaker ---
-    // NOTE (pre-existing, moot for mesh): this standalone H3 frontend selects
-    // upstream targets but does NOT run the per-target effective-proxy override
-    // pipeline (`resolve_effective_proxy_for_target` / `cap_proxy_retry_for_target`)
-    // that the H1/H2 dispatch path uses, so NONE of the DR per-port
-    // effective-proxy overrides (h2UpgradePolicy / maxRetries plus the
-    // pre-existing idleTimeout / http2MaxRequests / connectTimeout /
-    // maxConnections / tcpKeepalive / per-port LB+outlier) are applied here.
-    // This is moot for mesh: mesh capture is TCP-only (SO_ORIGINAL_DST/REDIRECT;
-    // UDP/H3 are out of mesh scope) and these are DestinationRule-derived
-    // (mesh-only). A uniform H3-override pass is a tracked follow-up — see
+    // NOTE (moot for mesh): this standalone H3 frontend's SELECTION path does
+    // not run `cap_proxy_retry_for_target` (the per-request `maxRetries` cap),
+    // so that DR knob is not applied on the H3 frontend. The H3→HTTP
+    // cross-protocol **plain** bridge DOES now apply the per-target
+    // effective-proxy overrides via `resolve_effective_proxy_for_target`
+    // (h2UpgradePolicy / idleTimeout / http2MaxRequests / connectTimeout / TLS,
+    // plus the service-discovery top-level fallback) — see
+    // `src/http3/cross_protocol.rs` `dispatch_plain`. The native-H3 backend pool
+    // and the gRPC bridge flavor, plus the `maxRetries` cap and per-port
+    // maxConnections / tcpKeepalive / LB+outlier, remain follow-ups. All moot
+    // for mesh: mesh capture is TCP-only (SO_ORIGINAL_DST/REDIRECT; UDP/H3 are
+    // out of mesh scope) and these are DestinationRule-derived (mesh-only) — see
     // `docs/mesh.md` "Dispatch-path coverage".
     // PASSTHROUGH orig-dst is `None` on H3: mesh capture is TCP-only
     // (SO_ORIGINAL_DST/REDIRECT; H3/UDP are out of mesh scope), so an H3
