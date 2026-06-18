@@ -2266,15 +2266,29 @@ impl LoadBalancer {
     }
 
     #[inline]
+    /// Resolve the locality-preferred candidate subset for the bitset path.
+    ///
+    /// `candidates` is the health-filtered pool to prefer within; `scope` is the
+    /// unfiltered candidate membership it was derived from (the full upstream,
+    /// or a port/subset/exclude-scoped pool). `scope` is only consulted on the
+    /// strict no-source path to decide whether configured-local endpoints exist
+    /// in this scope, so strict mode can fail closed to (possibly unhealthy)
+    /// local endpoints instead of widening to healthy remote-cluster endpoints.
+    ///
+    /// Returns `(preferred, degraded)`. `degraded` is true only when strict mode
+    /// had no healthy local candidate and fell back to scope-local endpoints that
+    /// were filtered out by health — i.e. the caller is serving an unhealthy
+    /// local target and should mark the selection as a degraded fallback.
     fn preferred_locality_bitset(
         &self,
         candidates: &HealthBitset,
+        scope: &HealthBitset,
         locality_lb: Option<&LocalityLbState>,
-    ) -> HealthBitset {
+    ) -> (HealthBitset, bool) {
         // Operator-disabled locality LB short-circuits the priority tier
         // preference entirely (Istio `localityLbSetting.enabled: false`).
         if locality_lb.is_some_and(|state| !state.enabled) {
-            return *candidates;
+            return (*candidates, false);
         }
 
         // distribute-mode: restrict the candidate set to targets the
@@ -2290,7 +2304,7 @@ impl LoadBalancer {
                 }
             }
             if !masked.is_empty() {
-                return masked;
+                return (masked, false);
             }
             // Operator typo or every weighted target unhealthy: keep
             // evaluating the normal locality tiers below so exact/zone/region
@@ -2300,13 +2314,14 @@ impl LoadBalancer {
 
         // No source locality → no tier preference. Default (fail-open) returns
         // the input unchanged — the mixed local + remote pool. Strict mode
-        // (fail-closed-to-local) instead restricts to LOCAL endpoints, widening
-        // back to the full set only when none are local.
+        // (fail-closed-to-local) instead restricts to LOCAL endpoints, failing
+        // closed to unhealthy local rather than widening to remote (see
+        // `strict_local_bitset`).
         if self.target_locality_ranks.is_empty() {
             if self.locality_lb_strict {
-                return self.strict_local_bitset(candidates);
+                return self.strict_local_bitset(candidates, scope);
             }
-            return *candidates;
+            return (*candidates, false);
         }
 
         let mut exact = HealthBitset::empty();
@@ -2325,13 +2340,13 @@ impl LoadBalancer {
         }
 
         if !exact.is_empty() {
-            return exact;
+            return (exact, false);
         }
         if !zone.is_empty() {
-            return zone;
+            return (zone, false);
         }
         if !region.is_empty() {
-            return region;
+            return (region, false);
         }
 
         // Failover override sits between the region tier and the unfiltered
@@ -2346,22 +2361,26 @@ impl LoadBalancer {
                 }
             }
             if !failover.is_empty() {
-                return failover;
+                return (failover, false);
             }
         }
 
-        *candidates
+        (*candidates, false)
     }
 
     fn preferred_locality_candidates<'a>(
-        &self,
+        &'a self,
         candidates: Vec<(usize, &'a Arc<UpstreamTarget>)>,
+        scope_indices: &[usize],
         locality_lb: Option<&LocalityLbState>,
-    ) -> Vec<(usize, &'a Arc<UpstreamTarget>)> {
+    ) -> (Vec<(usize, &'a Arc<UpstreamTarget>)>, bool) {
         // Mirror `preferred_locality_bitset` semantics on the Vec path so the
-        // > 128-target fallback agrees with the bitset path.
+        // > 128-target fallback agrees with the bitset path. `scope_indices` is
+        // the unfiltered candidate membership and is only consulted on the
+        // strict no-source path. Returns `(preferred, degraded)` where `degraded`
+        // marks a strict fail-closed fallback to unhealthy local endpoints.
         if locality_lb.is_some_and(|state| !state.enabled) {
-            return candidates;
+            return (candidates, false);
         }
 
         // distribute-mode: restrict to operator-weighted targets when any are
@@ -2374,18 +2393,18 @@ impl LoadBalancer {
                 .filter(|(idx, _)| weights.get(*idx).copied().unwrap_or(0) > 0)
                 .collect();
             if !masked.is_empty() {
-                return masked;
+                return (masked, false);
             }
         }
 
         // No source locality → no tier preference. Default returns the mixed
         // local + remote pool; strict mode restricts to LOCAL endpoints (Vec-
-        // path counterpart of `strict_local_bitset`), widening only when none.
+        // path counterpart of `strict_local_bitset`).
         if self.target_locality_ranks.is_empty() {
             if self.locality_lb_strict {
-                return self.strict_local_candidates(candidates);
+                return self.strict_local_candidates(candidates, scope_indices);
             }
-            return candidates;
+            return (candidates, false);
         }
 
         let mut best_rank = 3;
@@ -2405,7 +2424,7 @@ impl LoadBalancer {
         }
 
         if !preferred.is_empty() {
-            return preferred;
+            return (preferred, false);
         }
 
         if let Some(matches) = locality_lb.and_then(|state| state.failover_target_matches.as_ref())
@@ -2416,16 +2435,17 @@ impl LoadBalancer {
                 .filter(|(idx, _)| matches.get(*idx).copied().unwrap_or(false))
                 .collect();
             if !failover.is_empty() {
-                return failover;
+                return (failover, false);
             }
         }
 
-        candidates
+        (candidates, false)
     }
 
     /// Log the "strict locality LB found no local endpoints" widen-to-full-pool
-    /// warning at most once per balancer instance. Used by both the bitset and
-    /// Vec strict paths so the message is identical and never spams the hot path.
+    /// warning at most once per balancer instance. Used only when the upstream
+    /// has no configured local endpoints; strict mode must not widen merely
+    /// because configured local endpoints are currently unhealthy/ejected.
     #[cold]
     fn warn_strict_locality_widen(&self) {
         if !self
@@ -2456,15 +2476,30 @@ impl LoadBalancer {
 
     /// Strict local-first restriction for the bitset path: keep only candidates
     /// whose locality marks them LOCAL (precomputed in `local_locality_mask`).
-    /// When no candidate is local, widen back to the full input (warn once)
-    /// rather than black-holing — preserving availability over strictness.
+    ///
+    /// `candidates` is the health-filtered pool; `scope` is the unfiltered
+    /// candidate membership it was derived from. Behavior when no *healthy*
+    /// local candidate exists:
+    /// - If this scope has configured-local endpoints (present in `scope` but
+    ///   filtered out by health), fail closed to those unhealthy local
+    ///   endpoints — return them with `degraded = true` — instead of widening to
+    ///   healthy remote-cluster endpoints.
+    /// - If this scope has no local endpoint at all, widen back to the input
+    ///   (warn once) to preserve availability for genuinely remote-only scopes.
+    ///
+    /// Returns `(set, degraded)`. The set is non-empty whenever `scope` is
+    /// non-empty, so callers never have to re-widen a black-holed empty result.
     #[inline]
-    fn strict_local_bitset(&self, candidates: &HealthBitset) -> HealthBitset {
+    fn strict_local_bitset(
+        &self,
+        candidates: &HealthBitset,
+        scope: &HealthBitset,
+    ) -> (HealthBitset, bool) {
         if self.local_locality_mask.is_empty() {
             // Defensive: mask is always populated when strict mode is on, but if
             // it is somehow empty there is no local/remote signal — return the
             // input unchanged rather than dropping every candidate.
-            return *candidates;
+            return (*candidates, false);
         }
         let mut local = HealthBitset::empty();
         for idx in 0..self.targets.len() {
@@ -2475,20 +2510,32 @@ impl LoadBalancer {
             }
         }
         if !local.is_empty() {
-            return local;
+            return (local, false);
+        }
+        // No healthy local. Decide between failing closed to unhealthy local and
+        // widening to remote based on whether THIS scope has any local endpoint.
+        let mut scope_local = HealthBitset::empty();
+        for idx in 0..self.targets.len() {
+            if scope.contains(idx) && self.local_locality_mask.get(idx).copied().unwrap_or(true) {
+                scope_local.set(idx);
+            }
+        }
+        if !scope_local.is_empty() {
+            return (scope_local, true);
         }
         self.warn_strict_locality_widen();
-        *candidates
+        (*candidates, false)
     }
 
     /// Vec-path counterpart of [`Self::strict_local_bitset`] for the >128-target
-    /// fallback.
+    /// fallback. `scope_indices` is the unfiltered candidate membership.
     fn strict_local_candidates<'a>(
-        &self,
+        &'a self,
         candidates: Vec<(usize, &'a Arc<UpstreamTarget>)>,
-    ) -> Vec<(usize, &'a Arc<UpstreamTarget>)> {
+        scope_indices: &[usize],
+    ) -> (Vec<(usize, &'a Arc<UpstreamTarget>)>, bool) {
         if self.local_locality_mask.is_empty() {
-            return candidates;
+            return (candidates, false);
         }
         let local: Vec<(usize, &'a Arc<UpstreamTarget>)> = candidates
             .iter()
@@ -2496,10 +2543,21 @@ impl LoadBalancer {
             .filter(|(idx, _)| self.local_locality_mask.get(*idx).copied().unwrap_or(true))
             .collect();
         if !local.is_empty() {
-            return local;
+            return (local, false);
+        }
+        // No healthy local: fail closed to this scope's (unhealthy) local
+        // endpoints when it has any, else widen to the input (remote-only scope).
+        let scope_local: Vec<(usize, &'a Arc<UpstreamTarget>)> = scope_indices
+            .iter()
+            .copied()
+            .filter(|idx| self.local_locality_mask.get(*idx).copied().unwrap_or(true))
+            .map(|idx| (idx, &self.targets[idx]))
+            .collect();
+        if !scope_local.is_empty() {
+            return (scope_local, true);
         }
         self.warn_strict_locality_widen();
-        candidates
+        (candidates, false)
     }
 
     fn distribute_pick(
@@ -2660,10 +2718,11 @@ impl LoadBalancer {
         // Single-pass health bitset: every DashMap lookup happens here, once.
         let healthy = self.compute_health_bitset(health);
 
+        let scope = HealthBitset::all(n);
         if healthy.is_empty() {
             // All targets unhealthy — degraded mode fallback using all targets.
-            let all = HealthBitset::all(n);
-            let all = self.preferred_locality_bitset(&all, self.locality_lb.as_ref());
+            let (all, _) =
+                self.preferred_locality_bitset(&scope, &scope, self.locality_lb.as_ref());
             return self
                 .select_with_bitset(ctx_key, &all)
                 .map(|target| TargetSelection {
@@ -2672,11 +2731,12 @@ impl LoadBalancer {
                 });
         }
 
-        let healthy = self.preferred_locality_bitset(&healthy, self.locality_lb.as_ref());
+        let (healthy, degraded) =
+            self.preferred_locality_bitset(&healthy, &scope, self.locality_lb.as_ref());
         self.select_with_bitset(ctx_key, &healthy)
             .map(|target| TargetSelection {
                 target,
-                is_fallback: false,
+                is_fallback: degraded,
             })
     }
 
@@ -2725,8 +2785,12 @@ impl LoadBalancer {
             return None;
         }
 
-        let subset_healthy =
-            self.preferred_locality_bitset(&subset_healthy, self.locality_lb.as_ref());
+        let subset_scope = bitset_for_indices(subset_target_indices);
+        let (subset_healthy, degraded) = self.preferred_locality_bitset(
+            &subset_healthy,
+            &subset_scope,
+            self.locality_lb.as_ref(),
+        );
         self.select_with_bitset_using(
             ctx_key,
             &subset_healthy,
@@ -2738,7 +2802,7 @@ impl LoadBalancer {
         )
         .map(|target| TargetSelection {
             target,
-            is_fallback: false,
+            is_fallback: degraded,
         })
     }
 
@@ -2769,9 +2833,10 @@ impl LoadBalancer {
             .as_ref()
             .or(self.locality_lb.as_ref());
 
+        let port_scope = bitset_for_indices(&port_state.target_indices);
         if port_healthy.is_empty() {
-            let all_port_targets = bitset_for_indices(&port_state.target_indices);
-            let all_port_targets = self.preferred_locality_bitset(&all_port_targets, port_locality);
+            let (all_port_targets, _) =
+                self.preferred_locality_bitset(&port_scope, &port_scope, port_locality);
             return self
                 .select_with_bitset_using(
                     ctx_key,
@@ -2788,7 +2853,8 @@ impl LoadBalancer {
                 });
         }
 
-        let port_healthy = self.preferred_locality_bitset(&port_healthy, port_locality);
+        let (port_healthy, degraded) =
+            self.preferred_locality_bitset(&port_healthy, &port_scope, port_locality);
         self.select_with_bitset_using(
             ctx_key,
             &port_healthy,
@@ -2800,7 +2866,7 @@ impl LoadBalancer {
         )
         .map(|target| TargetSelection {
             target,
-            is_fallback: false,
+            is_fallback: degraded,
         })
     }
 
@@ -2856,8 +2922,8 @@ impl LoadBalancer {
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
-        let port_subset_healthy =
-            self.preferred_locality_bitset(&port_subset_healthy, port_locality);
+        let (port_subset_healthy, degraded) =
+            self.preferred_locality_bitset(&port_subset_healthy, &intersection, port_locality);
         self.select_with_bitset_using(
             ctx_key,
             &port_subset_healthy,
@@ -2869,7 +2935,7 @@ impl LoadBalancer {
         )
         .map(|target| TargetSelection {
             target,
-            is_fallback: false,
+            is_fallback: degraded,
         })
     }
 
@@ -2893,7 +2959,11 @@ impl LoadBalancer {
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
-        let candidates = self.preferred_locality_candidates(candidates, port_locality);
+        let (candidates, degraded) = self.preferred_locality_candidates(
+            candidates,
+            &port_state.target_indices,
+            port_locality,
+        );
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -2906,7 +2976,7 @@ impl LoadBalancer {
         )
         .map(|target| TargetSelection {
             target,
-            is_fallback,
+            is_fallback: is_fallback || degraded,
         })
     }
 
@@ -2931,7 +3001,8 @@ impl LoadBalancer {
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
-        let candidates = self.preferred_locality_candidates(candidates, port_locality);
+        let (candidates, degraded) =
+            self.preferred_locality_candidates(candidates, &intersection, port_locality);
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -2944,7 +3015,7 @@ impl LoadBalancer {
         )
         .map(|target| TargetSelection {
             target,
-            is_fallback: false,
+            is_fallback: degraded,
         })
     }
 
@@ -2964,8 +3035,11 @@ impl LoadBalancer {
         if subset_healthy.is_empty() {
             return None;
         }
-        let subset_healthy =
-            self.preferred_locality_candidates(subset_healthy, self.locality_lb.as_ref());
+        let (subset_healthy, degraded) = self.preferred_locality_candidates(
+            subset_healthy,
+            subset_indices,
+            self.locality_lb.as_ref(),
+        );
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -2978,7 +3052,7 @@ impl LoadBalancer {
         )
         .map(|target| TargetSelection {
             target,
-            is_fallback: false,
+            is_fallback: degraded,
         })
     }
 
@@ -3182,10 +3256,12 @@ impl LoadBalancer {
         ctx_key: &str,
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
+        let scope_indices: Vec<usize> = (0..self.targets.len()).collect();
         let healthy = self.healthy_targets_vec(health);
         if healthy.is_empty() {
             let all: Vec<(usize, &Arc<UpstreamTarget>)> = self.targets.iter().enumerate().collect();
-            let all = self.preferred_locality_candidates(all, self.locality_lb.as_ref());
+            let (all, _) =
+                self.preferred_locality_candidates(all, &scope_indices, self.locality_lb.as_ref());
             return self
                 .select_from_candidates_vec(ctx_key, &all)
                 .map(|target| TargetSelection {
@@ -3193,11 +3269,12 @@ impl LoadBalancer {
                     is_fallback: true,
                 });
         }
-        let healthy = self.preferred_locality_candidates(healthy, self.locality_lb.as_ref());
+        let (healthy, degraded) =
+            self.preferred_locality_candidates(healthy, &scope_indices, self.locality_lb.as_ref());
         self.select_from_candidates_vec(ctx_key, &healthy)
             .map(|target| TargetSelection {
                 target,
-                is_fallback: false,
+                is_fallback: degraded,
             })
     }
 
@@ -3416,22 +3493,27 @@ impl LoadBalancer {
             healthy.clear(ei);
         }
 
+        // Unfiltered candidate membership for this call: all targets minus the
+        // excluded one (drives the strict no-source local-presence decision).
+        let mut scope = HealthBitset::all(n);
+        if let Some(ei) = exclude_idx {
+            scope.clear(ei);
+        }
+
         if healthy.is_empty() {
             // No healthy targets except excluded — try any target except excluded
-            let mut fallback = HealthBitset::all(n);
-            if let Some(ei) = exclude_idx {
-                fallback.clear(ei);
-            }
-            if fallback.is_empty() {
+            if scope.is_empty() {
                 return None;
             }
-            let fallback = self.preferred_locality_bitset(&fallback, self.locality_lb.as_ref());
+            let (fallback, _) =
+                self.preferred_locality_bitset(&scope, &scope, self.locality_lb.as_ref());
             let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             let target_idx = fallback.nth_set_bit(idx);
             return Some(Arc::clone(&self.targets[target_idx]));
         }
 
-        let healthy = self.preferred_locality_bitset(&healthy, self.locality_lb.as_ref());
+        let (healthy, _) =
+            self.preferred_locality_bitset(&healthy, &scope, self.locality_lb.as_ref());
         self.select_with_bitset(ctx_key, &healthy)
     }
 
@@ -3470,19 +3552,22 @@ impl LoadBalancer {
             healthy.clear(ei);
         }
 
+        // Unfiltered candidate membership for this call: port targets minus the
+        // excluded one.
+        let mut scope = bitset_for_indices(&port_state.target_indices);
+        if let Some(ei) = exclude_idx {
+            scope.clear(ei);
+        }
+
         let port_locality = port_state
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
         if healthy.is_empty() {
-            let mut fallback = bitset_for_indices(&port_state.target_indices);
-            if let Some(ei) = exclude_idx {
-                fallback.clear(ei);
-            }
-            if fallback.is_empty() {
+            if scope.is_empty() {
                 return None;
             }
-            let fallback = self.preferred_locality_bitset(&fallback, port_locality);
+            let (fallback, _) = self.preferred_locality_bitset(&scope, &scope, port_locality);
             return self.select_with_bitset_using(
                 ctx_key,
                 &fallback,
@@ -3494,7 +3579,7 @@ impl LoadBalancer {
             );
         }
 
-        let healthy = self.preferred_locality_bitset(&healthy, port_locality);
+        let (healthy, _) = self.preferred_locality_bitset(&healthy, &scope, port_locality);
         self.select_with_bitset_using(
             ctx_key,
             &healthy,
@@ -3558,8 +3643,11 @@ impl LoadBalancer {
             return None;
         }
 
-        let subset_healthy =
-            self.preferred_locality_bitset(&subset_healthy, self.locality_lb.as_ref());
+        let (subset_healthy, _) = self.preferred_locality_bitset(
+            &subset_healthy,
+            &candidate_mask,
+            self.locality_lb.as_ref(),
+        );
         self.select_with_bitset_using(
             ctx_key,
             &subset_healthy,
@@ -3630,8 +3718,8 @@ impl LoadBalancer {
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
-        let port_subset_healthy =
-            self.preferred_locality_bitset(&port_subset_healthy, port_locality);
+        let (port_subset_healthy, _) =
+            self.preferred_locality_bitset(&port_subset_healthy, &candidate_mask, port_locality);
         self.select_with_bitset_using(
             ctx_key,
             &port_subset_healthy,
@@ -3656,22 +3744,31 @@ impl LoadBalancer {
             .filter(|(i, _)| exclude_idx.is_none_or(|ei| ei != *i))
             .collect();
 
+        // Unfiltered candidate membership for this call: all indices minus the
+        // excluded one (drives the strict no-source local-presence decision).
+        let scope_indices: Vec<usize> = (0..self.targets.len())
+            .filter(|i| exclude_idx.is_none_or(|ei| ei != *i))
+            .collect();
+
         if healthy.is_empty() {
-            let fallback: Vec<(usize, &Arc<UpstreamTarget>)> = self
-                .targets
+            let fallback: Vec<(usize, &Arc<UpstreamTarget>)> = scope_indices
                 .iter()
-                .enumerate()
-                .filter(|(i, _)| exclude_idx.is_none_or(|ei| ei != *i))
+                .map(|&i| (i, &self.targets[i]))
                 .collect();
             if fallback.is_empty() {
                 return None;
             }
-            let fallback = self.preferred_locality_candidates(fallback, self.locality_lb.as_ref());
+            let (fallback, _) = self.preferred_locality_candidates(
+                fallback,
+                &scope_indices,
+                self.locality_lb.as_ref(),
+            );
             let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             return Some(Arc::clone(fallback[idx % fallback.len()].1));
         }
 
-        let healthy = self.preferred_locality_candidates(healthy, self.locality_lb.as_ref());
+        let (healthy, _) =
+            self.preferred_locality_candidates(healthy, &scope_indices, self.locality_lb.as_ref());
         self.select_from_candidates_vec(ctx_key, &healthy)
     }
 
@@ -3682,18 +3779,23 @@ impl LoadBalancer {
         exclude_idx: Option<usize>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
+        // Unfiltered candidate membership for this call: port targets minus the
+        // excluded one.
+        let scope_indices: Vec<usize> = port_state
+            .target_indices
+            .iter()
+            .copied()
+            .filter(|&idx| exclude_idx.is_none_or(|ei| ei != idx))
+            .collect();
         let mut candidates: Vec<(usize, &Arc<UpstreamTarget>)> = self
             .healthy_targets_vec_for_indices(health, &port_state.target_indices)
             .into_iter()
             .filter(|(idx, _)| exclude_idx.is_none_or(|ei| ei != *idx))
             .collect();
         if candidates.is_empty() {
-            candidates = port_state
-                .target_indices
+            candidates = scope_indices
                 .iter()
-                .copied()
-                .filter(|&idx| exclude_idx.is_none_or(|ei| ei != idx))
-                .map(|idx| (idx, &self.targets[idx]))
+                .map(|&idx| (idx, &self.targets[idx]))
                 .collect();
         }
         if candidates.is_empty() {
@@ -3703,7 +3805,8 @@ impl LoadBalancer {
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
-        let candidates = self.preferred_locality_candidates(candidates, port_locality);
+        let (candidates, _) =
+            self.preferred_locality_candidates(candidates, &scope_indices, port_locality);
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -3745,7 +3848,8 @@ impl LoadBalancer {
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
-        let candidates = self.preferred_locality_candidates(candidates, port_locality);
+        let (candidates, _) =
+            self.preferred_locality_candidates(candidates, &intersection, port_locality);
 
         self.select_from_candidates_vec_using(
             ctx_key,
@@ -3787,8 +3891,11 @@ impl LoadBalancer {
         if subset_healthy.is_empty() {
             return None;
         }
-        let subset_healthy =
-            self.preferred_locality_candidates(subset_healthy, self.locality_lb.as_ref());
+        let (subset_healthy, _) = self.preferred_locality_candidates(
+            subset_healthy,
+            &candidate_indices,
+            self.locality_lb.as_ref(),
+        );
 
         self.select_from_candidates_vec_using(
             ctx_key,
