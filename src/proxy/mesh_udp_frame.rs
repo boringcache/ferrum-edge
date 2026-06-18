@@ -208,6 +208,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dtls_handshake_datagram_round_trips_opaque() {
+        // F3 §3.3 Stage 5 — DTLS passthrough: the mesh relays DTLS over the UDP
+        // datagram tunnel OPAQUELY. It never terminates or inspects DTLS — no
+        // ClientHello/SNI parse (unlike the standalone `passthrough` DTLS proxy);
+        // the inner DTLS rides the secured outer mesh hop (HBONE/mesh-mTLS)
+        // untouched. A DTLS 1.2 ClientHello record (content_type=22 handshake,
+        // version 0xFEFD, epoch/seq, length, handshake bytes) must therefore
+        // round-trip through the framing codec BYTE-FOR-BYTE — proving the relay is
+        // content-agnostic and needs no DTLS-specific handling.
+        let dtls_client_hello: &[u8] = &[
+            0x16, // content type: handshake (22)
+            0xFE, 0xFD, // DTLS 1.2 (0xFEFD)
+            0x00, 0x00, // epoch 0
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // record sequence number
+            0x00, 0x0C, // record length
+            0x01, // handshake type: client_hello (1)
+            0xFE, 0xFD, 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0xFF,
+        ];
+        // Interleave a second opaque datagram to confirm no cross-frame bleed.
+        let wire = encode_all(&[dtls_client_hello, b"app-data"]);
+        let out = decode_all_chunked(&wire, 3).await;
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            &out[0][..],
+            dtls_client_hello,
+            "a DTLS handshake datagram must relay byte-for-byte (opaque passthrough)"
+        );
+        assert_eq!(&out[1][..], b"app-data");
+    }
+
+    #[tokio::test]
     async fn zero_length_datagram_is_preserved() {
         // A 0-length datagram is UDP-legal and must round-trip as an empty
         // datagram, not be dropped or merged with a neighbor.
