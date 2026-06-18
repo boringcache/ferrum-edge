@@ -80,6 +80,30 @@ impl V001SqlBuilder {
         Ok(())
     }
 
+    /// Idempotently ensure baseline tables that were folded into V001 *after*
+    /// some databases had already recorded V001 in `_ferrum_migrations`.
+    ///
+    /// During build-out, schema additions are folded into the V001 baseline
+    /// rather than carried as upgrade migrations (see the project build-out
+    /// policy). The migration runner skips V001 entirely once version 1 is
+    /// recorded, so a table added to V001 here would never be created on an
+    /// already-initialized database — yet the proxy persistence path writes to
+    /// `proxy_route_locks` on every create/update/batch/API-spec proxy write.
+    /// Re-running this idempotent `CREATE TABLE IF NOT EXISTS` pass on every
+    /// startup guarantees the table exists regardless of whether V001 was
+    /// recorded before or after it was folded in. Every statement here must be
+    /// idempotent (no error on re-run) so the pass is safe on fresh databases
+    /// that have just applied V001 in full.
+    pub(super) async fn ensure_compatibility_tables(
+        &self,
+        pool: &AnyPool,
+    ) -> Result<(), anyhow::Error> {
+        sqlx::query(self.create_proxy_route_locks_sql())
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
     async fn enable_sqlite_foreign_keys(&self, pool: &AnyPool) -> Result<(), anyhow::Error> {
         if self.is_sqlite() {
             sqlx::query("PRAGMA foreign_keys = ON")
