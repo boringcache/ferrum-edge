@@ -559,24 +559,26 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_evict_and_acquire_never_double_admits() {
-        // Concurrent acquire/drop churn on a cap-1 destination: every successful
-        // acquire takes the counter 0 -> 1 and every drop takes it 1 -> 0, so an
-        // idle-entry eviction constantly races a concurrent acquirer for the SAME
-        // destination. Reserving the slot AND evicting under the shard lock makes
-        // over-admission structurally impossible (a lock-free CAS on a cloned
-        // `Arc` could instead let an eviction race an acquirer onto a second,
-        // orphaned counter). We assert the limiter's own per-destination count
-        // never exceeds the cap while a slot is held.
+    fn concurrent_churn_keeps_count_balanced_and_evicts() {
+        // Stress the concurrent acquire/evict path on a cap-1 destination: every
+        // successful acquire takes the counter 0 -> 1 and every drop takes it
+        // 1 -> 0, so an idle-entry eviction constantly races a concurrent acquirer
+        // for the SAME destination. Assert the churn corrupts no state — the count
+        // returns to zero and the idle key is evicted once all churn completes.
         //
-        // This is a deliberately TIMING-ROBUST check. A test-side "live guards"
-        // gauge cannot verify the invariant without spurious results, because the
-        // slot is released INSIDE `Drop` (the `remove_if`) — a point the test
-        // can't bracket: decrementing such a gauge *before* `drop` undercounts a
-        // real overlap, *after* `drop` overcounts a legitimate post-release
-        // acquire. Reading the limiter's count under its read lock sidesteps that:
-        // while this thread holds a guard the count is exactly 1, and a regression
-        // that admitted past the cap would surface as a count above the cap here.
+        // NOTE on what this deliberately does NOT assert: the cap-bypass via an
+        // *orphaned counter* (a lock-free CAS evicting a counter an acquirer has
+        // already cloned, splitting the count across an off-map `Arc` and a fresh
+        // map entry) is **structurally impossible** here — `try_acquire` reserves
+        // the slot through the map under the shard lock and never clones a stale
+        // off-map counter — and it is **not observable from a unit test** anyway:
+        // the slot releases INSIDE `Drop` (the `remove_if`), so a live-guard gauge
+        // can't be bracketed (decrement before `drop` undercounts a real overlap,
+        // after `drop` overcounts a legitimate post-release acquire), and an
+        // off-map orphan is invisible to `current()` / `resident_counters()` map
+        // reads. Static cap enforcement (no over-admission while guards are held)
+        // is covered by `concurrent_acquire_never_exceeds_cap`, which holds every
+        // granted guard and counts them — no `Drop`-timing dependence.
         use std::thread;
 
         let limiter = Arc::new(BackendPendingLimiter::new());
@@ -588,12 +590,6 @@ mod tests {
             handles.push(thread::spawn(move || {
                 for _ in 0..4_000 {
                     if let Ok(Some(guard)) = limiter.try_acquire("hot.example.com", 80, Some(cap)) {
-                        assert!(
-                            limiter.current("hot.example.com", 80) <= u64::from(cap),
-                            "in-flight count exceeded the cap while a guard was held"
-                        );
-                        // Widen the hold window without a wall-clock sleep so the
-                        // count check overlaps concurrent acquire/evict attempts.
                         for _ in 0..24 {
                             std::hint::spin_loop();
                         }
