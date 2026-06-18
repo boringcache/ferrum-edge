@@ -1833,6 +1833,15 @@ fn grpc_request_body_limit_exceeded(flag: &Option<Arc<std::sync::atomic::AtomicB
     flag.as_ref().is_some_and(|f| f.load(Ordering::Acquire))
 }
 
+/// Whether `status` is a no-body response status (`204 No Content` /
+/// `304 Not Modified`) whose body is suppressed regardless of the backend
+/// stream's `END_STREAM` state — RFC 7230 §3.3.3 / RFC 7232 §4.1. Same statuses
+/// the canonical [`crate::http3::client::is_response_body_complete`] no-body
+/// predicate uses (minus the method-side `HEAD` check, handled separately).
+fn response_is_no_body_status(status: u16) -> bool {
+    status == 204 || status == 304
+}
+
 /// Whether a streaming response's backend-dispatch outcome (CB / passive-health /
 /// least-latency) should be DEFERRED to body completion rather than recorded at
 /// response-header time (#1649 items 2 & 3).
@@ -1849,12 +1858,16 @@ fn grpc_request_body_limit_exceeded(flag: &Option<Arc<std::sync::atomic::AtomicB
 ///     responses preserves post-wire body timeout/reset accounting instead of
 ///     banking a header-time success before the body can fail.
 ///   * **Already-ended body** (`is_end_stream()` — empty `200`, gRPC
-///     Trailers-Only, `content-length: 0`, 204/304) OR a **HEAD request** (the
-///     response body is suppressed regardless of the backend stream's
-///     `END_STREAM` state at header time): nothing streams to the client, so a
-///     deferred outcome would be misread as a client disconnect by the
-///     never-polled `ProxyBody::Drop` path (`src/proxy/body.rs`) and a successful
-///     no-body probe would never heal a HALF_OPEN breaker (#1649 R7 finding 1).
+///     Trailers-Only, `content-length: 0`) OR a **no-body status / HEAD request**
+///     (a `204`/`304` response or a `HEAD` request suppresses the body regardless
+///     of the backend stream's `END_STREAM` state at header time — RFC 7230 §3.3.3
+///     / RFC 7232 §4.1): nothing streams to the client, so a deferred outcome would
+///     be misread as a client disconnect by the never-polled `ProxyBody::Drop` path
+///     (`src/proxy/body.rs`) and a successful no-body probe would never heal a
+///     HALF_OPEN breaker. A backend that emits a `304`/`204` header frame WITHOUT
+///     `END_STREAM` would otherwise slip past the `is_end_stream()` guard and into
+///     the deferred path (the `< 500` predicate admits it), so gate on the status
+///     explicitly here as well (#1649 R7 finding 1, R8 304 no-body finding).
 ///   * **Passively-unhealthy status** (`status_is_passively_unhealthy`): an
 ///     operator may list an otherwise streamable status (e.g. `206`/`299`/`429`)
 ///     in the target's resolved passive `unhealthy_status_codes`. That header is
@@ -1868,7 +1881,14 @@ fn streaming_dispatch_should_defer(
     request_is_head: bool,
     status_is_passively_unhealthy: bool,
 ) -> bool {
-    if body_already_ended || request_is_head {
+    // A `204`/`304` response carries no body regardless of whether the backend
+    // set `END_STREAM` on its header frame, so it must never be deferred — hyper
+    // may never poll the body, and `ProxyBody::Drop` would then record the
+    // never-polled streaming body as a client disconnect, dropping the header-time
+    // success and preventing a HALF_OPEN breaker from healing on cache-validation
+    // traffic. Mirrors the `HEAD` body-suppression case and the canonical no-body
+    // predicate in `http3::client::is_response_body_complete`.
+    if body_already_ended || request_is_head || response_is_no_body_status(response_status) {
         return false;
     }
     response_status < 500
@@ -20806,6 +20826,24 @@ mod tests {
             !grpc_streaming_dispatch_should_defer(&proxy, 200, true),
             "already-ended gRPC responses remain header-time-final"
         );
+
+        // No-body statuses (204/304) must stay eager even when the backend left
+        // the body open (no END_STREAM on the header frame, so `is_end_stream()`
+        // would report false): hyper may never poll a 304/204 body, and the
+        // never-polled streaming `ProxyBody::Drop` would otherwise record a client
+        // disconnect that drops the header-time success and blocks HALF_OPEN
+        // healing for cache-validation traffic.
+        for no_body_status in [204u16, 304u16] {
+            assert!(
+                !streaming_dispatch_should_defer(&proxy, no_body_status, false, false, false),
+                "{no_body_status} is a no-body status and must record eagerly even with an \
+                 open (non-END_STREAM) backend body"
+            );
+            assert!(
+                !grpc_streaming_dispatch_should_defer(&proxy, no_body_status, false),
+                "{no_body_status} no-body status must record eagerly on the gRPC path too"
+            );
+        }
     }
 
     /// F3 §3.4: the direct-pod-IP / headless per-workload raw-TCP egress
