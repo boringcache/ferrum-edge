@@ -12,6 +12,7 @@ pub mod adaptive_buffer;
 pub mod adaptive_concurrency;
 pub mod admin;
 pub mod backend_conn_limit;
+pub mod backend_pending_limit;
 pub mod capture;
 pub mod circuit_breaker;
 pub mod cli;

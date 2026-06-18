@@ -2613,6 +2613,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         }
     }
 
@@ -4949,6 +4950,7 @@ mod tests {
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                remote_provenance: false,
             }],
             ..MeshSlice::default()
         };
@@ -4981,6 +4983,7 @@ mod tests {
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                remote_provenance: false,
             }],
             ..MeshSlice::default()
         };

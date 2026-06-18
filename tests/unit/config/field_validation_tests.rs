@@ -6,10 +6,10 @@ use ferrum_edge::config::types::{
     MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
     MAX_CREDENTIAL_VALUE_LENGTH, MAX_CREDENTIALS_SIZE, MAX_FILE_PATH_LENGTH, MAX_HOSTS_PER_PROXY,
     MAX_HTTP2_MAX_FRAME_SIZE, MAX_HTTP3_CONNECTIONS_PER_BACKEND, MAX_LISTEN_PATH_LENGTH,
-    MAX_NAME_LENGTH, MAX_PLUGIN_CONFIG_SIZE, MAX_SD_STRING_LENGTH, MAX_TARGETS_PER_UPSTREAM,
-    MAX_TIMEOUT_MS, MAX_USERNAME_LENGTH, MIN_HTTP2_MAX_FRAME_SIZE, MIN_HTTP2_WINDOW_SIZE,
-    MeshSdConfig, PassiveHealthCheck, PluginConfig, PluginScope, Proxy, RetryConfig, SdProvider,
-    ServiceDiscoveryConfig, Upstream, UpstreamTarget,
+    MAX_NAME_LENGTH, MAX_PLUGIN_CONFIG_SIZE, MAX_POOL_SQL_INTEGER_VALUE, MAX_SD_STRING_LENGTH,
+    MAX_TARGETS_PER_UPSTREAM, MAX_TIMEOUT_MS, MAX_USERNAME_LENGTH, MIN_HTTP2_MAX_FRAME_SIZE,
+    MIN_HTTP2_WINDOW_SIZE, MeshSdConfig, PassiveHealthCheck, PluginConfig, PluginScope, Proxy,
+    RetryConfig, SdProvider, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
 use std::collections::HashMap;
 
@@ -37,6 +37,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: Default::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
@@ -54,6 +55,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        pool_http1_max_pending_requests: None,
         pool_tcp_keepalive_seconds: None,
         upstream_id: None,
         upstream_subset: None,
@@ -108,6 +110,7 @@ fn make_upstream(id: &str) -> Upstream {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -116,6 +119,7 @@ fn make_upstream(id: &str) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -860,13 +864,40 @@ fn test_upstream_target_locality_too_long() {
 fn test_upstream_source_locality_rejected_by_admin_api() {
     let mut upstream = make_upstream("test");
     upstream.source_locality = Some("us-west/us-west-1/a".into());
+    // The projected-field rejection is scoped to the admin write path
+    // (`validate_operator_provided_fields`), NOT `validate_fields` (which also runs on
+    // the runtime mesh-apply path, where the field is legitimately projected).
     let errs = upstream
-        .validate_fields()
-        .expect_err("source_locality must be rejected at admit time");
+        .validate_operator_provided_fields()
+        .expect_err("source_locality must be rejected on the admin write path");
     assert!(
         errs.iter().any(|e| e.contains("source_locality")
             && e.contains("cannot be set directly via the admin API")),
         "expected source_locality admin-API rejection, got: {errs:?}"
+    );
+    // Runtime apply must NOT reject (no false "misconfigured" warning).
+    assert!(
+        upstream.validate_fields().is_ok(),
+        "validate_fields must not reject a mesh-projected source_locality on the runtime path"
+    );
+}
+
+#[test]
+fn test_upstream_locality_lb_strict_rejected_by_admin_api() {
+    let mut upstream = make_upstream("test");
+    upstream.locality_lb_strict = true;
+    let errs = upstream
+        .validate_operator_provided_fields()
+        .expect_err("locality_lb_strict must be rejected on the admin write path");
+    assert!(
+        errs.iter().any(|e| e.contains("locality_lb_strict")
+            && e.contains("cannot be set directly via the admin API")),
+        "expected locality_lb_strict admin-API rejection, got: {errs:?}"
+    );
+    // Runtime apply (mesh slice prep SETS this) must NOT reject.
+    assert!(
+        upstream.validate_fields().is_ok(),
+        "validate_fields must not reject a mesh-projected locality_lb_strict on the runtime path"
     );
 }
 
@@ -891,12 +922,17 @@ fn test_upstream_locality_lb_setting_rejected_by_admin_api() {
         }],
     });
     let errs = upstream
-        .validate_fields()
-        .expect_err("locality_lb_setting must be rejected at admit time");
+        .validate_operator_provided_fields()
+        .expect_err("locality_lb_setting must be rejected on the admin write path");
     assert!(
         errs.iter().any(|e| e.contains("locality_lb_setting")
             && e.contains("cannot be set directly via the admin API")),
         "expected locality_lb_setting admin-API rejection, got: {errs:?}"
+    );
+    // Runtime apply must NOT reject.
+    assert!(
+        upstream.validate_fields().is_ok(),
+        "validate_fields must not reject a mesh-projected locality_lb_setting on the runtime path"
     );
 }
 
@@ -1283,9 +1319,42 @@ fn test_proxy_http2_max_concurrent_streams_zero() {
 }
 
 #[test]
+fn test_proxy_http2_max_concurrent_streams_above_sql_integer_limit() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.pool_http2_max_concurrent_streams = Some(MAX_POOL_SQL_INTEGER_VALUE as u32 + 1);
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("pool_http2_max_concurrent_streams"))
+    );
+}
+
+#[test]
 fn test_proxy_http2_max_concurrent_streams_valid() {
     let mut proxy = make_proxy("test", "/api");
     proxy.pool_http2_max_concurrent_streams = Some(1000);
+    assert!(proxy.validate_fields().is_ok());
+    proxy.pool_http2_max_concurrent_streams = Some(MAX_POOL_SQL_INTEGER_VALUE as u32);
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_proxy_pool_max_requests_per_connection_above_sql_integer_limit() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.pool_max_requests_per_connection = Some(MAX_POOL_SQL_INTEGER_VALUE + 1);
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("pool_max_requests_per_connection"))
+    );
+}
+
+#[test]
+fn test_proxy_pool_max_requests_per_connection_valid_bounds() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.pool_max_requests_per_connection = Some(0);
+    assert!(proxy.validate_fields().is_ok());
+    proxy.pool_max_requests_per_connection = Some(MAX_POOL_SQL_INTEGER_VALUE);
     assert!(proxy.validate_fields().is_ok());
 }
 
@@ -2156,6 +2225,7 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -2164,6 +2234,7 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

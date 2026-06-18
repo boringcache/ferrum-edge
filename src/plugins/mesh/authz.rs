@@ -242,14 +242,28 @@ fn parse_client_ip(client_ip: &str) -> Option<std::net::IpAddr> {
 ///
 /// A host-routed inbound `Proxy` carries `listen_port == None`, so without this
 /// the port would fall back to `frontend_listen_port` (the shared `:15006`
-/// listener socket) and a port-scoped rule would never match. Non-mesh and
-/// outbound traffic keep the existing listener/`listen_port` derivation.
+/// listener socket) and a port-scoped rule would never match.
+///
+/// For mesh **outbound** routes, `destination.port` is the captured original
+/// destination port when present. Direct/non-Linux single-port routes fall
+/// back to the router-stamped service port. They must never fall back to the
+/// outbound capture listener port (`:15001`), because that makes port-scoped
+/// ALLOWs over-deny and DENYs under-deny.
 fn mesh_authz_destination_port(
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     matched_proxy: Option<&crate::config::types::Proxy>,
     ingress_listener_authz_port: Option<u16>,
+    outbound_destination_authz_port: Option<u16>,
+    orig_dst: Option<std::net::SocketAddr>,
     frontend_listen_port: Option<u16>,
 ) -> Option<u16> {
+    if mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Outbound) {
+        return orig_dst
+            .map(|addr| addr.port())
+            .or(outbound_destination_authz_port)
+            .or_else(|| matched_proxy.and_then(|proxy| proxy.listen_port));
+    }
+
     mesh_inbound_app_port(
         mesh_direction,
         matched_proxy.map(|proxy| (proxy.id.as_str(), proxy.backend_port)),
@@ -257,6 +271,10 @@ fn mesh_authz_destination_port(
     )
     .or(frontend_listen_port)
     .or_else(|| matched_proxy.and_then(|proxy| proxy.listen_port))
+}
+
+fn mesh_authz_authorization_path(path: &str) -> String {
+    crate::router_cache::normalize_encoded_slashes(path).into_owned()
 }
 
 /// The authorization destination port for a materialized sidecar inbound route,
@@ -838,6 +856,8 @@ impl Plugin for MeshAuthz {
             ctx.mesh_direction,
             ctx.matched_proxy.as_deref(),
             ctx.mesh_inbound_listener_authz_port,
+            ctx.mesh_outbound_destination_authz_port,
+            ctx.orig_dst,
             ctx.frontend_listen_port,
         );
         // Istio source IP matchers. `source.ip` is the immediate downstream
@@ -862,7 +882,7 @@ impl Plugin for MeshAuthz {
             source_principal,
             request_principal,
             method: Some(ctx.method.clone()),
-            path: Some(ctx.path.clone()),
+            path: Some(mesh_authz_authorization_path(&ctx.path)),
             host,
             port,
             headers,
@@ -1299,7 +1319,9 @@ fn default_trusted_hbone_assertors() -> Vec<TrustedAssertor> {
 // no longer fails open.
 #[cfg(test)]
 mod tests {
-    use super::mesh_inbound_app_port;
+    use super::{
+        mesh_authz_authorization_path, mesh_authz_destination_port, mesh_inbound_app_port,
+    };
     use crate::modes::mesh::{
         MESH_INBOUND_PROXY_ID_PREFIX, MESH_INGRESS_PROXY_ID_PREFIX, MeshTrafficDirection,
     };
@@ -1384,5 +1406,67 @@ mod tests {
             mesh_inbound_app_port(Some(MeshTrafficDirection::Inbound), None, None),
             None,
         );
+    }
+
+    #[test]
+    fn mesh_authz_destination_port_uses_orig_dst_for_outbound() {
+        let orig_dst = "10.0.0.10:9080".parse().expect("valid socket addr");
+        assert_eq!(
+            mesh_authz_destination_port(
+                Some(MeshTrafficDirection::Outbound),
+                None,
+                None,
+                Some(8080),
+                Some(orig_dst),
+                Some(15001),
+            ),
+            Some(9080),
+            "outbound authz must prefer the real captured destination port over route/listener ports"
+        );
+    }
+
+    #[test]
+    fn mesh_authz_destination_port_uses_selected_outbound_service_port_without_orig_dst() {
+        assert_eq!(
+            mesh_authz_destination_port(
+                Some(MeshTrafficDirection::Outbound),
+                None,
+                None,
+                Some(8080),
+                None,
+                Some(15001),
+            ),
+            Some(8080),
+            "single-port direct/non-Linux outbound routes use the router-selected service port"
+        );
+    }
+
+    #[test]
+    fn mesh_authz_destination_port_does_not_fall_back_to_capture_listener_for_outbound() {
+        assert_eq!(
+            mesh_authz_destination_port(
+                Some(MeshTrafficDirection::Outbound),
+                None,
+                None,
+                None,
+                None,
+                Some(15001),
+            ),
+            None,
+            "outbound destination.port must not evaluate as the shared capture listener port"
+        );
+    }
+
+    #[test]
+    fn mesh_authz_authorization_path_normalizes_encoded_slashes() {
+        assert_eq!(
+            mesh_authz_authorization_path("/admin%2fsecret"),
+            "/admin/secret"
+        );
+        assert_eq!(
+            mesh_authz_authorization_path("/admin%252Fsecret"),
+            "/admin/secret"
+        );
+        assert_eq!(mesh_authz_authorization_path("/api%20name"), "/api%20name");
     }
 }

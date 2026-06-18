@@ -9,9 +9,9 @@ use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
 use super::common::{
-    BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs,
-    refresh_dp_grpc_tls_config_if_changed, should_race_primary_retry, tonic_tls_config,
-    wait_for_shutdown, wait_optional_tls_reload,
+    BACKOFF_INITIAL_SECS, MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE, jittered_backoff,
+    next_backoff_secs, refresh_dp_grpc_tls_config_if_changed, should_race_primary_retry,
+    tonic_tls_config, wait_for_shutdown, wait_optional_tls_reload,
 };
 use crate::grpc::dp_client::{
     DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, generate_dp_jwt_with_issuer,
@@ -381,9 +381,11 @@ impl ResourceAccumulator {
         if !is_known_type_url(type_url) {
             return Err(format!("unknown xDS type_url '{type_url}'"));
         }
-        if !resources.is_empty() && version.trim().is_empty() {
+        if version.trim().is_empty()
+            && (is_required_mesh_slice_type(type_url) || !resources.is_empty())
+        {
             return Err(format!(
-                "xDS response for type_url '{type_url}' has resources but empty version_info"
+                "xDS response for type_url '{type_url}' has empty version_info"
             ));
         }
 
@@ -579,11 +581,7 @@ pub async fn start_xds_client_with_shutdown(
         let is_primary = current_cp_index == 0;
         let is_fallback = !is_primary && cp_urls.len() > 1;
         let mut stream_shutdown_rx = shutdown_rx.clone();
-        let should_race_primary = should_race_primary_retry(
-            is_fallback,
-            config.primary_retry_secs,
-            state.has_first_slice(),
-        );
+        let should_race_primary = should_race_primary_retry(is_fallback, config.primary_retry_secs);
         let result = if should_race_primary {
             tokio::select! {
                 result = connect_ads(
@@ -594,7 +592,10 @@ pub async fn start_xds_client_with_shutdown(
                     tls_config.as_ref(),
                     &mut stream_state,
                 ) => result,
-                _ = tokio::time::sleep(Duration::from_secs(config.primary_retry_secs)) => {
+                _ = wait_for_first_slice_then_primary_retry(
+                    state.clone(),
+                    Duration::from_secs(config.primary_retry_secs),
+                ) => {
                     info!(
                         primary_retry_secs = config.primary_retry_secs,
                         cp_url = %cp_url,
@@ -676,6 +677,11 @@ pub async fn start_xds_client_with_shutdown(
     }
 }
 
+async fn wait_for_first_slice_then_primary_retry(state: MeshRuntimeState, interval: Duration) {
+    state.wait_for_first_slice().await;
+    tokio::time::sleep(interval).await;
+}
+
 async fn connect_ads(
     cp_url: &str,
     jwt_secret: &GrpcJwtSecret,
@@ -734,7 +740,8 @@ async fn run_ads_stream_with_auth(
             }
             Ok(req)
         },
-    );
+    )
+    .max_decoding_message_size(MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE);
 
     let (tx, rx) = mpsc::channel(config.stream_channel_capacity.max(1));
     let request_stream = ReceiverStream::new(rx);
@@ -2071,11 +2078,35 @@ mod tests {
     }
 
     #[test]
-    fn primary_retry_waits_for_initial_mesh_slice() {
-        assert!(!should_race_primary_retry(true, 300, false));
-        assert!(should_race_primary_retry(true, 300, true));
-        assert!(!should_race_primary_retry(false, 300, true));
-        assert!(!should_race_primary_retry(true, 0, true));
+    fn primary_retry_races_on_fallback_when_configured() {
+        assert!(should_race_primary_retry(true, 300));
+        assert!(!should_race_primary_retry(false, 300));
+        assert!(!should_race_primary_retry(true, 0));
+    }
+
+    #[tokio::test]
+    async fn primary_retry_waits_until_first_slice_on_fallback_stream() {
+        let state = MeshRuntimeState::new();
+        let retry = tokio::spawn(wait_for_first_slice_then_primary_retry(
+            state.clone(),
+            Duration::from_millis(1),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !retry.is_finished(),
+            "timer must not run before the first slice arrives"
+        );
+
+        state.install_slice(MeshSlice {
+            version: "first".to_string(),
+            ..MeshSlice::default()
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .expect("primary retry wait should complete after first slice")
+            .expect("primary retry wait task should join");
     }
 
     #[test]
@@ -3414,6 +3445,25 @@ mod tests {
     }
 
     #[test]
+    fn empty_required_response_requires_version_info() {
+        let mut accumulator = ResourceAccumulator::new();
+        let err = accumulator
+            .apply_sotw_response(CDS_TYPE_URL, &[], "")
+            .expect_err("empty required response with empty version must be rejected");
+
+        assert!(err.contains("empty version_info"));
+    }
+
+    #[test]
+    fn empty_optional_response_may_omit_version_info() {
+        let mut accumulator = ResourceAccumulator::new();
+
+        accumulator
+            .apply_sotw_response(SDS_TYPE_URL, &[], "")
+            .expect("empty optional response can omit version");
+    }
+
+    #[test]
     fn accumulator_accepts_ecds_typed_extension_config_resources() {
         let mut accumulator = ResourceAccumulator::new();
         accumulator
@@ -4076,6 +4126,7 @@ mod tests {
             locality: None,
             service_account: Some("api".to_string()),
             pod_uid: None,
+            remote_provenance: false,
         };
         let service = MeshService {
             cluster_ips: Vec::new(),
