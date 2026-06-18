@@ -905,15 +905,22 @@ impl RouterCache {
         //     increment.
         //
         // Instead subtract a snapshot of the counter taken just before each
-        // `clear()`. `fetch_sub` is an atomic RMW that composes additively with
-        // concurrent `fetch_add(1)`s, so no increment is ever lost. Correctness
-        // sketch: every entry resident *after* the clear was inserted after the
-        // `clear()` call, so its `fetch_add` (which always follows its map
-        // insert) ran after the snapshot load and is therefore not part of the
-        // subtracted snapshot — resident entries stay counted, so the counter
-        // can never drop below the live count. This is the load-bearing
-        // invariant: under-counting would delay eviction and let the cache grow
-        // unbounded, so we only ever err toward over-count.
+        // `clear()`, *floored at the live map length* (see
+        // `reconcile_cache_entries_after_clear`). `fetch_sub` is an atomic RMW
+        // that composes additively with concurrent `fetch_add(1)`s, so no
+        // increment is ever lost. Correctness sketch: every entry resident
+        // *after* the clear was inserted after the `clear()` call, so its
+        // `fetch_add` (which always follows its map insert) ran after the
+        // snapshot load and is therefore not part of the subtracted snapshot —
+        // resident entries stay counted. The `max(map.len())` floor closes the
+        // one remaining under-count window: if an eviction pass races the clear
+        // and `fetch_sub`s its own removals *after* this snapshot is loaded, the
+        // snapshot still includes those entries, so subtracting it bare would
+        // double-count the evictor's removals and could leave the counter below
+        // the live set; flooring at `len()` (a valid lower bound on resident
+        // entries) makes that impossible. This is the load-bearing invariant:
+        // under-counting would delay eviction and let the cache grow unbounded,
+        // so we only ever err toward over-count.
         //
         // The residual imprecision is a bounded *over*-count: an entry inserted
         // in the window `[snapshot load, clear()]` whose `fetch_add` runs after
@@ -937,10 +944,32 @@ impl RouterCache {
         // longer sits between the prefix snapshot and the prefix subtract).
         let prefix_cleared = self.prefix_cache_entries.load(Ordering::Relaxed);
         self.prefix_cache.clear();
-        subtract_cache_entries(&self.prefix_cache_entries, prefix_cleared);
+        reconcile_cache_entries_after_clear(
+            &self.prefix_cache_entries,
+            &self.prefix_cache,
+            prefix_cleared,
+        );
         let regex_cleared = self.regex_cache_entries.load(Ordering::Relaxed);
         self.regex_cache.clear();
-        subtract_cache_entries(&self.regex_cache_entries, regex_cleared);
+        reconcile_cache_entries_after_clear(
+            &self.regex_cache_entries,
+            &self.regex_cache,
+            regex_cleared,
+        );
+        // Drain the reservoirs *after* clearing the maps. A race-insert that lands
+        // after `clear()` but before this drain can have its candidate key popped
+        // here, so its still-resident entry temporarily holds no reservoir slot.
+        // That is an accepted eviction-*quality* residual, not a correctness gap:
+        // the entry stays resident and counted, so the capacity bound is still
+        // enforced — it simply re-enters the candidate pool via the periodic
+        // resident-key blend / underfilled-sample top-up in `frequency_aware_evict`
+        // (the very mechanism added for "resident keys that aged out of the
+        // reservoir"), or via its next access re-inserting it as a miss. Draining
+        // *before* clearing would NOT help — inserts race the clear regardless of
+        // order — and would reintroduce the unbounded-spin hazard the
+        // capacity-bounded `drain_reservoir` exists to avoid (a sustained insert
+        // storm could keep a drain-until-empty loop from ever terminating). So the
+        // ordering here is deliberate.
         drain_reservoir(&self.prefix_eviction_reservoir);
         drain_reservoir(&self.regex_eviction_reservoir);
         self.frequency_sketch.reset();
@@ -2227,6 +2256,43 @@ fn subtract_cache_entries(counter: &AtomicUsize, removed: usize) {
     });
 }
 
+/// Reconcile a per-partition entry counter after its map has just been
+/// `clear()`ed, subtracting `removed` (a pre-clear snapshot of the counter) while
+/// flooring the result at the live map length so the counter can never drop
+/// *below* the resident set.
+///
+/// A plain `subtract_cache_entries(snapshot)` is unsafe here because a config
+/// reload runs concurrently with both live request inserts *and* an in-flight
+/// eviction pass. If an evictor `map.remove`s `r` entries and `fetch_sub(r)`s the
+/// counter after this snapshot was loaded, those `r` entries are still part of
+/// the snapshot (they were counted when inserted, before the load), so
+/// subtracting the snapshot double-counts the evictor's `r` and can leave the
+/// counter `r` below the live map size. Under-count is the dangerous direction:
+/// inserts only trigger eviction from this counter (`entries > max_cache_entries`
+/// in `insert_*_cache_entry`), so an under-count delays eviction and lets the
+/// cache overshoot its configured bound until later inserts refill the deficit.
+///
+/// `DashMap::len()` read *inside* the `fetch_update` closure is a valid lower
+/// bound on the resident set at that instant (it sums shard lengths; an entry is
+/// counted iff its insert has landed, and every entry's counter `fetch_add`
+/// follows its map insert). Flooring at `len()` therefore guarantees the
+/// post-clear counter is `>= live`, preserving the load-bearing `counter >= live`
+/// invariant. The benign bounded *over*-count documented in `clear_lookup_caches`
+/// (an insert in the `[snapshot load, clear()]` window whose entry is removed by
+/// `clear()` yet still counted) is unaffected — `len()` only ever raises the
+/// floor, never lowers the value below it. `len()` is O(shards) and runs only on
+/// the cold reload path, never the proxy hot path; CAS retries re-read it, which
+/// is correct.
+fn reconcile_cache_entries_after_clear<V>(
+    counter: &AtomicUsize,
+    map: &DashMap<String, V>,
+    removed: usize,
+) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |entries| {
+        Some(entries.saturating_sub(removed).max(map.len()))
+    });
+}
+
 /// Drop queued keys from an eviction reservoir on a config-driven cache clear.
 ///
 /// Used so a rebuild does not leave stale candidate keys queued. `pop` is O(1)
@@ -2328,13 +2394,22 @@ fn blend_resident_keys<V>(
 /// clear, so the cache still cannot overshoot capacity unbounded.) The top-up
 /// walk is bounded by `sample_size`.
 ///
-/// Residual: because the rotated offset is capped at `sample_size`, the blend
-/// only sweeps the first `~2 * sample_size` shard-ordered positions, not the
-/// whole map. Resident keys deeper than that still rely on re-entering the
+/// Residual (deliberate, not an oversight): the rotated blend offset is taken
+/// modulo `sample_size + 1`, so `map.iter().skip(offset)` walks at most
+/// `sample_size` positions and the blend sweeps only the first `~2 * sample_size`
+/// shard-ordered positions, not the whole map. This cap is load-bearing: the
+/// hot-path contract is that an eviction pass is O(`sample_size`) regardless of
+/// `max_cache_entries`, and `skip(offset)` is O(`offset`). Rotating the offset
+/// across the whole map (`% map.len()`) would make a blend pass O(`map.len()`) —
+/// a per-eviction O(n) scan on the proxy path under the default >=10k (up to 1M)
+/// cap — which is exactly what the reservoir design exists to avoid. Resident
+/// keys deeper than the swept window therefore still rely on re-entering the
 /// reservoir (a later access re-inserts them as a miss after a generation bump,
 /// or a survivor requeue keeps them) to become candidates. Uniform coverage of
 /// arbitrarily-deep stale residents would need shard-indexed sampling (a
-/// DashMap-internal `shards()` walk); that is deferred as a heavier rework.
+/// DashMap-internal `shards()` walk that visits a bounded slice of each shard in
+/// O(`sample_size`)); that is deferred as a heavier rework rather than paying an
+/// O(n) blend scan here.
 fn frequency_aware_evict<V>(
     map: &DashMap<String, V>,
     reservoir: &ArrayQueue<String>,
@@ -2359,7 +2434,7 @@ fn frequency_aware_evict<V>(
     // under the default >=10k cap) never runs — pinning those cold residents
     // permanently and shrinking effective capacity. Reserving caps the reservoir
     // drain so the blend has guaranteed headroom on its period.
-    let blend_active = blend_rotation != 0 && blend_rotation % HEAD_BLEND_PERIOD == 0;
+    let blend_active = blend_rotation != 0 && blend_rotation.is_multiple_of(HEAD_BLEND_PERIOD);
     let head_reserve = if blend_active {
         (sample_size / 4).max(1)
     } else {
@@ -3161,6 +3236,56 @@ mod tests {
         // The reservoir is drained so no stale candidates linger.
         assert!(cache.prefix_eviction_reservoir.is_empty());
         assert!(cache.regex_eviction_reservoir.is_empty());
+    }
+
+    #[test]
+    fn reconcile_after_clear_never_undercounts_live_entries() {
+        // Models the clear-vs-evict race: a pre-clear counter snapshot can
+        // over-cover the live set when an in-flight eviction pass subtracts its
+        // own removals after the snapshot was taken. Subtracting the bare
+        // snapshot would drive the counter below the resident map; the
+        // `max(map.len())` floor must prevent that (under-count is the dangerous
+        // direction — it delays eviction and lets the cache overshoot its cap).
+        let map: DashMap<String, u8> = DashMap::new();
+        // Resident set survives the "clear" (these stand in for race-inserts that
+        // landed after clear() but are still live and counted).
+        for i in 0..40 {
+            map.insert(format!("live-{i}"), 1);
+        }
+        let counter = AtomicUsize::new(40);
+        // A racing evictor already subtracted 25 of these 40 from the counter,
+        // but the stale snapshot still reflects the full 40 (those 25 were
+        // counted before the snapshot load).
+        counter.fetch_sub(25, Ordering::Relaxed);
+        let stale_snapshot = 40usize;
+        reconcile_cache_entries_after_clear(&counter, &map, stale_snapshot);
+        // Bare subtract would have saturated to 0 (15 - 40); the floor keeps the
+        // counter at >= the 40 live entries, so the cap can never be under-driven.
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            map.len(),
+            "counter must be floored at the live map length, never below it"
+        );
+        assert!(counter.load(Ordering::Relaxed) >= map.len());
+    }
+
+    #[test]
+    fn reconcile_after_clear_subtracts_when_above_live_floor() {
+        // When no race is in play the helper behaves like the plain subtract:
+        // snapshot fully removed, counter lands at the (empty) live length.
+        let map: DashMap<String, u8> = DashMap::new();
+        let counter = AtomicUsize::new(500);
+        reconcile_cache_entries_after_clear(&counter, &map, 500);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        // With residents present and a snapshot that does not over-cover them,
+        // the subtract still applies and floors at the live length.
+        for i in 0..10 {
+            map.insert(format!("k-{i}"), 1);
+        }
+        let counter = AtomicUsize::new(310);
+        reconcile_cache_entries_after_clear(&counter, &map, 300);
+        assert_eq!(counter.load(Ordering::Relaxed), 10);
     }
 
     // ── RouterCache::new auto-resolution tests ──────────────────────────
