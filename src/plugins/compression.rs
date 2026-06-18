@@ -671,8 +671,19 @@ impl Plugin for CompressionPlugin {
         // Range responses carry byte offsets for the original representation.
         // Compressing them changes those byte positions and corrupts range
         // semantics, even if a backend sends Content-Range with a non-206
-        // status.
-        if response_status == 206 || response_headers.contains_key("content-range") {
+        // status. Range responses are also streamed (see
+        // `should_buffer_response_body_for_content_type`), so committing a
+        // `Content-Encoding` here would mislabel an uncompressed body whose
+        // `transform_response_body` (buffered-only) never runs. The live
+        // headers may already have been rewritten by an earlier-ordered hook
+        // (e.g. `response_transformer` removing `Content-Range`), so also honor
+        // the original backend range decision captured before `after_proxy`.
+        if response_status == 206
+            || response_headers.contains_key("content-range")
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::RANGE_RESPONSE_METADATA_KEY)
+        {
             return PluginResult::Continue;
         }
 

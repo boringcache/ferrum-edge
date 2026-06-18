@@ -145,6 +145,18 @@ fn http1_parser_max_buf_size(configured_header_limit: usize) -> usize {
 /// invoked on a backend response" path (response_headers came from upstream).
 pub(crate) const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 
+/// Marker recorded in `ctx.metadata` when the ORIGINAL backend response was a
+/// range/partial response (`206` or carrying `Content-Range`), captured before
+/// any `after_proxy` hook can mutate the response headers. A plugin whose
+/// `after_proxy` runs after a header-rewriting plugin (e.g. `compression` at
+/// order 4050 after `response_transformer` at 4000) can read this to preserve
+/// the original range decision even if an earlier hook stripped/renamed
+/// `Content-Range`. This matters because range responses are streamed (see
+/// `compression`'s `should_buffer_response_body_for_content_type`), so a plugin
+/// must not commit a body transform header (e.g. `Content-Encoding`) that its
+/// buffered-only `transform_response_body` will never actually apply.
+pub(crate) const RANGE_RESPONSE_METADATA_KEY: &str = "ferrum:range_response";
+
 fn record_node_waypoint_identity_drop(
     overload: &crate::overload::OverloadState,
     error: &NodeWaypointIdentityError,
@@ -14260,6 +14272,16 @@ async fn handle_proxy_request_inner(
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
+    // Record the ORIGINAL backend range decision before any `after_proxy` hook
+    // can rewrite the headers. A later plugin (e.g. `response_transformer`) may
+    // strip/rename `Content-Range`, which would otherwise let a body-transform
+    // plugin (`compression`) commit a transform header on a streamed range
+    // response whose body is never actually transformed. Only inserted for
+    // range responses, so the common path stays allocation-free.
+    if response_status == 206 || response_headers.contains_key("content-range") {
+        ctx.metadata
+            .insert(RANGE_RESPONSE_METADATA_KEY.to_string(), "true".to_string());
+    }
     let backend_resolved_ip = backend_resp.backend_resolved_ip;
     let backend_error_class = backend_resp.error_class;
     annotate_gateway_mesh_metadata(

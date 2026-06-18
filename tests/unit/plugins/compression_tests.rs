@@ -453,6 +453,60 @@ async fn test_skips_content_range_header_on_non_partial_status() {
 }
 
 #[tokio::test]
+async fn test_skips_range_response_when_content_range_was_stripped() {
+    // Regression: an earlier-ordered plugin (e.g. `response_transformer` at 4000,
+    // before `compression` at 4050) may strip `Content-Range` before
+    // `compression.after_proxy` runs. Range responses are streamed, so committing
+    // `Content-Encoding` here would mislabel an uncompressed body whose buffered-
+    // only `transform_response_body` never runs. The proxy records the ORIGINAL
+    // backend range decision under this marker before any after_proxy mutation, so
+    // compression must still decline to compress even though the live headers no
+    // longer carry `Content-Range` and the status was rewritten to 200.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    // Simulate the proxy-side marker stamped from the pristine backend response.
+    ctx.metadata
+        .insert("ferrum:range_response".to_string(), "true".to_string());
+
+    // Live headers after an earlier transform removed Content-Range and the
+    // status is no longer 206.
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/html".to_string());
+    resp_headers.insert("content-length".to_string(), "100".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    assert!(
+        !resp_headers.contains_key("content-encoding"),
+        "must not label a streamed range body as compressed"
+    );
+    assert_eq!(resp_headers.get("content-length").unwrap(), "100");
+}
+
+#[tokio::test]
+async fn test_compresses_normal_response_without_range_marker() {
+    // Control for the marker check: a plain 200 with no range marker and no
+    // Content-Range still compresses, so the marker does not over-suppress.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/html".to_string());
+    resp_headers.insert("content-length".to_string(), "5000".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
+    assert!(!resp_headers.contains_key("content-length"));
+}
+
+#[tokio::test]
 async fn test_skips_below_min_content_length() {
     let plugin = make_plugin(json!({"min_content_length": 1000}));
     let mut ctx = make_ctx(Some("gzip"));
