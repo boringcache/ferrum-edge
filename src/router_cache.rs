@@ -856,13 +856,29 @@ impl RouterCache {
         // `clear()` call, so its `fetch_add` (which always follows its map
         // insert) ran after the snapshot load and is therefore not part of the
         // subtracted snapshot — resident entries stay counted, so the counter
-        // can never drop below the live count. The only imprecision is a
-        // transient *over*-count when an entry inserted just before the clear had
-        // its `fetch_add` run after the snapshot (its +1 is not subtracted even
-        // though `clear()` removed the entry); over-counting is self-correcting
-        // (the next eviction subtracts it) and is the safe direction. Each
-        // partition snapshots, clears, and subtracts together so the per-
-        // partition window is as small as possible (the regex partition no
+        // can never drop below the live count. This is the load-bearing
+        // invariant: under-counting would delay eviction and let the cache grow
+        // unbounded, so we only ever err toward over-count.
+        //
+        // The residual imprecision is a bounded *over*-count: an entry inserted
+        // in the window `[snapshot load, clear()]` whose `fetch_add` runs after
+        // the subtract is removed by `clear()` yet still counted (its +1 is not
+        // in the subtracted snapshot). Note this over-count does NOT self-correct
+        // through eviction — an eviction subtracts equal amounts from the counter
+        // and the live set, preserving the offset — so it persists until the next
+        // clear. It is nonetheless harmless and self-limiting: (1) it only feeds
+        // the eviction-trigger comparison and admin telemetry, never a
+        // correctness/security decision, and erring high just makes eviction fire
+        // marginally early; (2) it is bounded by the inserts that race a single
+        // clear (a `clear()` is microseconds), not the whole map; and (3) it
+        // cannot accumulate across reloads — the *next* clear snapshots the
+        // entire current counter (leftover offset included) and subtracts it,
+        // re-deriving the counter from that reload's race window. Eliminating
+        // even this bounded skew would require making the clear and the counter
+        // reset atomic per entry, which DashMap does not offer without a global
+        // lock on the proxy hot path; the bounded over-count is the deliberate
+        // trade. Each partition snapshots, clears, and subtracts together so the
+        // per-partition window is as small as possible (the regex partition no
         // longer sits between the prefix snapshot and the prefix subtract).
         let prefix_cleared = self.prefix_cache_entries.load(Ordering::Relaxed);
         self.prefix_cache.clear();
@@ -2088,6 +2104,42 @@ fn drain_reservoir(reservoir: &ArrayQueue<String>) {
     }
 }
 
+/// Append up to `budget` resident DashMap keys (not already in `seen`) to the
+/// eviction `sample`, starting from a rotated, bounded shard-order offset.
+///
+/// Shared by the periodic resident-key blend and the underfilled-sample top-up
+/// in `frequency_aware_evict`. The offset is `rotation.wrapping_mul(budget)`
+/// taken modulo `sample_size + 1`, so the `skip` walks at most `sample_size`
+/// extra positions and the whole step stays O(`sample_size`), never an O(n) map
+/// scan. `rotation` advances the window across map positions over successive
+/// calls so different resident keys are sampled over time. Frequencies come from
+/// the Count-Min Sketch so the blended keys compete on the same footing as
+/// reservoir candidates.
+fn blend_resident_keys<V>(
+    map: &DashMap<String, V>,
+    sketch: &CountMinSketch,
+    sample: &mut Vec<(String, u8)>,
+    seen: &mut HashSet<String>,
+    rotation: usize,
+    budget: usize,
+    sample_size: usize,
+) {
+    if budget == 0 {
+        return;
+    }
+    let offset = rotation
+        .wrapping_mul(budget)
+        .checked_rem(sample_size + 1)
+        .unwrap_or(0);
+    for entry in map.iter().skip(offset).take(budget) {
+        if !seen.insert(entry.key().clone()) {
+            continue; // already sampled this pass
+        }
+        let freq = sketch.estimate(entry.key());
+        sample.push((entry.key().clone(), freq));
+    }
+}
+
 /// Evict entries from a DashMap using frequency-guided sampling.
 ///
 /// Builds a bounded sample of candidate keys by draining the per-partition
@@ -2109,15 +2161,25 @@ fn drain_reservoir(reservoir: &ArrayQueue<String>) {
 /// immortal. Production passes the per-partition eviction-attempts counter so
 /// the blend rotates its window across map positions over successive passes and
 /// only fires every `HEAD_BLEND_PERIOD` passes (the reservoir remains the
-/// dominant source). Passing `0` disables the blend (used by unit tests that
-/// assert pure-reservoir behavior). The rotated offset is capped at
-/// `sample_size`, so the head walk stays O(`sample_size`) and never becomes an
+/// dominant source). On a blend pass the reservoir drain is capped so a fixed
+/// slice of the sample budget (`<= sample_size / 4`) is *reserved* for resident
+/// keys; without that reservation a sustained high-cardinality stream keeps the
+/// reservoir full, the blend never gets spare budget, and the cold-resident
+/// rescue silently stops contributing. Passing `0` disables the blend (used by
+/// unit tests that assert pure-reservoir behavior). The rotated offset is capped
+/// at `sample_size`, so the head walk stays O(`sample_size`) and never becomes an
 /// O(n) scan.
 ///
-/// If the reservoir is transiently empty (e.g. right after a clear, or a burst
-/// where pops outran pushes) the sample falls back to the head of the map via
-/// `iter().take(sample_size)` — bounded by `sample_size` so the cache cannot
-/// overshoot capacity unbounded.
+/// The sample is also topped up from resident keys whenever it comes back
+/// *underfilled* — shorter than twice the removal target — not only when it is
+/// fully empty. A reload racing with inserts can leave the reservoir full of
+/// stale/duplicate keys so the bounded pop loop yields only a handful of live
+/// candidates; evicting that tiny sample wholesale would drop hot entries
+/// regardless of frequency while cold entries remain resident. Topping up from a
+/// bounded resident-key walk keeps eviction from being starved into removing its
+/// entire sample. (This also subsumes the transient-empty case right after a
+/// clear, so the cache still cannot overshoot capacity unbounded.) The top-up
+/// walk is bounded by `sample_size`.
 ///
 /// Residual: because the rotated offset is capped at `sample_size`, the blend
 /// only sweeps the first `~2 * sample_size` shard-ordered positions, not the
@@ -2140,16 +2202,35 @@ fn frequency_aware_evict<V>(
 
     let target_removals = (sample_size / 4).clamp(1, ROUTER_CACHE_EVICTION_MAX_REMOVALS);
 
-    // Drain up to `sample_size` distinct, still-live candidate keys from the
-    // reservoir. Bounded by `sample_size` pops (O(1) each); stale keys (already
-    // evicted) and duplicates are dropped so the sample reflects distinct live
-    // entries. Pop at most `2 * sample_size` to make headway past stale entries
-    // without ever turning the drain into an unbounded loop.
+    // Decide up front whether this is a periodic resident-key blend pass. On a
+    // blend pass we *reserve* part of the sample budget for resident keys so the
+    // blend always contributes, even when the reservoir alone could fill the
+    // whole sample. Without reserving room, a sustained high-cardinality stream
+    // keeps the reservoir full, the old `sample.len() < sample_size` guard never
+    // fires, and the resident-key walk that is meant to rescue entries which aged
+    // out of the reservoir before the first eviction (e.g. the earliest inserts
+    // under the default >=10k cap) never runs — pinning those cold residents
+    // permanently and shrinking effective capacity. Reserving caps the reservoir
+    // drain so the blend has guaranteed headroom on its period.
+    let blend_active = blend_rotation != 0 && blend_rotation % HEAD_BLEND_PERIOD == 0;
+    let head_reserve = if blend_active {
+        (sample_size / 4).max(1)
+    } else {
+        0
+    };
+    let reservoir_budget = sample_size - head_reserve;
+
+    // Drain up to `reservoir_budget` distinct, still-live candidate keys from the
+    // reservoir. Bounded by `2 * sample_size` pops (O(1) each); stale keys
+    // (already evicted) and duplicates are dropped so the sample reflects distinct
+    // live entries. Popping past `reservoir_budget` makes headway through stale
+    // entries without ever turning the drain into an unbounded loop, and leaves
+    // `head_reserve` slots free for the blend below.
     let mut sample: Vec<(String, u8)> = Vec::with_capacity(sample_size);
     let mut seen: HashSet<String> = HashSet::with_capacity(sample_size);
     let max_pops = sample_size.saturating_mul(2);
     for _ in 0..max_pops {
-        if sample.len() >= sample_size {
+        if sample.len() >= reservoir_budget {
             break;
         }
         let Some(key) = reservoir.pop() else {
@@ -2165,37 +2246,56 @@ fn frequency_aware_evict<V>(
         sample.push((key, freq));
     }
 
-    // Periodically blend a small, rotating slice of resident keys into the sample
-    // so older entries that fell out of the reservoir can still be evicted. Only
-    // every `HEAD_BLEND_PERIOD` passes, and only with spare sample budget, so the
-    // reservoir stays the primary candidate source and the pass stays bounded.
-    if blend_rotation != 0 && blend_rotation % HEAD_BLEND_PERIOD == 0 && sample.len() < sample_size
-    {
-        let head_budget = (sample_size / 4).max(1).min(sample_size - sample.len());
-        // Cap the rotated offset at `sample_size` so `skip` walks at most
-        // `sample_size` extra positions — the whole head step stays
-        // O(`sample_size`), never O(map.len()).
+    // Periodic resident-key blend: mix a small, rotating slice of resident keys
+    // into the sample so older entries that fell out of the reservoir can still be
+    // evicted. Runs only every `HEAD_BLEND_PERIOD` passes; the reserved budget
+    // above guarantees it has room even when the reservoir is full, so the blend
+    // actually contributes rather than only consuming spare budget. The reservoir
+    // remains the dominant source (it gets `sample_size - head_reserve` of the
+    // budget). `head_reserve` is at most `sample_size / 4`, so the walk stays
+    // O(`sample_size`).
+    if blend_active {
+        let head_budget = head_reserve.min(sample_size - sample.len());
         let rotation_steps = (blend_rotation / HEAD_BLEND_PERIOD) as usize;
-        let offset = rotation_steps
-            .wrapping_mul(head_budget)
-            .checked_rem(sample_size + 1)
-            .unwrap_or(0);
-        for entry in map.iter().skip(offset).take(head_budget) {
-            if !seen.insert(entry.key().clone()) {
-                continue; // already sampled from the reservoir this pass
-            }
-            let freq = sketch.estimate(entry.key());
-            sample.push((entry.key().clone(), freq));
-        }
+        blend_resident_keys(
+            map,
+            sketch,
+            &mut sample,
+            &mut seen,
+            rotation_steps,
+            head_budget,
+            sample_size,
+        );
     }
 
-    // Reservoir empty/exhausted: fall back to a bounded head sample so eviction
-    // still makes progress and the cache cannot grow without bound.
-    if sample.is_empty() {
-        for entry in map.iter().take(sample_size) {
-            let freq = sketch.estimate(entry.key());
-            sample.push((entry.key().clone(), freq));
-        }
+    // Top up an underfilled sample from resident keys before choosing victims.
+    // The reservoir sample can come up short of the removal target even when the
+    // reservoir is non-empty — e.g. after a reload races with inserts the queue
+    // fills with stale/duplicate keys, so the bounded pop loop yields only a few
+    // live candidates. The old code only topped up when the sample was *empty*,
+    // so a tiny non-empty sample would have every member evicted regardless of
+    // frequency (`to_remove == sample.len()`), evicting hot entries while many
+    // cold entries remained resident. Treat any sample shorter than the removal
+    // target like the empty case and supplement it with a bounded resident-key
+    // walk so eviction is never starved into removing its whole sample. This walk
+    // is also bounded by `sample_size`, so the pass stays O(`sample_size`).
+    if sample.len() < target_removals * 2 {
+        // Walk from the head (offset 0) rather than a rotated window: the top-up
+        // is a rare recovery path (it only fires when the reservoir under-delivers)
+        // and wants maximal coverage of accessible residents to fill the sample,
+        // not the rotation the periodic blend uses to sweep over time. This also
+        // exactly reproduces the previous empty-sample fallback's `take(sample_size)`
+        // from the head when the reservoir yielded nothing.
+        let topup_budget = sample_size - sample.len();
+        blend_resident_keys(
+            map,
+            sketch,
+            &mut sample,
+            &mut seen,
+            0,
+            topup_budget,
+            sample_size,
+        );
     }
 
     if sample.is_empty() {
@@ -2625,6 +2725,168 @@ mod tests {
             drained.push(k);
         }
         assert_eq!(drained.len(), surviving_candidates);
+    }
+
+    #[test]
+    fn blend_resident_keys_appends_within_bounds() {
+        // Direct unit test of the shared resident-key walk: it appends up to
+        // `budget` not-yet-seen resident keys, dedups against `seen`, and the
+        // rotated offset is taken modulo `sample_size + 1` so it never panics or
+        // walks more than `budget` positions.
+        let sketch = CountMinSketch::new(1024, 100_000);
+        let map: DashMap<String, ()> = DashMap::new();
+        for i in 0..100 {
+            map.insert(format!("k-{i}"), ());
+        }
+        let mut sample: Vec<(String, u8)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // budget 0 is a no-op.
+        blend_resident_keys(&map, &sketch, &mut sample, &mut seen, 3, 0, 64);
+        assert!(sample.is_empty());
+
+        // A normal call appends exactly `budget` distinct keys.
+        blend_resident_keys(&map, &sketch, &mut sample, &mut seen, 1, 8, 64);
+        assert_eq!(sample.len(), 8);
+        assert_eq!(seen.len(), 8);
+
+        // Keys already in `seen` are skipped (no duplicates appended).
+        let before = sample.len();
+        let dup_key = sample[0].0.clone();
+        let mut seen_with_dup = seen.clone();
+        // Force the walk to encounter an already-seen key by seeding `seen` with
+        // everything; the next call must add nothing.
+        for entry in map.iter() {
+            seen_with_dup.insert(entry.key().clone());
+        }
+        blend_resident_keys(&map, &sketch, &mut sample, &mut seen_with_dup, 2, 8, 64);
+        assert_eq!(sample.len(), before, "all-seen walk must append nothing");
+        assert!(seen_with_dup.contains(&dup_key));
+
+        // A large rotation must not panic (offset is reduced modulo sample_size+1).
+        blend_resident_keys(&map, &sketch, &mut sample, &mut seen, usize::MAX, 4, 64);
+    }
+
+    #[test]
+    fn evict_blend_reserves_budget_on_blend_pass() {
+        // Regression for the reserved-budget fix (F2): on a blend pass the
+        // reservoir drain is capped (`reservoir_budget = sample_size - head_reserve`)
+        // so the resident-key blend always has room, even when the reservoir alone
+        // could fill the whole sample. Without the reservation a saturated
+        // reservoir filled the sample, the old `sample.len() < sample_size` guard
+        // never fired, and cold residents that aged out of the reservoir could
+        // never be evicted.
+        //
+        // Sizing is chosen so coverage is deterministic, not shard-order-luck:
+        // sample_size = 40 -> head_reserve = 10, reservoir_budget = 30. The map
+        // holds 40 HOT keys (saturating the reservoir past reservoir_budget) plus
+        // 20 COLD keys absent from the reservoir (60 entries total). The blend
+        // walk covers a rotating `[offset, offset+10)` window with offsets
+        // sweeping 0..40 over rotations, so its union covers map positions 0..49;
+        // at most 10 of the 20 cold keys can sit in positions 50..59, so >=10 cold
+        // keys are guaranteed inside the covered window and become candidates.
+        let sketch = CountMinSketch::new(8192, 1_000_000);
+        let map: DashMap<String, ()> = DashMap::new();
+        for i in 0..20 {
+            let cold = format!("cold-{i}");
+            map.insert(cold.clone(), ());
+            sketch.increment(&cold); // freq 1
+        }
+        for i in 0..40 {
+            let hot = format!("hot-{i}");
+            map.insert(hot.clone(), ());
+            for _ in 0..100 {
+                sketch.increment(&hot); // hot
+            }
+        }
+        let reservoir = ArrayQueue::new(ROUTER_CACHE_EVICTION_RING_CAPACITY);
+
+        // Run blend passes across rotations, re-saturating the reservoir with hot,
+        // live keys before each pass (mimics sustained hot traffic keeping it full
+        // so the reservoir would otherwise monopolize the sample). The F2 guarantee
+        // is that cold residents *become candidates*: a cold key (freq 1) sorts
+        // below every co-sampled hot key (freq 100), so as soon as the rotating
+        // blend window covers a cold position it is evicted. Coverage of map
+        // positions 0..49 is guaranteed (see sizing note), and >=10 cold keys must
+        // lie there, so at least one cold key is deterministically evicted within
+        // the sweep — impossible if the blend never ran for lack of reserved room.
+        let mut cold_evicted = false;
+        for r in 1..=32u64 {
+            for i in 0..40 {
+                let _ = reservoir.force_push(format!("hot-{i}"));
+            }
+            let pass = r * HEAD_BLEND_PERIOD; // always a blend pass
+            let _ = frequency_aware_evict(&map, &reservoir, &sketch, 40, pass);
+            let cold_remaining = (0..20)
+                .filter(|i| map.contains_key(&format!("cold-{i}")))
+                .count();
+            if cold_remaining < 20 {
+                cold_evicted = true;
+                break;
+            }
+        }
+        assert!(
+            cold_evicted,
+            "reserved blend budget must let cold residents (absent from a full \
+             reservoir) become eviction candidates; none were evicted across the \
+             rotation sweep (the blend never ran for lack of reserved room)"
+        );
+    }
+
+    #[test]
+    fn evict_tops_up_underfilled_sample_instead_of_clearing_it() {
+        // Regression for the top-up fix (F3): a reservoir polluted with stale
+        // keys can yield only a couple of live candidates. The old code only
+        // topped up when the live sample was *empty*, so a tiny non-empty sample
+        // had every member evicted regardless of frequency. Here the only live
+        // reservoir candidates are HOT; without the top-up they would all be
+        // removed even though many cold residents exist. With the top-up, cold
+        // residents are pulled in so the hot candidates survive.
+        let sketch = CountMinSketch::new(4096, 100_000);
+        let map: DashMap<String, ()> = DashMap::new();
+        // Cold residents not in the reservoir (occupy the head of the map for the
+        // top-up walk's `skip(0)` offset on rotation 1).
+        for i in 0..256 {
+            let key = format!("cold-{i}");
+            map.insert(key.clone(), ());
+            sketch.increment(&key); // freq 1
+        }
+        // Two hot live keys, plus a flood of stale keys, in the reservoir.
+        let reservoir = ArrayQueue::new(ROUTER_CACHE_EVICTION_RING_CAPACITY);
+        for i in 0..2 {
+            let key = format!("hot-{i}");
+            map.insert(key.clone(), ());
+            for _ in 0..200 {
+                sketch.increment(&key);
+            }
+        }
+        // Stale keys first so the bounded pop loop burns its budget on them and
+        // the live sample comes up short (only the 2 hot keys are live).
+        for i in 0..400 {
+            let _ = reservoir.force_push(format!("stale-{i}"));
+        }
+        for i in 0..2 {
+            let _ = reservoir.force_push(format!("hot-{i}"));
+        }
+
+        // Non-blend pass (rotation not divisible by HEAD_BLEND_PERIOD) so only the
+        // shortfall top-up can supply extra candidates. `to_remove` is
+        // target_removals (sample_size/4 = 64), so without the top-up the 2-key
+        // sample would lose both hot keys; with it, 64 cold residents absorb the
+        // removal.
+        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 257, 1);
+        assert!(removed > 0, "underfilled sample must still evict");
+        assert!(
+            map.contains_key("hot-0") && map.contains_key("hot-1"),
+            "hot live candidates must not be wholesale-evicted from a tiny sample"
+        );
+        let cold_remaining = (0..256)
+            .filter(|i| map.contains_key(&format!("cold-{i}")))
+            .count();
+        assert!(
+            cold_remaining < 256,
+            "top-up should let cold residents absorb the eviction (cold_remaining={cold_remaining})"
+        );
     }
 
     #[test]
