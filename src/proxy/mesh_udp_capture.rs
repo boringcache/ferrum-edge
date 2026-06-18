@@ -1695,3 +1695,332 @@ mod tests {
         }
     }
 }
+
+/// Privileged live verification of the mesh UDP **source-capture** path (F3 §3.3
+/// Stage 3) against a real netfilter `TPROXY` rule + policy routing, inside a
+/// throwaway network namespace (the host's iptables / routing tables are never
+/// touched). Runs in CI's `netns-capture-live` job as root; self-skips (passes)
+/// without root / `unshare` / `iptables` / `ip`.
+///
+/// This is the UDP analogue of `socket_opts::original_dst_live_tests` (which
+/// proves the raw-TCP `SO_ORIGINAL_DST` recovery against an iptables `REDIRECT`).
+/// UDP differs fundamentally: TPROXY does NOT rewrite the datagram's destination
+/// (unlike the TCP REDIRECT model), so the original `service:port` rides a
+/// per-datagram `IP_RECVORIGDSTADDR` cmsg rather than a `getsockopt`. The mesh UDP
+/// destination relay is already e2e-tested without root; the remaining gap this
+/// closes is the live SOURCE-capture path, which needs `CAP_NET_ADMIN` (TPROXY +
+/// `IP_TRANSPARENT`) and so cannot run in the unprivileged test matrix.
+///
+/// ## What this covers
+/// - The exact transparent-capture socket the production listener binds
+///   (`build_bound_socket`'s `IP_TRANSPARENT` + `IP_RECVORIGDSTADDR` recipe), so a
+///   regression in the socket-option recipe surfaces here.
+/// - The Stage-2 TPROXY rule + Stage-3 policy-routing shapes
+///   (`udp_tproxy_commands_for_family`): an `OUTPUT -j MARK` on pod egress, the
+///   fwmark `ip rule` (priority [`crate::capture::TPROXY_ROUTE_RULE_PRIORITY`] →
+///   table [`crate::capture::TPROXY_ROUTE_TABLE`]), the `local 0.0.0.0/0 dev lo`
+///   route that loops the marked datagram back to the INPUT path, and the
+///   PREROUTING mark-match `-j TPROXY --on-port <port> --tproxy-mark <mark>` that
+///   reinjects it onto the transparent socket. All constants are read from
+///   `src/capture/mod.rs` (NOT hardcoded) so a default change keeps this honest.
+/// - The per-datagram orig-dst recovery the listener relies on: a single UDP
+///   datagram sent to a *remote* (non-local) destination is captured and the
+///   recovered original destination equals what the client dialed — the value
+///   `handle_captured_datagram` keys each session by.
+/// - That a reply can be SOURCED from the captured original destination on an
+///   `IP_TRANSPARENT` socket (`build_transparent_reply_socket`'s recipe), the
+///   return-path primitive the egress session uses.
+///
+/// ## What this does NOT cover (deliberately — a thin smoke test)
+/// - No full two-gateway loop: no HBONE / mesh-mTLS tunnel, no egress relay, no
+///   destination workload. The async listener task, LB selection, capability
+///   gating, and tunnel framing are exercised by the unit tests and the existing
+///   root-free destination-relay e2e, not here.
+/// - It drains with one `RecvMmsgBatch` (the listener's recv primitive) rather
+///   than spinning up `start_mesh_udp_capture_listener`, because the orig-dst
+///   recovery + transparent bind is the OS mechanism under test; the async
+///   plumbing around it is covered elsewhere.
+/// - IPv4 only (the netns gets a single fwmark rule + v4 `local` route); the
+///   v6 path shares the same code with a different cmsg level, covered by the
+///   unit-level extraction tests.
+#[cfg(all(test, target_os = "linux"))]
+mod live_netns_tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::os::fd::AsRawFd;
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
+    /// Where the transparent capture listener binds inside the netns (the
+    /// production `FERRUM_MESH_CAPTURE_UDP_PORT` shape). Read from
+    /// [`crate::capture::DEFAULT_UDP_OUTBOUND_PORT`] so a default change is
+    /// reflected automatically.
+    const CAPTURE_PORT: u16 = crate::capture::DEFAULT_UDP_OUTBOUND_PORT;
+    /// The remote destination the in-netns client dials. A NON-local address so
+    /// the `OUTPUT ! --dst-type LOCAL` mark rule matches it (exactly as it would
+    /// a real pod dialing a service VIP); TPROXY then delivers it WITHOUT
+    /// rewriting this destination, which is what `IP_RECVORIGDSTADDR` recovers.
+    const REMOTE_DST: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10); // TEST-NET-1 (RFC 5737)
+    /// The remote UDP port the client dials; recovered as the captured orig-dst.
+    const DIAL_PORT: u16 = 5300;
+
+    fn is_root() -> bool {
+        // Safety: `geteuid` is always sound and never fails.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// Reaps the netns child on drop so the test never leaks it.
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Spawn a child in a fresh netns with loopback up and the Stage-2/Stage-3
+    /// UDP TPROXY datapath installed: pod-egress UDP to a remote dst is MARKed in
+    /// `mangle OUTPUT`, the fwmark `ip rule` + `local` route loop it back to the
+    /// INPUT path, and a PREROUTING mark-match `-j TPROXY` reinjects it onto the
+    /// transparent capture socket on [`CAPTURE_PORT`]. This mirrors the rule set
+    /// `crate::capture::udp_tproxy_commands_for_family` emits for a catch-all
+    /// outbound config (the `OUTPUT_MARK` + `REINJECT` chains, collapsed to bare
+    /// rules for the test). Exits 97 when `iptables` / `ip` is unavailable inside
+    /// the netns so the test can skip; the `set -e` aborts (non-97 exit) if any
+    /// load-bearing rule fails to install.
+    fn spawn_tproxy_netns_child() -> Option<Child> {
+        // Constants pulled from production (NOT hardcoded from memory): a default
+        // change in `src/capture/mod.rs` flows through here.
+        let mark = crate::capture::DEFAULT_TPROXY_MARK;
+        let mask = crate::capture::TPROXY_MARK_MASK;
+        let table = crate::capture::TPROXY_ROUTE_TABLE;
+        let prio = crate::capture::TPROXY_ROUTE_RULE_PRIORITY;
+        let mark_arg = format!("0x{mark:x}/0x{mask:x}");
+        let script = format!(
+            "set -e; \
+             command -v iptables >/dev/null 2>&1 || exit 97; \
+             command -v ip >/dev/null 2>&1 || exit 97; \
+             ip link set lo up 2>/dev/null || true; \
+             ip rule add priority {prio} fwmark {mark_arg} lookup {table} || exit 97; \
+             ip route add local 0.0.0.0/0 dev lo table {table} || exit 97; \
+             iptables -t mangle -A OUTPUT -p udp -m addrtype ! --dst-type LOCAL \
+               -j MARK --set-mark {mark_arg} || exit 97; \
+             iptables -t mangle -A PREROUTING -p udp -m mark --mark {mark_arg} \
+               -j TPROXY --on-port {CAPTURE_PORT} --tproxy-mark {mark_arg} || exit 97; \
+             exec sleep 30"
+        );
+        Command::new("unshare")
+            .args(["--net", "sh", "-c", &script])
+            .spawn()
+            .ok()
+    }
+
+    /// Build the transparent capture socket EXACTLY as the production listener's
+    /// `build_bound_socket` does (`SO_REUSEADDR` + `IP_TRANSPARENT` +
+    /// `IP_RECVORIGDSTADDR`, options before bind), bound to the v4 wildcard on
+    /// `CAPTURE_PORT`. Returns the bound std socket so the test can drain it with
+    /// the listener's own `RecvMmsgBatch` primitive.
+    fn build_capture_socket() -> Result<std::net::UdpSocket, String> {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .map_err(|e| format!("socket: {e}"))?;
+        socket
+            .set_reuse_address(true)
+            .map_err(|e| format!("SO_REUSEADDR: {e}"))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| format!("set_nonblocking: {e}"))?;
+        let fd = socket.as_raw_fd();
+        crate::socket_opts::set_ip_transparent(fd).map_err(|e| format!("IP_TRANSPARENT: {e}"))?;
+        crate::socket_opts::set_ip_recvorigdstaddr(fd)
+            .map_err(|e| format!("IP_RECVORIGDSTADDR: {e}"))?;
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), CAPTURE_PORT);
+        socket
+            .bind(&bind_addr.into())
+            .map_err(|e| format!("bind {bind_addr}: {e}"))?;
+        Ok(socket.into())
+    }
+
+    #[test]
+    #[ignore = "requires root + iptables/TPROXY + iproute2 to capture UDP in a fresh netns"]
+    fn captured_udp_recovers_pre_tproxy_destination() {
+        if !is_root() {
+            eprintln!("SKIP: not root; cannot create network namespaces / TPROXY rules");
+            return;
+        }
+        let Some(mut child) = spawn_tproxy_netns_child() else {
+            eprintln!("SKIP: `unshare --net` unavailable");
+            return;
+        };
+        // Let the child unshare, bring loopback up, and install the TPROXY +
+        // policy-routing datapath; an exit (97 = iptables/ip unavailable, or any
+        // other set -e failure) == skip. `try_wait` rather than `kill(pid, 0)`:
+        // an exited-but-unreaped child is a zombie that still answers signal 0,
+        // which would wrongly run the scenario in a namespace without the rules.
+        let mut child_exited = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(50));
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => {
+                    child_exited = true;
+                    break;
+                }
+                Ok(None) => {}
+            }
+        }
+        if child_exited {
+            eprintln!("SKIP: iptables/TPROXY or iproute2 unavailable inside the test netns");
+            return;
+        }
+        let pid = child.id();
+        let _guard = ChildGuard(child);
+
+        // Everything runs on one throwaway thread inside the child's netns
+        // (`setns` mutates only the calling thread, which exits right after).
+        let recovered = std::thread::spawn(move || -> Result<Option<SocketAddr>, String> {
+            let ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
+                .map_err(|e| format!("open netns handle: {e}"))?;
+            // Safety: `ns` is an open netns handle owned for the call.
+            if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                return Err(format!("setns failed: {}", std::io::Error::last_os_error()));
+            }
+
+            // Bind the production transparent capture socket inside the netns.
+            let capture = build_capture_socket()?;
+            let capture_fd = capture.as_raw_fd();
+
+            // Client datagram to a REMOTE dst. The MARK rule matches (non-local
+            // dst), the fwmark route loops it to `lo`, and the PREROUTING
+            // mark-match TPROXY reinjects it onto the transparent socket WITHOUT
+            // rewriting REMOTE_DST:DIAL_PORT — which IP_RECVORIGDSTADDR recovers.
+            // A wildcard-bound (ephemeral-port) client is fine: the captured
+            // value under test is the ORIGINAL DESTINATION, not the source.
+            let client = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .map_err(|e| format!("bind client: {e}"))?;
+            let dst = SocketAddr::new(IpAddr::V4(REMOTE_DST), DIAL_PORT);
+            client
+                .send_to(b"capture-me", dst)
+                .map_err(|e| format!("client send_to {dst}: {e}"))?;
+
+            // Drain via the listener's own cmsg-aware recv primitive
+            // (`MSG_DONTWAIT`), polling for a short window since the reroute +
+            // reinject is asynchronous to the send.
+            let mut batch = super::super::udp_batch::RecvMmsgBatch::new(8, true);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match batch.recv(capture_fd, 8) {
+                    Ok(n) if n > 0 => {
+                        // A datagram landed on the capture socket; return its
+                        // recovered original destination (the value the listener
+                        // keys each session by).
+                        return Ok(batch.orig_dst(0));
+                    }
+                    _ => {
+                        if Instant::now() >= deadline {
+                            return Err("capture socket received no datagram within the deadline \
+                                 (TPROXY did not reinject the marked datagram)"
+                                .to_string());
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+        })
+        .join()
+        .expect("netns capture scenario thread must not panic")
+        .expect("live UDP TPROXY capture scenario must complete");
+
+        assert_eq!(
+            recovered,
+            Some(SocketAddr::new(IpAddr::V4(REMOTE_DST), DIAL_PORT)),
+            "a TPROXY-captured datagram must recover its pre-TPROXY (original) \
+             destination from the IP_RECVORIGDSTADDR cmsg"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires root + CAP_NET_ADMIN for IP_TRANSPARENT non-local bind in a fresh netns"]
+    fn reply_socket_binds_non_local_captured_destination() {
+        // The return-path primitive: a reply to the captured client must be
+        // SOURCED from the captured original destination (the VIP:port the pod
+        // dialed), which requires an IP_TRANSPARENT socket bound NON-LOCALLY to
+        // that address. This exercises `build_transparent_reply_socket`'s exact
+        // recipe (SO_REUSEADDR + IP_TRANSPARENT + non-local bind) against a real
+        // kernel inside the netns — proving the bind the egress return path
+        // depends on actually succeeds with CAP_NET_ADMIN.
+        if !is_root() {
+            eprintln!("SKIP: not root; IP_TRANSPARENT non-local bind needs CAP_NET_ADMIN");
+            return;
+        }
+        // A plain `unshare --net` (loopback up) is enough — no iptables needed,
+        // only CAP_NET_ADMIN for the transparent non-local bind. Skip if unshare
+        // is unavailable.
+        let Some(mut child) = Command::new("unshare")
+            .args([
+                "--net",
+                "sh",
+                "-c",
+                "ip link set lo up 2>/dev/null || true; exec sleep 30",
+            ])
+            .spawn()
+            .ok()
+        else {
+            eprintln!("SKIP: `unshare --net` unavailable");
+            return;
+        };
+        // Confirm the netns child is alive (did not immediately fail).
+        std::thread::sleep(Duration::from_millis(200));
+        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+            eprintln!("SKIP: netns child exited before setup completed");
+            let _ = child.wait();
+            return;
+        }
+        let pid = child.id();
+        let _guard = ChildGuard(child);
+
+        let bound = std::thread::spawn(move || -> Result<SocketAddr, String> {
+            let ns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
+                .map_err(|e| format!("open netns handle: {e}"))?;
+            if unsafe { libc::setns(ns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                return Err(format!("setns failed: {}", std::io::Error::last_os_error()));
+            }
+            // Mirror `build_transparent_reply_socket` for a NON-LOCAL captured
+            // destination (TEST-NET-1 — never assigned to `lo`, so the bind only
+            // succeeds because IP_TRANSPARENT permits binding a non-local addr).
+            let orig_dst = SocketAddr::new(IpAddr::V4(REMOTE_DST), DIAL_PORT);
+            let socket = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )
+            .map_err(|e| format!("socket: {e}"))?;
+            socket
+                .set_reuse_address(true)
+                .map_err(|e| format!("SO_REUSEADDR: {e}"))?;
+            socket
+                .set_nonblocking(true)
+                .map_err(|e| format!("set_nonblocking: {e}"))?;
+            crate::socket_opts::set_ip_transparent(socket.as_raw_fd())
+                .map_err(|e| format!("IP_TRANSPARENT: {e}"))?;
+            socket
+                .bind(&orig_dst.into())
+                .map_err(|e| format!("non-local transparent bind {orig_dst}: {e}"))?;
+            let std_sock: std::net::UdpSocket = socket.into();
+            std_sock
+                .local_addr()
+                .map_err(|e| format!("local_addr: {e}"))
+        })
+        .join()
+        .expect("transparent reply-bind thread must not panic")
+        .expect("IP_TRANSPARENT non-local bind must succeed under CAP_NET_ADMIN");
+
+        assert_eq!(
+            bound,
+            SocketAddr::new(IpAddr::V4(REMOTE_DST), DIAL_PORT),
+            "a transparent reply socket must bind the captured (non-local) original \
+             destination so pod replies are sourced from the VIP:port it dialed"
+        );
+    }
+}

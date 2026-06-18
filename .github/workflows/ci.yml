@@ -1287,17 +1287,22 @@ jobs:
         # live test (`src/socket_opts.rs::original_dst_live_tests`): a real
         # iptables REDIRECT in a throwaway netns must report the pre-NAT
         # destination on the accepted socket — the primitive mesh outbound
-        # multi-port routing rests on. Each test self-skips (passes) when
-        # the runner lacks root / `unshare` / `iptables`. Run the prebuilt
-        # binary directly under sudo so cargo never runs as root against the
-        # user-owned target.
+        # multi-port routing rests on. Also runs the mesh UDP source-capture
+        # live test (`src/proxy/mesh_udp_capture.rs::live_netns_tests`): a real
+        # TPROXY mangle rule + fwmark policy routing in a throwaway netns must
+        # divert a pod-egress UDP datagram onto the transparent capture socket
+        # and recover its pre-TPROXY destination from the IP_RECVORIGDSTADDR
+        # cmsg (the UDP analogue of SO_ORIGINAL_DST). Each test self-skips
+        # (passes) when the runner lacks root / `unshare` / `iptables` / `ip`.
+        # Run the prebuilt binary directly under sudo so cargo never runs as
+        # root against the user-owned target.
         run: |
           set -euo pipefail
           BIN=$(cargo test --lib --no-run --message-format=json 2>/dev/null \
             | jq -r 'select(.profile.test == true and .executable != null and (.target.kind[0] == "lib")) | .executable' \
             | tail -n1)
           echo "In-netns live test binary: $BIN"
-          sudo -E "$BIN" proxy::netns_capture::live_netns_tests socket_opts::original_dst_live_tests --ignored --nocapture --test-threads=1
+          sudo -E "$BIN" proxy::netns_capture::live_netns_tests socket_opts::original_dst_live_tests proxy::mesh_udp_capture::live_netns_tests --ignored --nocapture --test-threads=1
         env:
           RUST_BACKTRACE: 1
 
