@@ -5653,11 +5653,19 @@ impl ProxyState {
     /// Timestamp-neutral proxy content comparison for route-table reuse.
     ///
     /// Serialized proxy content catches ordinary route/backend/policy edits while
-    /// ignoring volatile timestamps. The two DR-derived dispatch projection fields
-    /// are skipped by serde and therefore compared explicitly.
+    /// ignoring volatile timestamps. The two DR-derived dispatch projection
+    /// fields are skipped by serde and therefore compared explicitly, but only
+    /// for keys and values read from the route-carried `Proxy` at dispatch time.
+    /// Load-balancer-only values are consumed by the LB cache and must not force
+    /// a route-table rebuild when the effective override key set is unchanged.
     fn proxy_content_eq(a: &Proxy, b: &Proxy) -> bool {
-        if a.dispatch_port_overrides != b.dispatch_port_overrides
-            || a.dispatch_port_override_fallback != b.dispatch_port_override_fallback
+        if !Self::route_dispatch_overrides_eq(
+            &a.dispatch_port_overrides,
+            &b.dispatch_port_overrides,
+        ) || !Self::route_dispatch_override_options_eq(
+            a.dispatch_port_override_fallback.as_ref(),
+            b.dispatch_port_override_fallback.as_ref(),
+        )
         {
             return false;
         }
@@ -5675,6 +5683,52 @@ impl ProxyState {
             (Some(a_value), Some(b_value)) => a_value == b_value,
             _ => false,
         }
+    }
+
+    fn route_dispatch_overrides_eq(
+        a: &Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>,
+        b: &Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>,
+    ) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.len() == b.len()
+                    && a.iter().all(|(port, a_override)| {
+                        b.get(port).is_some_and(|b_override| {
+                            Self::route_dispatch_override_eq(a_override, b_override)
+                        })
+                    })
+            }
+            (None, Some(_)) | (Some(_), None) => false,
+        }
+    }
+
+    fn route_dispatch_override_options_eq(
+        a: Option<&crate::config::types::ResolvedPortOverride>,
+        b: Option<&crate::config::types::ResolvedPortOverride>,
+    ) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Self::route_dispatch_override_eq(a, b),
+            (None, Some(_)) | (Some(_), None) => false,
+        }
+    }
+
+    fn route_dispatch_override_eq(
+        a: &crate::config::types::ResolvedPortOverride,
+        b: &crate::config::types::ResolvedPortOverride,
+    ) -> bool {
+        a.connect_timeout_ms == b.connect_timeout_ms
+            && a.passive_health_check == b.passive_health_check
+            && a.max_connections == b.max_connections
+            && a.tcp_keepalive == b.tcp_keepalive
+            && a.http_max_requests_per_connection == b.http_max_requests_per_connection
+            && a.http_idle_timeout_ms == b.http_idle_timeout_ms
+            && a.h2_max_concurrent_streams == b.h2_max_concurrent_streams
+            && a.tls == b.tls
+            && a.h2_upgrade_policy == b.h2_upgrade_policy
+            && a.max_retries == b.max_retries
+            && a.http1_max_pending_requests == b.http1_max_pending_requests
     }
 
     /// Whether the `config.mesh` block changed in a way that requires a route
@@ -23668,9 +23722,9 @@ mod tests {
         upstream
     }
 
-    fn route_delta_upstream_change_delta(
-        old_proxy: Proxy,
-        new_proxy: Proxy,
+    fn route_delta_projected_upstream_change_delta(
+        mutate_old_upstream: impl FnOnce(&mut Upstream),
+        mutate_new_upstream: impl FnOnce(&mut Upstream),
     ) -> (
         crate::config_delta::ConfigDelta,
         GatewayConfig,
@@ -23678,8 +23732,17 @@ mod tests {
     ) {
         let t0 = chrono::Utc::now();
         let t1 = t0 + chrono::Duration::seconds(1);
-        let old_config = route_delta_config_with_upstream(old_proxy, route_delta_upstream(t0));
-        let new_config = route_delta_config_with_upstream(new_proxy, route_delta_upstream(t1));
+        let mut old_upstream = route_delta_upstream(t0);
+        mutate_old_upstream(&mut old_upstream);
+        let mut new_upstream = route_delta_upstream(t1);
+        mutate_new_upstream(&mut new_upstream);
+
+        let proxy = http_route_proxy_with_upstream();
+        let mut old_config = route_delta_config_with_upstream(proxy.clone(), old_upstream);
+        let mut new_config = route_delta_config_with_upstream(proxy, new_upstream);
+        old_config.resolve_dispatch_port_overrides();
+        new_config.resolve_dispatch_port_overrides();
+
         let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
         assert!(
             delta.modified_proxies.is_empty(),
@@ -23699,8 +23762,8 @@ mod tests {
         proxy
     }
 
-    fn resolved_http_override(idle_ms: u64) -> crate::config::types::ResolvedPortOverride {
-        crate::config::types::ResolvedPortOverride {
+    fn upstream_http_override(idle_ms: u64) -> crate::config::types::UpstreamPortOverride {
+        crate::config::types::UpstreamPortOverride {
             http_idle_timeout_ms: Some(idle_ms),
             ..Default::default()
         }
@@ -23796,13 +23859,14 @@ mod tests {
 
     #[test]
     fn delta_routes_changed_detects_projected_fallback_change_without_proxy_delta() {
-        let mut old_proxy = http_route_proxy_with_upstream();
-        old_proxy.dispatch_port_override_fallback = Some(resolved_http_override(1_000));
-        let mut new_proxy = old_proxy.clone();
-        new_proxy.dispatch_port_override_fallback = Some(resolved_http_override(2_000));
-
-        let (delta, old_config, new_config) =
-            route_delta_upstream_change_delta(old_proxy, new_proxy);
+        let (delta, old_config, new_config) = route_delta_projected_upstream_change_delta(
+            |upstream| {
+                upstream.dispatch_port_override_fallback = Some(upstream_http_override(1_000));
+            },
+            |upstream| {
+                upstream.dispatch_port_override_fallback = Some(upstream_http_override(2_000));
+            },
+        );
 
         assert!(ProxyState::delta_routes_changed(
             &delta,
@@ -23837,25 +23901,26 @@ mod tests {
 
     #[test]
     fn delta_routes_changed_detects_projected_per_port_override_change_without_proxy_delta() {
-        let mut old_proxy = http_route_proxy_with_upstream();
-        old_proxy.dispatch_port_overrides = Some(HashMap::from([(
-            8080,
-            crate::config::types::ResolvedPortOverride {
-                max_retries: Some(1),
-                ..Default::default()
+        let (delta, old_config, new_config) = route_delta_projected_upstream_change_delta(
+            |upstream| {
+                upstream.port_overrides.insert(
+                    8080,
+                    crate::config::types::UpstreamPortOverride {
+                        max_retries: Some(1),
+                        ..Default::default()
+                    },
+                );
             },
-        )]));
-        let mut new_proxy = old_proxy.clone();
-        new_proxy.dispatch_port_overrides = Some(HashMap::from([(
-            8080,
-            crate::config::types::ResolvedPortOverride {
-                max_retries: Some(3),
-                ..Default::default()
+            |upstream| {
+                upstream.port_overrides.insert(
+                    8080,
+                    crate::config::types::UpstreamPortOverride {
+                        max_retries: Some(3),
+                        ..Default::default()
+                    },
+                );
             },
-        )]));
-
-        let (delta, old_config, new_config) =
-            route_delta_upstream_change_delta(old_proxy, new_proxy);
+        );
 
         assert!(ProxyState::delta_routes_changed(
             &delta,
@@ -23866,12 +23931,12 @@ mod tests {
 
     #[test]
     fn delta_routes_changed_detects_projected_override_removal_without_proxy_delta() {
-        let mut old_proxy = http_route_proxy_with_upstream();
-        old_proxy.dispatch_port_override_fallback = Some(resolved_http_override(1_000));
-        let mut new_proxy = old_proxy.clone();
-        new_proxy.dispatch_port_override_fallback = None;
-        let (delta, old_config, new_config) =
-            route_delta_upstream_change_delta(old_proxy, new_proxy);
+        let (delta, old_config, new_config) = route_delta_projected_upstream_change_delta(
+            |upstream| {
+                upstream.dispatch_port_override_fallback = Some(upstream_http_override(1_000));
+            },
+            |_| {},
+        );
         assert!(ProxyState::delta_routes_changed(
             &delta,
             &old_config,
@@ -23885,13 +23950,14 @@ mod tests {
             "rebuilt route must clear removed top-level fallback state"
         );
 
-        let mut old_proxy = http_route_proxy_with_upstream();
-        old_proxy.dispatch_port_overrides =
-            Some(HashMap::from([(8080, resolved_http_override(1_000))]));
-        let mut new_proxy = old_proxy.clone();
-        new_proxy.dispatch_port_overrides = None;
-        let (delta, old_config, new_config) =
-            route_delta_upstream_change_delta(old_proxy, new_proxy);
+        let (delta, old_config, new_config) = route_delta_projected_upstream_change_delta(
+            |upstream| {
+                upstream
+                    .port_overrides
+                    .insert(8080, upstream_http_override(1_000));
+            },
+            |_| {},
+        );
         assert!(ProxyState::delta_routes_changed(
             &delta,
             &old_config,
@@ -23908,14 +23974,46 @@ mod tests {
 
     #[test]
     fn delta_routes_changed_ignores_semantically_equivalent_dr_update() {
-        let mut old_proxy = http_route_proxy_with_upstream();
-        old_proxy.dispatch_port_override_fallback = Some(resolved_http_override(1_000));
-        old_proxy.dispatch_port_overrides =
-            Some(HashMap::from([(8080, resolved_http_override(2_000))]));
-        let new_proxy = old_proxy.clone();
+        let apply_equivalent_dr = |upstream: &mut Upstream| {
+            upstream.dispatch_port_override_fallback = Some(upstream_http_override(1_000));
+            upstream
+                .port_overrides
+                .insert(8080, upstream_http_override(2_000));
+        };
+        let (delta, old_config, new_config) = route_delta_projected_upstream_change_delta(
+            apply_equivalent_dr,
+            apply_equivalent_dr,
+        );
 
-        let (delta, old_config, new_config) =
-            route_delta_upstream_change_delta(old_proxy, new_proxy);
+        assert!(!ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &new_config
+        ));
+    }
+
+    #[test]
+    fn delta_routes_changed_ignores_lb_only_override_value_change() {
+        let (delta, old_config, new_config) = route_delta_projected_upstream_change_delta(
+            |upstream| {
+                upstream.port_overrides.insert(
+                    8080,
+                    crate::config::types::UpstreamPortOverride {
+                        algorithm: Some(LoadBalancerAlgorithm::Random),
+                        ..Default::default()
+                    },
+                );
+            },
+            |upstream| {
+                upstream.port_overrides.insert(
+                    8080,
+                    crate::config::types::UpstreamPortOverride {
+                        algorithm: Some(LoadBalancerAlgorithm::LeastConnections),
+                        ..Default::default()
+                    },
+                );
+            },
+        );
 
         assert!(!ProxyState::delta_routes_changed(
             &delta,
