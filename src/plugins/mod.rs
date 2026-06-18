@@ -623,6 +623,12 @@ pub struct RequestContext {
     /// port to disambiguate multi-port services; the address is reserved for
     /// the raw-TCP egress follow-up.
     pub orig_dst: Option<std::net::SocketAddr>,
+    /// Mesh outbound service port selected by the router after host/path
+    /// routing and optional original-destination disambiguation. Used by
+    /// `mesh_authz` for Istio `destination.port` when an outbound request has
+    /// no captured original destination, such as direct dials to a single-port
+    /// service in dev/non-Linux setups. `None` outside mesh outbound routes.
+    pub mesh_outbound_destination_authz_port: Option<u16>,
     /// Authorization destination port for a matched Sidecar `ingress[]` route
     /// (F6 §6.2): the operator-declared LISTENER port (e.g. `8443`), stamped by
     /// the request handler from `select_mesh_inbound_port_route` when the matched
@@ -705,6 +711,7 @@ impl RequestContext {
             node_waypoint_policy_scope: None,
             mesh_direction: None,
             orig_dst: None,
+            mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
         }
     }
@@ -770,6 +777,7 @@ impl RequestContext {
             node_waypoint_policy_scope: self.node_waypoint_policy_scope.clone(),
             mesh_direction: self.mesh_direction,
             orig_dst: self.orig_dst,
+            mesh_outbound_destination_authz_port: self.mesh_outbound_destination_authz_port,
             mesh_inbound_listener_authz_port: self.mesh_inbound_listener_authz_port,
         }
     }
@@ -977,6 +985,34 @@ impl RequestContext {
         let dispatch_port_overrides_changed = dispatch_port_overrides_override
             .as_ref()
             .is_some_and(|overrides| *overrides != proxy.dispatch_port_overrides);
+        // Recompute the service-discovery top-level `connectionPool.http`
+        // fallback for the override's destination, exactly mirroring
+        // `dispatch_port_overrides` above: a direct-backend override clears it
+        // (no upstream → no overlay), an upstream-id override recomputes it from
+        // the NEW upstream. Without this, a route from an SD upstream LEAKS its
+        // top-level fallback onto a different destination, and a route TO an SD
+        // upstream LOSES that destination's fallback (see #1806 codex r1).
+        let dispatch_port_override_fallback_override = if upstream_id_changed {
+            if direct_backend_override {
+                Some(None)
+            } else {
+                Some(
+                    self.route_override_upstream_id
+                        .as_deref()
+                        .and_then(|id| upstreams.and_then(|map| map.get(id)))
+                        .and_then(|upstream| {
+                            crate::config::types::dispatch_port_override_fallback_from_upstream(
+                                upstream,
+                            )
+                        }),
+                )
+            }
+        } else {
+            None
+        };
+        let dispatch_port_override_fallback_changed = dispatch_port_override_fallback_override
+            .as_ref()
+            .is_some_and(|fallback| *fallback != proxy.dispatch_port_override_fallback);
         let backend_read_timeout_changed = self
             .route_override_backend_read_timeout_ms
             .is_some_and(|timeout| timeout != proxy.backend_read_timeout_ms);
@@ -1003,6 +1039,7 @@ impl RequestContext {
             && !backend_port_changed
             && !resolved_tls_changed
             && !dispatch_port_overrides_changed
+            && !dispatch_port_override_fallback_changed
             && !backend_read_timeout_changed
             && !retry_changed
             && !preserve_host_changed
@@ -1037,6 +1074,9 @@ impl RequestContext {
         }
         if let Some(dispatch_port_overrides) = dispatch_port_overrides_override {
             overridden.dispatch_port_overrides = dispatch_port_overrides;
+        }
+        if let Some(dispatch_port_override_fallback) = dispatch_port_override_fallback_override {
+            overridden.dispatch_port_override_fallback = dispatch_port_override_fallback;
         }
         if let Some(timeout) = self.route_override_backend_read_timeout_ms {
             overridden.backend_read_timeout_ms = timeout;
@@ -1106,10 +1146,13 @@ impl RequestContext {
                     // spec), and hyper normalizes HTTP/1.1 header names to
                     // lowercase at parse time. No `to_lowercase()` needed.
                     let key = name.as_str();
-                    // Reserved gateway-asserted identity headers are never
-                    // trusted from clients. They are injected after
-                    // authentication from `identified_consumer`.
-                    if matches!(key, "x-consumer-username" | "x-consumer-custom-id") {
+                    // Reserved gateway-asserted headers are never trusted from
+                    // clients. Identity headers are injected after
+                    // authentication; path-param headers are injected after
+                    // route matching from regex captures.
+                    if matches!(key, "x-consumer-username" | "x-consumer-custom-id")
+                        || key.starts_with("x-path-param-")
+                    {
                         continue;
                     }
                     let separator = repeated_request_header_separator(key);
@@ -2384,6 +2427,11 @@ pub trait Plugin: Send + Sync {
     /// `Content-Type` is unknown at the pre-flight `should_buffer_response_body`
     /// decision, which is why this is a separate hook.
     ///
+    /// The full `response_headers` map (and `response_status`) are also passed so
+    /// a plugin can release a response it will decline to transform once headers
+    /// are known — e.g. `compression` skips `206 Partial Content` / `Content-Range`
+    /// responses, so it must not pin them onto the buffered path either.
+    ///
     /// Contract: this MUST only narrow `should_buffer_response_body` — it may
     /// return `false` where the unconditional check returned `true`, but never
     /// the reverse. The proxy uses it solely to downgrade buffer -> stream and
@@ -2395,6 +2443,8 @@ pub trait Plugin: Send + Sync {
         &self,
         ctx: &RequestContext,
         _content_type: Option<&str>,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
     }
@@ -3247,6 +3297,117 @@ mod tests {
             Some("/certs/canary-ca.pem")
         );
         assert!(!result.resolved_tls.verify_server_cert);
+    }
+
+    #[test]
+    fn upstream_override_recomputes_dispatch_port_override_fallback() {
+        // codex r1 #1806 finding 1: a route override that swaps the destination
+        // upstream must recompute the SD top-level `connectionPool.http`
+        // fallback from the NEW upstream — picking up the new destination's
+        // fallback, never leaking the old one.
+        use crate::config::types::UpstreamPortOverride;
+
+        // Source proxy points at SD upstream `stable` which carries no top-level
+        // overlay; assert the override TO `canary` picks up canary's overlay.
+        let proxy: Proxy = serde_json::from_value(json!({
+            "backend_host": "stable.svc",
+            "backend_port": 8080,
+            "upstream_id": "stable",
+        }))
+        .expect("minimal proxy should deserialize");
+
+        let mut canary: Upstream = serde_json::from_value(json!({
+            "id": "canary",
+            "targets": [{"host": "canary.svc", "port": 9090}],
+        }))
+        .expect("minimal upstream should deserialize");
+        // SD top-level overlay (serde-skipped field, set directly).
+        canary.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+            http1_max_pending_requests: Some(16),
+            h2_max_concurrent_streams: Some(64),
+            ..Default::default()
+        });
+        let mut upstreams = HashMap::new();
+        upstreams.insert("canary".to_string(), Arc::new(canary));
+
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        ctx.route_override_upstream_id = Some("canary".to_string());
+
+        let result = ctx.apply_route_overrides_with_upstreams(Arc::new(proxy), &upstreams);
+        assert_eq!(result.upstream_id.as_deref(), Some("canary"));
+        let fallback = result
+            .dispatch_port_override_fallback
+            .as_ref()
+            .expect("override TO an SD upstream must pick up that upstream's fallback");
+        assert_eq!(fallback.http1_max_pending_requests, Some(16));
+        assert_eq!(fallback.h2_max_concurrent_streams, Some(64));
+    }
+
+    #[test]
+    fn upstream_override_clears_fallback_when_new_upstream_has_none() {
+        // codex r1 #1806 finding 1 (no-leak): a proxy carrying an SD fallback
+        // routed TO a different upstream WITHOUT one must have it CLEARED — the
+        // old upstream's overlay must not leak onto the new destination.
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "backend_host": "stable.svc",
+            "backend_port": 8080,
+            "upstream_id": "stable",
+        }))
+        .expect("minimal proxy should deserialize");
+        // The referencing proxy already carries `stable`'s projected fallback.
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            http1_max_pending_requests: Some(99),
+            ..Default::default()
+        });
+
+        // `plain` has no top-level overlay.
+        let plain: Upstream = serde_json::from_value(json!({
+            "id": "plain",
+            "targets": [{"host": "plain.svc", "port": 9090}],
+        }))
+        .expect("minimal upstream should deserialize");
+        let mut upstreams = HashMap::new();
+        upstreams.insert("plain".to_string(), Arc::new(plain));
+
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        ctx.route_override_upstream_id = Some("plain".to_string());
+
+        let result = ctx.apply_route_overrides_with_upstreams(Arc::new(proxy), &upstreams);
+        assert_eq!(result.upstream_id.as_deref(), Some("plain"));
+        assert!(
+            result.dispatch_port_override_fallback.is_none(),
+            "routing to an upstream without a fallback must CLEAR the inherited one (no leak)"
+        );
+    }
+
+    #[test]
+    fn direct_backend_override_clears_dispatch_port_override_fallback() {
+        // codex r1 #1806 finding 1: a direct-backend override (no upstream)
+        // must clear the SD fallback, mirroring how it clears
+        // `dispatch_port_overrides`.
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "backend_host": "stable.svc",
+            "backend_port": 8080,
+            "upstream_id": "stable",
+        }))
+        .expect("minimal proxy should deserialize");
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            max_retries: Some(3),
+            ..Default::default()
+        });
+
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        ctx.route_override_backend_host = Some("direct.svc".to_string());
+
+        let result = ctx.apply_route_overrides_with_upstreams(Arc::new(proxy), &HashMap::new());
+        assert_eq!(result.upstream_id, None);
+        assert!(
+            result.dispatch_port_override_fallback.is_none(),
+            "a direct-backend override must clear the SD fallback"
+        );
     }
 
     #[test]

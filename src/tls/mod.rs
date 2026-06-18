@@ -986,7 +986,7 @@ fn certified_key_from_svid_bundle(
         return Err(anyhow::anyhow!("SVID bundle carries an empty cert chain"));
     }
     let key = PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
-        bundle.private_key_pkcs8_der.clone(),
+        bundle.private_key_pkcs8_der.to_vec(),
     ));
     rustls::sign::CertifiedKey::from_der(cert_chain, key, provider).map_err(|error| {
         anyhow::anyhow!("SVID leaf and private key do not form a valid pair: {error}")
@@ -1616,7 +1616,7 @@ mod tests {
             spiffe_id: crate::identity::SpiffeId::from_parts(&trust_domain, "ns/test/sa/test")
                 .expect("spiffe id"),
             cert_chain_der: vec![cert.der().as_ref().to_vec()],
-            private_key_pkcs8_der: key_pair.serialize_der(),
+            private_key_pkcs8_der: key_pair.serialize_der().into(),
             trust_bundles: crate::identity::TrustBundleSet::local_only(
                 crate::identity::TrustBundle {
                     trust_domain,
@@ -1686,7 +1686,7 @@ mod tests {
         );
 
         let mut broken = test_svid_bundle("broken");
-        broken.private_key_pkcs8_der = vec![0u8; 8];
+        broken.private_key_pkcs8_der = vec![0u8; 8].into();
         slot.store(Arc::new(Some(broken)));
         assert!(
             resolver.resolve_current().is_none(),
