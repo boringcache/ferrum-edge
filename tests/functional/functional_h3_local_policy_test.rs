@@ -86,10 +86,16 @@ async fn functional_h3_local_policy_pending_cap_rejects_before_backend_admission
 #[ignore]
 #[tokio::test]
 async fn functional_h3_local_policy_backend_tls_sni_rejects_before_dial_and_admission() {
-    let (backend_port, backend_hits, backend_task) = spawn_counting_backend().await;
+    let (backend_port, backend_hits, release_backend, backend_task) = spawn_holding_backend().await;
     let gateway = start_h3_policy_gateway(backend_tls_sni_config(backend_port))
         .await
         .expect("start h3 backend-SNI gateway");
+
+    let hold_client = Http3Client::insecure().expect("hold h3 client");
+    let hold_url = format!("https://localhost:{}/h3-admission-hold", gateway.https_port);
+    let hold = tokio::spawn(async move { retry_h3_get(&hold_client, &hold_url).await });
+
+    wait_for_hits(&backend_hits, 1, Duration::from_secs(10)).await;
 
     let client = Http3Client::insecure().expect("h3 client");
     let url = format!(
@@ -109,7 +115,15 @@ async fn functional_h3_local_policy_backend_tls_sni_rejects_before_dial_and_admi
             .and_then(|value| value.to_str().ok()),
         Some("backend_tls_sni_requires_direct_h2")
     );
-    assert_backend_hits_eq(&backend_hits, 0, Duration::from_millis(250)).await;
+    assert_backend_hits_eq(&backend_hits, 1, Duration::from_millis(250)).await;
+
+    release_backend.release();
+    let hold = hold.await.expect("held h3 task joined");
+    assert_eq!(
+        hold.status,
+        StatusCode::OK,
+        "admission-saturating request should complete after release"
+    );
 
     gateway.shutdown().await;
     backend_task.abort();
@@ -221,6 +235,7 @@ fn mesh_runtime_config() -> Result<MeshRuntimeConfig, String> {
 
 const H3_POLICY_NAMESPACE: &str = "ferrum";
 const H3_POLICY_UPSTREAM_ID: &str = "h3-local-policy-upstream";
+const H3_POLICY_HOLD_UPSTREAM_ID: &str = "h3-local-policy-hold-upstream";
 const H3_POLICY_JWT_SECRET: &str = "ferrum-edge-h3-local-policy-secret-0000";
 const H3_POLICY_JWT_ISSUER: &str = "ferrum-edge-h3-local-policy";
 
@@ -243,7 +258,7 @@ fn pending_cap_config(backend_port: u16) -> GatewayConfig {
 }
 
 fn backend_tls_sni_config(backend_port: u16) -> GatewayConfig {
-    h3_policy_config(
+    let mut config = h3_policy_config(
         backend_port,
         "https",
         json!({
@@ -252,7 +267,36 @@ fn backend_tls_sni_config(backend_port: u16) -> GatewayConfig {
             }
         }),
         None,
-    )
+    );
+    config.proxies.push(
+        serde_json::from_value(json!({
+            "id": "h3-local-policy-admission-hold",
+            "namespace": H3_POLICY_NAMESPACE,
+            "listen_path": "/h3-admission-hold",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "upstream_id": H3_POLICY_HOLD_UPSTREAM_ID,
+            "pool_enable_http2": false
+        }))
+        .expect("hold proxy config is valid"),
+    );
+    config.upstreams.push(
+        serde_json::from_value(json!({
+            "id": H3_POLICY_HOLD_UPSTREAM_ID,
+            "namespace": H3_POLICY_NAMESPACE,
+            "name": "H3 local policy admission hold upstream",
+            "algorithm": "round_robin",
+            "targets": [{
+                "host": "127.0.0.1",
+                "port": backend_port,
+                "weight": 1
+            }]
+        }))
+        .expect("hold upstream config is valid"),
+    );
+    config
 }
 
 fn h3_policy_config(
@@ -374,28 +418,6 @@ async fn run_holding_backend(
         let release = Arc::clone(&release);
         tokio::spawn(async move {
             let _ = read_http_request(stream, &hits, Some(release)).await;
-        });
-    }
-}
-
-async fn spawn_counting_backend() -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind counting backend");
-    let port = listener.local_addr().expect("backend addr").port();
-    let hits = Arc::new(AtomicUsize::new(0));
-    let task = tokio::spawn(run_counting_backend(listener, Arc::clone(&hits)));
-    (port, hits, task)
-}
-
-async fn run_counting_backend(listener: TcpListener, hits: Arc<AtomicUsize>) {
-    loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            continue;
-        };
-        let hits = Arc::clone(&hits);
-        tokio::spawn(async move {
-            let _ = read_http_request(stream, &hits, None).await;
         });
     }
 }

@@ -315,6 +315,9 @@ async fn run_cross_protocol_backend_admission_or_reject<S>(
     state: &ProxyState,
     cb_target_key: Option<&str>,
     cb_is_half_open_probe: bool,
+    pending_slot_to_release_before_reject: Option<
+        &mut Option<crate::backend_pending_limit::BackendPendingGuard>,
+    >,
 ) -> Result<Result<Option<BackendAdmissionPermitSet>, CrossProtocolOutcome>, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -338,6 +341,9 @@ where
                 cb_target_key,
                 cb_is_half_open_probe,
             );
+            if let Some(slot) = pending_slot_to_release_before_reject {
+                drop(slot.take());
+            }
             let mut headers = rejection.headers;
             crate::proxy::apply_after_proxy_hooks_to_rejection(
                 plugins,
@@ -821,6 +827,9 @@ async fn get_cross_protocol_client<S>(
     backend_admission_permits: &mut Option<BackendAdmissionPermitSet>,
     backend_admission_elapsed: Duration,
     stream: &mut RequestStream<S, Bytes>,
+    pending_slot_to_release_before_error: Option<
+        &mut Option<crate::backend_pending_limit::BackendPendingGuard>,
+    >,
 ) -> Result<Result<reqwest::Client, CrossProtocolOutcome>, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -844,6 +853,9 @@ where
                 backend_admission_permits,
                 backend_admission_elapsed,
             );
+            if let Some(slot) = pending_slot_to_release_before_error {
+                drop(slot.take());
+            }
             let mut outcome = write_error(
                 stream,
                 StatusCode::BAD_GATEWAY,
@@ -1149,7 +1161,7 @@ where
                         .map(|t| t.port)
                         .unwrap_or(dispatch_proxy.backend_port);
 
-                    let pending_slot = match run_plain_attempt_local_policy_or_reject(
+                    let mut pending_slot = match run_plain_attempt_local_policy_or_reject(
                         state,
                         epoch,
                         dispatch_proxy,
@@ -1186,6 +1198,7 @@ where
                             state,
                             current_cb_target_key.as_deref(),
                             cb_retry_probe_slot_available,
+                            Some(&mut pending_slot),
                         )
                         .await?
                         {
@@ -1210,6 +1223,7 @@ where
                         &mut backend_admission_permits,
                         backend_admission_start.elapsed(),
                         stream,
+                        Some(&mut pending_slot),
                     )
                     .await?
                     {
@@ -1469,7 +1483,7 @@ where
                     .map(|t| t.port)
                     .unwrap_or(dispatch_proxy.backend_port);
 
-                let pending_slot = match run_plain_attempt_local_policy_or_reject(
+                let mut pending_slot = match run_plain_attempt_local_policy_or_reject(
                     state,
                     epoch,
                     dispatch_proxy,
@@ -1506,6 +1520,7 @@ where
                         state,
                         current_cb_target_key.as_deref(),
                         cb_retry_probe_slot_available,
+                        Some(&mut pending_slot),
                     )
                     .await?
                     {
@@ -1530,6 +1545,7 @@ where
                     &mut backend_admission_permits,
                     backend_admission_start.elapsed(),
                     stream,
+                    Some(&mut pending_slot),
                 )
                 .await?
                 {
@@ -1712,6 +1728,7 @@ where
                     loop {
                         tokio::select! {
                             result = &mut send_future => {
+                                drop(pending_slot.take());
                                 if !reader_done {
                                     let backend_succeeded = result.is_ok();
                                     if backend_succeeded && drain_ms > 0 {
@@ -1752,7 +1769,6 @@ where
                 // ignored), so any inner halts already issued by the
                 // reader cost only one extra frame.
                 crate::http3::stream_util::halt_request_body(stream);
-                drop(pending_slot);
                 let bytes_sent = bytes_read.load(Ordering::Relaxed);
                 if oversized.load(Ordering::Relaxed) {
                     record_cross_protocol_backend_admission_outcome(
@@ -2503,6 +2519,7 @@ where
         state,
         current_cb_target_key.as_deref(),
         cb_retry_probe_slot_available,
+        None,
     )
     .await?
     {
@@ -2637,6 +2654,7 @@ where
                 state,
                 current_cb_target_key.as_deref(),
                 cb_retry_probe_slot_available,
+                None,
             )
             .await?
             {
