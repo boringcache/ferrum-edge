@@ -638,6 +638,7 @@ jobs:
               functional_allowed_methods_test
               functional_forwarded_via_headers_test
               functional_streaming_latency_tracking_test
+              functional_streaming_outcome_accounting_test
               functional_chunked_request_size_limits_test
               functional_chunked_response_size_limits_test
               functional_body_size_limits_test

@@ -152,6 +152,8 @@ pub const MAX_HTTP2_WINDOW_SIZE: u32 = 128 * 1024 * 1024;
 pub const MIN_HTTP2_MAX_FRAME_SIZE: u32 = 16_384;
 /// Maximum HTTP/2 max frame size (1 MiB practical operational limit).
 pub const MAX_HTTP2_MAX_FRAME_SIZE: u32 = 1_048_576;
+/// Maximum value for proxy pool integer fields stored in SQL INTEGER columns.
+pub const MAX_POOL_SQL_INTEGER_VALUE: u64 = i32::MAX as u64;
 /// Maximum HTTP/3 connections per backend (reasonable operational limit).
 pub const MAX_HTTP3_CONNECTIONS_PER_BACKEND: usize = 256;
 
@@ -443,6 +445,24 @@ pub struct UpstreamPortOverride {
     /// and never synthesizes a retry policy when the proxy has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
+    /// Per-port cap on concurrent *pending* (connection-waiting) HTTP/1.1
+    /// requests, mapped from DestinationRule
+    /// `connectionPool.http.http1MaxPendingRequests`. Enforced on the
+    /// reqwest/HTTP-1.1 backend-dispatch path by
+    /// [`crate::backend_pending_limit::BackendPendingLimiter`]: a request that
+    /// cannot get a pending slot is shed with a 503 ("upstream overflow") in
+    /// the connection-pending phase, rather than queued unboundedly. Projected
+    /// onto the per-target effective proxy's `pool_http1_max_pending_requests`.
+    /// The cap is keyed per resolved `(host, port)` endpoint, not per logical
+    /// cluster (same keying tradeoff as `max_connections`).
+    ///
+    /// HTTP/1.1-scoped: the multiplexed transports (direct H2, gRPC, HTTP/3,
+    /// HBONE, mesh-mTLS) do NOT consult this field — their request concurrency
+    /// is governed by `http2MaxRequests` (`h2_max_concurrent_streams`), not a
+    /// connection-pending queue. Always positive when set (zero rejected at
+    /// translate time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http1_max_pending_requests: Option<u32>,
 }
 
 /// Per-target TCP keepalive override. Mirrors Istio's
@@ -500,6 +520,7 @@ pub struct ResolvedPortOverride {
     pub tls: Option<BackendTlsConfig>,
     pub h2_upgrade_policy: Option<H2UpgradePolicy>,
     pub max_retries: Option<u32>,
+    pub http1_max_pending_requests: Option<u32>,
 }
 
 impl ResolvedPortOverride {
@@ -522,6 +543,7 @@ impl ResolvedPortOverride {
             tls,
             h2_upgrade_policy: value.h2_upgrade_policy,
             max_retries: value.max_retries,
+            http1_max_pending_requests: value.http1_max_pending_requests,
         };
         (!resolved.is_empty()).then_some(resolved)
     }
@@ -540,7 +562,75 @@ impl ResolvedPortOverride {
             && self.tls.is_none()
             && self.h2_upgrade_policy.is_none()
             && self.max_retries.is_none()
+            && self.http1_max_pending_requests.is_none()
     }
+
+    /// Field-by-field seed of the `connectionPool.http` fields from a
+    /// service-discovery TOP-LEVEL fallback overlay onto this (per-port) entry.
+    ///
+    /// For each of the six `connectionPool.http` fields, the per-port value wins
+    /// when set; otherwise the fallback's value is inherited. This mirrors the
+    /// NON-SD apply-time layering EXACTLY: there, the top-level
+    /// `connectionPool.http` is fanned onto the port slot FIRST and a partial
+    /// per-port `portLevelSettings.connectionPool.http` then overlays only the
+    /// fields it sets (see `apply_connection_pool_http_to_port_override` in
+    /// `src/modes/mesh/mod.rs`). SD upstreams cannot fan out at apply time, so
+    /// the top-level overlay is carried separately on
+    /// `Proxy.dispatch_port_override_fallback` and merged HERE at dispatch — so
+    /// an unrelated per-port field (e.g. `connectTimeout`/`tls`) no longer wipes
+    /// an inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`.
+    ///
+    /// Only the six `connectionPool.http` fields are merged; the fallback only
+    /// ever carries those (it is built solely from the DR top-level
+    /// `connectionPool.http` block), so non-`connectionPool.http` fields
+    /// (`connect_timeout_ms`/`algorithm`/`tls`/`max_connections`/… ) are left as
+    /// this per-port entry already has them.
+    pub fn seed_connection_pool_http_from_fallback(&mut self, fallback: &ResolvedPortOverride) {
+        self.http_max_requests_per_connection = self
+            .http_max_requests_per_connection
+            .or(fallback.http_max_requests_per_connection);
+        self.http_idle_timeout_ms = self.http_idle_timeout_ms.or(fallback.http_idle_timeout_ms);
+        self.h2_max_concurrent_streams = self
+            .h2_max_concurrent_streams
+            .or(fallback.h2_max_concurrent_streams);
+        self.h2_upgrade_policy = self.h2_upgrade_policy.or(fallback.h2_upgrade_policy);
+        self.max_retries = self.max_retries.or(fallback.max_retries);
+        self.http1_max_pending_requests = self
+            .http1_max_pending_requests
+            .or(fallback.http1_max_pending_requests);
+    }
+}
+
+/// Project an upstream's service-discovery TOP-LEVEL `connectionPool.http`
+/// overlay (`Upstream.dispatch_port_override_fallback`) into the resolved
+/// [`ResolvedPortOverride`] shape carried on a referencing `Proxy`
+/// (`Proxy.dispatch_port_override_fallback`).
+///
+/// Returns `None` for the common non-SD case (no top-level overlay) and for an
+/// overlay that resolves empty. Shared by config-build projection
+/// ([`GatewayConfig::resolve_dispatch_port_overrides`]) and the route-override
+/// path (`apply_route_overrides_inner` in `src/plugins/mod.rs`) so a route that
+/// swaps the destination upstream recomputes (or clears) the fallback exactly
+/// like `dispatch_port_overrides`, never leaking one upstream's overlay onto a
+/// different destination.
+pub(crate) fn dispatch_port_override_fallback_from_upstream(
+    upstream: &Upstream,
+) -> Option<ResolvedPortOverride> {
+    // TOP-LEVEL `connectionPool.http` overlay ONLY (#1806 narrowed; follow-up #1816).
+    // An explicit per-port `portLevelSettings` still WINS via the dispatch-time
+    // per-port lookup (by resolved dial port) in `resolve_effective_proxy_for_target`.
+    // We deliberately do NOT fold the upstream's `port_overrides` into this fallback:
+    // a multi-port upstream would cross-leak one port's `connectionPool.http` onto a
+    // different port (codex r3). The residual — applying an EXPLICIT per-port value to
+    // an SD upstream whose NAMED `targetPort` resolves to a different dial port (so the
+    // per-port lookup misses and only this top-level fallback is consulted) — is a
+    // DEFERRED accepted limitation (see #1816), as is immediate route-rebuild on a
+    // DR-only edit (a `#[serde(skip)]` DR-derived field, like the established per-port
+    // `dispatch_port_overrides`).
+    upstream
+        .dispatch_port_override_fallback
+        .as_ref()
+        .and_then(ResolvedPortOverride::from_upstream_override)
 }
 
 /// A named subset of upstream targets identified by label selectors.
@@ -1110,6 +1200,17 @@ pub struct Upstream {
     /// balancing. Projected from the selected workload at slice-apply time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_locality: Option<String>,
+    /// Strict local-first locality LB for this upstream. Default `false`
+    /// (fail-open): when `source_locality` is absent the locality-aware LB
+    /// returns mixed local + remote endpoints. When `true` (fail-closed-to-
+    /// local): an absent `source_locality` restricts selection to LOCAL-locality
+    /// endpoints (targets not tagged with the synthetic `remote-<cluster>`
+    /// locality), widening to the full healthy pool only when there are no local
+    /// endpoints. Projected from `FERRUM_MESH_LOCALITY_LB_STRICT` onto mesh
+    /// upstreams at slice apply; the load balancer reads it at cache-build time.
+    /// Stays `false` for non-mesh upstreams, preserving existing behavior.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locality_lb_strict: bool,
     /// Optional projection of Istio
     /// `DestinationRule.trafficPolicy.localityLbSetting`. Populated by the
     /// mesh apply layer from a matching `MeshDestinationRule`; `None` for
@@ -1147,6 +1248,21 @@ pub struct Upstream {
     /// `Upstream.subsets[].traffic_policy.tls`.
     #[serde(skip)]
     pub resolved_subset_tls: HashMap<String, ResolvedSubsetTrafficPolicy>,
+    /// Top-level (non-`portLevelSettings`) DestinationRule `connectionPool.http`
+    /// overlay for a **service-discovery** upstream.
+    ///
+    /// Non-SD upstreams fan the top-level `connectionPool.http` block out onto
+    /// every served `port_overrides` entry at apply time. SD upstreams cannot —
+    /// their target ports are resolved at runtime, not at apply — so the
+    /// top-level overlay is captured here instead and applied by the
+    /// LB-**selected** target port at dispatch. `resolve_dispatch_port_overrides`
+    /// projects this onto `Proxy.dispatch_port_override_fallback`, which the
+    /// HTTP-family dispatch resolvers (`resolve_effective_proxy_for_target` /
+    /// `cap_proxy_retry_for_target`) consult only when the selected port has no
+    /// explicit per-port override — so an explicit `portLevelSettings` entry
+    /// still wins. Not serialized — derived from the matching DestinationRule.
+    #[serde(default, skip)]
+    pub dispatch_port_override_fallback: Option<UpstreamPortOverride>,
     /// ID of the `ApiSpec` that created this upstream via the spec-import admin API.
     /// `None` for hand-crafted upstreams. Used to scope cascading DELETE when a
     /// spec is removed. NOT loaded by the gateway runtime — admin-only metadata.
@@ -1706,6 +1822,23 @@ pub struct Proxy {
     /// `apply_destination_rules` has written into `Upstream.port_overrides`.
     #[serde(skip)]
     pub dispatch_port_overrides: Option<HashMap<u16, ResolvedPortOverride>>,
+    /// Top-level (non-`portLevelSettings`) DestinationRule `connectionPool.http`
+    /// overlay for a **service-discovery** upstream, projected from
+    /// `Upstream.dispatch_port_override_fallback` by
+    /// `GatewayConfig::resolve_dispatch_port_overrides()`.
+    ///
+    /// SD upstreams have no apply-time port set to fan the top-level overlay
+    /// onto (targets resolve at runtime), so `dispatch_port_overrides` is empty
+    /// for the discovered ports. The HTTP-family dispatch resolvers
+    /// (`resolve_effective_proxy_for_target` / `cap_proxy_retry_for_target`)
+    /// fall back to this overlay when the LB-selected target port has no
+    /// explicit per-port override — so an explicit `portLevelSettings` entry for
+    /// that port still wins. `None` for the common (non-SD, or SD without a
+    /// top-level `connectionPool.http`) case, so the hot path skips it with a
+    /// single field read. `#[serde(skip)]` (derived-only) like
+    /// `dispatch_port_overrides`; DB/file loaders start it `None`.
+    #[serde(skip)]
+    pub dispatch_port_override_fallback: Option<ResolvedPortOverride>,
     #[serde(default)]
     pub dns_override: Option<String>,
     #[serde(default)]
@@ -1777,6 +1910,24 @@ pub struct Proxy {
     /// `None` (default) = no configured cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_max_requests_per_connection: Option<u64>,
+    /// Istio DestinationRule `connectionPool.http.http1MaxPendingRequests`. The
+    /// cap on concurrent *pending* (connection-waiting) requests on the
+    /// reqwest/HTTP-1.1 backend-dispatch path. Consulted by `proxy_to_backend`
+    /// via [`crate::backend_pending_limit::BackendPendingLimiter`]: a request
+    /// that cannot get a pending slot for its `(host, port)` is shed with a 503
+    /// ("upstream overflow") in the connection-pending phase. Does NOT gate
+    /// direct-H2 / gRPC / HTTP/3 / HBONE / mesh-mTLS dispatch.
+    ///
+    /// **Derived-only — never an input field.** It is projected at dispatch
+    /// time by `resolve_effective_proxy_for_target` from the DestinationRule
+    /// `Upstream.port_overrides[port].http1_max_pending_requests` slot, exactly
+    /// like `h2_upgrade_policy` / `resolved_tls` / `dispatch_port_overrides`. It
+    /// is `#[serde(skip)]` so the file/admin/API config surface (and the
+    /// SQL/Mongo loaders, which never persist a column for it) can neither
+    /// accept nor emit it — an operator value would otherwise be silently
+    /// dropped on reload. The DB loaders therefore always start it at `None`.
+    #[serde(skip)]
+    pub pool_http1_max_pending_requests: Option<u32>,
     /// Optional upstream ID for load-balanced backends.
     /// When set, overrides backend_host/backend_port with upstream target selection.
     #[serde(default)]
@@ -2528,12 +2679,24 @@ impl GatewayConfig {
             .filter(|(_, m)| !m.is_empty())
             .collect();
 
+        // Service-discovery top-level `connectionPool.http` fallback, applied by
+        // the LB-selected port at dispatch when that port has no explicit
+        // per-port override. Keyed by upstream id, separate from the per-port
+        // map above so an explicit `portLevelSettings` entry still wins.
+        let fallback_by_upstream: HashMap<&str, ResolvedPortOverride> = self
+            .upstreams
+            .iter()
+            .filter_map(|u| {
+                dispatch_port_override_fallback_from_upstream(u)
+                    .map(|resolved| (u.id.as_str(), resolved))
+            })
+            .collect();
+
         for proxy in &mut self.proxies {
-            proxy.dispatch_port_overrides = proxy
-                .upstream_id
-                .as_deref()
-                .and_then(|uid| by_upstream.get(uid))
-                .cloned();
+            let uid = proxy.upstream_id.as_deref();
+            proxy.dispatch_port_overrides = uid.and_then(|uid| by_upstream.get(uid)).cloned();
+            proxy.dispatch_port_override_fallback =
+                uid.and_then(|uid| fallback_by_upstream.get(uid)).cloned();
         }
     }
 
@@ -3775,8 +3938,21 @@ impl Proxy {
                 MIN_HTTP2_MAX_FRAME_SIZE, MAX_HTTP2_MAX_FRAME_SIZE, v
             ));
         }
-        if let Some(0) = self.pool_http2_max_concurrent_streams {
-            errors.push("pool_http2_max_concurrent_streams must be at least 1 (got 0)".to_string());
+        if let Some(v) = self.pool_http2_max_concurrent_streams
+            && (v == 0 || u64::from(v) > MAX_POOL_SQL_INTEGER_VALUE)
+        {
+            errors.push(format!(
+                "pool_http2_max_concurrent_streams must be between 1 and {} (got {})",
+                MAX_POOL_SQL_INTEGER_VALUE, v
+            ));
+        }
+        if let Some(v) = self.pool_max_requests_per_connection
+            && v > MAX_POOL_SQL_INTEGER_VALUE
+        {
+            errors.push(format!(
+                "pool_max_requests_per_connection must be between 0 and {} (got {})",
+                MAX_POOL_SQL_INTEGER_VALUE, v
+            ));
         }
 
         // HTTP/3 connections per backend
@@ -4486,52 +4662,19 @@ impl Upstream {
             ));
         }
 
-        // `port_overrides` is mesh-derived state populated at apply time by
-        // `apply_destination_rules` from `DestinationRule.portLevelSettings`.
-        // Admin POST/PUT setting it directly is rejected because (a) the SQL
-        // / MongoDB schemas do not persist this field — INSERT/UPDATE drops
-        // it silently, leaving operators with a "successful write" that
-        // didn't take effect, and (b) the canonical place to express per-
-        // port traffic policy is a DestinationRule, not a back-channel POST
-        // to /upstreams. Mesh-injected upstreams populate this in-memory and
-        // skip admin admission entirely.
-        if !self.port_overrides.is_empty() {
-            errors.push(
-                "port_overrides is populated by mesh DestinationRule \
-                 portLevelSettings and cannot be set directly via the admin \
-                 API — express per-port traffic policy as a DestinationRule"
-                    .to_string(),
-            );
-        }
-
-        // `source_locality` follows the same pattern as `port_overrides`: it
-        // is mesh-derived state populated at slice-apply time by
-        // `project_mesh_source_locality` from the workload's locality. SQL
-        // backends do not persist it (no column), so an admin write would
-        // succeed and silently vanish on the next reload. The canonical place
-        // to express source locality is the mesh `Workload.locality` field.
-        if self.source_locality.is_some() {
-            errors.push(
-                "source_locality is projected from the mesh workload's \
-                 locality and cannot be set directly via the admin API — \
-                 set it on the Workload / pod topology labels instead"
-                    .to_string(),
-            );
-        }
-
-        // `locality_lb_setting` is mesh-derived state populated at slice-apply
-        // time from `DestinationRule.trafficPolicy.localityLbSetting`. The
-        // canonical surface is a DestinationRule, mirroring `port_overrides`
-        // and `source_locality` above.
-        if self.locality_lb_setting.is_some() {
-            errors.push(
-                "locality_lb_setting is projected from a mesh \
-                 DestinationRule's trafficPolicy.localityLbSetting and \
-                 cannot be set directly via the admin API — express \
-                 weighted distribute and failover via a DestinationRule"
-                    .to_string(),
-            );
-        }
+        // NOTE: rejection of mesh-PROJECTED fields that an operator must not set
+        // directly (`port_overrides`, `source_locality`, `locality_lb_strict`,
+        // `locality_lb_setting`) lives in
+        // [`Upstream::validate_operator_provided_fields`], NOT here. The rejection
+        // belongs on every OPERATOR-PROVIDED load (admin write/admission AND the
+        // file-mode loader, via [`GatewayConfig::validate_operator_provided_fields`])
+        // but must NOT fire on the mesh slice-apply path, which legitimately
+        // PROJECTS those fields. `validate_fields` runs on the mesh slice-prep path
+        // too (it materializes upstreams carrying these fields), so putting the
+        // rejection here would make every mesh reload / remote-endpoint update emit
+        // a false "misconfigured" error. Operator entry points therefore call
+        // `validate_operator_provided_fields` explicitly in addition to
+        // `validate_fields`; the mesh slice-prep path never does.
 
         // Validate individual targets
         for (i, target) in self.targets.iter().enumerate() {
@@ -4743,6 +4886,74 @@ impl Upstream {
                 );
             }
             _ => {}
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Reject mesh-PROJECTED fields that an OPERATOR must not set directly.
+    ///
+    /// `port_overrides`, `source_locality`, `locality_lb_strict`, and
+    /// `locality_lb_setting` are all populated by the mesh slice-apply layer (from
+    /// DestinationRules / the workload locality / `FERRUM_MESH_LOCALITY_LB_STRICT`),
+    /// NOT by operators. None of them are persisted by the SQL / MongoDB schemas,
+    /// so a direct admin POST/PUT — or an operator-authored YAML/JSON file in file
+    /// mode — would "succeed" and then silently vanish on the next reload. Worse, a
+    /// file-mode operator slipping in `locality_lb_strict` / `locality_lb_setting`
+    /// could enable strict-locality or DR-derived policy that the mesh layer is
+    /// meant to own. The canonical surface for each is named in its message.
+    ///
+    /// This applies to **every operator-PROVIDED config load** — the admin write /
+    /// admission path AND the file-mode loader — and is deliberately SEPARATE from
+    /// [`Upstream::validate_fields`]: `validate_fields` also runs on the mesh
+    /// slice-apply path (which legitimately PROJECTS these fields), where rejecting
+    /// them would emit a false "misconfigured" error on every mesh reload /
+    /// remote-endpoint update. Operator entry points therefore call this in
+    /// addition to `validate_fields`; the mesh slice-prep path never does.
+    /// See [`GatewayConfig::validate_operator_provided_fields`] for the config-wide
+    /// wrapper the file loader uses.
+    pub fn validate_operator_provided_fields(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if !self.port_overrides.is_empty() {
+            errors.push(
+                "port_overrides is populated by mesh DestinationRule \
+                 portLevelSettings and cannot be set directly via the admin \
+                 API — express per-port traffic policy as a DestinationRule"
+                    .to_string(),
+            );
+        }
+
+        if self.source_locality.is_some() {
+            errors.push(
+                "source_locality is projected from the mesh workload's \
+                 locality and cannot be set directly via the admin API — \
+                 set it on the Workload / pod topology labels instead"
+                    .to_string(),
+            );
+        }
+
+        if self.locality_lb_strict {
+            errors.push(
+                "locality_lb_strict is projected from the \
+                 FERRUM_MESH_LOCALITY_LB_STRICT environment flag and cannot be \
+                 set directly via the admin API — set the env var instead"
+                    .to_string(),
+            );
+        }
+
+        if self.locality_lb_setting.is_some() {
+            errors.push(
+                "locality_lb_setting is projected from a mesh \
+                 DestinationRule's trafficPolicy.localityLbSetting and \
+                 cannot be set directly via the admin API — express \
+                 weighted distribute and failover via a DestinationRule"
+                    .to_string(),
+            );
         }
 
         if errors.is_empty() {
@@ -5536,6 +5747,38 @@ impl GatewayConfig {
             }
         }
 
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Reject mesh-PROJECTED upstream fields on operator-PROVIDED config loads.
+    ///
+    /// `Upstream.{port_overrides, source_locality, locality_lb_strict,
+    /// locality_lb_setting}` are owned by the mesh slice-apply layer (Destination
+    /// rules / workload locality / `FERRUM_MESH_LOCALITY_LB_STRICT`); an operator
+    /// must never set them directly. This is the config-wide wrapper over
+    /// [`Upstream::validate_operator_provided_fields`] that the **file-mode loader**
+    /// runs so an operator-authored YAML/JSON upstream cannot smuggle in strict
+    /// locality / DR-derived policy (none of these fields are persisted, so they
+    /// would silently vanish on reload, or worse, briefly take effect).
+    ///
+    /// It is deliberately SEPARATE from [`Self::validate_all_fields_with_ip_policy`]
+    /// (and is NOT part of the shared validation pipeline): the mesh slice-apply
+    /// path legitimately PROJECTS these fields and must keep applying clean, so
+    /// only operator entry points call this — file mode here, the admin API per
+    /// resource on POST/PUT/import/restore.
+    pub fn validate_operator_provided_fields(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        for upstream in &self.upstreams {
+            if let Err(errs) = upstream.validate_operator_provided_fields() {
+                for e in errs {
+                    errors.push(format!("Upstream '{}': {}", upstream.id, e));
+                }
+            }
+        }
         if errors.is_empty() {
             Ok(())
         } else {

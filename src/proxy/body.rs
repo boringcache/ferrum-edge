@@ -111,6 +111,22 @@ struct DeferredBackendAdmissionOutcome {
     grpc_trailer_http_status: Option<u16>,
 }
 
+/// Notified when a gRPC streaming RESPONSE body reaches its terminal state, with
+/// the same `(response_status, connection_error, error_class)` the deferred
+/// backend-dispatch outcome would record. Implemented by the gRPC streaming probe
+/// recorder (`proxy::mod`), which owns the circuit-breaker outcome and settles it
+/// at the join of response completion + request-upload termination (#1649 item 3)
+/// — recording a failure promptly but deferring a clean success until upload
+/// termination so a late client-upload overflow cannot falsely heal the breaker.
+pub(crate) trait GrpcResponseTerminalObserver: Send + Sync {
+    fn on_response_terminal(
+        &self,
+        response_status: u16,
+        connection_error: bool,
+        error_class: Option<ErrorClass>,
+    );
+}
+
 struct DeferredBackendDispatchOutcome {
     state: Arc<super::ProxyState>,
     proxy: Arc<crate::config::types::Proxy>,
@@ -127,6 +143,19 @@ struct DeferredBackendDispatchOutcome {
     request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
     classify_grpc_trailer: bool,
     grpc_trailer_http_status: Option<u16>,
+    /// gRPC streaming: the recorder that owns the circuit-breaker outcome at the
+    /// upload-termination join. When set, the CB is NOT recorded by
+    /// `record_backend_outcome_no_conn_end` here (`skip_circuit_breaker_record`
+    /// is `true`); instead the terminal `(status, connection_error, error_class)`
+    /// is handed to the recorder, which settles the breaker.
+    grpc_response_observer: Option<Arc<dyn GrpcResponseTerminalObserver>>,
+    /// Direct-H2/HBONE: the breaker's open generation captured at admission. When
+    /// `Some`, the deferred CB record is SKIPPED if the breaker has since opened a
+    /// new cycle (`open_epoch` advanced) — a stream admitted while the breaker was
+    /// CLOSED must not heal/reopen a later HALF_OPEN cycle it never probed (#1649
+    /// round-4 B). Passive-health + least-latency still record (per-target, not
+    /// per-cycle). `None` on the gRPC path, where the recorder does the check.
+    deferred_admission_open_epoch: Option<u64>,
 }
 
 /// Inner body variant — buffered, streaming, or tracked-streaming.
@@ -457,7 +486,20 @@ impl ProxyBody {
             request_body_exceeded: None,
             classify_grpc_trailer: false,
             grpc_trailer_http_status: None,
+            grpc_response_observer: None,
+            deferred_admission_open_epoch: None,
         });
+        self
+    }
+
+    /// Tag the deferred backend-dispatch outcome with the breaker's open
+    /// generation captured at admission (direct-H2/HBONE #1649 round-4 B). The CB
+    /// is skipped at completion if the breaker has since opened a new cycle.
+    /// No-op when no deferred dispatch outcome is attached.
+    pub(crate) fn with_deferred_dispatch_admission_open_epoch(mut self, epoch: u64) -> Self {
+        if let Some(outcome) = self.backend_dispatch_outcome.as_mut() {
+            outcome.deferred_admission_open_epoch = Some(epoch);
+        }
         self
     }
 
@@ -467,6 +509,22 @@ impl ProxyBody {
     pub(crate) fn with_grpc_trailer_backend_dispatch_classification(mut self) -> Self {
         if let Some(outcome) = self.backend_dispatch_outcome.as_mut() {
             outcome.classify_grpc_trailer = true;
+        }
+        self
+    }
+
+    /// Hand the gRPC streaming circuit-breaker outcome to `observer` (the probe
+    /// recorder) at response-body completion instead of recording it here.
+    /// Pairs with `skip_circuit_breaker_record = true` so the deferred outcome
+    /// still records passive-health + least-latency but the recorder settles the
+    /// breaker at the upload-termination join. No-op when no deferred dispatch
+    /// outcome is attached.
+    pub(crate) fn with_grpc_response_terminal_observer(
+        mut self,
+        observer: Arc<dyn GrpcResponseTerminalObserver>,
+    ) -> Self {
+        if let Some(outcome) = self.backend_dispatch_outcome.as_mut() {
+            outcome.grpc_response_observer = Some(observer);
         }
         self
     }
@@ -661,13 +719,10 @@ impl ProxyBody {
         let Some(outcome) = self.backend_dispatch_outcome.take() else {
             return;
         };
-        if outcome
+        let request_body_exceeded = outcome
             .request_body_exceeded
             .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Acquire))
-        {
-            return;
-        }
+            .is_some_and(|flag| flag.load(Ordering::Acquire));
 
         let error_class = if client_disconnected {
             Some(ErrorClass::ClientDisconnect)
@@ -686,6 +741,38 @@ impl ProxyBody {
         let response_status = outcome
             .grpc_trailer_http_status
             .unwrap_or(outcome.response_status);
+
+        // gRPC streaming (#1649 item 3): hand the terminal outcome to the probe
+        // recorder, which owns the circuit breaker and settles it at the
+        // upload-termination join (overflow-aware). Signal it unconditionally —
+        // it reads the shared overflow flag itself — even when the overflow short
+        // circuit below skips passive-health / least-latency.
+        if let Some(observer) = &outcome.grpc_response_observer {
+            observer.on_response_terminal(response_status, connection_error, error_class);
+        }
+
+        // A late client-upload overflow is a client/gateway-side size violation,
+        // not a backend fault — skip passive-health, least-latency, and the
+        // breaker (the recorder records NEUTRAL via the shared flag above).
+        if request_body_exceeded {
+            return;
+        }
+
+        // Direct-H2/HBONE (#1649 round-4 B): skip the deferred CB record if the
+        // breaker has opened a new generation since this request was admitted —
+        // this completion is stale for the current cycle and must not heal/reopen
+        // a HALF_OPEN cycle it never probed. Passive-health + least-latency still
+        // record (per-target, not per-cycle). The gRPC path leaves this `None`
+        // (its recorder does the epoch check).
+        let cb_stale = outcome.deferred_admission_open_epoch.is_some_and(|epoch| {
+            super::backend_dispatch::deferred_circuit_breaker_is_stale(
+                &outcome.state,
+                &outcome.proxy,
+                outcome.final_cb_target_key.as_deref(),
+                epoch,
+            )
+        });
+
         super::backend_dispatch::record_backend_outcome_no_conn_end(
             &outcome.state,
             &outcome.proxy,
@@ -697,7 +784,7 @@ impl ProxyBody {
             connection_error,
             error_class,
             outcome.is_half_open_probe,
-            outcome.skip_circuit_breaker_record,
+            outcome.skip_circuit_breaker_record || cb_stale,
             outcome.backend_elapsed,
         );
     }
@@ -1682,6 +1769,7 @@ impl<S: FrameSource> Coalescing<S> {
 
     fn flush_buffer(&mut self) -> Option<Frame<Bytes>> {
         if self.buffer.is_empty() {
+            self.flush_timer_armed = false;
             return None;
         }
 
@@ -1690,6 +1778,9 @@ impl<S: FrameSource> Coalescing<S> {
     }
 
     fn buffer_data(&mut self, data: &Bytes) {
+        if data.is_empty() {
+            return;
+        }
         self.buffer.extend_from_slice(data);
         if self.flush_after.is_some() && !self.flush_timer_armed {
             self.arm_flush_timer();
@@ -2921,6 +3012,40 @@ mod tests {
                 assert_eq!(frame.data_ref().unwrap().as_ref(), b"bbbccc");
             }
             other => panic!("expected timer-driven flush of phase-2 data, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn coalescing_empty_frame_does_not_stale_arm_flush_timer() {
+        let mut body = Box::pin(Coalescing::with_flush_after(
+            MockSource::new(vec![
+                MockStep::Frame(Ok(Frame::data(Bytes::new()))),
+                MockStep::Pending,
+                MockStep::Frame(Ok(Frame::data(Bytes::from("real")))),
+                MockStep::Pending,
+            ]),
+            1_000,
+            None,
+            Some(Duration::from_millis(2)),
+        ));
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(body.as_mut().poll_frame(&mut cx), Poll::Pending));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        assert!(
+            matches!(body.as_mut().poll_frame(&mut cx), Poll::Pending),
+            "real data after an empty frame must arm a fresh timer instead of inheriting the stale one"
+        );
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        match body.as_mut().poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(frame.data_ref().unwrap().as_ref(), b"real");
+            }
+            other => panic!("expected timer-driven flush of real data, got {other:?}"),
         }
     }
 

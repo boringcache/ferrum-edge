@@ -6,8 +6,8 @@ use tonic::transport::Channel;
 use tracing::{error, info, warn};
 
 use super::common::{
-    BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs,
-    refresh_dp_grpc_tls_config_if_changed, tonic_tls_config, wait_for_shutdown,
+    BACKOFF_INITIAL_SECS, MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE, jittered_backoff,
+    next_backoff_secs, refresh_dp_grpc_tls_config_if_changed, tonic_tls_config, wait_for_shutdown,
     wait_optional_tls_reload,
 };
 use crate::grpc::dp_client::{
@@ -219,7 +219,8 @@ async fn connect_mesh_subscribe(
         MeshConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
             req.metadata_mut().insert("authorization", token.clone());
             Ok(req)
-        });
+        })
+        .max_decoding_message_size(MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE);
 
     info!(
         node_id = %config.node_id,
@@ -232,11 +233,7 @@ async fn connect_mesh_subscribe(
     let mut stream = client.mesh_subscribe(request).await?.into_inner();
 
     while let Some(update) = stream.message().await? {
-        if !update.ferrum_version.is_empty()
-            && let Err(msg) = check_cp_version_compatibility(&update.ferrum_version)
-        {
-            return Err(anyhow::anyhow!(msg));
-        }
+        validate_mesh_update_ferrum_version(&update.ferrum_version)?;
 
         if update.heartbeat {
             tracing::debug!(
@@ -267,6 +264,15 @@ async fn connect_mesh_subscribe(
     }
 
     Ok(())
+}
+
+fn validate_mesh_update_ferrum_version(ferrum_version: &str) -> Result<(), anyhow::Error> {
+    if ferrum_version.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "native MeshSubscribe update is missing ferrum_version; refusing unversioned CP response"
+        ));
+    }
+    check_cp_version_compatibility(ferrum_version).map_err(anyhow::Error::msg)
 }
 
 async fn wait_for_first_slice_then_primary_retry(state: MeshRuntimeState, interval: Duration) {
@@ -330,6 +336,23 @@ mod tests {
                 .map(|slice| slice.version.as_str()),
             Some("v1")
         );
+    }
+
+    #[test]
+    fn native_update_rejects_empty_ferrum_version() {
+        let err = validate_mesh_update_ferrum_version("")
+            .expect_err("empty ferrum_version must be rejected");
+
+        assert!(
+            err.to_string().contains("missing ferrum_version"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn native_update_accepts_current_ferrum_version() {
+        validate_mesh_update_ferrum_version(crate::FERRUM_VERSION)
+            .expect("current ferrum_version should be compatible");
     }
 
     #[tokio::test]

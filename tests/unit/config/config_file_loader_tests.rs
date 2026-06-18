@@ -479,6 +479,105 @@ upstreams:
 }
 
 // ============================================================================
+// Mesh-projected upstream fields rejected on operator-provided file loads
+// ============================================================================
+
+/// Regression for codex F7.3 round-3 (Finding A): file mode runs
+/// `validate_all_fields_with_ip_policy` but NOT the projected-field rejection, so
+/// before the fix an operator-authored file could enable strict locality LB by
+/// setting `locality_lb_strict` directly. The rejection must apply to ALL
+/// operator-provided loads (admin API AND file mode). The mesh slice-apply path
+/// still projects these fields (covered by `validate_fields().is_ok()` in
+/// field_validation_tests.rs), so it must keep applying cleanly.
+#[test]
+fn test_file_load_rejects_mesh_projected_locality_lb_strict() {
+    let yaml = r#"
+version: "1"
+proxies: []
+consumers: []
+plugin_configs: []
+upstreams:
+  - id: "u1"
+    targets:
+      - host: "localhost"
+        port: 8080
+    locality_lb_strict: true
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
+    )
+    .expect_err("file mode must reject an operator-set locality_lb_strict");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("locality_lb_strict") && msg.contains("FERRUM_MESH_LOCALITY_LB_STRICT"),
+        "error should name the projected field + its canonical env surface: {msg}"
+    );
+}
+
+/// Companion to the above: a file-mode upstream that sets `source_locality`
+/// (another mesh-projected field) is also rejected.
+#[test]
+fn test_file_load_rejects_mesh_projected_source_locality() {
+    let yaml = r#"
+version: "1"
+proxies: []
+consumers: []
+plugin_configs: []
+upstreams:
+  - id: "u1"
+    targets:
+      - host: "localhost"
+        port: 8080
+    source_locality: "us-west/us-west-1/a"
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
+    )
+    .expect_err("file mode must reject an operator-set source_locality");
+    assert!(
+        err.to_string().contains("source_locality"),
+        "error should name the projected field: {err}"
+    );
+}
+
+/// A clean operator file (no mesh-projected fields) still loads — the rejection
+/// must not be over-broad.
+#[test]
+fn test_file_load_accepts_upstream_without_projected_fields() {
+    let yaml = r#"
+version: "1"
+proxies: []
+consumers: []
+plugin_configs: []
+upstreams:
+  - id: "u1"
+    targets:
+      - host: "localhost"
+        port: 8080
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
+    )
+    .expect("a clean operator upstream must still load");
+    assert_eq!(config.upstreams.len(), 1);
+}
+
+// ============================================================================
 // Auth Mode Tests
 // ============================================================================
 

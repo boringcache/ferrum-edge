@@ -4,13 +4,14 @@ use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, ConditionMatch, EastWestGateway, IngressListenerUnsupported, JwtHeader,
-    MeshConfig, MeshDestinationRule, MeshEndpoint, MeshJwtRule, MeshOutlierDetection, MeshPolicy,
-    MeshProxyConfig, MeshRequestAuthentication, MeshRule, MeshService, MeshSidecar,
-    MeshSidecarEgress, MeshSidecarIngress, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource,
-    MeshTracingConfig, MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, MultiClusterConfig,
-    ParsedCidr, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RemoteCluster,
-    RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle,
-    TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector, validate_mesh_config,
+    MAX_MESH_REMOTE_CLUSTERS, MeshConfig, MeshDestinationRule, MeshEndpoint, MeshJwtRule,
+    MeshOutlierDetection, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication, MeshRule,
+    MeshService, MeshSidecar, MeshSidecarEgress, MeshSidecarIngress, MeshSubset, MeshTelemetryConfig,
+    MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode,
+    MultiClusterConfig, ParsedCidr, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch,
+    RemoteCluster, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+    TrustBundle, TrustBundleSet, Workload, WorkloadPort, WorkloadRef, WorkloadSelector,
+    validate_mesh_config,
 };
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -35,6 +36,7 @@ fn fresh_workload() -> Workload {
         locality: None,
         service_account: None,
         pod_uid: None,
+        remote_provenance: false,
     }
 }
 
@@ -872,6 +874,34 @@ fn multi_cluster_remote_cluster_requires_federated_trust_bundle_when_bundles_are
 }
 
 #[test]
+fn multi_cluster_rejects_too_many_remote_clusters() {
+    let remote_clusters: Vec<RemoteCluster> = (0..=MAX_MESH_REMOTE_CLUSTERS)
+        .map(|index| RemoteCluster {
+            name: format!("cluster-{index}"),
+            trust_domain: TrustDomain::new(format!("remote-{index}.test")).unwrap(),
+            network: None,
+            control_plane_url: None,
+            federation_endpoint: None,
+        })
+        .collect();
+    let mesh = MeshConfig {
+        multi_cluster: Some(MultiClusterConfig {
+            remote_clusters,
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors
+            .iter()
+            .any(|err| err.contains("remote_clusters") && err.contains("max")),
+        "expected remote cluster cap error, got: {errors:?}"
+    );
+}
+
+#[test]
 fn multi_cluster_rejects_duplicate_east_west_sni_hosts_on_same_backend_port() {
     let mesh = MeshConfig {
         multi_cluster: Some(MultiClusterConfig {
@@ -925,6 +955,7 @@ fn gateway_config_validate_mesh_fields_dispatches() {
                 locality: None,
                 service_account: None,
                 pod_uid: None,
+                remote_provenance: false,
             }],
             ..Default::default()
         })),
@@ -1377,9 +1408,12 @@ fn mesh_config_validate_rejects_destination_rule_outlier_range_gaps() {
             host: "reviews.default.svc.cluster.local".into(),
             traffic_policy: Some(MeshTrafficPolicy {
                 outlier_detection: Some(MeshOutlierDetection {
-                    consecutive_errors: Some(0),
+                    // `consecutive_errors: 0` is Istio's "disable 5xx ejection"
+                    // sentinel, not an out-of-range value, so it must NOT be
+                    // rejected (see below).
+                    consecutive_errors: None,
                     interval_seconds: Some(0),
-                    base_ejection_seconds: None,
+                    base_ejection_seconds: Some(0),
                     max_ejection_percent: Some(200),
                 }),
                 ..MeshTrafficPolicy::default()
@@ -1394,20 +1428,54 @@ fn mesh_config_validate_rejects_destination_rule_outlier_range_gaps() {
     assert!(
         errors
             .iter()
-            .any(|e| e.contains("consecutive_errors") && e.contains("greater than 0")),
-        "expected consecutive_errors lower-bound error, got: {errors:?}"
-    );
-    assert!(
-        errors
-            .iter()
             .any(|e| e.contains("interval_seconds") && e.contains("greater than 0")),
         "expected interval_seconds lower-bound error, got: {errors:?}"
     );
     assert!(
         errors
             .iter()
+            .any(|e| e.contains("base_ejection_seconds") && e.contains("greater than 0")),
+        "expected base_ejection_seconds lower-bound error, got: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
             .any(|e| e.contains("max_ejection_percent") && e.contains("0 to 100")),
         "expected max_ejection_percent range error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn mesh_config_validate_accepts_zero_consecutive_errors_as_disabled() {
+    // Istio treats `outlierDetection.consecutive5xxErrors: 0` as *disabling*
+    // 5xx-based ejection rather than as a lower-bound violation, and the K8s
+    // translator preserves the value as `Some(0)`. The native/file/xDS boundary
+    // validator must accept it so a valid Istio config does not make mesh
+    // startup/reload fail.
+    let mesh = MeshConfig {
+        destination_rules: vec![MeshDestinationRule {
+            name: "dr".into(),
+            namespace: "default".into(),
+            host: "reviews.default.svc.cluster.local".into(),
+            traffic_policy: Some(MeshTrafficPolicy {
+                outlier_detection: Some(MeshOutlierDetection {
+                    consecutive_errors: Some(0),
+                    interval_seconds: Some(30),
+                    base_ejection_seconds: Some(30),
+                    max_ejection_percent: Some(50),
+                }),
+                ..MeshTrafficPolicy::default()
+            }),
+            port_level_settings: HashMap::new(),
+            subsets: Vec::new(),
+        }],
+        ..MeshConfig::default()
+    };
+
+    assert!(
+        mesh.validate().is_empty(),
+        "consecutive_errors: 0 (disable 5xx ejection) must be accepted, got: {:?}",
+        mesh.validate()
     );
 }
 
@@ -1447,6 +1515,7 @@ fn mesh_config_validate_rejects_destination_rule_tls_inconsistency() {
                     tls: Some(MeshTrafficPolicyTls {
                         mode: MtlsMode::IstioMutual,
                         client_certificate: Some("/operator-cert.pem".into()),
+                        ca_certificates: Some("/operator-ca.pem".into()),
                         ..MeshTrafficPolicyTls::default()
                     }),
                     ..MeshTrafficPolicy::default()
@@ -1475,6 +1544,13 @@ fn mesh_config_validate_rejects_destination_rule_tls_inconsistency() {
                 && e.contains("must be absent")
         }),
         "expected ISTIO_MUTUAL explicit-cert error, got: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|e| {
+            e.contains("subsets[0].traffic_policy.tls.ca_certificates")
+                && e.contains("must be absent")
+        }),
+        "expected ISTIO_MUTUAL explicit-CA error, got: {errors:?}"
     );
 }
 
