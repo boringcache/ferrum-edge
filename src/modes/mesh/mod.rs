@@ -1749,6 +1749,16 @@ fn build_east_west_service_targets(
         // container port) doesn't silently publish a target on the wrong port.
         // Only an ABSENT targetPort falls back to the service port; a service
         // with no ports at all uses the workload's first port.
+        //
+        // KNOWN LIMITATION (EastWestGateway is Beta): a multi-port service is
+        // reachable across clusters on only its FIRST port. The east-west
+        // gateway routes purely by SNI hostname (`{name}.{ns}.svc.{domain}`),
+        // and SNI carries no port, so one SNI cannot disambiguate per-port
+        // backends the way the inbound/outbound capture listeners do via
+        // `SO_ORIGINAL_DST`. Picking the first declared service port is the
+        // single-port-per-SNI compromise; full multi-port east-west routing
+        // would need a port-bearing transport (or one SNI per port). Documented
+        // here rather than changed because the behavior is partly inherent.
         let target_port = match service.ports.first() {
             Some(sp) => match sp.target_port.as_ref() {
                 Some(_) => match resolve_target_port(sp.target_port.as_ref(), &workload.ports) {
@@ -1924,6 +1934,19 @@ pub(crate) fn is_mesh_ingress_route_id(id: &str) -> bool {
     id.starts_with(MESH_INGRESS_PROXY_ID_PREFIX)
 }
 
+/// LATENT-COLLISION HAZARD (shared by this whole `mesh_*_id` family —
+/// `mesh_ingress_proxy_id`, `mesh_outbound_proxy_id`,
+/// `mesh_outbound_upstream_id`, `mesh_outbound_tcp_upstream_id`,
+/// `mesh_east_west_*_id`, etc.): the `{namespace}-{name}-{port}` join uses `-`
+/// as the field separator, but `replace(['/', '.'], "-")` ALSO emits `-`, so
+/// `(ns="a-b", name="c")` and `(ns="a", name="b-c")` would map to the same id.
+/// SAFE TODAY because every in-scope materializer consumes a SINGLE-namespace
+/// service set (the slice is scoped to one namespace), so the `namespace`
+/// segment is constant and only `name`+`port` vary — and a `name` cannot
+/// borrow a `-` from a fixed `namespace`. Before any MULTI-namespace caller is
+/// added, switch this family to the reversible token scheme used by the egress
+/// ids (`sanitize_egress_host_id_part`) so the id space stays injective. See
+/// #1727.
 fn mesh_inbound_proxy_id(namespace: &str, name: &str, port: u16) -> String {
     format!("{MESH_INBOUND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
@@ -4840,6 +4863,18 @@ fn apply_traffic_policy_to_port_override(
         slot.hash_on = mesh_hash_on_to_ferrum(&policy.load_balancer);
     }
     if let Some(ref od) = policy.outlier_detection {
+        // A PARTIAL per-port `outlierDetection` (e.g. only `consecutiveErrors`)
+        // is overlaid field-by-field by `apply_outlier_detection_to_passive`, so
+        // the *base* it layers onto matters. The caller in `apply_destination_rules`
+        // seeds `slot.passive_health_check` from the UPSTREAM-level passive (which
+        // already carries this DR's TOP-LEVEL `outlierDetection`) before calling
+        // here for the owner-gated port, so a partial override correctly layers
+        // over the DR's top-level window/recovery fields rather than over engine
+        // defaults. The `unwrap_or_default()` base is therefore only reached when
+        // there is genuinely no top-level outlier to inherit (no seed) — the
+        // intended fallback, not a regression. NOTE: this is a per-field merge,
+        // not Istio's portLevelSettings "complete replacement"; that divergence
+        // is uniform across the per-port DR knobs and documented in `docs/mesh.md`.
         let mut passive = slot.passive_health_check.clone().unwrap_or_default();
         apply_outlier_detection_to_passive(&mut passive, od);
         slot.passive_health_check = Some(passive);
@@ -5893,6 +5928,19 @@ fn build_egress_upstream_targets(
 /// stream proxies via [`build_stream_egress_for_entry`]; protocol-aware
 /// mediation (e.g., Mongo / Redis wire decode) is intentionally out of scope
 /// and tracked separately as T5-C.
+///
+/// INTENTIONAL divergence from the in-mesh passthrough treatment of `Tls`: an
+/// IN-MESH `Tls` service port is opaque-byte passthrough (`service_tcp_stream_ports`
+/// — the captured original destination selects the destination service and the
+/// app's own TLS is preserved end to end, never terminated by the mesh). At the
+/// EGRESS gateway, `Tls` instead maps to `Https` (HTTP-family) because the
+/// egress gateway is a terminate-and-re-encrypt boundary: it terminates the
+/// in-mesh SVID-mTLS from the sidecar and ORIGINATES a fresh TLS connection to
+/// the external backend (`backend_tls_verify_server_cert: true` in
+/// `egress_gateway_proxy`). Opaque SNI passthrough to an external host (no
+/// re-encryption) is not an egress-gateway capability today; if that is ever
+/// needed it would be a distinct stream-family egress mode, not a remap of this
+/// scheme. See #1727.
 fn egress_backend_scheme(protocol: AppProtocol) -> Option<BackendScheme> {
     match protocol {
         AppProtocol::Tls | AppProtocol::Http2 | AppProtocol::Grpc => Some(BackendScheme::Https),
@@ -6140,8 +6188,8 @@ fn stream_egress_gateway_proxy(
 fn mesh_egress_proxy_id(namespace: &str, name: &str, host: &str, port: u16) -> String {
     format!(
         "mesh-egress-{}-{}-{}-{port}",
-        sanitize_egress_id_part(namespace),
-        sanitize_egress_id_part(name),
+        sanitize_egress_host_id_part(namespace),
+        sanitize_egress_host_id_part(name),
         sanitize_egress_host_id_part(host)
     )
 }
@@ -6149,63 +6197,56 @@ fn mesh_egress_proxy_id(namespace: &str, name: &str, host: &str, port: u16) -> S
 fn mesh_egress_upstream_id(namespace: &str, name: &str, host: &str, port: u16) -> String {
     format!(
         "mesh-egress-up-{}-{}-{}-{port}",
-        sanitize_egress_id_part(namespace),
-        sanitize_egress_id_part(name),
+        sanitize_egress_host_id_part(namespace),
+        sanitize_egress_host_id_part(name),
         sanitize_egress_host_id_part(host)
     )
 }
 
-fn sanitize_egress_id_part(value: &str) -> String {
-    let mut sanitized = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if ch == '*' {
-            if !sanitized.is_empty() && !sanitized.ends_with('-') {
-                sanitized.push('-');
-            }
-            sanitized.push_str("wildcard");
-        } else if ch.is_ascii_alphanumeric() || ch == '_' {
-            sanitized.push(ch);
-        } else if !sanitized.ends_with('-') {
-            sanitized.push('-');
-        }
-    }
-    let sanitized = sanitized.trim_matches('-');
-    if sanitized.is_empty() {
-        "any".to_string()
-    } else {
-        sanitized.to_string()
-    }
-}
-
+/// INJECTIVE encoder for the namespace / name / host parts of an egress
+/// proxy/upstream id. Distinct inputs ALWAYS produce distinct outputs, AND the
+/// output never contains the segment delimiter `-`, so the assembled id
+/// `mesh-egress-{ns}-{name}-{host}-{port}` is unambiguous: `materialize_*`
+/// (and helpers like `egress_service_entry_port_remap`) merge/match
+/// proxies/upstreams by id, so two ServiceEntries that mapped to the same id
+/// would silently overwrite one another (and cross-apply each other's
+/// targetPort/port policy). K8s DNS-1123 forbids the offending characters in
+/// ns/name/host, but the FILE mesh-config path does not validate them.
+///
+/// Encoding (alphabet `[A-Za-z0-9_]`, no `-`): an ASCII alphanumeric is emitted
+/// verbatim; every other character — INCLUDING a literal `_` — becomes a
+/// `_`-delimited token. `_` is the sole escape introducer, so it is itself
+/// escaped, keeping the map injective:
+///   `.`→`_dot_`  `-`→`_dash_`  `/`→`_slash_`  `*`→`_star_`  `_`→`_us_`
+///   any other char → `_u<hex>_` (lowercase Unicode scalar, `_`-delimited).
+/// No run-collapsing and no trimming (the old token scheme did both, which is
+/// exactly what made `-`/`dash` and `a-b`/`a`+`b` collide). The `_`-delimited
+/// hex is self-terminating because hex digits are `[0-9a-f]` and the literal-`_`
+/// token (`us`) starts with the non-hex letter `s`, so `_us_` and `_u<hex>_`
+/// never overlap. An empty input maps to `_empty_` — a token-shaped placeholder
+/// no input can produce (`empty` is not a valid token after `_`), so it cannot
+/// collide with a literal segment (`any`/`empty`/… all encode to themselves).
 fn sanitize_egress_host_id_part(value: &str) -> String {
-    let mut sanitized = String::with_capacity(value.len());
+    if value.is_empty() {
+        return "_empty_".to_string();
+    }
+    let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
-            '*' => push_egress_id_token(&mut sanitized, "wildcard"),
-            '.' => push_egress_id_token(&mut sanitized, "dot"),
-            '-' => push_egress_id_token(&mut sanitized, "dash"),
-            '/' => push_egress_id_token(&mut sanitized, "slash"),
-            ch if ch.is_ascii_alphanumeric() || ch == '_' => sanitized.push(ch),
+            '.' => out.push_str("_dot_"),
+            '-' => out.push_str("_dash_"),
+            '/' => out.push_str("_slash_"),
+            '*' => out.push_str("_star_"),
+            '_' => out.push_str("_us_"),
+            ch if ch.is_ascii_alphanumeric() => out.push(ch),
             ch => {
-                let token = format!("x{:x}", ch as u32);
-                push_egress_id_token(&mut sanitized, &token);
+                out.push_str("_u");
+                out.push_str(&format!("{:x}", ch as u32));
+                out.push('_');
             }
         }
     }
-    let sanitized = sanitized.trim_matches('-');
-    if sanitized.is_empty() {
-        "any".to_string()
-    } else {
-        sanitized.to_string()
-    }
-}
-
-fn push_egress_id_token(sanitized: &mut String, token: &str) {
-    if !sanitized.is_empty() && !sanitized.ends_with('-') {
-        sanitized.push('-');
-    }
-    sanitized.push_str(token);
-    sanitized.push('-');
+    out
 }
 
 fn inject_mesh_global_plugins(
@@ -21563,7 +21604,7 @@ mod tests {
         let proxy = &proxies[0];
         assert_eq!(
             proxy.id,
-            "mesh-egress-default-external-api-api-dot-external-dot-com-443"
+            "mesh-egress-default-external_dash_api-api_dot_external_dot_com-443"
         );
         assert_eq!(proxy.hosts, vec!["api.external.com"]);
         assert!(proxy.listen_path.is_none());
@@ -21573,14 +21614,14 @@ mod tests {
         assert!(!proxy.passthrough);
         assert_eq!(
             proxy.upstream_id.as_deref(),
-            Some("mesh-egress-up-default-external-api-api-dot-external-dot-com-443")
+            Some("mesh-egress-up-default-external_dash_api-api_dot_external_dot_com-443")
         );
         assert!(proxy.preserve_host_header);
 
         let upstream = &upstreams[0];
         assert_eq!(
             upstream.id,
-            "mesh-egress-up-default-external-api-api-dot-external-dot-com-443"
+            "mesh-egress-up-default-external_dash_api-api_dot_external_dot_com-443"
         );
         assert!(
             upstream
@@ -21858,14 +21899,19 @@ mod tests {
         );
 
         assert_eq!(proxies.len(), 1);
+        // The injective id encoder maps each non-alnum char to a `_`-delimited
+        // token (`-`→`_dash_`, `.`→`_dot_`, `*`→`_star_`) — no `-` in any
+        // segment, so the `-` segment delimiters stay unambiguous. The service
+        // `name` ("wildcard-api") encodes to `wildcard_dash_api`; the host
+        // `*.api.external.com` encodes to `_star__dot_api_dot_external_dot_com`.
         assert_eq!(
             proxies[0].id,
-            "mesh-egress-default-wildcard-api-wildcard-dot-api-dot-external-dot-com-443"
+            "mesh-egress-default-wildcard_dash_api-_star__dot_api_dot_external_dot_com-443"
         );
         assert_eq!(proxies[0].hosts, vec!["*.api.external.com"]);
         assert_eq!(
             upstreams[0].id,
-            "mesh-egress-up-default-wildcard-api-wildcard-dot-api-dot-external-dot-com-443"
+            "mesh-egress-up-default-wildcard_dash_api-_star__dot_api_dot_external_dot_com-443"
         );
     }
 
@@ -21877,7 +21923,80 @@ mod tests {
         );
         assert_eq!(
             sanitize_egress_host_id_part("*.api.external.com"),
-            "wildcard-dot-api-dot-external-dot-com"
+            "_star__dot_api_dot_external_dot_com"
+        );
+    }
+
+    #[test]
+    fn egress_ids_do_not_collide_across_dash_ambiguous_namespace_name_pairs() {
+        // Regression for #1727 (+ codex round 1): the egress id encoder must be
+        // INJECTIVE over (namespace, name, host) and must keep the `-` segment
+        // delimiter unambiguous. The original `sanitize_egress_id_part`
+        // collapsed non-alnum runs to a single `-`; the first attempted fix
+        // tokenized chars but wrapped tokens in `-` and trimmed, which still
+        // collided (`"-"` and `"dash"`, or `(a-dash, c)` vs `(a, dash-c)`).
+        // Materialize merges/matches proxies + upstreams by id, and
+        // `egress_service_entry_port_remap` recomputes the upstream id across
+        // every ServiceEntry, so a collision silently overwrites one entry and
+        // can cross-apply its targetPort/port policy. The file mesh-config path
+        // does not validate these characters, so all of these are reachable.
+        let host = "ext.example.com";
+        let port = 443;
+
+        // 1. `-` straddling the namespace/name boundary.
+        let a = mesh_egress_proxy_id("a-b", "c", host, port);
+        let b = mesh_egress_proxy_id("a", "b-c", host, port);
+        assert_ne!(a, b, "egress proxy ids must not collide: {a} == {b}");
+        let ua = mesh_egress_upstream_id("a-b", "c", host, port);
+        let ub = mesh_egress_upstream_id("a", "b-c", host, port);
+        assert_ne!(ua, ub, "egress upstream ids must not collide: {ua} == {ub}");
+
+        // 2. A literal `-` vs the literal token text it used to render as.
+        assert_ne!(
+            mesh_egress_proxy_id("ns", "-", host, port),
+            mesh_egress_proxy_id("ns", "dash", host, port),
+            "a literal '-' name must not collide with the literal name 'dash'"
+        );
+
+        // 3. The codex counterexample: a token-word straddling the boundary.
+        assert_ne!(
+            mesh_egress_proxy_id("a-dash", "c", host, port),
+            mesh_egress_proxy_id("a", "dash-c", host, port),
+            "token-word boundary ambiguity must not collide"
+        );
+
+        // 4. `.` vs `-` in a segment, and a `.`-bearing host vs its token text.
+        assert_ne!(
+            mesh_egress_proxy_id("a.b", "c", host, port),
+            a,
+            "`.`- and `-`-separated segments must differ"
+        );
+        assert_ne!(
+            mesh_egress_upstream_id("ns", "name", "a.b", port),
+            mesh_egress_upstream_id("ns", "name", "a-dot-b", port),
+            "a '.'-bearing host must not collide with its token text"
+        );
+
+        // 5. Every produced segment is free of the `-` delimiter, so the
+        //    assembled id's `-` boundaries are unambiguous by construction.
+        for part in ["a-b", "a.b/c*d", "-", "_", "δ", "x_dash_y"] {
+            assert!(
+                !sanitize_egress_host_id_part(part).contains('-'),
+                "encoded segment for {part:?} must not contain the '-' delimiter"
+            );
+        }
+
+        // 6. The empty-segment placeholder cannot collide with a literal segment
+        //    (the old `any` placeholder collided with a literal `any` name).
+        assert_ne!(
+            sanitize_egress_host_id_part(""),
+            sanitize_egress_host_id_part("any"),
+            "empty placeholder must not collide with a literal 'any'"
+        );
+        assert_ne!(
+            sanitize_egress_host_id_part(""),
+            sanitize_egress_host_id_part("empty"),
+            "empty placeholder must not collide with a literal 'empty'"
         );
     }
 
@@ -21924,17 +22043,17 @@ mod tests {
         assert!(
             proxies
                 .iter()
-                .any(|p| p.id == "mesh-egress-default-multi-host-api-dot-example-dot-com-80")
+                .any(|p| p.id == "mesh-egress-default-multi_dash_host-api_dot_example_dot_com-80")
         );
         assert!(
             proxies
                 .iter()
-                .any(|p| p.id == "mesh-egress-default-multi-host-cdn-dot-example-dot-com-80")
+                .any(|p| p.id == "mesh-egress-default-multi_dash_host-cdn_dot_example_dot_com-80")
         );
 
         let http_proxy = proxies
             .iter()
-            .find(|p| p.id == "mesh-egress-default-multi-host-api-dot-example-dot-com-80")
+            .find(|p| p.id == "mesh-egress-default-multi_dash_host-api_dot_example_dot_com-80")
             .unwrap();
         assert_eq!(http_proxy.backend_scheme, Some(BackendScheme::Http));
     }
@@ -22016,7 +22135,7 @@ mod tests {
         assert_eq!(upstreams.len(), 2);
         let primary = upstreams
             .iter()
-            .find(|upstream| upstream.id.contains("primary-dot-external-dot-com"))
+            .find(|upstream| upstream.id.contains("primary_dot_external_dot_com"))
             .expect("primary upstream");
         assert_eq!(primary.targets.len(), 1);
         assert_eq!(primary.targets[0].host, "primary.external.com");
@@ -22024,7 +22143,7 @@ mod tests {
 
         let secondary = upstreams
             .iter()
-            .find(|upstream| upstream.id.contains("secondary-dot-external-dot-com"))
+            .find(|upstream| upstream.id.contains("secondary_dot_external_dot_com"))
             .expect("secondary upstream");
         assert_eq!(secondary.targets.len(), 1);
         assert_eq!(secondary.targets[0].host, "secondary.external.com");
@@ -22186,7 +22305,9 @@ mod tests {
         let egress_proxy = prepared
             .proxies
             .iter()
-            .find(|proxy| proxy.id == "mesh-egress-default-ext-api-api-dot-partner-dot-com-443")
+            .find(|proxy| {
+                proxy.id == "mesh-egress-default-ext_dash_api-api_dot_partner_dot_com-443"
+            })
             .expect("egress proxy should be materialized");
         assert_eq!(egress_proxy.hosts, vec!["api.partner.com"]);
         assert!(!egress_proxy.frontend_tls);
@@ -22198,7 +22319,7 @@ mod tests {
             .upstreams
             .iter()
             .find(|upstream| {
-                upstream.id == "mesh-egress-up-default-ext-api-api-dot-partner-dot-com-443"
+                upstream.id == "mesh-egress-up-default-ext_dash_api-api_dot_partner_dot_com-443"
             })
             .expect("egress upstream should be materialized");
         assert_eq!(egress_upstream.targets.len(), 1);
@@ -22570,7 +22691,7 @@ mod tests {
         assert!(proxy.frontend_tls);
         assert_eq!(
             proxy.upstream_id.as_deref(),
-            Some("mesh-egress-up-default-raw-tcp-raw-dot-external-dot-io-6380")
+            Some("mesh-egress-up-default-raw_dash_tcp-raw_dot_external_dot_io-6380")
         );
 
         let upstream = &upstreams[0];

@@ -500,7 +500,10 @@ fn egress_gateway_materialises_tcp_stream_proxy_for_external_tcp_service_entry()
     let upstream = prepared
         .upstreams
         .iter()
-        .find(|u| u.id.contains("redis-ext"))
+        // The SE name "redis-ext" is encoded into the egress id with the
+        // injective, `-`-free scheme (#1727), so its `-` becomes the `_dash_`
+        // token and the name segment is "redis_dash_ext".
+        .find(|u| u.id.contains("redis_dash_ext"))
         .expect("stream egress upstream materialised");
     assert!(
         !upstream.targets.is_empty(),
