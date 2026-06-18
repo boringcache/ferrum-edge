@@ -1808,17 +1808,23 @@ mod live_netns_tests {
         // for local delivery instead — exactly the production reroute path. A
         // real pod gets this initial route from its CNI default route.
         let script = format!(
+            // Exit-code discipline (codex #1823 review): `exit 97` == a genuine
+            // missing PREREQUISITE (no `iptables`/`ip` binary) → the test SKIPS.
+            // `exit 98` == a LOAD-BEARING route / fwmark-rule / `-j TPROXY` rule
+            // failed to install (e.g. a missing `xt_TPROXY` target or a
+            // mangle-table error on the CI kernel) → the test FAILS, because the
+            // capture path it exists to validate would otherwise pass vacuously.
             "set -e; \
              command -v iptables >/dev/null 2>&1 || exit 97; \
              command -v ip >/dev/null 2>&1 || exit 97; \
              ip link set lo up 2>/dev/null || true; \
-             ip route add default dev lo || exit 97; \
-             ip rule add priority {prio} fwmark {mark_arg} lookup {table} || exit 97; \
-             ip route add local 0.0.0.0/0 dev lo table {table} || exit 97; \
+             ip route add default dev lo || exit 98; \
+             ip rule add priority {prio} fwmark {mark_arg} lookup {table} || exit 98; \
+             ip route add local 0.0.0.0/0 dev lo table {table} || exit 98; \
              iptables -t mangle -A OUTPUT -p udp -m addrtype ! --dst-type LOCAL \
-               -j MARK --set-mark {mark_arg} || exit 97; \
+               -j MARK --set-mark {mark_arg} || exit 98; \
              iptables -t mangle -A PREROUTING -p udp -m mark --mark {mark_arg} \
-               -j TPROXY --on-port {CAPTURE_PORT} --tproxy-mark {mark_arg} || exit 97; \
+               -j TPROXY --on-port {CAPTURE_PORT} --tproxy-mark {mark_arg} || exit 98; \
              exec sleep 30"
         );
         Command::new("unshare")
@@ -1868,24 +1874,48 @@ mod live_netns_tests {
             return;
         };
         // Let the child unshare, bring loopback up, and install the TPROXY +
-        // policy-routing datapath; an exit (97 = iptables/ip unavailable, or any
-        // other set -e failure) == skip. `try_wait` rather than `kill(pid, 0)`:
-        // an exited-but-unreaped child is a zombie that still answers signal 0,
-        // which would wrongly run the scenario in a namespace without the rules.
-        let mut child_exited = false;
+        // policy-routing datapath, then `exec sleep 30` (stays alive). If it
+        // EXITS during setup, branch on the exit code: 97 == a missing
+        // prerequisite (no iptables/ip binary) → SKIP; anything else (98 == a
+        // load-bearing route/fwmark/TPROXY rule failed) → FAIL, so a broken
+        // capture setup never passes vacuously (codex #1823). `try_wait` rather
+        // than `kill(pid, 0)`: an exited-but-unreaped child is a zombie that
+        // still answers signal 0, which would wrongly run the scenario in a
+        // namespace without the rules.
+        let mut setup_exit: Option<std::process::ExitStatus> = None;
+        let mut setup_status_unknown = false;
         for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(50));
             match child.try_wait() {
-                Ok(Some(_)) | Err(_) => {
-                    child_exited = true;
+                Ok(Some(status)) => {
+                    setup_exit = Some(status);
+                    break;
+                }
+                Err(_) => {
+                    setup_status_unknown = true;
                     break;
                 }
                 Ok(None) => {}
             }
         }
-        if child_exited {
-            eprintln!("SKIP: iptables/TPROXY or iproute2 unavailable inside the test netns");
-            return;
+        if let Some(status) = setup_exit {
+            match status.code() {
+                Some(97) => {
+                    eprintln!("SKIP: iptables/ip binary unavailable inside the test netns");
+                    return;
+                }
+                other => panic!(
+                    "netns UDP TPROXY setup failed (exit {other:?}): a load-bearing \
+                     policy-route / fwmark-rule / `-j TPROXY` rule did not install, so the \
+                     capture path was NOT exercised — failing rather than skipping vacuously"
+                ),
+            }
+        }
+        if setup_status_unknown {
+            panic!(
+                "could not determine the netns setup child's exit status (try_wait errored); \
+                 failing rather than skipping a possibly-broken capture setup"
+            );
         }
         let pid = child.id();
         let _guard = ChildGuard(child);
