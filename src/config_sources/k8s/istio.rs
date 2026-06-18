@@ -1370,7 +1370,7 @@ fn translate_connection_pool_http(
     // "upstream overflow" when full); see `Proxy.pool_http1_max_pending_requests`
     // and `src/backend_pending_limit.rs`. No longer deferred at top-level/port.
     let http1_max_pending_requests = match http.get("http1MaxPendingRequests") {
-        Some(v) => Some(translate_http_uint32(object, "http1MaxPendingRequests", v)?),
+        Some(v) => Some(translate_http_uint32(object, "http1MaxPendingRequests", v, false)?),
         None => None,
     };
 
