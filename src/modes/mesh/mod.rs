@@ -73,6 +73,7 @@ const DEFAULT_DNS_ENABLED: bool = false;
 const DEFAULT_DNS_MAX_CONCURRENT_QUERIES: usize = 1024;
 const DEFAULT_EGRESS_LISTEN_ADDR: &str = "0.0.0.0:15090";
 const MESH_CA_INITIAL_SVID_TIMEOUT: Duration = Duration::from_secs(30);
+const INTERNAL_MESH_CA_FAILURE_BACKOFF_INITIAL_SECS: u64 = 5;
 
 pub const MESH_SPIFFE_IDENTITY_PLUGIN_ID: &str = "__mesh_spiffe_identity";
 pub const MESH_AUTHZ_PLUGIN_ID: &str = "__mesh_authz";
@@ -6378,14 +6379,10 @@ fn merge_tracing_config(
     if next.disable_span_reporting.is_some() {
         current.disable_span_reporting = next.disable_span_reporting;
     }
-    if !next.custom_tags.is_empty() {
-        current.custom_tags.clone_from(&next.custom_tags);
-    }
-    if !next.custom_header_tags.is_empty() {
-        current
-            .custom_header_tags
-            .clone_from(&next.custom_header_tags);
-    }
+    current.custom_tags.extend(next.custom_tags.clone());
+    current
+        .custom_header_tags
+        .extend(next.custom_header_tags.clone());
     if !next.providers.is_empty() {
         current.providers.clone_from(&next.providers);
     }
@@ -7016,19 +7013,19 @@ async fn serve_mesh_runtime(
              egress); keep it enabled only with compensating network controls."
         );
     }
-    let mesh_ca_trust_overlay_slot = empty_mesh_inbound_trust_overlay_slot();
+    let mesh_runtime_trust_overlay_slot = empty_mesh_inbound_trust_overlay_slot();
     let mesh_ca_svid_slot = start_mesh_ca_backend_svid_source(
         &proxy_state,
         &runtime,
         &env_config,
-        mesh_ca_trust_overlay_slot.clone(),
+        mesh_runtime_trust_overlay_slot.clone(),
         &mut mesh_background_handles,
         shutdown_tx.subscribe(),
     )
     .await?;
-    let mesh_ca_trust_overlay_slot = mesh_ca_svid_slot
-        .as_ref()
-        .map(|_| mesh_ca_trust_overlay_slot);
+    let mesh_runtime_trust_overlay_slot = (mesh_ca_svid_slot.is_some()
+        || gateway_svid_material_configured(&env_config))
+    .then_some(mesh_runtime_trust_overlay_slot);
 
     for host in proxy_state.plugin_cache.collect_warmup_hostnames() {
         hostnames.push((host, None, None));
@@ -7142,18 +7139,28 @@ async fn serve_mesh_runtime(
         initial_applied_mesh_slice.as_deref(),
         mesh_ca_svid_slot.as_ref(),
     );
-    if mesh_ca_svid_slot.is_some()
-        && let Some(slice) = initial_applied_mesh_slice.as_deref()
-    {
+    if let Some(slice) = initial_applied_mesh_slice.as_deref() {
         publish_staged_spiffe_bundle(
             &proxy_state,
             stage_gateway_runtime_spiffe_bundle(
                 &proxy_state,
-                mesh_ca_svid_slot.as_ref(),
-                mesh_ca_trust_overlay_slot.as_ref(),
+                mesh_inbound_spiffe_slot.as_ref(),
+                mesh_runtime_trust_overlay_slot.as_ref(),
                 slice,
             ),
         );
+    }
+    if let (Some(inbound_slot), Some(trust_overlay_slot)) = (
+        mesh_inbound_spiffe_slot.clone(),
+        mesh_runtime_trust_overlay_slot.clone(),
+    ) {
+        mesh_background_handles.push(start_mesh_inbound_svid_rotation_republisher(
+            proxy_state.clone(),
+            inbound_slot,
+            trust_overlay_slot,
+            proxy_state.backend_svid_rotation_tx.subscribe(),
+            shutdown_tx.subscribe(),
+        ));
     }
     let frontend_tls = load_mesh_frontend_tls(
         &env_config,
@@ -7340,7 +7347,7 @@ async fn serve_mesh_runtime(
             server_identity: mesh_frontend_identity,
             last_snapshot: initial_inbound_tls_snapshot,
             spiffe_bundle_slot: mesh_inbound_spiffe_slot,
-            runtime_trust_overlay_slot: mesh_ca_trust_overlay_slot,
+            runtime_trust_overlay_slot: mesh_runtime_trust_overlay_slot,
             production: mesh_production_mode,
         },
         shutdown_tx.subscribe(),
@@ -8033,8 +8040,12 @@ async fn run_internal_mesh_svid_rotation_loop(
     trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
+    let mut retry_after_failure = None;
+    let mut failure_backoff_secs = INTERNAL_MESH_CA_FAILURE_BACKOFF_INITIAL_SECS;
     loop {
-        let next_tick = {
+        let next_tick = if let Some(delay) = retry_after_failure.take() {
+            delay
+        } else {
             let snapshot = proxy_state.gateway_svid_bundle.load_full();
             snapshot
                 .as_ref()
@@ -8065,7 +8076,7 @@ async fn run_internal_mesh_svid_rotation_loop(
             continue;
         }
 
-        if let Err(error) = issue_and_install_mesh_ca_svid(
+        match issue_and_install_mesh_ca_svid(
             &proxy_state,
             ca.as_ref(),
             &spiffe_id,
@@ -8076,14 +8087,26 @@ async fn run_internal_mesh_svid_rotation_loop(
         )
         .await
         {
-            crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
-                &spiffe_id, "internal",
-            );
-            warn!(
-                error = %error,
-                spiffe_id = %spiffe_id,
-                "internal mesh CA SVID rotation failed; keeping current identity"
-            );
+            Ok(()) => {
+                failure_backoff_secs = INTERNAL_MESH_CA_FAILURE_BACKOFF_INITIAL_SECS;
+            }
+            Err(error) => {
+                let retry_delay = crate::util::backoff::jittered_backoff(failure_backoff_secs);
+                let retry_after_ms = retry_delay.as_millis();
+                retry_after_failure = Some(retry_delay);
+                failure_backoff_secs = failure_backoff_secs
+                    .saturating_mul(2)
+                    .min(crate::util::backoff::BACKOFF_MAX_SECS);
+                crate::plugins::mesh::prometheus_helpers::increment_mesh_cert_rotation_failure(
+                    &spiffe_id, "internal",
+                );
+                warn!(
+                    error = %error,
+                    spiffe_id = %spiffe_id,
+                    retry_after_ms,
+                    "internal mesh CA SVID rotation failed; keeping current identity"
+                );
+            }
         }
     }
 }
@@ -8169,6 +8192,64 @@ fn publish_runtime_svid_to_inbound_slot(
     inbound_slot.store(Arc::new(Some(bundle)));
 }
 
+fn start_mesh_inbound_svid_rotation_republisher(
+    proxy_state: ProxyState,
+    inbound_slot: tls::SharedBundleSlot,
+    trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
+    mut revision_rx: tokio::sync::watch::Receiver<u64>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // Snapshot the rotation revision *before* the initial publish, then
+        // republish once up front. A file/CA rotation can bump
+        // `backend_svid_rotation_tx` after this receiver was subscribed but
+        // before this task runs; the initial publish covers that case because
+        // `publish_runtime_svid_to_inbound_slot` re-reads `gateway_file_svid_bundle`
+        // live under `gateway_svid_update_lock`, so it picks up any already
+        // installed bundle.
+        //
+        // The ordering matters for the narrow window where a rotation lands
+        // *between* the baseline read and the publish (or just after it).
+        // The loop dedups on the `observed_revision` integer compare below;
+        // if the baseline were taken AFTER the publish it could capture a
+        // bump whose bundle the publish had NOT yet read, and then
+        // `next_revision == observed_revision` would skip the follow-up
+        // republish, pinning the inbound verifier to OLD roots until the next
+        // rotation or slice apply. Reading the baseline first guarantees any
+        // rotation that could change the bundle is either already reflected in
+        // the publish or strictly greater than `observed_revision` (forcing a
+        // republish). The publish is idempotent, so the occasional redundant
+        // republish is harmless.
+        let mut observed_revision = *revision_rx.borrow();
+        publish_runtime_svid_to_inbound_slot(&proxy_state, &inbound_slot, &trust_overlay_slot);
+        loop {
+            tokio::select! {
+                changed = revision_rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+            let next_revision = *revision_rx.borrow();
+            if next_revision == observed_revision {
+                continue;
+            }
+            observed_revision = next_revision;
+            publish_runtime_svid_to_inbound_slot(&proxy_state, &inbound_slot, &trust_overlay_slot);
+            debug!(
+                svid_revision = next_revision,
+                "Refreshed mesh inbound SPIFFE peer-verifier bundle after gateway SVID rotation"
+            );
+        }
+    })
+}
+
 struct MeshInboundTlsReloadState {
     server_identity: Option<Arc<tls::MeshServerIdentity>>,
     last_snapshot: Option<MeshInboundTlsReloadSnapshot>,
@@ -8192,9 +8273,10 @@ struct MeshInboundTlsReloadState {
 }
 
 /// Build the optional SPIFFE inbound trust-bundle slot from file-backed SVID
-/// material or a CA-backed runtime SVID slot. File material is merged with the
-/// slice's federated trust bundles immediately; runtime slots receive the
-/// accepted slice overlay through `stage_gateway_runtime_spiffe_bundle`.
+/// material or a CA-backed runtime SVID slot. Runtime-backed slots receive the
+/// accepted slice overlay through `stage_gateway_runtime_spiffe_bundle` so SVID
+/// rotations can refresh the inbound verifier without waiting for another
+/// slice apply.
 /// Returns `None` when no gateway SVID material is configured (the inbound
 /// listener then keeps the operator client-CA chain verification it has always
 /// used). It also returns `None` (logged) when file SVID material *is*
@@ -8309,6 +8391,32 @@ fn retain_svid_local_trust_only(bundle: &mut crate::identity::SvidBundle) {
     bundle.trust_bundles.federated.clear();
 }
 
+fn merge_trust_bundle_authorities(
+    target: &mut crate::identity::TrustBundle,
+    overlay: &crate::identity::TrustBundle,
+) {
+    for authority in &overlay.x509_authorities {
+        if !target
+            .x509_authorities
+            .iter()
+            .any(|existing| existing == authority)
+        {
+            target.x509_authorities.push(authority.clone());
+        }
+    }
+    for authority in &overlay.jwt_authorities {
+        if !target.jwt_authorities.iter().any(|existing| {
+            existing.key_id == authority.key_id
+                && existing.public_key_pem == authority.public_key_pem
+        }) {
+            target.jwt_authorities.push(authority.clone());
+        }
+    }
+    if target.refresh_hint_seconds.is_none() {
+        target.refresh_hint_seconds = overlay.refresh_hint_seconds;
+    }
+}
+
 fn merge_trust_overlay_into_svid_bundle(
     bundle: &mut crate::identity::SvidBundle,
     runtime: &crate::identity::TrustBundleSet,
@@ -8316,8 +8424,8 @@ fn merge_trust_overlay_into_svid_bundle(
     // CP-pushed slice trust is authoritative for inbound federation. Drop raw
     // federated bundles from the SVID source before adding accepted slice
     // bundles. The local bundle stays anchored to the gateway SVID's own trust
-    // domain (we do not let the slice override the local roots the SVID itself
-    // chains to).
+    // domain, but same-domain slice authorities are additive so a CP can stage
+    // CA-root rotation without replacing the freshly loaded SVID roots.
     retain_svid_local_trust_only(bundle);
     for (trust_domain, federated) in &runtime.federated {
         bundle
@@ -8326,22 +8434,24 @@ fn merge_trust_overlay_into_svid_bundle(
             .entry(trust_domain.clone())
             .or_insert_with(|| federated.clone());
     }
+    if runtime.local.trust_domain == bundle.trust_bundles.local.trust_domain {
+        merge_trust_bundle_authorities(&mut bundle.trust_bundles.local, &runtime.local);
+        return;
+    }
     // If the slice's local bundle is for a different trust domain than the
     // SVID's, treat it as a federated peer trust domain so cross-trust peers
     // still validate.
-    if runtime.local.trust_domain != bundle.trust_bundles.local.trust_domain {
-        bundle
-            .trust_bundles
-            .federated
-            .entry(runtime.local.trust_domain.clone())
-            .or_insert_with(|| runtime.local.clone());
-    }
+    bundle
+        .trust_bundles
+        .federated
+        .entry(runtime.local.trust_domain.clone())
+        .or_insert_with(|| runtime.local.clone());
 }
 
-/// Rebuild the inbound SPIFFE trust-bundle from the gateway SVID files plus the
-/// current slice's federated bundles, returning it STAGED (not yet stored into
-/// the live slot). The caller publishes it into the live slot only after the
-/// candidate proxy config is accepted, so a rejected slice cannot leave new
+/// Rebuild the inbound SPIFFE trust-bundle from the gateway SVID material plus
+/// the current slice's federated bundles, returning it STAGED (not yet stored
+/// into the live slot). The caller publishes it into the live slot only after
+/// the candidate proxy config is accepted, so a rejected slice cannot leave new
 /// federated trust domains active for inbound handshakes. A rebuild failure
 /// returns `None` (logged) and the caller leaves the previous trust bundles in
 /// place — this never fails the slice.
@@ -8353,6 +8463,14 @@ fn stage_mesh_inbound_spiffe_bundle(
     slice: &MeshSlice,
 ) -> Option<StagedSpiffeBundle> {
     let slot = slot?;
+    if runtime_trust_overlay_slot.is_some() {
+        return stage_gateway_runtime_spiffe_bundle(
+            proxy_state,
+            Some(slot),
+            runtime_trust_overlay_slot,
+            slice,
+        );
+    }
     if !gateway_svid_material_configured(env_config) {
         return stage_gateway_runtime_spiffe_bundle(
             proxy_state,
@@ -9069,10 +9187,11 @@ enum StagedSpiffeBundle {
         slot: tls::SharedBundleSlot,
         bundle: Arc<Option<crate::identity::SvidBundle>>,
     },
-    /// CA-backed SVID path: update the dedicated runtime inbound verifier slot
+    /// Runtime-backed SVID path: update the dedicated inbound verifier slot
     /// from the latest raw SVID plus the accepted slice trust overlay. The
-    /// SVID itself is intentionally not captured at staging time because a CA
-    /// rotation can complete while the candidate slice is still being planned.
+    /// SVID itself is intentionally not captured at staging time because a
+    /// file/CA rotation can complete while the candidate slice is still being
+    /// planned.
     RuntimeSlot {
         slot: tls::SharedBundleSlot,
         trust_overlay_slot: SharedMeshInboundTrustOverlaySlot,
@@ -15777,7 +15896,7 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_tracing_merge_replaces_tags_and_providers_across_scopes() {
+    fn telemetry_tracing_merge_combines_tags_and_replaces_providers_across_scopes() {
         let mesh_slice = MeshSlice {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
@@ -15849,12 +15968,21 @@ mod tests {
             tracing.custom_tags.get("env").map(String::as_str),
             Some("prod")
         );
-        assert!(!tracing.custom_tags.contains_key("mesh"));
+        assert_eq!(
+            tracing.custom_tags.get("mesh").map(String::as_str),
+            Some("ferrum")
+        );
         assert_eq!(
             tracing.custom_tags.get("region").map(String::as_str),
             Some("us-east")
         );
-        assert!(!tracing.custom_header_tags.contains_key("mesh-tenant"));
+        assert_eq!(
+            tracing
+                .custom_header_tags
+                .get("mesh-tenant")
+                .map(String::as_str),
+            Some("x-mesh-tenant")
+        );
         assert_eq!(
             tracing.custom_header_tags.get("tenant").map(String::as_str),
             Some("x-tenant")
@@ -19370,7 +19498,7 @@ mod tests {
             trust_bundles: Some(config::TrustBundleSet {
                 local: config::TrustBundle {
                     trust_domain: td.clone(),
-                    x509_authorities: vec![engine.encode(b"old-local-root")],
+                    x509_authorities: vec![engine.encode(b"slice-extra-local-root")],
                     jwt_authorities: Vec::new(),
                     refresh_hint_seconds: None,
                 },
@@ -19399,8 +19527,8 @@ mod tests {
         let bundle = active.as_ref().as_ref().expect("inbound bundle");
         assert_eq!(
             bundle.trust_bundles.local.x509_authorities,
-            vec![vec![9]],
-            "runtime CA local roots must come from the rotated SVID, not the stale slice overlay"
+            vec![vec![9], b"slice-extra-local-root".to_vec()],
+            "runtime CA local roots must keep the rotated SVID root and add accepted slice roots"
         );
         assert!(
             bundle
@@ -19413,6 +19541,173 @@ mod tests {
             !bundle.trust_bundles.federated.contains_key(&stale_td),
             "raw SPIRE federated roots must not remain in the inbound verifier"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inbound_svid_rotation_republisher_refreshes_file_backed_verifier_roots() {
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+        use base64::Engine;
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let inbound_slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        let overlay_slot = empty_mesh_inbound_trust_overlay_slot();
+        let td = TrustDomain::new("td.file-rotation").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+
+        let svid_bundle = |local_roots: Vec<Vec<u8>>| SvidBundle {
+            spiffe_id: id.clone(),
+            cert_chain_der: vec![vec![1, 2, 3]],
+            private_key_pkcs8_der: Vec::new().into(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td.clone(),
+                x509_authorities: local_roots,
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        };
+
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![1]]));
+        let engine = base64::engine::general_purpose::STANDARD;
+        let slice = MeshSlice {
+            version: "file-rotation-overlay".to_string(),
+            trust_bundles: Some(config::TrustBundleSet {
+                local: config::TrustBundle {
+                    trust_domain: td.clone(),
+                    x509_authorities: Vec::new(),
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: None,
+                },
+                federated: vec![config::TrustBundle {
+                    trust_domain: TrustDomain::new("partner.file-rotation").unwrap(),
+                    x509_authorities: vec![engine.encode(b"partner-root")],
+                    jwt_authorities: Vec::new(),
+                    refresh_hint_seconds: Some(300),
+                }],
+            }),
+            ..MeshSlice::default()
+        };
+        let staged = stage_gateway_runtime_spiffe_bundle(
+            &state,
+            Some(&inbound_slot),
+            Some(&overlay_slot),
+            &slice,
+        );
+        publish_staged_spiffe_bundle(&state, staged);
+
+        let (revision_tx, revision_rx) = tokio::sync::watch::channel(0u64);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let republisher = start_mesh_inbound_svid_rotation_republisher(
+            state.clone(),
+            inbound_slot.clone(),
+            overlay_slot.clone(),
+            revision_rx,
+            shutdown_rx,
+        );
+        tokio::task::yield_now().await;
+
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![9]]));
+        revision_tx.send_replace(1);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let active = inbound_slot.load_full();
+                if active.as_ref().as_ref().is_some_and(|bundle| {
+                    bundle.trust_bundles.local.x509_authorities == vec![vec![9]]
+                }) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rotation republisher refreshed inbound verifier roots");
+
+        let active = inbound_slot.load_full();
+        let bundle = active.as_ref().as_ref().expect("inbound bundle");
+        assert!(
+            bundle
+                .trust_bundles
+                .federated
+                .contains_key(&TrustDomain::new("partner.file-rotation").unwrap()),
+            "accepted federated overlay must survive file-backed SVID republish"
+        );
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(1), republisher)
+            .await
+            .expect("republisher observed shutdown")
+            .expect("republisher task joined");
+    }
+
+    // Regression for the file-SVID rotation republish race (#1707 / #1728 P3):
+    // a rotation can install the new gateway bundle and bump
+    // `backend_svid_rotation_tx` after the republisher subscribed but before its
+    // task first runs. The initial publish must read the freshly installed
+    // bundle, and the baseline revision must be captured *before* that publish so
+    // a later interleaving cannot be deduped away. We model the pre-run rotation
+    // deterministically on a single-threaded executor: install the new bundle and
+    // bump the revision while the spawned task is still parked, then drive it. A
+    // correct republisher pins the verifier to the NEW roots without waiting for a
+    // second rotation; the pre-fix order (publish-then-baseline) could leave it on
+    // the old roots.
+    #[tokio::test(flavor = "current_thread")]
+    async fn inbound_svid_rotation_republisher_picks_up_pre_run_rotation() {
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let inbound_slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        let overlay_slot = empty_mesh_inbound_trust_overlay_slot();
+        let td = TrustDomain::new("td.pre-run-rotation").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+
+        let svid_bundle = |local_roots: Vec<Vec<u8>>| SvidBundle {
+            spiffe_id: id.clone(),
+            cert_chain_der: vec![vec![1, 2, 3]],
+            private_key_pkcs8_der: Vec::new().into(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td.clone(),
+                x509_authorities: local_roots,
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        };
+
+        // Old roots in place when the republisher subscribes.
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![1]]));
+        let (revision_tx, revision_rx) = tokio::sync::watch::channel(0u64);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let republisher = start_mesh_inbound_svid_rotation_republisher(
+            state.clone(),
+            inbound_slot.clone(),
+            overlay_slot.clone(),
+            revision_rx,
+            shutdown_rx,
+        );
+
+        // Rotation lands while the spawned task is still parked (no yield yet):
+        // new bundle installed AND the revision bumped before the task runs.
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![9]]));
+        revision_tx.send_replace(1);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let active = inbound_slot.load_full();
+                if active.as_ref().as_ref().is_some_and(|bundle| {
+                    bundle.trust_bundles.local.x509_authorities == vec![vec![9]]
+                }) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("republisher must pin the inbound verifier to the new roots");
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(1), republisher)
+            .await
+            .expect("republisher observed shutdown")
+            .expect("republisher task joined");
     }
 
     #[test]
