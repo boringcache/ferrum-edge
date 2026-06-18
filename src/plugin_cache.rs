@@ -128,12 +128,18 @@ impl Plugin for PriorityOverridePlugin {
         &self,
         ctx: &RequestContext,
         content_type: Option<&str>,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
         // Must forward, not fall back to the trait default (which ignores
         // content-type): a priority-overridden inspect-mode policy needs the
         // buffer->stream downgrade for SSE, else it buffers an unbounded stream.
-        self.inner
-            .should_buffer_response_body_for_content_type(ctx, content_type)
+        self.inner.should_buffer_response_body_for_content_type(
+            ctx,
+            content_type,
+            response_status,
+            response_headers,
+        )
     }
     async fn on_response_body(
         &self,

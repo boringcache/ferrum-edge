@@ -1824,6 +1824,39 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   via the EgressGateway stays out of scope (its ServiceEntry UDP ports are classified
   but not materialized). The opaque relay is regression-pinned by
   `dtls_handshake_datagram_round_trips_opaque` in `mesh_udp_frame`.
+- **Fail-closed contract (F3 §3.3 Stage 6) — every relay decision drops/rejects on
+  doubt.** The UDP datapath mirrors the raw-TCP egress fail-closed table
+  gate-for-gate; the hardening landed incrementally across Stages 3–4 (and the
+  #1808 dual-transport work), and this stage consolidates the contract so a future
+  change knows what to preserve. Each gate has a regression pin:
+
+  | Gate | Enforced at | Failure mode | Pinned by |
+  |---|---|---|---|
+  | **Routability** — orig-dst ∈ `mesh_udp_egress` (strict VIP : UDP service port) | source capture, **before** any slot/task is reserved | drop datagram; no session created | `unroutable_destination_is_dropped_without_a_slot` |
+  | **Gateway SVID present** | egress dial (HBONE / mesh-mTLS) | end session; **never plaintext** | `open_datagram_tunnel_fails_closed_without_svid` |
+  | **Capability probe** — Ambient `Udp` enrolled before dial | egress session (Ambient branch) | drop; no blind dial | probe gate widened to `Http\|Tcp\|Udp`; `egress_transport_branch_selects_by_tag` |
+  | **Pinned-peer SPIFFE** | egress dial | refuse dial on missing/corrupt pin | `mtls_expected_peer_is_required_and_fails_closed` |
+  | **Transport selection** — materializer stamps exactly one of `mesh.hbone` / `mesh.mtls`; runtime precedence is HBONE → mesh-mTLS | egress session | end session if neither tag (a both-tags target — only reachable via a corrupted upstream, never the materializer — resolves to HBONE by precedence, which never relaxes a gate) | `egress_transport_branch_selects_by_tag` |
+  | **Authenticated peer** (dest) — `peer_spiffe_id.is_some()` | dest handler, before any socket opens | 403 | predicate by `authenticated_hbone_*_without_peer_is_rejected`; enforced inline in `handle_hbone_request` / `handle_hbone_udp_request` (the `ctx.peer_spiffe_id.is_none()` reject), with handler-level e2e deferred to Stage 7 |
+  | **Open-relay guard** (dest) — loopback / slice-declared workload addr + port only, re-checked on the **post-route-override** effective destination | dest handler | 403 | `inbound_hbone_relay_guard_allows_only_local_destinations` |
+  | **Marker discipline** — `udp`/`hbone` predicates disjoint; an unknown / future / malformed (incl. non-UTF-8) marker → neither | dispatch | 405 — the non-WebSocket-CONNECT gate (`!is_hbone_connect_any`) rejects an unrecognized CONNECT before routing; both skew directions | `connect_marker_classification_is_exhaustive_and_fail_closed`, `udp_and_hbone_predicates_are_disjoint` |
+  | **Session DoS bounds** — count + queued-bytes + idle sweep | source capture | shed / reap | `session_cap_sheds_new_flows_but_serves_existing`, `egress_enqueue_caps_queued_bytes_not_just_count` |
+  | **Return-path isolation** — per-session transparent socket bound to orig-dst, send-only, reply only to the captured client | return path | structural (one socket ↔ one client) | `canonicalize_unmaps_v4_mapped_clients_only`, `teardown_does_not_clobber_replacement_session` |
+
+  There is **no plaintext or alternate-hop fallback** anywhere on the relay: every
+  dial error path ends the session. The posture was confirmed by two independent
+  read-only audits plus an adversarial red-team pass over 10 attack classes
+  (slot/epoch TOCTOU, return-path cross-talk, route-override guard bypass, marker
+  confusion, unauthenticated relay, capability drop→open, transport downgrade,
+  teardown fail-open, codec desync, orig-dst spoofing) — no fail-open path was
+  found. One residual is noted for completeness: the inbound open-relay guard
+  validates the destination **string** before DNS resolution, so a workload that
+  declared a *hostname* (rather than a pod IP) as its address could in principle
+  resolve off-box. This is **not UDP-specific** — the byte-stream HBONE relay's
+  `connect_backend` has the byte-for-byte identical resolve-after-string-guard
+  pattern — and is inert in practice (workload addresses are pod IPs / loopback,
+  which resolve to themselves), so hardening it (validate the *resolved* IP in both
+  relays) is out of scope for this UDP stage.
 - **Locally-generated pod UDP egress: OUTPUT-MARK → lo-reroute → PREROUTING-TPROXY
   loop.** TPROXY runs **only in `PREROUTING`**, never for locally-generated (OUTPUT)
   packets — jumping into a `-j TPROXY` chain from `mangle OUTPUT` is invalid and can

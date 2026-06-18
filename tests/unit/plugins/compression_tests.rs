@@ -312,6 +312,238 @@ async fn test_skips_non_compressible_content_type() {
     assert!(!resp_headers.contains_key("content-encoding"));
 }
 
+#[test]
+fn test_response_buffering_is_narrowed_by_content_type() {
+    let plugin = make_plugin(json!({}));
+    let ctx = make_ctx(Some("gzip"));
+    let headers = HashMap::new();
+
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/html"),
+        200,
+        &headers
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json; charset=utf-8"),
+        200,
+        &headers
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &headers
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("image/png"),
+        200,
+        &headers
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/octet-stream"),
+        200,
+        &headers
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &headers));
+}
+
+#[test]
+fn test_response_buffering_skips_range_responses() {
+    // A range response with a compressible content-type must not be pinned onto
+    // the buffered path: `after_proxy` will skip compressing it, so buffering
+    // would just delay/collect the body (and can trip the response body limit on
+    // large ranged downloads) instead of streaming it. Mirrors the `after_proxy`
+    // 206/Content-Range skip so the proxy can downgrade buffer -> stream.
+    let plugin = make_plugin(json!({}));
+    let ctx = make_ctx(Some("gzip"));
+
+    // 206 Partial Content (even without an explicit Content-Range header).
+    let no_range = HashMap::new();
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/html"),
+        206,
+        &no_range
+    ));
+
+    // A Content-Range header on a non-206 status also opts out.
+    let mut range_headers = HashMap::new();
+    range_headers.insert("content-range".to_string(), "bytes 0-99/5000".to_string());
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/html"),
+        200,
+        &range_headers
+    ));
+
+    // A plain 200 with a compressible type still buffers (control).
+    let plain = HashMap::new();
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/html"),
+        200,
+        &plain
+    ));
+}
+
+#[test]
+fn test_response_buffering_skips_range_responses_via_metadata_marker() {
+    // On paths that run `after_proxy` before the refine/buffering decision (e.g.
+    // the H3 cross-protocol path), `RANGE_RESPONSE_METADATA_KEY` is stamped from
+    // the pristine backend headers. If an earlier-ordered hook (e.g.
+    // `response_transformer`) then strips `Content-Range` and the status is not
+    // 206, the live headers no longer reveal that this is a range response. The
+    // buffering check must still opt out via the stamped marker so the partial
+    // body streams instead of being pinned onto the buffered path (where it
+    // would never be compressed and could trip the response body size limit) —
+    // mirroring the `after_proxy` skip in
+    // `test_skips_range_response_when_content_range_was_stripped`.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    ctx.metadata
+        .insert("ferrum:range_response".to_string(), "true".to_string());
+
+    // Live headers look like a plain compressible 200 (Content-Range stripped).
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-length".to_string(), "100".to_string());
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/html"),
+        200,
+        &resp_headers
+    ));
+
+    // Without the marker the same headers buffer (control), so the marker — not
+    // some other signal — is what drives the opt-out.
+    let ctx_no_marker = make_ctx(Some("gzip"));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx_no_marker,
+        Some("text/html"),
+        200,
+        &resp_headers
+    ));
+}
+
+#[test]
+fn test_response_buffering_still_requires_accept_encoding() {
+    let plugin = make_plugin(json!({}));
+    let ctx = make_ctx(None);
+    let headers = HashMap::new();
+
+    assert!(!plugin.should_buffer_response_body(&ctx));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers
+    ));
+}
+
+#[tokio::test]
+async fn test_skips_partial_content_responses() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/html".to_string());
+    resp_headers.insert("content-length".to_string(), "100".to_string());
+    resp_headers.insert("content-range".to_string(), "bytes 0-99/5000".to_string());
+
+    plugin.after_proxy(&mut ctx, 206, &mut resp_headers).await;
+
+    assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("content-length").unwrap(), "100");
+    assert_eq!(
+        resp_headers.get("content-range").unwrap(),
+        "bytes 0-99/5000"
+    );
+}
+
+#[tokio::test]
+async fn test_skips_content_range_header_on_non_partial_status() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/html".to_string());
+    resp_headers.insert("content-length".to_string(), "100".to_string());
+    resp_headers.insert("content-range".to_string(), "bytes 0-99/5000".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(resp_headers.get("content-length").unwrap(), "100");
+    assert_eq!(
+        resp_headers.get("content-range").unwrap(),
+        "bytes 0-99/5000"
+    );
+}
+
+#[tokio::test]
+async fn test_skips_range_response_when_content_range_was_stripped() {
+    // Regression: an earlier-ordered plugin (e.g. `response_transformer` at 4000,
+    // before `compression` at 4050) may strip `Content-Range` before
+    // `compression.after_proxy` runs. Range responses are streamed, so committing
+    // `Content-Encoding` here would mislabel an uncompressed body whose buffered-
+    // only `transform_response_body` never runs. The proxy records the ORIGINAL
+    // backend range decision under this marker before any after_proxy mutation, so
+    // compression must still decline to compress even though the live headers no
+    // longer carry `Content-Range` and the status was rewritten to 200.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    // Simulate the proxy-side marker stamped from the pristine backend response.
+    ctx.metadata
+        .insert("ferrum:range_response".to_string(), "true".to_string());
+
+    // Live headers after an earlier transform removed Content-Range and the
+    // status is no longer 206.
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/html".to_string());
+    resp_headers.insert("content-length".to_string(), "100".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    assert!(
+        !resp_headers.contains_key("content-encoding"),
+        "must not label a streamed range body as compressed"
+    );
+    assert_eq!(resp_headers.get("content-length").unwrap(), "100");
+}
+
+#[tokio::test]
+async fn test_compresses_normal_response_without_range_marker() {
+    // Control for the marker check: a plain 200 with no range marker and no
+    // Content-Range still compresses, so the marker does not over-suppress.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/html".to_string());
+    resp_headers.insert("content-length".to_string(), "5000".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+
+    assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
+    assert!(!resp_headers.contains_key("content-length"));
+}
+
 #[tokio::test]
 async fn test_skips_below_min_content_length() {
     let plugin = make_plugin(json!({"min_content_length": 1000}));
