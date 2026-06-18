@@ -42,6 +42,8 @@ pub mod headers;
 pub mod http2_pool;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
+pub mod mesh_udp_capture;
+pub mod mesh_udp_frame;
 pub mod netns_capture;
 pub mod sni;
 pub mod stream_error;
@@ -144,6 +146,18 @@ fn http1_parser_max_buf_size(configured_header_limit: usize) -> usize {
 /// (response_headers are plugin-supplied) from the normal "after_proxy
 /// invoked on a backend response" path (response_headers came from upstream).
 pub(crate) const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+
+/// Marker recorded in `ctx.metadata` when the ORIGINAL backend response was a
+/// range/partial response (`206` or carrying `Content-Range`), captured before
+/// any `after_proxy` hook can mutate the response headers. A plugin whose
+/// `after_proxy` runs after a header-rewriting plugin (e.g. `compression` at
+/// order 4050 after `response_transformer` at 4000) can read this to preserve
+/// the original range decision even if an earlier hook stripped/renamed
+/// `Content-Range`. This matters because range responses are streamed (see
+/// `compression`'s `should_buffer_response_body_for_content_type`), so a plugin
+/// must not commit a body transform header (e.g. `Content-Encoding`) that its
+/// buffered-only `transform_response_body` will never actually apply.
+pub(crate) const RANGE_RESPONSE_METADATA_KEY: &str = "ferrum:range_response";
 
 fn record_node_waypoint_identity_drop(
     overload: &crate::overload::OverloadState,
@@ -264,6 +278,11 @@ struct HboneProbeTarget<'a> {
     /// Pinned destination identity for the probe handshake (mirrors dispatch).
     expected_peer: Option<&'a crate::identity::SpiffeId>,
     previous_hbone: Option<ProtocolSupport>,
+    /// `true` for a UDP egress target: probe with a `udp`-marked datagram-over-
+    /// HBONE CONNECT (the marker the dispatch datapath uses) instead of the
+    /// `hbone` byte-stream marker, so the probe reaches the destination's `udp`
+    /// relay rather than its byte-stream relay (codex r1 P1).
+    is_udp: bool,
 }
 
 fn gateway_managed_plugin_timestamp() -> chrono::DateTime<chrono::Utc> {
@@ -880,6 +899,7 @@ pub(crate) fn refine_stream_response_for_content_type(
     proxy: &Proxy,
     plugins: &[Arc<dyn Plugin>],
     ctx: Option<&RequestContext>,
+    response_status: u16,
     response_headers: &HashMap<String, String>,
 ) -> bool {
     if stream_response {
@@ -900,10 +920,17 @@ pub(crate) fn refine_stream_response_for_content_type(
         return false;
     }
     // Keep buffering only while at least one plugin still needs the body for
-    // this content-type; otherwise stream it straight through.
-    !plugins
-        .iter()
-        .any(|plugin| plugin.should_buffer_response_body_for_content_type(ctx, content_type))
+    // this content-type; otherwise stream it straight through. Plugins also see
+    // the response status/headers so a plugin can release a response it will not
+    // transform (e.g. `compression` skips `206`/`Content-Range` range responses).
+    !plugins.iter().any(|plugin| {
+        plugin.should_buffer_response_body_for_content_type(
+            ctx,
+            content_type,
+            response_status,
+            response_headers,
+        )
+    })
 }
 
 /// Fix 5: decide whether a plain-HTTPS direct-H2 response body should skip
@@ -1109,6 +1136,14 @@ pub fn is_h2_websocket_connect<B>(req: &Request<B>) -> bool {
 /// (for example `connect-udp`) on the existing fail-closed path.
 pub fn is_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> bool {
     hbone_proxy::is_connect_request(req, env_config)
+}
+
+/// Whether `req` is a datagram-over-HBONE CONNECT (F3 §3.3 Stage 4). Disjoint
+/// from [`is_hbone_connect_request`]; the dispatch ladder treats EITHER as a
+/// CONNECT-relay (shared path normalization, body-buffering avoidance, route-miss
+/// relay synthesis) but routes the `udp` flavor to the unframing UDP handler.
+pub fn is_udp_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> bool {
+    hbone_proxy::is_udp_connect_request(req, env_config)
 }
 
 /// Whether an authenticated inbound HBONE CONNECT to `host:port` may be
@@ -1358,8 +1393,65 @@ pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
             | retry::ErrorClass::ProtocolError
             | retry::ErrorClass::DnsLookupError
             | retry::ErrorClass::PortExhaustion
-            | retry::ErrorClass::ConnectionPoolError
     )
+}
+
+pub fn websocket_origin_allowed(allowed_origins: &[String], origin: &str) -> bool {
+    allowed_origins
+        .iter()
+        .any(|allowed| websocket_origin_matches(allowed, origin))
+}
+
+fn websocket_origin_matches(allowed: &str, origin: &str) -> bool {
+    if allowed.eq_ignore_ascii_case(origin) {
+        return true;
+    }
+
+    match (
+        normalized_websocket_origin(allowed),
+        normalized_websocket_origin(origin),
+    ) {
+        (Some(allowed), Some(origin)) => allowed.eq_ignore_ascii_case(&origin),
+        _ => false,
+    }
+}
+
+fn normalized_websocket_origin(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw).ok()?;
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        return None;
+    }
+    // RFC 6454 serialized origins are scheme://host[:port] and never carry
+    // userinfo. Fail closed on credentials so an Origin like
+    // `https://attacker@good.example` is not normalized down to the
+    // allow-listed `https://good.example` and waved through admission.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    let default_port = match parsed.scheme() {
+        "http" | "ws" => 80,
+        "https" | "wss" => 443,
+        _ => return None,
+    };
+    let host = parsed.host_str()?;
+
+    let mut normalized = String::with_capacity(raw.len());
+    normalized.push_str(&parsed.scheme().to_ascii_lowercase());
+    normalized.push_str("://");
+    if host.contains(':') && !host.starts_with('[') {
+        normalized.push('[');
+        normalized.push_str(&host.to_ascii_lowercase());
+        normalized.push(']');
+    } else {
+        normalized.push_str(&host.to_ascii_lowercase());
+    }
+    if let Some(port) = parsed.port()
+        && port != default_port
+    {
+        normalized.push(':');
+        normalized.push_str(&port.to_string());
+    }
+    Some(normalized)
 }
 
 /// Is this H3 backend response the kind that should downgrade the cached
@@ -2668,6 +2760,17 @@ pub struct ProxyState {
     /// `src/backend_conn_limit.rs` for why their pool-internal connection
     /// lifecycle makes a request-keyed counter the wrong control.
     pub backend_conn_limit: Arc<crate::backend_conn_limit::BackendConnectionLimiter>,
+    /// Per-destination *pending-request* limiter enforcing DestinationRule
+    /// `connectionPool.http.http1MaxPendingRequests` on the reqwest/HTTP-1.1
+    /// backend-dispatch path. Bounds how many requests can be simultaneously
+    /// waiting on connection capacity for a `(host, port)`; an over-cap request
+    /// is shed with a 503 ("upstream overflow") in the connection-pending phase
+    /// via an RAII [`crate::backend_pending_limit::BackendPendingGuard`] held
+    /// only until dispatch returns. HTTP/1.1-scoped: the multiplexed transports
+    /// (direct H2, gRPC, H3, HBONE, mesh-mTLS) do NOT consume it — their
+    /// concurrency is governed by `h2_max_concurrent_streams`. See
+    /// `docs/mesh.md` and `src/backend_pending_limit.rs`.
+    pub backend_pending_limit: Arc<crate::backend_pending_limit::BackendPendingLimiter>,
 }
 
 #[inline]
@@ -4221,6 +4324,11 @@ impl ProxyState {
                     pool_shard_amount,
                 ),
             ),
+            backend_pending_limit: Arc::new(
+                crate::backend_pending_limit::BackendPendingLimiter::with_shard_amount(
+                    pool_shard_amount,
+                ),
+            ),
         };
         if let Some(handle) =
             state.start_gateway_svid_file_rotation_task(health_check_restart_rx.clone())
@@ -4441,6 +4549,47 @@ impl ProxyState {
                 }
             }
         }
+
+        // Third pass: the UDP egress upstreams (F3 §3.3 Stage 4). Same trap as
+        // the raw-TCP VIP upstreams — referenced by NO config proxy, so without
+        // enrollment `retain_keys` evicts their HBONE records and every Ambient
+        // UDP dial 502s `hbone_required` forever. Built from the SAME
+        // deterministic UDP relay proxy the route table / dispatch use, so probe
+        // and dispatch capability keys agree. UDP egress is now dual-transport
+        // (#1808): Ambient `mesh.hbone` UDP targets ARE enrolled (HBONE capability
+        // registry), Sidecar `mesh.mtls` UDP targets are SKIPPED below — they
+        // dispatch over a mesh-mTLS CONNECT with NO capability probe (a
+        // slice-declared sidecar speaks mesh-mTLS by construction), and probing
+        // them would dial a non-existent `:15008` HBONE listener and record a
+        // spurious unsupported verdict (mirrors the raw-TCP passes).
+        for service in &mesh.services {
+            for sp in crate::modes::mesh::service_udp_stream_ports(service) {
+                let upstream_id = crate::modes::mesh::mesh_outbound_udp_upstream_id(
+                    &service.namespace,
+                    &service.name,
+                    sp.port,
+                );
+                let Some(upstream) = upstream_map.get(upstream_id.as_str()) else {
+                    continue;
+                };
+                let relay_proxy = crate::modes::mesh::mesh_outbound_udp_relay_proxy(
+                    &service.namespace,
+                    &service.name,
+                    sp.port,
+                    &upstream_id,
+                );
+                for target in &upstream.targets {
+                    if !crate::proxy::hbone_pool::target_hbone_enabled(target) {
+                        continue;
+                    }
+                    let probe_target =
+                        BackendCapabilityProbeTarget::from_proxy(&relay_proxy, Some(target));
+                    if seen.insert(probe_target.key.clone()) {
+                        targets.push(probe_target);
+                    }
+                }
+            }
+        }
     }
 
     fn collect_mesh_route_dispatch_capability_targets(
@@ -4586,11 +4735,20 @@ impl ProxyState {
             BackendScheme::Tcp | BackendScheme::Tcps | BackendScheme::Udp | BackendScheme::Dtls => {
             }
         }
-        // `Tcp` joins `Http` here for the raw-TCP mesh egress relay targets:
-        // their scheme keeps the plain-HTTP/h2c probes away from a raw-TCP
-        // app port (nothing above probes the Tcp arm), but HBONE support must
-        // still be proven — the probe only performs the CONNECT handshake.
-        if target.hbone_hint && matches!(scheme, BackendScheme::Http | BackendScheme::Tcp) {
+        // `Tcp` and `Udp` join `Http` here for the mesh egress relay targets:
+        // their scheme keeps the plain-HTTP/h2c probes away from a raw-TCP /
+        // UDP app port (nothing above probes those arms), but HBONE support
+        // must still be proven — a UDP egress target rides a `udp`-marked HBONE
+        // CONNECT, so without this its HBONE record is never probed AND
+        // `retain_keys` evicts it, permanently failing the UDP dispatch gate
+        // closed (the same trap as raw-TCP). The probe only performs the CONNECT
+        // handshake, identical for both transports.
+        if target.hbone_hint
+            && matches!(
+                scheme,
+                BackendScheme::Http | BackendScheme::Tcp | BackendScheme::Udp
+            )
+        {
             self.probe_hbone(
                 &probe_proxy,
                 probe_timeout,
@@ -4600,6 +4758,10 @@ impl ProxyState {
                     hbone_port: target.hbone_port,
                     expected_peer: target.hbone_expected_peer.as_ref(),
                     previous_hbone,
+                    // A UDP egress target's destination relay expects the `udp`
+                    // marker; probe it with the matching datagram CONNECT so the
+                    // handshake reaches the right relay (codex r1 P1).
+                    is_udp: matches!(scheme, BackendScheme::Udp),
                 },
                 &mut record,
             )
@@ -4720,18 +4882,29 @@ impl ProxyState {
             return;
         }
 
-        match tokio::time::timeout(
-            probe_timeout,
-            self.hbone_pool.warmup_connection(
-                probe_proxy,
-                host,
-                port,
-                hbone_port,
-                target.expected_peer,
-            ),
-        )
-        .await
-        {
+        // A UDP egress target rides a `udp`-marked datagram CONNECT, which the
+        // destination unframes into a local `UdpSocket`; a byte-stream
+        // (`hbone`-marked) probe would hit the wrong relay there. Probe with the
+        // SAME marker the dispatch path uses so the handshake proves the
+        // capability the egress datapath actually needs (codex r1 P1).
+        let warmup = async {
+            if target.is_udp {
+                self.hbone_pool
+                    .warmup_datagram_connection(
+                        probe_proxy,
+                        host,
+                        port,
+                        hbone_port,
+                        target.expected_peer,
+                    )
+                    .await
+            } else {
+                self.hbone_pool
+                    .warmup_connection(probe_proxy, host, port, hbone_port, target.expected_peer)
+                    .await
+            }
+        };
+        match tokio::time::timeout(probe_timeout, warmup).await {
             Ok(Ok(())) => {
                 record.hbone = ProtocolSupport::Supported;
             }
@@ -7301,21 +7474,12 @@ async fn handle_websocket_request_authenticated(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
-        let has_port_override = backend_dispatch::has_effective_port_override(
+        let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
             &proxy,
             &epoch.load_balancer,
             upstream_id,
             target.port,
         );
-        let strategy = if has_port_override {
-            LoadBalancerCache::get_hash_on_strategy_for_port_from(
-                &epoch.load_balancer,
-                upstream_id,
-                target.port,
-            )
-        } else {
-            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id)
-        };
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
@@ -9464,6 +9628,56 @@ pub(crate) async fn start_mesh_plaintext_listener_with_signal(
     .await
 }
 
+/// Start the mesh UDP TPROXY capture listener (F3 §3.3 Stage 3).
+///
+/// Binds a transparent UDP socket on `addr` (the Stage-2 capture port,
+/// `FERRUM_MESH_CAPTURE_UDP_PORT`), recovers each captured datagram's original
+/// destination via the `IP(v6)_RECVORIGDSTADDR` cmsg, keys a session by
+/// `(client, orig-dst)`, and DROPS it (egress relay is Stage 4). DoS bounds are
+/// pulled from `EnvConfig` (`FERRUM_UDP_MAX_SESSIONS` /
+/// `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` / `FERRUM_UDP_RECVMMSG_BATCH_SIZE` /
+/// `FERRUM_POOL_SHARD_AMOUNT`), matching the plain UDP proxy. `tls_config` is
+/// always `None` for this plaintext listener (the parameter is accepted only so
+/// the mesh listener-spawn loop can call every kind uniformly). `mesh_direction`
+/// is accepted for call-site uniformity; the capture listener is always
+/// outbound and does not thread it further.
+pub(crate) async fn start_mesh_udp_capture_listener_with_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    _mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
+    debug_assert!(
+        tls_config.is_none(),
+        "mesh UDP capture listener is plaintext; tls_config must be None"
+    );
+    let _ = tls_config;
+    let env = &state.env_config;
+    let max_sessions = env.udp_max_sessions;
+    let cleanup_interval_seconds = env.udp_cleanup_interval_seconds;
+    let recvmmsg_batch_size = env.udp_recvmmsg_batch_size;
+    let session_shard_amount = env.pool_shard_amount;
+    mesh_udp_capture::start_mesh_udp_capture_listener(mesh_udp_capture::MeshUdpCaptureConfig {
+        addr,
+        // Stage 4 needs the full proxy state for egress (route table, LB,
+        // capability registry, HBONE pool, SVID).
+        state: Arc::new(state),
+        shutdown,
+        // In mesh mode the per-listener `shutdown` is the runtime's
+        // SIGINT/SIGTERM-driven channel, so a separate global receiver is
+        // unnecessary here.
+        global_shutdown: None,
+        max_sessions,
+        cleanup_interval_seconds,
+        recvmmsg_batch_size,
+        session_shard_amount,
+        started_tx,
+    })
+    .await
+}
+
 /// Start a mesh mTLS/HBONE listener with handshake-failure telemetry enabled.
 ///
 /// `mesh_direction` is stamped onto every accepted connection's
@@ -10856,8 +11070,16 @@ async fn handle_proxy_request_inner(
     let method = req.method().as_str().to_owned();
     let inbound_version = req.version();
     let is_hbone_connect = is_hbone_connect_request(&req, &state.env_config);
+    // Datagram-over-HBONE CONNECT (F3 §3.3 Stage 4) — disjoint from the
+    // byte-stream `is_hbone_connect` (different wire marker). EITHER shape is a
+    // CONNECT-relay for the shared dispatch machinery (path normalization,
+    // body-buffering avoidance, route-miss relay synthesis, CONNECT-405 bypass),
+    // so the combined `is_hbone_connect_any` drives those; the `udp` flavor is
+    // routed to the unframing UDP handler at the final dispatch branch.
+    let is_udp_hbone_connect = is_udp_hbone_connect_request(&req, &state.env_config);
+    let is_hbone_connect_any = is_hbone_connect || is_udp_hbone_connect;
     let raw_path = req.uri().path();
-    let path = if is_hbone_connect && raw_path.is_empty() {
+    let path = if is_hbone_connect_any && raw_path.is_empty() {
         "/".to_string()
     } else {
         raw_path.to_string()
@@ -11041,7 +11263,7 @@ async fn handle_proxy_request_inner(
     // Note: we enable_connect_protocol() on the h2 server to support WebSocket,
     // which means h2 will deliver Extended CONNECT requests to us — we must
     // filter non-WebSocket ones here before routing.
-    if method == "CONNECT" && !is_h2_websocket_connect(&req) && !is_hbone_connect {
+    if method == "CONNECT" && !is_h2_websocket_connect(&req) && !is_hbone_connect_any {
         warn!("Rejected non-WebSocket CONNECT request");
         record_request(&state, 405);
         return Ok(build_response(
@@ -11051,6 +11273,8 @@ async fn handle_proxy_request_inner(
     }
     if is_hbone_connect {
         hbone_proxy::tag_request_metadata(&mut ctx);
+    } else if is_udp_hbone_connect {
+        hbone_proxy::tag_udp_request_metadata(&mut ctx);
     }
 
     // TLS 1.3 0-RTT early data enforcement (RFC 8470).
@@ -11255,9 +11479,14 @@ async fn handle_proxy_request_inner(
             let representative_id = Arc::clone(&rm.proxy);
             match epoch
                 .route_table
-                .select_mesh_outbound_port_route(rm, ctx.orig_dst.map(|addr| addr.port()))
-            {
-                Ok(rm) => Some(rm),
+                .select_mesh_outbound_port_route_with_authz_port(
+                    rm,
+                    ctx.orig_dst.map(|addr| addr.port()),
+                ) {
+                Ok((rm, authz_port)) => {
+                    ctx.mesh_outbound_destination_authz_port = authz_port;
+                    Some(rm)
+                }
                 Err(reason) => {
                     debug!(
                         proxy_id = %representative_id.id,
@@ -11352,6 +11581,25 @@ async fn handle_proxy_request_inner(
         other => other,
     };
 
+    // Datagram-over-HBONE CONNECTs MUST always traverse the guarded inbound
+    // relay-synthesis path, never an LB-backed HTTP/TCP route. The UDP handler
+    // dials a local `UdpSocket` straight at the route's backend addr+port, so a
+    // `udp`-marked CONNECT whose `:authority` happens to match a materialized
+    // HTTP/TCP route would open a socket to that route's destination WITHOUT the
+    // open-relay destination guard (`inbound_hbone_relay_destination_allowed`)
+    // that `build_inbound_hbone_relay_proxy` applies. Forcing a route miss here
+    // funnels every UDP CONNECT through that guard (which bounds the authority to
+    // a loopback / slice-known workload addr+port) or a fail-closed 404 — the
+    // same destination check the byte-stream relay's synthesis path enforces
+    // (codex r5 P2). The byte-stream HBONE relay deliberately keeps matched-route
+    // dispatch (VirtualService `mesh_route_dispatch` overrides ride it), so this
+    // is scoped to the UDP variant only.
+    let route_match = if is_udp_hbone_connect {
+        None
+    } else {
+        route_match
+    };
+
     let (proxy, strip_len) = match route_match {
         Some(rm) => {
             // Materialize headers now — path param injection writes to ctx.headers,
@@ -11409,9 +11657,14 @@ async fn handle_proxy_request_inner(
             // proxy is built only on the inbound listener (`mesh_direction ==
             // Inbound`) and only for a loopback / slice-known workload
             // destination, with loopback ports constrained to the slice's
-            // declared workload application ports; `handle_hbone_request`
-            // re-checks the authenticated-peer gate before dialing.
-            let hbone_relay = if is_hbone_connect
+            // declared workload application ports; `handle_hbone_request` /
+            // `handle_hbone_udp_request` re-checks the authenticated-peer gate
+            // before dialing. A datagram-over-HBONE CONNECT (`is_udp_hbone_connect`)
+            // takes the SAME transparent-relay synthesis — the open-relay guard
+            // (`inbound_hbone_relay_destination_allowed`) bounds the authority to
+            // a loopback / slice-known workload addr+port the same way — and is
+            // then routed to the UDP unframing handler at the dispatch branch.
+            let hbone_relay = if is_hbone_connect_any
                 && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
             {
                 build_inbound_hbone_relay_proxy(req.uri().authority(), epoch.config.mesh.as_deref())
@@ -11577,7 +11830,7 @@ async fn handle_proxy_request_inner(
     // WebSocket Extended CONNECT is also excluded: DATA frames after the 200
     // response are WebSocket bytes, not an HTTP request body to drain before
     // authentication.
-    let requires_body_before_authenticate = !is_hbone_connect
+    let requires_body_before_authenticate = !is_hbone_connect_any
         && allows_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
         && plugins.iter().any(|plugin| {
@@ -11720,7 +11973,7 @@ async fn handle_proxy_request_inner(
     // HBONE CONNECT requests must keep hyper's upgrade handle in the streaming
     // body (see `handle_hbone_request`), so pre-`before_proxy` buffering is
     // skipped — same reason as the pre-authenticate buffering guard above.
-    let requires_request_body_buffering = !is_hbone_connect
+    let requires_request_body_buffering = !is_hbone_connect_any
         && allows_request_body_buffering
         && maybe_requires_request_body_buffering
         && plugins
@@ -11898,6 +12151,24 @@ async fn handle_proxy_request_inner(
         )
         .await);
     }
+    // Datagram-over-HBONE CONNECT (F3 §3.3 Stage 4): same short-circuit as the
+    // byte-stream HBONE relay, but the destination side UNFRAMES the tunnel into
+    // a local `UdpSocket` toward the CONNECT authority instead of byte-relaying
+    // to a TCP backend.
+    if is_udp_hbone_connect {
+        return Ok(hbone_proxy::handle_hbone_udp_request(
+            &state,
+            &proxy,
+            &epoch,
+            &mut ctx,
+            client_request_body,
+            &plugins,
+            start_time,
+            &method,
+            plugin_execution_ns,
+        )
+        .await);
+    }
 
     // Inject identity headers when authentication resolved a principal.
     if let Some(username) = ctx.backend_consumer_username() {
@@ -12048,11 +12319,7 @@ async fn handle_proxy_request_inner(
         // When allowed_ws_origins is non-empty, reject upgrades from unlisted origins.
         if !proxy.allowed_ws_origins.is_empty() {
             let origin = ctx.headers.get("origin").map(|s| s.as_str()).unwrap_or("");
-            if !proxy
-                .allowed_ws_origins
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(origin))
-            {
+            if !websocket_origin_allowed(&proxy.allowed_ws_origins, origin) {
                 warn!(
                     "WebSocket upgrade rejected: Origin '{}' not in allowed_ws_origins for proxy {}",
                     origin, proxy.id
@@ -12205,8 +12472,8 @@ async fn handle_proxy_request_inner(
         //     retry, so retry alone is NOT a reason to buffer.
         //   * The REQUEST body still has to be collected up-front when
         //     retry is configured (caller side), so the retry loop can
-        //     replay it. `proxy_grpc_request` preserves the collected
-        //     request bytes regardless of the `stream_response` flag.
+        //     replay the collected request bytes regardless of the
+        //     `stream_response` flag.
         //   * Streaming IS unsafe when a plugin (or explicit
         //     `response_body_mode = Buffer`) requires the full response
         //     body in memory to make an admission decision.
@@ -12232,9 +12499,9 @@ async fn handle_proxy_request_inner(
         // `proxy_grpc_request_streaming` streams BOTH the request AND the
         // response, which means the request body is consumed on the wire
         // and cannot be replayed — incompatible with retry. Gate it on
-        // `!grpc_has_retry` so retry-enabled streaming proxies still flow
-        // via `proxy_grpc_request` (collects request body up-front,
-        // streams response frame-by-frame).
+        // `!grpc_has_retry` so retry-enabled streaming proxies still use the
+        // buffered-request path (collects request body up-front, streams
+        // response frame-by-frame).
         let grpc_can_use_streaming_fast_path = grpc_should_stream && !grpc_has_retry;
         // Deferred circuit-breaker probe recorder for the fully-streaming fast
         // path. Set only when that path is taken AND the request was admitted as
@@ -12344,8 +12611,7 @@ async fn handle_proxy_request_inner(
             // `Bytes::new()` here on the streaming branch silently fed the
             // retry loop an empty body whenever a body-hook proxy also had
             // `retry_on_connect_failure` enabled. Mirrors the same
-            // single-return contract documented in
-            // `proxy_grpc_request`.
+            // single-return contract used by the buffered-request gRPC path.
             backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
                 backend_admission_plugins.as_ref(),
                 &ctx,
@@ -13871,24 +14137,12 @@ async fn handle_proxy_request_inner(
                     && let (Some(upstream_id), Some(target)) =
                         (&proxy.upstream_id, &upstream_target)
                 {
-                    let has_port_override = backend_dispatch::has_effective_port_override(
+                    let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
                         &proxy,
                         &epoch.load_balancer,
                         upstream_id,
                         target.port,
                     );
-                    let strategy = if has_port_override {
-                        LoadBalancerCache::get_hash_on_strategy_for_port_from(
-                            &epoch.load_balancer,
-                            upstream_id,
-                            target.port,
-                        )
-                    } else {
-                        LoadBalancerCache::get_hash_on_strategy_from(
-                            &epoch.load_balancer,
-                            upstream_id,
-                        )
-                    };
                     if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
                         let upstream =
                             LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
@@ -14586,6 +14840,16 @@ async fn handle_proxy_request_inner(
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
+    // Record the ORIGINAL backend range decision before any `after_proxy` hook
+    // can rewrite the headers. A later plugin (e.g. `response_transformer`) may
+    // strip/rename `Content-Range`, which would otherwise let a body-transform
+    // plugin (`compression`) commit a transform header on a streamed range
+    // response whose body is never actually transformed. Only inserted for
+    // range responses, so the common path stays allocation-free.
+    if response_status == 206 || response_headers.contains_key("content-range") {
+        ctx.metadata
+            .insert(RANGE_RESPONSE_METADATA_KEY.to_string(), "true".to_string());
+    }
     let backend_resolved_ip = backend_resp.backend_resolved_ip;
     let backend_error_class = backend_resp.error_class;
     annotate_gateway_mesh_metadata(
@@ -15015,21 +15279,12 @@ async fn handle_proxy_request_inner(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
     {
-        let has_port_override = backend_dispatch::has_effective_port_override(
+        let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
             &proxy,
             &epoch.load_balancer,
             upstream_id,
             target.port,
         );
-        let strategy = if has_port_override {
-            LoadBalancerCache::get_hash_on_strategy_for_port_from(
-                &epoch.load_balancer,
-                upstream_id,
-                target.port,
-            )
-        } else {
-            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id)
-        };
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
@@ -15642,15 +15897,39 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     proxy: &'a Proxy,
     upstream_target: Option<&UpstreamTarget>,
 ) -> std::borrow::Cow<'a, Proxy> {
-    let Some(overrides) = proxy.dispatch_port_overrides.as_ref() else {
-        return std::borrow::Cow::Borrowed(proxy);
-    };
     let Some(target) = upstream_target else {
         return std::borrow::Cow::Borrowed(proxy);
     };
-    let Some(override_config) = overrides.get(&target.port) else {
+    // Per-port override for the LB-selected target port and the service-discovery
+    // top-level `connectionPool.http` overlay (`Proxy.dispatch_port_override_fallback`)
+    // are FIELD-MERGED, not wholesale-replaced: a per-port `connectionPool.http`
+    // field wins when set, otherwise the top-level overlay's value is inherited —
+    // so an unrelated per-port field (`connectTimeout`/`tls`) no longer wipes the
+    // inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`. This
+    // matches the NON-SD apply-time layering exactly (top-level fan-out, then a
+    // partial per-port overlay; see `apply_connection_pool_http_to_port_override`
+    // in `src/modes/mesh/mod.rs`). Either side may be absent; the owned merge only
+    // fires when BOTH are present (the rare SD-with-explicit-port case).
+    let per_port = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&target.port));
+    let fallback = proxy.dispatch_port_override_fallback.as_ref();
+    let merged: Option<std::borrow::Cow<'_, crate::config::types::ResolvedPortOverride>> =
+        match (per_port, fallback) {
+            (Some(per_port), Some(fallback)) => {
+                let mut owned = per_port.clone();
+                owned.seed_connection_pool_http_from_fallback(fallback);
+                Some(std::borrow::Cow::Owned(owned))
+            }
+            (Some(per_port), None) => Some(std::borrow::Cow::Borrowed(per_port)),
+            (None, Some(fallback)) => Some(std::borrow::Cow::Borrowed(fallback)),
+            (None, None) => None,
+        };
+    let Some(override_config) = merged else {
         return std::borrow::Cow::Borrowed(proxy);
     };
+    let override_config = override_config.as_ref();
 
     // Compare each candidate override against the proxy's current value and
     // build an owned clone only when at least one field actually differs.
@@ -15709,12 +15988,22 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
         .h2_upgrade_policy
         .filter(|new| Some(*new) != proxy.h2_upgrade_policy);
 
+    // Per-port `http1MaxPendingRequests` (DestinationRule `connectionPool.http`).
+    // Drives the reqwest/H1 dispatch path's pending-request gate in
+    // `proxy_to_backend` via the effective proxy's
+    // `pool_http1_max_pending_requests`. Project it when the per-port value
+    // differs from what the proxy already carries.
+    let http1_pending_override = override_config
+        .http1_max_pending_requests
+        .filter(|new| Some(*new) != proxy.pool_http1_max_pending_requests);
+
     if connect_override.is_none()
         && h2_streams_override.is_none()
         && idle_seconds_override.is_none()
         && max_reqs_override.is_none()
         && tls_override.is_none()
         && h2_upgrade_override.is_none()
+        && http1_pending_override.is_none()
     {
         return std::borrow::Cow::Borrowed(proxy);
     }
@@ -15737,6 +16026,9 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     }
     if let Some(policy) = h2_upgrade_override {
         owned.h2_upgrade_policy = Some(policy);
+    }
+    if let Some(pending) = http1_pending_override {
+        owned.pool_http1_max_pending_requests = Some(pending);
     }
     std::borrow::Cow::Owned(owned)
 }
@@ -15786,11 +16078,17 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
 /// `Proxy.dispatch_port_overrides` (no `ArcSwap` load, no allocation unless a
 /// clone is actually needed to reduce the count).
 ///
-/// NOTE on the H3 frontend: the pre-existing H1/H2 dispatch path is where DR
-/// per-port effective-proxy overrides (all of them, not just this cap) are
-/// applied; the standalone H3 frontend (`src/http3/server.rs`) applies NONE of
-/// them. That is pre-existing and moot for mesh (TCP-only capture; H3 is out of
-/// mesh scope) — see `docs/mesh.md` "Dispatch-path coverage".
+/// NOTE on the H3 frontend: the H3→HTTP cross-protocol **plain** bridge now
+/// applies the per-port effective-proxy overrides via
+/// `resolve_effective_proxy_for_target` (idleTimeout / http2MaxRequests / TLS /
+/// h2UpgradePolicy / connectTimeout, plus the service-discovery top-level
+/// fallback). This `maxRetries` cap is NOT yet applied on the H3 frontend
+/// (`cap_proxy_retry_for_target` runs once in `handle_proxy_request_inner` on
+/// the H1/H2 path; the standalone H3 frontend, `src/http3/server.rs`, defers
+/// it), and the native-H3 backend pool and the gRPC bridge flavor likewise
+/// remain effective-proxy-override follow-ups. All moot for mesh (TCP-only
+/// capture; H3 is out of mesh scope) — see `docs/mesh.md` "Dispatch-path
+/// coverage".
 pub(crate) fn cap_proxy_retry_for_target(
     proxy: Arc<Proxy>,
     upstream_target: Option<&UpstreamTarget>,
@@ -15799,15 +16097,29 @@ pub(crate) fn cap_proxy_retry_for_target(
     let Some(existing) = proxy.retry.as_ref() else {
         return proxy;
     };
-    let Some(overrides) = proxy.dispatch_port_overrides.as_ref() else {
-        return proxy;
-    };
     let Some(target) = upstream_target else {
         return proxy;
     };
     // Cap from the SELECTED dispatch target's port override. Retries stay in
     // this port's lane (see docstring), so this cap governs the whole sequence.
-    let Some(cap) = overrides.get(&target.port).and_then(|o| o.max_retries) else {
+    // FIELD-level fallback: the per-port `maxRetries` wins when set, otherwise
+    // the service-discovery top-level `connectionPool.http.maxRetries` overlay
+    // (`Proxy.dispatch_port_override_fallback`) is inherited — so a per-port
+    // entry that sets only an unrelated field (e.g. `connectTimeout`) does not
+    // wipe the inherited top-level cap. Mirrors the field-merge in
+    // `resolve_effective_proxy_for_target` and the non-SD apply-time layering.
+    let cap = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&target.port))
+        .and_then(|o| o.max_retries)
+        .or_else(|| {
+            proxy
+                .dispatch_port_override_fallback
+                .as_ref()
+                .and_then(|o| o.max_retries)
+        });
+    let Some(cap) = cap else {
         return proxy;
     };
     if existing.max_retries <= cap {
@@ -15840,6 +16152,120 @@ pub(crate) fn resolve_backend_max_connections(proxy: &Proxy, dispatch_port: u16)
         .as_ref()
         .and_then(|overrides| overrides.get(&dispatch_port))
         .and_then(|override_config| override_config.max_connections)
+}
+
+/// Resolve the DestinationRule `connectionPool.http.http1MaxPendingRequests`
+/// cap for the destination port a backend dial will target.
+///
+/// Returns `None` (no cap) in the common case: the proxy has no
+/// `dispatch_port_overrides`, the resolved port has no override, or the
+/// override carries no `http1_max_pending_requests`. Hot-path discipline
+/// matches [`resolve_backend_max_connections`]: a single field read on the
+/// precomputed `Proxy.dispatch_port_overrides` map, no `ArcSwap` load.
+///
+/// `dispatch_port` is the port the dial will actually use: the LB-selected
+/// `UpstreamTarget.port` for upstream proxies, or `proxy.backend_port` for a
+/// direct-backend proxy with no upstream.
+///
+/// FIELD-level fallback (#1806 codex r1): when the per-port entry carries no
+/// `http1_max_pending_requests`, inherit the service-discovery top-level
+/// `connectionPool.http.http1MaxPendingRequests` overlay
+/// (`Proxy.dispatch_port_override_fallback`) — so an SD upstream that sets ONLY a
+/// top-level cap (no per-port entry) is still capped, and a per-port entry that
+/// sets an unrelated field does not wipe the inherited cap. Mirrors how
+/// `resolve_effective_proxy_for_target` consumes the fallback.
+pub(crate) fn resolve_backend_http1_max_pending_requests(
+    proxy: &Proxy,
+    dispatch_port: u16,
+) -> Option<u32> {
+    proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&dispatch_port))
+        .and_then(|override_config| override_config.http1_max_pending_requests)
+        .or_else(|| {
+            proxy
+                .dispatch_port_override_fallback
+                .as_ref()
+                .and_then(|fallback| fallback.http1_max_pending_requests)
+        })
+}
+
+/// Whether the reqwest-backed backend client for this (effective) proxy is
+/// **known to dispatch over HTTP/1.1 at acquire time** — the only transport the
+/// `connectionPool.http.http1MaxPendingRequests` pending-request gate applies
+/// to. The gate is consulted ONLY when this returns `true`, so a backend that
+/// MIGHT negotiate h2 is left uncapped (an `http1*` knob must not 503 an h2
+/// backend — that is `http2MaxRequests`'s job).
+///
+/// HTTP/1.1 is *known* in exactly three cases:
+///
+/// * `proxy.forces_backend_http1_only()` — DestinationRule
+///   `h2UpgradePolicy: DO_NOT_UPGRADE` restricts the reqwest client's ALPN to
+///   `http/1.1` (see `BackendTlsConfigBuilder::build_reqwest`), so even an
+///   h2-capable backend is pinned to HTTP/1.1; or
+/// * the backend scheme is **plaintext `http`** (`DispatchKind::HttpPool`,
+///   i.e. `!is_tls_backend()` on the HTTP-family reqwest path) — reqwest never
+///   speaks h2c / HTTP/2-prior-knowledge over cleartext, so every cleartext
+///   dial is HTTP/1.1; or
+/// * the backend is **HTTPS but the capability registry has already classified
+///   this target H2/TLS-unsupported (H1-only)** — the direct-H2 pool fork
+///   (`direct_h2_known_unsupported` in `proxy_to_backend`) then bypasses the H2
+///   pool and falls to this reqwest path, where the backend re-negotiates
+///   HTTP/1.1 every time (the verdict was learned from a prior
+///   `Http2PoolError::BackendSelectedHttp1` fallback or a startup probe), so the
+///   dispatch is known HTTP/1.1 at acquire time and must be capped.
+///
+/// A **HTTPS** backend with no H1-only registry verdict MAY still negotiate h2
+/// via ALPN — unknown until the TLS handshake completes — so it is deliberately
+/// NOT capped (an `http1*` knob must not 503 a reqwest dispatch that becomes h2).
+/// This holds **even when `pool_enable_http2 == false`** (codex r6): that flag
+/// only steers `should_dispatch_direct_h2` away from the direct-H2 pool onto
+/// reqwest — it does NOT set reqwest `http1_only()` nor restrict the rustls ALPN
+/// (only `forces_backend_http1_only()` does, see `build_rustls_for_reqwest`), so
+/// the reqwest client still advertises h2 ALPN and the dial can become h2.
+/// (That `pool_enable_http2=false` doesn't enforce H1 on the reqwest client is a
+/// separate pre-existing gap, tracked in the F5.1 follow-up.) The
+/// buffered/retained-body bypass
+/// (`enable_http2 && (retain_request_body || requires_request_body_buffering)`)
+/// likewise stays uncapped absent a registry verdict.
+///
+/// Only ever called after a non-`None` `http1MaxPendingRequests` cap has been
+/// resolved (the rare case a DestinationRule sets the knob), so the
+/// `for_proxy` pool-config resolve and registry lookup never run on the no-cap
+/// hot path.
+pub(crate) fn reqwest_dispatch_is_http1_only(
+    state: &ProxyState,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> bool {
+    if proxy.forces_backend_http1_only() {
+        return true;
+    }
+    // Plaintext `http` backend: reqwest dispatches HTTP/1.1 (no h2c / prior
+    // knowledge over cleartext), so the H1 cap applies regardless of the h2
+    // preference. Only an HTTPS backend can ALPN-negotiate h2.
+    if !proxy.dispatch_kind.is_tls_backend() {
+        return true;
+    }
+    // HTTPS backend: HTTP/1.1 is *known* only when the capability registry has
+    // already classified this target H2/TLS-unsupported — then, even though the
+    // reqwest client still advertises h2 ALPN, the backend negotiates h1, and
+    // `proxy_to_backend`'s direct-H2 fork keys this exact verdict
+    // (`record.plain_http.h2_tls == Unsupported`) to bypass the H2 pool and fall
+    // to reqwest-H1. `pool_enable_http2 == false` is deliberately NOT treated as
+    // known-H1 (codex r6): it does not set reqwest `http1_only()` / restrict the
+    // ALPN, so that dispatch can still become h2 (see the doc comment above).
+    // Lookup is the same alloc-free thread-local-keyed `get` the H2 fork uses.
+    state
+        .backend_capabilities
+        .get(proxy, upstream_target)
+        .is_some_and(|record| {
+            matches!(
+                record.plain_http.h2_tls,
+                crate::proxy::backend_capabilities::ProtocolSupport::Unsupported
+            )
+        })
 }
 
 /// Resolve the per-port retry lane after a concrete target has failed.
@@ -16056,9 +16482,70 @@ pub(crate) async fn proxy_to_backend_retry(
         req_builder = req_builder.body(body.to_vec());
     }
 
+    // DestinationRule `connectionPool.http.http1MaxPendingRequests`: re-enter the
+    // same per-`(host, port)` pending gate as the initial attempt
+    // (`proxy_to_backend`). The initial attempt's slot was already released
+    // before the retry loop ran (it drops the moment that attempt's `send()`
+    // returns), so a retry no longer overlaps it — without acquiring here, a
+    // `retry_on_connect_failure`-driven retry storm would dial this destination
+    // unboundedly, bypassing the cap. Acquire under the SAME H1 predicate
+    // (`reqwest_dispatch_is_http1_only`). Under the in-flight reinterpretation
+    // (see `proxy_to_backend` / `docs/mesh.md`) every H1-determined attempt
+    // counts, so there is no body-shape exclusion. The slot is released the
+    // instant this attempt's `send()` returns (the `drop` below), so it spans
+    // only this attempt's in-flight window and an attempt never double-counts.
+    let retry_dispatch_port = upstream_target
+        .map(|t| t.port)
+        .unwrap_or(proxy.backend_port);
+    let retry_pending_cap = resolve_backend_http1_max_pending_requests(proxy, retry_dispatch_port)
+        .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
+    let retry_pending_slot = match state.backend_pending_limit.try_acquire(
+        effective_host,
+        retry_dispatch_port,
+        retry_pending_cap,
+    ) {
+        Ok(slot) => slot,
+        Err(limit) => {
+            warn!(
+                proxy_id = %proxy.id,
+                backend_host = %effective_host,
+                backend_port = retry_dispatch_port,
+                pending_requests = limit.current,
+                max_pending_requests = limit.cap,
+                "Shedding HTTP/1.1 retry: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
+            );
+            // Gateway-side capacity shed before the retry dial: classify
+            // `DispatchPolicyRejected` (NOT a connection_error) so the retry
+            // loop does not treat the shed as another connect failure and
+            // amplify the overflow. That class is a no-backend-signal
+            // (`client_side_no_backend_signal`), so this overflow 503 stays
+            // NEUTRAL to backend health/CB/AC, mirroring the initial-attempt
+            // shed.
+            return retry::BackendResponse {
+                status_code: 503,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Upstream pending request queue full"}"#
+                        .as_bytes()
+                        .to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip.clone(),
+                error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+            };
+        }
+    };
+
     let mut reqwest_backend_guard =
         Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
-    match req_builder.send().await {
+    let send_result = req_builder.send().await;
+    // Release this retry attempt's in-flight slot the instant `send()` resolves
+    // (response headers / dial failure) — BEFORE any response-body collection —
+    // so it spans this attempt's dispatch → response-headers window only, never
+    // the response lifetime. A no-cap / non-HTTP-1.1 retry holds `None` here, so
+    // the drop is a no-op.
+    drop(retry_pending_slot);
+    match send_result {
         Ok(response) => {
             let status = response.status().as_u16();
             let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -17170,6 +17657,98 @@ async fn proxy_to_backend(
         }
     }
 
+    // DestinationRule `connectionPool.http.http1MaxPendingRequests`: bound the
+    // number of concurrent in-flight HTTP/1.1 requests to this backend
+    // destination on the reqwest/HTTP-1.1 dispatch path (in-flight
+    // reinterpretation — see the detailed note below and `docs/mesh.md`). The
+    // slot is acquired here, AFTER local 413 / plugin rejections and
+    // request-body collection / final-body hooks, immediately before backend
+    // admission and the dispatch onto the shared reqwest client.
+    //
+    // Released the moment `send().await` returns (see the explicit `drop` below)
+    // — BEFORE any response-body collection — so the slot spans dispatch →
+    // response-headers (the in-flight window reqwest exposes), NOT the
+    // response-stream / response-buffering lifetime. When the destination is at
+    // its in-flight cap the request is shed with a 503 ("upstream overflow"),
+    // NOT queued unboundedly.
+    //
+    // HTTP/1.1-scoped: the direct-H2 / gRPC / H3 / HBONE / mesh-mTLS branches
+    // above already returned before reaching here, so the multiplexed transports
+    // never consult this gate. The reqwest fallback ALSO negotiates ALPN HTTP/2
+    // when the direct-H2 pool is bypassed for a buffered/retained body
+    // (`enable_http2 && (retain_request_body || requires_request_body_buffering)`);
+    // an H2 backend must not be capped by an `http1*` knob, so the slot is taken
+    // only when the reqwest client is forced/known HTTP/1.1
+    // (`reqwest_dispatch_is_http1_only`). Their concurrency is instead governed
+    // by `http2MaxRequests` → `h2_max_concurrent_streams`.
+    //
+    // In-flight reinterpretation (codex r3, finding 3): reqwest's `send()`
+    // resolves when RESPONSE HEADERS arrive, not when a connection slot is
+    // assigned, and reqwest exposes no connection-acquisition hook — so a slot
+    // held acquire-before-send / release-after-send inevitably spans
+    // connection-wait + upload + backend-TTFB. We therefore CANNOT implement
+    // Envoy's true pending-queue depth over reqwest. Mirroring how this repo
+    // honestly reinterprets DR `maxRetries` as a per-request cap, the knob is
+    // reframed as a **max concurrent in-flight HTTP/1.1 requests per
+    // `(host, port)`** cap (measured dispatch → response-headers), shedding
+    // excess with a 503 ("upstream overflow"). Under that framing a streamed
+    // upload IS legitimately in-flight, so there is NO body-shape exclusion —
+    // bodyless GET/HEAD/OPTIONS (where `stream_request_body` is true) are capped
+    // too, which is the most common H1 traffic. The connection-failure retry
+    // path (`proxy_to_backend_retry`) re-enters this same gate per attempt (see
+    // its own acquire); the initial slot is already released before the retry
+    // loop runs, so an attempt and its retry never double-count.
+    let pending_dispatch_port = upstream_target
+        .map(|t| t.port)
+        .unwrap_or(proxy.backend_port);
+    let pending_cap = resolve_backend_http1_max_pending_requests(proxy, pending_dispatch_port)
+        // Only an HTTP/1.1-determined reqwest dispatch consults the gate; a
+        // reqwest fallback that may ALPN-negotiate h2 ignores the `http1*` cap.
+        .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
+    let pending_slot = match state.backend_pending_limit.try_acquire(
+        effective_host,
+        pending_dispatch_port,
+        pending_cap,
+    ) {
+        Ok(slot) => slot,
+        Err(limit) => {
+            warn!(
+                proxy_id = %proxy.id,
+                backend_host = %effective_host,
+                backend_port = pending_dispatch_port,
+                pending_requests = limit.current,
+                max_pending_requests = limit.cap,
+                "Shedding HTTP/1.1 request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
+            );
+            return backend_dispatch_response(
+                retry::BackendResponse {
+                    status_code: 503,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Upstream pending request queue full"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    // Gateway-side capacity shed before any backend dial: the
+                    // request never reached the backend application layer, so it
+                    // is classified `DispatchPolicyRejected` (NOT a transport
+                    // connection_error). That class is now a no-backend-signal
+                    // (`client_side_no_backend_signal`), so this overflow 503 is
+                    // NEUTRAL to backend health: it is not retried, does not trip
+                    // the backend circuit breaker / passive health, and does not
+                    // shrink the adaptive-concurrency permit for a backend that
+                    // was never dialed — mirrors the backend-TLS-SNI gateway
+                    // reject above.
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
+                    error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                },
+                None,
+                None,
+            );
+        }
+    };
+
     backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
         backend_admission_plugins,
         request_ctx,
@@ -17187,7 +17766,18 @@ async fn proxy_to_backend(
     // Send
     let mut reqwest_backend_guard =
         Some(crate::runtime_metrics::global_ref().reqwest_backend_request_guard());
-    let response = match req_builder.send().await {
+    let send_result = req_builder.send().await;
+    // Release the in-flight slot the instant `send()` resolves — i.e. when
+    // RESPONSE HEADERS arrive (or the dial failed). This is the only join point
+    // reqwest exposes, so under the in-flight reinterpretation it IS the correct
+    // release point by definition (codex r3, finding 3): the slot spans dispatch
+    // → response-headers. Dropping here — before response-body collection /
+    // eager buffering / response-inspection — keeps the slot off the
+    // response-streaming lifetime. RAII covers all the early returns ABOVE this
+    // point (admission reject); this explicit drop covers the response-handling
+    // tail BELOW it. A no-cap / non-HTTP-1.1 dispatch holds `None`, so it no-ops.
+    drop(pending_slot);
+    let response = match send_result {
         Ok(response) => {
             // A streaming request body that overran `max_request_body_size_bytes`
             // is authoritative regardless of how the send/receive race resolved.
@@ -17240,6 +17830,7 @@ async fn proxy_to_backend(
                 proxy,
                 plugins,
                 response_decision_ctx,
+                status,
                 &resp_headers,
             );
 
@@ -17976,6 +18567,18 @@ pub fn check_protocol_headers(
                         r#"{"error":"Content-Length header contains invalid non-numeric value"}"#,
                     );
                 }
+                if trimmed
+                    .iter()
+                    .try_fold(0usize, |acc, &digit| {
+                        acc.checked_mul(10)
+                            .and_then(|acc| acc.checked_add((digit - b'0') as usize))
+                    })
+                    .is_none()
+                {
+                    return Some(
+                        r#"{"error":"Content-Length header exceeds supported integer range"}"#,
+                    );
+                }
                 // 2b. All tokens must agree on the same value
                 match canonical {
                     None => canonical = Some(trimmed),
@@ -18615,6 +19218,7 @@ async fn proxy_to_backend_hbone(
         proxy,
         plugins,
         ctx,
+        status,
         &resp_headers,
     );
 
@@ -19126,6 +19730,7 @@ async fn proxy_to_backend_mesh_mtls(
         proxy,
         plugins,
         ctx,
+        status,
         &resp_headers,
     );
 
@@ -19411,6 +20016,7 @@ async fn proxy_to_backend_http2(
         proxy,
         plugins,
         ctx,
+        status,
         &resp_headers,
     );
 
@@ -20216,6 +20822,27 @@ async fn proxy_to_backend_http3(
             }
         }
     } else {
+        // RESIDUAL (range/SSE buffering downgrade): unlike the reqwest and
+        // direct-H2/HBONE backend paths — which call
+        // `refine_stream_response_for_content_type` once the response headers
+        // are known and downgrade a buffered decision to streaming for a
+        // `206`/`Content-Range` (or SSE) body — the H3 pool's `.request()` /
+        // `.request_with_target()` methods drain the whole body internally and
+        // only hand back already-buffered `response.body`, so the response
+        // content-type/status are not observable before the drain. A large
+        // ranged H3-backend download therefore stays buffered here and is
+        // capped by the pool's size limit (graceful `502 ResponseBodyTooLarge`,
+        // never an OOM) rather than streamed through. This is a
+        // graceful-degradation gap, NOT a correctness bug: the range mislabel /
+        // byte-offset corruption that motivated the marker is already prevented
+        // because the sole caller stamps `RANGE_RESPONSE_METADATA_KEY` from the
+        // pristine headers before its `after_proxy` phase (see the H1/H2 stamp
+        // in `handle_proxy_request_inner`), so `compression.after_proxy` declines
+        // to compress regardless. Closing this fully needs the H3 buffered pool
+        // call to expose pre-drain headers + `recv_stream` (as
+        // `request_streaming_incoming_body` already does) so the same
+        // header-time downgrade can run before draining; deferred to keep this
+        // hot-path/pool change out of a guard-hardening PR.
         let h3_result = if let Some(target) = upstream_target {
             let target_host = target.host.clone();
             let target_port = target.port;
@@ -20970,6 +21597,83 @@ mod tests {
         );
     }
 
+    /// F3 §3.3 Stage 4: the UDP egress upstreams are referenced by NO config
+    /// proxy, so without a dedicated enrollment pass `retain_keys` would evict
+    /// their HBONE records and every Ambient UDP dial would 502 forever.
+    /// `collect_mesh_tcp_egress_capability_targets` must enroll the Ambient
+    /// `mesh.hbone` UDP per-port targets (keyed by the SAME deterministic UDP
+    /// relay proxy dispatch uses).
+    #[test]
+    fn collect_mesh_udp_egress_capability_targets_enrolls_hbone() {
+        use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+
+        let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
+        let svc = MeshService {
+            name: "dns".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 53,
+                protocol: AppProtocol::Udp,
+                name: Some("dns".to_string()),
+                target_port: None,
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: HashMap::new(),
+            cluster_ips: vec!["10.96.0.10".to_string()],
+        };
+        let udp_id = crate::modes::mesh::mesh_outbound_udp_upstream_id("default", "dns", 53);
+        let upstream: Upstream = serde_json::from_value(json!({
+            "id": udp_id,
+            "name": "dns.default.svc.cluster.local",
+            "targets": [{
+                "host": "10.0.0.9",
+                "port": 53,
+                "tags": {"mesh.hbone": "true", "mesh.spiffe_id": spiffe},
+            }],
+        }))
+        .expect("upstream deserializes");
+        let config = GatewayConfig {
+            upstreams: vec![upstream],
+            mesh: Some(Box::new(MeshConfig {
+                services: vec![svc],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+
+        let upstream_map: HashMap<&str, &Upstream> = config
+            .upstreams
+            .iter()
+            .map(|u| (u.id.as_str(), u))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut targets = Vec::new();
+        ProxyState::collect_mesh_tcp_egress_capability_targets(
+            &config,
+            &upstream_map,
+            &mut seen,
+            &mut targets,
+        );
+
+        let relay =
+            crate::modes::mesh::mesh_outbound_udp_relay_proxy("default", "dns", 53, &udp_id);
+        let expected =
+            BackendCapabilityProbeTarget::from_proxy(&relay, Some(&config.upstreams[0].targets[0]));
+        let enrolled = targets
+            .iter()
+            .find(|t| t.key == expected.key)
+            .expect("the UDP Ambient HBONE target is enrolled for probing");
+        assert!(
+            enrolled.hbone_hint,
+            "the enrolled UDP target opts into HBONE probing"
+        );
+        assert_eq!(
+            enrolled.hbone_expected_peer.as_ref().map(|p| p.as_str()),
+            Some(spiffe),
+            "the HBONE probe pins the same destination identity dispatch uses"
+        );
+    }
+
     /// Exercises `GrpcStreamingProbeRecorder` against a real breaker. Since
     /// #1649 item 3 the recorder ONLY settles the HALF_OPEN probe slot — it
     /// records a NEUTRAL outcome (release, no heal/trip) at the join of header
@@ -21437,6 +22141,8 @@ mod tests {
             &self,
             _ctx: &RequestContext,
             content_type: Option<&str>,
+            _response_status: u16,
+            _response_headers: &HashMap<String, String>,
         ) -> bool {
             content_type == Some(self.buffer_content_type)
         }
@@ -23000,6 +23706,7 @@ mod tests {
             &proxy,
             &plugins,
             Some(&ctx),
+            200,
             &json_headers,
         ));
 
@@ -23009,6 +23716,7 @@ mod tests {
             &proxy,
             &plugins,
             Some(&ctx),
+            200,
             &binary_headers,
         ));
 
@@ -23037,6 +23745,7 @@ mod tests {
             &proxy,
             &relabel_plugins,
             Some(&ctx),
+            200,
             &binary_headers,
         ));
 
@@ -23065,6 +23774,7 @@ mod tests {
             &proxy,
             &route_relabel_plugins,
             Some(&route_ctx),
+            200,
             &binary_headers,
         ));
 
@@ -23074,6 +23784,7 @@ mod tests {
             &proxy,
             &plugins,
             Some(&ctx),
+            200,
             &json_headers,
         ));
 
@@ -23084,6 +23795,7 @@ mod tests {
             &buffered_proxy,
             &plugins,
             Some(&ctx),
+            200,
             &binary_headers,
         ));
 
@@ -23094,6 +23806,7 @@ mod tests {
             &proxy,
             &plugins,
             None,
+            200,
             &binary_headers,
         ));
 
@@ -23107,6 +23820,7 @@ mod tests {
             &proxy,
             &always,
             Some(&ctx),
+            200,
             &binary_headers,
         ));
     }
@@ -23126,7 +23840,6 @@ mod tests {
             retry::ErrorClass::ProtocolError,
             retry::ErrorClass::DnsLookupError,
             retry::ErrorClass::PortExhaustion,
-            retry::ErrorClass::ConnectionPoolError,
         ] {
             assert!(
                 is_h3_transport_error_class(class),
@@ -23154,12 +23867,17 @@ mod tests {
         // `ReadWriteTimeout` is excluded for the same capability reason:
         // a backend that stalls after accepting a request is slow or wedged,
         // but it has not proved that the native H3 pool itself is invalid.
+        //
+        // `ConnectionPoolError` is also excluded: local QUIC endpoint/config
+        // failures such as CID exhaustion or endpoint shutdown are gateway-side
+        // resource conditions, not evidence that the backend lost H3 support.
         for class in [
             retry::ErrorClass::ClientDisconnect,
             retry::ErrorClass::RequestBodyTooLarge,
             retry::ErrorClass::ResponseBodyTooLarge,
             retry::ErrorClass::GracefulRemoteClose,
             retry::ErrorClass::ReadWriteTimeout,
+            retry::ErrorClass::ConnectionPoolError,
             retry::ErrorClass::DispatchPolicyRejected,
             retry::ErrorClass::RequestError,
         ] {
@@ -25246,7 +25964,7 @@ mod tests {
         crate::identity::SvidBundle {
             spiffe_id,
             cert_chain_der: vec![vec![42]],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles,
         }
     }
@@ -26125,6 +26843,64 @@ mod tests {
         );
     }
 
+    // ── DestinationRule per-port http1MaxPendingRequests resolution ──────
+    //
+    // `resolve_backend_http1_max_pending_requests` is the projection seam the
+    // reqwest/H1 dispatch path reads to enforce
+    // `connectionPool.http.http1MaxPendingRequests`. Same contract shape as the
+    // maxConnections resolver: the cap surfaces only for the matching
+    // destination port; no-override / no-cap / wrong-port all return `None`.
+
+    fn proxy_with_http1_pending_override(port: u16, cap: Option<u32>) -> Proxy {
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "id": "p-pending",
+            "backend_host": "backend.local",
+            "backend_port": 8080,
+            "upstream_id": "u1",
+        }))
+        .expect("test proxy should deserialize");
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            port,
+            crate::config::types::ResolvedPortOverride {
+                http1_max_pending_requests: cap,
+                ..Default::default()
+            },
+        )]));
+        proxy
+    }
+
+    #[test]
+    fn resolve_backend_http1_max_pending_returns_cap_for_matching_port() {
+        let proxy = proxy_with_http1_pending_override(8080, Some(64));
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&proxy, 8080),
+            Some(64),
+            "cap must surface for the matching destination port"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_http1_max_pending_none_for_other_port_or_no_override() {
+        let proxy = proxy_with_http1_pending_override(8080, Some(64));
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&proxy, 9090),
+            None,
+            "a port without an override must be unbounded"
+        );
+        let no_overrides = proxy_with_port_overrides_for_test(5000, &[]);
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&no_overrides, 8080),
+            None,
+            "a proxy with no port overrides must be unbounded"
+        );
+        let lacks_cap = proxy_with_http1_pending_override(8080, None);
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&lacks_cap, 8080),
+            None,
+            "an override without http1_max_pending_requests must be unbounded"
+        );
+    }
+
     #[test]
     fn resolve_effective_proxy_returns_borrowed_when_no_upstream_target() {
         // Direct-backend proxy (no upstream) → no per-target lookup possible.
@@ -26200,6 +26976,25 @@ mod tests {
         let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
         assert!(matches!(effective, std::borrow::Cow::Owned(_)));
         assert_eq!(effective.pool_max_requests_per_connection, Some(40));
+    }
+
+    #[test]
+    fn resolve_effective_proxy_projects_http1_max_pending_requests_per_port() {
+        // The per-port `http1MaxPendingRequests` cap projects onto the effective
+        // proxy's `pool_http1_max_pending_requests`, which the reqwest/H1
+        // dispatch gate then reads (via `resolve_backend_http1_max_pending_requests`).
+        let proxy = proxy_with_http1_pending_override(8080, Some(64));
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Owned(_)),
+            "differing pending cap must take the owned-clone branch"
+        );
+        assert_eq!(effective.pool_http1_max_pending_requests, Some(64));
+        assert!(
+            proxy.pool_http1_max_pending_requests.is_none(),
+            "original proxy is untouched"
+        );
     }
 
     #[test]
@@ -26615,6 +27410,7 @@ mod tests {
             backend_tls_sni: None,
             backend_tls_san_allow_list: Vec::new(),
             resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: None,
             api_spec_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -26671,6 +27467,7 @@ mod tests {
                 backend_tls_sni: None,
                 backend_tls_san_allow_list: Vec::new(),
                 resolved_subset_tls: HashMap::new(),
+                dispatch_port_override_fallback: None,
                 api_spec_id: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
@@ -26682,6 +27479,442 @@ mod tests {
             config_no_overrides.proxies[0]
                 .dispatch_port_overrides
                 .is_none()
+        );
+    }
+
+    // ── #1806: service-discovery top-level connectionPool.http fallback ───
+    //
+    // SD upstreams cannot fan the top-level `connectionPool.http` overlay onto
+    // a known apply-time port set (targets resolve at runtime), so the overlay
+    // is carried on `Proxy.dispatch_port_override_fallback` and applied by the
+    // LB-selected target port at dispatch. An explicit per-port override for
+    // the selected port still wins.
+
+    #[test]
+    fn resolve_effective_proxy_applies_sd_fallback_by_selected_port() {
+        // SD top-level overlay only: any selected port with no explicit per-port
+        // entry picks up the fallback (here `http2MaxRequests` →
+        // `pool_http2_max_concurrent_streams`).
+        let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        assert!(proxy.dispatch_port_overrides.is_none());
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            h2_max_concurrent_streams: Some(64),
+            ..Default::default()
+        });
+
+        // Port 9090 has no explicit per-port entry → fallback applies (owned).
+        let target = target_for_test(9090);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert!(
+            matches!(effective, std::borrow::Cow::Owned(_)),
+            "SD top-level fallback must produce an owned clone on the selected port"
+        );
+        assert_eq!(effective.pool_http2_max_concurrent_streams, Some(64));
+
+        // A different selected port ALSO gets the fallback (it is not keyed to a
+        // specific port — that is the whole point for runtime-resolved SD ports).
+        let other = target_for_test(7070);
+        let effective_other = resolve_effective_proxy_for_target(&proxy, Some(&other));
+        assert_eq!(effective_other.pool_http2_max_concurrent_streams, Some(64));
+
+        // No target → cannot resolve a port → borrowed, fallback not applied.
+        let none = resolve_effective_proxy_for_target(&proxy, None);
+        assert!(matches!(none, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn resolve_effective_proxy_per_port_wins_over_sd_fallback() {
+        // Both a per-port entry (port 8080) and the SD fallback are present.
+        // The selected port's explicit per-port entry must win; a different
+        // selected port falls back to the top-level overlay.
+        let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080u16,
+            crate::config::types::ResolvedPortOverride {
+                h2_max_concurrent_streams: Some(10),
+                ..Default::default()
+            },
+        )]));
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            h2_max_concurrent_streams: Some(64),
+            ..Default::default()
+        });
+
+        // Selected port 8080 → per-port entry wins (10, not the fallback 64).
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert_eq!(
+            effective.pool_http2_max_concurrent_streams,
+            Some(10),
+            "explicit per-port portLevelSettings must win over the SD top-level fallback"
+        );
+
+        // Selected port 9090 has no per-port entry → fallback (64).
+        let other = target_for_test(9090);
+        let effective_other = resolve_effective_proxy_for_target(&proxy, Some(&other));
+        assert_eq!(effective_other.pool_http2_max_concurrent_streams, Some(64));
+    }
+
+    #[test]
+    fn resolve_effective_proxy_field_merges_sd_fallback_with_partial_per_port() {
+        // codex r1 #1806: a partial per-port `portLevelSettings` entry that sets
+        // ONLY an unrelated field (here `connectTimeout`) must NOT wipe the
+        // inherited top-level `connectionPool.http` overlay
+        // (`idleTimeout`/`http2MaxRequests`/`maxRetries`/`http1MaxPendingRequests`).
+        // The per-port field wins where set; otherwise the fallback is inherited —
+        // exactly the non-SD apply-time layering
+        // (`apply_connection_pool_http_to_port_override`).
+        let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080u16,
+            crate::config::types::ResolvedPortOverride {
+                // Per-port sets connectTimeout + ONE http field
+                // (h2_max_concurrent_streams) — the rest must come from the
+                // fallback.
+                connect_timeout_ms: Some(750),
+                h2_max_concurrent_streams: Some(10),
+                ..Default::default()
+            },
+        )]));
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            h2_max_concurrent_streams: Some(64),
+            http_idle_timeout_ms: Some(120_000),
+            http1_max_pending_requests: Some(32),
+            ..Default::default()
+        });
+
+        let target = target_for_test(8080);
+        let effective = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        // Per-port connectTimeout applied.
+        assert_eq!(effective.backend_connect_timeout_ms, 750);
+        // Per-port http2MaxRequests wins over the fallback (10, not 64).
+        assert_eq!(
+            effective.pool_http2_max_concurrent_streams,
+            Some(10),
+            "per-port http2MaxRequests must win over the inherited fallback"
+        );
+        // idleTimeout NOT set per-port → inherited from the fallback (120s).
+        assert_eq!(
+            effective.pool_idle_timeout_seconds,
+            Some(120),
+            "an unrelated per-port field must not wipe the inherited top-level idleTimeout"
+        );
+        // http1MaxPendingRequests NOT set per-port → inherited from the fallback.
+        assert_eq!(
+            effective.pool_http1_max_pending_requests,
+            Some(32),
+            "an unrelated per-port field must not wipe the inherited top-level http1MaxPendingRequests"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_http1_max_pending_inherits_sd_fallback() {
+        // codex r1 #1806 finding 2: an SD upstream with ONLY a top-level
+        // `http1MaxPendingRequests` (no per-port entry) must still be capped.
+        let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            http1_max_pending_requests: Some(16),
+            ..Default::default()
+        });
+        assert!(proxy.dispatch_port_overrides.is_none());
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&proxy, 9090),
+            Some(16),
+            "SD top-level http1MaxPendingRequests must cap a runtime-resolved port with no per-port entry"
+        );
+
+        // codex r1 #1806 finding 3: a partial per-port entry (sets only an
+        // unrelated field) must inherit the fallback cap, not wipe it.
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080u16,
+            crate::config::types::ResolvedPortOverride {
+                connect_timeout_ms: Some(750),
+                ..Default::default()
+            },
+        )]));
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&proxy, 8080),
+            Some(16),
+            "a per-port entry without http1MaxPendingRequests must inherit the SD fallback cap"
+        );
+
+        // An explicit per-port cap still wins for its own port.
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080u16,
+            crate::config::types::ResolvedPortOverride {
+                http1_max_pending_requests: Some(4),
+                ..Default::default()
+            },
+        )]));
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(&proxy, 8080),
+            Some(4),
+            "explicit per-port http1MaxPendingRequests must win over the SD fallback"
+        );
+    }
+
+    #[test]
+    fn cap_proxy_retry_field_merges_partial_per_port_with_sd_fallback() {
+        // codex r1 #1806 finding 3: a per-port entry that sets only an unrelated
+        // field must inherit the SD top-level `maxRetries` cap, not lose it.
+        let mut inner = (*proxy_with_max_retries_override(None)).clone();
+        inner.dispatch_port_overrides = Some(HashMap::from([(
+            8080u16,
+            crate::config::types::ResolvedPortOverride {
+                // Sets ONLY connectTimeout — no maxRetries.
+                connect_timeout_ms: Some(750),
+                ..Default::default()
+            },
+        )]));
+        inner.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            max_retries: Some(2),
+            ..Default::default()
+        });
+        inner.retry = Some(crate::config::types::RetryConfig {
+            max_retries: 5,
+            ..Default::default()
+        });
+        let proxy = Arc::new(inner);
+        let target = target_for_test(8080);
+        let capped = cap_proxy_retry_for_target(proxy, Some(&target));
+        assert_eq!(
+            capped.retry.as_ref().unwrap().max_retries,
+            2,
+            "a partial per-port entry must inherit the SD top-level maxRetries cap"
+        );
+    }
+
+    #[test]
+    fn cap_proxy_retry_applies_sd_fallback_max_retries() {
+        // SD top-level `maxRetries` fallback caps the per-request retry count on
+        // whatever port the target resolves to (no explicit per-port entry).
+        let mut inner = (*proxy_with_max_retries_override(None)).clone();
+        inner.dispatch_port_overrides = None;
+        inner.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            max_retries: Some(2),
+            ..Default::default()
+        });
+        inner.retry = Some(crate::config::types::RetryConfig {
+            max_retries: 5,
+            ..Default::default()
+        });
+        let proxy = Arc::new(inner);
+        let target = target_for_test(9090);
+        let capped = cap_proxy_retry_for_target(proxy, Some(&target));
+        assert_eq!(
+            capped.retry.as_ref().unwrap().max_retries,
+            2,
+            "SD top-level maxRetries fallback must cap an existing larger policy"
+        );
+    }
+
+    #[test]
+    fn cap_proxy_retry_per_port_wins_over_sd_fallback() {
+        // Explicit per-port `maxRetries` (port 8080) wins over the SD fallback
+        // for that port; a different port uses the fallback.
+        let mut inner = (*proxy_with_max_retries_overrides(&[(8080, 4)])).clone();
+        inner.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            max_retries: Some(1),
+            ..Default::default()
+        });
+        inner.retry = Some(crate::config::types::RetryConfig {
+            max_retries: 9,
+            ..Default::default()
+        });
+        let proxy = Arc::new(inner);
+
+        // Port 8080 → per-port cap 4 wins over the fallback cap 1.
+        let target = target_for_test(8080);
+        let capped = cap_proxy_retry_for_target(proxy.clone(), Some(&target));
+        assert_eq!(
+            capped.retry.as_ref().unwrap().max_retries,
+            4,
+            "explicit per-port maxRetries must win over the SD fallback"
+        );
+
+        // Port 9090 → no per-port entry → fallback cap 1.
+        let other = target_for_test(9090);
+        let capped_other = cap_proxy_retry_for_target(proxy, Some(&other));
+        assert_eq!(capped_other.retry.as_ref().unwrap().max_retries, 1);
+    }
+
+    #[test]
+    fn resolve_dispatch_port_overrides_projects_sd_fallback_onto_proxies() {
+        // Cold-path projection: a service-discovery upstream's
+        // `dispatch_port_override_fallback` lands on the referencing proxy's
+        // `dispatch_port_override_fallback`, independently of the per-port map.
+        use crate::config::types::{Upstream, UpstreamPortOverride};
+        let mut upstream = Upstream {
+            id: "u1".to_string(),
+            namespace: "ferrum".to_string(),
+            name: Some("u1".to_string()),
+            targets: Vec::new(),
+            algorithm: Default::default(),
+            hash_on: None,
+            hash_on_cookie_config: None,
+            health_checks: None,
+            service_discovery: None,
+            subsets: None,
+            port_overrides: HashMap::new(),
+            source_locality: None,
+            locality_lb_strict: false,
+            locality_lb_setting: None,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            backend_tls_sni: None,
+            backend_tls_san_allow_list: Vec::new(),
+            resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: Some(UpstreamPortOverride {
+                max_retries: Some(2),
+                h2_max_concurrent_streams: Some(64),
+                ..Default::default()
+            }),
+            api_spec_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        // The fallback projects even when the per-port map is empty (the SD case).
+        assert!(upstream.port_overrides.is_empty());
+        upstream.normalize_fields();
+
+        let proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        let mut config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream],
+            ..GatewayConfig::default()
+        };
+        config.resolve_dispatch_port_overrides();
+        // No per-port entries → dispatch_port_overrides stays None ...
+        assert!(config.proxies[0].dispatch_port_overrides.is_none());
+        // ... but the top-level fallback is projected onto the proxy.
+        let fallback = config.proxies[0]
+            .dispatch_port_override_fallback
+            .as_ref()
+            .expect("SD top-level fallback must project onto the referencing proxy");
+        assert_eq!(fallback.max_retries, Some(2));
+        assert_eq!(fallback.h2_max_concurrent_streams, Some(64));
+    }
+
+    /// #1806 (narrowed; follow-up #1816): an SD upstream whose Service uses a
+    /// NAMED `targetPort` stores the explicit per-port `connectionPool.http` entry
+    /// under the DECLARED service port (named targetPorts can't be remapped at
+    /// apply time), while the LB-selected target carries the RESOLVED workload
+    /// port. When the resolved port MATCHES the service port the per-port entry
+    /// wins (field-merged over the top-level fallback); when it does NOT (the
+    /// named-targetPort case) the per-port lookup MISSES and the TOP-LEVEL fallback
+    /// applies instead — applying the explicit per-port value to a named-targetPort
+    /// SD upstream is a DEFERRED accepted limitation (#1816). This test pins both.
+    #[test]
+    fn sd_named_target_port_falls_back_to_top_level_connection_pool_http() {
+        use crate::config::types::{Upstream, UpstreamPortOverride};
+        // SD upstream: service port 80 carries an explicit per-port
+        // `http1MaxPendingRequests: 1` (and `maxRetries: 5`); the top-level
+        // `connectionPool.http` sets DIFFERENT values plus an unrelated field. At
+        // runtime the named targetPort resolves to workload port 8080.
+        let mut upstream = Upstream {
+            id: "u1".to_string(),
+            namespace: "ferrum".to_string(),
+            name: Some("u1".to_string()),
+            targets: Vec::new(),
+            algorithm: Default::default(),
+            hash_on: None,
+            hash_on_cookie_config: None,
+            health_checks: None,
+            service_discovery: None,
+            subsets: None,
+            // Per-port entry keyed by the DECLARED service port (80), as the mesh
+            // translator stores named-targetPort `portLevelSettings`.
+            port_overrides: HashMap::from([(
+                80u16,
+                UpstreamPortOverride {
+                    http1_max_pending_requests: Some(1),
+                    max_retries: Some(5),
+                    ..Default::default()
+                },
+            )]),
+            source_locality: None,
+            locality_lb_strict: false,
+            locality_lb_setting: None,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            backend_tls_sni: None,
+            backend_tls_san_allow_list: Vec::new(),
+            resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: Some(UpstreamPortOverride {
+                // Top-level overlay: a CONFLICTING pending cap + retries (must NOT
+                // override the per-port values) and an inherited-only idleTimeout.
+                http1_max_pending_requests: Some(32),
+                max_retries: Some(2),
+                http_idle_timeout_ms: Some(120_000),
+                ..Default::default()
+            }),
+            api_spec_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        upstream.normalize_fields();
+
+        let proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        let mut config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream],
+            ..GatewayConfig::default()
+        };
+        config.resolve_dispatch_port_overrides();
+        let proxy = &config.proxies[0];
+
+        // Case A — resolved port == service port (80): the per-port entry IS found,
+        // so the explicit per-port values WIN (field-merged over the fallback).
+        let matched = target_for_test(80);
+        let eff_matched = resolve_effective_proxy_for_target(proxy, Some(&matched));
+        assert_eq!(
+            eff_matched.pool_http1_max_pending_requests,
+            Some(1),
+            "resolved port == service port: the per-port cap wins"
+        );
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(proxy, 80),
+            Some(1),
+            "pending gate sees the per-port cap when the resolved port matches"
+        );
+
+        // Case B — named targetPort resolves to a DIFFERENT workload port (8080)
+        // with no per-port entry: the per-port lookup MISSES, so the TOP-LEVEL
+        // fallback applies. Applying the explicit per-port value here is the
+        // DEFERRED accepted limitation (#1816).
+        let resolved = target_for_test(8080);
+        let eff_resolved = resolve_effective_proxy_for_target(proxy, Some(&resolved));
+        assert_eq!(
+            eff_resolved.pool_http1_max_pending_requests,
+            Some(32),
+            "named-targetPort SD: top-level fallback applies on the resolved port (#1816)"
+        );
+        assert_eq!(
+            resolve_backend_http1_max_pending_requests(proxy, 8080),
+            Some(32),
+            "pending gate sees the top-level fallback on the resolved (named) port (#1816)"
+        );
+        // `maxRetries` on the resolved (named) port comes from the top-level (2).
+        let mut with_retry = proxy.clone();
+        with_retry.retry = Some(crate::config::types::RetryConfig {
+            max_retries: 10,
+            ..Default::default()
+        });
+        let capped = cap_proxy_retry_for_target(Arc::new(with_retry), Some(&resolved));
+        assert_eq!(
+            capped.retry.as_ref().map(|r| r.max_retries),
+            Some(2),
+            "named-targetPort SD: maxRetries comes from the top-level fallback (#1816)"
+        );
+        // The top-level-only field is inherited on the resolved port.
+        assert_eq!(
+            eff_resolved.pool_idle_timeout_seconds,
+            Some(120),
+            "a top-level-only field is inherited on the resolved port"
         );
     }
 

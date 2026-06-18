@@ -124,6 +124,10 @@ instant-distance = "0.6.1"
 # CachePadded for hot-path atomics in OverloadState. Already transitive via
 # tokio/dashmap; the explicit pin makes the surface intentional.
 crossbeam-utils = "0.8"
+# Lock-free bounded MPMC ring (ArrayQueue) backing the router-cache eviction
+# sample reservoir. Already transitive via sqlx-core; the explicit pin makes the
+# surface intentional.
+crossbeam-queue = "0.3"
 bytes = "1"
 thiserror = "2"
 anyhow = "1"

@@ -32,6 +32,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: Default::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
@@ -50,6 +51,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        pool_http1_max_pending_requests: None,
         pool_tcp_keepalive_seconds: None,
         upstream_id: None,
         upstream_subset: None,
@@ -115,6 +117,7 @@ fn make_upstream(id: &str) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -409,6 +412,40 @@ fn resolved_port_override_from_upstream_override_projects_http_fields() {
         ResolvedPortOverride::from_upstream_override(&empty).is_none(),
         "empty overlay must collapse to None"
     );
+}
+
+#[test]
+fn seed_connection_pool_http_from_fallback_merges_field_by_field() {
+    use ferrum_edge::config::types::ResolvedPortOverride;
+
+    // Per-port entry sets connectTimeout + one connectionPool.http field; the
+    // remaining http fields must be inherited from the SD top-level fallback and
+    // the per-port-set field must win. Non-http fields are untouched. This is the
+    // exact field-merge `resolve_effective_proxy_for_target` performs for an SD
+    // upstream (#1806 codex r1 finding 3).
+    let mut per_port = ResolvedPortOverride {
+        connect_timeout_ms: Some(750),
+        h2_max_concurrent_streams: Some(10),
+        ..ResolvedPortOverride::default()
+    };
+    let fallback = ResolvedPortOverride {
+        h2_max_concurrent_streams: Some(64),
+        http_idle_timeout_ms: Some(120_000),
+        max_retries: Some(2),
+        http1_max_pending_requests: Some(32),
+        ..ResolvedPortOverride::default()
+    };
+
+    per_port.seed_connection_pool_http_from_fallback(&fallback);
+
+    // Per-port field wins.
+    assert_eq!(per_port.h2_max_concurrent_streams, Some(10));
+    // Unset http fields inherited from the fallback.
+    assert_eq!(per_port.http_idle_timeout_ms, Some(120_000));
+    assert_eq!(per_port.max_retries, Some(2));
+    assert_eq!(per_port.http1_max_pending_requests, Some(32));
+    // Non-connectionPool.http field untouched (fallback never carries it).
+    assert_eq!(per_port.connect_timeout_ms, Some(750));
 }
 
 #[test]
@@ -866,6 +903,7 @@ fn test_unique_listen_paths_valid() {
                 backend_tls_server_ca_cert_path: None,
                 resolved_tls: Default::default(),
                 dispatch_port_overrides: None,
+                dispatch_port_override_fallback: None,
                 dns_override: None,
                 dns_cache_ttl_seconds: None,
                 auth_mode: AuthMode::Single,
@@ -884,6 +922,7 @@ fn test_unique_listen_paths_valid() {
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
                 pool_max_requests_per_connection: None,
+                pool_http1_max_pending_requests: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
                 upstream_subset: None,
@@ -924,6 +963,7 @@ fn test_unique_listen_paths_valid() {
                 backend_tls_server_ca_cert_path: None,
                 resolved_tls: Default::default(),
                 dispatch_port_overrides: None,
+                dispatch_port_override_fallback: None,
                 dns_override: None,
                 dns_cache_ttl_seconds: None,
                 auth_mode: AuthMode::Single,
@@ -942,6 +982,7 @@ fn test_unique_listen_paths_valid() {
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
                 pool_max_requests_per_connection: None,
+                pool_http1_max_pending_requests: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
                 upstream_subset: None,
@@ -998,6 +1039,7 @@ fn test_unique_listen_paths_duplicate() {
                 backend_tls_server_ca_cert_path: None,
                 resolved_tls: Default::default(),
                 dispatch_port_overrides: None,
+                dispatch_port_override_fallback: None,
                 dns_override: None,
                 dns_cache_ttl_seconds: None,
                 auth_mode: AuthMode::Single,
@@ -1016,6 +1058,7 @@ fn test_unique_listen_paths_duplicate() {
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
                 pool_max_requests_per_connection: None,
+                pool_http1_max_pending_requests: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
                 upstream_subset: None,
@@ -1056,6 +1099,7 @@ fn test_unique_listen_paths_duplicate() {
                 backend_tls_server_ca_cert_path: None,
                 resolved_tls: Default::default(),
                 dispatch_port_overrides: None,
+                dispatch_port_override_fallback: None,
                 dns_override: None,
                 dns_cache_ttl_seconds: None,
                 auth_mode: AuthMode::Single,
@@ -1074,6 +1118,7 @@ fn test_unique_listen_paths_duplicate() {
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
                 pool_max_requests_per_connection: None,
+                pool_http1_max_pending_requests: None,
                 pool_tcp_keepalive_seconds: Some(10),
                 upstream_id: None,
                 upstream_subset: None,

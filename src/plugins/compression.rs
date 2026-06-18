@@ -538,6 +538,41 @@ impl Plugin for CompressionPlugin {
         !self.config.algorithms.is_empty() && ctx.headers.contains_key("accept-encoding")
     }
 
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        // Mirror the `after_proxy` skip checks that are knowable from the
+        // response headers so we never pin a body onto the buffered path that
+        // we are going to decline to compress. Range responses (`206` or any
+        // `Content-Range`) are skipped there to preserve byte-offset semantics,
+        // so they must stream instead of being fully collected (which would also
+        // risk tripping the response body size limit on large ranged downloads).
+        //
+        // On paths that run `after_proxy` *before* this refine decision (e.g.
+        // the H3 cross-protocol path stamps `RANGE_RESPONSE_METADATA_KEY` from
+        // the pristine headers, then runs `after_proxy`, then refines), an
+        // earlier-ordered hook such as `response_transformer` (ordering 4000)
+        // can strip `Content-Range` from a non-206 response before this check
+        // sees it. `after_proxy` already honors the stamped marker, so honor it
+        // here too; otherwise the partial body stays pinned on the buffered path
+        // (uncompressed, since `transform_response_body` is buffered-only) and
+        // can trip the response body size limit instead of streaming.
+        if response_status == 206
+            || response_headers.contains_key("content-range")
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::RANGE_RESPONSE_METADATA_KEY)
+        {
+            return false;
+        }
+        self.should_buffer_response_body(ctx)
+            && content_type.is_some_and(|ct| self.is_compressible_content_type(ct))
+    }
+
     fn applies_after_proxy_on_reject(&self) -> bool {
         true
     }
@@ -645,6 +680,25 @@ impl Plugin for CompressionPlugin {
 
         // Skip uncompressible status codes.
         if UNCOMPRESSIBLE_STATUS_CODES.contains(&response_status) {
+            return PluginResult::Continue;
+        }
+
+        // Range responses carry byte offsets for the original representation.
+        // Compressing them changes those byte positions and corrupts range
+        // semantics, even if a backend sends Content-Range with a non-206
+        // status. Range responses are also streamed (see
+        // `should_buffer_response_body_for_content_type`), so committing a
+        // `Content-Encoding` here would mislabel an uncompressed body whose
+        // `transform_response_body` (buffered-only) never runs. The live
+        // headers may already have been rewritten by an earlier-ordered hook
+        // (e.g. `response_transformer` removing `Content-Range`), so also honor
+        // the original backend range decision captured before `after_proxy`.
+        if response_status == 206
+            || response_headers.contains_key("content-range")
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::RANGE_RESPONSE_METADATA_KEY)
+        {
             return PluginResult::Continue;
         }
 

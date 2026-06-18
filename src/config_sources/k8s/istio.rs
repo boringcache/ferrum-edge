@@ -1285,16 +1285,16 @@ fn parse_keepalive_duration_seconds(
 /// Translate Istio `connectionPool.http` into Ferrum's typed HTTP overlay.
 ///
 /// Supported fields: `maxRequestsPerConnection`, `idleTimeout`,
-/// `http2MaxRequests`, `h2UpgradePolicy`, and `maxRetries`. The only
-/// remaining deferred field, `http1MaxPendingRequests`, is detected and
-/// pushed onto `acc.warnings` so operators see the gateway acknowledging the
-/// field but otherwise dropping it — the Istio status writer
-/// (`src/k8s_controller/istio_status.rs`) promotes the same field into the
-/// DestinationRule `status.ferrum.translation.deferred_fields` list so the
-/// gap is visible from `kubectl describe` (it needs a Ferrum-side
-/// pending-request gauge to enforce). Returning `Ok(None)` from this
-/// function signals "block was present but no supported field was set" so
-/// the caller can skip emitting an empty overlay on the slice.
+/// `http2MaxRequests`, `h2UpgradePolicy`, `maxRetries`, and
+/// `http1MaxPendingRequests`. At top-level / `portLevelSettings` scope every
+/// field is projected; there are no longer any deferred `connectionPool.http`
+/// knobs at that scope. (`h2UpgradePolicy` / `maxRetries` /
+/// `http1MaxPendingRequests` are still deferred-warned for a SUBSET
+/// `trafficPolicy` — see the `scope` note below — because a subset's
+/// `SubsetTrafficPolicy` carries no `connectionPool.http`.) Returning
+/// `Ok(None)` from this function signals "block was present but no supported
+/// field was set" so the caller can skip emitting an empty overlay on the
+/// slice.
 ///
 /// `maxRetries` semantics differ honestly from Envoy: Envoy's
 /// `connectionPool.http.maxRetries` is a cluster-wide outstanding-retry
@@ -1303,15 +1303,22 @@ fn parse_keepalive_duration_seconds(
 /// `cap_proxy_retry_for_target`). It is still validated as a positive
 /// integer here (zero/negative rejected) like the other uint32 knobs.
 ///
-/// `scope` distinguishes top-level/`portLevelSettings` (where
-/// `h2UpgradePolicy` / `maxRetries` ARE applied) from a SUBSET `trafficPolicy`
-/// (where the mesh apply path builds a `SubsetTrafficPolicy` that carries no
-/// `connectionPool.http`, so those two fields are genuinely NOT applied). For
-/// a subset scope they are deferred-warned + surfaced in the DestinationRule
-/// `status.ferrum.translation.deferred_fields` (codex round-1 Finding 4),
-/// matching reality; do NOT try to wire subset connectionPool.http through
-/// `SubsetTrafficPolicy`. Validation (positive int / valid enum) still runs in
-/// every scope so a malformed subset value still fails closed.
+/// `http1MaxPendingRequests` is honestly reinterpreted as a max-concurrent-
+/// in-flight-HTTP/1.1-requests cap, NOT Envoy's connection-pending-queue:
+/// reqwest's `send()` resolves at response headers with no connection-acquire
+/// hook, so true pending-queue depth is unmeasurable (see `docs/mesh.md`;
+/// "upstream overflow" → 503). Scoped to the reqwest/H1 dispatch path; validated
+/// as a positive integer here (zero rejected) like the other uint32 knobs.
+///
+/// `scope` distinguishes top-level/`portLevelSettings` (where `h2UpgradePolicy`
+/// / `maxRetries` / `http1MaxPendingRequests` ARE applied) from a SUBSET
+/// `trafficPolicy` (where the mesh apply path builds a `SubsetTrafficPolicy`
+/// that carries no `connectionPool.http`, so those fields are genuinely NOT
+/// applied). For a subset scope they are deferred-warned + surfaced in the
+/// DestinationRule `status.ferrum.translation.deferred_fields` (codex round-1
+/// Finding 4), matching reality; do NOT try to wire subset connectionPool.http
+/// through `SubsetTrafficPolicy`. Validation (positive int / valid enum) still
+/// runs in every scope so a malformed subset value still fails closed.
 fn translate_connection_pool_http(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -1320,11 +1327,16 @@ fn translate_connection_pool_http(
 ) -> Result<Option<crate::modes::mesh::config::MeshConnectionPoolHttp>, K8sTranslateError> {
     use crate::modes::mesh::config::MeshConnectionPoolHttp;
 
+    // `maxRequestsPerConnection: 0` is Istio's explicit "unlimited" value and is
+    // advertised as supported by the Ferrum schema/OpenAPI, so accept it here
+    // (`allow_zero = true`); the projected `Proxy.pool_max_requests_per_connection`
+    // validator likewise permits `0`.
     let max_requests_per_connection = match http.get("maxRequestsPerConnection") {
         Some(v) => Some(translate_http_uint32(
             object,
             "maxRequestsPerConnection",
             v,
+            true,
         )?),
         None => None,
     };
@@ -1333,7 +1345,7 @@ fn translate_connection_pool_http(
         None => None,
     };
     let http2_max_requests = match http.get("http2MaxRequests") {
-        Some(v) => Some(translate_http_uint32(object, "http2MaxRequests", v)?),
+        Some(v) => Some(translate_http_uint32(object, "http2MaxRequests", v, false)?),
         None => None,
     };
     let h2_upgrade_policy = match http.get("h2UpgradePolicy") {
@@ -1346,38 +1358,41 @@ fn translate_connection_pool_http(
     // not what an operator setting an Envoy outstanding-retry budget means);
     // fail closed at translate time rather than silently disabling retries.
     let max_retries = match http.get("maxRetries") {
-        Some(v) => Some(translate_http_uint32(object, "maxRetries", v)?),
+        Some(v) => Some(translate_http_uint32(object, "maxRetries", v, false)?),
         None => None,
     };
 
-    // Always-deferred field (every scope): surface an operator-visible warning
-    // so the gateway acknowledges the field but signals it is not yet enforced.
-    // The Istio status writer mirrors the same field list into the
-    // DestinationRule `status.ferrum.translation.deferred_fields` block so the
-    // gap is also visible from `kubectl describe`. Keep this list in sync with
-    // `DEFERRED_CONNECTION_POOL_HTTP_FIELDS` in
-    // `src/k8s_controller/istio_status.rs` and docs/mesh.md's
-    // `connectionPool.http.*` status table.
-    for field in ["http1MaxPendingRequests"] {
-        if http.get(field).is_some() {
-            acc.warnings.push(format!(
-                "DestinationRule {}/{}: connectionPool.http.{field} is parsed but not yet projected; tracked as a follow-on (needs a Ferrum-side pending-request gauge)",
-                object.metadata.namespace, object.metadata.name
-            ));
-        }
-    }
+    // `http1MaxPendingRequests` — the HTTP/1.1 connection-pending-queue cap.
+    // Validated as a positive integer like the other uint32 knobs (zero
+    // rejected: a `0` pending cap would shed every H1 request, which is not
+    // what an operator setting a pending budget means). Applied at runtime as
+    // a per-`(host, port)` pending gate on the reqwest/H1 dispatch path (503
+    // "upstream overflow" when full); see `Proxy.pool_http1_max_pending_requests`
+    // and `src/backend_pending_limit.rs`. No longer deferred at top-level/port.
+    let http1_max_pending_requests = match http.get("http1MaxPendingRequests") {
+        Some(v) => Some(translate_http_uint32(
+            object,
+            "http1MaxPendingRequests",
+            v,
+            false,
+        )?),
+        None => None,
+    };
 
-    // Subset-scoped `h2UpgradePolicy` / `maxRetries`: applied at top-level /
-    // `portLevelSettings`, but a SUBSET's `SubsetTrafficPolicy` carries no
-    // `connectionPool.http`, so inside a subset they are genuinely NOT applied.
-    // Warn + surface as deferred (codex round-1 Finding 4) and DROP them from
-    // the (unused) subset overlay so no dead value rides the slice. Keep this
-    // list in sync with `SUBSET_DEFERRED_CONNECTION_POOL_HTTP_FIELDS` in
+    // Subset-scoped `h2UpgradePolicy` / `maxRetries` / `http1MaxPendingRequests`:
+    // applied at top-level / `portLevelSettings`, but a SUBSET's
+    // `SubsetTrafficPolicy` carries no `connectionPool.http`, so inside a subset
+    // they are genuinely NOT applied. Warn + surface as deferred (codex round-1
+    // Finding 4) and DROP them from the (unused) subset overlay so no dead value
+    // rides the slice. Keep this list in sync with
+    // `SUBSET_DEFERRED_CONNECTION_POOL_HTTP_FIELDS` in
     // `src/k8s_controller/istio_status.rs`.
-    let (h2_upgrade_policy, max_retries) = match scope {
-        TrafficPolicyScope::TopLevelOrPort => (h2_upgrade_policy, max_retries),
+    let (h2_upgrade_policy, max_retries, http1_max_pending_requests) = match scope {
+        TrafficPolicyScope::TopLevelOrPort => {
+            (h2_upgrade_policy, max_retries, http1_max_pending_requests)
+        }
         TrafficPolicyScope::Subset => {
-            for field in ["h2UpgradePolicy", "maxRetries"] {
+            for field in ["h2UpgradePolicy", "maxRetries", "http1MaxPendingRequests"] {
                 if http.get(field).is_some() {
                     acc.warnings.push(format!(
                         "DestinationRule {}/{}: subsets[].trafficPolicy.connectionPool.http.{field} is parsed and validated but not applied for subsets (subset traffic policy carries LB/TLS/connectTimeout/passive-health only); apply it at top-level or portLevelSettings instead",
@@ -1386,7 +1401,7 @@ fn translate_connection_pool_http(
                 }
             }
             // Not applied for subsets — do not carry the value on the overlay.
-            (None, None)
+            (None, None, None)
         }
     };
 
@@ -1396,6 +1411,7 @@ fn translate_connection_pool_http(
         http2_max_requests,
         h2_upgrade_policy,
         max_retries,
+        http1_max_pending_requests,
     };
     if overlay == MeshConnectionPoolHttp::default() {
         Ok(None)
@@ -1437,13 +1453,18 @@ fn translate_h2_upgrade_policy(
     }
 }
 
-/// Parse a `connectionPool.http.*` `uint32`-typed field. Rejects negative
-/// values, zero (every supported field's semantics require at least one),
-/// and values > `u32::MAX`.
+/// Parse a uint32 `connectionPool.http.*` knob. Negative and non-integer
+/// values are always rejected. `allow_zero` controls the lower bound: most
+/// knobs (`http2MaxRequests`, `maxRetries`) reject `0` as ambiguous, but
+/// `maxRequestsPerConnection` accepts `0` as Istio's documented "unlimited"
+/// sentinel (Istio default; the Ferrum schema/OpenAPI advertise `0` as the
+/// supported unlimited value for `Proxy.pool_max_requests_per_connection`),
+/// so blocking it here would reject a config the schema claims to accept.
 fn translate_http_uint32(
     object: &K8sObject,
     field: &str,
     value: &Value,
+    allow_zero: bool,
 ) -> Result<u32, K8sTranslateError> {
     let raw = value.as_i64().ok_or_else(|| {
         invalid_resource(
@@ -1451,10 +1472,16 @@ fn translate_http_uint32(
             format!("trafficPolicy.connectionPool.http.{field} must be an integer"),
         )
     })?;
-    if raw <= 0 {
+    let lower_bound_violated = if allow_zero { raw < 0 } else { raw <= 0 };
+    if lower_bound_violated {
+        let requirement = if allow_zero {
+            "must be non-negative"
+        } else {
+            "must be positive"
+        };
         return Err(invalid_resource(
             object,
-            format!("trafficPolicy.connectionPool.http.{field} must be positive, got {raw}"),
+            format!("trafficPolicy.connectionPool.http.{field} {requirement}, got {raw}"),
         ));
     }
     if raw > i64::from(u32::MAX) {
@@ -15092,9 +15119,36 @@ extensionProviders:
         .expect_err("negative maxRequestsPerConnection must fail");
         assert!(
             err.to_string()
-                .contains("maxRequestsPerConnection must be positive"),
+                .contains("maxRequestsPerConnection must be non-negative"),
             "unexpected: {err}"
         );
+    }
+
+    #[test]
+    fn destination_rule_accepts_zero_max_requests_per_connection() {
+        // Istio's documented "unlimited" sentinel for maxRequestsPerConnection
+        // is `0`; the Ferrum schema/OpenAPI advertise `0` as supported, so the
+        // translator must accept it (unlike `http2MaxRequests`/`maxRetries`,
+        // which reject zero) and carry it through to the overlay.
+        let result = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {"http": {"maxRequestsPerConnection": 0}}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("zero maxRequestsPerConnection (Istio unlimited) must translate");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let dr = &mesh.destination_rules[0];
+        let tp = dr.traffic_policy.as_ref().expect("traffic policy");
+        let http = tp.connection_pool_http.as_ref().expect("http overlay");
+        assert_eq!(http.max_requests_per_connection, Some(0));
     }
 
     #[test]
@@ -15215,12 +15269,11 @@ extensionProviders:
     }
 
     #[test]
-    fn destination_rule_defers_only_http1_max_pending_requests_with_warning() {
-        // After F5.1, `maxRetries` and `h2UpgradePolicy` are projected and must
-        // NOT warn. Only `http1MaxPendingRequests` remains deferred (it needs a
-        // Ferrum-side pending-request gauge); the gateway emits an
-        // operator-visible warning and drops just that one. The Istio status
-        // writer mirrors only it into `status.ferrum.translation.deferred_fields`.
+    fn destination_rule_projects_top_level_http_connection_pool_knobs_without_warning() {
+        // After F5.1's final knob, ALL of `maxRetries`, `h2UpgradePolicy`, and
+        // `http1MaxPendingRequests` are projected at top-level/portLevelSettings
+        // and must NOT warn. There are no longer any deferred connectionPool.http
+        // knobs at top-level scope. Every supported field lands on the overlay.
         let result = translate_k8s_objects(
             &[object(
                 "DestinationRule",
@@ -15240,17 +15293,9 @@ extensionProviders:
             )],
             options(),
         )
-        .expect("translation succeeds despite the deferred field");
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.contains("http1MaxPendingRequests") && w.contains("not yet projected")),
-            "expected a deferred-field warning for http1MaxPendingRequests; warnings = {:?}",
-            result.warnings
-        );
-        // The now-projected fields must NOT warn.
-        for field in ["maxRetries", "h2UpgradePolicy"] {
+        .expect("translation succeeds");
+        // None of the top-level connectionPool.http knobs warn anymore.
+        for field in ["http1MaxPendingRequests", "maxRetries", "h2UpgradePolicy"] {
             assert!(
                 !result.warnings.iter().any(|w| w.contains(field)),
                 "{field} is projected now and must not warn; warnings = {:?}",
@@ -15265,16 +15310,42 @@ extensionProviders:
             .connection_pool_http
             .as_ref()
             .unwrap();
-        // The supported + newly-projected fields landed on the overlay.
+        // Every supported field landed on the overlay, including the new one.
         assert_eq!(http.http2_max_requests, Some(250));
         assert_eq!(http.max_retries, Some(5));
         assert_eq!(
             http.h2_upgrade_policy,
             Some(crate::config::types::H2UpgradePolicy::Upgrade)
         );
-        // `http1MaxPendingRequests` is still dropped (no overlay slot).
+        assert_eq!(http.http1_max_pending_requests, Some(1024));
+        // Unset fields stay None.
         assert!(http.max_requests_per_connection.is_none());
         assert!(http.idle_timeout_ms.is_none());
+    }
+
+    #[test]
+    fn destination_rule_rejects_zero_http1_max_pending_requests() {
+        // A `0` pending cap would shed every H1 request; reject at translate
+        // time like the other uint32 knobs rather than silently disabling.
+        let err = translate_k8s_objects(
+            &[object(
+                "DestinationRule",
+                serde_json::json!({
+                    "host": "reviews.default.svc.cluster.local",
+                    "trafficPolicy": {
+                        "connectionPool": {
+                            "http": { "http1MaxPendingRequests": 0 }
+                        }
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect_err("zero http1MaxPendingRequests must fail closed");
+        assert!(
+            err.to_string().contains("http1MaxPendingRequests"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -15413,13 +15484,14 @@ extensionProviders:
     }
 
     #[test]
-    fn destination_rule_subset_h2_upgrade_policy_and_max_retries_deferred_with_warning() {
+    fn destination_rule_subset_http_connection_pool_knobs_deferred_with_warning() {
         use crate::config::types::H2UpgradePolicy;
-        // codex round-1 Finding 4: top-level h2UpgradePolicy/maxRetries are
-        // APPLIED (no warning), but the SAME fields inside a subset's
-        // trafficPolicy are NOT applied (subset -> SubsetTrafficPolicy carries
-        // no connectionPool.http), so they must warn (and be dropped from the
-        // subset overlay), matching reality.
+        // codex round-1 Finding 4 (+ F5.1 final knob): top-level
+        // h2UpgradePolicy/maxRetries/http1MaxPendingRequests are APPLIED (no
+        // warning), but the SAME fields inside a subset's trafficPolicy are NOT
+        // applied (subset -> SubsetTrafficPolicy carries no connectionPool.http),
+        // so they must warn (and be dropped from the subset overlay), matching
+        // reality.
         let result = translate_k8s_objects(
             &[object(
                 "DestinationRule",
@@ -15427,7 +15499,7 @@ extensionProviders:
                     "host": "reviews.default.svc.cluster.local",
                     // Top-level: applied, must NOT warn.
                     "trafficPolicy": {
-                        "connectionPool": {"http": {"h2UpgradePolicy": "UPGRADE", "maxRetries": 4}}
+                        "connectionPool": {"http": {"h2UpgradePolicy": "UPGRADE", "maxRetries": 4, "http1MaxPendingRequests": 32}}
                     },
                     "subsets": [{
                         "name": "v1",
@@ -15436,7 +15508,8 @@ extensionProviders:
                         "trafficPolicy": {
                             "connectionPool": {"http": {
                                 "h2UpgradePolicy": "DO_NOT_UPGRADE",
-                                "maxRetries": 9
+                                "maxRetries": 9,
+                                "http1MaxPendingRequests": 16
                             }}
                         }
                     }]
@@ -15446,8 +15519,8 @@ extensionProviders:
         )
         .expect("translation succeeds");
 
-        // Subset-scoped warnings present for BOTH fields.
-        for field in ["h2UpgradePolicy", "maxRetries"] {
+        // Subset-scoped warnings present for ALL THREE fields.
+        for field in ["h2UpgradePolicy", "maxRetries", "http1MaxPendingRequests"] {
             assert!(
                 result.warnings.iter().any(|w| {
                     w.contains("subsets[].trafficPolicy.connectionPool.http")
@@ -15470,9 +15543,10 @@ extensionProviders:
             .unwrap();
         assert_eq!(top.h2_upgrade_policy, Some(H2UpgradePolicy::Upgrade));
         assert_eq!(top.max_retries, Some(4));
+        assert_eq!(top.http1_max_pending_requests, Some(32));
 
         // Subset fields are DROPPED (not applied), so the subset's HTTP overlay
-        // carries neither (and with only those two fields set, no overlay).
+        // carries none (and with only the deferred fields set, no overlay).
         let subset = &dr.subsets[0];
         assert!(
             subset
