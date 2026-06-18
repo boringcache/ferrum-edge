@@ -1459,6 +1459,56 @@ mod tests {
     }
 
     #[test]
+    fn connect_marker_classification_is_exhaustive_and_fail_closed() {
+        // Stage 6 fail-closed contract: every CONNECT marker maps to EXACTLY ONE
+        // of {byte-stream HBONE, datagram UDP, neither → 404}, and the two relay
+        // predicates are never simultaneously true. An UNKNOWN / future / typo
+        // marker (a not-yet-implemented transport like "quic", a stray "tcp", or
+        // an empty value) must take NEITHER branch, so dispatch falls through to
+        // the normal HTTP path and 404s the CONNECT — a marker we don't recognize
+        // is never relayed onto either transport. This pins the whole marker space
+        // in one place; `udp_and_hbone_predicates_are_disjoint` covers only the
+        // udp / markerless rows.
+        //
+        // (marker value, expect is_hbone_connect, expect is_udp_hbone_connect)
+        let cases: &[(Option<&str>, bool, bool)] = &[
+            (None, true, false),             // markerless → byte-stream HBONE
+            (Some("hbone"), true, false),    // explicit hbone → byte-stream
+            (Some("HBONE"), true, false),    // case-insensitive
+            (Some("udp"), false, true),      // udp → datagram relay
+            (Some("UDP"), false, true),      // case-insensitive
+            (Some("tcp"), false, false),     // unknown → neither → 404
+            (Some("quic"), false, false),    // future transport → neither → 404
+            (Some("dtls"), false, false),    // DTLS has no own marker (rides "udp")
+            (Some("garbage"), false, false), // typo → neither → 404
+            (Some(""), false, false),        // present-but-blank → neither → 404
+        ];
+
+        for &(marker, expect_hbone, expect_udp) in cases {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = marker {
+                headers.insert("x-ferrum-mesh-protocol", value.parse().unwrap());
+            }
+            let is_hbone = is_hbone_connect(&Method::CONNECT, Version::HTTP_2, &headers);
+            let is_udp = is_udp_hbone_connect(&Method::CONNECT, Version::HTTP_2, &headers);
+            assert_eq!(
+                is_hbone, expect_hbone,
+                "is_hbone_connect({marker:?}) mismatch"
+            );
+            assert_eq!(
+                is_udp, expect_udp,
+                "is_udp_hbone_connect({marker:?}) mismatch"
+            );
+            // Dispatch-safety invariant: a request can NEVER match both relay
+            // predicates, so it can never take both branches, for any marker.
+            assert!(
+                !(is_hbone && is_udp),
+                "marker {marker:?} matched BOTH relay predicates"
+            );
+        }
+    }
+
+    #[test]
     fn is_udp_hbone_connect_rejects_non_connect_and_non_h2() {
         let mut headers = HeaderMap::new();
         headers.insert("x-ferrum-mesh-protocol", "udp".parse().unwrap());
