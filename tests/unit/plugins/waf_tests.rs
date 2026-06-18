@@ -1478,19 +1478,37 @@ fn response_body_buffering_narrows_to_inspectable_content_types() {
 
     // Pre-flight (content-type-agnostic) decision buffers.
     assert!(plugin.should_buffer_response_body(&ctx));
+    let headers = HashMap::new();
 
     // Allowlisted content-types stay buffered (they will be scanned).
-    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/html")));
-    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/html"),
+        200,
+        &headers
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers
+    ));
 
     // Non-allowlisted / binary / missing content-types narrow to false so the
     // proxy streams them instead of buffering a body the WAF will not scan.
-    assert!(
-        !plugin
-            .should_buffer_response_body_for_content_type(&ctx, Some("application/octet-stream"))
-    );
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("image/png")));
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/octet-stream"),
+        200,
+        &headers
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("image/png"),
+        200,
+        &headers
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &headers));
 }
 
 #[tokio::test]

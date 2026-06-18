@@ -1629,6 +1629,11 @@ impl MeshSidecarEgress {
 
 // ── Multi-cluster ────────────────────────────────────────────────────────
 
+/// Maximum number of remote clusters accepted in one mesh slice. Each remote
+/// cluster may spawn federation and/or endpoint-discovery work, so keep the
+/// fan-out explicitly bounded even though the source is a trusted CP/config.
+pub const MAX_MESH_REMOTE_CLUSTERS: usize = 256;
+
 /// Layer-10 multi-cluster mesh settings.
 ///
 /// This is intentionally control-plane neutral. Istio CRDs, Gateway API,
@@ -1762,15 +1767,13 @@ pub struct MeshTrafficPolicy {
     /// Optional `DestinationRule.trafficPolicy.connectionPool.http` block.
     /// When present, the K8s translator has parsed at least one of the
     /// supported HTTP connection-pool knobs (`maxRequestsPerConnection`,
-    /// `idleTimeout`, `http2MaxRequests`, `h2UpgradePolicy`, `maxRetries`);
-    /// the mesh apply layer projects these onto the matching upstream's
-    /// `port_overrides[port]` slot (top-level fan-out applies to every
-    /// target port; per-port `portLevelSettings` overrides per-port). Old
-    /// DPs reading new slices see this as a no-op via the serde default.
-    /// The only currently-deferred Istio HTTP knob,
-    /// `http1MaxPendingRequests`, is intentionally absent — the K8s
-    /// translator emits a warning when an operator sets it and otherwise
-    /// drops it (it needs a Ferrum-side pending-request gauge).
+    /// `idleTimeout`, `http2MaxRequests`, `h2UpgradePolicy`, `maxRetries`,
+    /// `http1MaxPendingRequests`); the mesh apply layer projects these onto
+    /// the matching upstream's `port_overrides[port]` slot (top-level fan-out
+    /// applies to every target port; per-port `portLevelSettings` overrides
+    /// per-port). Old DPs reading new slices see this as a no-op via the
+    /// serde default. There are no longer any deferred `connectionPool.http`
+    /// knobs at top-level/`portLevelSettings` scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_pool_http: Option<MeshConnectionPoolHttp>,
 }
@@ -1822,6 +1825,18 @@ pub struct MeshConnectionPoolHttp {
     /// positive when set (zero/negative rejected at translate time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
+    /// Mapped from `http1MaxPendingRequests`. The maximum number of requests
+    /// that may be simultaneously *waiting on connection capacity* for a
+    /// backend destination on the HTTP/1.1 dispatch path. Projects onto
+    /// `Upstream.port_overrides[port].http1_max_pending_requests` and is
+    /// enforced as a per-`(host, port)` pending gate: when the queue is full a
+    /// new H1 request is shed with a 503 ("upstream overflow" in Envoy terms)
+    /// rather than queued unboundedly. HTTP/1.1-scoped: it does NOT gate
+    /// direct-H2 / gRPC / HTTP/3 / HBONE / mesh-mTLS dispatch (those use
+    /// `http2MaxRequests` → `h2_max_concurrent_streams` for concurrency).
+    /// Always positive when set (zero/negative rejected at translate time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http1_max_pending_requests: Option<u32>,
 }
 
 /// `DestinationRule.trafficPolicy.tls` settings mapped from Istio's
@@ -2256,7 +2271,9 @@ impl MeshConfig {
             &self.peer_authentications,
             &self.service_entries,
             &self.request_authentications,
+            &self.telemetry_resources,
             &self.destination_rules,
+            &self.proxy_configs,
             &self.sidecars,
             self.trust_bundles.as_ref(),
             self.multi_cluster.as_ref(),
@@ -2306,6 +2323,8 @@ pub fn validate_mesh_config(
         request_authentications,
         &[],
         &[],
+        &[],
+        &[],
         trust_bundles,
         None,
     )
@@ -2319,7 +2338,9 @@ fn validate_mesh_config_internal(
     peer_auths: &[PeerAuthentication],
     service_entries: &[ServiceEntry],
     request_authentications: &[MeshRequestAuthentication],
+    telemetry_resources: &[MeshTelemetryResource],
     destination_rules: &[MeshDestinationRule],
+    proxy_configs: &[MeshProxyConfig],
     sidecars: &[MeshSidecar],
     trust_bundles: Option<&TrustBundleSet>,
     multi_cluster: Option<&MultiClusterConfig>,
@@ -2661,6 +2682,30 @@ fn validate_mesh_config_internal(
         }
     }
 
+    // Telemetry
+    for telemetry in telemetry_resources {
+        validate_non_empty_string(
+            "MeshTelemetryResource.name".to_string(),
+            &telemetry.name,
+            &mut errors,
+        );
+        validate_non_empty_string(
+            format!("MeshTelemetryResource '{}'.namespace", telemetry.name),
+            &telemetry.namespace,
+            &mut errors,
+        );
+        if let Some(tracing) = telemetry.config.tracing.as_ref() {
+            validate_percentage(
+                format!(
+                    "MeshTelemetryResource '{}'.config.tracing.sampling_percentage",
+                    telemetry.name
+                ),
+                tracing.sampling_percentage,
+                &mut errors,
+            );
+        }
+    }
+
     // DestinationRules
     for dr in destination_rules {
         validate_non_empty_string(
@@ -2678,13 +2723,55 @@ fn validate_mesh_config_internal(
             &dr.host,
             &mut errors,
         );
-        for port in dr.port_level_settings.keys() {
+        // Validate top-level trafficPolicy boundary fields (outlier-detection
+        // ranges, client-TLS mode/cert consistency) that the K8s translator
+        // enforces but the native/file/xDS slice path otherwise skips.
+        if let Some(policy) = dr.traffic_policy.as_ref() {
+            validate_mesh_traffic_policy(
+                format!("MeshDestinationRule '{}'.traffic_policy", dr.name),
+                policy,
+                &mut errors,
+            );
+        }
+        // `connectionPool.http.http1MaxPendingRequests` is enforced by the
+        // limiter as a per-`(host, port)` pending gate where `Some(0)` is
+        // hard-overflow (sheds EVERY H1 request). The K8s translator rejects
+        // 0/negative at parse time (`translate_http_uint32`), but the
+        // native/file slice path bypasses that translator, so apply the same
+        // positive-value check here — matching the repo invariant that
+        // native/file slices run the validation the K8s translator does.
+        // Walk every place a `connectionPool.http` block can ride a DR:
+        // top-level `trafficPolicy`, per-port `portLevelSettings`, and each
+        // `subsets[].trafficPolicy` (the translator rejects subset-scoped 0 too,
+        // before it drops the field from the unused subset overlay).
+        validate_dr_connection_pool_http(
+            &format!("MeshDestinationRule '{}'.trafficPolicy", dr.name),
+            dr.traffic_policy.as_ref(),
+            &mut errors,
+        );
+        for (port, policy) in &dr.port_level_settings {
             validate_non_zero_port(
                 format!(
                     "MeshDestinationRule '{}'.port_level_settings[{}]",
                     dr.name, port
                 ),
                 *port,
+                &mut errors,
+            );
+            validate_mesh_traffic_policy(
+                format!(
+                    "MeshDestinationRule '{}'.port_level_settings[{}]",
+                    dr.name, port
+                ),
+                policy,
+                &mut errors,
+            );
+            validate_dr_connection_pool_http(
+                &format!(
+                    "MeshDestinationRule '{}'.port_level_settings[{}].trafficPolicy",
+                    dr.name, port
+                ),
+                Some(policy),
                 &mut errors,
             );
         }
@@ -2694,7 +2781,44 @@ fn validate_mesh_config_internal(
                 &subset.name,
                 &mut errors,
             );
+            if let Some(policy) = subset.traffic_policy.as_ref() {
+                validate_mesh_traffic_policy(
+                    format!(
+                        "MeshDestinationRule '{}'.subsets[{}].traffic_policy",
+                        dr.name, i
+                    ),
+                    policy,
+                    &mut errors,
+                );
+            }
+            validate_dr_connection_pool_http(
+                &format!(
+                    "MeshDestinationRule '{}'.subsets[{}].trafficPolicy",
+                    dr.name, i
+                ),
+                subset.traffic_policy.as_ref(),
+                &mut errors,
+            );
         }
+    }
+
+    // ProxyConfigs
+    for proxy_config in proxy_configs {
+        validate_non_empty_string(
+            "MeshProxyConfig.name".to_string(),
+            &proxy_config.name,
+            &mut errors,
+        );
+        validate_non_empty_string(
+            format!("MeshProxyConfig '{}'.namespace", proxy_config.name),
+            &proxy_config.namespace,
+            &mut errors,
+        );
+        validate_percentage(
+            format!("MeshProxyConfig '{}'.tracing_sampling", proxy_config.name),
+            proxy_config.tracing_sampling,
+            &mut errors,
+        );
     }
 
     // Sidecars
@@ -2796,6 +2920,143 @@ fn validate_non_zero_port(context: String, port: u16, errors: &mut Vec<String>) 
     }
 }
 
+fn validate_percentage(context: String, value: Option<f64>, errors: &mut Vec<String>) {
+    if let Some(value) = value
+        && (!value.is_finite() || !(0.0..=100.0).contains(&value))
+    {
+        errors.push(format!(
+            "{context}: must be a finite percentage from 0 to 100"
+        ));
+    }
+}
+
+fn validate_mesh_traffic_policy(
+    context: String,
+    policy: &MeshTrafficPolicy,
+    errors: &mut Vec<String>,
+) {
+    if let Some(outlier) = policy.outlier_detection.as_ref() {
+        validate_mesh_outlier_detection(format!("{context}.outlier_detection"), outlier, errors);
+    }
+    if let Some(tls) = policy.tls.as_ref() {
+        validate_mesh_traffic_policy_tls(format!("{context}.tls"), tls, errors);
+    }
+}
+
+fn validate_mesh_outlier_detection(
+    context: String,
+    outlier: &MeshOutlierDetection,
+    errors: &mut Vec<String>,
+) {
+    // Istio treats `consecutive5xxErrors: 0` as *disabling* 5xx ejection rather
+    // than as an out-of-range value, and the K8s translator preserves the
+    // `Some(0)` verbatim. Rejecting it here would make a valid Istio config fail
+    // mesh startup/reload, so only reject negatives-via-overflow ranges and the
+    // degenerate zero-interval / zero-base-ejection cases that disable recovery.
+    if matches!(outlier.interval_seconds, Some(0)) {
+        errors.push(format!(
+            "{context}.interval_seconds: must be greater than 0"
+        ));
+    }
+    // Istio requires `baseEjectionTime` to be at least 1ms; a `Some(0)` projects
+    // onto `PassiveHealthCheck.healthy_after_seconds = 0`, which disables
+    // automatic readmission (ejected hosts are never recovered). The native/file
+    // path deserializes seconds as an integer, so reject the zero case at the
+    // boundary instead of producing never-readmitted passive ejections.
+    if matches!(outlier.base_ejection_seconds, Some(0)) {
+        errors.push(format!(
+            "{context}.base_ejection_seconds: must be greater than 0"
+        ));
+    }
+    if let Some(max_ejection_percent) = outlier.max_ejection_percent
+        && max_ejection_percent > 100
+    {
+        errors.push(format!(
+            "{context}.max_ejection_percent: must be from 0 to 100"
+        ));
+    }
+}
+
+fn validate_mesh_traffic_policy_tls(
+    context: String,
+    tls: &MeshTrafficPolicyTls,
+    errors: &mut Vec<String>,
+) {
+    match tls.mode {
+        MtlsMode::Strict | MtlsMode::Permissive => errors.push(format!(
+            "{context}.mode: {mode:?} is invalid for DestinationRule client TLS",
+            mode = tls.mode
+        )),
+        MtlsMode::Mutual => {
+            validate_required_tls_path(
+                format!("{context}.client_certificate"),
+                tls.client_certificate.as_deref(),
+                errors,
+            );
+            validate_required_tls_path(
+                format!("{context}.private_key"),
+                tls.private_key.as_deref(),
+                errors,
+            );
+        }
+        MtlsMode::IstioMutual => {
+            // Istio requires every ClientTLSSettings field to be empty for
+            // ISTIO_MUTUAL: the workload SVID and its trust bundle are used and
+            // any caller-supplied cert/key/CA is silently ignored at TLS apply.
+            // Reject stray fields at the boundary instead of letting the slice
+            // silently change the trust configuration.
+            if tls.client_certificate.is_some() {
+                errors.push(format!(
+                    "{context}.client_certificate: must be absent when mode is IstioMutual"
+                ));
+            }
+            if tls.private_key.is_some() {
+                errors.push(format!(
+                    "{context}.private_key: must be absent when mode is IstioMutual"
+                ));
+            }
+            if tls.ca_certificates.is_some() {
+                errors.push(format!(
+                    "{context}.ca_certificates: must be absent when mode is IstioMutual"
+                ));
+            }
+        }
+        MtlsMode::Disable | MtlsMode::Simple => {}
+    }
+}
+
+fn validate_required_tls_path(context: String, value: Option<&str>, errors: &mut Vec<String>) {
+    if value.is_none_or(|value| value.trim().is_empty()) {
+        errors.push(format!("{context}: must be set and non-empty"));
+    }
+}
+
+/// Validate a DestinationRule `connectionPool.http` block from the native/file
+/// mesh slice path, matching the positive-value checks the K8s translator
+/// (`translate_http_uint32`) enforces at parse time.
+///
+/// `http1MaxPendingRequests` is the load-bearing one: the
+/// [`crate::backend_pending_limit::BackendPendingLimiter`] treats `Some(0)` as a
+/// hard-overflow that sheds every HTTP/1.1 request, so an accidental `0` on a
+/// hand-authored native/file DR would silently blackhole all H1 traffic to the
+/// matched destination. The K8s translator rejects 0/negative; this keeps the
+/// native/file path equivalent (negatives are already impossible — the field
+/// deserializes as `u32` — so only the zero case needs rejecting here).
+fn validate_dr_connection_pool_http(
+    context: &str,
+    policy: Option<&MeshTrafficPolicy>,
+    errors: &mut Vec<String>,
+) {
+    let Some(http) = policy.and_then(|p| p.connection_pool_http.as_ref()) else {
+        return;
+    };
+    if http.http1_max_pending_requests == Some(0) {
+        errors.push(format!(
+            "{context}.connectionPool.http.http1MaxPendingRequests must be positive (0 would shed every HTTP/1.1 request)"
+        ));
+    }
+}
+
 fn validate_mesh_condition_ip_values(
     policy: &MeshPolicy,
     rule_index: usize,
@@ -2847,6 +3108,13 @@ fn validate_multi_cluster(
     {
         errors
             .push("MultiClusterConfig.federation_endpoint must not be empty when set".to_string());
+    }
+    if multi_cluster.remote_clusters.len() > MAX_MESH_REMOTE_CLUSTERS {
+        errors.push(format!(
+            "MultiClusterConfig.remote_clusters has {} entries; max is {}",
+            multi_cluster.remote_clusters.len(),
+            MAX_MESH_REMOTE_CLUSTERS
+        ));
     }
 
     let mut seen_cluster_names = HashSet::new();

@@ -241,17 +241,17 @@ pub(crate) fn select_upstream_target(
         max_ejection_percent,
     };
 
-    let strategy = if has_port_override {
-        LoadBalancerCache::get_hash_on_strategy_for_port_from(balancers, upstream_id, dispatch_port)
-    } else {
-        LoadBalancerCache::get_hash_on_strategy_from(balancers, upstream_id)
-    };
+    let subset_name = proxy.upstream_subset.as_deref();
+    let port_scope = has_port_override.then_some(dispatch_port);
+    let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+        balancers,
+        upstream_id,
+        port_scope,
+        subset_name,
+    );
     let (hash_key, needs_set) = resolve_hash_key(&strategy, client_ip, proxy_headers);
 
     let selected_balancer = balancers.get_balancer(upstream_id);
-
-    let subset_name = proxy.upstream_subset.as_deref();
-    let port_scope = has_port_override.then_some(dispatch_port);
 
     // PASSTHROUGH (Istio `loadBalancer.simple=PASSTHROUGH`): when this upstream's
     // effective algorithm is Passthrough, dial the captured original destination
@@ -362,15 +362,12 @@ pub(crate) fn select_upstream_target(
             let needs_set = if selection.target.port != dispatch_port {
                 let tp = selection.target.port;
                 let tp_override = has_effective_port_override(proxy, balancers, upstream_id, tp);
-                let tp_strategy = if tp_override {
-                    LoadBalancerCache::get_hash_on_strategy_for_port_from(
-                        balancers,
-                        upstream_id,
-                        tp,
-                    )
-                } else {
-                    LoadBalancerCache::get_hash_on_strategy_from(balancers, upstream_id)
-                };
+                let tp_strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+                    balancers,
+                    upstream_id,
+                    tp_override.then_some(tp),
+                    subset_name,
+                );
                 resolve_hash_key(&tp_strategy, client_ip, proxy_headers).1
             } else {
                 needs_set
@@ -417,6 +414,23 @@ pub(crate) fn has_effective_port_override(
         .as_ref()
         .is_some_and(|overrides| overrides.contains_key(&port))
         && LoadBalancerCache::has_port_override_state_from(balancers, upstream_id, port)
+}
+
+#[inline]
+pub(crate) fn hash_on_strategy_for_selected_target(
+    proxy: &Proxy,
+    balancers: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    target_port: u16,
+) -> HashOnStrategy {
+    let port_scope = has_effective_port_override(proxy, balancers, upstream_id, target_port)
+        .then_some(target_port);
+    LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+        balancers,
+        upstream_id,
+        port_scope,
+        proxy.upstream_subset.as_deref(),
+    )
 }
 
 /// Replace a wildcard upstream target host (for example `*.example.com`) with
@@ -635,11 +649,30 @@ pub(crate) fn record_backend_outcome_no_conn_end(
     );
 }
 
+/// Whether an outcome's `error_class` carries NO signal about backend health,
+/// so circuit-breaker / passive-health / least-latency / adaptive-concurrency
+/// accounting must treat it as neutral (no failure ding, no permit shrink, no
+/// latency sample):
+///
+/// * `ClientDisconnect` / `RequestBodyTooLarge` — client/gateway-side terminals;
+///   the client gave up or over-sent, which says nothing about the backend.
+/// * `DispatchPolicyRejected` — a gateway-side dispatch-policy shed BEFORE the
+///   backend was dialed (backend-TLS-SNI reject, or the
+///   `http1MaxPendingRequests` in-flight-overflow 503). The request never
+///   reached the backend, so the synthetic 503 must not trip the backend's
+///   circuit breaker / passive health, nor shrink its adaptive-concurrency
+///   permit — those would penalize a backend that was never contacted and let
+///   an overflow burst falsely eject a healthy target. Without this, default
+///   CB/AC failure classification (which counts 503) would do exactly that.
 #[inline]
 pub(crate) fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> bool {
     matches!(
         error_class,
-        Some(ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge)
+        Some(
+            ErrorClass::ClientDisconnect
+                | ErrorClass::RequestBodyTooLarge
+                | ErrorClass::DispatchPolicyRejected
+        )
     )
 }
 
