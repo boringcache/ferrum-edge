@@ -236,6 +236,23 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
                 if address.is_empty() {
                     continue;
                 }
+                // Collapse runtime targets on `(address, port, spiffe_id)` ONLY —
+                // deliberately NOT on `cluster`/`network` provenance. Two remote
+                // entries can advertise the same address on different networks
+                // (overlapping CIDR), but the rest of the runtime keys a target by
+                // its literal `host:port`: the dial uses `UpstreamTarget.host`, and
+                // LoadBalancer/HealthChecker/circuit-breaker keys are `host:port`
+                // (or `upstream_id::host:port`). The `mesh.cluster`/`mesh.network`
+                // tags are introspection metadata only — nothing downstream reads
+                // them to disambiguate dial/health/CB. Emitting two same-`host:port`
+                // targets would therefore yield no independently-dial-able failover
+                // peer (no network-gateway address rewrite exists yet, issue #1719)
+                // while letting a passive/active ejection or opened circuit for one
+                // overlapping-CIDR endpoint silently eject the sibling via the
+                // shared key. Keep them collapsed until target identity carries
+                // provenance. The merge-layer `WorkloadEndpointKey` still retains
+                // `cluster`/`network` so the workload REGISTRY keeps both for
+                // provenance/metadata; only the emitted RUNTIME target collapses.
                 let key = (
                     address.as_str(),
                     selected_port.port,
