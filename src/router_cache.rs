@@ -245,6 +245,12 @@ pub(crate) struct MeshTcpInboundEntry {
     pub(crate) backend_addr: std::net::SocketAddr,
     /// The local service FQDN for logging.
     pub(crate) service_fqdn: String,
+    /// `true` only for opaque-TLS app ports: the inbound relay peeks the
+    /// ClientHello SNI before the stream plugin chain. `false` for server-first
+    /// raw-TCP ports, where peeking would block the relay on the handshake clock
+    /// (the client sends nothing until the backend greeting). Carried from
+    /// [`crate::modes::mesh::config::MeshInboundTcpRoute::tls_inspect`].
+    pub(crate) tls_inspect: bool,
 }
 
 /// Outcome of a raw-TCP egress lookup for a captured original destination
@@ -1581,6 +1587,7 @@ impl RouterCache {
                         relay_proxy,
                         backend_addr: route.backend_addr,
                         service_fqdn: route.service_fqdn.clone(),
+                        tls_inspect: route.tls_inspect,
                     })
                 });
             }
@@ -3632,6 +3639,8 @@ mod tests {
             namespace: "default".to_string(),
             service_name: "redis".to_string(),
             service_fqdn: "redis.default.svc.cluster.local".to_string(),
+            // Redis is server-first: the relay must NOT peek SNI for this port.
+            tls_inspect: false,
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
@@ -3648,6 +3657,10 @@ mod tests {
             .expect("captured app port should route");
         assert_eq!(entry.backend_addr, "127.0.0.1:6380".parse().unwrap());
         assert_eq!(entry.service_fqdn, "redis.default.svc.cluster.local");
+        assert!(
+            !entry.tls_inspect,
+            "server-first raw-TCP inbound entries must not SNI-peek (would stall on the handshake clock)"
+        );
         assert_eq!(entry.relay_proxy.backend_scheme, Some(BackendScheme::Tcp));
         assert_eq!(
             entry.relay_proxy.id,

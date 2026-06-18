@@ -104,12 +104,20 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     // route too (the captured original destination selects the destination
     // service, not SNI). For those the captured plaintext bytes are a real TLS
     // ClientHello, so an `AuthorizationPolicy` using `when: connection.sni` needs
-    // the SNI populated before `on_stream_connect`. The peek is non-destructive
-    // (the bytes stay in the socket buffer for the relay) and returns `None` for
-    // non-TLS streams (raw Redis/MySQL/etc. openings), so it is safe to attempt
-    // for every captured inbound connection — parity with the TCP passthrough
-    // path, which also peeks the ClientHello before the stream plugin chain.
-    let sni_hostname = super::sni::extract_sni_from_tcp_stream(&client_stream, peek_timeout).await;
+    // the SNI populated before `on_stream_connect`. The peek is gated on the
+    // route's opaque-TLS classification (`entry.tls_inspect`), NOT attempted for
+    // every captured connection: server-first stream ports (Redis/MySQL/Postgres/
+    // Mongo/plain TCP) send NO client bytes until the backend greeting, so a peek
+    // there would block on the handshake clock (up to the frontend handshake
+    // timeout, indefinitely when `0`) BEFORE the loopback dial — stalling every
+    // such inbound connection. TLS ports speak first (the ClientHello), so the
+    // peek there resolves immediately and matches the TCP passthrough path, which
+    // only peeks ClientHello-first listeners.
+    let sni_hostname = if entry.tls_inspect {
+        super::sni::extract_sni_from_tcp_stream(&client_stream, peek_timeout).await
+    } else {
+        None
+    };
 
     // Capture the opening client bytes when a first-bytes-aware plugin (stream
     // WAF, `tcp_require_tls`) is configured, so it inspects the same plaintext

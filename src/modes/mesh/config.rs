@@ -2248,6 +2248,15 @@ pub struct MeshInboundTcpRoute {
     pub service_name: String,
     /// Fully qualified service host, used in logs.
     pub service_fqdn: String,
+    /// `true` only for opaque-TLS app ports (`AppProtocol::Tls`), where the
+    /// captured plaintext bytes are a real TLS ClientHello so the inbound relay
+    /// peeks the SNI before the stream plugin chain (a `when: connection.sni`
+    /// `AuthorizationPolicy` needs it). `false` for server-first raw-TCP ports
+    /// (Redis/MySQL/Postgres/Mongo/plain TCP), whose clients send NOTHING until
+    /// the backend greeting — peeking those would block the relay on the
+    /// handshake clock (up to `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`,
+    /// indefinitely when `0`) before the loopback dial.
+    pub tls_inspect: bool,
 }
 
 fn default_waypoint_for() -> String {

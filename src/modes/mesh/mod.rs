@@ -2734,6 +2734,18 @@ fn materialize_sidecar_inbound_proxies(
                     );
                     continue;
                 };
+                // Effective protocol with `protocol_overrides` applied (same
+                // resolution `service_tcp_stream_ports` filtered on). Only an
+                // opaque-TLS port carries a real ClientHello, so only it is SNI-
+                // peeked by the inbound relay; server-first ports (Redis/MySQL/
+                // Postgres/Mongo/plain TCP) must not peek or the relay stalls on
+                // the handshake clock waiting for bytes the client never sends
+                // before the backend greeting.
+                let effective_protocol = service
+                    .protocol_overrides
+                    .get(&service_port.port)
+                    .copied()
+                    .unwrap_or(service_port.protocol);
                 tcp_routes.push(MeshInboundTcpRoute {
                     match_port: backend_port,
                     backend_addr: std::net::SocketAddr::new(
@@ -2748,6 +2760,7 @@ fn materialize_sidecar_inbound_proxies(
                         service.namespace,
                         runtime.cluster_domain.trim_matches('.')
                     ),
+                    tls_inspect: matches!(effective_protocol, AppProtocol::Tls),
                 });
             }
         }
@@ -13650,6 +13663,53 @@ mod tests {
         assert_eq!(route.match_port, 6380);
         assert_eq!(route.backend_addr, "127.0.0.1:6380".parse().unwrap());
         assert_eq!(route.service_fqdn, "redis.default.svc.cluster.local");
+        assert!(
+            !route.tls_inspect,
+            "a server-first Redis inbound port must not be marked for SNI peeking"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_tls_tcp_route_marks_sni_inspect() {
+        // An opaque-TLS app port (`AppProtocol::Tls`) materializes a raw-TCP
+        // inbound route whose captured bytes ARE a ClientHello, so the relay must
+        // peek the SNI before the stream plugin chain (`tls_inspect == true`).
+        // This is the only stream-family inbound protocol that speaks first; the
+        // server-first ports above stay `false` so the relay never blocks on the
+        // handshake clock waiting for client bytes that arrive after the greeting.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/tlsapp";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut local = workload("tlsapp", "tlsapp");
+        local.ports = vec![WorkloadPort {
+            port: 8443,
+            protocol: AppProtocol::Tls,
+            name: Some("tls".to_string()),
+        }];
+        let mut service = http_mesh_service("tlsapp", 8443, spiffe);
+        service.ports[0].protocol = AppProtocol::Tls;
+        service.ports[0].target_port = Some(ServiceTargetPort::Name("tls".to_string()));
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local],
+            services: vec![service],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let mesh = config.mesh.as_deref().expect("prepared mesh config");
+        assert_eq!(mesh.local_inbound_tcp_routes.len(), 1);
+        let route = &mesh.local_inbound_tcp_routes[0];
+        assert_eq!(route.match_port, 8443);
+        assert!(
+            route.tls_inspect,
+            "an opaque-TLS inbound port must be marked for ClientHello SNI peeking"
+        );
     }
 
     #[test]
