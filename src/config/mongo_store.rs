@@ -3687,10 +3687,41 @@ mod inner {
                 SortOrder::Desc => -1,
             };
 
+            // The floored `updated_at` prefilter over-includes the boundary
+            // second `[floor(since), since)` ONLY when `updated_since` carries a
+            // sub-second component (a whole-second floor is exact). The exact
+            // `updated_at >= since` predicate is faithful across every AutoSi
+            // fractional width, but it can only be applied in app code on the
+            // parsed `DateTime` — it has no ordering-faithful string `$gte` form.
+            //
+            // Pagination must therefore see the *kept* rows, not the raw
+            // prefilter rows. If we let Mongo `.skip()/.limit()` the
+            // over-inclusive set and post-filtered afterwards, a dropped
+            // boundary row would consume a page slot (under-filling the page,
+            // hiding valid rows past the limit) and shift `next_offset`,
+            // producing duplicates on the next page. So when (and only when) the
+            // boundary post-filter can fire, paginate app-side over the kept
+            // rows; otherwise keep the efficient server-side skip/limit. This
+            // matches the SQL backend, which applies the exact `updated_at >= ?`
+            // predicate before `LIMIT/OFFSET`.
+            let exact_postfilter_since = match filter.updated_since {
+                Some(since) if since.timestamp_subsec_nanos() != 0 => Some(since),
+                _ => None,
+            };
+
+            // Push skip/limit to Mongo only when no boundary over-inclusion is
+            // possible. When the exact post-filter can fire (sub-second `since`),
+            // leave skip/limit unset (`None`) and paginate app-side over kept
+            // rows below, so dropped boundary rows never consume a page slot.
+            let (mongo_skip, mongo_limit) = if exact_postfilter_since.is_some() {
+                (None, None)
+            } else {
+                (Some(filter.offset as u64), Some(filter.limit as i64))
+            };
             let options = mongodb::options::FindOptions::builder()
                 .sort(doc! { sort_field: sort_dir })
-                .skip(Some(filter.offset as u64))
-                .limit(Some(filter.limit as i64))
+                .skip(mongo_skip)
+                .limit(mongo_limit)
                 .projection(doc! { "spec_content": 0, "resource_hash": 0 })
                 .build();
             let mut cursor = self
@@ -3698,20 +3729,36 @@ mod inner {
                 .find(filter_doc)
                 .with_options(options)
                 .await?;
+
             let mut specs = Vec::new();
-            while cursor.advance().await? {
-                let doc = cursor.deserialize_current()?;
-                let spec = doc_to_api_spec_summary(doc)?;
-                // Re-apply the exact `updated_at >= since` predicate against the
-                // parsed timestamp to drop any boundary-second rows the floored
-                // prefilter over-matched. `updated_at` parsing is exact across
-                // every stored fractional width (unlike string `$gte`).
-                if let Some(since) = filter.updated_since
-                    && spec.updated_at < since
-                {
-                    continue;
+            if let Some(since) = exact_postfilter_since {
+                // App-side pagination over kept rows.
+                let offset = filter.offset as u64;
+                let limit = filter.limit as usize;
+                let mut kept_seen: u64 = 0;
+                while cursor.advance().await? {
+                    let doc = cursor.deserialize_current()?;
+                    let spec = doc_to_api_spec_summary(doc)?;
+                    // Drop boundary-second rows the floored prefilter over-matched.
+                    if spec.updated_at < since {
+                        continue;
+                    }
+                    // Skip the first `offset` kept rows, then collect `limit`.
+                    if kept_seen < offset {
+                        kept_seen += 1;
+                        continue;
+                    }
+                    if specs.len() >= limit {
+                        // Enough kept rows for this page; stop scanning early.
+                        break;
+                    }
+                    specs.push(spec);
                 }
-                specs.push(spec);
+            } else {
+                while cursor.advance().await? {
+                    let doc = cursor.deserialize_current()?;
+                    specs.push(doc_to_api_spec_summary(doc)?);
+                }
             }
             self.check_slow_query("list_api_specs", start);
             Ok(PaginatedResult {
@@ -4376,6 +4423,86 @@ mod inner {
                 parse_stored("2026-05-18T01:00:00.000000001Z") >= whole,
                 "with whole-second since, same-second sub-second rows are kept"
             );
+        }
+
+        #[test]
+        fn list_api_specs_sub_second_since_paginates_over_kept_rows() {
+            // Finding: with a sub-second `updated_since`, the exact post-filter
+            // runs AFTER Mongo skip/limit, so a dropped boundary-second row would
+            // consume a page slot — under-filling the page and shifting
+            // `next_offset` into duplicates. The fix paginates app-side over the
+            // *kept* rows. This test models that app-side loop against the same
+            // sorted prefilter set the store scans.
+            let since = parse_stored("2026-05-18T01:00:00.500Z");
+
+            // Sorted (updated_at ASC) prefilter set: the floored `$gte` matches
+            // every row at/after `...T01:00:00`. Two boundary rows are `< since`
+            // and must be dropped without consuming page slots.
+            let prefilter_sorted = [
+                "2026-05-18T01:00:00.100Z", // boundary, dropped (< since)
+                "2026-05-18T01:00:00.400Z", // boundary, dropped (< since)
+                "2026-05-18T01:00:00.500Z", // kept[0] (== since)
+                "2026-05-18T01:00:00.700Z", // kept[1]
+                "2026-05-18T01:00:01.000Z", // kept[2]
+                "2026-05-18T01:00:02.000Z", // kept[3]
+                "2026-05-18T01:00:03.000Z", // kept[4]
+            ];
+
+            // App-side pagination identical to the store: drop `< since`, skip
+            // `offset` kept rows, then collect up to `limit` kept rows.
+            let page = |offset: u64, limit: usize| -> Vec<String> {
+                let mut kept_seen: u64 = 0;
+                let mut out: Vec<String> = Vec::new();
+                for stored in prefilter_sorted {
+                    if parse_stored(stored) < since {
+                        continue;
+                    }
+                    if kept_seen < offset {
+                        kept_seen += 1;
+                        continue;
+                    }
+                    if out.len() >= limit {
+                        break;
+                    }
+                    out.push(stored.to_string());
+                }
+                out
+            };
+
+            // Page 1 (offset 0, limit 2) must be FULL with kept rows — the two
+            // dropped boundary rows do not steal slots.
+            let p1 = page(0, 2);
+            assert_eq!(
+                p1,
+                vec![
+                    "2026-05-18T01:00:00.500Z".to_string(),
+                    "2026-05-18T01:00:00.700Z".to_string(),
+                ],
+                "first page must be filled from kept rows only"
+            );
+
+            // `next_offset` = offset + items.len() = 2 (handler computation).
+            // Page 2 must continue WITHOUT repeating page-1 rows.
+            let p2 = page(2, 2);
+            assert_eq!(
+                p2,
+                vec![
+                    "2026-05-18T01:00:01.000Z".to_string(),
+                    "2026-05-18T01:00:02.000Z".to_string(),
+                ],
+                "second page must not duplicate first-page rows"
+            );
+
+            // Final page drains the remainder, no overlap.
+            let p3 = page(4, 2);
+            assert_eq!(
+                p3,
+                vec!["2026-05-18T01:00:03.000Z".to_string()],
+                "tail page returns only the final kept row"
+            );
+
+            // Exactly 5 kept rows total across non-overlapping pages.
+            assert_eq!(p1.len() + p2.len() + p3.len(), 5);
         }
 
         #[test]
