@@ -2506,6 +2506,12 @@ async fn handle_h3_request(
 
         // Hop-by-hop headers already filtered during collection in the H3 pool.
 
+        // Capture the original range decision before `after_proxy` runs on this
+        // default native-H3 streaming path; `compression.after_proxy` honors the
+        // marker so a streamed range body is never mislabeled `Content-Encoding`
+        // even if a `response_transformer` strips `Content-Range` first.
+        stamp_h3_range_response_metadata(&mut ctx, response_status, &response_headers);
+
         // Enforce response body size limit via Content-Length fast path
         if state.max_response_body_size_bytes > 0
             && let Some(len) = response_headers
@@ -4593,6 +4599,29 @@ fn h3_backend_unavailable_stream_result(
     }
 }
 
+/// Record the ORIGINAL backend range decision before any `after_proxy` hook can
+/// rewrite the response headers, mirroring the H1/H2 stamp in `proxy/mod.rs`.
+/// On every native-H3 streaming branch `after_proxy` runs after this point, and
+/// `response_transformer` (ordering 4000) runs before `compression` (4050); if
+/// the transformer strips/renames `Content-Range` on a non-206 response,
+/// `compression.after_proxy` would otherwise no longer see the header (nor the
+/// marker) and could commit a `Content-Encoding` on a streamed range body whose
+/// buffered-only `transform_response_body` never runs — sending raw bytes
+/// mislabeled as gzip/br. Only inserted for range responses, so the common path
+/// stays allocation-free.
+fn stamp_h3_range_response_metadata(
+    ctx: &mut RequestContext,
+    response_status: u16,
+    response_headers: &HashMap<String, String>,
+) {
+    if response_status == 206 || response_headers.contains_key("content-range") {
+        ctx.metadata.insert(
+            crate::proxy::RANGE_RESPONSE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
+}
+
 async fn run_h3_streaming_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -4699,6 +4728,12 @@ async fn proxy_to_backend_h3_refined_response(
     let response_status = h3_resp.status;
     let mut response_headers = h3_resp.headers;
     response_headers.retain(|name, _| !is_backend_response_strip_header(name));
+
+    // Stamp the original range decision before the buffer/stream refine and
+    // before any `after_proxy` hook can strip `Content-Range`. The streaming
+    // branch below runs `compression.after_proxy` later (via
+    // `stream_h3_open_response_to_client`), which honors this marker.
+    stamp_h3_range_response_metadata(ctx, response_status, &response_headers);
 
     if crate::proxy::refine_stream_response_for_content_type(
         false,
@@ -5378,6 +5413,11 @@ async fn proxy_to_backend_h3_streaming(
     // `proxy::headers` for the canonical predicate. Response-direction
     // set differs from the request-direction set.
     response_headers.retain(|name, _| !is_backend_response_strip_header(name));
+
+    // Capture the original range decision before `after_proxy` (below) can let a
+    // `response_transformer` strip `Content-Range`; `compression.after_proxy`
+    // honors this marker so a streamed range body is never mislabeled compressed.
+    stamp_h3_range_response_metadata(ctx, response_status, &response_headers);
 
     // Enforce response body size limit via Content-Length fast path
     if state.max_response_body_size_bytes > 0
