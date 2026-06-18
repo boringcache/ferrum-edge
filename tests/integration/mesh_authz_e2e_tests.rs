@@ -857,18 +857,57 @@ fn mesh_authz_construction_tolerates_selector_labels_without_proxy_labels() {
         },
         CLIENT_SPIFFE,
     );
-    // Bypass the prepare path so we feed mesh_policies directly into
-    // MeshAuthz::new — exercising the construction-time validator without help
-    // from the upstream prepare pipeline.
+    // Feed the policy through a `mesh_slice` (the slice-apply shape the
+    // production prepare pipeline builds) with no proxy labels — the ambiguous
+    // shared-SPIFFE case. The slice computed authoritative (here empty) labels
+    // and a downstream consumer may re-filter, so construction must tolerate.
+    let slice = json!({
+        "node_id": "node-a",
+        "namespace": DEFAULT_NAMESPACE,
+        "version": "v1",
+        "mesh_policies": [policy],
+        // labels: intentionally omitted (empty intersection)
+    });
+    let config = json!({ "mesh_slice": slice });
+    assert!(
+        MeshAuthz::new(&config).is_ok(),
+        "slice-path construction must tolerate an unevaluable ambiguous selector policy, not error"
+    );
+}
+
+#[test]
+fn mesh_authz_construction_rejects_operator_selector_policy_without_labels() {
+    // Operator-direct config (flat `mesh_policies`, no `mesh_slice` context): a
+    // workload-selector policy with selector labels but no proxy `labels`. There
+    // is no downstream consumer to recover the labels, so the cold-path `retain`
+    // would drop the policy and `evaluate_mesh_authorization_policies` would
+    // allow the request by default — a silent fail-open. Construction must fail
+    // closed instead, forcing the operator to supply the proxy identity.
+    let policy = policy_allow_principal(
+        "labels-required",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "ratings".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
     let config = json!({
         "mesh_policies": [policy],
         "namespace": DEFAULT_NAMESPACE,
         // labels: intentionally omitted
     });
-    assert!(
-        MeshAuthz::new(&config).is_ok(),
-        "construction must tolerate an unevaluable ambiguous selector policy, not error"
-    );
+    // `MeshAuthz` does not implement `Debug`, so inspect the `Result` directly
+    // instead of `expect_err`.
+    match MeshAuthz::new(&config) {
+        Ok(_) => panic!("operator-direct selector policy without labels must fail closed"),
+        Err(err) => assert!(
+            err.contains("no proxy labels are configured"),
+            "expected a labels-required construction error, got: {err}"
+        ),
+    }
 }
 
 #[test]

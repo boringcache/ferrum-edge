@@ -170,6 +170,23 @@ pub struct MeshSlice {
     pub waypoint_name: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// `labels` is an AMBIGUOUS intersection inferred from a shared-SPIFFE match
+    /// across multiple workloads, NOT this workload's authoritative label set.
+    /// Set only when the slice request carried no explicit labels and more than
+    /// one workload shared the SPIFFE id, so `labels` is the (possibly empty)
+    /// intersection while `mesh_policies` / `peer_authentications` /
+    /// `request_authentications` carry the candidate-any superset.
+    ///
+    /// Consumers that hold the workload's real labels MUST prefer those over the
+    /// intersection when this is `true`: the xDS DP re-filters the superset
+    /// against its local `FERRUM_MESH_WORKLOAD_LABELS` rather than letting the
+    /// non-empty intersection carrier replace them (otherwise a candidate-only
+    /// selector PeerAuthentication / RequestAuthentication / AuthorizationPolicy
+    /// is silently dropped — a fail-open whenever the intersection is non-empty).
+    /// `false` (the default) means `labels` is authoritative; never serialized
+    /// when unset so non-ambiguous slices stay byte-identical on the wire.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub labels_ambiguous: bool,
     pub version: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workloads: Vec<Workload>,
@@ -408,6 +425,13 @@ impl MeshSlice {
             && self.workload_spiffe_id == other.workload_spiffe_id
             && self.waypoint_name == other.waypoint_name
             && self.labels == other.labels
+            // The ambiguous-labels marker can flip independently of `labels`
+            // (e.g. the shared-SPIFFE candidate set shrinks from two workloads
+            // to one while the intersection is unchanged), changing how the xDS
+            // DP resolves label precedence. It MUST be compared so the slice is
+            // re-broadcast and the DP stops deferring to (or starts deferring
+            // to) its local labels; omitting it would keep the stale precedence.
+            && self.labels_ambiguous == other.labels_ambiguous
             && self.workloads == other.workloads
             && self.services == other.services
             && self.local_inbound_services == other.local_inbound_services
@@ -597,6 +621,14 @@ impl MeshSlice {
         } else {
             request.labels.clone()
         };
+        // `effective_labels` is an ambiguous intersection (not this workload's
+        // authoritative labels) precisely when no explicit request labels were
+        // supplied AND more than one workload shared the SPIFFE id. In that case
+        // selector-scoped resources rode in as a candidate-any superset above,
+        // and a consumer holding the real labels (the xDS DP) must re-filter
+        // against them instead of trusting the intersection. A single candidate
+        // (or concrete request labels) is authoritative, so this stays false.
+        let labels_ambiguous = request.labels.is_empty() && candidate_label_sets.len() > 1;
         // Candidate-any projection input for selector-scoped resources. When the
         // labels are INFERRED from an ambiguous shared-SPIFFE match, keep a
         // resource if it applies to ANY candidate workload (a superset), not
@@ -994,6 +1026,7 @@ impl MeshSlice {
             workload_spiffe_id: request.workload_spiffe_id,
             waypoint_name: request.waypoint_name,
             labels: effective_labels,
+            labels_ambiguous,
             version,
             workloads,
             services,
@@ -2834,6 +2867,7 @@ mod tests {
             namespace: "ns".into(),
             workload_spiffe_id: Some("spiffe://td/ns/x/sa/y".into()),
             labels: BTreeMap::from([("app".into(), "web".into())]),
+            labels_ambiguous: false,
             version: "v1".into(),
             workloads: vec![make_workload("ns", "web", HashMap::new())],
             services: vec![make_service("ns", "web")],
@@ -2921,6 +2955,25 @@ mod tests {
             "a flipped sidecar_ingress_declared marker (empty listeners) must be a content change"
         );
         // Symmetric, and identical marker values are equal.
+        assert!(!b.content_eq(&a));
+        assert!(a.content_eq(&a.clone()));
+    }
+
+    #[test]
+    fn content_eq_detects_labels_ambiguous_change() {
+        // The ambiguous-labels marker can flip while `labels` is unchanged (the
+        // shared-SPIFFE candidate set changes but the intersection does not),
+        // altering how the xDS DP resolves label precedence. It must count as a
+        // content change so the slice is re-broadcast and the DP updates.
+        let a = MeshSlice {
+            labels_ambiguous: true,
+            ..MeshSlice::default()
+        };
+        let b = MeshSlice::default();
+        assert!(
+            !a.content_eq(&b),
+            "a flipped labels_ambiguous marker must be a content change"
+        );
         assert!(!b.content_eq(&a));
         assert!(a.content_eq(&a.clone()));
     }
@@ -3551,6 +3604,11 @@ mod tests {
             BTreeMap::from([("app".into(), "shared".into())]),
             "only labels common to every matching workload should be authoritative for slice.labels"
         );
+        assert!(
+            slice.labels_ambiguous,
+            "labels inferred from >1 shared-SPIFFE candidate must be marked ambiguous so the xDS \
+             DP re-filters the candidate-any superset against its own labels"
+        );
         // Candidate-any superset: the `role=api` selector resources match the
         // `api` candidate workload, so they are kept for the per-pod NodeWaypoint
         // and xDS DP-local-label consumers to re-filter — even though
@@ -3708,6 +3766,12 @@ mod tests {
         // The slice should inherit labels from the matched workload.
         assert_eq!(slice.labels.get("app"), Some(&"web".to_string()));
         assert_eq!(slice.labels.get("tier"), Some(&"frontend".to_string()));
+        // A single matching workload is unambiguous: its labels are
+        // authoritative, so the xDS DP keeps trusting the carrier.
+        assert!(
+            !slice.labels_ambiguous,
+            "single-candidate inherited labels are authoritative, not ambiguous"
+        );
         // The workload-selector policy should match via inherited labels.
         assert_eq!(slice.mesh_policies.len(), 1);
         assert_eq!(slice.mesh_policies[0].name, "selector-policy");
@@ -3759,6 +3823,10 @@ mod tests {
         let slice = MeshSlice::from_gateway_config(&config, request);
 
         assert!(slice.labels.is_empty());
+        assert!(
+            slice.labels_ambiguous,
+            "an empty intersection across >1 shared-SPIFFE candidates is still ambiguous"
+        );
         assert_eq!(
             slice.mesh_policies.len(),
             1,

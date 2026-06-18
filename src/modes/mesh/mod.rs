@@ -14599,6 +14599,7 @@ mod tests {
             workload_spiffe_id: None,
             waypoint_name: None,
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            labels_ambiguous: false,
             version: "test".to_string(),
             workloads: Vec::new(),
             services: Vec::new(),

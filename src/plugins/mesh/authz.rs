@@ -336,6 +336,17 @@ const DEFAULT_TRUSTED_HBONE_ASSERTOR_SA_NAMES: &[&str] = &["ztunnel", "waypoint"
 
 impl MeshAuthz {
     pub fn new(config: &Value) -> Result<Self, String> {
+        // Whether the policies arrived via a `mesh_slice` (the slice-apply path
+        // builds this — see `inject_mesh_authz_plugin`) vs. a flat
+        // `mesh_policies` operator config with no slice context. This selects
+        // how `validate_scope_filter_identity` treats a workload-selector policy
+        // whose labels cannot be resolved against the proxy: the slice path
+        // computed authoritative (possibly empty/ambiguous) labels and a
+        // downstream consumer may re-filter, so it tolerates; a flat operator
+        // config has no such recovery and must fail closed instead of silently
+        // dropping the policy (which `evaluate_mesh_authorization_policies`
+        // would then treat as allow-by-default).
+        let from_slice = config.get("mesh_slice").is_some();
         let mut slice = if let Some(value) = config.get("mesh_slice") {
             serde_json::from_value::<MeshSlice>(value.clone())
                 .map_err(|e| format!("mesh_authz: invalid mesh_slice: {e}"))?
@@ -381,7 +392,7 @@ impl MeshAuthz {
             .unwrap_or(false);
 
         if !per_pod_policy_scoping {
-            validate_scope_filter_identity(&slice)?;
+            validate_scope_filter_identity(&slice, from_slice)?;
 
             // Pre-filter the slice's mesh_policies down to those whose `scope`
             // applies to this proxy's workload identity. Done once at
@@ -675,7 +686,7 @@ impl MeshAuthz {
     }
 }
 
-fn validate_scope_filter_identity(slice: &MeshSlice) -> Result<(), String> {
+fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result<(), String> {
     let has_proxy_namespace = !slice.namespace.trim().is_empty();
     let has_proxy_labels = !slice.labels.is_empty();
 
@@ -704,17 +715,38 @@ fn validate_scope_filter_identity(slice: &MeshSlice) -> Result<(), String> {
                 }
 
                 if !selector.labels.is_empty() && !has_proxy_labels {
-                    // Ambiguous shared-SPIFFE identity: the slice carries this
-                    // selector policy as a candidate-any superset (so per-pod
-                    // NodeWaypoint and xDS DP-local-label consumers can re-filter
-                    // it) but resolved no proxy labels — the candidate label
-                    // intersection was empty. It cannot be evaluated for THIS
-                    // workload, so skip it with a warning instead of failing
-                    // plugin construction, which would reject the slice or drop
-                    // authz entirely (issue #1708). The load-bearing cold-path
-                    // `retain` in `new()` then drops it from enforcement; set
-                    // `mesh_slice.labels` / `FERRUM_MESH_WORKLOAD_LABELS` for
-                    // deterministic selector scoping on Sidecar/Ambient.
+                    if !from_slice {
+                        // Operator-direct config (flat `mesh_policies`, no
+                        // `mesh_slice` context): a workload-selector policy
+                        // carries selector labels but the operator supplied no
+                        // proxy `labels`, so the cold-path `retain` would drop
+                        // it and `evaluate_mesh_authorization_policies` would
+                        // then allow the request by default — a silent fail-open
+                        // for a DENY/ALLOW the operator clearly intended to
+                        // apply. There is no downstream consumer to recover the
+                        // labels here (unlike the slice path), so fail closed at
+                        // construction and make the operator supply the proxy's
+                        // identity.
+                        return Err(format!(
+                            "mesh_authz: policy '{}' uses a workload selector with labels {:?} but \
+                             no proxy labels are configured; set `labels` so the policy can be \
+                             scoped to this workload",
+                            policy.name, selector.labels
+                        ));
+                    }
+                    // Slice-apply path: the slice computed authoritative proxy
+                    // labels that resolved to empty here. This is the ambiguous
+                    // shared-SPIFFE case — the slice carries this selector policy
+                    // as a candidate-any superset (so per-pod NodeWaypoint and
+                    // xDS DP-local-label consumers can re-filter it) but the
+                    // candidate label intersection was empty. It cannot be
+                    // evaluated for THIS workload, so skip it with a warning
+                    // instead of failing plugin construction, which would reject
+                    // the slice or drop authz entirely (issue #1708). The
+                    // load-bearing cold-path `retain` in `new()` then drops it
+                    // from enforcement; set `mesh_slice.labels` /
+                    // `FERRUM_MESH_WORKLOAD_LABELS` for deterministic selector
+                    // scoping on Sidecar/Ambient.
                     tracing::warn!(
                         policy = %policy.name,
                         "mesh_authz: workload-selector policy has selector labels but no proxy \
