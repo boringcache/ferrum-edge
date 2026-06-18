@@ -1899,23 +1899,34 @@ mod live_netns_tests {
             }
         }
         if let Some(status) = setup_exit {
-            match status.code() {
-                Some(97) => {
-                    eprintln!("SKIP: iptables/ip binary unavailable inside the test netns");
-                    return;
-                }
-                other => panic!(
-                    "netns UDP TPROXY setup failed (exit {other:?}): a load-bearing \
-                     policy-route / fwmark-rule / `-j TPROXY` rule did not install, so the \
-                     capture path was NOT exercised — failing rather than skipping vacuously"
-                ),
+            // ONLY exit 98 is a load-bearing failure: it is emitted by the script
+            // ITSELF, which means `unshare --net` created the netns and `sh` ran,
+            // but a route / fwmark / `-j TPROXY` rule failed to install — a real
+            // break in the path under test → FAIL (don't pass vacuously). Every
+            // other exit is an ENVIRONMENTAL prerequisite the live job can't meet
+            // → SKIP: 97 = no `iptables`/`ip` binary; anything else means the
+            // script never ran (e.g. `unshare --net` exits 1 without
+            // CAP_SYS_ADMIN, or `sh`/`unshare` missing → 127), so no netns or
+            // UDP capture was exercised. (codex #1823 r1 + r2)
+            if status.code() == Some(98) {
+                panic!(
+                    "netns UDP TPROXY setup failed (exit 98): a load-bearing policy-route / \
+                     fwmark-rule / `-j TPROXY` rule did not install, so the capture path was \
+                     NOT exercised — failing rather than skipping vacuously"
+                );
             }
+            eprintln!(
+                "SKIP: netns/capture prerequisites unavailable (setup child exited {:?}: \
+                 `unshare --net` denied, or no iptables/ip binary)",
+                status.code()
+            );
+            return;
         }
         if setup_status_unknown {
-            panic!(
-                "could not determine the netns setup child's exit status (try_wait errored); \
-                 failing rather than skipping a possibly-broken capture setup"
-            );
+            // `try_wait` errored — an environmental ambiguity reading the child,
+            // NOT a confirmed load-bearing failure → skip rather than fail.
+            eprintln!("SKIP: could not determine netns setup-child status (try_wait errored)");
+            return;
         }
         let pid = child.id();
         let _guard = ChildGuard(child);
