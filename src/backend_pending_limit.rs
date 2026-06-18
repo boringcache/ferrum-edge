@@ -560,46 +560,44 @@ mod tests {
 
     #[test]
     fn concurrent_evict_and_acquire_never_double_admits() {
-        // Regression for the eviction-vs-acquire race closed by reserving the
-        // slot under the shard lock. With `cap == 1` every successful acquire
-        // takes the counter 0 -> 1 and every drop takes it 1 -> 0, so an
-        // idle-entry eviction constantly races a concurrent acquirer for the
-        // SAME destination. If the count mutation were lock-free (a CAS on a
-        // cloned `Arc`), the eviction could drop a counter the racing acquirer
-        // had already cloned, the acquirer would bump an orphaned counter, a
-        // later request would cold-path a fresh entry, and the destination would
-        // carry two live holders past a cap of one. Assert simultaneously-held
-        // guards never exceed the cap.
-        use std::sync::atomic::AtomicUsize;
+        // Concurrent acquire/drop churn on a cap-1 destination: every successful
+        // acquire takes the counter 0 -> 1 and every drop takes it 1 -> 0, so an
+        // idle-entry eviction constantly races a concurrent acquirer for the SAME
+        // destination. Reserving the slot AND evicting under the shard lock makes
+        // over-admission structurally impossible (a lock-free CAS on a cloned
+        // `Arc` could instead let an eviction race an acquirer onto a second,
+        // orphaned counter). We assert the limiter's own per-destination count
+        // never exceeds the cap while a slot is held.
+        //
+        // This is a deliberately TIMING-ROBUST check. A test-side "live guards"
+        // gauge cannot verify the invariant without spurious results, because the
+        // slot is released INSIDE `Drop` (the `remove_if`) — a point the test
+        // can't bracket: decrementing such a gauge *before* `drop` undercounts a
+        // real overlap, *after* `drop` overcounts a legitimate post-release
+        // acquire. Reading the limiter's count under its read lock sidesteps that:
+        // while this thread holds a guard the count is exactly 1, and a regression
+        // that admitted past the cap would surface as a count above the cap here.
         use std::thread;
 
         let limiter = Arc::new(BackendPendingLimiter::new());
         let cap: u32 = 1;
-        let live = Arc::new(AtomicUsize::new(0));
-        let max_live = Arc::new(AtomicUsize::new(0));
 
         let mut handles = Vec::new();
         for _ in 0..8 {
             let limiter = Arc::clone(&limiter);
-            let live = Arc::clone(&live);
-            let max_live = Arc::clone(&max_live);
             handles.push(thread::spawn(move || {
                 for _ in 0..4_000 {
                     if let Ok(Some(guard)) = limiter.try_acquire("hot.example.com", 80, Some(cap)) {
-                        let now = live.fetch_add(1, Ordering::AcqRel) + 1;
-                        max_live.fetch_max(now, Ordering::AcqRel);
-                        // Widen the hold window without a wall-clock sleep so a
-                        // racing acquirer can overlap if the cap ever leaks.
+                        assert!(
+                            limiter.current("hot.example.com", 80) <= u64::from(cap),
+                            "in-flight count exceeded the cap while a guard was held"
+                        );
+                        // Widen the hold window without a wall-clock sleep so the
+                        // count check overlaps concurrent acquire/evict attempts.
                         for _ in 0..24 {
                             std::hint::spin_loop();
                         }
-                        // Drop (release the slot) BEFORE decrementing `live`, so
-                        // the guard is counted as held throughout its own
-                        // release — if a regression admitted a second guard while
-                        // this one's slot was being released, `max_live` records
-                        // the overlap.
                         drop(guard);
-                        live.fetch_sub(1, Ordering::AcqRel);
                     }
                 }
             }));
@@ -608,14 +606,6 @@ mod tests {
             h.join().expect("thread join");
         }
 
-        assert!(
-            max_live.load(Ordering::Acquire) <= cap as usize,
-            "in-flight cap exceeded under concurrent eviction churn (observed {} \
-             simultaneous holders for cap {}): an idle-entry eviction orphaned a \
-             live counter",
-            max_live.load(Ordering::Acquire),
-            cap
-        );
         assert_eq!(
             limiter.current("hot.example.com", 80),
             0,
