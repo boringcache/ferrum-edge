@@ -1668,6 +1668,23 @@ mod tests {
         assert!(!crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(
             &untagged
         ));
+
+        // BOTH tags → both predicates true. The materializer stamps exactly one
+        // transport tag, so a both-tags target is only reachable via a
+        // hand-authored / corrupted upstream; the branch is documented
+        // PRECEDENCE (not a rejection): `run_udp_egress_session` evaluates
+        // `target_hbone_enabled` FIRST, so a both-tags target takes the HBONE
+        // branch. That is the safe resolution — a target carrying `mesh.hbone` is
+        // an Ambient HBONE target regardless, and HBONE egress is itself
+        // identity-pinned + capability-gated, so precedence never relaxes a gate.
+        let both = target_with(&[
+            (crate::proxy::hbone_pool::HBONE_TARGET_TAG, "true"),
+            (crate::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG, "true"),
+        ]);
+        assert!(crate::proxy::hbone_pool::target_hbone_enabled(&both));
+        assert!(crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(
+            &both
+        ));
     }
 
     fn admission_name(a: &SessionAdmission) -> &'static str {
