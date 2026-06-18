@@ -838,13 +838,14 @@ async fn allow_then_deny_for_different_principal_lets_target_through() {
 
 #[test]
 fn mesh_authz_construction_tolerates_selector_labels_without_proxy_labels() {
-    // Ambiguous shared-SPIFFE identity: the slice can carry a label-based
-    // selector policy as a candidate-any superset (so per-pod NodeWaypoint and
-    // xDS DP-local-label consumers can re-filter it) while resolving no proxy
-    // labels — the candidate label intersection was empty. Construction must NOT
-    // error on this (a hard error would reject the whole slice or drop authz
-    // entirely — issue #1708); it warns and the load-bearing cold-path `retain`
-    // drops the un-evaluable policy from enforcement (covered behaviorally by
+    // Non-ambiguous slice (no `labels_ambiguous` marker) that nonetheless
+    // resolved empty proxy labels — e.g. a single-candidate or label-less
+    // workload. The slice's labels are authoritative for THIS workload, so a
+    // label-based selector simply does not apply and dropping it via the
+    // cold-path `retain` is correct (not a fail-open). Construction must NOT
+    // error (a hard error would reject the whole slice or drop authz entirely —
+    // issue #1708); it warns and the cold-path `retain` drops the un-evaluable
+    // policy from enforcement (covered behaviorally by
     // `mesh_authz_construction_filters_policies_for_workload_at_build_time`).
     let policy = policy_allow_principal(
         "labels-required",
@@ -858,21 +859,63 @@ fn mesh_authz_construction_tolerates_selector_labels_without_proxy_labels() {
         CLIENT_SPIFFE,
     );
     // Feed the policy through a `mesh_slice` (the slice-apply shape the
-    // production prepare pipeline builds) with no proxy labels — the ambiguous
-    // shared-SPIFFE case. The slice computed authoritative (here empty) labels
-    // and a downstream consumer may re-filter, so construction must tolerate.
+    // production prepare pipeline builds) with no proxy labels and the labels
+    // NOT flagged ambiguous, so construction must tolerate.
     let slice = json!({
         "node_id": "node-a",
         "namespace": DEFAULT_NAMESPACE,
         "version": "v1",
         "mesh_policies": [policy],
-        // labels: intentionally omitted (empty intersection)
+        // labels: intentionally omitted; labels_ambiguous defaults to false
     });
     let config = json!({ "mesh_slice": slice });
     assert!(
         MeshAuthz::new(&config).is_ok(),
-        "slice-path construction must tolerate an unevaluable ambiguous selector policy, not error"
+        "slice-path construction must tolerate an unevaluable non-ambiguous selector policy, not error"
     );
+}
+
+#[test]
+fn mesh_authz_construction_rejects_ambiguous_slice_selector_policy_without_labels() {
+    // Ambiguous shared-SPIFFE slice (`labels_ambiguous = true`) carrying a
+    // label-based selector policy as a candidate-any superset, but the slice
+    // resolved EMPTY proxy labels here. Reaching mesh_authz `new()` in this
+    // state means recovery already failed (the per-pod NodeWaypoint consumer
+    // skips this validation; the xDS DP only leaves `labels` empty when it had
+    // no local `FERRUM_MESH_WORKLOAD_LABELS` to prefer). There is no further
+    // consumer, so the cold-path `retain` would drop the policy and
+    // `evaluate_mesh_authorization_policies` would allow by default — a silent
+    // fail-open for a selector DENY/ALLOW that applies to a candidate workload.
+    // Construction must fail closed (Codex P1).
+    let policy = policy_allow_principal(
+        "labels-required",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "ratings".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
+    let slice = json!({
+        "node_id": "node-a",
+        "namespace": DEFAULT_NAMESPACE,
+        "version": "v1",
+        "mesh_policies": [policy],
+        "labels_ambiguous": true,
+        // labels: intentionally omitted (empty intersection, recovery failed)
+    });
+    let config = json!({ "mesh_slice": slice });
+    match MeshAuthz::new(&config) {
+        Ok(_) => {
+            panic!("ambiguous slice with unrecoverable selector labels must fail closed")
+        }
+        Err(err) => assert!(
+            err.contains("ambiguous shared-SPIFFE"),
+            "expected an ambiguous-slice fail-closed construction error, got: {err}"
+        ),
+    }
 }
 
 #[test]

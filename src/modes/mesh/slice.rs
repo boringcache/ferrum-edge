@@ -623,12 +623,22 @@ impl MeshSlice {
         };
         // `effective_labels` is an ambiguous intersection (not this workload's
         // authoritative labels) precisely when no explicit request labels were
-        // supplied AND more than one workload shared the SPIFFE id. In that case
+        // supplied AND several workloads share the SPIFFE id with DIVERGENT
+        // label sets, so the intersection loses information. In that case
         // selector-scoped resources rode in as a candidate-any superset above,
         // and a consumer holding the real labels (the xDS DP) must re-filter
-        // against them instead of trusting the intersection. A single candidate
-        // (or concrete request labels) is authoritative, so this stays false.
-        let labels_ambiguous = request.labels.is_empty() && candidate_label_sets.len() > 1;
+        // against them instead of trusting the intersection.
+        //
+        // A bare candidate count is NOT sufficient: the common replica/endpoints
+        // case has many `Workload` records for one SPIFFE with IDENTICAL labels.
+        // There the intersection equals every candidate set (no information
+        // lost), so the inferred labels are authoritative and the marker must
+        // stay false — otherwise the xDS DP would prefer its own (possibly stale
+        // or partial) `FERRUM_MESH_WORKLOAD_LABELS` over the CP's correct labels
+        // and could drop selector-scoped DENY/PeerAuth/JWT rules. A single
+        // candidate (or concrete request labels) is likewise authoritative.
+        let labels_ambiguous =
+            request.labels.is_empty() && candidate_label_sets_diverge(&candidate_label_sets);
         // Candidate-any projection input for selector-scoped resources. When the
         // labels are INFERRED from an ambiguous shared-SPIFFE match, keep a
         // resource if it applies to ANY candidate workload (a superset), not
@@ -1345,6 +1355,23 @@ fn inferred_workload_label_sets_for_request(
         );
     }
     matches
+}
+
+/// Whether the candidate label sets for a shared SPIFFE actually diverge, so
+/// that their intersection ([`inferred_workload_labels_for_request`]) loses
+/// information and cannot be trusted as the workload's authoritative labels.
+///
+/// Returns `false` for zero/one candidate and for the common replica case where
+/// every matching `Workload` carries the SAME labels: there the intersection
+/// equals each set and is authoritative. Only genuinely divergent sets (where a
+/// selector policy may match one candidate but not another) make the labels
+/// ambiguous and require a label-holding consumer to re-filter the superset.
+fn candidate_label_sets_diverge(candidate_label_sets: &[BTreeMap<String, String>]) -> bool {
+    let mut iter = candidate_label_sets.iter();
+    let Some(first) = iter.next() else {
+        return false;
+    };
+    iter.any(|labels| labels != first)
 }
 
 fn inferred_workload_labels_for_request(
@@ -3925,6 +3952,65 @@ mod tests {
                 .any(|policy| policy.name == "replica-specific-policy"),
             "candidate-matching selector policy kept as superset for per-pod / DP-local re-filtering"
         );
+    }
+
+    #[test]
+    fn from_gateway_config_identical_replica_labels_are_not_ambiguous() {
+        // The common replica/endpoints case: several `Workload` records share a
+        // SPIFFE id with IDENTICAL label maps. The intersection equals each set,
+        // so the inferred labels are authoritative — the marker must stay false.
+        // If it were set, the xDS DP would prefer its own (possibly stale or
+        // partial) FERRUM_MESH_WORKLOAD_LABELS over the CP's correct labels and
+        // could drop selector-scoped DENY/PeerAuth/JWT rules (Codex P2).
+        let td = td();
+        let spiffe_id = SpiffeId::from_parts(&td, "ns/alpha/sa/shared").unwrap();
+        let labels = HashMap::from([
+            ("app".into(), "web".into()),
+            ("version".into(), "v1".into()),
+        ]);
+        let mut replica_a = make_workload("alpha", "web", labels.clone());
+        let mut replica_b = make_workload("alpha", "web", labels.clone());
+        let mut replica_c = make_workload("alpha", "web", labels);
+        replica_a.spiffe_id = spiffe_id.clone();
+        replica_b.spiffe_id = spiffe_id.clone();
+        replica_c.spiffe_id = spiffe_id.clone();
+        let mesh = MeshConfig {
+            workloads: vec![replica_a, replica_b, replica_c],
+            mesh_policies: vec![make_policy(
+                "app-selector-policy",
+                "alpha",
+                PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".into(), "web".into())]),
+                        namespace: None,
+                    },
+                },
+            )],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let request = MeshSliceRequest {
+            node_id: "node-1".into(),
+            namespace: "alpha".into(),
+            workload_spiffe_id: Some(spiffe_id.to_string()),
+            labels: BTreeMap::new(),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            enforce_sidecar_egress: false,
+            sidecar_egress_dry_run: false,
+            enforce_sidecar_identity_narrowing: false,
+            waypoint_name: None,
+        };
+
+        let slice = MeshSlice::from_gateway_config(&config, request);
+
+        assert_eq!(slice.labels.get("app"), Some(&"web".to_string()));
+        assert_eq!(slice.labels.get("version"), Some(&"v1".to_string()));
+        assert!(
+            !slice.labels_ambiguous,
+            "identical replica labels intersect to the full authoritative set; not ambiguous"
+        );
+        assert_eq!(slice.mesh_policies.len(), 1);
+        assert_eq!(slice.mesh_policies[0].name, "app-selector-policy");
     }
 
     #[test]

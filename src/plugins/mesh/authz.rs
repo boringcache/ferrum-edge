@@ -752,25 +752,46 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                             policy.name, selector.labels
                         ));
                     }
-                    // Slice-apply path: the slice computed authoritative proxy
-                    // labels that resolved to empty here. This is the ambiguous
-                    // shared-SPIFFE case — the slice carries this selector policy
-                    // as a candidate-any superset (so per-pod NodeWaypoint and
-                    // xDS DP-local-label consumers can re-filter it) but the
-                    // candidate label intersection was empty. It cannot be
-                    // evaluated for THIS workload, so skip it with a warning
-                    // instead of failing plugin construction, which would reject
-                    // the slice or drop authz entirely (issue #1708). The
-                    // load-bearing cold-path `retain` in `new()` then drops it
-                    // from enforcement; set `mesh_slice.labels` /
-                    // `FERRUM_MESH_WORKLOAD_LABELS` for deterministic selector
-                    // scoping on Sidecar/Ambient.
+                    // Slice-apply path with no resolved proxy labels.
+                    if slice.labels_ambiguous {
+                        // The slice marked these labels as an ambiguous
+                        // shared-SPIFFE intersection and shipped the selector
+                        // policy as a candidate-any superset for a label-holding
+                        // consumer to re-filter. Reaching mesh_authz `new()` with
+                        // EMPTY `slice.labels` means that recovery already failed:
+                        // the per-pod NodeWaypoint consumer skips this validation
+                        // entirely (it re-filters per pod), so we are a
+                        // Sidecar/Ambient/xDS DP whose labels are final, and the
+                        // xDS reverse path only leaves `labels` empty when the DP
+                        // also had no local `FERRUM_MESH_WORKLOAD_LABELS` to
+                        // prefer. There is no further consumer; the cold-path
+                        // `retain` would drop the policy and
+                        // `evaluate_mesh_authorization_policies` would then allow
+                        // by default — a silent fail-open for a selector DENY/ALLOW
+                        // that demonstrably applies to a candidate workload. Fail
+                        // closed and make the operator pin the proxy identity.
+                        return Err(format!(
+                            "mesh_authz: policy '{}' uses a workload selector with labels {:?} but \
+                             the slice resolved no proxy labels for this ambiguous shared-SPIFFE \
+                             workload; set mesh_slice.labels / FERRUM_MESH_WORKLOAD_LABELS so the \
+                             policy can be scoped to this workload",
+                            policy.name, selector.labels
+                        ));
+                    }
+                    // Non-ambiguous slice that still resolved empty proxy labels
+                    // (e.g. a single-candidate or label-less workload). The slice
+                    // is authoritative for THIS workload and a label-based
+                    // selector simply does not apply, so dropping it via the
+                    // cold-path `retain` is correct, not a fail-open. Warn for
+                    // visibility but tolerate construction (failing here would
+                    // reject the slice or drop authz entirely — issue #1708); set
+                    // `mesh_slice.labels` / `FERRUM_MESH_WORKLOAD_LABELS` for
+                    // deterministic selector scoping on Sidecar/Ambient.
                     tracing::warn!(
                         policy = %policy.name,
-                        "mesh_authz: workload-selector policy has selector labels but no proxy \
-                         labels resolved (ambiguous shared-SPIFFE); not enforced for this \
-                         workload — set mesh_slice.labels / FERRUM_MESH_WORKLOAD_LABELS for \
-                         deterministic scoping"
+                        "mesh_authz: workload-selector policy has selector labels but the slice \
+                         resolved no proxy labels for this workload; not enforced here — set \
+                         mesh_slice.labels / FERRUM_MESH_WORKLOAD_LABELS for deterministic scoping"
                     );
                 }
             }
