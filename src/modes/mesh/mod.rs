@@ -911,7 +911,7 @@ fn prepare_normalized_gateway_config_for_mesh(
     // Outbound (egress) runs after inbound and before `apply_destination_rules`
     // so the materialized outbound upstreams pick up port-level DR policy
     // (re-keyed there to the resolved dial port). Topology-aware: Ambient emits
-    // HBONE routes; Sidecar (SVID-mTLS) lands in a follow-up.
+    // HBONE routes; Sidecar emits SVID-mTLS routes.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_tcp_upstreams(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_udp_upstreams(&mut config, runtime, mesh_slice);
@@ -1410,6 +1410,50 @@ fn materialize_east_west_gateway_proxies(
         }
     }
 
+    // SNI hosts already claimed by explicit EastWestGateway entries (same
+    // namespace as the materialized explicit proxies above). The auto-materializer
+    // yields to these so an operator's explicit route is never rejected as an
+    // overlapping host on the shared listen port. Hosts are lowercased during
+    // materialization and compared case-insensitively + wildcard-aware by
+    // `validate_stream_proxies` (`hosts_overlap`), so the override set is
+    // lowercased and the skip below uses the SAME overlap semantics — an exact
+    // membership test would miss a wildcard explicit entry like
+    // `*.ns.svc.cluster.local` that still owns the concrete auto host.
+    //
+    // The set must reflect only the gateways that ACTUALLY materialized a proxy.
+    // The loop above collapses entries by generated proxy id (`find().map() ->
+    // overwrite`), so two same-namespace gateways sharing a `name` leave only the
+    // last one's proxy bound. Collecting SNI hosts from the raw list would also
+    // keep the overwritten entry's hosts, suppressing an auto local-service proxy
+    // that no surviving explicit proxy actually owns — silently dropping that
+    // service from east-west routing. Dedup by the same generated id (last wins)
+    // so an overwritten entry's hosts never suppress autos.
+    let explicit_sni_hosts: Vec<String> = config
+        .mesh
+        .as_ref()
+        .and_then(|mesh| mesh.multi_cluster.as_ref())
+        .map(|multi_cluster| {
+            let mut hosts_by_proxy_id: HashMap<String, Vec<String>> = HashMap::new();
+            for gateway in multi_cluster
+                .east_west_gateways
+                .iter()
+                .filter(|gateway| gateway.namespace == runtime.namespace)
+            {
+                // Last write wins, mirroring the materialization loop's
+                // overwrite-by-id behavior above.
+                hosts_by_proxy_id.insert(
+                    mesh_east_west_proxy_id(&gateway.namespace, &gateway.name),
+                    gateway
+                        .sni_hosts
+                        .iter()
+                        .map(|host| host.to_ascii_lowercase())
+                        .collect(),
+                );
+            }
+            hosts_by_proxy_id.into_values().flatten().collect()
+        })
+        .unwrap_or_default();
+
     // Materialize SNI-routed TCP passthrough proxies for each local mesh
     // service so that inbound cross-cluster traffic on the east-west listen
     // port reaches the correct workload. Each service gets one proxy (SNI host
@@ -1419,6 +1463,7 @@ fn materialize_east_west_gateway_proxies(
         runtime.east_west_listen_port,
         &runtime.namespace,
         &runtime.cluster_domain,
+        &explicit_sni_hosts,
     );
 
     if !proxies.is_empty() {
@@ -1539,6 +1584,7 @@ fn build_east_west_service_proxies_and_upstreams(
     listen_port: u16,
     namespace: &str,
     cluster_domain: &str,
+    explicit_sni_hosts: &[String],
 ) -> (Vec<Proxy>, Vec<Upstream>) {
     let mut proxies = Vec::new();
     let mut upstreams = Vec::new();
@@ -1560,10 +1606,38 @@ fn build_east_west_service_proxies_and_upstreams(
             continue;
         }
 
+        let cluster_domain = cluster_domain.trim_matches('.');
         let sni_hostname = format!(
             "{}.{}.svc.{}",
             service.name, service.namespace, cluster_domain
         );
+
+        // An explicit `EastWestGateway.sni_hosts` entry takes precedence over the
+        // auto-materialized local-service proxy: materializing both yields two
+        // TCP passthrough proxies claiming the same SNI on the shared east-west
+        // listen port, which `validate_stream_proxies` rejects as overlapping
+        // hosts — silently dropping the operator's explicit route. Skip the auto
+        // proxy (and its upstream) so the override survives. Use the SAME
+        // wildcard-aware `hosts_overlap` semantics validation uses (an exact
+        // match would miss a wildcard explicit entry); guard on non-empty so an
+        // absent explicit list (a catch-all under `hosts_overlap`) never
+        // suppresses every auto proxy.
+        let auto_sni_lower = sni_hostname.to_ascii_lowercase();
+        if !explicit_sni_hosts.is_empty()
+            && crate::config::types::hosts_overlap(
+                std::slice::from_ref(&auto_sni_lower),
+                explicit_sni_hosts,
+            )
+        {
+            debug!(
+                service = %service.name,
+                namespace = %service.namespace,
+                sni = %sni_hostname,
+                "Skipping east-west auto-materialization; an explicit EastWestGateway already owns this SNI host"
+            );
+            continue;
+        }
+
         let upstream_id = mesh_east_west_service_upstream_id(&service.namespace, &service.name);
 
         let upstream = Upstream {
@@ -16793,6 +16867,7 @@ mod tests {
                 ("FERRUM_NAMESPACE", "default"),
                 ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
                 ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "15443"),
+                ("FERRUM_MESH_CLUSTER_DOMAIN", "cluster.local."),
             ],
             || {
                 let env = EnvConfig::from_env().expect("mesh env config");
@@ -16858,6 +16933,191 @@ mod tests {
                 assert_eq!(upstream.targets.len(), 1);
                 assert_eq!(upstream.targets[0].host, "10.0.0.5");
                 assert_eq!(upstream.targets[0].port, 9080);
+            },
+        );
+    }
+
+    #[test]
+    fn east_west_explicit_sni_override_suppresses_auto_service_proxy() {
+        // codex finding: an explicit EastWestGateway.sni_hosts entry for a local
+        // service FQDN must win over the auto-materialized local-service proxy.
+        // Materializing both yields two TCP passthrough proxies on the same SNI +
+        // listen port, which validate_stream_proxies rejects as overlapping hosts
+        // — silently dropping the operator's explicit route.
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_NAMESPACE", "default"),
+                ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
+                ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "15443"),
+                ("FERRUM_MESH_CLUSTER_DOMAIN", "cluster.local."),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                let config = GatewayConfig {
+                    mesh: Some(Box::new(MeshConfig {
+                        // Explicit gateway claiming the reviews service FQDN
+                        // (mixed-case, to exercise the case-insensitive match).
+                        multi_cluster: Some(MultiClusterConfig {
+                            east_west_gateways: vec![EastWestGateway {
+                                name: "explicit-reviews".to_string(),
+                                namespace: "default".to_string(),
+                                host: "gw.remote.example".to_string(),
+                                port: 443,
+                                sni_hosts: vec!["Reviews.Default.SVC.Cluster.Local".to_string()],
+                                trust_domain: Some(TrustDomain::new("remote.test").unwrap()),
+                                network: Some("network-a".to_string()),
+                            }],
+                            ..MultiClusterConfig::default()
+                        }),
+                        services: vec![MeshService {
+                            cluster_ips: Vec::new(),
+                            name: "reviews".to_string(),
+                            namespace: "default".to_string(),
+                            ports: vec![ServicePort {
+                                port: 9080,
+                                protocol: AppProtocol::Http,
+                                name: Some("http".to_string()),
+                                target_port: None,
+                            }],
+                            workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                                spiffe_id: SpiffeId::new(
+                                    "spiffe://cluster.local/ns/default/sa/reviews",
+                                )
+                                .unwrap(),
+                            }],
+                            protocol_overrides: HashMap::new(),
+                        }],
+                        workloads: vec![{
+                            let mut wl = workload("reviews", "reviews");
+                            wl.addresses = vec!["10.0.0.5".to_string()];
+                            wl
+                        }],
+                        ..MeshConfig::default()
+                    })),
+                    ..GatewayConfig::default()
+                };
+
+                let prepared =
+                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+
+                // The explicit gateway proxy owns the SNI.
+                let explicit = prepared
+                    .proxies
+                    .iter()
+                    .find(|p| p.id == "__mesh-east-west-default-explicit-reviews")
+                    .expect("explicit east-west proxy");
+                assert_eq!(explicit.hosts, vec!["reviews.default.svc.cluster.local"]);
+
+                // The auto-materialized local-service proxy is suppressed.
+                assert!(
+                    prepared
+                        .proxies
+                        .iter()
+                        .all(|p| p.id != "__mesh-ew-svc-default-reviews"),
+                    "auto service proxy must yield to the explicit SNI override"
+                );
+                // No two proxies share the canonical SNI on the listen port.
+                let claimants = prepared
+                    .proxies
+                    .iter()
+                    .filter(|p| {
+                        p.listen_port == Some(15443)
+                            && p.hosts
+                                .iter()
+                                .any(|h| h == "reviews.default.svc.cluster.local")
+                    })
+                    .count();
+                assert_eq!(claimants, 1, "exactly one proxy may claim the SNI");
+            },
+        );
+    }
+
+    #[test]
+    fn east_west_explicit_wildcard_sni_override_suppresses_auto_service_proxy() {
+        // codex follow-up: a WILDCARD explicit sni_hosts entry (e.g.
+        // `*.default.svc.cluster.local`) must also win. `validate_stream_proxies`
+        // uses wildcard-aware `hosts_overlap`, so an exact-membership skip would
+        // miss it and emit both passthrough proxies on the shared port → slice
+        // rejected. The skip uses the same overlap semantics.
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_NAMESPACE", "default"),
+                ("FERRUM_MESH_TOPOLOGY", "east_west_gateway"),
+                ("FERRUM_MESH_EAST_WEST_LISTEN_PORT", "15443"),
+                ("FERRUM_MESH_CLUSTER_DOMAIN", "cluster.local"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                let config = GatewayConfig {
+                    mesh: Some(Box::new(MeshConfig {
+                        multi_cluster: Some(MultiClusterConfig {
+                            east_west_gateways: vec![EastWestGateway {
+                                name: "explicit-wildcard".to_string(),
+                                namespace: "default".to_string(),
+                                host: "gw.remote.example".to_string(),
+                                port: 443,
+                                sni_hosts: vec!["*.default.svc.cluster.local".to_string()],
+                                trust_domain: Some(TrustDomain::new("remote.test").unwrap()),
+                                network: Some("network-a".to_string()),
+                            }],
+                            ..MultiClusterConfig::default()
+                        }),
+                        services: vec![MeshService {
+                            cluster_ips: Vec::new(),
+                            name: "reviews".to_string(),
+                            namespace: "default".to_string(),
+                            ports: vec![ServicePort {
+                                port: 9080,
+                                protocol: AppProtocol::Http,
+                                name: Some("http".to_string()),
+                                target_port: None,
+                            }],
+                            workloads: vec![crate::modes::mesh::config::WorkloadRef {
+                                spiffe_id: SpiffeId::new(
+                                    "spiffe://cluster.local/ns/default/sa/reviews",
+                                )
+                                .unwrap(),
+                            }],
+                            protocol_overrides: HashMap::new(),
+                        }],
+                        workloads: vec![{
+                            let mut wl = workload("reviews", "reviews");
+                            wl.addresses = vec!["10.0.0.5".to_string()];
+                            wl
+                        }],
+                        ..MeshConfig::default()
+                    })),
+                    ..GatewayConfig::default()
+                };
+
+                let prepared =
+                    prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
+
+                assert!(
+                    prepared
+                        .proxies
+                        .iter()
+                        .all(|p| p.id != "__mesh-ew-svc-default-reviews"),
+                    "auto service proxy must yield to the explicit wildcard SNI override"
+                );
             },
         );
     }

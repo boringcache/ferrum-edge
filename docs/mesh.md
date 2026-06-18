@@ -990,7 +990,7 @@ When `FERRUM_MESH_TOPOLOGY=east_west_gateway`, the mesh runtime materializes pas
 
 The materialized proxies use `passthrough: true` (no TLS termination), route by SNI, and share the listener on `FERRUM_MESH_EAST_WEST_LISTEN_PORT` (default 15443). Only entries matching the gateway's namespace are materialized.
 
-In addition to remote-cluster gateways, the east-west topology materializes a TCP passthrough proxy for each local `MeshService` in the mesh slice. The SNI routing host is the service FQDN (e.g., `reviews.default.svc.cluster.local`), enabling cross-cluster clients to reach local services through the east-west gateway without separate per-service configuration.
+In addition to remote-cluster gateways, the east-west topology materializes a TCP passthrough proxy for each local `MeshService` in the mesh slice. The SNI routing host is the service FQDN (e.g., `reviews.default.svc.cluster.local`), enabling cross-cluster clients to reach local services through the east-west gateway without separate per-service configuration. Because SNI carries a hostname but no service-port signal, a multi-port service is exposed through this automatic local-service route on its first declared service port; use explicit east-west gateway entries when a different port-specific route is required. An explicit `EastWestGateway.sni_hosts` entry takes precedence over the automatic local-service route for any SNI host it owns (wildcard-aware, matching the same overlap semantics validation uses): the automatic proxy for an overlapping FQDN is suppressed so the explicit route is the one bound on the shared listen port.
 
 ### Trust Federation
 
