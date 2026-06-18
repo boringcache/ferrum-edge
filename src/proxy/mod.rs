@@ -1925,32 +1925,47 @@ fn grpc_request_body_limit_exceeded(flag: &Option<Arc<std::sync::atomic::AtomicB
     flag.as_ref().is_some_and(|f| f.load(Ordering::Acquire))
 }
 
+/// Whether `status` is a no-body response status (`204 No Content` /
+/// `304 Not Modified`) whose body is suppressed regardless of the backend
+/// stream's `END_STREAM` state — RFC 7230 §3.3.3 / RFC 7232 §4.1. Same statuses
+/// the canonical [`crate::http3::client::is_response_body_complete`] no-body
+/// predicate uses (minus the method-side `HEAD` check, handled separately).
+fn response_is_no_body_status(status: u16) -> bool {
+    status == 204 || status == 304
+}
+
 /// Whether a streaming response's backend-dispatch outcome (CB / passive-health /
 /// least-latency) should be DEFERRED to body completion rather than recorded at
 /// response-header time (#1649 items 2 & 3).
 ///
-/// Defer ONLY a response that looks healthy at headers AND has an open body that
-/// can still fail post-wire — i.e. a `2xx` status (not a configured CB
-/// `failure_status_codes`) whose body is NOT already end-of-stream. Everything
-/// else is header-time-final and must be recorded eagerly:
-///   * **Non-`2xx`** (3xx/4xx/5xx, including a passive `unhealthy_status_codes`
+/// Defer a response whose header-time status is not already a configured
+/// failure/unhealthy signal AND has an open body that can still fail post-wire —
+/// i.e. any `< 500` status (not a configured CB `failure_status_codes` and not
+/// passively unhealthy) whose body is NOT already end-of-stream. Everything else
+/// is header-time-final and must be recorded eagerly:
+///   * **5xx / configured failures** (including a passive `unhealthy_status_codes`
 ///     entry like `429` or a CB failure status): the outcome is known now, so
 ///     trip the breaker / report passive health promptly instead of waiting for a
-///     possibly long-lived/stalled body. Restricting deferral to `2xx` keeps any
-///     non-`2xx` status the resolved CB **or** passive-health config might treat
-///     as unhealthy on the eager path.
+///     possibly long-lived/stalled body. Deferring streamable non-failure 3xx/4xx
+///     responses preserves post-wire body timeout/reset accounting instead of
+///     banking a header-time success before the body can fail.
 ///   * **Already-ended body** (`is_end_stream()` — empty `200`, gRPC
-///     Trailers-Only, `content-length: 0`, 204/304) OR a **HEAD request** (the
-///     response body is suppressed regardless of the backend stream's
-///     `END_STREAM` state at header time): nothing streams to the client, so a
-///     deferred outcome would be misread as a client disconnect by the
-///     never-polled `ProxyBody::Drop` path (`src/proxy/body.rs`) and a successful
-///     no-body probe would never heal a HALF_OPEN breaker (#1649 R7 finding 1).
-///   * **Passively-unhealthy `2xx`** (`status_is_passively_unhealthy`): an
-///     operator may list a `2xx` (e.g. `206`/`299`) in the target's resolved
-///     passive `unhealthy_status_codes`. That header is already a configured
-///     unhealthy outcome, so report it eagerly instead of leaving the target in
-///     rotation until a long-lived/stalled body terminates (#1649 R7 finding 3).
+///     Trailers-Only, `content-length: 0`) OR a **no-body status / HEAD request**
+///     (a `204`/`304` response or a `HEAD` request suppresses the body regardless
+///     of the backend stream's `END_STREAM` state at header time — RFC 7230 §3.3.3
+///     / RFC 7232 §4.1): nothing streams to the client, so a deferred outcome would
+///     be misread as a client disconnect by the never-polled `ProxyBody::Drop` path
+///     (`src/proxy/body.rs`) and a successful no-body probe would never heal a
+///     HALF_OPEN breaker. A backend that emits a `304`/`204` header frame WITHOUT
+///     `END_STREAM` would otherwise slip past the `is_end_stream()` guard and into
+///     the deferred path (the `< 500` predicate admits it), so gate on the status
+///     explicitly here as well (#1649 R7 finding 1, R8 304 no-body finding).
+///   * **Passively-unhealthy status** (`status_is_passively_unhealthy`): an
+///     operator may list an otherwise streamable status (e.g. `206`/`299`/`429`)
+///     in the target's resolved passive `unhealthy_status_codes`. That header is
+///     already a configured unhealthy outcome, so report it eagerly instead of
+///     leaving the target in rotation until a long-lived/stalled body terminates
+///     (#1649 R7 finding 3).
 fn streaming_dispatch_should_defer(
     proxy: &Proxy,
     response_status: u16,
@@ -1958,15 +1973,36 @@ fn streaming_dispatch_should_defer(
     request_is_head: bool,
     status_is_passively_unhealthy: bool,
 ) -> bool {
-    if body_already_ended || request_is_head {
+    // A `204`/`304` response carries no body regardless of whether the backend
+    // set `END_STREAM` on its header frame, so it must never be deferred — hyper
+    // may never poll the body, and `ProxyBody::Drop` would then record the
+    // never-polled streaming body as a client disconnect, dropping the header-time
+    // success and preventing a HALF_OPEN breaker from healing on cache-validation
+    // traffic. Mirrors the `HEAD` body-suppression case and the canonical no-body
+    // predicate in `http3::client::is_response_body_complete`.
+    if body_already_ended || request_is_head || response_is_no_body_status(response_status) {
         return false;
     }
-    (200..300).contains(&response_status)
+    response_status < 500
         && !proxy
             .circuit_breaker
             .as_ref()
             .is_some_and(|cb| cb.failure_status_codes.contains(&response_status))
         && !status_is_passively_unhealthy
+}
+
+fn grpc_streaming_dispatch_should_defer(
+    proxy: &Proxy,
+    response_status: u16,
+    body_already_ended: bool,
+) -> bool {
+    // gRPC streaming terminal failures are classified at response-body
+    // completion (including reset/timeout/trailer-derived backend failures).
+    // Do not apply the passive-unhealthy-2xx eager shortcut here: the gRPC eager
+    // branch records only the HTTP status to the circuit breaker and then skips
+    // terminal CB accounting, so a passive-only unhealthy 2xx could otherwise be
+    // banked as success and mask the real stream failure.
+    streaming_dispatch_should_defer(proxy, response_status, body_already_ended, false, false)
 }
 
 /// Whether `response_status` is in the dispatched target's effective passive
@@ -13222,7 +13258,7 @@ async fn handle_proxy_request_inner(
                     &response_headers,
                     grpc_streaming.status,
                 );
-                // #1649 item 3: a healthy 2xx streaming header defers the circuit
+                // #1649 item 3: a streamable non-failure streaming header defers the circuit
                 // breaker — for the fully-streaming path the recorder settles it at
                 // the upload-termination + response-completion join (overflow-aware,
                 // #1640), and for the buffered-request path the deferred dispatch
@@ -13246,18 +13282,10 @@ async fn handle_proxy_request_inner(
                     // A rotated retry already recorded (and released) the prior
                     // target's breaker — never record again here.
                     true
-                } else if streaming_dispatch_should_defer(
+                } else if grpc_streaming_dispatch_should_defer(
                     &proxy,
                     grpc_backend_dispatch_status,
                     grpc_body_ended,
-                    // gRPC requests are always POST — never a body-suppressed HEAD.
-                    false,
-                    streaming_response_status_is_passively_unhealthy(
-                        &epoch.load_balancer,
-                        &proxy,
-                        grpc_final_upstream_target.as_deref(),
-                        grpc_backend_dispatch_status,
-                    ),
                 ) {
                     false
                 } else if grpc_body_ended
@@ -14476,6 +14504,7 @@ async fn handle_proxy_request_inner(
     let mut cb_retry_probe_slot_available = cb_is_half_open_probe;
     let mut skip_final_cb_record = false;
     let mut backend_admission_started_at = backend_start;
+    let mut hbone_request_body_exceeded = None;
     let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
@@ -14524,6 +14553,7 @@ async fn handle_proxy_request_inner(
                 response,
                 retained_body,
                 backend_admission_permits: permits,
+                ..
             } => {
                 backend_admission_permits = permits;
                 (response, retained_body)
@@ -14798,9 +14828,11 @@ async fn handle_proxy_request_inner(
             BackendDispatchResult::Response {
                 response,
                 backend_admission_permits: permits,
+                request_body_exceeded,
                 ..
             } => {
                 backend_admission_permits = permits;
+                hbone_request_body_exceeded = request_body_exceeded;
                 response
             }
             BackendDispatchResult::AdmissionRejected(rejection) => {
@@ -14867,10 +14899,10 @@ async fn handle_proxy_request_inner(
     // gauge is not decremented twice per request (guard + this call).
     //
     // #1649 item 2: a direct-H2 `StreamingH2` response can fail *after* headers —
-    // a 2xx-then-stall body raises a post-wire read-timeout / reset once the
-    // streaming read-timeout window (#1626) fires. Recording the dispatch outcome
-    // here, at header time, would bank a phantom success and even feed the broken
-    // backend's fast TTFB into least-latency, and a mid-stream failure could never
+    // a streamable non-failure status followed by a stalled body raises a post-wire
+    // read-timeout / reset once the streaming read-timeout window (#1626) fires.
+    // Recording the dispatch outcome here, at header time, would bank a phantom
+    // success and even feed the broken backend's fast TTFB into least-latency, and a mid-stream failure could never
     // correct it. Only that genuinely-unknown case is deferred to body completion
     // via `with_deferred_backend_dispatch_outcome` (mirroring the gRPC streaming
     // path); `streaming_dispatch_should_defer` keeps known-failure-status and
@@ -14880,18 +14912,11 @@ async fn handle_proxy_request_inner(
     // deferred record runs as a non-probe (`is_half_open_probe = false`).
     //
     // HBONE (`current_dispatch_hbone`) flows through the same `StreamingH2` arm.
-    // Unlike direct-H2 (gated on `max_request_body_size == 0` by
-    // `can_dispatch_direct_http2_pool`), HBONE can carry a request-body size limit,
-    // and a late tunnel overflow would be misclassified as a backend body failure
-    // by the deferred path (no `request_body_exceeded` flag is threaded on the H2
-    // path, unlike gRPC). So defer HBONE only when NO request-body limit applies —
-    // provably no overflow, the same condition that makes direct-H2 safe — which
-    // fixes 2xx-then-stall accounting for the common (unlimited) mesh config so an
-    // HBONE backend that stalls/resets its body after 2xx headers trips the breaker
-    // instead of banking a phantom success (#1649 R8 finding 2). With a request-body
-    // limit configured, HBONE keeps the eager header-time record (residual
-    // follow-up: thread an HBONE request-body overflow flag to defer
-    // unconditionally).
+    // It can also carry a request-body size limit, so thread the HBONE upload
+    // overflow flag into the deferred dispatch outcome. That lets genuine
+    // streamable-status-then-stall/reset response-body failures trip backend
+    // health while a late client-upload overflow remains neutral instead of being
+    // misclassified as a backend fault.
     // Whether the H2 response body is already end-of-stream at header time (empty
     // 200 / `content-length: 0` / END_STREAM-in-headers). Such a body is dropped
     // without being polled, so deferring it would be misread as a client
@@ -14901,7 +14926,6 @@ async fn handle_proxy_request_inner(
         _ => false,
     };
     let defer_streaming_h2_dispatch = matches!(&response_body, ResponseBody::StreamingH2(_))
-        && (!current_dispatch_hbone || state.max_request_body_size_bytes == 0)
         && streaming_dispatch_should_defer(
             &proxy,
             response_status,
@@ -15655,7 +15679,10 @@ async fn handle_proxy_request_inner(
                     // #1649 round-4 B: skip the deferred CB record if the breaker
                     // opened a new cycle since admission (stale stream must not
                     // heal/reopen a later HALF_OPEN cycle).
-                    .with_deferred_dispatch_admission_open_epoch(cb_admission_open_epoch);
+                    .with_deferred_dispatch_admission_open_epoch(cb_admission_open_epoch)
+                    .with_deferred_dispatch_request_body_exceeded_flag(
+                        hbone_request_body_exceeded.clone(),
+                    );
             }
             body
         }
@@ -16699,6 +16726,7 @@ enum BackendDispatchResult {
         response: retry::BackendResponse,
         retained_body: Option<Bytes>,
         backend_admission_permits: Option<BackendAdmissionPermitSet>,
+        request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
     },
     AdmissionRejected(backend_dispatch::BackendAdmissionRejection),
 }
@@ -16712,6 +16740,7 @@ fn backend_dispatch_response(
         response,
         retained_body,
         backend_admission_permits,
+        request_body_exceeded: None,
     }
 }
 
@@ -16931,7 +16960,7 @@ async fn proxy_to_backend(
             Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
         };
         *backend_admission_started_at = Instant::now();
-        let (backend_resp, body_bytes) = proxy_to_backend_hbone(
+        let (backend_resp, body_bytes, request_body_exceeded) = proxy_to_backend_hbone(
             state,
             proxy,
             backend_url,
@@ -16949,7 +16978,12 @@ async fn proxy_to_backend(
             ctx_bytes_sent_observed,
         )
         .await;
-        return backend_dispatch_response(backend_resp, body_bytes, backend_admission_permits);
+        return BackendDispatchResult::Response {
+            response: backend_resp,
+            retained_body: body_bytes,
+            backend_admission_permits,
+            request_body_exceeded,
+        };
     }
 
     // Sidecar egress: plain HTTP/2 over SVID-mTLS to the peer sidecar's
@@ -18816,7 +18850,11 @@ async fn proxy_to_backend_hbone(
     is_tls: bool,
     resolved_ip: Option<String>,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
-) -> (retry::BackendResponse, Option<Bytes>) {
+) -> (
+    retry::BackendResponse,
+    Option<Bytes>,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
     let Some(target) = upstream_target else {
         return (
             retry::BackendResponse {
@@ -18829,6 +18867,7 @@ async fn proxy_to_backend_hbone(
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ConnectionPoolError),
             },
+            None,
             None,
         );
     };
@@ -18861,6 +18900,7 @@ async fn proxy_to_backend_hbone(
                     error_class: None,
                 },
                 None,
+                None,
             );
         }
     };
@@ -18878,6 +18918,7 @@ async fn proxy_to_backend_hbone(
                 Some(len),
                 state.max_request_body_size_bytes,
             ),
+            None,
             None,
         );
     }
@@ -18897,6 +18938,7 @@ async fn proxy_to_backend_hbone(
             );
             return (
                 hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                None,
                 None,
             );
         }
@@ -18927,6 +18969,7 @@ async fn proxy_to_backend_hbone(
             return (
                 hbone_pool_error_response(state, proxy, &err, resolved_ip),
                 None,
+                None,
             );
         }
     };
@@ -18937,7 +18980,13 @@ async fn proxy_to_backend_hbone(
         .await
     {
         Ok(parts) => parts,
-        Err(err) => return (hbone_hyper_error_response(proxy, err, resolved_ip), None),
+        Err(err) => {
+            return (
+                hbone_hyper_error_response(proxy, err, resolved_ip),
+                None,
+                None,
+            );
+        }
     };
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -18960,6 +19009,7 @@ async fn proxy_to_backend_hbone(
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
                 },
+                None,
                 None,
             );
         }
@@ -19002,6 +19052,7 @@ async fn proxy_to_backend_hbone(
                     backend_resolved_ip: resolved_ip,
                     error_class: None,
                 },
+                None,
                 None,
             );
         }
@@ -19089,9 +19140,14 @@ async fn proxy_to_backend_hbone(
                             state.max_request_body_size_bytes,
                         ),
                         None,
+                        None,
                     );
                 }
-                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+                return (
+                    hbone_hyper_error_response(proxy, err, resolved_ip),
+                    None,
+                    None,
+                );
             }
             Err(_) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
@@ -19102,6 +19158,7 @@ async fn proxy_to_backend_hbone(
                             None,
                             state.max_request_body_size_bytes,
                         ),
+                        None,
                         None,
                     );
                 }
@@ -19122,6 +19179,7 @@ async fn proxy_to_backend_hbone(
                         error_class: Some(retry::ErrorClass::ReadWriteTimeout),
                     },
                     None,
+                    None,
                 );
             }
         }
@@ -19138,9 +19196,14 @@ async fn proxy_to_backend_hbone(
                             state.max_request_body_size_bytes,
                         ),
                         None,
+                        None,
                     );
                 }
-                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+                return (
+                    hbone_hyper_error_response(proxy, err, resolved_ip),
+                    None,
+                    None,
+                );
             }
         }
     };
@@ -19162,6 +19225,7 @@ async fn proxy_to_backend_hbone(
                 Some(len),
                 state.max_response_body_size_bytes,
             ),
+            None,
             None,
         );
     }
@@ -19189,6 +19253,7 @@ async fn proxy_to_backend_hbone(
                 error_class: None,
             },
             None,
+            Some(body_size_exceeded),
         )
     } else {
         let body_bytes = match collect_hyper_body_with_limit(
@@ -19208,10 +19273,15 @@ async fn proxy_to_backend_hbone(
                         state.max_response_body_size_bytes,
                     ),
                     None,
+                    None,
                 );
             }
             Err(HyperBodyCollectError::Read(err)) => {
-                return (hbone_hyper_error_response(proxy, err, resolved_ip), None);
+                return (
+                    hbone_hyper_error_response(proxy, err, resolved_ip),
+                    None,
+                    None,
+                );
             }
             Err(HyperBodyCollectError::ReadTimeout { timeout_ms }) => {
                 warn!(
@@ -19231,6 +19301,7 @@ async fn proxy_to_backend_hbone(
                         error_class: Some(retry::ErrorClass::ReadWriteTimeout),
                     },
                     None,
+                    None,
                 );
             }
         };
@@ -19243,6 +19314,7 @@ async fn proxy_to_backend_hbone(
                 backend_resolved_ip: resolved_ip,
                 error_class: None,
             },
+            None,
             None,
         )
     }
@@ -21363,6 +21435,63 @@ mod tests {
     use async_trait::async_trait;
     use http::header::HeaderValue;
     use serde_json::json;
+
+    fn streaming_dispatch_test_proxy() -> Proxy {
+        serde_json::from_value(json!({
+            "id": "p",
+            "hosts": ["p.example.com"],
+            "backend_host": "127.0.0.1",
+            "backend_port": 50051,
+            "circuit_breaker": {
+                "failure_status_codes": [500]
+            }
+        }))
+        .expect("valid proxy")
+    }
+
+    #[test]
+    fn grpc_streaming_defers_passive_unhealthy_2xx_until_body_terminal() {
+        let proxy = streaming_dispatch_test_proxy();
+
+        assert!(
+            streaming_dispatch_should_defer(&proxy, 206, false, false, false),
+            "ordinary open 2xx streaming responses defer terminal accounting"
+        );
+        assert!(
+            !streaming_dispatch_should_defer(&proxy, 206, false, false, true),
+            "direct HTTP/2 streaming keeps passively-unhealthy 2xx eager"
+        );
+        assert!(
+            grpc_streaming_dispatch_should_defer(&proxy, 206, false),
+            "gRPC streaming must not eagerly bank passive-only unhealthy 2xx as CB success"
+        );
+        assert!(
+            !grpc_streaming_dispatch_should_defer(&proxy, 500, false),
+            "configured CB failures remain header-time-final"
+        );
+        assert!(
+            !grpc_streaming_dispatch_should_defer(&proxy, 200, true),
+            "already-ended gRPC responses remain header-time-final"
+        );
+
+        // No-body statuses (204/304) must stay eager even when the backend left
+        // the body open (no END_STREAM on the header frame, so `is_end_stream()`
+        // would report false): hyper may never poll a 304/204 body, and the
+        // never-polled streaming `ProxyBody::Drop` would otherwise record a client
+        // disconnect that drops the header-time success and blocks HALF_OPEN
+        // healing for cache-validation traffic.
+        for no_body_status in [204u16, 304u16] {
+            assert!(
+                !streaming_dispatch_should_defer(&proxy, no_body_status, false, false, false),
+                "{no_body_status} is a no-body status and must record eagerly even with an \
+                 open (non-END_STREAM) backend body"
+            );
+            assert!(
+                !grpc_streaming_dispatch_should_defer(&proxy, no_body_status, false),
+                "{no_body_status} no-body status must record eagerly on the gRPC path too"
+            );
+        }
+    }
 
     /// F3 §3.4: the direct-pod-IP / headless per-workload raw-TCP egress
     /// upstreams are referenced by NO config proxy, so without a dedicated
