@@ -2022,14 +2022,28 @@ fn subtract_cache_entries(counter: &AtomicUsize, removed: usize) {
     });
 }
 
-/// Drop every queued key from an eviction reservoir.
+/// Drop queued keys from an eviction reservoir on a config-driven cache clear.
 ///
-/// Used on config-driven cache clears so a rebuild does not leave stale
-/// candidate keys queued. `pop` is O(1) and lock-free; stale keys are otherwise
-/// harmless (they self-skip on the live-entry check in `frequency_aware_evict`),
-/// but draining keeps the reservoir coherent with the cleared map.
+/// Used so a rebuild does not leave stale candidate keys queued. `pop` is O(1)
+/// and lock-free; stale keys are otherwise harmless (they self-skip on the
+/// live-entry check in `frequency_aware_evict`), but draining keeps the
+/// reservoir coherent with the cleared map.
+///
+/// The drain is bounded to the reservoir's fixed capacity rather than looping
+/// until empty. A reload runs concurrently with request threads still inserting
+/// cache misses (each `force_push`es a key here), so an unbounded
+/// `while pop().is_some()` could be kept non-empty by a sustained
+/// high-cardinality insert storm and make the reload spin for an unbounded
+/// time. Popping at most `capacity` times still removes every key that was
+/// queued when the clear began (the queue cannot hold more than `capacity`);
+/// any keys pushed by races after that point are fresh candidates for the
+/// rebuilt cache, and the few that may be stale self-skip on the next pass.
 fn drain_reservoir(reservoir: &ArrayQueue<String>) {
-    while reservoir.pop().is_some() {}
+    for _ in 0..reservoir.capacity() {
+        if reservoir.pop().is_none() {
+            break;
+        }
+    }
 }
 
 /// Evict entries from a DashMap using frequency-guided sampling.
@@ -2113,6 +2127,22 @@ fn frequency_aware_evict<V>(
         if map.remove(key).is_some() {
             removed += 1;
         }
+    }
+
+    // Requeue the sampled survivors (everything not removed) so they remain
+    // eviction candidates on a later pass. Without this, draining the reservoir
+    // permanently dropped these still-live keys: in a saturated cache an old
+    // cold-but-not-coldest entry would get a single chance to be removed and
+    // then become effectively immortal, while subsequent passes could only
+    // sample freshly inserted keys. `force_push` is O(1) and lock-free, and the
+    // survivor count is bounded by `sample_size`, so requeueing keeps the pass
+    // O(`sample_size`) and the reservoir a moving window over still-resident
+    // recent inserts rather than a one-shot queue. Survivors came from the head
+    // of the reservoir; pushing them back puts them behind newer inserts, which
+    // is the intended recency ordering. Stale survivors (none here — every
+    // sample entry was live when popped) would self-skip on the next pass.
+    for (key, _) in sample.drain(to_remove..) {
+        let _ = reservoir.force_push(key);
     }
 
     removed
@@ -2472,6 +2502,43 @@ mod tests {
         for i in 0..100 {
             assert!(!map.contains_key(&format!("stale-{i}")));
         }
+    }
+
+    #[test]
+    fn evict_requeues_sampled_survivors() {
+        // Survivors of a sample (live keys popped but not in the removed
+        // bottom quartile) must be pushed back into the reservoir so a later
+        // pass can reconsider them. Otherwise a single pass would permanently
+        // drop them and they could become immortal once resident.
+        let sketch = CountMinSketch::new(1024, 100_000);
+        let map: DashMap<String, ()> = DashMap::new();
+        for i in 0..50 {
+            map.insert(format!("key-{i}"), ());
+            // Uniform-ish frequency so removals come from a small quartile and
+            // most sampled keys survive the pass.
+            sketch.increment(&format!("key-{i}"));
+        }
+        let reservoir = reservoir_with_map_keys(&map);
+
+        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 50);
+        assert!(removed > 0, "expected at least one removal");
+        // Survivors were requeued: the reservoir holds the sampled-but-kept
+        // keys (sample_size - removed), not zero.
+        let surviving_candidates = reservoir.len();
+        assert!(
+            surviving_candidates > 0,
+            "sampled survivors must be requeued, reservoir is empty"
+        );
+        // Every requeued key is still live in the map (no stale survivors).
+        let mut drained = Vec::new();
+        while let Some(k) = reservoir.pop() {
+            assert!(
+                map.contains_key(&k),
+                "requeued survivor {k} is not a live map entry"
+            );
+            drained.push(k);
+        }
+        assert_eq!(drained.len(), surviving_candidates);
     }
 
     #[test]
