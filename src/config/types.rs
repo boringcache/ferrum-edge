@@ -152,6 +152,8 @@ pub const MAX_HTTP2_WINDOW_SIZE: u32 = 128 * 1024 * 1024;
 pub const MIN_HTTP2_MAX_FRAME_SIZE: u32 = 16_384;
 /// Maximum HTTP/2 max frame size (1 MiB practical operational limit).
 pub const MAX_HTTP2_MAX_FRAME_SIZE: u32 = 1_048_576;
+/// Maximum value for proxy pool integer fields stored in SQL INTEGER columns.
+pub const MAX_POOL_SQL_INTEGER_VALUE: u64 = i32::MAX as u64;
 /// Maximum HTTP/3 connections per backend (reasonable operational limit).
 pub const MAX_HTTP3_CONNECTIONS_PER_BACKEND: usize = 256;
 
@@ -3825,8 +3827,21 @@ impl Proxy {
                 MIN_HTTP2_MAX_FRAME_SIZE, MAX_HTTP2_MAX_FRAME_SIZE, v
             ));
         }
-        if let Some(0) = self.pool_http2_max_concurrent_streams {
-            errors.push("pool_http2_max_concurrent_streams must be at least 1 (got 0)".to_string());
+        if let Some(v) = self.pool_http2_max_concurrent_streams
+            && (v == 0 || u64::from(v) > MAX_POOL_SQL_INTEGER_VALUE)
+        {
+            errors.push(format!(
+                "pool_http2_max_concurrent_streams must be between 1 and {} (got {})",
+                MAX_POOL_SQL_INTEGER_VALUE, v
+            ));
+        }
+        if let Some(v) = self.pool_max_requests_per_connection
+            && v > MAX_POOL_SQL_INTEGER_VALUE
+        {
+            errors.push(format!(
+                "pool_max_requests_per_connection must be between 0 and {} (got {})",
+                MAX_POOL_SQL_INTEGER_VALUE, v
+            ));
         }
 
         // HTTP/3 connections per backend

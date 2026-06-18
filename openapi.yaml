@@ -5741,9 +5741,10 @@ components:
           type: [integer, "null"]
           format: uint32
           minimum: 1
+          maximum: 2147483647
           description: |
             Maximum concurrent HTTP/2 streams per backend connection (overrides global).
-            Must be at least 1. Default: 1000.
+            Range: 1–2147483647. Default: 1000.
         pool_http3_connections_per_backend:
           type: [integer, "null"]
           minimum: 1
@@ -5755,13 +5756,15 @@ components:
         pool_max_requests_per_connection:
           type: [integer, "null"]
           format: uint64
-          minimum: 1
+          minimum: 0
+          maximum: 2147483647
           description: |
             Reserved for Istio DestinationRule
             `connectionPool.http.maxRequestsPerConnection`. The field is
             validated and persisted for schema compatibility, but currently has
             no runtime effect because reqwest/hyper do not expose a stable
-            per-connection request cap for the shared client pool.
+            per-connection request cap for the shared client pool. Range:
+            0–2147483647, where 0 preserves Istio's explicit unlimited value.
         upstream_id:
           type: [string, "null"]
           description: |
