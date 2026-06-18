@@ -61,6 +61,25 @@ enum ScanMode {
     All,
 }
 
+/// Result of attempting redaction on a request body.
+enum RedactionOutcome {
+    /// No PII to redact, body not parseable, or over `max_scan_bytes` — the
+    /// caller should forward the body unchanged without claiming redaction.
+    NoChange,
+    /// PII was detected and the rewritten body no longer contains any
+    /// detectable PII — safe to forward and report as redacted.
+    Redacted(Value),
+    /// PII was detected but could not be fully removed (e.g. it was carried in
+    /// an object key, or matched only a cross-token/contextual custom pattern
+    /// that has no single rewritable token). The carried `Value` is the
+    /// best-effort redaction (string values and numeric scalars already
+    /// removed). `before_proxy` fails the request closed on this outcome rather
+    /// than forwarding the residual value while falsely reporting redaction;
+    /// the body-transform path, which cannot reject, still emits this
+    /// best-effort body so it never forwards the *original* unredacted bytes.
+    Incomplete(Value),
+}
+
 /// A named regex pattern for PII detection.
 #[derive(Debug)]
 struct PiiPattern {
@@ -346,10 +365,61 @@ impl AiPromptShield {
         self.detect_pii(std::slice::from_ref(&body))
     }
 
-    /// Parse the body as JSON, apply mode-appropriate redaction, and return
-    /// the mutated `Value`. Returns `None` when the body isn't valid JSON,
-    /// is over `max_scan_bytes`, or contains no PII to redact (so callers
-    /// don't waste serialization on a no-op).
+    /// `ScanMode::All` detection: the union of two passes over the parsed JSON.
+    ///
+    /// 1. Decoded walker (`collect_json_strings`): scans each JSON token after
+    ///    serde has resolved `\uXXXX` and other escapes, so escaped PII in
+    ///    string values, object keys, and numeric scalars is caught exactly as
+    ///    the backend LLM will see it. This is the coverage issue #1714 added.
+    /// 2. Raw-body pass: runs the `RegexSet` over `raw` (the serialized request
+    ///    body). The original all-mode scan was raw-only, and some patterns —
+    ///    notably operator-supplied `custom_patterns` — depend on JSON context
+    ///    that spans tokens (e.g. `"password"\s*:`) or match scalar shapes the
+    ///    decoded walker drops (booleans/null, e.g. `"allow_pii"\s*:\s*true`).
+    ///    Testing the key and value as separate tokens never reconstructs that
+    ///    context, so without this pass those patterns regress to no-match.
+    ///
+    /// Unioning the two only ever *adds* detections, so this strictly hardens
+    /// all-mode coverage: escaped-value PII (pass 1) and cross-token/contextual
+    /// patterns plus dropped scalars (pass 2) are both caught. Both passes feed
+    /// the reject/warn decision; the redact path additionally re-scans the
+    /// rewritten body so any detection a token rewrite cannot remove fails
+    /// closed rather than forwarding PII while claiming redaction succeeded.
+    fn detect_pii_all_mode(&self, json: &Value, raw: &str) -> Vec<String> {
+        if self.patterns.is_empty() {
+            return Vec::new();
+        }
+        let mut hit = vec![false; self.patterns.len()];
+        // Pass 1: decoded tokens.
+        let mut texts: Vec<Cow<'_, str>> = Vec::new();
+        collect_json_strings(json, &mut texts);
+        for text in &texts {
+            for idx in self.detection_set.matches(text.as_ref()).into_iter() {
+                hit[idx] = true;
+            }
+        }
+        // Pass 2: raw serialized body (cross-token / contextual patterns).
+        for idx in self.detection_set.matches(raw).into_iter() {
+            hit[idx] = true;
+        }
+        hit.iter()
+            .enumerate()
+            .filter_map(|(idx, &h)| {
+                if h {
+                    self.patterns.get(idx).map(|p| p.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Parse the body as JSON, apply mode-appropriate redaction, and return a
+    /// [`RedactionOutcome`]. Returns `NoChange` when the body isn't valid JSON,
+    /// is over `max_scan_bytes`, or contains no PII to redact (so callers don't
+    /// waste serialization on a no-op); `Redacted` when PII was detected and
+    /// fully removed; `Incomplete` when PII was detected but some could not be
+    /// rewritten in place.
     ///
     /// Shared between `before_proxy` (which uses this to update
     /// `ctx.metadata["request_body"]` so downstream `before_proxy` plugins
@@ -357,20 +427,20 @@ impl AiPromptShield {
     /// returned `Value` to rewrite the wire body on the backend dispatch
     /// path). Keeping the two paths in lockstep guarantees both see the
     /// same redacted bytes regardless of which path actually runs.
-    fn apply_redaction_in_place(&self, body: &str) -> Option<Value> {
+    fn apply_redaction_in_place(&self, body: &str) -> RedactionOutcome {
         if body.len() > self.max_scan_bytes {
-            return None;
+            return RedactionOutcome::NoChange;
         }
-        let mut json: Value = serde_json::from_str(body).ok()?;
+        let Ok(mut json) = serde_json::from_str::<Value>(body) else {
+            return RedactionOutcome::NoChange;
+        };
 
         if self.scan_mode == ScanMode::All {
-            let detected = {
-                let mut texts = Vec::new();
-                collect_json_strings(&json, &mut texts);
-                self.detect_pii(&texts)
-            };
+            // Gate on the same union detection used for reject/warn so the
+            // redact path can't silently miss cross-token/contextual matches.
+            let detected = self.detect_pii_all_mode(&json, body);
             if detected.is_empty() {
-                return None;
+                return RedactionOutcome::NoChange;
             }
             // Run structured redaction first on known prompt-content
             // fields (messages[].content) so recognized chat-completion
@@ -392,16 +462,65 @@ impl AiPromptShield {
                 self.redact_body(&mut json);
             }
             redact_json_strings(&mut json, &self.patterns, true);
-            return Some(json);
+
+            // Re-scan the rewritten body. The walker redacts string values and
+            // numeric scalars, but cannot rewrite PII carried in an object key
+            // or a purely cross-token/contextual custom-pattern match. If any
+            // detection still fires, redaction is incomplete: forwarding now
+            // would leak the value while reporting it redacted, so signal the
+            // caller to fail closed. `[REDACTED:...]` placeholders match no PII
+            // pattern, so a fully-redacted body re-scans clean.
+            if self.redacted_body_has_residual_pii(&json) {
+                return RedactionOutcome::Incomplete(json);
+            }
+            return RedactionOutcome::Redacted(json);
         }
 
         // Content mode: only redact within messages
         let texts = self.extract_scan_text(&json);
         if self.detect_pii(&texts).is_empty() {
-            return None;
+            return RedactionOutcome::NoChange;
         }
         self.redact_body(&mut json);
-        Some(json)
+        RedactionOutcome::Redacted(json)
+    }
+
+    /// After `ScanMode::All` redaction, decide whether any *unredactable* PII
+    /// still remains, so the caller can fail closed instead of forwarding it
+    /// while reporting the body as redacted.
+    ///
+    /// This must mirror `redact_json_strings`' structural carve-out: top-level
+    /// structural scalar values (`model`, `id`, request parameters, …) are
+    /// deliberately preserved even when they incidentally match a PII regex, so
+    /// they are NOT residual leaks and must not trigger a fail-closed. To run
+    /// the same union detection (decoded tokens + a raw-body pass for
+    /// cross-token/contextual custom patterns) without those preserved scalars
+    /// re-triggering, we scan a copy of the body whose top-level structural
+    /// scalars have been blanked to an empty string. Blanking only the scalar
+    /// values keeps the surrounding JSON structure intact, so a contextual
+    /// pattern such as `"password"\s*:` still matches while a preserved
+    /// `"max_tokens": 123456789` no longer does.
+    ///
+    /// What this still catches: PII in an object key (`{"a@b.com": …}`), a
+    /// string/number the walker failed to rewrite, and contextual custom
+    /// patterns that have no single rewritable token — all genuine
+    /// "detected but not removed" cases.
+    fn redacted_body_has_residual_pii(&self, json: &Value) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        let mut check = json.clone();
+        if let Value::Object(map) = &mut check {
+            for (key, value) in map.iter_mut() {
+                if STRUCTURAL_KEYS.contains(&key.as_str())
+                    && (value.is_string() || value.is_number())
+                {
+                    *value = Value::String(String::new());
+                }
+            }
+        }
+        let serialized = check.to_string();
+        !self.detect_pii_all_mode(&check, &serialized).is_empty()
     }
 
     /// Apply redaction to message content fields in the JSON body.
@@ -545,9 +664,7 @@ impl Plugin for AiPromptShield {
             match serde_json::from_str::<Value>(body) {
                 Ok(json) => {
                     let is_streaming = json.get("stream").and_then(|s| s.as_bool()) == Some(true);
-                    let mut texts: Vec<Cow<'_, str>> = Vec::new();
-                    collect_json_strings(&json, &mut texts);
-                    (self.detect_pii(&texts), is_streaming)
+                    (self.detect_pii_all_mode(&json, body), is_streaming)
                 }
                 // Malformed JSON in all-mode: handled below for non-redact
                 // actions by falling back to a raw-body scan so PII in an
@@ -636,17 +753,60 @@ impl Plugin for AiPromptShield {
                     .get("request_body")
                     .cloned()
                     .unwrap_or_default();
-                let redacted_body = self
-                    .apply_redaction_in_place(&original_body)
-                    .and_then(|json| serde_json::to_string(&json).ok());
-
-                ctx.metadata
-                    .insert("ai_shield_redacted".to_string(), detected.join(","));
-                if let Some(serialized) = redacted_body {
-                    ctx.metadata.insert("request_body".to_string(), serialized);
+                match self.apply_redaction_in_place(&original_body) {
+                    RedactionOutcome::Redacted(json) => {
+                        // Only claim redaction once the rewritten body is
+                        // verified free of detectable PII (see
+                        // `apply_redaction_in_place`).
+                        ctx.metadata
+                            .insert("ai_shield_redacted".to_string(), detected.join(","));
+                        if let Ok(serialized) = serde_json::to_string(&json) {
+                            ctx.metadata.insert("request_body".to_string(), serialized);
+                        }
+                        PluginResult::Continue
+                    }
+                    RedactionOutcome::Incomplete(_) => {
+                        // PII was detected but could not be fully removed from
+                        // the body (e.g. carried in an object key, or matching
+                        // only a cross-token custom pattern). Fail closed
+                        // rather than forward the value while reporting it
+                        // redacted.
+                        warn!(
+                            "ai_prompt_shield: PII detected (types: {:?}) could not be fully redacted, rejecting request",
+                            detected
+                        );
+                        PluginResult::Reject {
+                            status_code: 400,
+                            body: serde_json::json!({
+                                "error": "PII detected in request",
+                                "detected_types": detected,
+                                "message": "Request blocked: sensitive data could not be redacted. Remove sensitive data before sending to AI provider."
+                            })
+                            .to_string(),
+                            headers: HashMap::new(),
+                        }
+                    }
+                    RedactionOutcome::NoChange => {
+                        // `detected` is non-empty (checked above) yet redaction
+                        // found nothing to change. This should not happen for a
+                        // parseable in-range body, but if it does, do not claim
+                        // redaction and do not forward unredacted PII.
+                        warn!(
+                            "ai_prompt_shield: PII detected (types: {:?}) but redaction produced no change, rejecting request",
+                            detected
+                        );
+                        PluginResult::Reject {
+                            status_code: 400,
+                            body: serde_json::json!({
+                                "error": "PII detected in request",
+                                "detected_types": detected,
+                                "message": "Request blocked: sensitive data could not be redacted. Remove sensitive data before sending to AI provider."
+                            })
+                            .to_string(),
+                            headers: HashMap::new(),
+                        }
+                    }
                 }
-
-                PluginResult::Continue
             }
         }
     }
@@ -673,8 +833,20 @@ impl Plugin for AiPromptShield {
         }
 
         let body_str = std::str::from_utf8(body).ok()?;
-        let json = self.apply_redaction_in_place(body_str)?;
-        serde_json::to_vec(&json).ok()
+        match self.apply_redaction_in_place(body_str) {
+            // Fully redacted, or best-effort on a body whose residual PII lives
+            // somewhere a token rewrite can't reach. `before_proxy` runs first
+            // and already rejects the `Incomplete` case, so in normal flow this
+            // path only sees fully-redacted bodies; emitting the best-effort
+            // body here is a defensive backstop that still strips every PII the
+            // walker *can* remove and never forwards the original bytes.
+            RedactionOutcome::Redacted(json) | RedactionOutcome::Incomplete(json) => {
+                serde_json::to_vec(&json).ok()
+            }
+            // No PII to redact (or body not parseable / over the size cap):
+            // leave the wire body unchanged.
+            RedactionOutcome::NoChange => None,
+        }
     }
 }
 
@@ -949,6 +1121,24 @@ fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern], top_level: bo
                 *s = result;
             }
         }
+        // Numeric scalar PII (e.g. a bare `{"ssn":123456789}` or a numeric
+        // credit-card number). `ScanMode::All` detection collects stringified
+        // numbers, so a number that matches a PII pattern must actually be
+        // removed here — otherwise it is forwarded unchanged while the request
+        // is reported as redacted. A number has no in-place string to rewrite,
+        // so when it matches we replace the whole scalar with the placeholder
+        // string. The type change (number -> string) is the safe direction for
+        // a privacy control: the alternative is leaking the value. Only the
+        // first matching pattern's placeholder is used; a number matches at
+        // most one PII shape in practice. The top-level structural carve-out
+        // below prevents legitimate top-level numerics (timestamps, token
+        // limits) from being rewritten.
+        Value::Number(n) => {
+            let rendered = n.to_string();
+            if let Some(pattern) = patterns.iter().find(|p| p.regex.is_match(&rendered)) {
+                *value = Value::String(pattern.placeholder.clone());
+            }
+        }
         Value::Array(arr) => {
             for item in arr.iter_mut() {
                 redact_json_strings(item, patterns, false);
@@ -956,17 +1146,28 @@ fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern], top_level: bo
         }
         Value::Object(map) => {
             for (k, val) in map.iter_mut() {
-                // Preserve only top-level structural scalar strings (the
-                // model name, IDs, roles, and request parameters an operator
-                // legitimately sends). Always recurse into nested
-                // objects/arrays, and never skip nested occurrences of these
-                // key names, so PII cannot hide under a structural key.
-                if top_level && STRUCTURAL_KEYS.contains(&k.as_str()) && val.is_string() {
+                // Preserve only top-level structural scalar values (the model
+                // name, IDs, roles, and request parameters an operator
+                // legitimately sends) — both strings and numbers, since a
+                // numeric `id`/`created`/token limit must not be rewritten.
+                // Always recurse into nested objects/arrays, and never skip
+                // nested occurrences of these key names, so PII cannot hide
+                // under a structural key.
+                if top_level
+                    && STRUCTURAL_KEYS.contains(&k.as_str())
+                    && (val.is_string() || val.is_number())
+                {
                     continue;
                 }
                 redact_json_strings(val, patterns, false);
             }
         }
+        // PII carried in an object KEY name (e.g. `{"a@b.com":"x"}`) cannot be
+        // rewritten here without rebuilding the map, and renaming keys risks
+        // collisions and reorders the document. Such PII is instead caught by
+        // the post-redaction re-scan in `apply_redaction_in_place`, which fails
+        // the request closed rather than forwarding key PII while reporting it
+        // redacted. Bool / Null carry no PII.
         _ => {}
     }
 }

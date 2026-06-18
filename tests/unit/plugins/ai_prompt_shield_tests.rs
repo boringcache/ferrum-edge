@@ -612,6 +612,228 @@ async fn test_scan_all_mode_malformed_json_without_pii_continues() {
     assert_continue(result);
 }
 
+// ─── ScanMode::All — raw-body pass for cross-token / contextual patterns ──
+// The decoded-token walker tests each key and value separately, so a custom
+// pattern that spans the key+colon+value (or matches a dropped boolean scalar)
+// would regress to no-match. A raw-body RegexSet pass, unioned with the decoded
+// pass, restores that coverage without losing the \uXXXX decode guarantee.
+
+#[tokio::test]
+async fn test_scan_all_mode_detects_cross_token_custom_pattern() {
+    // `"password"\s*:` only matches the raw serialized body — the key
+    // `password` and its value are distinct decoded tokens that never
+    // reconstruct the colon-joined context.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": [],
+        "custom_patterns": [
+            {"name": "password_field", "regex": "\"password\"\\s*:"}
+        ],
+        "scan_fields": "all"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4",
+        "password": "hunter2"
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_scan_all_mode_detects_boolean_via_raw_pass() {
+    // A boolean scalar is dropped by the decoded walker; a custom pattern
+    // matching `"allow_pii": true` therefore needs the raw-body pass.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": [],
+        "custom_patterns": [
+            {"name": "allow_pii_flag", "regex": "\"allow_pii\"\\s*:\\s*true"}
+        ],
+        "scan_fields": "all"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4",
+        "allow_pii": true
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn test_scan_all_mode_still_decodes_escaped_pii_with_raw_pass() {
+    // Regression: adding the raw-body pass must not lose the issue #1714
+    // decode guarantee — a \uXXXX-escaped email (invisible in the raw bytes)
+    // must still be detected via the decoded-token pass.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["email"],
+        "scan_fields": "all"
+    }))
+    .unwrap();
+    let raw_body =
+        r#"{"model":"gpt-4","note":"contact \u0061\u0040\u0062\u002e\u0063\u006f\u006d"}"#;
+    assert!(
+        !raw_body.contains("a@b.com"),
+        "test payload must only contain the escaped form"
+    );
+    let mut ctx = make_post_ctx_with_raw_body(raw_body);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+// ─── ScanMode::All redact — honest redaction (no fail-open on unredactable) ──
+// All-mode detection collects numeric scalars and object keys, but the JSON
+// walker can only rewrite string values and numbers. Redaction must either
+// actually remove the detected PII or fail the request closed — never forward
+// the value while reporting `ai_shield_redacted`.
+
+#[tokio::test]
+async fn test_scan_all_mode_redacts_numeric_ssn_in_place() {
+    // A numeric SSN is now redactable: the walker replaces the number scalar
+    // with the placeholder string, and the request is reported redacted.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ssn"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4",
+        "ssn": 123456789i64
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert!(
+        ctx.metadata.contains_key("ai_shield_redacted"),
+        "numeric SSN should be redacted, not fail-closed"
+    );
+    let redacted = ctx
+        .metadata
+        .get("request_body")
+        .expect("redacted body must be set");
+    assert!(
+        !redacted.contains("123456789"),
+        "numeric SSN must be removed from the forwarded body, got: {redacted}"
+    );
+    assert!(
+        redacted.contains("[REDACTED:ssn]"),
+        "numeric SSN should be replaced with its placeholder, got: {redacted}"
+    );
+    // Body must remain valid JSON after the number -> string rewrite.
+    let parsed: serde_json::Value = serde_json::from_str(redacted).unwrap();
+    assert_eq!(parsed["ssn"], json!("[REDACTED:ssn]"));
+}
+
+#[tokio::test]
+async fn test_scan_all_mode_redact_preserves_structural_numerics() {
+    // Top-level structural numerics (timestamps, token limits) must not be
+    // rewritten even though detection walks them, mirroring the string
+    // structural carve-out. Only the nested PII number is touched.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ssn"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4",
+        "max_tokens": 123456789i64,
+        "meta": {"ssn": 987654321i64}
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    let redacted = ctx.metadata.get("request_body").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(redacted).unwrap();
+    assert_eq!(
+        parsed["max_tokens"],
+        json!(123456789i64),
+        "top-level structural numeric must be preserved"
+    );
+    assert_eq!(
+        parsed["meta"]["ssn"],
+        json!("[REDACTED:ssn]"),
+        "nested PII numeric must be redacted"
+    );
+}
+
+#[tokio::test]
+async fn test_scan_all_mode_redact_fails_closed_on_object_key_pii() {
+    // PII in an object KEY cannot be rewritten in place; redaction must fail
+    // the request closed rather than forward the key while claiming redaction.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+    let original = json!({
+        "model": "gpt-4",
+        "a@b.com": "allowed"
+    });
+    let mut ctx = make_post_ctx(&original);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+    assert!(
+        !ctx.metadata.contains_key("ai_shield_redacted"),
+        "must not report redaction when key PII cannot be removed"
+    );
+}
+
+#[tokio::test]
+async fn test_scan_all_mode_redact_fails_closed_on_contextual_custom_pattern() {
+    // A custom pattern that matches only the raw cross-token context (no
+    // single rewritable token) cannot be redacted; fail closed instead of
+    // forwarding while claiming redaction.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": [],
+        "custom_patterns": [
+            {"name": "password_field", "regex": "\"password\"\\s*:"}
+        ],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4",
+        "password": "hunter2"
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+    assert!(
+        !ctx.metadata.contains_key("ai_shield_redacted"),
+        "must not report redaction for an unredactable contextual match"
+    );
+}
+
+#[tokio::test]
+async fn test_scan_all_mode_redact_string_value_still_succeeds() {
+    // Regression: the honest-redaction gate must not break the happy path —
+    // PII in a string value is fully redactable and forwarded redacted.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4",
+        "note": "reach me at a@b.com"
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    assert!(ctx.metadata.contains_key("ai_shield_redacted"));
+    let redacted = ctx.metadata.get("request_body").unwrap();
+    assert!(!redacted.contains("a@b.com"));
+    assert!(redacted.contains("[REDACTED:email]"));
+}
+
 #[tokio::test]
 async fn test_scan_content_only_mode() {
     let plugin = AiPromptShield::new(&json!({
