@@ -70,9 +70,12 @@
 //! - [`BackendPendingGuard`]'s `Drop` decrements exactly once on every dispatch
 //!   exit (success, early return, error, task cancellation), so an in-flight
 //!   slot can never leak and wedge a destination. When the count returns to
-//!   zero, the guard also evicts the idle counter entry. That keeps wildcard
-//!   upstreams, whose concrete host can come from request authority, from
-//!   accumulating unbounded zero-count keys over the gateway lifetime.
+//!   zero, the guard also evicts the idle counter entry under the shard write
+//!   lock, gated on `Arc::strong_count == 2` so an eviction can never race a
+//!   concurrent re-acquirer (which would orphan a live counter and admit past
+//!   the cap). That keeps wildcard upstreams, whose concrete host can come from
+//!   request authority, from accumulating unbounded zero-count keys over the
+//!   gateway lifetime.
 //!
 //! The implementation is deliberately a counting gate (a `CachePadded` atomic
 //! with a try-increment CAS), not a `tokio::sync::Semaphore`: a semaphore would
@@ -205,8 +208,17 @@ impl BackendPendingLimiter {
         let Some(cap) = cap else {
             return Ok(None);
         };
-        let counter = self.counter_for(host, port);
         let cap_u64 = u64::from(cap);
+        // A zero cap rejects unconditionally — reject BEFORE touching the map.
+        // `try_acquire` never hands out a guard for a zero cap, so the drop-time
+        // eviction can never fire for it; creating a counter here would leave a
+        // permanent zero-count entry per unique host (the exact unbounded growth
+        // this limiter guards against). `http1MaxPendingRequests: 0` is rejected
+        // at translate time, so production never reaches this; it is defensive.
+        if cap_u64 == 0 {
+            return Err(BackendPendingLimitExceeded { current: 0, cap: 0 });
+        }
+        let counter = self.counter_for(host, port);
         loop {
             let current = counter.count.load(Ordering::Relaxed);
             if current >= cap_u64 {
@@ -272,9 +284,33 @@ impl Drop for BackendPendingGuard {
         // silently mask a double-release / missing-acquire bug. The test suite
         // asserts the count returns to zero so any guard-lifetime regression
         // surfaces immediately.
+        //
+        // When this drop returns the count to zero, evict the idle entry so a
+        // wildcard-host spray cannot retain unbounded zero-count keys. The
+        // `remove_if` predicate runs under the DashMap shard write lock, which
+        // makes the three checks a consistent snapshot:
+        //   * `Arc::ptr_eq` — the mapped counter is still the exact one this
+        //     guard held (not a fresh entry a re-acquirer cold-path inserted
+        //     after a previous eviction).
+        //   * `Arc::strong_count(current) == 2` — only the map and THIS dropping
+        //     guard reference the counter. A concurrent acquirer that already
+        //     cloned this counter via `counter_for`'s borrowed `get()` (but has
+        //     not yet CAS-incremented) holds a third strong ref, so the count is
+        //     left intact and that acquirer keeps using the still-mapped counter.
+        //     Without this guard the eviction could race such an acquirer: the
+        //     entry would be removed, the acquirer would increment an orphaned
+        //     counter, a later request would cold-path a fresh entry, and the
+        //     destination's in-flight count would split across two counters —
+        //     silently admitting past the cap. An acquirer blocked on the shard
+        //     lock behind this eviction has not cloned yet, so removing here is
+        //     safe: its later `get()` misses and it cold-paths a fresh counter.
+        //   * `count == 0` — defensive; guaranteed once `strong_count == 2` after
+        //     a `1 -> 0` decrement (no other holder can have re-incremented).
         if self.counter.count.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.counters.remove_if(&self.counter.key, |_, current| {
-                Arc::ptr_eq(current, &self.counter) && current.count.load(Ordering::Acquire) == 0
+                Arc::ptr_eq(current, &self.counter)
+                    && Arc::strong_count(current) == 2
+                    && current.count.load(Ordering::Acquire) == 0
             });
         }
     }
@@ -358,6 +394,15 @@ mod tests {
             .try_acquire("h", 1, Some(0))
             .expect_err("cap 0 rejects every request");
         assert_eq!(limiter.current("h", 1), 0);
+        // A zero cap rejects without ever handing out a guard, so the drop-time
+        // eviction can never fire. It must therefore not create a counter entry
+        // at all — otherwise a unique-host spray at a zero-cap destination would
+        // leave a permanent zero-count entry per host.
+        assert_eq!(
+            limiter.resident_counters(),
+            0,
+            "a zero cap must reject without creating a resident counter"
+        );
     }
 
     #[test]
@@ -482,5 +527,105 @@ mod tests {
         );
         held.lock().expect("held lock").clear();
         assert_eq!(limiter.current("h", 9090), 0);
+    }
+
+    #[test]
+    fn shared_destination_entry_stays_until_last_guard_drops() {
+        // The drop-time eviction must fire only when the LAST holder releases.
+        // A second slot still held keeps the entry resident (count > 0); a
+        // `remove_if` that evicted while a holder remained would drop a live
+        // destination's counter and lose its in-flight accounting.
+        let limiter = BackendPendingLimiter::new();
+        let g1 = limiter
+            .try_acquire("shared.example.com", 80, Some(2))
+            .expect("first under cap")
+            .expect("guard present");
+        let g2 = limiter
+            .try_acquire("shared.example.com", 80, Some(2))
+            .expect("second under cap")
+            .expect("guard present");
+        assert_eq!(limiter.resident_counters(), 1);
+
+        drop(g1);
+        assert_eq!(
+            limiter.resident_counters(),
+            1,
+            "a still-held slot must keep the destination counter resident"
+        );
+        assert_eq!(limiter.current("shared.example.com", 80), 1);
+
+        drop(g2);
+        assert_eq!(
+            limiter.resident_counters(),
+            0,
+            "the last release must evict the now-idle counter"
+        );
+        assert_eq!(limiter.current("shared.example.com", 80), 0);
+    }
+
+    #[test]
+    fn concurrent_evict_and_acquire_never_double_admits() {
+        // Regression for the eviction-vs-acquire race the `Arc::strong_count`
+        // guard in `BackendPendingGuard::drop` closes. With `cap == 1` every
+        // successful acquire takes the counter 0 -> 1 and every drop takes it
+        // 1 -> 0, so an idle-entry eviction constantly races a concurrent
+        // acquirer that has already cloned the SAME counter via `counter_for`'s
+        // borrowed `get()` but has not yet CAS-incremented. Without the
+        // strong-count guard the eviction would drop that counter from the map,
+        // the racing acquirer would bump an orphaned counter, a later request
+        // would cold-path a fresh entry, and the destination would carry two
+        // live holders past a cap of one. Assert simultaneously-held guards never
+        // exceed the cap.
+        use std::sync::atomic::AtomicUsize;
+        use std::thread;
+
+        let limiter = Arc::new(BackendPendingLimiter::new());
+        let cap: u32 = 1;
+        let live = Arc::new(AtomicUsize::new(0));
+        let max_live = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let limiter = Arc::clone(&limiter);
+            let live = Arc::clone(&live);
+            let max_live = Arc::clone(&max_live);
+            handles.push(thread::spawn(move || {
+                for _ in 0..4_000 {
+                    if let Ok(Some(guard)) = limiter.try_acquire("hot.example.com", 80, Some(cap)) {
+                        let now = live.fetch_add(1, Ordering::AcqRel) + 1;
+                        max_live.fetch_max(now, Ordering::AcqRel);
+                        // Widen the hold window without a wall-clock sleep so a
+                        // racing acquirer can overlap if the cap ever leaks.
+                        for _ in 0..24 {
+                            std::hint::spin_loop();
+                        }
+                        live.fetch_sub(1, Ordering::AcqRel);
+                        drop(guard);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        assert!(
+            max_live.load(Ordering::Acquire) <= cap as usize,
+            "in-flight cap exceeded under concurrent eviction churn (observed {} \
+             simultaneous holders for cap {}): an idle-entry eviction orphaned a \
+             live counter",
+            max_live.load(Ordering::Acquire),
+            cap
+        );
+        assert_eq!(
+            limiter.current("hot.example.com", 80),
+            0,
+            "all guards released — the count must be zero"
+        );
+        assert_eq!(
+            limiter.resident_counters(),
+            0,
+            "the idle destination must be evicted once all churn completes"
+        );
     }
 }
