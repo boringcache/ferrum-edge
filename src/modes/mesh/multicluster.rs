@@ -611,10 +611,14 @@ fn tag_remote_workloads(
         // payload value is the workload's OWN identity (e.g. a WorkloadEntry's
         // real cluster, which may legitimately diverge from this entry's alias)
         // and `remote_provenance` above — not the cluster field — is what
-        // classifies the endpoint as remote, so it must be preserved. Distinct
-        // cross-cluster endpoints stay distinct in dedup because the downstream
-        // keys (`WorkloadEndpointKey` and the `service_discovery::mesh` seen set)
-        // now include cluster/network provenance.
+        // classifies the endpoint as remote, so it must be preserved. The
+        // merge-layer registry dedup (`WorkloadEndpointKey`) includes
+        // cluster/network, so two same-address endpoints on distinct networks
+        // stay as distinct WORKLOADS for provenance/introspection. The runtime
+        // target dedup in `service_discovery::mesh` deliberately collapses them
+        // back on `host:port` (they are not independently dial-able until a
+        // network-gateway address rewrite exists — issue #1719 — and the
+        // health/CB/LB keys are `host:port`).
         if workload.cluster.is_none() {
             workload.cluster = Some(cluster_name.to_string());
         }
