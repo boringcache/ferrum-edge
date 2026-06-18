@@ -37,7 +37,7 @@ use serde_json::json;
 
 use super::mesh_test_support::{
     DEFAULT_NAMESPACE, DEFAULT_TRUST_DOMAIN, default_mesh_runtime, mesh_config_with,
-    policy_allow_principal, policy_deny_principal,
+    policy_allow_principal, policy_audit_principal, policy_deny_principal,
 };
 use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::modes::mesh::{MESH_AUTHZ_PLUGIN_ID, prepare_gateway_config_for_mesh};
@@ -995,6 +995,129 @@ fn mesh_authz_construction_tolerates_ambiguous_slice_selector_satisfied_by_inter
 }
 
 #[test]
+fn mesh_authz_construction_tolerates_ambiguous_slice_audit_only_selector_without_labels() {
+    // Same shape as
+    // `mesh_authz_construction_rejects_ambiguous_slice_selector_policy_without_labels`
+    // (ambiguous slice, empty intersection, candidate-only selector the labels
+    // cannot resolve) — but the policy is AUDIT-only. AUDIT is non-enforcing per
+    // Istio semantics (records `mesh_authz.audit_policy` and continues), so
+    // dropping it via the cold-path `retain` is NOT the allow-by-default
+    // fail-open the guard protects against. Construction must TOLERATE it, not
+    // fail closed (Codex P2). Mirrors the per-pod missing-scope audit exemption.
+    let policy = policy_audit_principal(
+        "audit-role-api",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
+    let slice = json!({
+        "node_id": "node-a",
+        "namespace": DEFAULT_NAMESPACE,
+        "version": "v1",
+        "mesh_policies": [policy],
+        "labels_ambiguous": true,
+        // labels: intentionally omitted (empty intersection, recovery failed)
+    });
+    let config = json!({ "mesh_slice": slice });
+    assert!(
+        MeshAuthz::new(&config).is_ok(),
+        "an ambiguous slice carrying only an AUDIT selector policy must construct (audit is \
+         non-enforcing — dropping it is not a fail-open), not fail closed"
+    );
+}
+
+#[test]
+fn mesh_authz_construction_tolerates_ambiguous_slice_audit_only_selector_with_nonempty_intersection()
+ {
+    // Same shape as
+    // `mesh_authz_construction_rejects_ambiguous_slice_candidate_only_selector_with_nonempty_intersection`
+    // (ambiguous slice, `app=shared` intersection, candidate-only `role=api`
+    // selector the intersection cannot resolve) — but AUDIT-only. The
+    // non-empty-intersection fail-closed guard must also EXEMPT audit-only
+    // policies: dropping an audit no-op never opens an allow-by-default hole
+    // (Codex P2). Construction must tolerate it.
+    let policy = policy_audit_principal(
+        "audit-role-api",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
+    let slice = json!({
+        "node_id": "node-a",
+        "namespace": DEFAULT_NAMESPACE,
+        "version": "v1",
+        "mesh_policies": [policy],
+        "labels": { "app": "shared" },
+        "labels_ambiguous": true,
+    });
+    let config = json!({ "mesh_slice": slice });
+    assert!(
+        MeshAuthz::new(&config).is_ok(),
+        "an ambiguous slice with a candidate-only AUDIT selector the intersection cannot resolve \
+         must construct (audit is non-enforcing), not fail closed"
+    );
+}
+
+#[test]
+fn mesh_authz_construction_still_fails_closed_on_ambiguous_slice_mixed_audit_and_enforcing() {
+    // Defense-in-depth: an ambiguous slice carrying BOTH an audit-only
+    // candidate-only selector AND an ENFORCING (DENY) candidate-only selector
+    // the intersection cannot resolve must STILL fail closed — the audit
+    // exemption must not mask a real enforcing fail-open in the same slice.
+    let audit = policy_audit_principal(
+        "audit-role-api",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
+    let deny = policy_deny_principal(
+        "deny-role-worker",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("role".to_string(), "worker".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        ROGUE_SPIFFE,
+    );
+    let slice = json!({
+        "node_id": "node-a",
+        "namespace": DEFAULT_NAMESPACE,
+        "version": "v1",
+        "mesh_policies": [audit, deny],
+        "labels": { "app": "shared" },
+        "labels_ambiguous": true,
+    });
+    let config = json!({ "mesh_slice": slice });
+    match MeshAuthz::new(&config) {
+        Ok(_) => panic!(
+            "an ambiguous slice with an unresolvable enforcing DENY selector must fail closed even \
+             when an audit-only selector is also present"
+        ),
+        Err(err) => assert!(
+            err.contains("partial label intersection"),
+            "expected a partial-intersection fail-closed construction error, got: {err}"
+        ),
+    }
+}
+
+#[test]
 fn mesh_authz_construction_rejects_operator_selector_policy_without_labels() {
     // Operator-direct config (flat `mesh_policies`, no `mesh_slice` context): a
     // workload-selector policy with selector labels but no proxy `labels`. There
@@ -1027,6 +1150,37 @@ fn mesh_authz_construction_rejects_operator_selector_policy_without_labels() {
             "expected a labels-required construction error, got: {err}"
         ),
     }
+}
+
+#[test]
+fn mesh_authz_construction_tolerates_operator_audit_only_selector_without_labels() {
+    // Operator-direct config (flat `mesh_policies`) with an AUDIT-only
+    // workload-selector policy and no proxy `labels`. AUDIT is non-enforcing per
+    // Istio semantics, so dropping it via the cold-path `retain` is a no-op, not
+    // a fail-open. Construction must TOLERATE it, not fail closed (Codex P2 — the
+    // audit exemption applies on the operator path too, consistent with the
+    // slice path and the per-pod missing-scope check).
+    let policy = policy_audit_principal(
+        "audit-labels-optional",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "ratings".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
+    let config = json!({
+        "mesh_policies": [policy],
+        "namespace": DEFAULT_NAMESPACE,
+        // labels: intentionally omitted
+    });
+    assert!(
+        MeshAuthz::new(&config).is_ok(),
+        "an operator-direct AUDIT-only selector policy without labels must construct (audit is \
+         non-enforcing), not fail closed"
+    );
 }
 
 #[test]

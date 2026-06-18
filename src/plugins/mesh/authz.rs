@@ -718,6 +718,23 @@ impl MeshAuthz {
     }
 }
 
+/// Whether a policy carries at least one ENFORCING rule (`Allow` / `Deny`).
+///
+/// An `Audit`-only policy is non-enforcing per Istio semantics:
+/// `evaluate_mesh_authorization_policies` records `mesh_authz.audit_policy`
+/// metadata and returns `Continue`, so dropping an audit-only policy never
+/// changes the allow/deny outcome (it is NOT the allow-by-default fail-open the
+/// scope-resolution guards below protect against). The construction-time
+/// fail-closed branches must therefore gate on this, exactly as the per-pod
+/// missing-scope check in `MeshAuthz::new` (`has_scoped_policies`) already does
+/// — an unscopable audit-only selector policy is skipped, not rejected.
+fn policy_has_enforcing_rule(policy: &MeshPolicy) -> bool {
+    policy
+        .rules
+        .iter()
+        .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny))
+}
+
 fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result<(), String> {
     let has_proxy_namespace = !slice.namespace.trim().is_empty();
     let has_proxy_labels = !slice.labels.is_empty();
@@ -747,7 +764,7 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                 }
 
                 if !selector.labels.is_empty() && !has_proxy_labels {
-                    if !from_slice {
+                    if !from_slice && policy_has_enforcing_rule(policy) {
                         // Operator-direct config (flat `mesh_policies`, no
                         // `mesh_slice` context): a workload-selector policy
                         // carries selector labels but the operator supplied no
@@ -759,6 +776,13 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                         // labels here (unlike the slice path), so fail closed at
                         // construction and make the operator supply the proxy's
                         // identity.
+                        //
+                        // Gated on an ENFORCING rule: an AUDIT-only operator
+                        // selector policy is non-enforcing, so dropping it is a
+                        // no-op, not a fail-open — it falls through to the
+                        // warn-and-tolerate path below (the `!from_slice` audit
+                        // exemption, consistent with the slice-path branches and
+                        // the per-pod missing-scope `has_scoped_policies` check).
                         return Err(format!(
                             "mesh_authz: policy '{}' uses a workload selector with labels {:?} but \
                              no proxy labels are configured; set `labels` so the policy can be \
@@ -767,7 +791,7 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                         ));
                     }
                     // Slice-apply path with no resolved proxy labels.
-                    if slice.labels_ambiguous {
+                    if slice.labels_ambiguous && policy_has_enforcing_rule(policy) {
                         // The slice marked these labels as an ambiguous
                         // shared-SPIFFE intersection and shipped the selector
                         // policy as a candidate-any superset for a label-holding
@@ -784,6 +808,14 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                         // by default — a silent fail-open for a selector DENY/ALLOW
                         // that demonstrably applies to a candidate workload. Fail
                         // closed and make the operator pin the proxy identity.
+                        //
+                        // Gated on an ENFORCING rule: an AUDIT-only selector policy
+                        // is a non-enforcing no-op (it only records audit metadata
+                        // and continues), so dropping it via the cold-path `retain`
+                        // is NOT a fail-open — rejecting plugin construction for it
+                        // would be a regression. It falls through to the
+                        // warn-and-tolerate path below, mirroring the per-pod
+                        // missing-scope `has_scoped_policies` audit exemption.
                         return Err(format!(
                             "mesh_authz: policy '{}' uses a workload selector with labels {:?} but \
                              the slice resolved no proxy labels for this ambiguous shared-SPIFFE \
@@ -792,28 +824,33 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                             policy.name, selector.labels
                         ));
                     }
-                    // Non-ambiguous slice that still resolved empty proxy labels
-                    // (e.g. a single-candidate or label-less workload). The slice
-                    // is authoritative for THIS workload and a label-based
-                    // selector simply does not apply, so dropping it via the
-                    // cold-path `retain` is correct, not a fail-open. Warn for
-                    // visibility but tolerate construction (failing here would
-                    // reject the slice or drop authz entirely — issue #1708); set
-                    // `mesh_slice.labels` / `FERRUM_MESH_WORKLOAD_LABELS` for
-                    // deterministic selector scoping on Sidecar/Ambient.
+                    // Reached when the slice is NOT ambiguous (the slice is
+                    // authoritative for THIS workload and a label-based selector
+                    // simply does not apply — single-candidate or label-less
+                    // workload), OR the slice IS ambiguous but the policy is
+                    // AUDIT-only (non-enforcing — gated out of the fail-closed
+                    // branch above). In both cases dropping the policy via the
+                    // cold-path `retain` is correct, not a fail-open: a
+                    // non-applicable authoritative selector or an audit-only no-op
+                    // never opens an allow-by-default hole. Warn for visibility but
+                    // tolerate construction (a hard error would reject the slice or
+                    // drop authz entirely — issue #1708); set `mesh_slice.labels` /
+                    // `FERRUM_MESH_WORKLOAD_LABELS` for deterministic selector
+                    // scoping on Sidecar/Ambient.
                     //
-                    // A current Ferrum CP cannot reach this branch with a
-                    // genuinely-ambiguous slice: it sets `labels_ambiguous` on
-                    // divergent shared-SPIFFE candidates (slice.rs), and the
-                    // candidate-any projection only keeps a selector policy that
-                    // matches SOME candidate — a single label-less candidate `{}`
-                    // never matches a non-empty selector, so the policy is dropped
-                    // at slice build and never rides in. The only way an unmarked
-                    // empty-label slice carries an unsatisfiable selector policy is
-                    // a cross-version slice from a CP predating the marker (serde
-                    // defaults `labels_ambiguous = false`). Per the Build-Out Policy
-                    // (no legacy shims for old wire/config shapes; CP and DP ship
-                    // from one binary version), that case is out of scope and is not
+                    // A current Ferrum CP cannot reach this branch with an
+                    // ENFORCING genuinely-ambiguous slice: it sets
+                    // `labels_ambiguous` on divergent shared-SPIFFE candidates
+                    // (slice.rs), and the candidate-any projection only keeps a
+                    // selector policy that matches SOME candidate — a single
+                    // label-less candidate `{}` never matches a non-empty selector,
+                    // so the policy is dropped at slice build and never rides in.
+                    // The only way an unmarked empty-label slice carries an
+                    // unsatisfiable enforcing selector policy is a cross-version
+                    // slice from a CP predating the marker (serde defaults
+                    // `labels_ambiguous = false`). Per the Build-Out Policy (no
+                    // legacy shims for old wire/config shapes; CP and DP ship from
+                    // one binary version), that case is out of scope and is not
                     // failed closed here — set the labels to pin identity.
                     tracing::warn!(
                         policy = %policy.name,
@@ -823,6 +860,7 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                     );
                 } else if slice.labels_ambiguous
                     && from_slice
+                    && policy_has_enforcing_rule(policy)
                     && !workload_selector_matches(selector, &slice.namespace, &slice.labels)
                 {
                     // Ambiguous shared-SPIFFE slice with a NON-EMPTY label
@@ -841,6 +879,14 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                     // final, so we cannot prove this DENY/ALLOW does not apply.
                     // Fail closed and make the operator pin the proxy identity so
                     // the candidate-any superset can be re-filtered deterministically.
+                    //
+                    // Gated on an ENFORCING rule: an AUDIT-only candidate-only
+                    // selector policy is a non-enforcing no-op, so dropping it via
+                    // the cold-path `retain` does not open an allow-by-default hole.
+                    // Rejecting plugin construction for it would be a regression, so
+                    // it is tolerated (the `retain` still drops it from evaluation),
+                    // mirroring the per-pod missing-scope `has_scoped_policies` audit
+                    // exemption.
                     return Err(format!(
                         "mesh_authz: policy '{}' uses a workload selector with labels {:?} that the \
                          ambiguous shared-SPIFFE slice's partial label intersection {:?} cannot \

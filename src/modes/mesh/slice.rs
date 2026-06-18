@@ -559,6 +559,69 @@ impl MeshSlice {
         )
     }
 
+    /// Resolve the effective inbound mTLS mode for `port`, FAILING CLOSED on an
+    /// ambiguous shared-SPIFFE slice whose partial label intersection cannot
+    /// confirm a candidate-only selector PeerAuthentication.
+    ///
+    /// On a `labels_ambiguous` slice, `self.labels` is only the intersection of
+    /// the divergent candidates sharing this SPIFFE, NOT this workload's
+    /// authoritative labels, and `peer_authentications` carries the candidate-any
+    /// superset (a STRICT PeerAuth that matches only ONE candidate rode in). The
+    /// plain [`Self::resolve_effective_mtls_mode`] re-filters by the partial
+    /// intersection, so such a selector STRICT is silently dropped and the
+    /// listener falls back to `Permissive` — a silent fail-OPEN: a workload whose
+    /// real labels match the selector would have required mTLS.
+    ///
+    /// When the marker is set, we cannot prove an unresolvable selector
+    /// PeerAuth does NOT apply, so we ESCALATE to the most-restrictive effective
+    /// mode any such candidate-only selector PeerAuth would yield for this port
+    /// (Strict > Permissive > Disable), but never DOWNGRADE below the
+    /// normally-resolved mode. The operator's remedy is to pin
+    /// `FERRUM_MESH_WORKLOAD_LABELS` / `mesh_slice.labels` so the marker clears
+    /// and the superset is re-filtered deterministically. A non-ambiguous slice
+    /// (the marker absent — unique SPIFFE, concrete request labels, or a DP that
+    /// resolved its authoritative labels) is enforcement-IDENTICAL to the plain
+    /// resolver.
+    pub fn resolve_inbound_mtls_mode_fail_closed(&self, port: u16) -> MtlsMode {
+        let resolved = self.resolve_effective_mtls_mode(port);
+        if !self.labels_ambiguous {
+            return resolved;
+        }
+        // Most-restrictive mode among candidate-any selector PeerAuths that the
+        // partial intersection could NOT confirm (the plain resolver dropped
+        // them). Only WorkloadSelector-scoped entries with non-empty selector
+        // labels are at risk: namespace/mesh-wide scopes resolve against the
+        // authoritative `self.namespace`, not the ambiguous labels.
+        let mut effective = resolved;
+        for pa in &self.peer_authentications {
+            if classify_peer_auth_scope(pa) != PeerAuthScope::WorkloadSelector {
+                continue;
+            }
+            if peer_auth_applies_to_workload(pa, &self.namespace, &self.labels) {
+                // Already accounted for by the normal resolution above.
+                continue;
+            }
+            let candidate = peer_auth_effective_mode(pa, port);
+            if peer_auth_mtls_restrictiveness(candidate) < peer_auth_mtls_restrictiveness(effective)
+            {
+                effective = candidate;
+            }
+        }
+        if effective != resolved {
+            tracing::warn!(
+                port,
+                resolved = ?resolved,
+                fail_closed = ?effective,
+                "mesh PeerAuthentication: ambiguous shared-SPIFFE slice carries a candidate-only \
+                 selector PeerAuthentication the partial label intersection cannot resolve; \
+                 escalating inbound mTLS to the most-restrictive candidate mode (fail closed). \
+                 Set FERRUM_MESH_WORKLOAD_LABELS / mesh_slice.labels to pin this workload's \
+                 identity for deterministic resolution"
+            );
+        }
+        effective
+    }
+
     /// Returns the most-specific applicable [`MeshProxyConfig`] for this slice's
     /// workload, or `None` when no `ProxyConfig` applies.
     ///
@@ -3004,6 +3067,136 @@ mod tests {
         );
         assert!(!b.content_eq(&a));
         assert!(a.content_eq(&a.clone()));
+    }
+
+    fn selector_peer_auth(
+        name: &str,
+        key: &str,
+        value: &str,
+        mode: MtlsMode,
+    ) -> PeerAuthentication {
+        PeerAuthentication {
+            name: name.into(),
+            namespace: "default".into(),
+            scope: None,
+            selector: Some(WorkloadSelector {
+                labels: HashMap::from([(key.to_string(), value.to_string())]),
+                namespace: None,
+            }),
+            mtls_mode: mode,
+            port_overrides: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn fail_closed_mtls_escalates_unresolvable_selector_strict_on_ambiguous_slice() {
+        // Codex P1: an ambiguous shared-SPIFFE slice carries a candidate-only
+        // STRICT PeerAuthentication keyed on the divergent `role=api` as a
+        // superset, but `labels` is only the partial intersection `app=shared`,
+        // which does NOT match the selector. The plain resolver drops it and
+        // falls back to Permissive — a fail-OPEN. The fail-closed resolver must
+        // escalate to STRICT because it cannot prove the selector does not apply.
+        let slice = MeshSlice {
+            namespace: "default".into(),
+            labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
+            labels_ambiguous: true,
+            peer_authentications: vec![selector_peer_auth(
+                "role-api-strict",
+                "role",
+                "api",
+                MtlsMode::Strict,
+            )],
+            ..MeshSlice::default()
+        };
+        assert_eq!(
+            slice.resolve_effective_mtls_mode(8080),
+            MtlsMode::Permissive,
+            "the plain resolver drops the unresolvable selector (the fail-open this fix closes)"
+        );
+        assert_eq!(
+            slice.resolve_inbound_mtls_mode_fail_closed(8080),
+            MtlsMode::Strict,
+            "the fail-closed resolver must escalate to STRICT for an unresolvable candidate STRICT"
+        );
+    }
+
+    #[test]
+    fn fail_closed_mtls_is_enforcement_identical_on_non_ambiguous_slice() {
+        // Guardrail: the non-ambiguous case must be byte-identical to the plain
+        // resolver. Same slice as above but NOT flagged ambiguous (the labels are
+        // authoritative), so the selector simply does not apply and Permissive is
+        // correct — no escalation.
+        let slice = MeshSlice {
+            namespace: "default".into(),
+            labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
+            labels_ambiguous: false,
+            peer_authentications: vec![selector_peer_auth(
+                "role-api-strict",
+                "role",
+                "api",
+                MtlsMode::Strict,
+            )],
+            ..MeshSlice::default()
+        };
+        assert_eq!(
+            slice.resolve_effective_mtls_mode(8080),
+            slice.resolve_inbound_mtls_mode_fail_closed(8080),
+            "fail-closed resolution must equal plain resolution on a non-ambiguous slice"
+        );
+        assert_eq!(
+            slice.resolve_inbound_mtls_mode_fail_closed(8080),
+            MtlsMode::Permissive,
+        );
+    }
+
+    #[test]
+    fn fail_closed_mtls_does_not_escalate_when_selector_resolved_by_intersection() {
+        // The candidate-only selector IS satisfied by the partial intersection
+        // (`app=shared` selector against `app=shared` labels), so the plain
+        // resolver already enforces STRICT and the fail-closed path is a no-op —
+        // no over-escalation beyond what actually resolved.
+        let slice = MeshSlice {
+            namespace: "default".into(),
+            labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
+            labels_ambiguous: true,
+            peer_authentications: vec![selector_peer_auth(
+                "app-shared-strict",
+                "app",
+                "shared",
+                MtlsMode::Strict,
+            )],
+            ..MeshSlice::default()
+        };
+        assert_eq!(slice.resolve_effective_mtls_mode(8080), MtlsMode::Strict,);
+        assert_eq!(
+            slice.resolve_inbound_mtls_mode_fail_closed(8080),
+            MtlsMode::Strict,
+        );
+    }
+
+    #[test]
+    fn fail_closed_mtls_does_not_escalate_unresolvable_permissive_selector() {
+        // An ambiguous slice whose only unresolvable candidate-only selector is
+        // PERMISSIVE (not STRICT) must NOT escalate past Permissive — the
+        // fail-closed path escalates only toward the MORE restrictive mode, it
+        // does not invent STRICT where no STRICT policy exists.
+        let slice = MeshSlice {
+            namespace: "default".into(),
+            labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
+            labels_ambiguous: true,
+            peer_authentications: vec![selector_peer_auth(
+                "role-api-permissive",
+                "role",
+                "api",
+                MtlsMode::Permissive,
+            )],
+            ..MeshSlice::default()
+        };
+        assert_eq!(
+            slice.resolve_inbound_mtls_mode_fail_closed(8080),
+            MtlsMode::Permissive,
+            "no STRICT candidate exists, so fail-closed resolution stays Permissive"
+        );
     }
 
     #[test]
