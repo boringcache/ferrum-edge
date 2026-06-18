@@ -27,11 +27,28 @@ const STRUCTURAL_KEYS: &[&str] = &[
     "type",
     "created",
     "stream",
+    // Numeric/scalar LLM request parameters an operator legitimately sends.
+    // Their values are tuning knobs, not user content, so a top-level scalar
+    // here that incidentally matches a PII regex (e.g. a 9-digit `seed` that
+    // looks like an SSN) must be preserved rather than rewritten — otherwise
+    // redaction silently changes the upstream request schema/semantics. These
+    // are carved out at the TOP LEVEL only; the same names nested under
+    // attacker-controlled structure are still scanned/redacted.
     "temperature",
     "top_p",
+    "top_k",
     "max_tokens",
     "max_output_tokens",
     "max_completion_tokens",
+    "seed",
+    "n",
+    "best_of",
+    "logprobs",
+    "top_logprobs",
+    "frequency_penalty",
+    "presence_penalty",
+    "repetition_penalty",
+    "logit_bias",
     "tool_call_id",
 ];
 
@@ -414,6 +431,45 @@ impl AiPromptShield {
             .collect()
     }
 
+    /// Whether the ORIGINAL request matched any pattern *only* in the raw
+    /// cross-token context — i.e. a pattern that matched the serialized body but
+    /// matches none of its decoded tokens (string values, object keys, numeric
+    /// scalars). Such a hit (e.g. a contextual `custom_pattern` like
+    /// `"password"\s*:`) has no single rewritable token, so `redact_json_strings`
+    /// — which only rewrites tokens — can never remove it. The request is
+    /// therefore unredactable and must fail closed.
+    ///
+    /// This is computed from the ORIGINAL body, independent of the rewritten
+    /// body's serialization, precisely so a whitespace-sensitive contextual
+    /// match cannot be "cleared" by the minification that `serde_json::to_string`
+    /// applies to the rewritten body. Using minified output as proof of removal
+    /// is unsound: minification can erase the formatting a raw regex depended on
+    /// even though nothing was redacted. A pattern that matches a decoded token
+    /// is excluded here because that path *is* removable and is verified by the
+    /// post-rewrite decoded-token re-scan instead.
+    fn original_has_unredactable_contextual_match(&self, json: &Value, raw: &str) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        // Patterns that fired on the raw serialized original.
+        let raw_hits = self.detection_set.matches(raw);
+        if !raw_hits.matched_any() {
+            return false;
+        }
+        // Patterns that fired on at least one decoded token of the original.
+        let mut token_hit = vec![false; self.patterns.len()];
+        let mut texts: Vec<Cow<'_, str>> = Vec::new();
+        collect_json_strings(json, &mut texts);
+        for text in &texts {
+            for idx in self.detection_set.matches(text.as_ref()).into_iter() {
+                token_hit[idx] = true;
+            }
+        }
+        // A raw hit with no corresponding decoded-token hit is contextual-only
+        // and cannot be removed by token rewriting.
+        raw_hits.into_iter().any(|idx| !token_hit[idx])
+    }
+
     /// Parse the body as JSON, apply mode-appropriate redaction, and return a
     /// [`RedactionOutcome`]. Returns `NoChange` when the body isn't valid JSON,
     /// is over `max_scan_bytes`, or contains no PII to redact (so callers don't
@@ -442,6 +498,13 @@ impl AiPromptShield {
             if detected.is_empty() {
                 return RedactionOutcome::NoChange;
             }
+            // Decide UP FRONT, against the unmodified original, whether any hit
+            // is a raw-only contextual match that token rewriting cannot remove.
+            // Captured before mutation so the verdict can't depend on the
+            // minified serialization of the rewritten body (see
+            // `original_has_unredactable_contextual_match`).
+            let unredactable_contextual =
+                self.original_has_unredactable_contextual_match(&json, body);
             // Run structured redaction first on known prompt-content
             // fields (messages[].content) so recognized chat-completion
             // shapes are handled with the correct template. Then run the
@@ -463,14 +526,16 @@ impl AiPromptShield {
             }
             redact_json_strings(&mut json, &self.patterns, true);
 
-            // Re-scan the rewritten body. The walker redacts string values and
-            // numeric scalars, but cannot rewrite PII carried in an object key
-            // or a purely cross-token/contextual custom-pattern match. If any
-            // detection still fires, redaction is incomplete: forwarding now
-            // would leak the value while reporting it redacted, so signal the
-            // caller to fail closed. `[REDACTED:...]` placeholders match no PII
-            // pattern, so a fully-redacted body re-scans clean.
-            if self.redacted_body_has_residual_pii(&json) {
+            // Fail closed when redaction provably could not remove the PII:
+            //   1. A raw-only contextual match in the original (no rewritable
+            //      token) — decided above against the unmodified body so
+            //      minification can't erase the signal.
+            //   2. The rewritten body still has residual PII in a decoded token
+            //      (e.g. PII carried in an object key, which is never rewritten).
+            // Either case means forwarding would leak the value while reporting
+            // it redacted. `[REDACTED:...]` placeholders match no PII pattern, so
+            // a fully-redacted token re-scans clean.
+            if unredactable_contextual || self.redacted_body_has_residual_pii(&json) {
                 return RedactionOutcome::Incomplete(json);
             }
             return RedactionOutcome::Redacted(json);

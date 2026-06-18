@@ -835,6 +835,75 @@ async fn test_scan_all_mode_redact_string_value_still_succeeds() {
 }
 
 #[tokio::test]
+async fn test_scan_all_mode_redact_preserves_numeric_llm_parameters() {
+    // A top-level numeric LLM request parameter (`seed`) whose string form
+    // incidentally matches the default `ssn` pattern (9 digits) must be
+    // preserved as a number, not rewritten to a placeholder string — otherwise
+    // redaction silently changes the upstream request schema. Only the nested
+    // PII number is touched.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ssn"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4",
+        "seed": 123456789i64,
+        "n": 123456789i64,
+        "frequency_penalty": 0,
+        "meta": {"ssn": 987654321i64}
+    }));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+    let redacted = ctx.metadata.get("request_body").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(redacted).unwrap();
+    assert_eq!(
+        parsed["seed"],
+        json!(123456789i64),
+        "top-level numeric `seed` parameter must be preserved as a number"
+    );
+    assert_eq!(
+        parsed["n"],
+        json!(123456789i64),
+        "top-level numeric `n` parameter must be preserved as a number"
+    );
+    assert_eq!(
+        parsed["meta"]["ssn"],
+        json!("[REDACTED:ssn]"),
+        "nested PII numeric must still be redacted"
+    );
+}
+
+#[tokio::test]
+async fn test_scan_all_mode_redact_fails_closed_on_whitespace_sensitive_pattern() {
+    // A contextual custom pattern that *requires* whitespace around the colon
+    // matches the incoming raw body, but no token is rewritten. The residual
+    // verification must not treat the minified rewritten body (which strips that
+    // whitespace) as proof of redaction: the request must fail closed.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": [],
+        "custom_patterns": [
+            {"name": "password_field", "regex": "\"password\"\\s+:"}
+        ],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+    // Note the space before the colon — required by the regex and removed by
+    // `serde_json::to_string` minification.
+    let mut ctx = make_post_ctx_with_raw_body(r#"{"model":"gpt-4","password" : "hunter2"}"#);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+    assert!(
+        !ctx.metadata.contains_key("ai_shield_redacted"),
+        "must not report redaction when a whitespace-sensitive contextual match cannot be removed"
+    );
+}
+
+#[tokio::test]
 async fn test_scan_content_only_mode() {
     let plugin = AiPromptShield::new(&json!({
         "patterns": ["ssn"],
