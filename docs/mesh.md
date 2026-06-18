@@ -1796,10 +1796,17 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   `node_waypoint_policy_scope: None` (UDP has no per-source-pod cookie — see the
   UDP/DTLS limitation above). **Linux-only** (`IP_TRANSPARENT` + recvmsg cmsg);
   on other platforms the listener is a no-op stub. With the flag off there is no
-  listener and no capture rules. The full source-capture→tunnel→unframe→app→return
-  datapath (including return-source spoofing on a transparent socket) is
-  **unit/dest-tested**; a live netns root e2e is deferred to the §3.1 capture-live
-  verification stage (Stage 7).
+  listener and no capture rules. **Destination relay e2e-tested (F3 §3.3 Stage 7):**
+  the inbound relay (`handle_hbone_udp_request` / `relay_hbone_udp`) is now exercised
+  end-to-end by the `functional_mesh_udp_dest_*` functional tests — a `udp`-marked
+  mTLS HTTP/2 CONNECT into a spawned Ambient gateway → framed datagram → local UDP
+  echo backend → framed reply byte-for-byte (`..._relays_datagram_round_trip`), plus
+  the fail-closed negatives (`..._off_allowlist_authority_is_refused` →
+  open-relay-guard refuse; `..._untrusted_peer_fails_closed` → STRICT inbound
+  rejects an unchained client SVID). These need no root/netns (the client synthesizes
+  the `udp` CONNECT). The **remaining gap** is the live **source-capture** e2e
+  (TPROXY → tunnel → return-source spoofing on a transparent socket), which needs a
+  root/netns env and rides the §3.1 `netns-capture-live` follow-up.
 - **End-to-end status (#1808): Sidecar is the FIRST working end-to-end UDP path.**
   The Sidecar mesh-mTLS datagram relay (`open_datagram_tunnel`) pairs the
   reusable Stage-4 codec / materialization / dest-side unframe with the **existing
@@ -1837,7 +1844,7 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   | **Capability probe** — Ambient `Udp` enrolled before dial | egress session (Ambient branch) | drop; no blind dial | probe gate widened to `Http\|Tcp\|Udp`; `egress_transport_branch_selects_by_tag` |
   | **Pinned-peer SPIFFE** | egress dial | refuse dial on missing/corrupt pin | `mtls_expected_peer_is_required_and_fails_closed` |
   | **Transport selection** — materializer stamps exactly one of `mesh.hbone` / `mesh.mtls`; runtime precedence is HBONE → mesh-mTLS | egress session | end session if neither tag (a both-tags target — only reachable via a corrupted upstream, never the materializer — resolves to HBONE by precedence, which never relaxes a gate) | `egress_transport_branch_selects_by_tag` |
-  | **Authenticated peer** (dest) — `peer_spiffe_id.is_some()` | dest handler, before any socket opens | 403 | predicate by `authenticated_hbone_*_without_peer_is_rejected`; enforced inline in `handle_hbone_request` / `handle_hbone_udp_request` (the `ctx.peer_spiffe_id.is_none()` reject), with handler-level e2e deferred to Stage 7 |
+  | **Authenticated peer** (dest) — `peer_spiffe_id.is_some()` | dest handler, before any socket opens | 403 | predicate by `authenticated_hbone_*_without_peer_is_rejected` + inline handler reject (`ctx.peer_spiffe_id.is_none()`); the fail-closed OUTCOME is e2e-tested by `functional_mesh_udp_dest_untrusted_peer_fails_closed` (under STRICT inbound the unchained peer is rejected at the TLS layer; the handler's own 403 stays predicate-pinned) |
   | **Open-relay guard** (dest) — loopback / slice-declared workload addr + port only, re-checked on the **post-route-override** effective destination | dest handler | 403 | `inbound_hbone_relay_guard_allows_only_local_destinations` |
   | **Marker discipline** — `udp`/`hbone` predicates disjoint; an unknown / future / malformed (incl. non-UTF-8) marker → neither | dispatch | 405 — the non-WebSocket-CONNECT gate (`!is_hbone_connect_any`) rejects an unrecognized CONNECT before routing; both skew directions | `connect_marker_classification_is_exhaustive_and_fail_closed`, `udp_and_hbone_predicates_are_disjoint` |
   | **Session DoS bounds** — count + queued-bytes + idle sweep | source capture | shed / reap | `session_cap_sheds_new_flows_but_serves_existing`, `egress_enqueue_caps_queued_bytes_not_just_count` |
