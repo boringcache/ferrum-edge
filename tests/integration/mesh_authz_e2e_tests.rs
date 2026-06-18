@@ -919,6 +919,82 @@ fn mesh_authz_construction_rejects_ambiguous_slice_selector_policy_without_label
 }
 
 #[test]
+fn mesh_authz_construction_rejects_ambiguous_slice_candidate_only_selector_with_nonempty_intersection()
+ {
+    // Ambiguous shared-SPIFFE slice with a NON-EMPTY label intersection: both
+    // candidates share `app=shared` but only one has `role=api`. The slice
+    // labels here are just that partial intersection (`app=shared`), NOT this
+    // workload's authoritative labels, and the slice carried the candidate-only
+    // `role=api` selector policy as a superset. Because the selector is not
+    // satisfied by the partial intersection, the cold-path `retain` would DROP
+    // it and `evaluate_mesh_authorization_policies` would allow by default — the
+    // non-empty-intersection fail-open (Codex P1). Construction must fail closed.
+    let policy = policy_allow_principal(
+        "role-api-allow",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
+    let slice = json!({
+        "node_id": "node-a",
+        "namespace": DEFAULT_NAMESPACE,
+        "version": "v1",
+        "mesh_policies": [policy],
+        "labels": { "app": "shared" },
+        "labels_ambiguous": true,
+    });
+    let config = json!({ "mesh_slice": slice });
+    match MeshAuthz::new(&config) {
+        Ok(_) => panic!(
+            "ambiguous slice with a candidate-only selector the partial intersection cannot resolve must fail closed"
+        ),
+        Err(err) => assert!(
+            err.contains("partial label intersection"),
+            "expected a partial-intersection fail-closed construction error, got: {err}"
+        ),
+    }
+}
+
+#[test]
+fn mesh_authz_construction_tolerates_ambiguous_slice_selector_satisfied_by_intersection() {
+    // Ambiguous shared-SPIFFE slice with a non-empty intersection where the
+    // selector IS satisfied by the intersection (`app=shared` selector against
+    // `app=shared` intersection labels). The cold-path `retain` keeps the
+    // policy, so there is no fail-open and construction must NOT over-reject —
+    // the labels-ambiguous fail-closed guard only fires for selectors the
+    // partial intersection cannot resolve.
+    let policy = policy_allow_principal(
+        "app-shared-allow",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "shared".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
+    let slice = json!({
+        "node_id": "node-a",
+        "namespace": DEFAULT_NAMESPACE,
+        "version": "v1",
+        "mesh_policies": [policy],
+        "labels": { "app": "shared" },
+        "labels_ambiguous": true,
+    });
+    let config = json!({ "mesh_slice": slice });
+    assert!(
+        MeshAuthz::new(&config).is_ok(),
+        "an ambiguous slice whose selector is satisfied by the intersection must construct (no over-rejection)"
+    );
+}
+
+#[test]
 fn mesh_authz_construction_rejects_operator_selector_policy_without_labels() {
     // Operator-direct config (flat `mesh_policies`, no `mesh_slice` context): a
     // workload-selector policy with selector labels but no proxy `labels`. There

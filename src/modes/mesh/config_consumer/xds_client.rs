@@ -1369,11 +1369,21 @@ fn reverse_translate(
             recovered.labels_ambiguous,
             &config.labels,
         ),
-        // Once the DP has re-resolved `labels` above (preferring its own local
-        // labels in the ambiguous case), the recovered slice's labels are
-        // authoritative for THIS DP, so the marker is cleared — downstream
-        // consumers (mesh_authz cold-path retain) must treat them as final.
-        labels_ambiguous: false,
+        // Clear the marker only when the recovered `labels` above are actually
+        // authoritative for THIS DP: either the CP labels were unambiguous, or
+        // the CP marked them ambiguous but the DP had its own local labels that
+        // `pick_recovered_labels` preferred over the partial intersection. When
+        // the CP marked them ambiguous AND the DP had no local labels, the
+        // recovered `labels` are only the (partial/empty) intersection — NOT
+        // authoritative — so the marker is PRESERVED. Clearing it there would
+        // defeat the mesh_authz ambiguous-slice fail-closed check: the cold-path
+        // retain would silently drop the candidate-only selector policies the
+        // slice carried as a superset and fall back to allow-by-default
+        // (fail-open). Downstream consumers (mesh_authz cold-path retain) treat
+        // a still-set marker as "labels not final; fail closed for selectors
+        // that the partial labels cannot satisfy".
+        labels_ambiguous: recovered.labels_ambiguous
+            && !recovered_labels_are_authoritative(recovered.labels_ambiguous, &config.labels),
         // Required xDS types are coherent before a slice is built, so this is
         // the shared observability version for the installed mesh slice.
         version: composite_required_version(accumulator),
@@ -1477,6 +1487,29 @@ fn pick_recovered_labels(
         return local_labels.clone();
     }
     carrier_labels.unwrap_or_else(|| local_labels.clone())
+}
+
+/// Whether the labels [`pick_recovered_labels`] produced are AUTHORITATIVE for
+/// this DP, so the `labels_ambiguous` marker can be cleared in the recovered
+/// slice.
+///
+/// Recovery is authoritative when the CP did not mark the labels ambiguous (the
+/// non-empty carrier — or the DP's own local labels for an empty carrier — is
+/// trustworthy), or when the CP marked them ambiguous but the DP supplied its
+/// own local `FERRUM_MESH_WORKLOAD_LABELS` that [`pick_recovered_labels`] then
+/// preferred over the partial intersection. When the CP marked the labels
+/// ambiguous AND the DP had no local labels, `pick_recovered_labels` falls back
+/// to the partial intersection (or empty), which is NOT this workload's real
+/// label set: the candidate-only selector policies the slice carried as a
+/// superset cannot be re-filtered here, so the marker MUST be preserved so the
+/// mesh_authz ambiguous-slice fail-closed check still runs instead of letting
+/// the cold-path `retain` silently drop those selector DENY/ALLOW/PeerAuth/JWT
+/// rules and fall back to allow-by-default.
+fn recovered_labels_are_authoritative(
+    ambiguous: bool,
+    local_labels: &BTreeMap<String, String>,
+) -> bool {
+    !ambiguous || !local_labels.is_empty()
 }
 
 /// Slice fields recovered from Ferrum mesh-slice ECDS carriers (GAP-1a).
@@ -4576,6 +4609,60 @@ mod tests {
             recovered.resolve_effective_mtls_mode(8080),
             MtlsMode::Strict,
             "the candidate-only role=api PeerAuthentication must still match the DP's real labels"
+        );
+    }
+
+    #[test]
+    fn xds_round_trip_preserves_ambiguous_marker_when_dp_has_no_local_labels() {
+        use crate::modes::mesh::config::{MtlsMode, PeerAuthentication, WorkloadSelector};
+
+        // Ambiguous shared-SPIFFE slice with an EMPTY label intersection (the
+        // candidates diverge with no common label), and the DP supplies NO local
+        // `FERRUM_MESH_WORKLOAD_LABELS`. `pick_recovered_labels` then falls back
+        // to the (empty) intersection, which is NOT authoritative, so the
+        // recovered slice MUST keep `labels_ambiguous = true` — otherwise the
+        // mesh_authz ambiguous-slice fail-closed check never runs and the
+        // candidate-only selector policy is silently dropped (fail-open).
+        let native = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "v1".to_string(),
+            labels: BTreeMap::new(),
+            labels_ambiguous: true,
+            peer_authentications: vec![PeerAuthentication {
+                name: "role-api-strict".to_string(),
+                namespace: "default".to_string(),
+                scope: None,
+                selector: Some(WorkloadSelector {
+                    labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                    namespace: None,
+                }),
+                mtls_mode: MtlsMode::Strict,
+                port_overrides: HashMap::new(),
+            }],
+            ..MeshSlice::default()
+        };
+        let snapshot = translate_mesh_slice_to_snapshot(&native);
+        let accumulator = accumulator_from_snapshot(&snapshot);
+
+        // DP config: no local labels to make the intersection authoritative.
+        let mut config = test_config();
+        config.node_id = native.node_id.clone();
+        config.namespace = native.namespace.clone();
+        config.labels = BTreeMap::new();
+
+        let recovered = accumulator
+            .try_build_mesh_slice(&config)
+            .expect("reverse translate succeeds")
+            .expect("all required types present");
+
+        assert!(
+            recovered.labels.is_empty(),
+            "with no local DP labels the recovered labels stay the empty intersection"
+        );
+        assert!(
+            recovered.labels_ambiguous,
+            "the marker must be PRESERVED when the recovered labels are not authoritative"
         );
     }
 

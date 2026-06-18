@@ -43,7 +43,7 @@ use crate::modes::mesh::config::{
     MeshPolicy, PolicyAction, PolicyScope, is_mesh_condition_ip_key,
     is_supported_mesh_condition_key, mesh_condition_has_values,
     normalize_request_match_host_pattern, policy_scope_applies_to_workload,
-    validate_mesh_condition_ip_block,
+    validate_mesh_condition_ip_block, workload_selector_matches,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
@@ -793,6 +793,33 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                          resolved no proxy labels for this workload; not enforced here — set \
                          mesh_slice.labels / FERRUM_MESH_WORKLOAD_LABELS for deterministic scoping"
                     );
+                } else if slice.labels_ambiguous
+                    && from_slice
+                    && !workload_selector_matches(selector, &slice.namespace, &slice.labels)
+                {
+                    // Ambiguous shared-SPIFFE slice with a NON-EMPTY label
+                    // intersection (e.g. candidates share `app=shared` but only
+                    // one has `role=api`). `slice.labels` here is just that
+                    // partial intersection, NOT this workload's authoritative
+                    // labels, and the slice carried this candidate-only selector
+                    // policy (`role=api`) as a superset. Because the selector is
+                    // not satisfied by the partial intersection, the cold-path
+                    // `retain` below would DROP it; if no other ALLOW remains
+                    // `evaluate_mesh_authorization_policies` then allows by default
+                    // — the non-empty-intersection fail-open. The marker reaching
+                    // here unchanged (xDS preserves it when the DP had no local
+                    // labels to make the intersection authoritative; native
+                    // MeshSubscribe carries it verbatim) proves the labels are not
+                    // final, so we cannot prove this DENY/ALLOW does not apply.
+                    // Fail closed and make the operator pin the proxy identity so
+                    // the candidate-any superset can be re-filtered deterministically.
+                    return Err(format!(
+                        "mesh_authz: policy '{}' uses a workload selector with labels {:?} that the \
+                         ambiguous shared-SPIFFE slice's partial label intersection {:?} cannot \
+                         resolve; set mesh_slice.labels / FERRUM_MESH_WORKLOAD_LABELS so the policy \
+                         can be scoped to this workload",
+                        policy.name, selector.labels, slice.labels
+                    ));
                 }
             }
         }
