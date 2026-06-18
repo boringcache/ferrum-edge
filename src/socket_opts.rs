@@ -911,15 +911,208 @@ pub fn extract_pktinfo_local_addr(_msg: &()) -> Option<PktinfoLocal> {
     None
 }
 
-/// Cmsg buffer size large enough to hold UDP_GRO (u16) plus either IP_PKTINFO
-/// or IPV6_PKTINFO on recv. Sized for the worst case (IPv6) so a single
-/// allocation works for both address families.
+/// Cmsg buffer size large enough to hold UDP_GRO (u16), either IP_PKTINFO or
+/// IPV6_PKTINFO, and either an IP_RECVORIGDSTADDR (`sockaddr_in`) or
+/// IPV6_RECVORIGDSTADDR (`sockaddr_in6`) original-destination cmsg on recv. All
+/// three can arrive on the same datagram (a mesh UDP TPROXY capture socket
+/// enables PKTINFO + RECVORIGDSTADDR together, and GRO may coalesce on top), so
+/// the buffer reserves room for each. Sized for the worst case (IPv6) so a
+/// single allocation works for both address families.
 #[cfg(target_os = "linux")]
 pub fn recv_cmsg_space() -> usize {
     unsafe {
         libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize
             + libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize
+            + libc::CMSG_SPACE(std::mem::size_of::<libc::sockaddr_in6>() as u32) as usize
     }
+}
+
+// ── IP_TRANSPARENT / IPV6_TRANSPARENT ──────────────────────────────────
+//
+// `IP_TRANSPARENT` lets a socket bind to and receive packets addressed to a
+// non-local address. The mesh UDP capture listener (F3 §3.3 Stage 3) needs it
+// to accept datagrams that netfilter `TPROXY` delivered transparently: TPROXY
+// does NOT rewrite the datagram's destination (unlike the TCP REDIRECT model),
+// so the socket receiving them must be transparent to claim packets whose dst
+// is the captured pod's real `service:port`, not the listener's own bind addr.
+
+/// Enable `IP_TRANSPARENT` on a socket (Linux only).
+///
+/// Required on the UDP TPROXY capture socket so it can receive datagrams whose
+/// destination address is not local to this host (the original, un-rewritten
+/// `service:port` the captured pod dialed). Needs `CAP_NET_ADMIN`.
+///
+/// No-op on non-Linux platforms.
+#[cfg(target_os = "linux")]
+pub fn set_ip_transparent(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+    let val: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_TRANSPARENT,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Enable `IPV6_TRANSPARENT` on a socket (Linux only). IPv6 analogue of
+/// [`set_ip_transparent`].
+#[cfg(target_os = "linux")]
+pub fn set_ipv6_transparent(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+    // IPV6_TRANSPARENT = 75 (Linux 2.6.37+). Not exposed by the `libc` crate.
+    const IPV6_TRANSPARENT: libc::c_int = 75;
+    let val: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            IPV6_TRANSPARENT,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn set_ip_transparent(_fd: i32) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn set_ipv6_transparent(_fd: i32) -> std::io::Result<()> {
+    Ok(())
+}
+
+// ── IP_RECVORIGDSTADDR / IPV6_RECVORIGDSTADDR ──────────────────────────
+//
+// Tells the kernel to attach the ORIGINAL (pre-`TPROXY`) destination address of
+// inbound datagrams as a cmsg on recv. This is how the mesh UDP capture listener
+// recovers which `service:port` a captured pod dialed: `TPROXY` delivers the
+// datagram WITHOUT rewriting its destination, so — unlike the TCP REDIRECT path
+// which uses `SO_ORIGINAL_DST` (a getsockopt, TCP/conntrack-only) — the orig-dst
+// rides a per-datagram cmsg. Must be paired with `IP_TRANSPARENT` on the capture
+// socket.
+
+/// Enable `IP_RECVORIGDSTADDR` (IPv4) on a UDP socket (Linux only).
+///
+/// After enabling, recvmsg()/recvmmsg() cmsg buffers carry an `IP_RECVORIGDSTADDR`
+/// (`SOL_IP`, type 20) `sockaddr_in` with the datagram's original destination —
+/// recovered per-datagram by [`extract_origdst`].
+#[cfg(target_os = "linux")]
+pub fn set_ip_recvorigdstaddr(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+    // IP_RECVORIGDSTADDR = 20 (a.k.a. IP_ORIGDSTADDR). Not exposed by `libc`.
+    const IP_RECVORIGDSTADDR: libc::c_int = 20;
+    let val: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_IP,
+            IP_RECVORIGDSTADDR,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Enable `IPV6_RECVORIGDSTADDR` on a UDP socket (Linux only). IPv6 analogue of
+/// [`set_ip_recvorigdstaddr`] (`SOL_IPV6`, type 74, `sockaddr_in6` payload).
+#[cfg(target_os = "linux")]
+pub fn set_ipv6_recvorigdstaddr(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+    // IPV6_RECVORIGDSTADDR = 74 (a.k.a. IPV6_ORIGDSTADDR). Not exposed by `libc`.
+    const IPV6_RECVORIGDSTADDR: libc::c_int = 74;
+    let val: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            IPV6_RECVORIGDSTADDR,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn set_ip_recvorigdstaddr(_fd: i32) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn set_ipv6_recvorigdstaddr(_fd: i32) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Parse an `IP_RECVORIGDSTADDR` / `IPV6_RECVORIGDSTADDR` cmsg and return the
+/// datagram's original (pre-`TPROXY`) destination address.
+///
+/// Returns `None` when neither cmsg is present (e.g. the socket has the option
+/// disabled, or the datagram arrived through a cmsg-less recv path). Mirrors
+/// [`extract_pktinfo_local_addr`] but parses the orig-dst sockaddr instead of
+/// the pktinfo reply-source. The IPv4 cmsg carries a `sockaddr_in`
+/// (`SOL_IP`, type 20); the IPv6 cmsg carries a `sockaddr_in6`
+/// (`SOL_IPV6`, type 74). The address/port are read with `read_unaligned`
+/// because cmsg payloads are not guaranteed aligned for the wider sockaddr
+/// structs.
+#[cfg(target_os = "linux")]
+pub fn extract_origdst(msg: &libc::msghdr) -> Option<std::net::SocketAddr> {
+    const IP_RECVORIGDSTADDR: libc::c_int = 20;
+    const IPV6_RECVORIGDSTADDR: libc::c_int = 74;
+
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
+    while !cmsg.is_null() {
+        unsafe {
+            let level = (*cmsg).cmsg_level;
+            let ty = (*cmsg).cmsg_type;
+            if level == libc::SOL_IP && ty == IP_RECVORIGDSTADDR {
+                let data_ptr = libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in;
+                let sin = std::ptr::read_unaligned(data_ptr);
+                return Some(std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(
+                        sin.sin_addr.s_addr,
+                    ))),
+                    u16::from_be(sin.sin_port),
+                ));
+            }
+            if level == libc::SOL_IPV6 && ty == IPV6_RECVORIGDSTADDR {
+                let data_ptr = libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in6;
+                let sin6 = std::ptr::read_unaligned(data_ptr);
+                return Some(std::net::SocketAddr::new(
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr)),
+                    u16::from_be(sin6.sin6_port),
+                ));
+            }
+            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn extract_origdst(_msg: &()) -> Option<std::net::SocketAddr> {
+    None
 }
 
 /// Send a UDP datagram (or a GSO-batched buffer of same-size datagrams) with
@@ -2415,7 +2608,8 @@ mod pktinfo_tests {
             client.send_to(b"hello", server_addr).await.unwrap();
 
             // Use recvmsg via recvmmsg wrapper (already exercises the cmsg path).
-            let mut batch = crate::proxy::udp_batch::RecvMmsgBatch::new(1);
+            // `false`: this test exercises pktinfo, not orig-dst recovery.
+            let mut batch = crate::proxy::udp_batch::RecvMmsgBatch::new(1, false);
             // Poll until the datagram arrives.
             server.readable().await.unwrap();
             let n = batch.recv(server.as_raw_fd(), 1).unwrap();
@@ -2498,13 +2692,109 @@ mod pktinfo_tests {
 
     #[test]
     fn cmsg_space_is_large_enough_for_both() {
-        // The recv cmsg buffer must fit UDP_GRO + IP(v6)_PKTINFO simultaneously.
+        // The recv cmsg buffer must fit UDP_GRO + IP(v6)_PKTINFO + the orig-dst
+        // (IP(v6)_RECVORIGDSTADDR) cmsg simultaneously — a mesh UDP capture
+        // socket enables PKTINFO + RECVORIGDSTADDR together and GRO may coalesce.
         let space = recv_cmsg_space();
         let v6_pkt =
             unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize };
         let gro = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize };
-        assert!(space >= v6_pkt + gro);
+        let origdst =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::sockaddr_in6>() as u32) as usize };
+        assert!(space >= v6_pkt + gro + origdst);
         let _ = SocketAddr::from(([127, 0, 0, 1], 0)); // silence unused import
+    }
+
+    /// Build a single `IP_RECVORIGDSTADDR` (IPv4) cmsg by hand and confirm
+    /// [`extract_origdst`] recovers the encoded `addr:port`. Mirrors the
+    /// pktinfo cmsg-parse coverage but for the original-destination cmsg the
+    /// mesh UDP TPROXY capture listener relies on. Does not touch the network —
+    /// pure cmsg layout/parse coverage so it runs on any Linux kernel.
+    #[test]
+    fn extract_origdst_parses_ipv4_cmsg() {
+        const IP_RECVORIGDSTADDR: libc::c_int = 20;
+        let orig: SocketAddr = "10.1.2.3:5353".parse().unwrap();
+
+        // A cmsg buffer holding exactly one IP_RECVORIGDSTADDR (sockaddr_in).
+        let space =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::sockaddr_in>() as u32) as usize };
+        let mut cmsg_buf = vec![0u8; space];
+
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = cmsg_buf.len();
+
+        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+        assert!(!cmsg.is_null());
+        let SocketAddr::V4(v4) = orig else {
+            unreachable!()
+        };
+        unsafe {
+            (*cmsg).cmsg_level = libc::SOL_IP;
+            (*cmsg).cmsg_type = IP_RECVORIGDSTADDR;
+            (*cmsg).cmsg_len =
+                libc::CMSG_LEN(std::mem::size_of::<libc::sockaddr_in>() as u32) as usize;
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from(*v4.ip()).to_be(),
+                },
+                sin_zero: [0; 8],
+            };
+            std::ptr::copy_nonoverlapping(
+                &sin as *const libc::sockaddr_in as *const u8,
+                libc::CMSG_DATA(cmsg),
+                std::mem::size_of::<libc::sockaddr_in>(),
+            );
+        }
+
+        let parsed = extract_origdst(&msg);
+        assert_eq!(parsed, Some(orig));
+    }
+
+    /// A msghdr with no orig-dst cmsg yields `None` (e.g. a pktinfo-only cmsg
+    /// must not be misread as an original destination).
+    #[test]
+    fn extract_origdst_absent_is_none() {
+        let mut cmsg_buf = vec![0u8; recv_cmsg_space()];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        // Zero controllen ⇒ CMSG_FIRSTHDR returns null ⇒ no cmsg present.
+        msg.msg_controllen = 0;
+        assert_eq!(extract_origdst(&msg), None);
+    }
+
+    /// End-to-end recvmmsg roundtrip: enable IP_RECVORIGDSTADDR on a loopback
+    /// socket, send a datagram to it, and confirm [`RecvMmsgBatch::orig_dst`]
+    /// surfaces the destination from the cmsg. (On loopback without TPROXY the
+    /// orig-dst equals the bind addr, which is enough to prove the cmsg is
+    /// parsed end-to-end.) Skips gracefully if the option is unsupported.
+    #[test]
+    fn recvmmsg_surfaces_origdst_cmsg() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let server_addr = server.local_addr().unwrap();
+            if set_ip_recvorigdstaddr(server.as_raw_fd()).is_err() {
+                return; // kernel without IP_RECVORIGDSTADDR — skip
+            }
+
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client.send_to(b"capture", server_addr).await.unwrap();
+
+            // `true`: this test asserts orig-dst recovery, so opt the batch in.
+            let mut batch = crate::proxy::udp_batch::RecvMmsgBatch::new(1, true);
+            server.readable().await.unwrap();
+            let n = batch.recv(server.as_raw_fd(), 1).unwrap();
+            assert_eq!(n, 1);
+            let orig = batch.orig_dst(0);
+            assert_eq!(
+                orig,
+                Some(server_addr),
+                "orig-dst cmsg should surface the datagram destination"
+            );
+        });
     }
 }
 
