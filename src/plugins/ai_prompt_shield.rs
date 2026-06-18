@@ -431,43 +431,62 @@ impl AiPromptShield {
             .collect()
     }
 
-    /// Whether the ORIGINAL request matched any pattern *only* in the raw
-    /// cross-token context — i.e. a pattern that matched the serialized body but
-    /// matches none of its decoded tokens (string values, object keys, numeric
-    /// scalars). Such a hit (e.g. a contextual `custom_pattern` like
-    /// `"password"\s*:`) has no single rewritable token, so `redact_json_strings`
-    /// — which only rewrites tokens — can never remove it. The request is
-    /// therefore unredactable and must fail closed.
+    /// Whether the ORIGINAL request contains a raw-body match that token
+    /// rewriting cannot remove — i.e. an individual match in the serialized body
+    /// whose matched substring is not contained in any rewritable decoded token
+    /// (a string VALUE or numeric scalar). Such a match (e.g. a contextual
+    /// `custom_pattern` like `"password"\s*:`, which spans a key name, the
+    /// surrounding quotes, and the colon) has no single rewritable token, so
+    /// `redact_json_strings` — which only rewrites string values and numbers —
+    /// can never remove it. The request is therefore unredactable and must fail
+    /// closed.
+    ///
+    /// Matching is done per individual occurrence (`Regex::find_iter`), NOT per
+    /// pattern index. A single custom regex can alternate a removable value
+    /// alternative with an unremovable structural-context alternative (for
+    /// example `(?:"password"\s+:)|(?:\w+@\w+\.\w+)`); if the value alternative
+    /// hits a token, an index-level "this pattern matched a token" flag would
+    /// wrongly mark the structural-context occurrence removable too. Testing
+    /// each matched substring against the rewritable tokens avoids that
+    /// suppression so the contextual occurrence is still caught.
     ///
     /// This is computed from the ORIGINAL body, independent of the rewritten
     /// body's serialization, precisely so a whitespace-sensitive contextual
     /// match cannot be "cleared" by the minification that `serde_json::to_string`
     /// applies to the rewritten body. Using minified output as proof of removal
     /// is unsound: minification can erase the formatting a raw regex depended on
-    /// even though nothing was redacted. A pattern that matches a decoded token
-    /// is excluded here because that path *is* removable and is verified by the
-    /// post-rewrite decoded-token re-scan instead.
+    /// even though nothing was redacted.
+    ///
+    /// Object KEY names are intentionally excluded from the rewritable-token set
+    /// (`redact_json_strings` cannot rename keys), so a raw match that overlaps
+    /// only a key is treated as non-token-removable here. PII carried purely in
+    /// a key name is still caught — by `redacted_body_has_residual_pii`, whose
+    /// key text survives minification unchanged — so it does not need to drive
+    /// this contextual verdict as well.
     fn original_has_unredactable_contextual_match(&self, json: &Value, raw: &str) -> bool {
         if self.patterns.is_empty() {
             return false;
         }
-        // Patterns that fired on the raw serialized original.
-        let raw_hits = self.detection_set.matches(raw);
-        if !raw_hits.matched_any() {
+        // Cheap DFA pre-check: nothing fired on the raw body at all.
+        if !self.detection_set.is_match(raw) {
             return false;
         }
-        // Patterns that fired on at least one decoded token of the original.
-        let mut token_hit = vec![false; self.patterns.len()];
-        let mut texts: Vec<Cow<'_, str>> = Vec::new();
-        collect_json_strings(json, &mut texts);
-        for text in &texts {
-            for idx in self.detection_set.matches(text.as_ref()).into_iter() {
-                token_hit[idx] = true;
+        // Rewritable decoded tokens (string values + numeric scalars; NOT keys).
+        let mut value_tokens: Vec<Cow<'_, str>> = Vec::new();
+        collect_json_value_tokens(json, &mut value_tokens);
+        // A raw match is removable iff its exact matched substring is contained
+        // in some rewritable token. Any raw match that is not is contextual-only
+        // (spans keys/punctuation/whitespace) and cannot be rewritten in place.
+        for pattern in &self.patterns {
+            for m in pattern.regex.find_iter(raw) {
+                let matched = m.as_str();
+                let removable = value_tokens.iter().any(|t| t.as_ref().contains(matched));
+                if !removable {
+                    return true;
+                }
             }
         }
-        // A raw hit with no corresponding decoded-token hit is contextual-only
-        // and cannot be removed by token rewriting.
-        raw_hits.into_iter().any(|idx| !token_hit[idx])
+        false
     }
 
     /// Parse the body as JSON, apply mode-appropriate redaction, and return a
@@ -1013,6 +1032,36 @@ fn collect_json_strings<'a>(value: &'a Value, texts: &mut Vec<Cow<'a, str>>) {
             for (key, value) in map {
                 texts.push(Cow::Borrowed(key.as_str()));
                 collect_json_strings(value, texts);
+            }
+        }
+        // Bool / Null carry no PII; deliberately dropped.
+        _ => {}
+    }
+}
+
+/// Collect only the *rewritable* decoded tokens — string VALUES and numeric
+/// scalars — skipping object KEY names.
+///
+/// `redact_json_strings` rewrites string values and numeric scalars in place
+/// but cannot rewrite a key name (renaming keys risks collisions and reorders
+/// the document; key-PII is instead caught by the post-redaction residual
+/// re-scan). The unredactable-contextual analysis uses this narrower set so a
+/// raw match that overlaps only a key name or structural punctuation is still
+/// treated as non-token-removable. PII carried purely in a key is deliberately
+/// *not* collected here: it is handled by `redacted_body_has_residual_pii`,
+/// whose key text survives minification unchanged.
+fn collect_json_value_tokens<'a>(value: &'a Value, texts: &mut Vec<Cow<'a, str>>) {
+    match value {
+        Value::String(s) => texts.push(Cow::Borrowed(s.as_str())),
+        Value::Number(n) => texts.push(Cow::Owned(n.to_string())),
+        Value::Array(items) => {
+            for item in items {
+                collect_json_value_tokens(item, texts);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_json_value_tokens(value, texts);
             }
         }
         // Bool / Null carry no PII; deliberately dropped.
