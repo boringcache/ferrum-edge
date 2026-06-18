@@ -272,28 +272,6 @@ impl RequestDeduplication {
         }
     }
 
-    /// Release the `InFlight` marker for `key` without storing a `Completed`
-    /// entry — used when this request will never reach `on_final_response_body`
-    /// (e.g. a streaming `text/event-stream` response that the proxy hands off
-    /// to the client incrementally, so the full body is never buffered for
-    /// caching). Without this, the marker would block duplicate keys with 409
-    /// until `inflight_ttl` cleanup runs, even though the original request has
-    /// already completed successfully.
-    ///
-    /// Removes the entry only while it is still `InFlight`: a `Completed` entry
-    /// (stored by a concurrent path, or by `on_final_response_body` if the body
-    /// was nonetheless buffered) is left intact, and its `inflight_count` is not
-    /// touched. This keeps the counter consistent with whichever path actually
-    /// transitioned the entry.
-    fn release_inflight(&self, key: &str) {
-        if let Entry::Occupied(entry) = self.local_cache.entry(key.to_string())
-            && matches!(entry.get(), DeduplicationEntry::InFlight { .. })
-        {
-            entry.remove();
-            decrement_atomic(&self.inflight_count);
-        }
-    }
-
     /// Try to retrieve a cached response from Redis.
     async fn redis_get(&self, key: &str) -> Option<CachedResponse> {
         let redis = self.redis_client.as_ref()?;
@@ -752,33 +730,21 @@ impl Plugin for RequestDeduplication {
         ctx: &RequestContext,
         content_type: Option<&str>,
     ) -> bool {
+        // Never hold a `text/event-stream` body: it cannot be cached for
+        // idempotent replay (an incrementally-delivered stream has no final
+        // body to store), so buffering it would only pin an unbounded response
+        // on the buffered path with no benefit. Streaming it instead keeps the
+        // `InFlight` marker active for the lifetime of the still-in-flight
+        // stream — which is exactly the concurrent-duplicate protection this
+        // plugin promises — and the marker self-heals once it exceeds
+        // `inflight_ttl` (documented to cover the longest protected request,
+        // including a long-lived stream). The marker is intentionally NOT
+        // released at response-headers time: there is no plugin hook for
+        // streamed-body completion, and releasing early would admit a duplicate
+        // mutating request to the backend while the original stream is still
+        // running, defeating the in-flight lock.
         self.should_buffer_response_body(ctx)
             && !content_type.is_some_and(is_event_stream_content_type)
-    }
-
-    async fn after_proxy(
-        &self,
-        ctx: &mut RequestContext,
-        _response_status: u16,
-        response_headers: &mut HashMap<String, String>,
-    ) -> PluginResult {
-        // `should_buffer_response_body_for_content_type` declines to buffer a
-        // `text/event-stream` response, so the proxy streams it and never calls
-        // `on_final_response_body` — the hook that normally replaces the
-        // `InFlight` marker with the cached `Completed` entry. Release the marker
-        // here (this hook runs after the response headers arrive, before the body
-        // phase, on both the streamed and buffered paths) so a duplicate key is
-        // not held in-flight (and answered with 409) until `inflight_ttl`
-        // cleanup, long after the stream has ended. A streaming response is never
-        // cacheable for idempotent replay anyway, so dropping it is correct even
-        // if another plugin forced the body to buffer.
-        let is_event_stream = response_headers
-            .get("content-type")
-            .is_some_and(|ct| is_event_stream_content_type(ct.as_str()));
-        if is_event_stream && let Some(key) = ctx.metadata.remove(DEDUP_KEY_METADATA) {
-            self.release_inflight(&key);
-        }
-        PluginResult::Continue
     }
 
     async fn before_proxy(

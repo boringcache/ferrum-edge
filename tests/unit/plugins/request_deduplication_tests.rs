@@ -479,13 +479,16 @@ async fn test_response_buffering_releases_event_stream_content_type() {
     assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
 }
 
-/// A keyed request that streams a `text/event-stream` response never reaches
-/// `on_final_response_body` (the proxy hands the body off incrementally), so the
-/// `after_proxy` hook must release the in-flight marker. Otherwise the key stays
-/// in-flight until `inflight_ttl` cleanup and a duplicate key is answered with
-/// 409 long after the stream has ended.
+/// A keyed request whose response is streamed as `text/event-stream` is handed
+/// to the client incrementally, so `on_final_response_body` (which transitions
+/// the `InFlight` marker to a cached `Completed` entry) never runs. The marker
+/// is intentionally kept in-flight for the lifetime of the stream — there is no
+/// plugin hook for streamed-body completion, and releasing it at response-headers
+/// time would let a concurrent duplicate mutating request reach the backend while
+/// the original stream is still running. While the stream is active a duplicate
+/// key must therefore still 409.
 #[tokio::test]
-async fn test_after_proxy_releases_inflight_for_event_stream_response() {
+async fn test_streamed_event_stream_keeps_inflight_marker_for_stream_lifetime() {
     let config = json!({});
     let plugin = make_plugin(config);
 
@@ -498,28 +501,17 @@ async fn test_after_proxy_releases_inflight_for_event_stream_response() {
     headers.insert("idempotency-key".to_string(), "sse-key".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    // The fresh key is now marked in-flight.
+    // The fresh key is marked in-flight and stays that way for the stream.
     assert_eq!(plugin.tracked_keys_count(), Some(1));
     assert!(ctx.metadata.contains_key("_dedup_key"));
 
-    // Backend returned an SSE response → `after_proxy` releases the marker.
-    let mut response_headers = HashMap::new();
-    response_headers.insert("content-type".to_string(), "text/event-stream".to_string());
-    let result = plugin
-        .after_proxy(&mut ctx, 200, &mut response_headers)
-        .await;
-    assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(plugin.tracked_keys_count(), Some(0));
-    // The dedup key is dropped so a later `on_final_response_body` is a no-op
-    // (the streamed body was never buffered for caching).
-    assert!(!ctx.metadata.contains_key("_dedup_key"));
-    let result = plugin
-        .on_final_response_body(&mut ctx, 200, &HashMap::new(), b"data: x\n\n")
-        .await;
-    assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(plugin.tracked_keys_count(), Some(0));
+    // The SSE response is streamed (not buffered), confirmed by the content-type
+    // refinement declining to buffer it.
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
 
-    // A duplicate request with the same key is now treated as fresh, not 409.
+    // A duplicate request arriving while the stream is still active must be
+    // rejected with 409 — the in-flight lock is exactly the protection this
+    // plugin promises for the still-running request.
     let mut dup_ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
@@ -529,16 +521,30 @@ async fn test_after_proxy_releases_inflight_for_event_stream_response() {
     dup_headers.insert("idempotency-key".to_string(), "sse-key".to_string());
     let result = plugin.before_proxy(&mut dup_ctx, &mut dup_headers).await;
     assert!(
-        matches!(result, PluginResult::Continue),
-        "duplicate after a streamed SSE response should be fresh, not 409, got {result:?}"
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "duplicate during an active streamed SSE response must 409, got {result:?}"
     );
 }
 
-/// `after_proxy` only releases the marker for streaming responses; a buffered
-/// (non-SSE) response keeps the marker so `on_final_response_body` can transition
-/// it to the cached `Completed` entry.
+// Note: after a streamed SSE response ends, the `InFlight` marker self-heals
+// once it exceeds `inflight_ttl` (documented to cover the longest protected
+// request, including a long-lived stream) via the staleness branch in
+// `local_lookup_or_mark_inflight`. That path is exercised by the staleness logic
+// generally; a dedicated test here would require either a real >=1s sleep
+// (`inflight_ttl_seconds` is rejected at 0) or injectable time, which this suite
+// deliberately avoids to keep CI fast (see `test_inflight_marker_carries_timestamp`).
+
+/// A buffered (non-SSE) keyed response keeps the marker in-flight through the
+/// header phase and transitions it to a cached `Completed` entry via
+/// `on_final_response_body`, which only runs on the buffered path.
 #[tokio::test]
-async fn test_after_proxy_keeps_inflight_for_buffered_response() {
+async fn test_buffered_response_transitions_inflight_to_completed() {
     let config = json!({});
     let plugin = make_plugin(config);
 
@@ -552,18 +558,12 @@ async fn test_after_proxy_keeps_inflight_for_buffered_response() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(plugin.tracked_keys_count(), Some(1));
-
-    let mut response_headers = HashMap::new();
-    response_headers.insert("content-type".to_string(), "application/json".to_string());
-    let result = plugin
-        .after_proxy(&mut ctx, 200, &mut response_headers)
-        .await;
-    assert!(matches!(result, PluginResult::Continue));
-    // Still in-flight and the dedup key is preserved for caching.
-    assert_eq!(plugin.tracked_keys_count(), Some(1));
     assert!(ctx.metadata.contains_key("_dedup_key"));
 
-    // `on_final_response_body` then transitions the marker to a cached entry.
+    // A JSON response is buffered (the content-type refinement still votes to
+    // buffer), so `on_final_response_body` runs and caches it.
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")));
+    let response_headers = HashMap::new();
     let result = plugin
         .on_final_response_body(&mut ctx, 200, &response_headers, b"{}")
         .await;
