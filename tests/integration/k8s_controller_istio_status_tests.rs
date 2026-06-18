@@ -519,13 +519,16 @@ fn root_namespace_peer_authentication_resolves_to_mesh_wide_scope() {
     assert_eq!(detail["translation"]["scope"].as_str(), Some("MeshWide"),);
 }
 
-/// DestinationRule deferred-fields tracking: when an operator uses a
-/// parsed-but-unenforced field (here `connectionPool.http.http1MaxPendingRequests`,
-/// the only remaining deferred HTTP knob — `maxRetries` and `h2UpgradePolicy`
-/// became applied in F5.1), the detail block surfaces it as a deferred field so
-/// they know Ferrum parsed it but does not enforce it.
-/// (`portLevelSettings[].tls` was the example here before it became applied
-/// per-port, so it is no longer deferred.)
+/// DestinationRule deferred-fields tracking: after F5.1 there are NO
+/// universally-deferred `connectionPool.http` knobs at top-level /
+/// `portLevelSettings` — `maxRequestsPerConnection` / `idleTimeout` /
+/// `http2MaxRequests` / `maxRetries` / `h2UpgradePolicy` / `http1MaxPendingRequests`
+/// are all projected. The remaining deferred case is a `connectionPool.http` knob
+/// set inside a `subsets[].trafficPolicy` (the subset apply path builds a
+/// `SubsetTrafficPolicy` that carries no `connectionPool.http`). This test uses a
+/// subset-scoped `http1MaxPendingRequests` to confirm the deferred-fields detail
+/// block + message still surface that case so operators know Ferrum parsed it but
+/// does not apply it for subsets — while the TOP-LEVEL value is applied (not deferred).
 #[test]
 fn destination_rule_deferred_fields_listed_in_detail() {
     let obj = object(
@@ -534,9 +537,18 @@ fn destination_rule_deferred_fields_listed_in_detail() {
         "secured",
         json!({
             "host": "secured.default.svc.cluster.local",
+            // Top-level: applied — must NOT be deferred.
             "trafficPolicy": {
-                "connectionPool": { "http": { "http1MaxPendingRequests": 64 } }
-            }
+                "connectionPool": { "http": { "http1MaxPendingRequests": 128 } }
+            },
+            "subsets": [{
+                "name": "v1",
+                "labels": { "version": "v1" },
+                // Subset: ignored — must be surfaced as deferred.
+                "trafficPolicy": {
+                    "connectionPool": { "http": { "http1MaxPendingRequests": 64 } }
+                }
+            }]
         }),
     );
     let updates = plan_istio_status_updates(&[obj], options());
@@ -547,17 +559,19 @@ fn destination_rule_deferred_fields_listed_in_detail() {
         .iter()
         .filter_map(Value::as_str)
         .collect();
+    // The subset-scoped knob is surfaced (tagged subset-scoped).
     assert!(
         deferred
             .iter()
-            .any(|f| f.contains("http1MaxPendingRequests"))
+            .any(|f| f.contains("subsets[]") && f.contains("http1MaxPendingRequests")),
+        "subset-scoped http1MaxPendingRequests must be deferred; got: {deferred:?}"
     );
-    // The now-applied fields must NOT appear as deferred.
+    // The top-level (applied) value must NOT appear as deferred.
     assert!(
         !deferred
             .iter()
-            .any(|f| f.contains("maxRetries") || f.contains("h2UpgradePolicy")),
-        "maxRetries/h2UpgradePolicy are applied now, not deferred; got: {deferred:?}"
+            .any(|f| f.starts_with("trafficPolicy.connectionPool.http")),
+        "top-level applied http1MaxPendingRequests must not be deferred; got: {deferred:?}"
     );
     let message = find_condition(
         updates[0].status["conditions"].as_array().unwrap(),

@@ -2936,6 +2936,9 @@ mod inner {
                 Err(e) => return Err(e.into()),
             }
             self.api_specs()
+                .create_index(IndexModel::builder().keys(doc! { "proxy_id": 1 }).build())
+                .await?;
+            self.api_specs()
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "updated_at": 1 })
@@ -2987,7 +2990,21 @@ mod inner {
             self.audit_events()
                 .create_index(
                     IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "action": 1 })
+                        .build(),
+                )
+                .await?;
+            self.audit_events()
+                .create_index(
+                    IndexModel::builder()
                         .keys(doc! { "resource_type": 1 })
+                        .build(),
+                )
+                .await?;
+            self.audit_events()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "resource_id": 1 })
                         .build(),
                 )
                 .await?;
@@ -4343,6 +4360,7 @@ mod inner {
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
                 pool_max_requests_per_connection: None,
+                pool_http1_max_pending_requests: None,
                 upstream_id: None,
                 upstream_subset: None,
                 api_spec_id: None,
@@ -4453,6 +4471,7 @@ mod inner {
                 subsets: None,
                 port_overrides: std::collections::HashMap::new(),
                 source_locality: None,
+                locality_lb_strict: false,
                 locality_lb_setting: None,
                 backend_tls_client_cert_path: None,
                 backend_tls_client_key_path: None,
@@ -4537,6 +4556,7 @@ mod inner {
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
                 pool_max_requests_per_connection: None,
+                pool_http1_max_pending_requests: None,
                 upstream_id: None,
                 upstream_subset: None,
                 api_spec_id: None,
@@ -4637,6 +4657,7 @@ mod inner {
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
                 pool_max_requests_per_connection: None,
+                pool_http1_max_pending_requests: None,
                 upstream_id: None,
                 upstream_subset: None,
                 api_spec_id: None,
@@ -4707,6 +4728,7 @@ mod inner {
                 subsets: None,
                 port_overrides: std::collections::HashMap::new(),
                 source_locality: None,
+                locality_lb_strict: false,
                 locality_lb_setting: None,
                 backend_tls_client_cert_path: None,
                 backend_tls_client_key_path: None,
@@ -4809,6 +4831,7 @@ mod inner {
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
                 pool_max_requests_per_connection: None,
+                pool_http1_max_pending_requests: None,
                 upstream_id: Some("my-upstream".to_string()),
                 upstream_subset: None,
                 api_spec_id: None,

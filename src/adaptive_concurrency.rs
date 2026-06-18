@@ -16,7 +16,6 @@ use dashmap::mapref::entry::Entry;
 
 use crate::config::types::{Proxy, UpstreamTarget};
 use crate::plugins::{BackendAdmissionOutcome, BackendAdmissionPermit};
-use crate::retry::ErrorClass;
 
 const EWMA_PREVIOUS_WEIGHT: u64 = 8;
 const EWMA_SAMPLE_WEIGHT: u64 = 2;
@@ -345,12 +344,15 @@ impl AdaptiveConcurrencyPermit {
         // Client-/gateway-side outcomes do not reflect backend health: release
         // the slot without feeding a latency, growth, or shrink signal. An
         // oversized *client* upload surfaces as a gateway 413
-        // (`RequestBodyTooLarge`) and a client abort as `ClientDisconnect`;
-        // neither is the backend's fault, so they must not train the limiter.
-        if matches!(
-            outcome.error_class,
-            Some(ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge)
-        ) {
+        // (`RequestBodyTooLarge`), a client abort as `ClientDisconnect`, and a
+        // pre-dial dispatch-policy shed (backend-TLS-SNI reject, or an
+        // `http1MaxPendingRequests` in-flight-overflow 503) as
+        // `DispatchPolicyRejected`; none is the backend's fault, so they must
+        // not train the limiter. Shares `client_side_no_backend_signal` with the
+        // circuit-breaker / passive-health accounting so an overflow shed's
+        // synthetic 503 cannot reach the `>= 500` shrink branch below and shrink
+        // a backend that was never dialed — the predicates cannot drift.
+        if crate::proxy::backend_dispatch::client_side_no_backend_signal(outcome.error_class) {
             return;
         }
         // Backend faults shrink the limit. Besides connection errors and 5xx,

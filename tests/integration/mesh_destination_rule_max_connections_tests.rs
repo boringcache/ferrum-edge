@@ -108,6 +108,7 @@ fn runtime() -> MeshRuntimeConfig {
         egress_stream_enabled: false,
         egress_stream_allow_plaintext: false,
         request_auth_require_exp: true,
+        locality_lb_strict: false,
     }
 }
 
@@ -146,6 +147,7 @@ fn ws_upstream(id: &str) -> Upstream {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,

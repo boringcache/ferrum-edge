@@ -85,6 +85,7 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         api_spec_id: None,
@@ -166,6 +167,7 @@ fn create_test_mesh_config() -> GatewayConfig {
             locality: None,
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         }],
         services: vec![MeshService {
             cluster_ips: Vec::new(),
@@ -2709,6 +2711,7 @@ fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
