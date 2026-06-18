@@ -392,6 +392,44 @@ fn test_response_buffering_skips_range_responses() {
 }
 
 #[test]
+fn test_response_buffering_skips_range_responses_via_metadata_marker() {
+    // On paths that run `after_proxy` before the refine/buffering decision (e.g.
+    // the H3 cross-protocol path), `RANGE_RESPONSE_METADATA_KEY` is stamped from
+    // the pristine backend headers. If an earlier-ordered hook (e.g.
+    // `response_transformer`) then strips `Content-Range` and the status is not
+    // 206, the live headers no longer reveal that this is a range response. The
+    // buffering check must still opt out via the stamped marker so the partial
+    // body streams instead of being pinned onto the buffered path (where it
+    // would never be compressed and could trip the response body size limit) —
+    // mirroring the `after_proxy` skip in
+    // `test_skips_range_response_when_content_range_was_stripped`.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    ctx.metadata
+        .insert("ferrum:range_response".to_string(), "true".to_string());
+
+    // Live headers look like a plain compressible 200 (Content-Range stripped).
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-length".to_string(), "100".to_string());
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/html"),
+        200,
+        &resp_headers
+    ));
+
+    // Without the marker the same headers buffer (control), so the marker — not
+    // some other signal — is what drives the opt-out.
+    let ctx_no_marker = make_ctx(Some("gzip"));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx_no_marker,
+        Some("text/html"),
+        200,
+        &resp_headers
+    ));
+}
+
+#[test]
 fn test_response_buffering_still_requires_accept_encoding() {
     let plugin = make_plugin(json!({}));
     let ctx = make_ctx(None);
