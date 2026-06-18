@@ -475,8 +475,18 @@ async fn test_response_buffering_releases_event_stream_content_type() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 
-    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")));
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &HashMap::new()
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
 }
 
 /// A keyed request whose response is streamed as `text/event-stream` is handed
@@ -507,7 +517,12 @@ async fn test_streamed_event_stream_keeps_inflight_marker_for_stream_lifetime() 
 
     // The SSE response is streamed (not buffered), confirmed by the content-type
     // refinement declining to buffer it.
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
 
     // A duplicate request arriving while the stream is still active must be
     // rejected with 409 — the in-flight lock is exactly the protection this
@@ -562,7 +577,12 @@ async fn test_buffered_response_transitions_inflight_to_completed() {
 
     // A JSON response is buffered (the content-type refinement still votes to
     // buffer), so `on_final_response_body` runs and caches it.
-    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &HashMap::new()
+    ));
     let response_headers = HashMap::new();
     let result = plugin
         .on_final_response_body(&mut ctx, 200, &response_headers, b"{}")

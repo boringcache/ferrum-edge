@@ -729,6 +729,8 @@ impl Plugin for RequestDeduplication {
         &self,
         ctx: &RequestContext,
         content_type: Option<&str>,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
     ) -> bool {
         // Never hold a `text/event-stream` body: it cannot be cached for
         // idempotent replay (an incrementally-delivered stream has no final

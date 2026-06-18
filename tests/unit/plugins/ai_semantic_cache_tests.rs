@@ -405,8 +405,18 @@ async fn test_response_buffering_releases_streaming_ai_responses() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 
-    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")));
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &HashMap::new()
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
 }
 
 #[test]
