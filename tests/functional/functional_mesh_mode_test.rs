@@ -3957,13 +3957,18 @@ async fn drive_one_udp_connect(
     let server_name = rustls::pki_types::ServerName::IpAddress(
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)).into(),
     );
-    let tls = connector
-        .connect(server_name, tcp)
+    // Bound the handshakes: if the HBONE port is bound but the TLS server wedges
+    // (or a regression binds a non-TLS listener), an unbounded handshake await
+    // would hang the ignored test forever before reaching the later timeouts.
+    let tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(server_name, tcp))
         .await
+        .map_err(|_| "client TLS handshake timed out".to_string())?
         .map_err(|e| format!("client TLS handshake: {e}"))?;
-    let (mut sender, conn) = h2::client::handshake(tls)
-        .await
-        .map_err(|e| format!("h2 handshake: {e}"))?;
+    let (mut sender, conn) =
+        tokio::time::timeout(Duration::from_secs(10), h2::client::handshake(tls))
+            .await
+            .map_err(|_| "h2 handshake timed out".to_string())?
+            .map_err(|e| format!("h2 handshake: {e}"))?;
     let conn_task = tokio::spawn(conn);
 
     let req = http::Request::builder()
@@ -4004,16 +4009,29 @@ async fn drive_one_udp_connect(
     Ok((status, reply))
 }
 
+/// Outcome of a UDP dest drive AFTER the gateway came up. Distinguishes a
+/// completed CONNECT from a connection/handshake failure so a SETUP failure
+/// (gateway never built/bound — returned as the outer `Err`) can never be
+/// mistaken for an expected fail-closed rejection.
+enum UdpDestOutcome {
+    /// The CONNECT completed: (status, optional framed reply payload).
+    Connected(u16, Option<Vec<u8>>),
+    /// The connection/handshake/request failed before a CONNECT response — the
+    /// expected outcome for an untrusted (cert-rejected) peer.
+    ConnectFailed(String),
+}
+
 /// Spawn gateway B (Ambient inbound HBONE terminator) over a slice declaring a
 /// UDP svc-b workload, then drive a single `udp` CONNECT at its HBONE port.
 /// `client_trusted` selects whether the client SVID chains to B's mesh CA;
 /// `dial_declared_port` selects an in-allowlist vs off-allowlist authority.
-/// Returns `(status, Some(reply))` on a framed round-trip, or `Err` when the
-/// connection/handshake fails closed (the untrusted case).
+/// The outer `Err` is a SETUP failure (gateway never built/bound after retries)
+/// — callers must treat it as a test failure, NOT a fail-closed pass. `Ok`
+/// carries the [`UdpDestOutcome`] of the actual CONNECT attempt.
 async fn drive_udp_dest_connect(
     client_trusted: bool,
     dial_declared_port: bool,
-) -> Result<(u16, Option<Vec<u8>>), String> {
+) -> Result<UdpDestOutcome, String> {
     ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
     let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client-app";
     let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/svc-b";
@@ -4092,7 +4110,10 @@ async fn drive_udp_dest_connect(
         cp_b.shutdown().await;
         echo.abort();
 
-        return outcome.map_err(|e| format!("{e}\n--- gateway B ---\n{logs}"));
+        return Ok(match outcome {
+            Ok((status, reply)) => UdpDestOutcome::Connected(status, reply),
+            Err(e) => UdpDestOutcome::ConnectFailed(format!("{e}\n--- gateway B ---\n{logs}")),
+        });
     }
 
     Err(format!(
@@ -4108,15 +4129,24 @@ async fn drive_udp_dest_connect(
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_udp_dest_relays_datagram_round_trip() {
-    let (status, reply) = drive_udp_dest_connect(true, true)
+    // `.expect` on the outer Result = the gateway must come up (setup failure is a
+    // test failure, never a silent pass).
+    match drive_udp_dest_connect(true, true)
         .await
-        .expect("udp dest round trip");
-    assert_eq!(status, 200, "the udp CONNECT must be accepted by B's relay");
-    assert_eq!(
-        reply.as_deref(),
-        Some(&b"ping"[..]),
-        "the echoed datagram must return framed byte-for-byte"
-    );
+        .expect("udp dest setup")
+    {
+        UdpDestOutcome::Connected(status, reply) => {
+            assert_eq!(status, 200, "the udp CONNECT must be accepted by B's relay");
+            assert_eq!(
+                reply.as_deref(),
+                Some(&b"ping"[..]),
+                "the echoed datagram must return framed byte-for-byte"
+            );
+        }
+        UdpDestOutcome::ConnectFailed(e) => {
+            panic!("a trusted udp CONNECT must connect and round-trip, not fail closed: {e}")
+        }
+    }
 }
 
 /// Stage 7 fail-closed (open-relay guard): a `udp` CONNECT whose authority is a
@@ -4126,17 +4156,25 @@ async fn functional_mesh_udp_dest_relays_datagram_round_trip() {
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_udp_dest_off_allowlist_authority_is_refused() {
-    let (status, reply) = drive_udp_dest_connect(true, false)
+    match drive_udp_dest_connect(true, false)
         .await
-        .expect("udp dest off-allowlist drive");
-    assert_ne!(
-        status, 200,
-        "a udp CONNECT to an undeclared port must be refused, not relayed"
-    );
-    assert!(
-        reply.is_none(),
-        "a refused CONNECT must not return a relayed datagram"
-    );
+        .expect("udp dest setup")
+    {
+        UdpDestOutcome::Connected(status, reply) => {
+            assert_ne!(
+                status, 200,
+                "a udp CONNECT to an undeclared port must be refused, not relayed"
+            );
+            assert!(
+                reply.is_none(),
+                "a refused CONNECT must not return a relayed datagram"
+            );
+        }
+        UdpDestOutcome::ConnectFailed(e) => panic!(
+            "an off-allowlist CONNECT should reach B and be refused (non-200), \
+             not fail to connect: {e}"
+        ),
+    }
 }
 
 /// Stage 7 fail-closed (peer authentication): a client whose SVID does NOT chain
@@ -4148,11 +4186,17 @@ async fn functional_mesh_udp_dest_off_allowlist_authority_is_refused() {
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_udp_dest_untrusted_peer_fails_closed() {
-    match drive_udp_dest_connect(false, true).await {
-        // Expected: the mTLS handshake / request fails closed.
-        Err(_) => {}
+    // `.expect` ensures a SETUP failure (gateway never bound) is a test failure,
+    // not a false "fail-closed" pass — the bug codex flagged. Only a genuine
+    // CONNECT-attempt failure counts as the expected fail-closed outcome.
+    match drive_udp_dest_connect(false, true)
+        .await
+        .expect("udp dest setup")
+    {
+        // Expected: the mTLS handshake fails closed before any CONNECT response.
+        UdpDestOutcome::ConnectFailed(_) => {}
         // If a connection somehow established, it must NOT have relayed a datagram.
-        Ok((status, reply)) => {
+        UdpDestOutcome::Connected(status, reply) => {
             assert_ne!(
                 status, 200,
                 "an untrusted client's udp CONNECT must fail closed, not be relayed"
