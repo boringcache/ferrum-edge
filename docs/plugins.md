@@ -3690,7 +3690,7 @@ config:
 
 ### `ai_token_metrics`
 
-Extracts token usage from LLM response bodies and writes it to request metadata for downstream logging and observability plugins. Supports both regular JSON responses and SSE (Server-Sent Events) streaming responses.
+Extracts token usage from LLM JSON response bodies and writes it to request metadata for downstream logging and observability plugins. SSE (Server-Sent Events) usage extraction is available only when explicitly opted into because it requires buffering the full stream.
 
 **Priority:** 4100
 
@@ -3700,21 +3700,23 @@ Extracts token usage from LLM response bodies and writes it to request metadata 
 | `include_model` | Boolean | `true` | Extract model name into metadata |
 | `include_token_details` | Boolean | `true` | Extract prompt/completion tokens separately |
 | `metadata_prefix` | String | `"ai"` | Prefix for metadata keys |
+| `buffer_streaming_responses` | Boolean | `false` | Buffer `text/event-stream` responses so final SSE usage events can be parsed; this disables streaming delivery for those responses |
 | `cost_per_prompt_token` | Float | *(none)* | Calculate estimated cost per request |
 | `cost_per_completion_token` | Float | *(none)* | Calculate estimated cost per request |
 
-**Note**: Requires response body buffering. Set `response_body_mode: buffer` on the proxy.
+**Note**: Requires response body buffering for JSON responses. `text/event-stream` responses are not buffered by default so LLM streaming remains live; set `buffer_streaming_responses: true` only when buffered SSE token metrics are more important than streaming delivery.
 
 `provider` is parsed case-insensitively and ignores surrounding whitespace.
 
 **Status filtering**: Only 2xx responses are inspected for token usage. Error responses (4xx, 5xx) are typically not LLM-shaped JSON and would otherwise pollute token metrics and chargeback accounting.
 
-**SSE streaming support:** When the response content-type is `text/event-stream`, the plugin parses `data:` lines from the SSE stream to extract token usage. For OpenAI-compatible providers, usage data is found in the final SSE event (when `stream_options.include_usage: true` is set on the request). For Anthropic streaming, usage is extracted from `message_start` (input tokens) and `message_delta` (output tokens) events. Model name is extracted from the first parseable chunk. Sets `{prefix}_streaming: true` metadata when processing a streaming response.
+**SSE streaming support:** When `buffer_streaming_responses: true` and the response content-type is `text/event-stream`, the plugin buffers the stream and parses `data:` lines to extract token usage. For OpenAI-compatible providers, usage data is found in the final SSE event (when `stream_options.include_usage: true` is set on the request). For Anthropic streaming, usage is extracted from `message_start` (input tokens) and `message_delta` (output tokens) events. Model name is extracted from the first parseable chunk. Sets `{prefix}_streaming: true` metadata when processing a streaming response.
 
 ```yaml
 plugin_name: ai_token_metrics
 config:
   provider: auto
+  buffer_streaming_responses: false
   cost_per_prompt_token: 0.000003
   cost_per_completion_token: 0.000012
 ```

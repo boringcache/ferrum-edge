@@ -1959,6 +1959,7 @@ mod tests {
             backend_tls_server_ca_cert_path: None,
             resolved_tls: BackendTlsConfig::default_verify(),
             dispatch_port_overrides: None,
+            dispatch_port_override_fallback: None,
             dns_override: None,
             dns_cache_ttl_seconds: None,
             auth_mode: AuthMode::Single,
@@ -2277,7 +2278,7 @@ mod tests {
         SvidBundle {
             spiffe_id: SpiffeId::from_parts(&td, "ns/default/sa/gateway").unwrap(),
             cert_chain_der: vec![leaf.to_vec()],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td,
                 x509_authorities: vec![],
@@ -2682,7 +2683,7 @@ mod tests {
         let bundle = SvidBundle {
             spiffe_id: SpiffeId::from_parts(&td, "ns/default/sa/gateway").unwrap(),
             cert_chain_der: vec![b"leaf-cert".to_vec(), b"intermediate".to_vec()],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td,
                 x509_authorities: vec![],

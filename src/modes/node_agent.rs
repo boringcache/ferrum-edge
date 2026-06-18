@@ -542,6 +542,10 @@ async fn run_with_backend(
                             for uid in stale_uids {
                                 handle_pod_removed(backend.as_mut(), &pod_states, config, metrics.as_ref(), &uid);
                             }
+                            // Also drop owned failure snapshots for pods that
+                            // vanished across the relist; otherwise the retry
+                            // loop replays them indefinitely (see helper docs).
+                            prune_failed_enrollments_from_relist(&pod_states, &seen);
                         }
                         startup_ready.store(true, Ordering::Release);
                         info!("Node agent initial pod sync complete; /health now reports ready");
@@ -619,6 +623,40 @@ fn watcher_init_stale_uids(
         .filter(|entry| !seen.contains(entry.key().as_str()))
         .map(|entry| entry.key().clone())
         .collect()
+}
+
+/// Drop transient-failure records (in `FAILED_POD_ENROLLMENT_ATTEMPTS`) for pods
+/// that vanished across a watcher reconnect/relist. The InitDone stale sweep only
+/// reconciles enrolled pods (`watcher_init_stale_uids` walks `pod_states`), but a
+/// pod that failed enrollment before it was inserted into `pod_states` keeps an
+/// owned snapshot *outside* `pod_states`. If that pod is gone after the relist,
+/// nothing else clears the record, so the periodic retry loop would replay it
+/// forever — warning and bumping `attach_errors` every ~30s for a UID the API no
+/// longer reports. Pruning here against the relist `seen` set closes that loop.
+///
+/// Records are scoped by the `pod_states` key prefix so a sibling node-agent
+/// runtime (or, under `cargo test`, another test's pods) is never pruned.
+fn prune_failed_enrollments_from_relist(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    seen: &HashSet<String>,
+) {
+    if FAILED_POD_ENROLLMENT_ATTEMPTS.is_empty() {
+        return;
+    }
+
+    let key_prefix = pod_state_key_prefix(pod_states);
+    // Collect first so we never remove while iterating the same DashMap.
+    let stale_keys: Vec<String> = FAILED_POD_ENROLLMENT_ATTEMPTS
+        .iter()
+        .filter_map(|entry| {
+            let pod_uid = entry.key().strip_prefix(&key_prefix)?;
+            (!seen.contains(pod_uid)).then(|| entry.key().clone())
+        })
+        .collect();
+
+    for state_key in stale_keys {
+        forget_failed_pod_enrollment(&state_key);
+    }
 }
 
 fn mark_relist_seen_from_cni_add(
@@ -4370,6 +4408,78 @@ mod tests {
         assert!(pod_states.is_empty());
         assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.attach_errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn relist_prunes_failed_enrollment_for_vanished_pod_but_keeps_present_one() {
+        // Codex finding: a pod that fails enrollment before it is inserted into
+        // `pod_states` keeps an owned snapshot in FAILED_POD_ENROLLMENT_ATTEMPTS.
+        // The InitDone sweep only reconciles `pod_states`, so if that pod
+        // disappears across a watcher relist nothing clears the record and the
+        // retry loop replays it forever (warn + attach_errors every ~30s for a
+        // UID the API no longer reports). Pruning against the relist `seen` set
+        // must drop the vanished pod's record — but never one still in `seen`.
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        backend.fail_attach_tc = true; // transient failure lands post-resolve.
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        // Both pods resolve a cgroup so the only failure is the injected attach.
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podgone-uid")).unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podstays-uid")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let mut failed_event = |uid: &'static str, ip: &'static str| {
+            let event = PodEvent {
+                pod_uid: uid,
+                pod_name: "p",
+                namespace: "default",
+                service_account: None,
+                labels: &labels,
+                annotations: &HashMap::new(),
+                pod_ip_str: Some(ip),
+                pod_pid: None,
+                veth_iface_override: None,
+            };
+            handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        };
+        failed_event("gone-uid", "10.0.0.1");
+        failed_event("stays-uid", "10.0.0.2");
+
+        let gone_key = pod_state_key(&pod_states, "gone-uid");
+        let stays_key = pod_state_key(&pod_states, "stays-uid");
+        assert!(FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&gone_key));
+        assert!(FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&stays_key));
+
+        // Relist saw `stays-uid` but not `gone-uid`.
+        let mut seen = HashSet::new();
+        seen.insert("stays-uid".to_string());
+        prune_failed_enrollments_from_relist(&pod_states, &seen);
+
+        assert!(
+            !FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&gone_key),
+            "failed record for a pod absent from the relist must be pruned"
+        );
+        assert!(
+            FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&stays_key),
+            "failed record for a pod still present in the relist must be retained for retry"
+        );
+
+        // Clean up the global between tests sharing this static.
+        forget_failed_pod_enrollment(&gone_key);
+        forget_failed_pod_enrollment(&stays_key);
     }
 
     #[test]
