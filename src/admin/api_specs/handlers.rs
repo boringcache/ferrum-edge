@@ -1531,27 +1531,42 @@ async fn validate_bundle(
                     Err(e) => return Err(classify_db_error(e)),
                 }
             };
-            if let Some(upstream) = resolved_upstream
-                && let Some(conflict) =
+            if let Some(upstream) = resolved_upstream {
+                // The bundled/looked-up upstream carries `port_overrides`, but the
+                // imported proxy arrives without its `#[serde(skip)]`
+                // `dispatch_port_overrides` resolved — derive them so a
+                // `maxRetries = 0` cap on the mesh port is honored here exactly as
+                // the runtime applies it.
+                if let Some(conflict) =
                     crate::config::types::first_effective_mesh_transport_conflict(
-                        proxy,
+                        &crate::config::types::proxy_with_resolved_port_caps(proxy, &upstream),
                         &upstream,
                         proxy.upstream_subset.as_deref(),
                         proxy.retry.as_ref(),
                         proxy.allowed_methods.as_deref(),
                     )
-            {
-                failures.push(ValidationFailure {
-                    resource_type: "proxy",
-                    id: proxy.id.clone(),
-                    errors: vec![crate::config::types::mesh_transport_retry_conflict_message(
-                        &proxy.id,
-                        upstream_id,
-                        &conflict,
-                    )],
-                });
+                {
+                    failures.push(ValidationFailure {
+                        resource_type: "proxy",
+                        id: proxy.id.clone(),
+                        errors: vec![crate::config::types::mesh_transport_retry_conflict_message(
+                            &proxy.id,
+                            upstream_id,
+                            &conflict,
+                        )],
+                    });
+                }
             }
         }
+
+        // Spec-extracted plugins (`x-ferrum-plugins`) are associated with the
+        // imported proxy and may include a `mesh_route_dispatch` rule that routes
+        // matched traffic to a mesh-tagged upstream — independent of whether the
+        // proxy's DEFAULT upstream exists or is plain. Mirror the CRUD proxy path:
+        // reject when an override destination still has an effective retry over a
+        // mesh transport.
+        validate_bundle_route_override_conflicts(db, namespace, proxy, &bundle, &mut failures)
+            .await?;
 
         if proxy.dispatch_kind.is_stream() {
             // Stream-family: validate port uniqueness, reserved-port conflict, and
@@ -1683,6 +1698,167 @@ async fn validate_bundle(
     }
 
     Ok(ValidatedBundle { bundle, metadata })
+}
+
+/// Reject a retry-enabled imported proxy whose `mesh_route_dispatch` rules route
+/// matched traffic to a mesh-tagged (`mesh.hbone` / `mesh.mtls`) upstream — the
+/// API-spec equivalent of the route-override conflict check in `Proxy::after_validate`.
+///
+/// Spec-extracted plugins (`x-ferrum-plugins`) are associated with the imported
+/// proxy via `bundle.proxy.plugins`, so a bundled `mesh_route_dispatch` whose rule
+/// overrides the upstream still 502s at runtime (issue #1669) just like a
+/// CRUD-written one. The candidate plugin set mirrors the runtime plugin cache:
+/// the bundle's own proxy-scoped/proxy_group mesh_route_dispatch instances (only
+/// those the proxy actually attaches) plus enabled DB globals — except a bundled
+/// local instance shadows DB globals of the same name, so those are excluded.
+/// Override-destination upstreams resolve from the bundle first, then the DB.
+async fn validate_bundle_route_override_conflicts(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxy: &crate::config::types::Proxy,
+    bundle: &crate::admin::api_specs::extractor::ExtractedBundle,
+    failures: &mut Vec<ValidationFailure>,
+) -> Result<(), ApiSpecError> {
+    use crate::config::types::PluginScope;
+    use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
+
+    // Plugin config ids the proxy actually attaches (runtime only instantiates
+    // attached instances; an inert bundled instance never dispatches).
+    let attached_ids: std::collections::HashSet<&str> = proxy
+        .plugins
+        .iter()
+        .map(|a| a.plugin_config_id.as_str())
+        .collect();
+
+    // mesh_route_dispatch instances this proxy attaches, resolved from the bundle
+    // first then the DB (an operator-written association may reference a
+    // pre-existing DB plugin). A local instance shadows DB globals of the same
+    // name (PluginCache removes them).
+    let mut candidates: Vec<crate::config::types::PluginConfig> = Vec::new();
+    let mut shadows_global = false;
+    let bundle_plugin_ids: std::collections::HashSet<&str> =
+        bundle.plugins.iter().map(|p| p.id.as_str()).collect();
+    for pc in &bundle.plugins {
+        if pc.enabled
+            && pc.plugin_name == "mesh_route_dispatch"
+            && attached_ids.contains(pc.id.as_str())
+        {
+            shadows_global = true;
+            candidates.push(pc.clone());
+        }
+    }
+    for id in &attached_ids {
+        if bundle_plugin_ids.contains(id) {
+            continue;
+        }
+        if let Some(pc) = db.get_plugin_config(id).await.map_err(classify_db_error)?
+            && pc.namespace == namespace
+            && pc.enabled
+            && pc.plugin_name == "mesh_route_dispatch"
+        {
+            shadows_global = true;
+            candidates.push(pc);
+        }
+    }
+
+    // DB globals run on this proxy unless a local instance shadows them.
+    let db_globals: Vec<crate::config::types::PluginConfig> = if shadows_global {
+        Vec::new()
+    } else {
+        let mut globals = Vec::new();
+        let mut offset = 0_i64;
+        const PAGE_SIZE: i64 = 1_000;
+        loop {
+            let page = db
+                .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
+                .await
+                .map_err(classify_db_error)?;
+            let items_len = page.items.len() as i64;
+            for plugin in page.items {
+                if plugin.scope == PluginScope::Global
+                    && plugin.enabled
+                    && plugin.plugin_name == "mesh_route_dispatch"
+                {
+                    globals.push(plugin);
+                }
+            }
+            if items_len == 0 {
+                break;
+            }
+            offset += items_len;
+            if offset >= page.total {
+                break;
+            }
+        }
+        globals
+    };
+
+    let default_uid = proxy.upstream_id.as_deref().unwrap_or("");
+    for pc in candidates.iter().chain(db_globals.iter()) {
+        let Ok(dispatch) = MeshRouteDispatchConfig::from_value(&pc.config) else {
+            continue;
+        };
+        for rule in &dispatch.rules {
+            // Redirect rules answer the request before any upstream override, so
+            // they never dispatch to their destination upstream.
+            if rule.redirect.is_some() {
+                continue;
+            }
+            let Some(override_uid) = rule.destination.upstream_id.as_deref() else {
+                continue;
+            };
+            let rule_changes_retry = rule.retry.is_some() || rule.retry_disabled;
+            // A same-upstream rule that leaves retry untouched is covered by the
+            // default-upstream check.
+            if override_uid == default_uid && !rule_changes_retry {
+                continue;
+            }
+            let effective_retry = if rule.retry.is_some() {
+                rule.retry.clone()
+            } else if rule.retry_disabled {
+                None
+            } else {
+                proxy.retry.clone()
+            };
+            // Runtime preserves `proxy.upstream_subset` only for a same-upstream
+            // rule; a different-upstream override drops it.
+            let selected_subset = if override_uid == default_uid {
+                proxy.upstream_subset.as_deref()
+            } else {
+                None
+            };
+            // Resolve the override destination upstream: bundle first, then DB.
+            let resolved = match bundle.upstream.as_ref() {
+                Some(u) if u.id == override_uid => Some(u.clone()),
+                _ => match db.get_upstream(override_uid).await {
+                    Ok(Some(u)) if u.namespace == namespace => Some(u),
+                    Ok(_) => None,
+                    Err(e) => return Err(classify_db_error(e)),
+                },
+            };
+            if let Some(upstream) = resolved
+                && let Some(conflict) =
+                    crate::config::types::first_effective_mesh_transport_conflict(
+                        &crate::config::types::proxy_with_resolved_port_caps(proxy, &upstream),
+                        &upstream,
+                        selected_subset,
+                        effective_retry.as_ref(),
+                        proxy.allowed_methods.as_deref(),
+                    )
+            {
+                failures.push(ValidationFailure {
+                    resource_type: "proxy",
+                    id: proxy.id.clone(),
+                    errors: vec![crate::config::types::mesh_transport_retry_conflict_message(
+                        &proxy.id,
+                        override_uid,
+                        &conflict,
+                    )],
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build an `ApiSpec` row from body bytes, metadata, and bundle.

@@ -2507,6 +2507,39 @@ pub(crate) fn first_effective_mesh_transport_conflict(
         })
 }
 
+/// Project a single referenced upstream's per-port / top-level retry caps onto a
+/// throwaway proxy clone so the per-resource admission paths
+/// (`Proxy::after_validate`, API-spec import, batch import) model the same
+/// `cap_proxy_retry_for_target` cap the runtime applies before deciding whether
+/// retry disables HBONE/SVID-mTLS dispatch.
+///
+/// `Proxy.dispatch_port_overrides` / `Proxy.dispatch_port_override_fallback` are
+/// `#[serde(skip)]` DR-derived projections that only
+/// [`GatewayConfig::resolve_dispatch_port_overrides`] populates over a full
+/// config. A proxy that arrives straight off the admin request body therefore has
+/// both fields `None`, so without this projection
+/// [`retry_is_effective_for_mesh_target`] cannot see a `maxRetries = 0` cap on the
+/// mesh port and would over-reject a config the runtime serves correctly. Mirrors
+/// the per-upstream projection in `resolve_dispatch_port_overrides`.
+pub(crate) fn proxy_with_resolved_port_caps(proxy: &Proxy, upstream: &Upstream) -> Proxy {
+    let mut resolved = proxy.clone();
+    resolved.dispatch_port_overrides = if upstream.port_overrides.is_empty() {
+        None
+    } else {
+        let ports: HashMap<u16, ResolvedPortOverride> = upstream
+            .port_overrides
+            .iter()
+            .filter_map(|(port, ovr)| {
+                ResolvedPortOverride::from_upstream_override(ovr).map(|r| (*port, r))
+            })
+            .collect();
+        (!ports.is_empty()).then_some(ports)
+    };
+    resolved.dispatch_port_override_fallback =
+        dispatch_port_override_fallback_from_upstream(upstream);
+    resolved
+}
+
 /// A mesh-transport requirement that conflicts with an effective retry policy.
 pub(crate) struct MeshTransportConflict {
     /// The conflicting transport tag (`"mesh.hbone"` / `"mesh.mtls"`).
@@ -2531,6 +2564,13 @@ struct MeshRouteOverrideDest {
     /// `retry`, `None` when the rule disables retry, or the proxy's base retry
     /// when the rule leaves retry untouched.
     effective_retry: Option<RetryConfig>,
+    /// The upstream subset the runtime selects for this override. A rule that
+    /// keeps the proxy's default upstream preserves `proxy.upstream_subset`
+    /// (`apply_route_overrides_inner` only clears it when the upstream changes);
+    /// a different-upstream rule drops the subset (the new upstream has its own
+    /// targets), so this is `None` there. Used so the conflict check filters the
+    /// same target set the load balancer would.
+    selected_subset: Option<String>,
 }
 
 /// Build the canonical retry/mesh-transport conflict error message.
@@ -3150,9 +3190,14 @@ impl GatewayConfig {
             for override_dest in self.mesh_route_dispatch_override_destinations(proxy) {
                 if let Some(upstream) = upstreams_by_id.get(override_dest.upstream_id.as_str())
                     && let Some(required) = first_effective_mesh_transport_conflict(
-                        proxy,
+                        // The runtime recomputes `dispatch_port_overrides` from the
+                        // OVERRIDE destination upstream when a rule swaps the
+                        // upstream (`apply_route_overrides_inner`), so the per-port
+                        // retry cap must come from that upstream, not the proxy's
+                        // default-upstream-derived caps.
+                        &proxy_with_resolved_port_caps(proxy, upstream),
                         upstream,
-                        None,
+                        override_dest.selected_subset.as_deref(),
                         override_dest.effective_retry.as_ref(),
                         proxy.allowed_methods.as_deref(),
                     )
@@ -3215,6 +3260,15 @@ impl GatewayConfig {
                 return;
             };
             for rule in &dispatch.rules {
+                // A redirect rule answers the request itself
+                // (`build_redirect_response` short-circuits before any
+                // `route_override_upstream_id` is set), so it never dispatches to
+                // `destination.upstream_id` even when one is present. Collecting it
+                // would spuriously reject a retry-enabled proxy whose redirect rule
+                // names a mesh upstream that no matched request ever reaches.
+                if rule.redirect.is_some() {
+                    continue;
+                }
                 let Some(override_uid) = rule.destination.upstream_id.as_deref() else {
                     continue;
                 };
@@ -3250,13 +3304,23 @@ impl GatewayConfig {
                 } else {
                     proxy.retry.clone()
                 };
+                // Runtime preserves `proxy.upstream_subset` only when the rule
+                // keeps the default upstream; a different-upstream override drops
+                // it.
+                let selected_subset = if override_uid == default_uid {
+                    proxy.upstream_subset.clone()
+                } else {
+                    None
+                };
                 if !overrides.iter().any(|existing| {
                     existing.upstream_id == override_uid
                         && existing.effective_retry == effective_retry
+                        && existing.selected_subset == selected_subset
                 }) {
                     overrides.push(MeshRouteOverrideDest {
                         upstream_id: override_uid.to_string(),
                         effective_retry,
+                        selected_subset,
                     });
                 }
             }
