@@ -433,13 +433,13 @@ impl AiPromptShield {
 
     /// Whether the ORIGINAL request contains a raw-body match that token
     /// rewriting cannot remove — i.e. an individual match in the serialized body
-    /// whose matched substring is not contained in any rewritable decoded token
-    /// (a string VALUE or numeric scalar). Such a match (e.g. a contextual
-    /// `custom_pattern` like `"password"\s*:`, which spans a key name, the
-    /// surrounding quotes, and the colon) has no single rewritable token, so
-    /// `redact_json_strings` — which only rewrites string values and numbers —
-    /// can never remove it. The request is therefore unredactable and must fail
-    /// closed.
+    /// whose matched byte span is not fully contained inside the serialized span
+    /// of a single rewritable value (a string VALUE or numeric scalar). Such a
+    /// match (e.g. a contextual `custom_pattern` like `"password"\s*:`, which
+    /// spans a key name, the surrounding quotes, and the colon) covers structural
+    /// bytes that lie outside any value, so `redact_json_strings` — which only
+    /// rewrites string values and numbers — can never remove it. The request is
+    /// therefore unredactable and must fail closed.
     ///
     /// Matching is done per individual occurrence (`Regex::find_iter`), NOT per
     /// pattern index. A single custom regex can alternate a removable value
@@ -447,8 +447,20 @@ impl AiPromptShield {
     /// example `(?:"password"\s+:)|(?:\w+@\w+\.\w+)`); if the value alternative
     /// hits a token, an index-level "this pattern matched a token" flag would
     /// wrongly mark the structural-context occurrence removable too. Testing
-    /// each matched substring against the rewritable tokens avoids that
-    /// suppression so the contextual occurrence is still caught.
+    /// each matched occurrence by byte span avoids that suppression so the
+    /// contextual occurrence is still caught.
+    ///
+    /// Removability is decided by BYTE-SPAN containment in the raw body, not by
+    /// substring containment in decoded tokens. The substring test was unsound:
+    /// a structural match (key + colon) could be wrongly judged removable merely
+    /// because an unrelated string VALUE happened to contain the same decoded
+    /// text — e.g. with pattern `"password"\s+:` and body
+    /// `{"password" : "hunter2", "note": "\"password\" :"}`, the real
+    /// `"password" :` field match would be "absorbed" by the `note` value while
+    /// the key/colon it actually spans can never be rewritten. Tying each match
+    /// to a concrete value span fixes that: a match overlapping any structural
+    /// byte (a key, a `:`/`,`, container brackets, or inter-token whitespace)
+    /// falls outside every value span and is correctly treated as unredactable.
     ///
     /// This is computed from the ORIGINAL body, independent of the rewritten
     /// body's serialization, precisely so a whitespace-sensitive contextual
@@ -457,13 +469,13 @@ impl AiPromptShield {
     /// is unsound: minification can erase the formatting a raw regex depended on
     /// even though nothing was redacted.
     ///
-    /// Object KEY names are intentionally excluded from the rewritable-token set
+    /// Object KEY spans are intentionally excluded from the rewritable-value set
     /// (`redact_json_strings` cannot rename keys), so a raw match that overlaps
-    /// only a key is treated as non-token-removable here. PII carried purely in
-    /// a key name is still caught — by `redacted_body_has_residual_pii`, whose
-    /// key text survives minification unchanged — so it does not need to drive
-    /// this contextual verdict as well.
-    fn original_has_unredactable_contextual_match(&self, json: &Value, raw: &str) -> bool {
+    /// only a key is treated as non-removable here. PII carried purely in a key
+    /// name is still caught — by `redacted_body_has_residual_pii`, whose key text
+    /// survives minification unchanged — so it does not need to drive this
+    /// contextual verdict as well.
+    fn original_has_unredactable_contextual_match(&self, raw: &str) -> bool {
         if self.patterns.is_empty() {
             return false;
         }
@@ -471,16 +483,19 @@ impl AiPromptShield {
         if !self.detection_set.is_match(raw) {
             return false;
         }
-        // Rewritable decoded tokens (string values + numeric scalars; NOT keys).
-        let mut value_tokens: Vec<Cow<'_, str>> = Vec::new();
-        collect_json_value_tokens(json, &mut value_tokens);
-        // A raw match is removable iff its exact matched substring is contained
-        // in some rewritable token. Any raw match that is not is contextual-only
-        // (spans keys/punctuation/whitespace) and cannot be rewritten in place.
+        // Byte spans of the rewritable values (string VALUES + numeric scalars;
+        // NOT keys, NOT structural punctuation). Computed once over the raw body.
+        let value_spans = collect_json_value_spans(raw);
+        // A raw match is removable iff its byte span lies entirely within one
+        // value span. Any match that touches structural bytes (keys/punctuation/
+        // whitespace) or straddles a token boundary is contextual-only and cannot
+        // be rewritten in place, so the request must fail closed.
         for pattern in &self.patterns {
             for m in pattern.regex.find_iter(raw) {
-                let matched = m.as_str();
-                let removable = value_tokens.iter().any(|t| t.as_ref().contains(matched));
+                let (start, end) = (m.start(), m.end());
+                let removable = value_spans
+                    .iter()
+                    .any(|span| span.start <= start && end <= span.end);
                 if !removable {
                     return true;
                 }
@@ -522,8 +537,7 @@ impl AiPromptShield {
             // Captured before mutation so the verdict can't depend on the
             // minified serialization of the rewritten body (see
             // `original_has_unredactable_contextual_match`).
-            let unredactable_contextual =
-                self.original_has_unredactable_contextual_match(&json, body);
+            let unredactable_contextual = self.original_has_unredactable_contextual_match(body);
             // Run structured redaction first on known prompt-content
             // fields (messages[].content) so recognized chat-completion
             // shapes are handled with the correct template. Then run the
@@ -1039,34 +1053,111 @@ fn collect_json_strings<'a>(value: &'a Value, texts: &mut Vec<Cow<'a, str>>) {
     }
 }
 
-/// Collect only the *rewritable* decoded tokens — string VALUES and numeric
-/// scalars — skipping object KEY names.
+/// Scan a raw JSON body and return the byte spans of every *rewritable* value —
+/// string VALUES (quotes included) and number literals — while excluding object
+/// KEY spans and all structural punctuation/whitespace.
 ///
-/// `redact_json_strings` rewrites string values and numeric scalars in place
-/// but cannot rewrite a key name (renaming keys risks collisions and reorders
-/// the document; key-PII is instead caught by the post-redaction residual
-/// re-scan). The unredactable-contextual analysis uses this narrower set so a
-/// raw match that overlaps only a key name or structural punctuation is still
-/// treated as non-token-removable. PII carried purely in a key is deliberately
-/// *not* collected here: it is handled by `redacted_body_has_residual_pii`,
-/// whose key text survives minification unchanged.
-fn collect_json_value_tokens<'a>(value: &'a Value, texts: &mut Vec<Cow<'a, str>>) {
-    match value {
-        Value::String(s) => texts.push(Cow::Borrowed(s.as_str())),
-        Value::Number(n) => texts.push(Cow::Owned(n.to_string())),
-        Value::Array(items) => {
-            for item in items {
-                collect_json_value_tokens(item, texts);
-            }
-        }
-        Value::Object(map) => {
-            for value in map.values() {
-                collect_json_value_tokens(value, texts);
-            }
-        }
-        // Bool / Null carry no PII; deliberately dropped.
-        _ => {}
+/// `redact_json_strings` rewrites string values and numeric scalars in place but
+/// cannot rewrite a key name (renaming keys risks collisions and reorders the
+/// document; key-PII is instead caught by the post-redaction residual re-scan).
+/// `original_has_unredactable_contextual_match` uses these spans to decide
+/// removability by BYTE-SPAN containment rather than decoded-substring presence:
+/// a raw regex match is rewritable only if it lies entirely inside one value
+/// span. A match that overlaps a key, a `:`/`,` separator, container brackets,
+/// or inter-token whitespace lands outside every span and is treated as
+/// unredactable — which a decoded-substring test could not distinguish, since an
+/// unrelated value may contain the same text as a structural match.
+///
+/// This is a forward single-pass scanner over the raw bytes (the body already
+/// parsed as valid JSON upstream, so it is well-formed). Strings honor `\\`
+/// escapes so an escaped quote does not end the span prematurely. In an object,
+/// the string immediately after `{` or `,` is a KEY (its span is skipped); the
+/// value after `:` — and every array element and the root token — is a VALUE.
+fn collect_json_value_spans(raw: &str) -> Vec<std::ops::Range<usize>> {
+    /// What the next encountered value token represents in the current context.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Expect {
+        /// Object key position (after `{` or `,` inside an object).
+        Key,
+        /// Value position (after `:`, an array element, or the root token).
+        Value,
     }
+    let bytes = raw.as_bytes();
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
+    // Stack of `true` for object contexts, `false` for array contexts. Drives
+    // whether `,` returns us to a Key (object) or a Value (array) expectation.
+    let mut in_object: Vec<bool> = Vec::new();
+    // Root token is a value; inside an object the first token is a key.
+    let mut expect = Expect::Value;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => {
+                in_object.push(true);
+                expect = Expect::Key;
+                i += 1;
+            }
+            b'[' => {
+                in_object.push(false);
+                expect = Expect::Value;
+                i += 1;
+            }
+            b'}' | b']' => {
+                in_object.pop();
+                i += 1;
+            }
+            b':' => {
+                // Object key/value separator: the next token is a VALUE.
+                expect = Expect::Value;
+                i += 1;
+            }
+            b',' => {
+                // Next token: a key in an object, a value in an array.
+                expect = match in_object.last() {
+                    Some(true) => Expect::Key,
+                    _ => Expect::Value,
+                };
+                i += 1;
+            }
+            b'"' => {
+                // Scan to the closing quote, skipping `\\`-escaped bytes.
+                let start = i;
+                let mut j = i + 1;
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'\\' => j += 2, // escape consumes the next byte
+                        b'"' => {
+                            j += 1;
+                            break;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                // Only VALUE strings are rewritable; KEY strings are not.
+                if expect == Expect::Value {
+                    spans.push(start..j.min(bytes.len()));
+                }
+                i = j;
+            }
+            // Number literal (rewritable only in value position). serde accepts
+            // a leading `-`; scan the contiguous numeric run.
+            b'-' | b'0'..=b'9' if expect == Expect::Value => {
+                let start = i;
+                let mut j = i + 1;
+                while j < bytes.len()
+                    && matches!(bytes[j], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
+                    j += 1;
+                }
+                spans.push(start..j);
+                i = j;
+            }
+            // Whitespace and literal scalars (true/false/null) carry no
+            // rewritable PII span; advance past them.
+            _ => i += 1,
+        }
+    }
+    spans
 }
 
 /// Collect scannable prompt text from a top-level LLM field that may be a

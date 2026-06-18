@@ -904,6 +904,38 @@ async fn test_scan_all_mode_redact_fails_closed_on_whitespace_sensitive_pattern(
 }
 
 #[tokio::test]
+async fn test_scan_all_mode_redact_contextual_match_not_absorbed_by_unrelated_value() {
+    // Regression for the unredactable-contextual containment check. The
+    // whitespace-sensitive field pattern matches the REAL `"password" :` key/
+    // colon (structural — no rewritable token) AND there is an unrelated string
+    // VALUE whose decoded text is literally `"password" :`. A substring-based
+    // removability test would "absorb" the structural match into that value and
+    // wrongly continue; byte-span containment must keep the structural match
+    // unredactable so the request fails closed with the password still present.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": [],
+        "custom_patterns": [
+            {"name": "password_field", "regex": "\"password\"\\s+:"}
+        ],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+    // Note the space before the first colon (matched by the regex) and the
+    // `note` value carrying the same decoded text `"password" :`.
+    let mut ctx =
+        make_post_ctx_with_raw_body(r#"{"password" : "hunter2", "note": "\"password\" :"}"#);
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+    assert!(
+        !ctx.metadata.contains_key("ai_shield_redacted"),
+        "a structural match must not be treated as removable just because an \
+         unrelated value contains the same decoded substring"
+    );
+}
+
+#[tokio::test]
 async fn test_scan_content_only_mode() {
     let plugin = AiPromptShield::new(&json!({
         "patterns": ["ssn"],
