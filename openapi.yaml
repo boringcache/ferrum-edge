@@ -14104,6 +14104,10 @@ components:
           type: string
           default: ai
           description: Prefix for metadata keys
+        buffer_streaming_responses:
+          type: boolean
+          default: false
+          description: Buffer text/event-stream responses so final SSE usage events can be parsed; disables streaming delivery for those responses
         cost_per_prompt_token:
           type: number
           format: double
