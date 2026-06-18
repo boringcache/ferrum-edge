@@ -197,6 +197,21 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
 
         let mut targets = Vec::new();
         let mut seen = HashSet::new();
+        // Multi-cluster config for the cluster-name FALLBACK leg of remote
+        // classification. Remote endpoints reach this discoverer via
+        // `merge_remote_endpoints_into_mesh` carrying the RESERVED, un-spoofable
+        // `Workload::remote_provenance` marker stamped by the DP-side poll loop's
+        // `tag_remote_workloads` at ingestion; we copy that into the explicit
+        // `mesh.remote=true` target tag so strict local-first LB keys on real
+        // cross-cluster PROVENANCE — independent of whatever `cluster` name an
+        // Istio WorkloadEntry translation stamped, and NOT a locality-string
+        // prefix. This uses the SAME `workload_is_remote` predicate as the egress
+        // local-only filter (`matched_local_service_workloads`), so "remote" never
+        // means two different things. The provenance marker is authoritative;
+        // cluster-name matching (which needs this `multi_cluster`) only ever
+        // promotes an unmarked workload to remote (defense in depth), never the
+        // reverse.
+        let multi_cluster = mesh.multi_cluster.as_ref();
         let matching_service_spiffe_ids: HashSet<&str> = mesh
             .workloads
             .iter()
@@ -214,10 +229,30 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
                 continue;
             };
 
+            let is_remote =
+                crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster);
+
             for address in &workload.addresses {
                 if address.is_empty() {
                     continue;
                 }
+                // Collapse runtime targets on `(address, port, spiffe_id)` ONLY —
+                // deliberately NOT on `cluster`/`network` provenance. Two remote
+                // entries can advertise the same address on different networks
+                // (overlapping CIDR), but the rest of the runtime keys a target by
+                // its literal `host:port`: the dial uses `UpstreamTarget.host`, and
+                // LoadBalancer/HealthChecker/circuit-breaker keys are `host:port`
+                // (or `upstream_id::host:port`). The `mesh.cluster`/`mesh.network`
+                // tags are introspection metadata only — nothing downstream reads
+                // them to disambiguate dial/health/CB. Emitting two same-`host:port`
+                // targets would therefore yield no independently-dial-able failover
+                // peer (no network-gateway address rewrite exists yet, issue #1719)
+                // while letting a passive/active ejection or opened circuit for one
+                // overlapping-CIDR endpoint silently eject the sibling via the
+                // shared key. Keep them collapsed until target identity carries
+                // provenance. The merge-layer `WorkloadEndpointKey` still retains
+                // `cluster`/`network` so the workload REGISTRY keeps both for
+                // provenance/metadata; only the emitted RUNTIME target collapses.
                 let key = (
                     address.as_str(),
                     selected_port.port,
@@ -227,11 +262,18 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
                     continue;
                 }
 
+                let mut tags = Self::tags_for_target(service, workload, &selected_port);
+                if is_remote {
+                    tags.insert(
+                        crate::modes::mesh::multicluster::MESH_REMOTE_TAG.to_string(),
+                        crate::modes::mesh::multicluster::MESH_REMOTE_TAG_VALUE.to_string(),
+                    );
+                }
                 targets.push(UpstreamTarget {
                     host: address.clone(),
                     port: selected_port.port,
                     weight: self.default_weight,
-                    tags: Self::tags_for_target(service, workload, &selected_port),
+                    tags,
                     locality: workload.locality.clone(),
                     path: None,
                 });
@@ -397,6 +439,7 @@ mod tests {
             locality: None,
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         }
     }
 

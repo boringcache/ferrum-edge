@@ -1831,16 +1831,18 @@ async fn handle_h3_request(
     let needs_response_buffering = has_retry || !should_stream_response;
 
     // --- Upstream target selection and circuit breaker ---
-    // NOTE (pre-existing, moot for mesh): this standalone H3 frontend selects
-    // upstream targets but does NOT run the per-target effective-proxy override
-    // pipeline (`resolve_effective_proxy_for_target` / `cap_proxy_retry_for_target`)
-    // that the H1/H2 dispatch path uses, so NONE of the DR per-port
-    // effective-proxy overrides (h2UpgradePolicy / maxRetries plus the
-    // pre-existing idleTimeout / http2MaxRequests / connectTimeout /
-    // maxConnections / tcpKeepalive / per-port LB+outlier) are applied here.
-    // This is moot for mesh: mesh capture is TCP-only (SO_ORIGINAL_DST/REDIRECT;
-    // UDP/H3 are out of mesh scope) and these are DestinationRule-derived
-    // (mesh-only). A uniform H3-override pass is a tracked follow-up — see
+    // NOTE (moot for mesh): this standalone H3 frontend's SELECTION path does
+    // not run `cap_proxy_retry_for_target` (the per-request `maxRetries` cap),
+    // so that DR knob is not applied on the H3 frontend. The H3→HTTP
+    // cross-protocol **plain** bridge DOES now apply the per-target
+    // effective-proxy overrides via `resolve_effective_proxy_for_target`
+    // (h2UpgradePolicy / idleTimeout / http2MaxRequests / connectTimeout / TLS,
+    // plus the service-discovery top-level fallback) — see
+    // `src/http3/cross_protocol.rs` `dispatch_plain`. The native-H3 backend pool
+    // and the gRPC bridge flavor, plus the `maxRetries` cap and per-port
+    // maxConnections / tcpKeepalive / LB+outlier, remain follow-ups. All moot
+    // for mesh: mesh capture is TCP-only (SO_ORIGINAL_DST/REDIRECT; UDP/H3 are
+    // out of mesh scope) and these are DestinationRule-derived (mesh-only) — see
     // `docs/mesh.md` "Dispatch-path coverage".
     // PASSTHROUGH orig-dst is `None` on H3: mesh capture is TCP-only
     // (SO_ORIGINAL_DST/REDIRECT; H3/UDP are out of mesh scope), so an H3
@@ -1874,7 +1876,10 @@ async fn handle_h3_request(
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
     let mut backend_admission_start: std::time::Instant;
 
-    let (cb_target_key, cb_is_half_open_probe) =
+    // H3 records the circuit-breaker outcome at header time (it does not defer the
+    // dispatch outcome like the direct-H2 path), so the admission open-epoch is
+    // unused here.
+    let (cb_target_key, cb_is_half_open_probe, _cb_admission_open_epoch) =
         match crate::proxy::backend_dispatch::check_circuit_breaker(
             &proxy,
             &state,
@@ -1977,11 +1982,7 @@ async fn handle_h3_request(
                 .get("origin")
                 .map(String::as_str)
                 .unwrap_or("");
-            if !proxy
-                .allowed_ws_origins
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(origin))
-            {
+            if !crate::proxy::websocket_origin_allowed(&proxy.allowed_ws_origins, origin) {
                 warn!(
                     "H3 WebSocket upgrade rejected: Origin '{}' not in allowed_ws_origins for proxy {}",
                     origin, proxy.id
@@ -4391,21 +4392,12 @@ pub(crate) fn inject_sticky_cookie(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
     {
-        let has_port_override = crate::proxy::backend_dispatch::has_effective_port_override(
+        let strategy = crate::proxy::backend_dispatch::hash_on_strategy_for_selected_target(
             proxy,
             &epoch.load_balancer,
             upstream_id,
             target.port,
         );
-        let strategy = if has_port_override {
-            LoadBalancerCache::get_hash_on_strategy_for_port_from(
-                &epoch.load_balancer,
-                upstream_id,
-                target.port,
-            )
-        } else {
-            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id)
-        };
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
