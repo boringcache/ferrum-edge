@@ -418,6 +418,159 @@ fn test_requires_response_body_buffering() {
     assert!(plugin.requires_response_body_buffering());
 }
 
+#[tokio::test]
+async fn test_response_buffering_only_for_fresh_dedup_keys() {
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    let mut get_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    let mut get_headers = HashMap::new();
+    get_headers.insert("idempotency-key".to_string(), "get-key".to_string());
+    let result = plugin.before_proxy(&mut get_ctx, &mut get_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!plugin.should_buffer_response_body(&get_ctx));
+
+    let mut keyless_post_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut keyless_post_headers = HashMap::new();
+    let result = plugin
+        .before_proxy(&mut keyless_post_ctx, &mut keyless_post_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!plugin.should_buffer_response_body(&keyless_post_ctx));
+
+    let mut keyed_post_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut keyed_post_headers = HashMap::new();
+    keyed_post_headers.insert("idempotency-key".to_string(), "post-key".to_string());
+    let result = plugin
+        .before_proxy(&mut keyed_post_ctx, &mut keyed_post_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(plugin.should_buffer_response_body(&keyed_post_ctx));
+}
+
+#[tokio::test]
+async fn test_response_buffering_releases_event_stream_content_type() {
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("idempotency-key".to_string(), "stream-key".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+}
+
+/// A keyed request whose response is streamed as `text/event-stream` is handed
+/// to the client incrementally, so `on_final_response_body` (which transitions
+/// the `InFlight` marker to a cached `Completed` entry) never runs. The marker
+/// is intentionally kept in-flight for the lifetime of the stream — there is no
+/// plugin hook for streamed-body completion, and releasing it at response-headers
+/// time would let a concurrent duplicate mutating request reach the backend while
+/// the original stream is still running. While the stream is active a duplicate
+/// key must therefore still 409.
+#[tokio::test]
+async fn test_streamed_event_stream_keeps_inflight_marker_for_stream_lifetime() {
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("idempotency-key".to_string(), "sse-key".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    // The fresh key is marked in-flight and stays that way for the stream.
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert!(ctx.metadata.contains_key("_dedup_key"));
+
+    // The SSE response is streamed (not buffered), confirmed by the content-type
+    // refinement declining to buffer it.
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
+
+    // A duplicate request arriving while the stream is still active must be
+    // rejected with 409 — the in-flight lock is exactly the protection this
+    // plugin promises for the still-running request.
+    let mut dup_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut dup_headers = HashMap::new();
+    dup_headers.insert("idempotency-key".to_string(), "sse-key".to_string());
+    let result = plugin.before_proxy(&mut dup_ctx, &mut dup_headers).await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "duplicate during an active streamed SSE response must 409, got {result:?}"
+    );
+}
+
+// Note: after a streamed SSE response ends, the `InFlight` marker self-heals
+// once it exceeds `inflight_ttl` (documented to cover the longest protected
+// request, including a long-lived stream) via the staleness branch in
+// `local_lookup_or_mark_inflight`. That path is exercised by the staleness logic
+// generally; a dedicated test here would require either a real >=1s sleep
+// (`inflight_ttl_seconds` is rejected at 0) or injectable time, which this suite
+// deliberately avoids to keep CI fast (see `test_inflight_marker_carries_timestamp`).
+
+/// A buffered (non-SSE) keyed response keeps the marker in-flight through the
+/// header phase and transitions it to a cached `Completed` entry via
+/// `on_final_response_body`, which only runs on the buffered path.
+#[tokio::test]
+async fn test_buffered_response_transitions_inflight_to_completed() {
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("idempotency-key".to_string(), "json-key".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert!(ctx.metadata.contains_key("_dedup_key"));
+
+    // A JSON response is buffered (the content-type refinement still votes to
+    // buffer), so `on_final_response_body` runs and caches it.
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, Some("application/json")));
+    let response_headers = HashMap::new();
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, b"{}")
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+}
+
 #[test]
 fn test_tracked_keys_count() {
     let config = json!({});
