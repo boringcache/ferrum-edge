@@ -457,6 +457,18 @@ impl AiResponseGuard {
     /// all-mode coverage. `raw` may be `None` when the serialized bytes are not
     /// valid UTF-8 (the body still parsed via `from_slice`), in which case only
     /// the decoded pass runs.
+    ///
+    /// Accepted trade-off: because pass 1 evaluates each decoded value in
+    /// isolation, an *anchored* custom `blocked_pattern` (e.g. `^done$`) that an
+    /// operator authored against the whole serialized body will additionally fire
+    /// on a lone scalar value (`{"finish_reason":"done"}`). This is intentional
+    /// and load-bearing for `ScanMode::All`: the decoded per-value pass is exactly
+    /// what closes the escaped-PII gap (#1720) — a value encoded as `done`
+    /// must be caught after decoding — so restricting custom patterns to
+    /// whole-body-only would reopen that bypass for them. Operators who need
+    /// strictly whole-body matching can keep the anchor and rely on raw-pass
+    /// semantics in `ScanMode::Content`, or write the pattern to include the JSON
+    /// context (`"finish_reason"\s*:\s*"done"`) so the lone token does not match.
     fn detect_matches_in_decoded_json(&self, json: &Value, raw: Option<&str>) -> Vec<String> {
         if self.detection_pattern_count == 0 {
             return Vec::new();
@@ -546,6 +558,31 @@ impl AiResponseGuard {
         result
     }
 
+    /// Remove every rendered redaction placeholder from `text`.
+    ///
+    /// The residual re-scan (`redact_leaves_residual`) runs the detection
+    /// `RegexSet` over the body *after* redaction. Placeholders embed the
+    /// pattern identity — e.g. the default template makes a blocked phrase
+    /// `cost $5` render as `[REDACTED:blocked_phrase:cost $5]`, and PII/custom
+    /// names render as `[REDACTED:pii:ssn]` / `[REDACTED:<custom name>]`. Those
+    /// marker strings would otherwise re-match the very pattern that produced
+    /// them (the literal phrase is echoed inside the marker, and a custom name
+    /// can coincide with its own regex), making a fully-redactable body look
+    /// like it still carries residual content and forcing a false 502.
+    /// Stripping the placeholders before the residual scan looks only at the
+    /// bytes that will actually be delivered, not at text the redactor itself
+    /// wrote. Placeholders are fixed strings rendered at construction, so this
+    /// is a plain substring removal with no regex on the hot path.
+    fn strip_known_placeholders(&self, text: &str) -> String {
+        let mut result = text.to_string();
+        for pattern in self.pii_patterns.iter().chain(self.blocked_phrases.iter()) {
+            if result.contains(pattern.placeholder.as_str()) {
+                result = result.replace(pattern.placeholder.as_str(), "");
+            }
+        }
+        result
+    }
+
     /// `ScanMode::All` redact mode: after applying the same redaction the
     /// response transform performs, decide whether any *unredactable* PII still
     /// remains, so the caller can fail closed (reject) instead of forwarding the
@@ -568,6 +605,12 @@ impl AiResponseGuard {
     /// scalar values keeps the surrounding JSON structure intact, so a contextual
     /// pattern such as `"role"\s*:` still matches while a preserved
     /// `"created": 1700000000` no longer does.
+    ///
+    /// The residual scan also strips the redactor's own placeholder markers
+    /// (`strip_known_placeholders`) before matching: a successfully redacted
+    /// phrase renders as e.g. `[REDACTED:blocked_phrase:cost $5]`, whose echoed
+    /// phrase text would otherwise re-match the same pattern and report a false
+    /// residual leak (turning a fully redacted body into a spurious 502).
     fn redact_leaves_residual(&self, original: &Value) -> bool {
         if self.detection_pattern_count == 0 {
             return false;
@@ -594,10 +637,64 @@ impl AiResponseGuard {
             }
         }
 
-        let serialized = redacted.to_string();
-        !self
-            .detect_matches_in_decoded_json(&redacted, Some(&serialized))
-            .is_empty()
+        // Union the same two passes as `detect_matches_in_decoded_json`, but run
+        // each over text with the redactor's placeholder markers removed so the
+        // markers cannot re-trigger their own pattern.
+        let mut texts: Vec<Cow<'_, str>> = Vec::new();
+        collect_decoded_json_strings(&redacted, &mut texts);
+        for text in &texts {
+            let cleaned = self.strip_known_placeholders(text.as_ref());
+            if self.detection_set.is_match(&cleaned) {
+                return true;
+            }
+        }
+        let serialized = self.strip_known_placeholders(&redacted.to_string());
+        self.detection_set.is_match(&serialized)
+    }
+
+    /// `ScanMode::All` redact mode, SSE bodies: decide whether redaction would
+    /// leave residual detectable content, so the caller can fail closed instead
+    /// of forwarding the original bytes while reporting them `redacted`.
+    ///
+    /// The SSE transform (`redact_sse_body`) only rewrites `data:` payloads that
+    /// parse as JSON. A plaintext or malformed `data:` frame (e.g.
+    /// `data: contact user@example.com`) is matched by the raw-body union in
+    /// detection but cannot be rewritten, so the transform returns `None` and the
+    /// original PII would be delivered. This mirrors the JSON
+    /// `redact_leaves_residual` fail-closed: run the same redaction the transform
+    /// performs, then re-scan the result (with the redactor's own placeholder
+    /// markers stripped). If redaction produced no rewrite at all, or the rewrite
+    /// still matches, residual content remains and the caller must reject.
+    fn redact_sse_leaves_residual(&self, body: &[u8]) -> bool {
+        if self.detection_pattern_count == 0 {
+            return false;
+        }
+        // `redact_sse_body` returns `None` when nothing was rewritten; with
+        // detection already positive that means the matched bytes are not
+        // JSON-redactable (plaintext/malformed frame or a STRUCTURAL_KEYS-only
+        // scalar). Treat "no rewrite while detected" as residual so we fail
+        // closed rather than forward the original PII.
+        let Some(redacted) = self.redact_sse_body(body) else {
+            return true;
+        };
+        let Ok(redacted_str) = std::str::from_utf8(&redacted) else {
+            // Redacted output is not valid UTF-8 — cannot re-scan safely, so
+            // fail closed rather than risk forwarding undetectable residual.
+            return true;
+        };
+        let frames = parse_sse_data_frames(&redacted);
+        let mut texts: Vec<Cow<'_, str>> = Vec::new();
+        for frame in &frames {
+            collect_decoded_json_strings(frame, &mut texts);
+        }
+        for text in &texts {
+            let cleaned = self.strip_known_placeholders(text.as_ref());
+            if self.detection_set.is_match(&cleaned) {
+                return true;
+            }
+        }
+        let cleaned_raw = self.strip_known_placeholders(redacted_str);
+        self.detection_set.is_match(&cleaned_raw)
     }
 
     /// Redact content in LLM response JSON.
@@ -1044,6 +1141,35 @@ impl Plugin for AiResponseGuard {
 
             if detected.is_empty() {
                 return PluginResult::Continue;
+            }
+
+            // Scan-all redact mode can detect SSE content the per-frame redactor
+            // cannot rewrite (plaintext/malformed `data:` frames, cross-frame or
+            // structural-scalar matches surfaced by the raw-body union). The
+            // transform (`redact_sse_body`) would return `None` for those, so
+            // forwarding the body while reporting it `redacted` leaks PII. Fail
+            // closed (reject) when redaction would leave residual content, exactly
+            // as the JSON path does below.
+            if self.action == GuardAction::Redact
+                && self.scan_mode == ScanMode::All
+                && self.redact_sse_leaves_residual(body)
+            {
+                debug!(
+                    "ai_response_guard: scan-all redact leaves residual SSE content (types: {:?}), rejecting response",
+                    detected
+                );
+                let types_json: Vec<String> = detected
+                    .iter()
+                    .map(|t| format!("\"{}\"", escape_json_string(t)))
+                    .collect();
+                return PluginResult::Reject {
+                    status_code: 502,
+                    body: format!(
+                        r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
+                        types_json.join(","),
+                    ),
+                    headers: HashMap::new(),
+                };
             }
 
             return self.respond_to_detection(ctx, &detected);
