@@ -400,6 +400,20 @@ impl MeshAuthz {
             let labels = serde_json::from_value::<BTreeMap<String, String>>(value.clone())
                 .map_err(|e| format!("mesh_authz: invalid labels: {e}"))?;
             slice.labels = labels;
+            // An explicit `labels` override is the DP resolving its AUTHORITATIVE
+            // identity (the documented way to pin a workload's labels — see
+            // docs/mesh.md "The marker is cleared on the recovered slice once the
+            // DP has resolved its authoritative labels"). Once provided, the
+            // shared-SPIFFE `labels_ambiguous` intersection marker is stale: these
+            // labels — not the slice's partial intersection — are this workload's
+            // real set, so the cold-path `retain` can narrow the candidate-any
+            // superset deterministically. Leaving the marker set would make the
+            // ambiguous fail-closed branches in `validate_scope_filter_identity`
+            // reject an otherwise-valid workload whose authoritative labels simply
+            // do not match a candidate-only selector policy carried in the superset
+            // (e.g. override `role=worker` while the slice also carried a
+            // `role=api` policy). Clear it so the override governs scoping.
+            slice.labels_ambiguous = false;
         }
 
         validate_policy_ip_inputs(&slice.mesh_policies)?;
@@ -787,6 +801,20 @@ fn validate_scope_filter_identity(slice: &MeshSlice, from_slice: bool) -> Result
                     // reject the slice or drop authz entirely — issue #1708); set
                     // `mesh_slice.labels` / `FERRUM_MESH_WORKLOAD_LABELS` for
                     // deterministic selector scoping on Sidecar/Ambient.
+                    //
+                    // A current Ferrum CP cannot reach this branch with a
+                    // genuinely-ambiguous slice: it sets `labels_ambiguous` on
+                    // divergent shared-SPIFFE candidates (slice.rs), and the
+                    // candidate-any projection only keeps a selector policy that
+                    // matches SOME candidate — a single label-less candidate `{}`
+                    // never matches a non-empty selector, so the policy is dropped
+                    // at slice build and never rides in. The only way an unmarked
+                    // empty-label slice carries an unsatisfiable selector policy is
+                    // a cross-version slice from a CP predating the marker (serde
+                    // defaults `labels_ambiguous = false`). Per the Build-Out Policy
+                    // (no legacy shims for old wire/config shapes; CP and DP ship
+                    // from one binary version), that case is out of scope and is not
+                    // failed closed here — set the labels to pin identity.
                     tracing::warn!(
                         policy = %policy.name,
                         "mesh_authz: workload-selector policy has selector labels but the slice \

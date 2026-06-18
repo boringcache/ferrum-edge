@@ -1030,6 +1030,49 @@ fn mesh_authz_construction_rejects_operator_selector_policy_without_labels() {
 }
 
 #[test]
+fn mesh_authz_construction_clears_ambiguous_marker_on_explicit_labels_override() {
+    // An ambiguous shared-SPIFFE slice (`labels_ambiguous = true`) carries a
+    // candidate-only `role=api` selector policy as a superset, but the operator
+    // pins the proxy identity with an explicit top-level `labels` override of
+    // `role=worker` (the documented way to resolve authoritative labels — see
+    // docs/mesh.md "The marker is cleared on the recovered slice once the DP has
+    // resolved its authoritative labels"). The override IS authoritative, so the
+    // stale ambiguous marker must be cleared: the `role=api` policy simply does
+    // not apply to `role=worker` and the cold-path `retain` drops it. Construction
+    // must NOT reject the workload (Codex P2: the recommended pin mechanism must
+    // not fail closed against a non-applicable candidate-only superset policy).
+    let policy = policy_allow_principal(
+        "role-api-allow",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
+    let slice = json!({
+        "node_id": "node-a",
+        "namespace": DEFAULT_NAMESPACE,
+        "version": "v1",
+        "mesh_policies": [policy],
+        "labels_ambiguous": true,
+        // No slice-embedded labels: the operator pins identity via the top-level
+        // `labels` override below, which must clear the ambiguous marker.
+    });
+    let config = json!({
+        "mesh_slice": slice,
+        "labels": { "role": "worker" },
+    });
+    assert!(
+        MeshAuthz::new(&config).is_ok(),
+        "an explicit `labels` override pins authoritative identity and must clear the \
+         ambiguous marker so a non-applicable candidate-only selector policy is dropped, not rejected"
+    );
+}
+
+#[test]
 fn mesh_authz_construction_filters_policies_for_workload_at_build_time() {
     // Verify the construction-time filter actually removes
     // non-applicable policies, not just at request time. Construct
