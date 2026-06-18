@@ -2271,7 +2271,9 @@ impl MeshConfig {
             &self.peer_authentications,
             &self.service_entries,
             &self.request_authentications,
+            &self.telemetry_resources,
             &self.destination_rules,
+            &self.proxy_configs,
             &self.sidecars,
             self.trust_bundles.as_ref(),
             self.multi_cluster.as_ref(),
@@ -2321,6 +2323,8 @@ pub fn validate_mesh_config(
         request_authentications,
         &[],
         &[],
+        &[],
+        &[],
         trust_bundles,
         None,
     )
@@ -2334,7 +2338,9 @@ fn validate_mesh_config_internal(
     peer_auths: &[PeerAuthentication],
     service_entries: &[ServiceEntry],
     request_authentications: &[MeshRequestAuthentication],
+    telemetry_resources: &[MeshTelemetryResource],
     destination_rules: &[MeshDestinationRule],
+    proxy_configs: &[MeshProxyConfig],
     sidecars: &[MeshSidecar],
     trust_bundles: Option<&TrustBundleSet>,
     multi_cluster: Option<&MultiClusterConfig>,
@@ -2676,6 +2682,30 @@ fn validate_mesh_config_internal(
         }
     }
 
+    // Telemetry
+    for telemetry in telemetry_resources {
+        validate_non_empty_string(
+            "MeshTelemetryResource.name".to_string(),
+            &telemetry.name,
+            &mut errors,
+        );
+        validate_non_empty_string(
+            format!("MeshTelemetryResource '{}'.namespace", telemetry.name),
+            &telemetry.namespace,
+            &mut errors,
+        );
+        if let Some(tracing) = telemetry.config.tracing.as_ref() {
+            validate_percentage(
+                format!(
+                    "MeshTelemetryResource '{}'.config.tracing.sampling_percentage",
+                    telemetry.name
+                ),
+                tracing.sampling_percentage,
+                &mut errors,
+            );
+        }
+    }
+
     // DestinationRules
     for dr in destination_rules {
         validate_non_empty_string(
@@ -2693,6 +2723,16 @@ fn validate_mesh_config_internal(
             &dr.host,
             &mut errors,
         );
+        // Validate top-level trafficPolicy boundary fields (outlier-detection
+        // ranges, client-TLS mode/cert consistency) that the K8s translator
+        // enforces but the native/file/xDS slice path otherwise skips.
+        if let Some(policy) = dr.traffic_policy.as_ref() {
+            validate_mesh_traffic_policy(
+                format!("MeshDestinationRule '{}'.traffic_policy", dr.name),
+                policy,
+                &mut errors,
+            );
+        }
         // `connectionPool.http.http1MaxPendingRequests` is enforced by the
         // limiter as a per-`(host, port)` pending gate where `Some(0)` is
         // hard-overflow (sheds EVERY H1 request). The K8s translator rejects
@@ -2718,6 +2758,14 @@ fn validate_mesh_config_internal(
                 *port,
                 &mut errors,
             );
+            validate_mesh_traffic_policy(
+                format!(
+                    "MeshDestinationRule '{}'.port_level_settings[{}]",
+                    dr.name, port
+                ),
+                policy,
+                &mut errors,
+            );
             validate_dr_connection_pool_http(
                 &format!(
                     "MeshDestinationRule '{}'.port_level_settings[{}].trafficPolicy",
@@ -2733,6 +2781,16 @@ fn validate_mesh_config_internal(
                 &subset.name,
                 &mut errors,
             );
+            if let Some(policy) = subset.traffic_policy.as_ref() {
+                validate_mesh_traffic_policy(
+                    format!(
+                        "MeshDestinationRule '{}'.subsets[{}].traffic_policy",
+                        dr.name, i
+                    ),
+                    policy,
+                    &mut errors,
+                );
+            }
             validate_dr_connection_pool_http(
                 &format!(
                     "MeshDestinationRule '{}'.subsets[{}].trafficPolicy",
@@ -2742,6 +2800,25 @@ fn validate_mesh_config_internal(
                 &mut errors,
             );
         }
+    }
+
+    // ProxyConfigs
+    for proxy_config in proxy_configs {
+        validate_non_empty_string(
+            "MeshProxyConfig.name".to_string(),
+            &proxy_config.name,
+            &mut errors,
+        );
+        validate_non_empty_string(
+            format!("MeshProxyConfig '{}'.namespace", proxy_config.name),
+            &proxy_config.namespace,
+            &mut errors,
+        );
+        validate_percentage(
+            format!("MeshProxyConfig '{}'.tracing_sampling", proxy_config.name),
+            proxy_config.tracing_sampling,
+            &mut errors,
+        );
     }
 
     // Sidecars
@@ -2840,6 +2917,117 @@ fn validate_non_empty_string(context: String, value: &str, errors: &mut Vec<Stri
 fn validate_non_zero_port(context: String, port: u16, errors: &mut Vec<String>) {
     if port == 0 {
         errors.push(format!("{context}: port must be greater than 0"));
+    }
+}
+
+fn validate_percentage(context: String, value: Option<f64>, errors: &mut Vec<String>) {
+    if let Some(value) = value
+        && (!value.is_finite() || !(0.0..=100.0).contains(&value))
+    {
+        errors.push(format!(
+            "{context}: must be a finite percentage from 0 to 100"
+        ));
+    }
+}
+
+fn validate_mesh_traffic_policy(
+    context: String,
+    policy: &MeshTrafficPolicy,
+    errors: &mut Vec<String>,
+) {
+    if let Some(outlier) = policy.outlier_detection.as_ref() {
+        validate_mesh_outlier_detection(format!("{context}.outlier_detection"), outlier, errors);
+    }
+    if let Some(tls) = policy.tls.as_ref() {
+        validate_mesh_traffic_policy_tls(format!("{context}.tls"), tls, errors);
+    }
+}
+
+fn validate_mesh_outlier_detection(
+    context: String,
+    outlier: &MeshOutlierDetection,
+    errors: &mut Vec<String>,
+) {
+    // Istio treats `consecutive5xxErrors: 0` as *disabling* 5xx ejection rather
+    // than as an out-of-range value, and the K8s translator preserves the
+    // `Some(0)` verbatim. Rejecting it here would make a valid Istio config fail
+    // mesh startup/reload, so only reject negatives-via-overflow ranges and the
+    // degenerate zero-interval / zero-base-ejection cases that disable recovery.
+    if matches!(outlier.interval_seconds, Some(0)) {
+        errors.push(format!(
+            "{context}.interval_seconds: must be greater than 0"
+        ));
+    }
+    // Istio requires `baseEjectionTime` to be at least 1ms; a `Some(0)` projects
+    // onto `PassiveHealthCheck.healthy_after_seconds = 0`, which disables
+    // automatic readmission (ejected hosts are never recovered). The native/file
+    // path deserializes seconds as an integer, so reject the zero case at the
+    // boundary instead of producing never-readmitted passive ejections.
+    if matches!(outlier.base_ejection_seconds, Some(0)) {
+        errors.push(format!(
+            "{context}.base_ejection_seconds: must be greater than 0"
+        ));
+    }
+    if let Some(max_ejection_percent) = outlier.max_ejection_percent
+        && max_ejection_percent > 100
+    {
+        errors.push(format!(
+            "{context}.max_ejection_percent: must be from 0 to 100"
+        ));
+    }
+}
+
+fn validate_mesh_traffic_policy_tls(
+    context: String,
+    tls: &MeshTrafficPolicyTls,
+    errors: &mut Vec<String>,
+) {
+    match tls.mode {
+        MtlsMode::Strict | MtlsMode::Permissive => errors.push(format!(
+            "{context}.mode: {mode:?} is invalid for DestinationRule client TLS",
+            mode = tls.mode
+        )),
+        MtlsMode::Mutual => {
+            validate_required_tls_path(
+                format!("{context}.client_certificate"),
+                tls.client_certificate.as_deref(),
+                errors,
+            );
+            validate_required_tls_path(
+                format!("{context}.private_key"),
+                tls.private_key.as_deref(),
+                errors,
+            );
+        }
+        MtlsMode::IstioMutual => {
+            // Istio requires every ClientTLSSettings field to be empty for
+            // ISTIO_MUTUAL: the workload SVID and its trust bundle are used and
+            // any caller-supplied cert/key/CA is silently ignored at TLS apply.
+            // Reject stray fields at the boundary instead of letting the slice
+            // silently change the trust configuration.
+            if tls.client_certificate.is_some() {
+                errors.push(format!(
+                    "{context}.client_certificate: must be absent when mode is IstioMutual"
+                ));
+            }
+            if tls.private_key.is_some() {
+                errors.push(format!(
+                    "{context}.private_key: must be absent when mode is IstioMutual"
+                ));
+            }
+            if tls.ca_certificates.is_some() {
+                errors.push(format!(
+                    "{context}.ca_certificates: must be absent when mode is IstioMutual"
+                ));
+            }
+        }
+        MtlsMode::Disable | MtlsMode::Simple => {}
+    }
+}
+
+fn validate_required_tls_path(context: String, value: Option<&str>, errors: &mut Vec<String>) {
+    if value.is_none_or(|value| value.trim().is_empty()) {
+        errors.push(format!("{context}: must be set and non-empty"));
     }
 }
 
