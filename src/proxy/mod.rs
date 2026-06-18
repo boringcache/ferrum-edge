@@ -14410,12 +14410,22 @@ async fn handle_proxy_request_inner(
         )
         && supports_hbone_backend(&state, &proxy, upstream_target.as_deref());
     if hbone_required && !current_dispatch_hbone {
+        let block_reason = if has_retry {
+            "effective retry config disables HBONE dispatch"
+        } else if requires_request_body_buffering {
+            "request body buffering disables HBONE dispatch"
+        } else if !stream_request_body {
+            "non-streaming request body disables HBONE dispatch"
+        } else {
+            "HBONE backend capability is not available"
+        };
         warn!(
             proxy_id = %proxy.id,
             upstream_target = ?upstream_target,
             has_retry,
             requires_request_body_buffering,
             stream_request_body,
+            block_reason,
             "mesh.hbone=true target requires HBONE dispatch; refusing direct-backend fallback"
         );
         return Ok(build_response(
@@ -14437,12 +14447,22 @@ async fn handle_proxy_request_inner(
         )
         && supports_mesh_mtls_backend(&state, &proxy, upstream_target.as_deref());
     if mesh_mtls_required && !current_dispatch_mesh_mtls {
+        let block_reason = if has_retry {
+            "effective retry config disables sidecar SVID-mTLS dispatch"
+        } else if requires_request_body_buffering {
+            "request body buffering disables sidecar SVID-mTLS dispatch"
+        } else if !stream_request_body {
+            "non-streaming request body disables sidecar SVID-mTLS dispatch"
+        } else {
+            "sidecar SVID-mTLS backend transport is not available"
+        };
         warn!(
             proxy_id = %proxy.id,
             upstream_target = ?upstream_target,
             has_retry,
             requires_request_body_buffering,
             stream_request_body,
+            block_reason,
             "mesh.mtls=true target requires sidecar SVID-mTLS dispatch; refusing direct-backend fallback"
         );
         return Ok(build_response(

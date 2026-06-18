@@ -2187,6 +2187,163 @@ impl PersistCounts {
     }
 }
 
+/// Reject a retry-enabled batch proxy whose `mesh_route_dispatch` rules route
+/// matched traffic to a mesh-tagged upstream (`mesh.hbone` / `mesh.mtls`) — the
+/// batch-import equivalent of the route-override conflict check in
+/// `Proxy::after_validate`.
+///
+/// The candidate plugin set mirrors the runtime plugin cache: the batch's own
+/// proxy-scoped/proxy_group `mesh_route_dispatch` instances the proxy attaches,
+/// plus enabled DB globals (excluded when a batch local instance shadows them by
+/// name). Override-destination upstreams resolve from the batch payload first,
+/// then the DB. Redirect rules and same-upstream rules that leave retry untouched
+/// are skipped (the latter is covered by the default-upstream check).
+async fn validate_batch_route_override_conflicts(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxy: &Proxy,
+    batch_upstreams: &std::collections::HashMap<&str, &crate::config::types::Upstream>,
+    batch_plugin_configs: &std::collections::HashMap<&str, &PluginConfig>,
+    validation_errors: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
+
+    let attached_ids: HashSet<&str> = proxy
+        .plugins
+        .iter()
+        .map(|a| a.plugin_config_id.as_str())
+        .collect();
+
+    // Proxy-scoped/proxy_group mesh_route_dispatch instances this proxy attaches,
+    // resolved from the batch payload first then the DB (a batch proxy can attach
+    // a pre-existing DB plugin). A local instance shadows DB globals of the same
+    // name.
+    let mut candidates: Vec<PluginConfig> = Vec::new();
+    let mut shadows_global = false;
+    for id in &attached_ids {
+        let pc = if let Some(pc) = batch_plugin_configs.get(*id) {
+            Some((*pc).clone())
+        } else {
+            match db.get_plugin_config(id).await? {
+                Some(pc) if pc.namespace == namespace => Some(pc),
+                _ => None,
+            }
+        };
+        if let Some(pc) = pc
+            && pc.enabled
+            && pc.plugin_name == "mesh_route_dispatch"
+        {
+            shadows_global = true;
+            candidates.push(pc);
+        }
+    }
+
+    if !shadows_global {
+        // A `scope=global` `mesh_route_dispatch` submitted IN THIS SAME BATCH needs
+        // no proxy association to run, and it is not yet in the DB — so the DB-global
+        // page below would miss it. Enumerate the batch's own enabled global
+        // dispatch plugins first (deduping by id against the DB fetch) so a batch
+        // that creates the whole conflicting graph (retry proxy + mesh upstream +
+        // global route override) is rejected before persist instead of 502ing.
+        let mut seen_global_ids: HashSet<String> = HashSet::new();
+        for pc in batch_plugin_configs.values() {
+            if pc.scope == PluginScope::Global
+                && pc.namespace == namespace
+                && pc.enabled
+                && pc.plugin_name == "mesh_route_dispatch"
+                && seen_global_ids.insert(pc.id.clone())
+            {
+                candidates.push((*pc).clone());
+            }
+        }
+        let mut offset = 0_i64;
+        const PAGE_SIZE: i64 = 1_000;
+        loop {
+            let page = db
+                .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
+                .await?;
+            let items_len = page.items.len() as i64;
+            for plugin in page.items {
+                if plugin.scope == PluginScope::Global
+                    && plugin.enabled
+                    && plugin.plugin_name == "mesh_route_dispatch"
+                    && seen_global_ids.insert(plugin.id.clone())
+                {
+                    candidates.push(plugin);
+                }
+            }
+            if items_len == 0 {
+                break;
+            }
+            offset += items_len;
+            if offset >= page.total {
+                break;
+            }
+        }
+    }
+
+    let default_uid = proxy.upstream_id.as_deref().unwrap_or("");
+    for pc in &candidates {
+        let Ok(dispatch) = MeshRouteDispatchConfig::from_value(&pc.config) else {
+            continue;
+        };
+        for rule in &dispatch.rules {
+            if rule.redirect.is_some() {
+                continue;
+            }
+            let Some(override_uid) = rule.destination.upstream_id.as_deref() else {
+                continue;
+            };
+            let rule_changes_retry = rule.retry.is_some() || rule.retry_disabled;
+            if override_uid == default_uid && !rule_changes_retry {
+                continue;
+            }
+            let effective_retry = if rule.retry.is_some() {
+                rule.retry.clone()
+            } else if rule.retry_disabled {
+                None
+            } else {
+                proxy.retry.clone()
+            };
+            // Runtime preserves `proxy.upstream_subset` only for a same-upstream
+            // rule; a different-upstream override drops it.
+            let selected_subset = if override_uid == default_uid {
+                proxy.upstream_subset.as_deref()
+            } else {
+                None
+            };
+            let resolved = if let Some(u) = batch_upstreams.get(override_uid) {
+                Some((*u).clone())
+            } else {
+                match db.get_upstream(override_uid).await {
+                    Ok(Some(u)) if u.namespace == namespace => Some(u),
+                    Ok(_) => None,
+                    Err(e) => return Err(e),
+                }
+            };
+            if let Some(upstream) = resolved
+                && let Some(conflict) =
+                    crate::config::types::first_effective_mesh_transport_conflict(
+                        &crate::config::types::proxy_with_resolved_port_caps(proxy, &upstream),
+                        &upstream,
+                        selected_subset,
+                        effective_retry.as_ref(),
+                        proxy.allowed_methods.as_deref(),
+                    )
+            {
+                validation_errors.push(
+                    crate::config::types::mesh_transport_retry_conflict_message(
+                        &proxy.id,
+                        override_uid,
+                        &conflict,
+                    ),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn persist_payload_resources(
     db: &dyn DatabaseBackend,
     payload: &RestorePayload,
@@ -3091,6 +3248,77 @@ async fn handle_batch_create(
                     proxy.id, subset_name, upstream_id
                 ));
             }
+        }
+
+        // Reject a retry-enabled proxy whose selected default-upstream targets
+        // require a mesh transport (`mesh.hbone` / `mesh.mtls`): retry forces that
+        // transport off at runtime and the request 502s (issue #1669). The
+        // per-resource CRUD paths reject this, so the batch import must too rather
+        // than persist a config the next load rejects. The upstream is resolved
+        // from the batch payload first, then the DB. Route-dispatch override
+        // destinations are checked separately below
+        // (`validate_batch_route_override_conflicts`).
+        if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+            let resolved_upstream = if let Some(upstream) = batch_upstreams.get(upstream_id) {
+                Some((*upstream).clone())
+            } else {
+                match db.get_upstream(upstream_id).await {
+                    Ok(Some(upstream)) if upstream.namespace == namespace => Some(upstream),
+                    Ok(_) => None,
+                    Err(err) => {
+                        validation_errors.push(format!(
+                            "Proxy '{}' upstream mesh-transport check failed: {}",
+                            proxy.id, err
+                        ));
+                        None
+                    }
+                }
+            };
+            if let Some(upstream) = resolved_upstream
+                && let Some(conflict) =
+                    crate::config::types::first_effective_mesh_transport_conflict(
+                        // Per-resource batch proxies arrive without their
+                        // `#[serde(skip)]` `dispatch_port_overrides` resolved;
+                        // derive them from the referenced upstream so a
+                        // `maxRetries = 0` mesh-port cap is honored as the runtime
+                        // applies it.
+                        &crate::config::types::proxy_with_resolved_port_caps(proxy, &upstream),
+                        &upstream,
+                        proxy.upstream_subset.as_deref(),
+                        proxy.retry.as_ref(),
+                        proxy.allowed_methods.as_deref(),
+                    )
+            {
+                validation_errors.push(
+                    crate::config::types::mesh_transport_retry_conflict_message(
+                        &proxy.id,
+                        upstream_id,
+                        &conflict,
+                    ),
+                );
+            }
+        }
+
+        // Spec/route overrides: an enabled `mesh_route_dispatch` plugin in this
+        // batch (proxy-scoped/proxy_group association) or an existing DB global can
+        // route matched traffic to a mesh-tagged upstream even when the proxy's
+        // default upstream is plain — the same 502 path. The per-resource CRUD
+        // proxy write rejects this; the batch must too rather than persist a config
+        // the next config load rejects (which silently stalls applying the batch).
+        if let Err(err) = validate_batch_route_override_conflicts(
+            db.as_ref(),
+            namespace,
+            proxy,
+            &batch_upstreams,
+            &batch_plugin_configs,
+            &mut validation_errors,
+        )
+        .await
+        {
+            validation_errors.push(format!(
+                "Proxy '{}' route-override mesh-transport check failed: {}",
+                proxy.id, err
+            ));
         }
 
         let mut unresolved = Vec::new();
