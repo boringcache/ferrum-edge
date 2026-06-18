@@ -264,6 +264,19 @@ pub struct RemoteEndpointStore {
     /// Generation at which each cluster was last registered. Stored alongside
     /// the snapshot so `install` can compare atomically.
     cluster_generation: Arc<ArcSwap<HashMap<String, u64>>>,
+    /// Serializes the remote-discovery success-metric *record* (in the poll
+    /// task) against the success-metric *clear* + generation retire (in the
+    /// reconcile task). The generation check that authorizes a metric record is
+    /// lock-free inside `install`, but the metric write itself lands in a
+    /// separate `DashMap` from `cluster_generation`, so without this lock a poll
+    /// that observed a live generation could resurrect the success / last-success
+    /// / endpoint-age series *after* a concurrent `remove` cleared it — leaving a
+    /// freshly-polled, endpoint-less cluster visible on unauthenticated
+    /// `/metrics`. Holding this lock across the generation-retire+clear and the
+    /// generation-check+record makes the two mutually exclusive, so removal can
+    /// never lose the race. This is the multi-second discovery/reconcile control
+    /// path, never the request hot path, so a mutex here is fine.
+    metrics_ordering: Arc<std::sync::Mutex<()>>,
 }
 
 impl Default for RemoteEndpointStore {
@@ -275,6 +288,7 @@ impl Default for RemoteEndpointStore {
             revision_tx: Arc::new(revision_tx),
             generation: Arc::new(AtomicU64::new(0)),
             cluster_generation: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
+            metrics_ordering: Arc::new(std::sync::Mutex::new(())),
         }
     }
 }
@@ -484,6 +498,63 @@ impl RemoteEndpointStore {
         if changed {
             self.revision_tx.send_modify(|revision| *revision += 1);
         }
+    }
+
+    /// Record a successful, still-live remote-discovery poll's success /
+    /// last-success / endpoint-age metrics — but only while holding the metrics
+    /// ordering lock and re-confirming the cluster's generation under it.
+    ///
+    /// The poll task computes its live/retired verdict inside `install`, but the
+    /// metric write happens in a separate `DashMap` from `cluster_generation`,
+    /// so a bare post-`install` record could resurrect the series *after* a
+    /// concurrent reconcile already retired the generation and cleared the
+    /// metrics (see [`Self::remove_and_clear_metrics`]). Taking the same lock
+    /// and re-checking the generation here makes the record mutually exclusive
+    /// with the retire+clear: either this record observes a live generation
+    /// (and any later clear removes it) or it observes the retired generation
+    /// (and skips), so removal can never lose the race and leave a
+    /// freshly-polled, endpoint-less cluster on unauthenticated `/metrics`.
+    fn record_remote_discovery_success_if_live(
+        &self,
+        cluster: &str,
+        trust_domain: &str,
+        fetched_at_unix_seconds: u64,
+        task_generation: u64,
+    ) {
+        // Poison is impossible: the critical sections are panic-free (atomic
+        // map ops + an ArcSwap load). Recover the guard either way rather than
+        // propagating, since a poisoned ordering lock must not wedge polling.
+        let _guard = self
+            .metrics_ordering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.cluster_generation_matches(cluster, task_generation) {
+            crate::plugins::mesh::prometheus_helpers::record_mesh_remote_discovery_poll_success(
+                cluster,
+                trust_domain,
+                fetched_at_unix_seconds,
+            );
+        }
+    }
+
+    /// Remove a remote cluster's endpoints **and** prune its discovery metric
+    /// series, retiring the generation and clearing the metrics under the
+    /// metrics ordering lock so the clear cannot race a concurrent
+    /// [`Self::record_remote_discovery_success_if_live`].
+    pub(crate) fn remove_and_clear_metrics(&self, cluster_name: &str, trust_domain: &str) {
+        let _guard = self
+            .metrics_ordering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Retire the generation + drop the endpoints first, then clear the
+        // metric series — all while holding the lock, so a poll task's
+        // generation-checked record (which takes the same lock) is serialized
+        // against this clear and cannot re-create the cleared series.
+        self.remove(cluster_name);
+        crate::plugins::mesh::prometheus_helpers::clear_mesh_remote_discovery_metrics(
+            cluster_name,
+            trust_domain,
+        );
     }
 }
 
@@ -870,15 +941,16 @@ impl RemoteDiscoveryManager {
             let _ = running.shutdown_tx.send(true);
             running.handle.abort();
             if remove_endpoints {
-                self.store.remove(cluster_name);
-                // Prune the success / last-success / endpoint-age series so a
-                // removed (or trust-withdrawn) cluster does not linger as a
-                // freshly-polled, endpoint-less entry on `/metrics`. Keyed by
-                // (cluster, trust_domain) to match the metric maps.
-                crate::plugins::mesh::prometheus_helpers::clear_mesh_remote_discovery_metrics(
-                    cluster_name,
-                    running.target.trust_domain.as_str(),
-                );
+                // Drop the endpoints (retiring the generation) AND prune the
+                // success / last-success / endpoint-age series so a removed (or
+                // trust-withdrawn) cluster does not linger as a freshly-polled,
+                // endpoint-less entry on `/metrics`. Keyed by
+                // (cluster, trust_domain) to match the metric maps. The retire +
+                // clear run under the store's metrics ordering lock so an
+                // in-flight poll's generation-checked success record cannot race
+                // this clear and re-create the series.
+                self.store
+                    .remove_and_clear_metrics(cluster_name, running.target.trust_domain.as_str());
             }
         }
     }
@@ -1187,11 +1259,18 @@ async fn remote_discovery_loop(
                 // in flight) must not refresh the success / last-success /
                 // endpoint-age gauges, or `/metrics` would advertise a healthy
                 // remote cluster whose endpoints were intentionally dropped.
+                //
+                // `install`'s live/retired verdict is computed lock-free, but the
+                // metric write lands in a separate map; recording through the
+                // store re-checks the generation under the metrics ordering lock
+                // so this record cannot resurrect the series after a concurrent
+                // reconcile retired the generation and cleared the metrics.
                 if outcome.is_live_poll() {
-                    crate::plugins::mesh::prometheus_helpers::record_mesh_remote_discovery_poll_success(
+                    store.record_remote_discovery_success_if_live(
                         &ctx.cluster_name,
                         ctx.trust_domain.as_str(),
                         now,
+                        task_generation,
                     );
                 }
                 backoff_secs = REMOTE_BACKOFF_INITIAL_SECS;
@@ -2919,6 +2998,61 @@ mod tests {
         assert!(
             store.snapshot().is_empty(),
             "retired cluster must not be reinstated by a no-op timestamp refresh"
+        );
+    }
+
+    /// codex finding (removal race): a poll task's success-metric record must be
+    /// dropped when its cluster's generation has been retired — so a poll that
+    /// completed `install` as live, but whose reconcile concurrently removed the
+    /// cluster and cleared the metric series, cannot RESURRECT the
+    /// success / last-success / endpoint-age series on unauthenticated
+    /// `/metrics`. The store re-checks the generation under the metrics ordering
+    /// lock before writing.
+    #[test]
+    fn success_metric_record_is_blocked_for_retired_cluster() {
+        // Unique cluster/trust-domain so the shared global metric maps don't
+        // collide with other tests rendering the same output.
+        let suffix = format!("{}-{}", std::process::id(), line!());
+        let cluster = format!("recordrace-{suffix}");
+        let trust_domain = format!("td-{suffix}.example");
+
+        let store = RemoteEndpointStore::new();
+        // Register the cluster, then retire it (reconcile remove + metric clear).
+        let stale_gen = store.register_cluster(&cluster);
+        store.remove_and_clear_metrics(&cluster, &trust_domain);
+
+        // The stale poll task — which observed a live generation inside
+        // `install` before the removal landed — now tries to record success with
+        // its (now retired) generation. The store must drop it.
+        store.record_remote_discovery_success_if_live(&cluster, &trust_domain, 1234, stale_gen);
+        let mut after_retired = String::new();
+        crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(
+            &mut after_retired,
+        );
+        assert!(
+            !after_retired.contains(&format!("cluster=\"{cluster}\"")),
+            "a retired-generation success record must NOT resurrect the metric series: {after_retired}"
+        );
+
+        // Sanity: a record on a freshly-registered (live) generation DOES write,
+        // proving the guard rejects only the retired case (not all records).
+        let live_gen = store.register_cluster(&cluster);
+        store.record_remote_discovery_success_if_live(&cluster, &trust_domain, 5678, live_gen);
+        let mut after_live = String::new();
+        crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(
+            &mut after_live,
+        );
+        assert!(
+            after_live.contains(&format!(
+                "ferrum_mesh_remote_discovery_last_success_timestamp_seconds{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\"}} 5678"
+            )),
+            "a live-generation success record must write the last-success gauge: {after_live}"
+        );
+
+        // Clean up the global metric maps so this test leaves no residue.
+        crate::plugins::mesh::prometheus_helpers::clear_mesh_remote_discovery_metrics(
+            &cluster,
+            &trust_domain,
         );
     }
 
