@@ -1810,6 +1810,20 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   #1803) and eBPF capture is `connect()`-hooked / TCP-only — so Ambient ships only
   the transport half (HBONE relay + codec, awaiting a producer). An Ambient UDP
   producer is blocked alongside F4.3.
+- **DTLS passthrough (F3 §3.3 Stage 5) — opaque, never terminated.** There is no
+  separate `Dtls` `AppProtocol`: a DTLS service port is declared `protocol: UDP` and
+  rides the exact same `mesh_udp_egress` datapath as any other UDP datagram. The mesh
+  relays DTLS **opaquely** — it never terminates the DTLS session, parses the
+  ClientHello, or routes on DTLS SNI (unlike the standalone `passthrough` UDP/DTLS
+  stream proxy, which peeks the first ClientHello for SNI). The inner DTLS handshake
+  and records are framed and relayed **byte-for-byte** (`mesh_udp_frame`); the
+  **outer** mesh hop's confidentiality/integrity come from HBONE / mesh-mTLS, while the
+  inner DTLS stays end-to-end between the two workloads. This is the plan's "UDP via
+  the mesh is datagram-over-stream with documented semantics" posture (Istio likewise
+  does not terminate mesh DTLS). **East-west pod→peer only**; external DTLS/UDP egress
+  via the EgressGateway stays out of scope (its ServiceEntry UDP ports are classified
+  but not materialized). The opaque relay is regression-pinned by
+  `dtls_handshake_datagram_round_trips_opaque` in `mesh_udp_frame`.
 - **Locally-generated pod UDP egress: OUTPUT-MARK → lo-reroute → PREROUTING-TPROXY
   loop.** TPROXY runs **only in `PREROUTING`**, never for locally-generated (OUTPUT)
   packets — jumping into a `-j TPROXY` chain from `mangle OUTPUT` is invalid and can
