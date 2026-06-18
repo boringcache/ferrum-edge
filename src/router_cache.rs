@@ -33,6 +33,13 @@ thread_local! {
 
 const ROUTER_CACHE_EVICTION_SAMPLE_LIMIT: usize = 256;
 const ROUTER_CACHE_EVICTION_MAX_REMOVALS: usize = 64;
+/// One in every `HEAD_BLEND_PERIOD` eviction passes mixes a small rotating slice
+/// of resident keys into the reservoir sample (see `frequency_aware_evict`) so
+/// that entries which fell out of the recency reservoir without ever being
+/// sampled can still become eviction candidates. Kept infrequent so the
+/// reservoir stays the dominant candidate source and the extra bounded head walk
+/// only runs occasionally. Must be non-zero (it is a modulus divisor).
+const HEAD_BLEND_PERIOD: u64 = 8;
 /// Capacity of each partition's eviction sample reservoir (a lock-free MPMC
 /// ring). Eviction samples candidate keys by draining this ring instead of
 /// walking a shard-ordered prefix of the DashMap, so per-pass work is bounded by
@@ -830,40 +837,65 @@ impl RouterCache {
     pub(crate) fn clear_lookup_caches(&self) {
         // Eviction is driven by the atomic entry counters, so the clear and the
         // counter reset must stay coherent even while request threads keep
-        // inserting cache misses concurrently. A blind `store(0)` after `clear()`
-        // would wipe out the `fetch_add(1)` of any insert that lands in the
-        // window between `clear()` and the store, leaving live DashMap entries
-        // uncounted and desyncing the counter *below* the real entry count —
-        // which under-reports admin stats and delays future eviction until later
-        // inserts make the counter catch up.
+        // inserting cache misses concurrently (a reload runs alongside live
+        // traffic). Neither a blind `store(0)` nor a `store(len())` is safe:
         //
-        // Instead reset each counter to the actual post-clear map length, read
-        // immediately after that partition's `clear()`. Inserts that raced in
-        // before the `len()` read are reflected in `len()`; inserts that land
-        // after it keep their own increment, so the counter can only ever be at
-        // or slightly above the live count, never short by a lost increment.
-        // Each partition is cleared and re-counted together so the per-partition
-        // race window is as small as possible (the regex partition no longer sits
-        // between the prefix clear and the prefix counter reset).
+        //   * `store(0)` and `store(self.prefix_cache.len())` both *overwrite*
+        //     the counter, so any insert whose `fetch_add(1)` lands between the
+        //     value being computed and the store has its increment clobbered.
+        //     With `store(len())` the racing insert's entry may not yet be
+        //     visible to the `len()` read, so the store can leave the counter
+        //     *below* the real entry count — under-reporting admin stats and
+        //     delaying future eviction until later inserts make up the lost
+        //     increment.
+        //
+        // Instead subtract a snapshot of the counter taken just before each
+        // `clear()`. `fetch_sub` is an atomic RMW that composes additively with
+        // concurrent `fetch_add(1)`s, so no increment is ever lost. Correctness
+        // sketch: every entry resident *after* the clear was inserted after the
+        // `clear()` call, so its `fetch_add` (which always follows its map
+        // insert) ran after the snapshot load and is therefore not part of the
+        // subtracted snapshot — resident entries stay counted, so the counter
+        // can never drop below the live count. The only imprecision is a
+        // transient *over*-count when an entry inserted just before the clear had
+        // its `fetch_add` run after the snapshot (its +1 is not subtracted even
+        // though `clear()` removed the entry); over-counting is self-correcting
+        // (the next eviction subtracts it) and is the safe direction. Each
+        // partition snapshots, clears, and subtracts together so the per-
+        // partition window is as small as possible (the regex partition no
+        // longer sits between the prefix snapshot and the prefix subtract).
+        let prefix_cleared = self.prefix_cache_entries.load(Ordering::Relaxed);
         self.prefix_cache.clear();
-        self.prefix_cache_entries
-            .store(self.prefix_cache.len(), Ordering::Relaxed);
+        subtract_cache_entries(&self.prefix_cache_entries, prefix_cleared);
+        let regex_cleared = self.regex_cache_entries.load(Ordering::Relaxed);
         self.regex_cache.clear();
-        self.regex_cache_entries
-            .store(self.regex_cache.len(), Ordering::Relaxed);
+        subtract_cache_entries(&self.regex_cache_entries, regex_cleared);
         drain_reservoir(&self.prefix_eviction_reservoir);
         drain_reservoir(&self.regex_eviction_reservoir);
         self.frequency_sketch.reset();
     }
 
     fn insert_prefix_cache_entry(&self, cache_key: String, entry: PrefixCacheEntry) {
-        // Record this key as an eviction candidate before the map consumes it.
-        // `force_push` is O(1) and lock-free; it overwrites the oldest queued key
-        // when the reservoir is full, and any key it drops is simply a candidate
-        // we chose not to consider. This runs only on the cold miss path, never
-        // on the cache-hit fast path.
-        let _ = self.prefix_eviction_reservoir.force_push(cache_key.clone());
-        if self.prefix_cache.insert(cache_key, entry).is_none() {
+        // Record this key as an eviction candidate only *after* the map insert
+        // lands, then trip eviction. If we enqueued before the insert, a
+        // concurrent eviction pass (the cache may already be over capacity) could
+        // pop this key, find `map.contains_key` still false, and drop it as
+        // stale — leaving the freshly inserted entry with no reservoir candidate,
+        // so under sustained traffic where the reservoir never empties cold
+        // entries stay outside the eviction sample and bias eviction toward later
+        // inserts. Enqueuing after the insert guarantees a popped candidate is
+        // live. `force_push` is O(1) and lock-free; it overwrites the oldest
+        // queued key when the reservoir is full, and any key it drops is simply a
+        // candidate we chose not to consider. This runs only on the cold miss
+        // path, never on the cache-hit fast path. The clone is required because
+        // the map insert consumes the key.
+        let reservoir_key = cache_key.clone();
+        let is_new = self.prefix_cache.insert(cache_key, entry).is_none();
+        // Entry is now resident either way; enqueue the candidate so any concurrent
+        // evictor that later pops it sees a live entry. On an overwrite this just
+        // refreshes recency (membership unchanged).
+        let _ = self.prefix_eviction_reservoir.force_push(reservoir_key);
+        if is_new {
             let entries = self.prefix_cache_entries.fetch_add(1, Ordering::Relaxed) + 1;
             if entries > self.max_cache_entries {
                 self.evict_prefix_sample();
@@ -872,10 +904,13 @@ impl RouterCache {
     }
 
     fn insert_regex_cache_entry(&self, cache_key: String, entry: RegexCacheEntry) {
-        // See `insert_prefix_cache_entry`: record the eviction candidate before
-        // the map consumes the key. Cold miss path only.
-        let _ = self.regex_eviction_reservoir.force_push(cache_key.clone());
-        if self.regex_cache.insert(cache_key, entry).is_none() {
+        // See `insert_prefix_cache_entry`: enqueue the eviction candidate only
+        // after the map insert lands so a concurrent evictor never pops it while
+        // it is not yet resident. Cold miss path only.
+        let reservoir_key = cache_key.clone();
+        let is_new = self.regex_cache.insert(cache_key, entry).is_none();
+        let _ = self.regex_eviction_reservoir.force_push(reservoir_key);
+        if is_new {
             let entries = self.regex_cache_entries.fetch_add(1, Ordering::Relaxed) + 1;
             if entries > self.max_cache_entries {
                 self.evict_regex_sample();
@@ -1244,14 +1279,19 @@ impl RouterCache {
     /// capacity, and — because every inserted key passes through the reservoir —
     /// lets cold entries anywhere in the map become eviction candidates.
     fn evict_prefix_sample(&self) {
-        // Bump the pass counter for telemetry; it no longer selects the sample.
-        self.prefix_eviction_attempts
-            .fetch_add(1, Ordering::Relaxed);
+        // Bump the pass counter for telemetry and reuse it as the head-blend
+        // rotation seed so successive passes periodically sample resident keys
+        // from a rotating window (see `frequency_aware_evict`).
+        let pass = self
+            .prefix_eviction_attempts
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         let removed = frequency_aware_evict(
             &self.prefix_cache,
             &self.prefix_eviction_reservoir,
             &self.frequency_sketch,
             self.max_cache_entries,
+            pass,
         );
         if removed > 0 {
             subtract_cache_entries(&self.prefix_cache_entries, removed);
@@ -1266,13 +1306,15 @@ impl RouterCache {
 
     /// Evict low-frequency entries from the regex cache using frequency-guided sampling.
     fn evict_regex_sample(&self) {
-        // Bump the pass counter for telemetry; it no longer selects the sample.
-        self.regex_eviction_attempts.fetch_add(1, Ordering::Relaxed);
+        // Bump the pass counter for telemetry and reuse it as the head-blend
+        // rotation seed (see `evict_prefix_sample` / `frequency_aware_evict`).
+        let pass = self.regex_eviction_attempts.fetch_add(1, Ordering::Relaxed) + 1;
         let removed = frequency_aware_evict(
             &self.regex_cache,
             &self.regex_eviction_reservoir,
             &self.frequency_sketch,
             self.max_cache_entries,
+            pass,
         );
         if removed > 0 {
             subtract_cache_entries(&self.regex_cache_entries, removed);
@@ -2059,17 +2101,37 @@ fn drain_reservoir(reservoir: &ArrayQueue<String>) {
 /// the only ones at risk. Frequently accessed entries are still protected
 /// (similar to Redis LFU and TinyUFO).
 ///
+/// `blend_rotation` periodically mixes a small bounded slice of *resident* keys
+/// into the sample so that entries which aged out of the reservoir before any
+/// eviction fired — e.g. the earliest inserts under the default >=10k cap, which
+/// fill the map before the first eviction and then fall out of the 4096-slot
+/// reservoir — can still become eviction candidates instead of becoming
+/// immortal. Production passes the per-partition eviction-attempts counter so
+/// the blend rotates its window across map positions over successive passes and
+/// only fires every `HEAD_BLEND_PERIOD` passes (the reservoir remains the
+/// dominant source). Passing `0` disables the blend (used by unit tests that
+/// assert pure-reservoir behavior). The rotated offset is capped at
+/// `sample_size`, so the head walk stays O(`sample_size`) and never becomes an
+/// O(n) scan.
+///
 /// If the reservoir is transiently empty (e.g. right after a clear, or a burst
 /// where pops outran pushes) the sample falls back to the head of the map via
-/// `iter().take(sample_size)` — bounded by `sample_size` (no `skip`, so no
-/// position-dependent scan) so the cache cannot overshoot capacity unbounded.
+/// `iter().take(sample_size)` — bounded by `sample_size` so the cache cannot
+/// overshoot capacity unbounded.
 ///
-/// Returns the number of entries actually removed.
+/// Residual: because the rotated offset is capped at `sample_size`, the blend
+/// only sweeps the first `~2 * sample_size` shard-ordered positions, not the
+/// whole map. Resident keys deeper than that still rely on re-entering the
+/// reservoir (a later access re-inserts them as a miss after a generation bump,
+/// or a survivor requeue keeps them) to become candidates. Uniform coverage of
+/// arbitrarily-deep stale residents would need shard-indexed sampling (a
+/// DashMap-internal `shards()` walk); that is deferred as a heavier rework.
 fn frequency_aware_evict<V>(
     map: &DashMap<String, V>,
     reservoir: &ArrayQueue<String>,
     sketch: &CountMinSketch,
     max_entries: usize,
+    blend_rotation: u64,
 ) -> usize {
     let sample_size = max_entries.min(ROUTER_CACHE_EVICTION_SAMPLE_LIMIT);
     if sample_size < 4 {
@@ -2101,6 +2163,30 @@ fn frequency_aware_evict<V>(
         }
         let freq = sketch.estimate(&key);
         sample.push((key, freq));
+    }
+
+    // Periodically blend a small, rotating slice of resident keys into the sample
+    // so older entries that fell out of the reservoir can still be evicted. Only
+    // every `HEAD_BLEND_PERIOD` passes, and only with spare sample budget, so the
+    // reservoir stays the primary candidate source and the pass stays bounded.
+    if blend_rotation != 0 && blend_rotation % HEAD_BLEND_PERIOD == 0 && sample.len() < sample_size
+    {
+        let head_budget = (sample_size / 4).max(1).min(sample_size - sample.len());
+        // Cap the rotated offset at `sample_size` so `skip` walks at most
+        // `sample_size` extra positions — the whole head step stays
+        // O(`sample_size`), never O(map.len()).
+        let rotation_steps = (blend_rotation / HEAD_BLEND_PERIOD) as usize;
+        let offset = rotation_steps
+            .wrapping_mul(head_budget)
+            .checked_rem(sample_size + 1)
+            .unwrap_or(0);
+        for entry in map.iter().skip(offset).take(head_budget) {
+            if !seen.insert(entry.key().clone()) {
+                continue; // already sampled from the reservoir this pass
+            }
+            let freq = sketch.estimate(entry.key());
+            sample.push((entry.key().clone(), freq));
+        }
     }
 
     // Reservoir empty/exhausted: fall back to a bounded head sample so eviction
@@ -2393,7 +2479,7 @@ mod tests {
         }
 
         let reservoir = reservoir_with_map_keys(&map);
-        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 100);
+        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 100, 0);
         assert!(removed > 0, "Should have evicted some entries");
         assert!(map.len() < 100, "Map should be smaller after eviction");
 
@@ -2423,7 +2509,7 @@ mod tests {
         let sketch = CountMinSketch::new(64, 1000);
         let map: DashMap<String, ()> = DashMap::new();
         let reservoir = reservoir_with_map_keys(&map);
-        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 100);
+        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 100, 0);
         assert_eq!(removed, 0);
     }
 
@@ -2434,7 +2520,7 @@ mod tests {
         let map: DashMap<String, ()> = DashMap::new();
         map.insert("a".into(), ());
         let reservoir = reservoir_with_map_keys(&map);
-        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 3);
+        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 3, 0);
         assert_eq!(removed, 0);
     }
 
@@ -2450,7 +2536,7 @@ mod tests {
         }
 
         let reservoir = reservoir_with_map_keys(&map);
-        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 10_000);
+        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 10_000, 0);
         assert!(
             removed <= ROUTER_CACHE_EVICTION_MAX_REMOVALS,
             "eviction removed {removed} entries despite bounded sample"
@@ -2472,7 +2558,7 @@ mod tests {
             map.insert(format!("key-{i}"), ());
         }
         let empty = ArrayQueue::new(ROUTER_CACHE_EVICTION_RING_CAPACITY);
-        let removed = frequency_aware_evict(&map, &empty, &sketch, 200);
+        let removed = frequency_aware_evict(&map, &empty, &sketch, 200, 0);
         assert!(removed > 0, "empty reservoir must fall back to head sample");
         assert!(removed <= ROUTER_CACHE_EVICTION_MAX_REMOVALS);
     }
@@ -2496,7 +2582,7 @@ mod tests {
             let _ = reservoir.force_push(format!("live-{i}"));
         }
         let before = map.len();
-        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 50);
+        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 50, 0);
         // Only live keys can be removed; stale candidates never touch the map.
         assert_eq!(map.len() + removed, before);
         for i in 0..100 {
@@ -2520,7 +2606,7 @@ mod tests {
         }
         let reservoir = reservoir_with_map_keys(&map);
 
-        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 50);
+        let removed = frequency_aware_evict(&map, &reservoir, &sketch, 50, 0);
         assert!(removed > 0, "expected at least one removal");
         // Survivors were requeued: the reservoir holds the sampled-but-kept
         // keys (sample_size - removed), not zero.
@@ -2618,21 +2704,24 @@ mod tests {
             cache.cache_len()
         );
 
-        // Hot entries should overwhelmingly survive (re-accessed just before the
-        // assertion to be sure they are resident, then counted). At least most of
-        // them must be present — the old prefix-only sampler would have evicted
-        // hot entries sitting in the covered windows.
-        for h in &hot {
-            let _ = cache.find_proxy(None, h);
-        }
+        // Hot entries must have *survived* eviction on their own frequency, so
+        // inspect cache residency directly rather than calling `find_proxy`
+        // (which would repopulate a missing entry from the route table and mask
+        // an eviction). The hot keys were accumulating frequency throughout the
+        // run (50 warm-up hits + ~1250 interleaved hits each), so they should be
+        // far above the cold keys (frequency 1) the sampler removes. The old
+        // prefix-only sampler would have evicted hot entries sitting in the
+        // covered shard windows; this asserts the reservoir+sketch keeps them.
         let surviving_hot = hot
             .iter()
-            .filter(|h| cache.find_proxy(None, h).is_some())
+            .filter(|h| cache.prefix_cache.contains_key(&make_cache_key(None, h)))
             .count();
         assert_eq!(
             surviving_hot,
             hot.len(),
-            "all hot entries should be resident after re-access"
+            "all hot entries should still be resident in the cache (not repopulated): \
+             survived {surviving_hot}/{}",
+            hot.len()
         );
     }
 
