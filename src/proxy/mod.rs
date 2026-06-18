@@ -1377,6 +1377,64 @@ pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
     )
 }
 
+pub fn websocket_origin_allowed(allowed_origins: &[String], origin: &str) -> bool {
+    allowed_origins
+        .iter()
+        .any(|allowed| websocket_origin_matches(allowed, origin))
+}
+
+fn websocket_origin_matches(allowed: &str, origin: &str) -> bool {
+    if allowed.eq_ignore_ascii_case(origin) {
+        return true;
+    }
+
+    match (
+        normalized_websocket_origin(allowed),
+        normalized_websocket_origin(origin),
+    ) {
+        (Some(allowed), Some(origin)) => allowed.eq_ignore_ascii_case(&origin),
+        _ => false,
+    }
+}
+
+fn normalized_websocket_origin(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw).ok()?;
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        return None;
+    }
+    // RFC 6454 serialized origins are scheme://host[:port] and never carry
+    // userinfo. Fail closed on credentials so an Origin like
+    // `https://attacker@good.example` is not normalized down to the
+    // allow-listed `https://good.example` and waved through admission.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    let default_port = match parsed.scheme() {
+        "http" | "ws" => 80,
+        "https" | "wss" => 443,
+        _ => return None,
+    };
+    let host = parsed.host_str()?;
+
+    let mut normalized = String::with_capacity(raw.len());
+    normalized.push_str(&parsed.scheme().to_ascii_lowercase());
+    normalized.push_str("://");
+    if host.contains(':') && !host.starts_with('[') {
+        normalized.push('[');
+        normalized.push_str(&host.to_ascii_lowercase());
+        normalized.push(']');
+    } else {
+        normalized.push_str(&host.to_ascii_lowercase());
+    }
+    if let Some(port) = parsed.port()
+        && port != default_port
+    {
+        normalized.push(':');
+        normalized.push_str(&port.to_string());
+    }
+    Some(normalized)
+}
+
 /// Is this H3 backend response the kind that should downgrade the cached
 /// H3 capability to `Unsupported`? Only connection / protocol-level
 /// failures — not 4xx/5xx application responses, not client disconnects,
@@ -12215,11 +12273,7 @@ async fn handle_proxy_request_inner(
         // When allowed_ws_origins is non-empty, reject upgrades from unlisted origins.
         if !proxy.allowed_ws_origins.is_empty() {
             let origin = ctx.headers.get("origin").map(|s| s.as_str()).unwrap_or("");
-            if !proxy
-                .allowed_ws_origins
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(origin))
-            {
+            if !websocket_origin_allowed(&proxy.allowed_ws_origins, origin) {
                 warn!(
                     "WebSocket upgrade rejected: Origin '{}' not in allowed_ws_origins for proxy {}",
                     origin, proxy.id
@@ -18477,6 +18531,18 @@ pub fn check_protocol_headers(
                 if !trimmed.iter().all(|&b| b.is_ascii_digit()) {
                     return Some(
                         r#"{"error":"Content-Length header contains invalid non-numeric value"}"#,
+                    );
+                }
+                if trimmed
+                    .iter()
+                    .try_fold(0usize, |acc, &digit| {
+                        acc.checked_mul(10)
+                            .and_then(|acc| acc.checked_add((digit - b'0') as usize))
+                    })
+                    .is_none()
+                {
+                    return Some(
+                        r#"{"error":"Content-Length header exceeds supported integer range"}"#,
                     );
                 }
                 // 2b. All tokens must agree on the same value

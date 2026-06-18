@@ -1982,11 +1982,7 @@ async fn handle_h3_request(
                 .get("origin")
                 .map(String::as_str)
                 .unwrap_or("");
-            if !proxy
-                .allowed_ws_origins
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(origin))
-            {
+            if !crate::proxy::websocket_origin_allowed(&proxy.allowed_ws_origins, origin) {
                 warn!(
                     "H3 WebSocket upgrade rejected: Origin '{}' not in allowed_ws_origins for proxy {}",
                     origin, proxy.id
