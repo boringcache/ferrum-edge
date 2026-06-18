@@ -896,6 +896,7 @@ fn build_sidecar_patch_for_namespace(
         path: "/metadata/annotations/ferrum.io~1injected".to_string(),
         value: Some(Value::String("true".to_string())),
     });
+    ensure_containers(pod, &mut patch);
     patch.push(JsonPatchOperation {
         op: "add",
         path: "/spec/containers/-".to_string(),
@@ -930,7 +931,7 @@ fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
 
     if value_is_false(annotations.and_then(|m| m.get("sidecar.istio.io/inject")))
         || value_is_false(annotations.and_then(|m| m.get("ferrum.io/inject")))
-        || value_is_false(labels.and_then(|m| m.get("ferrum.io/mesh")))
+        || mesh_label_opts_out(labels.and_then(|m| m.get("ferrum.io/mesh")))
     {
         return false;
     }
@@ -974,6 +975,12 @@ fn value_is_true(value: Option<&Value>) -> bool {
 fn value_is_false(value: Option<&Value>) -> bool {
     value
         .and_then(Value::as_str)
+        .is_some_and(|value| value == "false")
+}
+
+fn mesh_label_opts_out(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
         .is_some_and(|value| matches!(value, "false" | "disabled"))
 }
 
@@ -992,6 +999,16 @@ fn ensure_init_containers(pod: &Value, patch: &mut Vec<JsonPatchOperation>) {
         patch.push(JsonPatchOperation {
             op: "add",
             path: "/spec/initContainers".to_string(),
+            value: Some(json!([])),
+        });
+    }
+}
+
+fn ensure_containers(pod: &Value, patch: &mut Vec<JsonPatchOperation>) {
+    if pod.pointer("/spec/containers").is_none() {
+        patch.push(JsonPatchOperation {
+            op: "add",
+            path: "/spec/containers".to_string(),
             value: Some(json!([])),
         });
     }
@@ -1698,6 +1715,73 @@ mod tests {
         assert_eq!(
             jwt_secret.pointer("/valueFrom/secretKeyRef/key"),
             Some(&Value::String("cp-dp-grpc-jwt-secret".to_string()))
+        );
+    }
+
+    #[test]
+    fn patch_creates_missing_containers_array_before_appending_sidecar() {
+        let pod = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "enabled"}},
+            "spec": {}
+        });
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Explicit),
+            None,
+        )
+        .expect("patch");
+
+        let containers_index = patch
+            .iter()
+            .position(|op| op.path == "/spec/containers")
+            .expect("containers array guard");
+        let sidecar_index = patch
+            .iter()
+            .position(|op| op.path == "/spec/containers/-")
+            .expect("sidecar append");
+        assert!(
+            containers_index < sidecar_index,
+            "containers array must exist before appending the sidecar"
+        );
+    }
+
+    #[test]
+    fn istio_disabled_inject_annotation_does_not_opt_out() {
+        let pod = json!({
+            "metadata": {
+                "annotations": {"sidecar.istio.io/inject": "disabled"}
+            },
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(false, CaptureMode::Explicit),
+            None,
+        )
+        .expect("patch");
+
+        assert!(
+            patch.iter().any(|op| op.path == "/spec/containers/-"),
+            "Istio compatibility only treats sidecar.istio.io/inject=\"false\" as opt-out"
+        );
+    }
+
+    #[test]
+    fn ferrum_mesh_disabled_label_opts_out() {
+        let pod = json!({
+            "metadata": {"labels": {"ferrum.io/mesh": "disabled"}},
+            "spec": {"containers": [{"name": "app", "image": "app:test"}]}
+        });
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(false, CaptureMode::Explicit),
+            None,
+        )
+        .expect("patch");
+
+        assert!(
+            patch.is_empty(),
+            "Ferrum-native disabled label remains opt-out"
         );
     }
 
