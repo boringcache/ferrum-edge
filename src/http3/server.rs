@@ -4375,21 +4375,12 @@ pub(crate) fn inject_sticky_cookie(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
     {
-        let has_port_override = crate::proxy::backend_dispatch::has_effective_port_override(
+        let strategy = crate::proxy::backend_dispatch::hash_on_strategy_for_selected_target(
             proxy,
             &epoch.load_balancer,
             upstream_id,
             target.port,
         );
-        let strategy = if has_port_override {
-            LoadBalancerCache::get_hash_on_strategy_for_port_from(
-                &epoch.load_balancer,
-                upstream_id,
-                target.port,
-            )
-        } else {
-            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id)
-        };
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();

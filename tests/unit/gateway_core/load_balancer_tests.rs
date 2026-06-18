@@ -1080,6 +1080,64 @@ fn test_load_balancer_cache_get_hash_on_strategy() {
     );
 }
 
+#[test]
+fn test_load_balancer_cache_get_subset_hash_on_strategy() {
+    use ferrum_edge::config::types::{SubsetDefinition, SubsetTrafficPolicy};
+
+    let mut upstream = make_upstream("us-subset", make_targets(2));
+    upstream.algorithm = LoadBalancerAlgorithm::ConsistentHashing;
+    upstream.hash_on = Some("header:x-parent".to_string());
+    upstream.subsets = Some(vec![
+        SubsetDefinition {
+            name: "stable".into(),
+            labels: HashMap::from([("version".into(), "v1".into())]),
+            traffic_policy: Some(SubsetTrafficPolicy {
+                load_balancer_algorithm: Some(LoadBalancerAlgorithm::ConsistentHashing),
+                hash_on: None,
+                tls: None,
+                connect_timeout_ms: None,
+                passive_health_check: None,
+            }),
+        },
+        SubsetDefinition {
+            name: "canary".into(),
+            labels: HashMap::from([("version".into(), "v2".into())]),
+            traffic_policy: Some(SubsetTrafficPolicy {
+                load_balancer_algorithm: Some(LoadBalancerAlgorithm::ConsistentHashing),
+                hash_on: Some("cookie:canary-session".into()),
+                tls: None,
+                connect_timeout_ms: None,
+                passive_health_check: None,
+            }),
+        },
+    ]);
+
+    let cache = LoadBalancerCache::new(&GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    });
+    let snapshot = cache.load();
+
+    assert_eq!(
+        LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+            &snapshot,
+            "us-subset",
+            None,
+            Some("stable"),
+        ),
+        HashOnStrategy::Header("x-parent".to_string())
+    );
+    assert_eq!(
+        LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+            &snapshot,
+            "us-subset",
+            None,
+            Some("canary"),
+        ),
+        HashOnStrategy::Cookie("canary-session".to_string())
+    );
+}
+
 // ─── LoadBalancerCache apply_delta Tests ─────────────────────────────────────
 
 fn make_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
@@ -2004,6 +2062,7 @@ fn subset_traffic_policy_overrides_parent_algorithm() {
         labels: HashMap::from([("version".into(), "v2".into())]),
         traffic_policy: Some(SubsetTrafficPolicy {
             load_balancer_algorithm: Some(LoadBalancerAlgorithm::LeastConnections),
+            hash_on: None,
             tls: None,
             connect_timeout_ms: None,
             passive_health_check: None,

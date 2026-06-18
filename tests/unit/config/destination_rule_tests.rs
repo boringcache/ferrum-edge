@@ -20,6 +20,7 @@ fn subset_definition_round_trip_json() {
         labels: HashMap::from([("version".into(), "v2".into())]),
         traffic_policy: Some(SubsetTrafficPolicy {
             load_balancer_algorithm: Some(LoadBalancerAlgorithm::Random),
+            hash_on: Some("header:x-user".into()),
             tls: None,
             connect_timeout_ms: None,
             passive_health_check: None,
@@ -38,6 +39,15 @@ fn subset_definition_round_trip_json() {
             .unwrap()
             .load_balancer_algorithm,
         Some(LoadBalancerAlgorithm::Random)
+    );
+    assert_eq!(
+        deserialized
+            .traffic_policy
+            .as_ref()
+            .unwrap()
+            .hash_on
+            .as_deref(),
+        Some("header:x-user")
     );
 }
 
@@ -72,6 +82,7 @@ fn subset_definition_multi_label_selector() {
 fn subset_traffic_policy_omits_none_fields() {
     let policy = SubsetTrafficPolicy {
         load_balancer_algorithm: None,
+        hash_on: None,
         tls: None,
         connect_timeout_ms: None,
         passive_health_check: None,
@@ -90,6 +101,7 @@ fn subset_traffic_policy_tls_round_trip_json() {
 
     let policy = SubsetTrafficPolicy {
         load_balancer_algorithm: None,
+        hash_on: None,
         tls: Some(MeshTrafficPolicyTls {
             mode: MtlsMode::Mutual,
             ca_certificates: Some("/etc/certs/subset-ca.pem".into()),
@@ -230,6 +242,32 @@ fn upstream_validates_duplicate_subset_names() {
 }
 
 #[test]
+fn upstream_validates_oversized_subset_hash_on() {
+    // codex: a syntactically valid but very long subset hash_on (e.g. `header:`
+    // + megabytes) must be rejected at admission like upstream-level hash_on
+    // (MAX_HASH_ON_LENGTH), since it's persisted, cloned into the LB cache, and
+    // read per request.
+    let long = format!("header:{}", "x".repeat(1000));
+    let policy: SubsetTrafficPolicy =
+        serde_json::from_value(serde_json::json!({ "hash_on": long }))
+            .expect("subset traffic policy");
+    let u = make_upstream(Some(vec![SubsetDefinition {
+        name: "big".into(),
+        labels: HashMap::from([("v".into(), "1".into())]),
+        traffic_policy: Some(policy),
+    }]));
+
+    let errors = u.validate_fields().unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("subsets[0].traffic_policy.hash_on")),
+        "Expected oversized subset hash_on length error, got: {:?}",
+        errors
+    );
+}
+
+#[test]
 fn upstream_validates_empty_subset_labels() {
     let u = make_upstream(Some(vec![SubsetDefinition {
         name: "empty-labels".into(),
@@ -308,6 +346,7 @@ fn upstream_valid_subsets_pass_validation() {
             labels: HashMap::from([("version".into(), "v2".into())]),
             traffic_policy: Some(SubsetTrafficPolicy {
                 load_balancer_algorithm: Some(LoadBalancerAlgorithm::Random),
+                hash_on: None,
                 tls: None,
                 connect_timeout_ms: None,
                 passive_health_check: None,

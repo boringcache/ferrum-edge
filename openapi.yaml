@@ -7578,6 +7578,14 @@ components:
             Optional load-balancer algorithm override for this subset. When set,
             the subset uses this algorithm instead of the parent upstream's
             algorithm.
+        hash_on:
+          oneOf:
+            - type: string
+            - type: "null"
+          description: |
+            Optional hash-key source for subset-scoped consistent hashing. Uses
+            the same syntax as `Upstream.hash_on`: `ip`, `header:<name>`, or
+            `cookie:<name>`.
 
     LoadBalancerAlgorithm:
       type: string
