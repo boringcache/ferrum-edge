@@ -216,10 +216,18 @@ pub(crate) async fn handle_mesh_tcp_inbound(
             // The connection was admitted into the plugin chain, so any plugin
             // that allocated per-connection state before the rejecting one (e.g.
             // `tcp_connection_throttle`'s active count) must be released. Emit a
-            // zero-byte disconnect summary; the close is a policy decision, not an
-            // I/O failure, so no error class/cause is attributed (mirrors the
-            // generic TCP proxy, which records no `error_class` for a plugin
-            // reject either).
+            // zero-byte disconnect summary attributed as a policy reject, NOT a
+            // clean close: the generic TCP path wraps the same `on_stream_connect`
+            // reject as `StreamSetupKind::RejectedByPlugin`, which it classifies
+            // as a client-side `ErrorClass::RequestError` with a
+            // `ClientToBackend` direction and a `RecvError` disconnect cause (see
+            // `classify_stream_setup_kind` and `pre_copy_disconnect_{cause,
+            // direction}`). Mirror that here so `record_stream_transaction`
+            // counts the deny (it only records a failure when `error_class` is
+            // present) instead of logging a zero-byte graceful close. The
+            // `connection_error` text matches the generic path's
+            // `STREAM_ERR_REJECTED_BY_PLUGIN` prefix so log consumers see
+            // consistent wording across the two stream paths.
             emit_disconnect(
                 &plugins,
                 &mut stream_ctx,
@@ -230,10 +238,10 @@ pub(crate) async fn handle_mesh_tcp_inbound(
                 connected_at,
                 0,
                 0,
-                None,
-                None,
-                None,
-                None,
+                Some(tcp_proxy::STREAM_ERR_REJECTED_BY_PLUGIN.to_string()),
+                Some(crate::retry::ErrorClass::RequestError),
+                Some(crate::plugins::Direction::ClientToBackend),
+                Some(DisconnectCause::RecvError),
             )
             .await;
             return;
