@@ -508,6 +508,22 @@ async fn validate_mesh_route_dispatch_plugin_retry_conflicts(
     plugin_config: &PluginConfig,
 ) -> Result<Vec<String>, AfterValidateError> {
     if !plugin_config.enabled || plugin_config.plugin_name != "mesh_route_dispatch" {
+        // Disabling (or renaming away from `mesh_route_dispatch`) a proxy-scoped /
+        // proxy_group instance that the proxy ATTACHES stops it shadowing global
+        // `mesh_route_dispatch` plugins of the same name (`PluginCache::build_cache`
+        // removes a global only while a same-name local instance is enabled). A
+        // retry-enabled proxy can therefore start inheriting an existing global rule
+        // that routes to a mesh-tagged upstream, which the runtime would 502. The
+        // enabled-rule scan below never runs for this write, so re-check the
+        // newly-unshadowed globals for the proxies that attach this plugin. (A
+        // disabled GLOBAL instance cannot ADD a conflict — it only stops its own
+        // rules running — so this only applies to proxy / proxy_group scope.)
+        if matches!(
+            plugin_config.scope,
+            PluginScope::Proxy | PluginScope::ProxyGroup
+        ) {
+            return validate_unshadowed_globals_for_plugin(db, namespace, plugin_config).await;
+        }
         return Ok(Vec::new());
     }
     let dispatch = match MeshRouteDispatchConfig::from_value(&plugin_config.config) {
@@ -607,6 +623,146 @@ async fn validate_mesh_route_dispatch_plugin_retry_conflicts(
     }
 
     Ok(errors)
+}
+
+/// Re-validate retry/mesh-transport conflicts that a proxy/proxy_group
+/// `mesh_route_dispatch` plugin write *unshadows* by ceasing to be an enabled
+/// `mesh_route_dispatch` (it was disabled or renamed to a different plugin).
+///
+/// While a proxy attaches an enabled `mesh_route_dispatch` instance,
+/// `PluginCache::build_cache` removes every global `mesh_route_dispatch` of the
+/// same name from that proxy's chain. Disabling the local instance therefore lets
+/// the proxy inherit those globals again — and a global rule routing matched
+/// traffic to a mesh-tagged upstream (`mesh.hbone` / `mesh.mtls`) 502s on a
+/// retry-enabled proxy. The normal enabled-rule scan does not run for this write,
+/// so check the now-applicable globals for every proxy that attaches this plugin.
+///
+/// `after_validate` runs BEFORE the DB write, so the DB still reports this plugin
+/// as the old enabled `mesh_route_dispatch`; the shadow recomputation deliberately
+/// ignores `plugin_config.id` (the instance being unshadowed) while still honoring
+/// any OTHER enabled `mesh_route_dispatch` the proxy attaches.
+async fn validate_unshadowed_globals_for_plugin(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    plugin_config: &PluginConfig,
+) -> Result<Vec<String>, AfterValidateError> {
+    // Collect the override rules of every enabled global `mesh_route_dispatch`.
+    // Parsed configs are kept owned so the borrowed rule slice stays valid.
+    let mut global_dispatch_configs: Vec<MeshRouteDispatchConfig> = Vec::new();
+    {
+        let mut offset = 0_i64;
+        const PAGE_SIZE: i64 = 1_000;
+        loop {
+            let page = db
+                .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
+                .await
+                .map_err(AfterValidateError::Db)?;
+            let items_len = page.items.len() as i64;
+            for plugin in &page.items {
+                if plugin.scope == PluginScope::Global
+                    && plugin.enabled
+                    && plugin.plugin_name == "mesh_route_dispatch"
+                    && let Ok(dispatch) = MeshRouteDispatchConfig::from_value(&plugin.config)
+                {
+                    global_dispatch_configs.push(dispatch);
+                }
+            }
+            if items_len == 0 {
+                break;
+            }
+            offset += items_len;
+            if offset >= page.total {
+                break;
+            }
+        }
+    }
+    let global_override_rules: Vec<&crate::plugins::mesh_route_dispatch::RouteRule> =
+        global_dispatch_configs
+            .iter()
+            .flat_map(|dispatch| dispatch.rules.iter())
+            .filter(|rule| rule.redirect.is_none() && rule.destination.upstream_id.is_some())
+            .collect();
+    if global_override_rules.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut errors = Vec::new();
+    let mut offset = 0_i64;
+    const PAGE_SIZE: i64 = 1_000;
+    loop {
+        let page = db
+            .list_proxies_paginated(namespace, PAGE_SIZE, offset)
+            .await
+            .map_err(AfterValidateError::Db)?;
+        let items_len = page.items.len() as i64;
+        for proxy in &page.items {
+            // Only proxies that ATTACH the plugin being unshadowed are affected.
+            if !proxy
+                .plugins
+                .iter()
+                .any(|assoc| assoc.plugin_config_id == plugin_config.id)
+            {
+                continue;
+            }
+            // If the proxy still attaches ANOTHER enabled `mesh_route_dispatch`
+            // (one whose id differs from the plugin being disabled), the globals
+            // remain shadowed and must not be evaluated.
+            if proxy_shadows_global_mesh_route_dispatch_excluding(
+                db,
+                namespace,
+                proxy,
+                &plugin_config.id,
+            )
+            .await
+            .map_err(AfterValidateError::Db)?
+            {
+                continue;
+            }
+            evaluate_mesh_route_dispatch_rules_for_proxy(
+                db,
+                namespace,
+                proxy,
+                &global_override_rules,
+                &mut errors,
+            )
+            .await
+            .map_err(AfterValidateError::Db)?;
+        }
+        if items_len == 0 {
+            break;
+        }
+        offset += items_len;
+        if offset >= page.total {
+            break;
+        }
+    }
+    Ok(errors)
+}
+
+/// Whether `proxy` attaches an enabled, namespace-local `mesh_route_dispatch`
+/// instance whose id is NOT `excluded_id`. Used when a proxy/proxy_group
+/// `mesh_route_dispatch` plugin is being disabled: the DB still shows that
+/// instance as enabled, so it is excluded from the shadow computation while any
+/// OTHER enabled local instance still shadows the globals.
+async fn proxy_shadows_global_mesh_route_dispatch_excluding(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxy: &Proxy,
+    excluded_id: &str,
+) -> DbResult<bool> {
+    for assoc in &proxy.plugins {
+        if assoc.plugin_config_id == excluded_id {
+            continue;
+        }
+        if let Some(plugin) = db.get_plugin_config(&assoc.plugin_config_id).await?
+            && plugin.namespace == namespace
+            && plugin.enabled
+            && plugin.plugin_name == "mesh_route_dispatch"
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Evaluate one proxy against a set of upstream-overriding `mesh_route_dispatch`

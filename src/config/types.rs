@@ -2379,13 +2379,19 @@ fn proxy_retry_cap_for_port(proxy: &Proxy, port: u16) -> Option<u32> {
 /// after applying the per-port retry cap the runtime applies before deciding
 /// whether retry disables HBONE / SVID-mTLS dispatch.
 ///
-/// The conflicting target's dispatch port (`conflict.port`) drives the cap; it is
-/// `None` for mesh service discovery (targets not yet present), meaning no cap can
-/// be proven at admission so the base effectiveness stands. An operator who caps
-/// `dispatch_port_overrides[mesh_port].max_retries = 0` makes
-/// `cap_proxy_retry_for_target` zero `max_retries` for that target at runtime, so
-/// retry never engages and HBONE is not disabled — that config must NOT be
-/// rejected.
+/// The conflicting target's dispatch port (`conflict.port`) drives the per-port
+/// cap. It is `None` for mesh service discovery (discovered targets — and thus
+/// their dispatch ports — are not present at admission), but the runtime's
+/// [`crate::proxy::cap_proxy_retry_for_target`] still applies the top-level
+/// service-discovery `connectionPool.http.maxRetries` overlay
+/// (`Proxy.dispatch_port_override_fallback`) to EVERY discovered target whose
+/// per-port lookup misses. So a top-level DestinationRule `maxRetries = 0` on a
+/// mesh SD upstream disarms retry for every discovered target at dispatch time
+/// and must NOT be rejected here even though no concrete port is known yet.
+/// Likewise an operator who caps `dispatch_port_overrides[mesh_port].max_retries
+/// = 0` makes `cap_proxy_retry_for_target` zero `max_retries` for that target at
+/// runtime, so retry never engages and HBONE is not disabled — that config must
+/// also NOT be rejected.
 pub(crate) fn retry_is_effective_for_mesh_target(
     proxy: &Proxy,
     retry: Option<&RetryConfig>,
@@ -2398,12 +2404,24 @@ pub(crate) fn retry_is_effective_for_mesh_target(
     if !proxy_retry_is_effective(Some(retry), allowed_methods) {
         return false;
     }
-    match conflict
+    // Mirror `cap_proxy_retry_for_target`'s field-level fallback: the per-port
+    // `max_retries` for the selected port wins when present, otherwise the
+    // service-discovery top-level overlay (`dispatch_port_override_fallback`) is
+    // inherited. For an SD upstream `conflict.port` is `None` (no concrete port),
+    // so only the top-level fallback can be proven to govern — but it governs
+    // every discovered target, so honoring it here matches the runtime.
+    let cap = conflict
         .port
         .and_then(|port| proxy_retry_cap_for_port(proxy, port))
-    {
-        // A per-port cap of 0 disarms retry for this target at runtime, so the
-        // HBONE/mTLS dispatch path is preserved and there is no 502.
+        .or_else(|| {
+            proxy
+                .dispatch_port_override_fallback
+                .as_ref()
+                .and_then(|fallback| fallback.max_retries)
+        });
+    match cap {
+        // A cap of 0 disarms retry for this target at runtime, so the HBONE/mTLS
+        // dispatch path is preserved and there is no 502.
         Some(cap) => cap > 0,
         None => true,
     }
@@ -2442,9 +2460,12 @@ pub(crate) fn upstream_required_mesh_transports(
         return vec![MeshTransportConflict {
             transport: "mesh.hbone",
             detail: "mesh service discovery".to_string(),
-            // Discovered targets (and thus their dispatch ports) are not present
-            // at admission, so a per-port retry cap can't be proven to disarm
-            // retry here; keep the conflict unconditional.
+            // Discovered targets (and thus their concrete dispatch ports) are not
+            // present at admission, so no PER-PORT cap can be proven here. The
+            // top-level SD `connectionPool.http.maxRetries` overlay
+            // (`dispatch_port_override_fallback`) still governs every discovered
+            // port at runtime, so `retry_is_effective_for_mesh_target` consults it
+            // for this `port: None` conflict.
             port: None,
         }];
     }
@@ -3285,18 +3306,23 @@ impl GatewayConfig {
                 }
                 // Effective retry the runtime would apply for this matched rule.
                 //
-                // Residual (accepted): when a rule restricts itself to specific
-                // request methods (`rule.match.methods`) AND the rule's retry only
-                // engages status-code retries for methods outside that predicate,
-                // no request reaching this override can actually retry, so the
-                // conflict is theoretical. We intentionally do not intersect the
-                // rule's method predicate with `retryable_methods` here:
-                // `match.methods` supports prefix/regex matchers that cannot be
-                // statically intersected with a concrete method list, so a partial
-                // (exact-only) model would still over-reject the open-ended cases.
-                // `proxy_retry_is_effective` still gates on `allowed_methods`, so
-                // the only over-rejection is the narrow status-only + restricted
-                // rule-method + mesh-override combination.
+                // Residual (accepted): a rule's own request-method predicate
+                // (`rule.match.methods`) is intentionally NOT modeled here, so two
+                // narrow over-rejections remain. (1) When the rule restricts itself
+                // to methods outside its own `retryable_methods` (status-code
+                // retries only), no request reaching the override can retry. (2)
+                // When the rule's method predicate is disjoint from the proxy's
+                // `allowed_methods` (e.g. proxy allows only POST, rule matches only
+                // GET), method admission rejects every such request before plugins
+                // run, so the override is unreachable. Both could be filtered by
+                // intersecting the rule's method predicate, but `match.methods`
+                // supports prefix/regex matchers (see `MethodMatcher`) that cannot
+                // be statically intersected with the concrete `allowed_methods`
+                // list, and the lenient case-insensitive `allowed_methods` admission
+                // vs the rule's case-sensitive `Exact` matching makes even an
+                // exact-only model unsafe (it would introduce fresh under-rejection).
+                // `proxy_retry_is_effective` still gates on `allowed_methods`, so the
+                // residual is confined to these method-gated mesh-override rules.
                 let effective_retry = if rule.retry.is_some() {
                     rule.retry.clone()
                 } else if rule.retry_disabled {

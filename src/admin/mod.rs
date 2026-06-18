@@ -2239,6 +2239,23 @@ async fn validate_batch_route_override_conflicts(
     }
 
     if !shadows_global {
+        // A `scope=global` `mesh_route_dispatch` submitted IN THIS SAME BATCH needs
+        // no proxy association to run, and it is not yet in the DB — so the DB-global
+        // page below would miss it. Enumerate the batch's own enabled global
+        // dispatch plugins first (deduping by id against the DB fetch) so a batch
+        // that creates the whole conflicting graph (retry proxy + mesh upstream +
+        // global route override) is rejected before persist instead of 502ing.
+        let mut seen_global_ids: HashSet<String> = HashSet::new();
+        for pc in batch_plugin_configs.values() {
+            if pc.scope == PluginScope::Global
+                && pc.namespace == namespace
+                && pc.enabled
+                && pc.plugin_name == "mesh_route_dispatch"
+                && seen_global_ids.insert(pc.id.clone())
+            {
+                candidates.push((*pc).clone());
+            }
+        }
         let mut offset = 0_i64;
         const PAGE_SIZE: i64 = 1_000;
         loop {
@@ -2250,6 +2267,7 @@ async fn validate_batch_route_override_conflicts(
                 if plugin.scope == PluginScope::Global
                     && plugin.enabled
                     && plugin.plugin_name == "mesh_route_dispatch"
+                    && seen_global_ids.insert(plugin.id.clone())
                 {
                     candidates.push(plugin);
                 }
