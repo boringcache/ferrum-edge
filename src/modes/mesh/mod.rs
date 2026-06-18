@@ -19059,7 +19059,7 @@ mod tests {
         let svid_bundle = |local_roots: Vec<Vec<u8>>| SvidBundle {
             spiffe_id: id.clone(),
             cert_chain_der: vec![vec![1, 2, 3]],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td.clone(),
                 x509_authorities: local_roots,
@@ -19165,7 +19165,7 @@ mod tests {
         let svid_bundle = |local_roots: Vec<Vec<u8>>| SvidBundle {
             spiffe_id: id.clone(),
             cert_chain_der: vec![vec![1, 2, 3]],
-            private_key_pkcs8_der: Vec::new(),
+            private_key_pkcs8_der: Vec::new().into(),
             trust_bundles: TrustBundleSet::local_only(TrustBundle {
                 trust_domain: td.clone(),
                 x509_authorities: local_roots,
