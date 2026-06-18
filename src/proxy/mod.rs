@@ -7390,6 +7390,9 @@ async fn handle_websocket_request_authenticated(
     let max_ws_frame = state.max_websocket_frame_size_bytes;
     let ws_write_buf = state.websocket_write_buffer_size;
     let ws_tunnel = state.websocket_tunnel_mode;
+    let ws_tunnel_idle_disabled_safety_cap = websocket_tunnel_idle_disabled_safety_cap(
+        state.env_config.tcp_half_close_max_wait_seconds,
+    );
     let adaptive_buf = state.adaptive_buffer.clone();
     // Track the upgraded WebSocket session in `OverloadState.active_connections`
     // so graceful drain waits for in-flight WS sessions before exiting.
@@ -7481,6 +7484,7 @@ async fn handle_websocket_request_authenticated(
                             max_ws_frame,
                             ws_write_buf,
                             ws_tunnel,
+                            ws_tunnel_idle_disabled_safety_cap,
                             // H1/H2: RFC 6455 / RFC 8441 mandate masked
                             // client-to-server frames. The H3 caller in
                             // `src/http3/websocket.rs` passes `true` for
@@ -7505,6 +7509,7 @@ async fn handle_websocket_request_authenticated(
                             max_ws_frame,
                             ws_write_buf,
                             ws_tunnel,
+                            ws_tunnel_idle_disabled_safety_cap,
                             false,
                             ws_idle_tracker,
                             &adaptive_buf,
@@ -8427,6 +8432,19 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
 /// still bounding teardown for pathological peers.
 const WS_CANCEL_CLOSE_TIMEOUT_MS: u64 = 100;
 
+/// Drain grace used after one WebSocket relay half exits and the other half is
+/// cancelled. Also acts as the fallback safety bound for tunnel-mode residual
+/// forwarding when both the WebSocket idle timeout and TCP half-close cap are
+/// disabled by configuration.
+pub(crate) const WS_DRAIN_GRACE: Duration = Duration::from_secs(30);
+
+fn websocket_tunnel_idle_disabled_safety_cap(tcp_half_close_max_wait_seconds: u64) -> Duration {
+    if tcp_half_close_max_wait_seconds == 0 {
+        return WS_DRAIN_GRACE;
+    }
+    Duration::from_secs(tcp_half_close_max_wait_seconds).min(WS_DRAIN_GRACE)
+}
+
 #[inline]
 fn ws_message_payload_bytes(msg: &Message) -> u64 {
     match msg {
@@ -8681,6 +8699,7 @@ pub(crate) async fn run_websocket_proxy<C, B>(
     max_websocket_frame_size_bytes: usize,
     websocket_write_buffer_size: usize,
     websocket_tunnel_mode: bool,
+    websocket_tunnel_idle_disabled_safety_cap: Duration,
     accept_unmasked_client_frames: bool,
     ws_idle_tracker: Option<Arc<WsIdleTracker>>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
@@ -8728,39 +8747,51 @@ where
         // backend coalesced with the 101 response and forward them before the
         // raw relay can read later backend bytes.
         let (backend, backend_read_buffer) = backend_ws_stream.into_inner_with_read_buffer();
-        let mut recovered_backend_bytes_written = 0u64;
+        let recovered_backend_bytes_written;
+        let residual_write_timeout =
+            websocket_idle_timeout.unwrap_or(websocket_tunnel_idle_disabled_safety_cap);
         let pre_relay_failure = {
             use tokio::io::AsyncWriteExt;
             let mut offset = 0usize;
-            let mut failure = None;
-            while offset < backend_read_buffer.len() {
-                match client_io.write(&backend_read_buffer[offset..]).await {
-                    Ok(0) => {
-                        failure = Some(std::io::Error::new(
-                            std::io::ErrorKind::WriteZero,
-                            "client accepted zero bytes while forwarding WebSocket backend residual bytes",
-                        ));
-                        break;
-                    }
-                    Ok(n) => {
-                        offset = offset.saturating_add(n);
-                        recovered_backend_bytes_written =
-                            recovered_backend_bytes_written.saturating_add(n as u64);
-                    }
-                    Err(err) => {
-                        failure = Some(err);
-                        break;
+            let write_result = tokio::time::timeout(residual_write_timeout, async {
+                while offset < backend_read_buffer.len() {
+                    match client_io.write(&backend_read_buffer[offset..]).await {
+                        Ok(0) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "client accepted zero bytes while forwarding WebSocket backend residual bytes",
+                            ));
+                        }
+                        Ok(n) => {
+                            offset = offset.saturating_add(n);
+                        }
+                        Err(err) => {
+                            return Err(err);
+                        }
                     }
                 }
-            }
-            failure.map(|err| {
-                (
+                Ok(())
+            })
+            .await;
+            recovered_backend_bytes_written = offset as u64;
+            match write_result {
+                Ok(Ok(())) => None,
+                Ok(Err(err)) => Some((
                     crate::plugins::Direction::BackendToClient,
                     crate::retry::ErrorClass::ClientDisconnect,
                     Some(tcp_proxy::StreamIoSide::Write),
                     format!("failed forwarding WebSocket backend residual bytes to client: {err}"),
-                )
-            })
+                )),
+                Err(_) => Some((
+                    crate::plugins::Direction::BackendToClient,
+                    crate::retry::ErrorClass::ReadWriteTimeout,
+                    Some(tcp_proxy::StreamIoSide::Write),
+                    format!(
+                        "timed out after {}ms forwarding WebSocket backend residual bytes to client",
+                        residual_write_timeout.as_millis()
+                    ),
+                )),
+            }
         };
         if let Some((direction, class, side, message)) = pre_relay_failure {
             debug!(
@@ -8772,6 +8803,7 @@ where
                 error = %message,
                 "WebSocket tunnel residual forward failed"
             );
+            adaptive_buffer.record_connection(proxy_id, recovered_backend_bytes_written);
             fire_ws_tunnel_disconnect_hooks(
                 &ws_disconnect_plugins,
                 proxy_id,
@@ -8784,11 +8816,20 @@ where
             return Ok(());
         }
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+        // With the WebSocket idle timeout disabled, pass a non-zero relay cap
+        // so the shared TCP relay uses its direction-tracking path instead of
+        // Tokio's opaque fast path. That preserves per-direction byte counters
+        // when the relay exits with an error.
+        let tunnel_half_close_cap = if websocket_idle_timeout.is_none() {
+            Some(websocket_tunnel_idle_disabled_safety_cap)
+        } else {
+            None
+        };
         let copy_result = tcp_proxy::bidirectional_copy_for_relay(
             client_io,
             backend,
             websocket_idle_timeout,
-            None,
+            tunnel_half_close_cap,
             None,
             None,
             buf_size,
@@ -9280,7 +9321,6 @@ where
     // then wait on the remaining half with a bounded drain grace. If the
     // grace expires the remaining future is dropped — in-flight plugin calls
     // are cancelled and all captured sockets are released.
-    const WS_DRAIN_GRACE: Duration = Duration::from_secs(30);
     let mut c2b = Box::pin(client_to_backend);
     let mut b2c = Box::pin(backend_to_client);
     let client_done = tokio::select! {

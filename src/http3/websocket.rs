@@ -1150,6 +1150,7 @@ pub(crate) async fn handle_h3_websocket(
         max_ws_frame,
         ws_write_buf,
         false, // H3 always frame-parses; tunnel mode is H1-only
+        crate::proxy::WS_DRAIN_GRACE,
         // RFC 9220 §5: WebSocket frames over HTTP/3 are NOT masked.
         // TODO(h3-ws-rfc9220-masked-close): strict enforcement (closing
         // with 1002 on a masked frame) is still a documented compliance
