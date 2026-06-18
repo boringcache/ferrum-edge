@@ -26,14 +26,20 @@
 
 use std::collections::HashMap;
 
+use ferrum_edge::config::types::{BackendScheme, Consumer};
+use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
+use ferrum_edge::modes::mesh::MeshTrafficDirection;
 use ferrum_edge::modes::mesh::config::{
     ConditionMatch, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
     WorkloadSelector,
 };
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
-use ferrum_edge::plugins::{JwtAuthAttributeValue, Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::{
+    JwtAuthAttributeValue, Plugin, PluginResult, RequestContext, StreamConnectionContext,
+};
 use serde_json::json;
+use std::sync::Arc;
 
 use super::mesh_test_support::{
     DEFAULT_NAMESPACE, DEFAULT_TRUST_DOMAIN, default_mesh_runtime, mesh_config_with,
@@ -1074,6 +1080,154 @@ async fn condition_not_values_on_jwt_claim_allows_absent_attribute() {
             PluginResult::Reject { .. }
         ),
         "absent claim on a DENY not_values-only condition should fire (fail-closed)"
+    );
+}
+
+/// Build a `StreamConnectionContext` for an inbound captured raw-TCP stream
+/// landing on `listen_port`, identifying the peer by SPIFFE id in metadata.
+/// Mirrors what `proxy::mesh_tcp_inbound::handle_mesh_tcp_inbound` stamps before
+/// running the `on_stream_connect` chain (mesh-inbound direction, the captured
+/// APP port as the authorization destination).
+fn inbound_stream_ctx(listen_port: u16, peer_spiffe: &str) -> StreamConnectionContext {
+    let mut ctx = StreamConnectionContext {
+        client_ip: "10.0.0.7".to_string(),
+        proxy_id: "__mesh-in-tcp-relay-default-redis-6379".to_string(),
+        proxy_name: Some("mesh raw-tcp inbound".to_string()),
+        listen_port,
+        backend_scheme: BackendScheme::Tcp,
+        consumer_index: Arc::new(ConsumerIndex::new(&[] as &[Consumer])),
+        identified_consumer: None,
+        authenticated_identity: None,
+        auth_method: None,
+        metadata: None,
+        tls_client_cert_der: None,
+        tls_client_cert_chain_der: None,
+        sni_hostname: None,
+        mesh_direction: Some(MeshTrafficDirection::Inbound),
+        node_waypoint_policy_scope: None,
+        first_bytes: None,
+        first_bytes_kind: None,
+    };
+    // `mesh_authz`'s stream path reads the source principal from the
+    // `peer_spiffe_id` metadata key (parity with the HBONE/HTTP path).
+    ctx.insert_metadata("peer_spiffe_id".to_string(), peer_spiffe.to_string());
+    ctx
+}
+
+/// A DENY `AuthorizationPolicy` scoped to one destination port. Mirrors an
+/// operator denying L4 access to e.g. a Redis service port.
+fn deny_principal_on_port(name: &str, principal: &str, port: u16) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some(principal.to_string()),
+                namespace_pattern: None,
+                trust_domain: Some(TrustDomain::new(DEFAULT_TRUST_DOMAIN).expect("trust domain")),
+                trust_domain_pattern: None,
+            }],
+            to: vec![RequestMatch {
+                ports: vec![port],
+                ..RequestMatch::default()
+            }],
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Deny,
+        }],
+    }
+}
+
+/// A DENY scoped ONLY to a destination port (no `from` principal) — fires
+/// against any source, including an unauthenticated one.
+fn deny_any_source_on_port(name: &str, port: u16) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: vec![RequestMatch {
+                ports: vec![port],
+                ..RequestMatch::default()
+            }],
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Deny,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn stream_port_only_deny_rejects_unauthenticated_inbound_raw_tcp() {
+    // The captured-plaintext raw-TCP inbound path carries NO peer SVID (it is
+    // not mTLS-terminated), so the source is anonymous. A port-only DENY (no
+    // `from`) must still fire against it on the app port — the relay closes
+    // before reaching loopback. This is the most faithful representation of the
+    // real captured-plaintext L4 enforcement the handler must perform.
+    let deny = deny_any_source_on_port("deny-redis-port", 6379);
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny]);
+
+    // No `peer_spiffe_id` metadata: an unauthenticated captured stream.
+    let mut ctx = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+    ctx.metadata = None;
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "a port-only L4 DENY must reject an unauthenticated captured raw-TCP \
+         inbound stream on the app port"
+    );
+}
+
+#[tokio::test]
+async fn stream_port_scoped_deny_rejects_inbound_raw_tcp_on_app_port() {
+    // Regression for the raw-TCP Sidecar inbound finding: the accept-loop relay
+    // (`handle_mesh_tcp_inbound`) runs the `on_stream_connect` chain with the
+    // captured APP port as the stream destination BEFORE connecting to loopback.
+    // A `destination.port`-scoped DENY on that app port must therefore be
+    // evaluated and reject the connection (the handler closes without relaying).
+    let deny = deny_principal_on_port("deny-redis-l4", CLIENT_SPIFFE, 6379);
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny]);
+
+    // Authorizing on the app port (6379) — the DENY fires.
+    let mut ctx = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "a port-scoped L4 DENY on the app port must reject the captured raw-TCP \
+         inbound stream so the relay never reaches loopback"
+    );
+}
+
+#[tokio::test]
+async fn stream_port_scoped_deny_ignores_non_matching_port_and_admits_relay() {
+    // The DENY is scoped to a DIFFERENT port than the captured app port, so it
+    // must NOT fire — the legitimate stream-only-port relay case proceeds. This
+    // pins that authorizing on the real app port (not the shared :15006 capture
+    // listener) is the discriminator: were the handler to authorize on :15006,
+    // a 6379-scoped DENY would silently never apply.
+    let deny = deny_principal_on_port("deny-other-port", CLIENT_SPIFFE, 5432);
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny]);
+
+    let mut ctx = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut ctx).await,
+            PluginResult::Continue
+        ),
+        "a DENY scoped to an unrelated port must not block the captured raw-TCP \
+         inbound relay on the app port"
     );
 }
 

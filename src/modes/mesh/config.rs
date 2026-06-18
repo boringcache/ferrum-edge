@@ -2152,6 +2152,13 @@ pub struct MeshConfig {
     /// never operator-settable, never serialized.
     #[serde(skip)]
     pub declared_ingress_http_ports: usize,
+    /// Runtime-only back-projection of local Sidecar stream-family inbound
+    /// routes. The accept loop indexes these by captured original-destination
+    /// app port before handing plaintext inbound streams to Hyper, so raw TCP
+    /// protocols never need HTTP route parsing. `serde(skip)`: never
+    /// operator-settable, never serialized.
+    #[serde(skip)]
+    pub local_inbound_tcp_routes: Vec<MeshInboundTcpRoute>,
 }
 
 pub fn default_istio_root_namespace() -> String {
@@ -2184,6 +2191,7 @@ impl Default for MeshConfig {
             local_inbound_services: None,
             local_ingress_listeners: Vec::new(),
             declared_ingress_http_ports: 0,
+            local_inbound_tcp_routes: Vec::new(),
         }
     }
 }
@@ -2223,6 +2231,32 @@ pub struct MeshWaypointBinding {
     /// fails closed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<MeshWaypointServiceRef>,
+}
+
+/// Runtime-only local Sidecar raw-TCP inbound route, prepared from the same
+/// local workload/service view as HTTP-family inbound materialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshInboundTcpRoute {
+    /// Captured original-destination port that selects this route. For
+    /// REDIRECT-captured inbound traffic this is the local app/container port.
+    pub match_port: u16,
+    /// Loopback target for the co-located application.
+    pub backend_addr: std::net::SocketAddr,
+    /// Local service namespace, used for synthesized proxy identity/logging.
+    pub namespace: String,
+    /// Local service name, used for synthesized proxy identity/logging.
+    pub service_name: String,
+    /// Fully qualified service host, used in logs.
+    pub service_fqdn: String,
+    /// `true` only for opaque-TLS app ports (`AppProtocol::Tls`), where the
+    /// captured plaintext bytes are a real TLS ClientHello so the inbound relay
+    /// peeks the SNI before the stream plugin chain (a `when: connection.sni`
+    /// `AuthorizationPolicy` needs it). `false` for server-first raw-TCP ports
+    /// (Redis/MySQL/Postgres/Mongo/plain TCP), whose clients send NOTHING until
+    /// the backend greeting — peeking those would block the relay on the
+    /// handshake clock (up to `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`,
+    /// indefinitely when `0`) before the loopback dial.
+    pub tls_inspect: bool,
 }
 
 fn default_waypoint_for() -> String {

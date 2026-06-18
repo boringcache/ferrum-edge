@@ -1701,7 +1701,11 @@ const STREAM_FIRST_BYTES_PEEK_RETRY_INTERVAL: Duration = Duration::from_millis(5
 /// never completes — failing closed on the short prefix is the caller's job.
 ///
 /// Returns `None` when nothing was readable in time.
-async fn peek_tcp_first_bytes(
+///
+/// `pub(crate)` so the mesh raw-TCP inbound handler
+/// (`mesh_tcp_inbound::handle_mesh_tcp_inbound`) can capture the same plaintext
+/// prefix before running the global stream plugin chain.
+pub(crate) async fn peek_tcp_first_bytes(
     stream: &TcpStream,
     timeout: Option<Duration>,
     min_len: usize,

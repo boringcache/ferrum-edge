@@ -226,6 +226,13 @@ pub(crate) struct HostRouteTable {
     /// backing workload addresses, canonicalized the SAME way as the VIP keys);
     /// empty outside mesh mode.
     mesh_tcp_egress_by_workload: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision>,
+    /// Local Sidecar raw-TCP inbound lookup: captured original-destination app
+    /// port → loopback relay entry. Consulted by the inbound accept loop before
+    /// Hyper parses the connection, so Redis/MySQL/etc. bytes never enter the
+    /// HTTP parser. Built from runtime-only mesh preparation state; empty
+    /// outside Sidecar mesh mode or when no local stream-family service port
+    /// resolved.
+    mesh_tcp_inbound: HashMap<u16, Arc<MeshTcpInboundEntry>>,
     /// UDP mesh egress lookup (F3 §3.3 Stage 4): strict `(service VIP, UDP
     /// service port)` → relay entry, consulted by the UDP capture listener for
     /// each captured datagram's recovered original destination BEFORE any
@@ -252,6 +259,21 @@ pub(crate) struct MeshTcpEgressEntry {
     pub(crate) relay_proxy: Arc<Proxy>,
     /// The service FQDN (the upstream's DR-matchable name) for logging.
     pub(crate) service_fqdn: String,
+}
+
+/// One local raw-TCP Sidecar inbound destination: the synthesized relay proxy
+/// and loopback backend selected by captured original-destination app port.
+pub(crate) struct MeshTcpInboundEntry {
+    pub(crate) relay_proxy: Arc<Proxy>,
+    pub(crate) backend_addr: std::net::SocketAddr,
+    /// The local service FQDN for logging.
+    pub(crate) service_fqdn: String,
+    /// `true` only for opaque-TLS app ports: the inbound relay peeks the
+    /// ClientHello SNI before the stream plugin chain. `false` for server-first
+    /// raw-TCP ports, where peeking would block the relay on the handshake clock
+    /// (the client sends nothing until the backend greeting). Carried from
+    /// [`crate::modes::mesh::config::MeshInboundTcpRoute::tls_inspect`].
+    pub(crate) tls_inspect: bool,
 }
 
 /// Outcome of a raw-TCP egress lookup for a captured original destination
@@ -573,6 +595,20 @@ impl HostRouteTable {
         }
         self.mesh_tcp_egress_by_workload
             .get(&(orig_dst.ip().to_canonical(), orig_dst.port()))
+    }
+
+    /// Local Sidecar raw-TCP inbound lookup for a captured connection's
+    /// original destination. The inbound REDIRECT path preserves the local app
+    /// port in `orig_dst.port()`, which selects the loopback relay target.
+    /// `None` means no prepared stream-family local service port matched.
+    pub(crate) fn mesh_tcp_inbound_entry(
+        &self,
+        orig_dst: std::net::SocketAddr,
+    ) -> Option<Arc<MeshTcpInboundEntry>> {
+        if self.mesh_tcp_inbound.is_empty() {
+            return None;
+        }
+        self.mesh_tcp_inbound.get(&orig_dst.port()).cloned()
     }
 
     /// UDP mesh egress lookup (F3 §3.3 Stage 4) for a captured datagram's
@@ -1724,6 +1760,28 @@ impl RouterCache {
             }
         }
 
+        // ── Local raw-TCP Sidecar inbound lookup ──────────────────────────
+        // Forward-derived during mesh preparation from the same local
+        // workload/service view that HTTP inbound materialization consumes.
+        // Keyed by the captured original-destination app/container port.
+        let mut mesh_tcp_inbound: HashMap<u16, Arc<MeshTcpInboundEntry>> = HashMap::new();
+        if let Some(mesh) = config.mesh.as_deref() {
+            for route in &mesh.local_inbound_tcp_routes {
+                if route.match_port == 0 || route.backend_addr.port() == 0 {
+                    continue;
+                }
+                let relay_proxy = Arc::new(crate::modes::mesh::mesh_inbound_tcp_relay_proxy(route));
+                mesh_tcp_inbound.entry(route.match_port).or_insert_with(|| {
+                    Arc::new(MeshTcpInboundEntry {
+                        relay_proxy,
+                        backend_addr: route.backend_addr,
+                        service_fqdn: route.service_fqdn.clone(),
+                        tls_inspect: route.tls_inspect,
+                    })
+                });
+            }
+        }
+
         // ── UDP egress (VIP, UDP port) lookup (F3 §3.3 Stage 4) ─────────────
         // Forward-derived from the prepared `mesh` block: every declared UDP
         // service port × every declared service VIP. Routable when its per-port
@@ -2028,6 +2086,7 @@ impl RouterCache {
             mesh_inbound_ports,
             mesh_tcp_egress,
             mesh_tcp_egress_by_workload,
+            mesh_tcp_inbound,
             mesh_udp_egress,
         }
     }
@@ -4493,6 +4552,53 @@ mod tests {
             table.mesh_tcp_egress_decision("10.96.0.1:6379".parse().expect("addr")),
             Some(MeshTcpEgressDecision::CloseNotRoutable)
         ));
+    }
+
+    #[test]
+    fn mesh_tcp_inbound_table_routes_by_captured_app_port() {
+        use crate::config::types::BackendScheme;
+        use crate::modes::mesh::config::{MeshConfig, MeshInboundTcpRoute};
+
+        let route = MeshInboundTcpRoute {
+            match_port: 6380,
+            backend_addr: "127.0.0.1:6380".parse().unwrap(),
+            namespace: "default".to_string(),
+            service_name: "redis".to_string(),
+            service_fqdn: "redis.default.svc.cluster.local".to_string(),
+            // Redis is server-first: the relay must NOT peek SNI for this port.
+            tls_inspect: false,
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                local_inbound_tcp_routes: vec![route],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+        let table = cache.route_table.load();
+
+        let entry = table
+            .mesh_tcp_inbound_entry("10.0.0.7:6380".parse().unwrap())
+            .expect("captured app port should route");
+        assert_eq!(entry.backend_addr, "127.0.0.1:6380".parse().unwrap());
+        assert_eq!(entry.service_fqdn, "redis.default.svc.cluster.local");
+        assert!(
+            !entry.tls_inspect,
+            "server-first raw-TCP inbound entries must not SNI-peek (would stall on the handshake clock)"
+        );
+        assert_eq!(entry.relay_proxy.backend_scheme, Some(BackendScheme::Tcp));
+        assert_eq!(
+            entry.relay_proxy.id,
+            "__mesh-in-tcp-relay-default-redis-6380"
+        );
+
+        assert!(
+            table
+                .mesh_tcp_inbound_entry("10.0.0.7:6381".parse().unwrap())
+                .is_none(),
+            "raw-TCP inbound never routes by IP or nearby port alone"
+        );
     }
 
     #[test]

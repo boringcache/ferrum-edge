@@ -42,6 +42,7 @@ pub mod headers;
 pub mod http2_pool;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
+mod mesh_tcp_inbound;
 pub mod mesh_udp_capture;
 pub mod mesh_udp_frame;
 pub mod netns_capture;
@@ -5616,6 +5617,38 @@ impl ProxyState {
             .any(|id| old_route_indexed_proxy_ids.contains(id))
     }
 
+    /// Whether the `config.mesh` block changed in a way that requires a route
+    /// table rebuild.
+    ///
+    /// `ConfigDelta` only diffs proxies/upstreams/consumers/plugins (keyed on
+    /// `id`/`updated_at`); it never inspects `config.mesh`. But the route table
+    /// snapshot materializes several MESH-derived lookup maps that are NOT a
+    /// function of `config.proxies` — most notably the raw-TCP inbound port map
+    /// (`mesh_tcp_inbound`, derived from `mesh.local_inbound_tcp_routes`, a
+    /// `#[serde(skip)]` runtime field invisible to `ConfigDelta`), plus the
+    /// raw-TCP / UDP VIP egress tables (derived from `mesh.services`) and the
+    /// outbound/inbound/ingress sibling port groups. So a mesh slice update that
+    /// retargets/adds/removes a local stream-family service port (or any other
+    /// route-table mesh input) without changing a route-indexed proxy leaves
+    /// `delta_routes_changed` false, and the published epoch would reuse the STALE
+    /// `HostRouteTable` — the inbound accept loop would keep relaying removed/
+    /// retargeted raw-TCP ports to the old loopback backend, or fall through to
+    /// Hyper for newly added ports.
+    ///
+    /// The route table is a pure function of `config` (including `config.mesh`),
+    /// so comparing the whole mesh block here is the maintenance-safe signal: any
+    /// future addition to a route-table mesh map is covered automatically, with no
+    /// risk of an under-inclusive field list silently reintroducing the staleness.
+    /// A mesh-only change that does not actually alter the route table (e.g. a
+    /// `peer_authentications` edit) merely recomputes an equivalent snapshot — a
+    /// bounded, off-hot-path cost paid at config-application time only.
+    fn mesh_route_table_inputs_changed(
+        old_config: &GatewayConfig,
+        new_config: &GatewayConfig,
+    ) -> bool {
+        old_config.mesh != new_config.mesh
+    }
+
     fn delta_consumers_changed(delta: &crate::config_delta::ConfigDelta) -> bool {
         !delta.added_consumers.is_empty()
             || !delta.modified_consumers.is_empty()
@@ -5637,7 +5670,12 @@ impl ProxyState {
     ) -> Result<StagedRequestEpoch, String> {
         let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(new_config);
         let rebuild_globals = delta.global_plugin_configs_changed;
-        let route_changed = Self::delta_routes_changed(delta, &current.config);
+        // A route-indexed proxy delta OR a change to the route table's mesh
+        // inputs (e.g. `mesh.local_inbound_tcp_routes`, invisible to `ConfigDelta`)
+        // must rebuild the route table; otherwise the stale snapshot's mesh maps
+        // (raw-TCP inbound port map, VIP egress tables, sibling port groups) leak.
+        let route_changed = Self::delta_routes_changed(delta, &current.config)
+            || Self::mesh_route_table_inputs_changed(&current.config, new_config);
         let consumer_changed = Self::delta_consumers_changed(delta);
         let lb_changed = Self::delta_load_balancers_changed(delta);
 
@@ -5935,9 +5973,9 @@ impl ProxyState {
                     // `merge_remote_endpoints_into_mesh`) leaves the delta empty
                     // yet genuinely changes routable state. Republish the epoch
                     // with the fresh config so the request path observes the new
-                    // `config.mesh`; the pre-computed caches (routes, plugins,
-                    // consumers, LB) are unchanged and reused as-is
-                    // (`route_changed = false`, `lb_changed = false`).
+                    // `config.mesh`; the plugin/consumer/LB caches are unaffected
+                    // by a mesh-only change and reused as-is, and the route table
+                    // is reused UNLESS the mesh route inputs changed (see below).
                     //
                     // Without this, the `Ok(None)` no-delta path below updates
                     // only `ProxyState.config` (the ArcSwap the request path
@@ -5948,13 +5986,28 @@ impl ProxyState {
                     if current.config.mesh == new_config.mesh {
                         return Ok(None);
                     }
+                    // The mesh block changed. The pre-computed plugin/consumer/LB
+                    // caches are unaffected by a mesh-only change and are reused,
+                    // but the route table snapshot materializes mesh-derived maps
+                    // (raw-TCP inbound port map from the `#[serde(skip)]`
+                    // `mesh.local_inbound_tcp_routes`, VIP egress tables, sibling
+                    // port groups), and the route table is a pure function of
+                    // `config.mesh`, so a mesh change rebuilds it here. Without this,
+                    // a mesh slice update that retargets/adds/removes a local
+                    // stream-family port would leave the inbound accept loop relaying
+                    // to a stale loopback backend (or falling through to Hyper for a
+                    // newly added port). `mesh_route_table_inputs_changed` is the same
+                    // whole-mesh signal the incremental path ORs into `route_changed`;
+                    // having already established the mesh differs, the rebuild is
+                    // unconditional here.
+                    route_changed.set(true);
                     return Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
-                        route_table: Arc::clone(&current.route_table),
+                        route_table: RouterCache::build_route_table_snapshot(&new_config),
                         plugin_cache: Arc::clone(&current.plugin_cache),
                         consumer_index: Arc::clone(&current.consumer_index),
                         load_balancer: Arc::clone(&current.load_balancer),
-                        route_changed: false,
+                        route_changed: true,
                         lb_changed: false,
                     }));
                 }
@@ -10189,6 +10242,32 @@ async fn run_accept_loop(
                                         return;
                                     }
                                     None => {}
+                                }
+                            }
+
+                            // Raw-TCP Sidecar inbound: when mesh inbound TLS
+                            // is intentionally disabled/absent and iptables
+                            // REDIRECT captures plaintext TCP for a local
+                            // stream-family app port, route by the captured
+                            // original destination before Hyper tries to parse
+                            // Redis/MySQL/etc. bytes as HTTP.
+                            if tls_config.is_none()
+                                && mesh_direction
+                                    == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+                                && let Some(dst) = orig_dst
+                            {
+                                let epoch = state.request_epoch.load();
+                                if let Some(entry) = epoch.route_table.mesh_tcp_inbound_entry(dst) {
+                                    mesh_tcp_inbound::handle_mesh_tcp_inbound(
+                                        stream,
+                                        remote_addr,
+                                        &state,
+                                        &epoch,
+                                        &entry,
+                                        dst,
+                                    )
+                                    .await;
+                                    return;
                                 }
                             }
 

@@ -46,11 +46,11 @@ use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{DpGrpcTlsReload, GrpcJwtSecret, build_dp_grpc_tls_config};
 use crate::identity::ca::{CaBackend, CertificateAuthority};
 use crate::modes::mesh::config::{
-    AppProtocol, EastWestGateway, MeshConfig, MeshDestinationRule, MeshJwtRule, MeshLoadBalancer,
-    MeshLocalityLbSetting, MeshOutlierDetection, MeshRequestAuthentication, MeshSimpleLb,
-    MeshTelemetryConfig, MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyScope,
-    Resolution, ServiceEntry, ServiceEntryLocation, ServiceTargetPort, resolve_target_port,
-    service_entry_exported_to_namespace,
+    AppProtocol, EastWestGateway, MeshConfig, MeshDestinationRule, MeshInboundTcpRoute,
+    MeshJwtRule, MeshLoadBalancer, MeshLocalityLbSetting, MeshOutlierDetection,
+    MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig, MeshTrafficPolicy,
+    MeshTrafficPolicyTls, MtlsMode, PolicyScope, Resolution, ServiceEntry, ServiceEntryLocation,
+    ServiceTargetPort, resolve_target_port, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;
 use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
@@ -2431,10 +2431,41 @@ pub(crate) fn mesh_outbound_tcp_bywl_upstreams<'a>(
 /// inbound connection's captured original destination (REDIRECT-captured
 /// plain inbound) or the pre-strip `Host`/`:authority` port (peer-sidecar
 /// dials), failing closed when a multi-port request carries neither signal —
-/// see `HostRouteTable::select_mesh_inbound_port_route`. Stream (TCP) inbound
-/// lands in a later stage. The emitted proxies carry the
+/// see `HostRouteTable::select_mesh_inbound_port_route`. Stream-family raw TCP
+/// inbound is prepared as a runtime-only port map consumed by the accept loop
+/// before Hyper parses the connection. The emitted HTTP proxies carry the
 /// [`MESH_INBOUND_PROXY_ID_PREFIX`] so the request path keeps them off the
 /// outbound listener.
+fn resolve_sidecar_inbound_backend_port(
+    service_port: &crate::modes::mesh::config::ServicePort,
+    workload: &crate::modes::mesh::config::Workload,
+) -> Option<u16> {
+    match service_port.target_port.as_ref() {
+        Some(ServiceTargetPort::Number(n)) => Some(*n),
+        Some(ServiceTargetPort::Name(name)) => workload
+            .ports
+            .iter()
+            .find(|wp| wp.name.as_deref() == Some(name.as_str()))
+            .map(|wp| wp.port),
+        None if workload.ports.is_empty() => Some(service_port.port),
+        None => workload
+            .ports
+            .iter()
+            .find(|wp| wp.name.is_some() && wp.name == service_port.name)
+            .or_else(|| {
+                workload
+                    .ports
+                    .iter()
+                    .find(|wp| wp.port == service_port.port)
+            })
+            .or(match workload.ports.as_slice() {
+                [only] => Some(only),
+                _ => None,
+            })
+            .map(|wp| wp.port),
+    }
+}
+
 fn materialize_sidecar_inbound_proxies(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -2501,6 +2532,9 @@ fn materialize_sidecar_inbound_proxies(
     // declared, so the OR also covers a pre-marker slice that somehow carries
     // listeners without the flag.)
     if mesh_slice.sidecar_ingress_declared || !mesh_slice.local_ingress_listeners.is_empty() {
+        if let Some(mesh) = config.mesh.as_deref_mut() {
+            mesh.local_inbound_tcp_routes.clear();
+        }
         if mesh_slice.local_ingress_listeners.is_empty() {
             warn!(
                 local_spiffe,
@@ -2520,6 +2554,19 @@ fn materialize_sidecar_inbound_proxies(
     }
 
     let mut materialized = 0usize;
+    let mut tcp_routes = Vec::new();
+    // Container (app) ports claimed by a materialized HTTP-family inbound route.
+    // The raw-TCP inbound accept-loop branch matches ONLY `orig_dst.port()` and
+    // runs BEFORE Hyper routing + the mesh plugin chain, so a stream-family
+    // route sharing a container port with an HTTP-family route would splice a
+    // REDIRECTed HTTP request straight to loopback as raw TCP — bypassing the
+    // HTTP inbound route, `mesh_authz`, and the access log. When both families
+    // resolve to the same container port the HTTP route WINS: the raw-TCP entry
+    // is dropped so the request is parsed + authorized on the materialized HTTP
+    // route. Collected across ALL local services/workloads because the collision
+    // can straddle two distinct Services backing one workload.
+    let mut http_inbound_backend_ports: std::collections::HashSet<u16> =
+        std::collections::HashSet::new();
     for workload in crate::modes::mesh::slice::resolve_local_workloads(
         local_workload_src,
         local_spiffe,
@@ -2596,30 +2643,7 @@ fn materialize_sidecar_inbound_proxies(
                 // A workload that declares no ports defaults to the service port
                 // (Kubernetes' `targetPort`-defaults-to-`port` rule). Otherwise the
                 // target is genuinely ambiguous: skip and warn rather than misroute.
-                let backend_port = match service_port.target_port.as_ref() {
-                    Some(ServiceTargetPort::Number(n)) => Some(*n),
-                    Some(ServiceTargetPort::Name(name)) => workload
-                        .ports
-                        .iter()
-                        .find(|wp| wp.name.as_deref() == Some(name.as_str()))
-                        .map(|wp| wp.port),
-                    None if workload.ports.is_empty() => Some(service_port.port),
-                    None => workload
-                        .ports
-                        .iter()
-                        .find(|wp| wp.name.is_some() && wp.name == service_port.name)
-                        .or_else(|| {
-                            workload
-                                .ports
-                                .iter()
-                                .find(|wp| wp.port == service_port.port)
-                        })
-                        .or(match workload.ports.as_slice() {
-                            [only] => Some(only),
-                            _ => None,
-                        })
-                        .map(|wp| wp.port),
-                };
+                let backend_port = resolve_sidecar_inbound_backend_port(service_port, workload);
                 // Reject a 0 backend (invalid targetPort/port; config validation also
                 // rejects it for non-xDS slices) defensively rather than route to :0.
                 let Some(backend_port) = backend_port.filter(|&p| p != 0) else {
@@ -2635,6 +2659,12 @@ fn materialize_sidecar_inbound_proxies(
                     );
                     continue;
                 };
+                // Claim this container port for the HTTP family so the raw-TCP
+                // inbound branch never preempts it (recorded even when the
+                // operator-overlap scan below skips materializing our route —
+                // an operator proxy still serves HTTP on this port, not raw
+                // TCP).
+                http_inbound_backend_ports.insert(backend_port);
                 let proxy = mesh_inbound_loopback_proxy(
                     &mesh_inbound_proxy_id(&service.namespace, &service.name, service_port.port),
                     mesh_service_host_variants(
@@ -2688,13 +2718,93 @@ fn materialize_sidecar_inbound_proxies(
                 }
                 materialized += 1;
             }
+
+            for service_port in service_tcp_stream_ports(service) {
+                let backend_port = resolve_sidecar_inbound_backend_port(service_port, workload);
+                let Some(backend_port) = backend_port.filter(|&p| p != 0) else {
+                    warn!(
+                        service = %service.name,
+                        namespace = %service.namespace,
+                        service_port = service_port.port,
+                        target_port = ?service_port.target_port,
+                        "Cannot resolve a usable local backend port for an inbound raw-TCP mesh \
+                         route (no resolvable Service targetPort, and no port name/number match \
+                         among multiple container ports). Set targetPort or name ports \
+                         consistently. Skipping this route."
+                    );
+                    continue;
+                };
+                // Effective protocol with `protocol_overrides` applied (same
+                // resolution `service_tcp_stream_ports` filtered on). Only an
+                // opaque-TLS port carries a real ClientHello, so only it is SNI-
+                // peeked by the inbound relay; server-first ports (Redis/MySQL/
+                // Postgres/Mongo/plain TCP) must not peek or the relay stalls on
+                // the handshake clock waiting for bytes the client never sends
+                // before the backend greeting.
+                let effective_protocol = service
+                    .protocol_overrides
+                    .get(&service_port.port)
+                    .copied()
+                    .unwrap_or(service_port.protocol);
+                tcp_routes.push(MeshInboundTcpRoute {
+                    match_port: backend_port,
+                    backend_addr: std::net::SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        backend_port,
+                    ),
+                    namespace: service.namespace.clone(),
+                    service_name: service.name.clone(),
+                    service_fqdn: format!(
+                        "{}.{}.svc.{}",
+                        service.name,
+                        service.namespace,
+                        runtime.cluster_domain.trim_matches('.')
+                    ),
+                    tls_inspect: matches!(effective_protocol, AppProtocol::Tls),
+                });
+            }
         }
+    }
+
+    // HTTP-family inbound routes WIN a shared container port. Drop any raw-TCP
+    // route whose app port also backs an HTTP-family inbound route so the
+    // accept-loop branch never preempts HTTP parsing + `mesh_authz` + access
+    // logging for that port. Filtered AFTER the full workload/service sweep so
+    // the decision is independent of the order distinct Services are visited.
+    if !http_inbound_backend_ports.is_empty() {
+        tcp_routes.retain(|route| {
+            if http_inbound_backend_ports.contains(&route.match_port) {
+                warn!(
+                    service = %route.service_name,
+                    namespace = %route.namespace,
+                    app_port = route.match_port,
+                    "A stream-family inbound port collides with an HTTP-family inbound route on \
+                     the same container port; the HTTP route wins. Not installing a raw-TCP \
+                     inbound entry for this port (it would bypass HTTP routing, mesh authz, and \
+                     access logging)."
+                );
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    let tcp_route_count = tcp_routes.len();
+    if let Some(mesh) = config.mesh.as_deref_mut() {
+        mesh.local_inbound_tcp_routes = tcp_routes;
     }
 
     if materialized > 0 {
         info!(
             inbound_proxies = materialized,
             local_spiffe, "Materialized sidecar inbound routes to the local application"
+        );
+    }
+    if tcp_route_count > 0 {
+        info!(
+            inbound_tcp_routes = tcp_route_count,
+            local_spiffe, "Prepared sidecar raw-TCP inbound routes to the local application"
         );
     }
 }
@@ -2914,6 +3024,83 @@ fn mesh_inbound_loopback_proxy_to(
         strip_listen_path: false,
         // The local app expects its own service Host, not 127.0.0.1.
         preserve_host_header: true,
+        backend_connect_timeout_ms: 5_000,
+        backend_read_timeout_ms: 30_000,
+        backend_write_timeout_ms: 30_000,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: false,
+        backend_tls_server_ca_cert_path: None,
+        resolved_tls: BackendTlsConfig::default(),
+        dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
+        dns_override: None,
+        dns_cache_ttl_seconds: None,
+        auth_mode: Default::default(),
+        plugins: Vec::<PluginAssociation>::new(),
+        pool_idle_timeout_seconds: None,
+        pool_enable_http_keep_alive: None,
+        pool_enable_http2: None,
+        pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
+        pool_http2_initial_stream_window_size: None,
+        pool_http2_initial_connection_window_size: None,
+        pool_http2_adaptive_window: None,
+        pool_http2_max_frame_size: None,
+        pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
+        h2_upgrade_policy: None,
+        pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time via `resolve_effective_proxy_for_target`; a
+        // freshly-materialized mesh proxy starts at `None`.
+        pool_http1_max_pending_requests: None,
+        upstream_id: None,
+        upstream_subset: None,
+        api_spec_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: ResponseBodyMode::Stream,
+        listen_port: None,
+        frontend_tls: false,
+        passthrough: false,
+        udp_idle_timeout_seconds: 60,
+        udp_max_response_amplification_factor: None,
+        tcp_idle_timeout_seconds: Some(300),
+        allowed_methods: None,
+        allowed_ws_origins: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// Reserved id prefix for synthesized local raw-TCP inbound relay proxies.
+/// These proxies never enter `config.proxies`; they provide a stable proxy
+/// identity and timeout config for the accept-loop relay from captured
+/// plaintext inbound TCP to the co-located loopback app.
+pub(crate) const MESH_INBOUND_TCP_RELAY_PROXY_ID_PREFIX: &str = "__mesh-in-tcp-relay-";
+
+pub(crate) fn mesh_inbound_tcp_relay_proxy(route: &MeshInboundTcpRoute) -> Proxy {
+    let id = format!(
+        "{MESH_INBOUND_TCP_RELAY_PROXY_ID_PREFIX}{}-{}-{}",
+        route.namespace, route.service_name, route.match_port
+    )
+    .replace(['/', '.'], "-");
+    let now = chrono::Utc::now();
+    Proxy {
+        id: id.clone(),
+        name: Some(format!("mesh raw-tcp inbound {id}")),
+        namespace: route.namespace.clone(),
+        hosts: Vec::new(),
+        listen_path: None,
+        backend_scheme: Some(BackendScheme::Tcp),
+        dispatch_kind: Default::default(),
+        backend_host: route.backend_addr.ip().to_string(),
+        backend_port: route.backend_addr.port(),
+        backend_path: None,
+        strip_listen_path: false,
+        preserve_host_header: false,
         backend_connect_timeout_ms: 5_000,
         backend_read_timeout_ms: 30_000,
         backend_write_timeout_ms: 30_000,
@@ -13429,8 +13616,258 @@ mod tests {
         assert_eq!(
             route.backend_port, 9090,
             "a named targetPort must resolve to the matching container port, \
-             not the service port's own name"
+            not the service port's own name"
         );
+    }
+
+    #[test]
+    fn sidecar_inbound_tcp_routes_prepare_stream_family_ports() {
+        // Stream-family sidecar inbound cannot be host-routed through Hyper.
+        // Instead mesh preparation records a runtime-only app-port map consumed
+        // by the accept loop before HTTP parsing.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut local = workload("redis", "redis");
+        local.ports = vec![WorkloadPort {
+            port: 6380,
+            protocol: AppProtocol::Redis,
+            name: Some("redis".to_string()),
+        }];
+        let mut service = http_mesh_service("redis", 6379, spiffe);
+        service.ports[0].protocol = AppProtocol::Redis;
+        service.ports[0].target_port = Some(ServiceTargetPort::Name("redis".to_string()));
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local],
+            services: vec![service],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            !config
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-inbound-")),
+            "raw-TCP inbound does not add HTTP route proxies"
+        );
+        let mesh = config.mesh.as_deref().expect("prepared mesh config");
+        assert_eq!(mesh.local_inbound_tcp_routes.len(), 1);
+        let route = &mesh.local_inbound_tcp_routes[0];
+        assert_eq!(route.match_port, 6380);
+        assert_eq!(route.backend_addr, "127.0.0.1:6380".parse().unwrap());
+        assert_eq!(route.service_fqdn, "redis.default.svc.cluster.local");
+        assert!(
+            !route.tls_inspect,
+            "a server-first Redis inbound port must not be marked for SNI peeking"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_tls_tcp_route_marks_sni_inspect() {
+        // An opaque-TLS app port (`AppProtocol::Tls`) materializes a raw-TCP
+        // inbound route whose captured bytes ARE a ClientHello, so the relay must
+        // peek the SNI before the stream plugin chain (`tls_inspect == true`).
+        // This is the only stream-family inbound protocol that speaks first; the
+        // server-first ports above stay `false` so the relay never blocks on the
+        // handshake clock waiting for client bytes that arrive after the greeting.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/tlsapp";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut local = workload("tlsapp", "tlsapp");
+        local.ports = vec![WorkloadPort {
+            port: 8443,
+            protocol: AppProtocol::Tls,
+            name: Some("tls".to_string()),
+        }];
+        let mut service = http_mesh_service("tlsapp", 8443, spiffe);
+        service.ports[0].protocol = AppProtocol::Tls;
+        service.ports[0].target_port = Some(ServiceTargetPort::Name("tls".to_string()));
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local],
+            services: vec![service],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let mesh = config.mesh.as_deref().expect("prepared mesh config");
+        assert_eq!(mesh.local_inbound_tcp_routes.len(), 1);
+        let route = &mesh.local_inbound_tcp_routes[0];
+        assert_eq!(route.match_port, 8443);
+        assert!(
+            route.tls_inspect,
+            "an opaque-TLS inbound port must be marked for ClientHello SNI peeking"
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_tcp_route_yields_shared_app_port_to_http_route() {
+        // Shared-port preemption guard: when an HTTP-family service port and a
+        // stream-family service port resolve to the SAME container/app port, the
+        // HTTP inbound route wins. No raw-TCP inbound entry is prepared for that
+        // port, so the accept-loop branch (which matches only `orig_dst.port()`
+        // before Hyper routing + `mesh_authz`) cannot splice a REDIRECTed HTTP
+        // request straight to loopback as raw TCP.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/web";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        // Single container port 8080 backs both service ports below.
+        let mut local = workload("web", "web");
+        local.ports = vec![WorkloadPort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }];
+        // One Service exposing an HTTP port (80→8080) and a stream-family port
+        // (6379→8080) that BOTH target the same container port.
+        let mut service = http_mesh_service("web", 80, spiffe);
+        service.ports[0].target_port = Some(ServiceTargetPort::Number(8080));
+        service.ports.push(crate::modes::mesh::config::ServicePort {
+            port: 6379,
+            protocol: AppProtocol::Redis,
+            name: Some("redis".to_string()),
+            target_port: Some(ServiceTargetPort::Number(8080)),
+        });
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local],
+            services: vec![service],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        // The HTTP inbound route for the shared port IS materialized.
+        assert!(
+            config
+                .proxies
+                .iter()
+                .any(|p| p.id == "__mesh-inbound-default-web-80" && p.backend_port == 8080),
+            "the HTTP-family inbound route must still materialize on the shared app port"
+        );
+        // No raw-TCP inbound entry preempts the shared port.
+        let mesh = config.mesh.as_deref().expect("prepared mesh config");
+        assert!(
+            mesh.local_inbound_tcp_routes.is_empty(),
+            "no raw-TCP inbound route may be prepared for a port also backing an \
+             HTTP-family inbound route; the HTTP route wins, got {:?}",
+            mesh.local_inbound_tcp_routes
+        );
+    }
+
+    #[test]
+    fn sidecar_inbound_tcp_route_kept_when_app_port_is_stream_only() {
+        // The shared-port guard must NOT regress the legitimate stream-only-port
+        // case: a stream-family port on a DISTINCT container port still prepares
+        // its raw-TCP inbound route alongside the HTTP route.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/web";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut local = workload("web", "web");
+        local.ports = vec![
+            WorkloadPort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            },
+            WorkloadPort {
+                port: 6379,
+                protocol: AppProtocol::Redis,
+                name: Some("redis".to_string()),
+            },
+        ];
+        let mut service = http_mesh_service("web", 80, spiffe);
+        service.ports[0].target_port = Some(ServiceTargetPort::Number(8080));
+        service.ports.push(crate::modes::mesh::config::ServicePort {
+            port: 6379,
+            protocol: AppProtocol::Redis,
+            name: Some("redis".to_string()),
+            target_port: Some(ServiceTargetPort::Number(6379)),
+        });
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: vec![local],
+            services: vec![service],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        assert!(
+            config
+                .proxies
+                .iter()
+                .any(|p| p.id == "__mesh-inbound-default-web-80" && p.backend_port == 8080),
+            "the HTTP inbound route on its own container port is unaffected"
+        );
+        let mesh = config.mesh.as_deref().expect("prepared mesh config");
+        assert_eq!(
+            mesh.local_inbound_tcp_routes.len(),
+            1,
+            "the stream-only container port keeps its raw-TCP inbound route"
+        );
+        assert_eq!(mesh.local_inbound_tcp_routes[0].match_port, 6379);
+    }
+
+    #[test]
+    fn sidecar_inbound_tcp_routes_use_local_inbound_views() {
+        // Same security boundary as HTTP inbound: when Sidecar narrowing
+        // preserves a local-inbound view while egress scope emptied `services`,
+        // raw-TCP inbound must still derive from the local view.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some(spiffe.to_string()),
+            ..test_mesh_runtime_config()
+        };
+        let mut service = http_mesh_service("redis", 6379, spiffe);
+        service.ports[0].protocol = AppProtocol::Redis;
+        service.ports[0].target_port = Some(ServiceTargetPort::Name("redis".to_string()));
+        let mut local = workload("redis", "redis");
+        local.ports = vec![WorkloadPort {
+            port: 6379,
+            protocol: AppProtocol::Redis,
+            name: Some("redis".to_string()),
+        }];
+        let slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            version: "test".to_string(),
+            workloads: Vec::new(),
+            services: Vec::new(),
+            local_inbound_workloads: Some(vec![local]),
+            local_inbound_services: vec![service],
+            ..MeshSlice::default()
+        };
+
+        let config =
+            gateway_config_from_mesh_slice(&slice, &runtime, None, None).expect("slice → config");
+        let routes = &config
+            .mesh
+            .as_deref()
+            .expect("prepared mesh config")
+            .local_inbound_tcp_routes;
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].match_port, 6379);
     }
 
     #[test]
