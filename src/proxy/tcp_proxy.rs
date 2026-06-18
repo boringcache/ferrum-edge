@@ -33,6 +33,9 @@ use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
+use crate::modes::mesh::outbound_enforcement::{
+    Decision, MeshOutboundEnforcement, PROTOCOL_TCP, PROTOCOL_TCP_TLS,
+};
 use crate::plugins::{
     Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind, StreamConnectionContext,
     StreamTransactionSummary,
@@ -705,6 +708,46 @@ pub struct TcpProxyMetrics {
     pub backend_inflight: BackendConnectionLimiter,
 }
 
+struct TcpActiveConnectionGuard {
+    metrics: Arc<TcpProxyMetrics>,
+}
+
+impl TcpActiveConnectionGuard {
+    fn new(metrics: Arc<TcpProxyMetrics>) -> Self {
+        metrics.active_connections.fetch_add(1, Ordering::Relaxed);
+        Self { metrics }
+    }
+}
+
+impl Drop for TcpActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tcp_active_connection_guard_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use super::{TcpActiveConnectionGuard, TcpProxyMetrics};
+
+    #[test]
+    fn guard_releases_listener_metric_on_drop() {
+        let metrics = Arc::new(TcpProxyMetrics::default());
+        assert_eq!(metrics.active_connections.load(Ordering::Relaxed), 0);
+
+        {
+            let _guard = TcpActiveConnectionGuard::new(Arc::clone(&metrics));
+            assert_eq!(metrics.active_connections.load(Ordering::Relaxed), 1);
+        }
+
+        assert_eq!(metrics.active_connections.load(Ordering::Relaxed), 0);
+    }
+}
+
 struct TcpBackendSessionGuard<'a> {
     metrics: &'a TcpProxyMetrics,
 }
@@ -1058,7 +1101,6 @@ async fn run_tcp_accept_loop(
                 }
 
                 state.metrics.total_connections.fetch_add(1, Ordering::Relaxed);
-                state.metrics.active_connections.fetch_add(1, Ordering::Relaxed);
 
                 let port = state.port;
                 let proxy_id = state.proxy_id.clone();
@@ -1093,6 +1135,7 @@ async fn run_tcp_accept_loop(
                     state.node_waypoint_identity_resolver.clone();
 
                 tokio::spawn(async move {
+                    let _active_metric_guard = TcpActiveConnectionGuard::new(metrics.clone());
                     // Track this connection for global overload accounting and graceful drain.
                     // The guard decrements the counter on drop (all exit paths).
                     let _conn_guard = crate::overload::ConnectionGuard::new(&overload_for_conn);
@@ -1358,8 +1401,6 @@ async fn run_tcp_accept_loop(
                             }
                         }
                     }
-
-                    metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             _ = shutdown_rx.changed() => {
@@ -1557,9 +1598,7 @@ async fn handle_tcp_connection(
     record_mesh_mtls_metric: bool,
     overload: &crate::overload::OverloadState,
     metrics: &TcpProxyMetrics,
-    mesh_outbound_enforcement: Option<
-        &Arc<crate::modes::mesh::outbound_enforcement::MeshOutboundEnforcement>,
-    >,
+    mesh_outbound_enforcement: Option<&Arc<MeshOutboundEnforcement>>,
 ) -> TcpConnectionResult {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
@@ -1763,9 +1802,7 @@ async fn handle_tcp_connection_inner(
     record_mesh_mtls_metric: bool,
     overload: &crate::overload::OverloadState,
     metrics: &TcpProxyMetrics,
-    mesh_outbound_enforcement: Option<
-        &Arc<crate::modes::mesh::outbound_enforcement::MeshOutboundEnforcement>,
-    >,
+    mesh_outbound_enforcement: Option<&Arc<MeshOutboundEnforcement>>,
 ) -> Result<TcpConnectionSuccess, anyhow::Error> {
     // Bound the passthrough SNI peek by the same deadline as terminating-TLS
     // handshakes. Without this, a peer that opens a TCP connection and never
@@ -1870,60 +1907,15 @@ async fn handle_tcp_connection_inner(
         (params, cb_info)
     };
 
-    // Mesh `outboundTrafficPolicy: REGISTRY_ONLY` enforcement (T5-B).
-    // When the runtime carries an enforcement snapshot AND this listener is
-    // a mesh outbound capture port AND the destination is not in the
-    // admitted registry, drop the inbound TCP connection with a graceful
-    // close before dialing the backend. This matches Istio's REGISTRY_ONLY
-    // semantics for stream-family egress: an unadmitted destination must
-    // never reach a backend connect, so backend circuit breakers, pool
-    // entries, and DNS caches stay untouched by hostile traffic.
-    //
-    // The enforcement check sits BEFORE the connect (and even before the
-    // SNI plugin loop for passthrough below); on `Decision::Skip` the
-    // listener is not an outbound capture port (inbound / HBONE / admin
-    // / east-west / egress-gateway) and we flow through unchanged. On
-    // `Decision::Admit` we record the metric and continue. On
-    // `Decision::Deny` we record the metric, log once per
-    // (cgroup-substitute, destination) — keyed by `(stream_ctx.client_ip,
-    // backend_target)` so repeated unauthorised attempts surface without
-    // log spam — and return a typed `StreamSetupError` that the listener
-    // wrapper turns into a closed inbound connection.
-    if let Some(enforcement) = mesh_outbound_enforcement {
-        use crate::modes::mesh::outbound_enforcement::{Decision, PROTOCOL_TCP, PROTOCOL_TCP_TLS};
-        let decision = enforcement.check_destination(
-            stream_ctx.listen_port,
-            &params.backend_host,
-            params.backend_port,
-        );
-        let protocol_label = if matches!(params.backend_scheme, BackendScheme::Tcps) {
-            PROTOCOL_TCP_TLS
-        } else {
-            PROTOCOL_TCP
-        };
-        match decision {
-            Decision::Admit => {
-                enforcement.record_stream_decision(protocol_label, Decision::Admit);
-            }
-            Decision::Deny => {
-                enforcement.record_stream_decision(protocol_label, Decision::Deny);
-                warn!(
-                    proxy_id = %proxy_id,
-                    client = %remote_addr.ip(),
-                    listen_port = stream_ctx.listen_port,
-                    backend_target = %backend_info.backend_target,
-                    protocol = protocol_label,
-                    "Mesh REGISTRY_ONLY: rejecting TCP egress to unadmitted destination"
-                );
-                return Err(StreamSetupError::new(
-                    StreamSetupKind::RejectedByPlugin,
-                    "(mesh REGISTRY_ONLY)",
-                )
-                .into());
-            }
-            Decision::Skip => {}
-        }
-    }
+    enforce_mesh_tcp_outbound_target(
+        mesh_outbound_enforcement,
+        stream_ctx.listen_port,
+        &params.backend_host,
+        params.backend_port,
+        params.backend_scheme,
+        proxy_id,
+        remote_addr.ip(),
+    )?;
 
     let plugins = epoch
         .plugin_cache
@@ -2451,12 +2443,16 @@ async fn handle_tcp_connection_inner(
                 Err(_) => {
                     if can_retry && attempt < max_retries {
                         // Circuit open on this target — try another
-                        if let Some(next) = try_next_target(
+                        if let Some(next) = try_next_enforced_target(
                             &params,
                             &current_host,
                             current_port,
                             &epoch.load_balancer,
-                        ) {
+                            mesh_outbound_enforcement,
+                            stream_ctx.listen_port,
+                            proxy_id,
+                            remote_addr.ip(),
+                        )? {
                             warn!(
                                 proxy_id = %proxy_id,
                                 attempt,
@@ -2505,8 +2501,16 @@ async fn handle_tcp_connection_inner(
                 let err_msg = format!("DNS resolution failed for {}: {}", current_host, e);
                 if can_retry
                     && attempt < max_retries
-                    && let Some(next) =
-                        try_next_target(&params, &current_host, current_port, &epoch.load_balancer)
+                    && let Some(next) = try_next_enforced_target(
+                        &params,
+                        &current_host,
+                        current_port,
+                        &epoch.load_balancer,
+                        mesh_outbound_enforcement,
+                        stream_ctx.listen_port,
+                        proxy_id,
+                        remote_addr.ip(),
+                    )?
                 {
                     warn!(
                         proxy_id = %proxy_id,
@@ -2576,8 +2580,16 @@ async fn handle_tcp_connection_inner(
                 record_cb_neutral(circuit_breaker_cache, proxy_id, &current_cb_info);
                 if can_retry
                     && attempt < max_retries
-                    && let Some(next) =
-                        try_next_target(&params, &current_host, current_port, &epoch.load_balancer)
+                    && let Some(next) = try_next_enforced_target(
+                        &params,
+                        &current_host,
+                        current_port,
+                        &epoch.load_balancer,
+                        mesh_outbound_enforcement,
+                        stream_ctx.listen_port,
+                        proxy_id,
+                        remote_addr.ip(),
+                    )?
                 {
                     current_host = next.0;
                     current_port = next.1;
@@ -2652,8 +2664,16 @@ async fn handle_tcp_connection_inner(
                 record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
                 if can_retry
                     && attempt < max_retries
-                    && let Some(next) =
-                        try_next_target(&params, &current_host, current_port, &epoch.load_balancer)
+                    && let Some(next) = try_next_enforced_target(
+                        &params,
+                        &current_host,
+                        current_port,
+                        &epoch.load_balancer,
+                        mesh_outbound_enforcement,
+                        stream_ctx.listen_port,
+                        proxy_id,
+                        remote_addr.ip(),
+                    )?
                 {
                     warn!(
                         proxy_id = %proxy_id,
@@ -2931,6 +2951,51 @@ async fn handle_tcp_connection_inner(
     })
 }
 
+fn mesh_tcp_protocol_label(backend_scheme: BackendScheme) -> &'static str {
+    if matches!(backend_scheme, BackendScheme::Tcps) {
+        PROTOCOL_TCP_TLS
+    } else {
+        PROTOCOL_TCP
+    }
+}
+
+fn enforce_mesh_tcp_outbound_target(
+    enforcement: Option<&Arc<MeshOutboundEnforcement>>,
+    listen_port: u16,
+    backend_host: &str,
+    backend_port: u16,
+    backend_scheme: BackendScheme,
+    proxy_id: &str,
+    client_ip: IpAddr,
+) -> Result<(), anyhow::Error> {
+    let Some(enforcement) = enforcement else {
+        return Ok(());
+    };
+    let protocol_label = mesh_tcp_protocol_label(backend_scheme);
+    match enforcement.check_destination(listen_port, backend_host, backend_port) {
+        Decision::Admit => {
+            enforcement.record_stream_decision(protocol_label, Decision::Admit);
+            Ok(())
+        }
+        Decision::Deny => {
+            enforcement.record_stream_decision(protocol_label, Decision::Deny);
+            warn!(
+                proxy_id = %proxy_id,
+                client = %client_ip,
+                listen_port = listen_port,
+                backend_target = %format_backend_target(backend_host, backend_port),
+                protocol = protocol_label,
+                "Mesh REGISTRY_ONLY: rejecting TCP egress to unadmitted destination"
+            );
+            Err(
+                StreamSetupError::new(StreamSetupKind::RejectedByPlugin, "(mesh REGISTRY_ONLY)")
+                    .into(),
+            )
+        }
+        Decision::Skip => Ok(()),
+    }
+}
+
 /// Resolve the backend target — either direct from proxy config or via load balancer.
 fn resolve_backend_target(
     proxy: &Proxy,
@@ -3009,6 +3074,56 @@ mod backend_target_selection_tests {
         .expect("gateway config should deserialize")
     }
 
+    fn config_with_two_targets() -> GatewayConfig {
+        serde_json::from_value(json!({
+            "version": "1",
+            "proxies": [],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "orders",
+                "targets": [
+                    { "host": "allowed.local", "port": 5432 },
+                    { "host": "blocked.local", "port": 5432 }
+                ]
+            }]
+        }))
+        .expect("gateway config should deserialize")
+    }
+
+    fn retry_params() -> TcpConnParams {
+        TcpConnParams {
+            backend_host: "allowed.local".to_string(),
+            backend_port: 5432,
+            backend_scheme: BackendScheme::Tcp,
+            dns_override: None,
+            dns_cache_ttl_seconds: None,
+            backend_connect_timeout_ms: 1000,
+            backend_read_timeout_ms: 0,
+            backend_write_timeout_ms: 0,
+            tcp_idle_timeout_seconds: 60,
+            tcp_half_close_max_wait_seconds: 0,
+            retry: None,
+            upstream_id: Some("orders".to_string()),
+            upstream_subset: None,
+            passthrough: false,
+            tcp_fastopen_enabled: false,
+            dispatch_port_overrides: None,
+        }
+    }
+
+    fn enforcement(entries: &[&str]) -> std::sync::Arc<MeshOutboundEnforcement> {
+        let registry = crate::plugins::mesh::outbound_registry::OutboundRegistry::new(&json!({
+            "registry": entries
+        }))
+        .expect("valid registry");
+        std::sync::Arc::new(MeshOutboundEnforcement::from_registry(
+            "default",
+            vec![15001],
+            registry,
+        ))
+    }
+
     #[test]
     fn resolve_backend_target_honors_upstream_subset() {
         let config = config_with_subset();
@@ -3032,6 +3147,54 @@ mod backend_target_selection_tests {
         let err = resolve_backend_target(&proxy, &snapshot).expect_err("missing subset rejected");
 
         assert!(err.to_string().contains("subset missing"));
+    }
+
+    #[test]
+    fn tcp_retry_target_is_checked_against_mesh_registry() {
+        let config = config_with_two_targets();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let params = retry_params();
+        let enforcement = enforcement(&["allowed.local:5432"]);
+
+        let err = try_next_enforced_target(
+            &params,
+            "allowed.local",
+            5432,
+            &snapshot,
+            Some(&enforcement),
+            15001,
+            "tcp-proxy",
+            "127.0.0.1".parse().unwrap(),
+        )
+        .expect_err("unadmitted retry target must fail closed");
+
+        assert!(err.to_string().contains("mesh REGISTRY_ONLY"));
+    }
+
+    #[test]
+    fn tcp_retry_target_skips_mesh_registry_on_non_capture_listener() {
+        let config = config_with_two_targets();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let params = retry_params();
+        let enforcement = enforcement(&["allowed.local:5432"]);
+
+        let (host, port) = try_next_enforced_target(
+            &params,
+            "allowed.local",
+            5432,
+            &snapshot,
+            Some(&enforcement),
+            8080,
+            "tcp-proxy",
+            "127.0.0.1".parse().unwrap(),
+        )
+        .expect("non-capture listener should skip enforcement")
+        .expect("alternate target should be selected");
+
+        assert_eq!(host, "blocked.local");
+        assert_eq!(port, 5432);
     }
 }
 
@@ -3085,6 +3248,34 @@ fn try_next_target(
         )
     }?;
     Some((next.host.clone(), next.port))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_next_enforced_target(
+    params: &TcpConnParams,
+    current_host: &str,
+    current_port: u16,
+    lb_snapshot: &LoadBalancerCacheInner,
+    enforcement: Option<&Arc<MeshOutboundEnforcement>>,
+    listen_port: u16,
+    proxy_id: &str,
+    client_ip: IpAddr,
+) -> Result<Option<(String, u16)>, anyhow::Error> {
+    let Some((next_host, next_port)) =
+        try_next_target(params, current_host, current_port, lb_snapshot)
+    else {
+        return Ok(None);
+    };
+    enforce_mesh_tcp_outbound_target(
+        enforcement,
+        listen_port,
+        &next_host,
+        next_port,
+        params.backend_scheme,
+        proxy_id,
+        client_ip,
+    )?;
+    Ok(Some((next_host, next_port)))
 }
 
 fn resolve_port_override(
@@ -5688,6 +5879,20 @@ fn create_splice_pipe(desired_size: usize) -> Result<(i32, i32), anyhow::Error> 
 /// carries read_watermark — they share scope with the watchdog instead of
 /// going through `Arc`.
 #[cfg(target_os = "linux")]
+fn refresh_splice_write_progress(
+    last_activity: Option<&AtomicU64>,
+    write_watermark: Option<&AtomicU64>,
+) {
+    let now = coarse_now_ms();
+    if let Some(la) = last_activity {
+        la.store(now, Ordering::Relaxed);
+    }
+    if let Some(wm) = write_watermark {
+        wm.store(now, Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn splice_one_direction_no_guard(
     src: &TcpStream,
@@ -5756,9 +5961,10 @@ async fn splice_one_direction_no_guard(
                 if written > 0 {
                     remaining -= written as usize;
                     bytes.fetch_add(written as u64, Ordering::Relaxed);
-                    if let Some(ref wm) = write_watermark {
-                        wm.store(coarse_now_ms(), Ordering::Relaxed);
-                    }
+                    refresh_splice_write_progress(
+                        last_activity.as_deref(),
+                        write_watermark.as_deref(),
+                    );
                 } else if written == 0 {
                     // See the synchronous libc fallback above: a clean
                     // terminal write-side condition should still propagate
@@ -6238,6 +6444,8 @@ mod ktls_param_tests {
 
 #[cfg(test)]
 mod splice_readiness_wait_tests {
+    #[cfg(target_os = "linux")]
+    use super::refresh_splice_write_progress;
     use super::splice_poll_timeout_ms_at;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -6305,6 +6513,20 @@ mod splice_readiness_wait_tests {
 
         let wait = splice_poll_timeout_ms_at(now, 1_000, &activity, None, 0, None, 0);
         assert_eq!(wait, 1_000);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn splice_write_progress_refreshes_idle_clock_and_write_watermark() {
+        let idle = AtomicU64::new(u64::MAX);
+        let write = AtomicU64::new(u64::MAX);
+
+        refresh_splice_write_progress(Some(&idle), Some(&write));
+
+        let idle_value = idle.load(Ordering::Relaxed);
+        let write_value = write.load(Ordering::Relaxed);
+        assert_ne!(idle_value, u64::MAX);
+        assert_eq!(idle_value, write_value);
     }
 }
 
@@ -6541,6 +6763,7 @@ mod node_waypoint_stream_scope_tests {
             locality: None,
             service_account: None,
             pod_uid: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            remote_provenance: false,
         };
         resolver.install_policy_scopes_from_workloads(&[workload]);
 

@@ -328,19 +328,17 @@ fn dr_connection_pool_http_max_retries() {
     assert_eq!(http.max_retries, Some(2));
 }
 
-/// Deferred set after F5.1: only `http1MaxPendingRequests` remains.
-/// Translator parses it and emits an operator-visible warning, but does not
-/// project (it needs a Ferrum-side pending-request gauge). The conformance
-/// assertion is that translation does not fail and no overlay slot is populated.
-/// The Istio controller also surfaces it in
-/// `status.ferrum.translation.deferred_fields`.
+/// `trafficPolicy.connectionPool.http.http1MaxPendingRequests` (F5.1 final knob):
+/// projected onto the HTTP overlay and enforced at runtime as a per-`(host,port)`
+/// HTTP/1.1 pending-request gate (503 "upstream overflow" when full). No longer
+/// deferred at top-level / `portLevelSettings`.
 #[test]
-fn dr_connection_pool_http_http1_max_pending_requests_deferred() {
+fn dr_connection_pool_http_http1_max_pending_requests_supported() {
     register_feature!(
         category = CATEGORY,
         feature = "trafficPolicy.connectionPool.http.http1MaxPendingRequests",
-        status = Status::Deferred,
-        notes = "Only remaining deferred HTTP knob: translator warns + surfaces in status deferred_fields; needs a Ferrum-side pending-request gauge.",
+        status = Status::Supported,
+        notes = "Projected onto port_overrides[port].http1_max_pending_requests → Proxy.pool_http1_max_pending_requests; enforced as a 503-on-overflow pending-request gate on the reqwest/HTTP-1.1 dispatch path (src/backend_pending_limit.rs).",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",
@@ -348,14 +346,14 @@ fn dr_connection_pool_http_http1_max_pending_requests_deferred() {
             "connectionPool": {"http": {"http1MaxPendingRequests": 50}}
         }
     }));
-    // Translation must succeed and the deferred-only block produces no overlay.
-    assert!(
-        dr.traffic_policy
-            .as_ref()
-            .and_then(|p| p.connection_pool_http.as_ref())
-            .is_none(),
-        "deferred-only http connectionPool block must not synthesize an empty overlay"
-    );
+    let http = dr
+        .traffic_policy
+        .as_ref()
+        .expect("traffic policy")
+        .connection_pool_http
+        .as_ref()
+        .expect("http overlay");
+    assert_eq!(http.http1_max_pending_requests, Some(50));
 }
 
 /// `trafficPolicy.loadBalancer.simple = ROUND_ROBIN` → `RoundRobin`.

@@ -929,6 +929,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: BackendTlsConfig::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: Default::default(),
@@ -947,6 +948,9 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        // Derived-only: projected from DestinationRule port overrides at
+        // dispatch time, never set by route translation.
+        pool_http1_max_pending_requests: None,
         upstream_id: spec.upstream_id,
         upstream_subset: None,
         api_spec_id: None,
@@ -2142,6 +2146,7 @@ pub(crate) fn upstream_for_route(
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -2150,6 +2155,7 @@ pub(crate) fn upstream_for_route(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,

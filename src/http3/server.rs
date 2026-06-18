@@ -1831,16 +1831,18 @@ async fn handle_h3_request(
     let needs_response_buffering = has_retry || !should_stream_response;
 
     // --- Upstream target selection and circuit breaker ---
-    // NOTE (pre-existing, moot for mesh): this standalone H3 frontend selects
-    // upstream targets but does NOT run the per-target effective-proxy override
-    // pipeline (`resolve_effective_proxy_for_target` / `cap_proxy_retry_for_target`)
-    // that the H1/H2 dispatch path uses, so NONE of the DR per-port
-    // effective-proxy overrides (h2UpgradePolicy / maxRetries plus the
-    // pre-existing idleTimeout / http2MaxRequests / connectTimeout /
-    // maxConnections / tcpKeepalive / per-port LB+outlier) are applied here.
-    // This is moot for mesh: mesh capture is TCP-only (SO_ORIGINAL_DST/REDIRECT;
-    // UDP/H3 are out of mesh scope) and these are DestinationRule-derived
-    // (mesh-only). A uniform H3-override pass is a tracked follow-up — see
+    // NOTE (moot for mesh): this standalone H3 frontend's SELECTION path does
+    // not run `cap_proxy_retry_for_target` (the per-request `maxRetries` cap),
+    // so that DR knob is not applied on the H3 frontend. The H3→HTTP
+    // cross-protocol **plain** bridge DOES now apply the per-target
+    // effective-proxy overrides via `resolve_effective_proxy_for_target`
+    // (h2UpgradePolicy / idleTimeout / http2MaxRequests / connectTimeout / TLS,
+    // plus the service-discovery top-level fallback) — see
+    // `src/http3/cross_protocol.rs` `dispatch_plain`. The native-H3 backend pool
+    // and the gRPC bridge flavor, plus the `maxRetries` cap and per-port
+    // maxConnections / tcpKeepalive / LB+outlier, remain follow-ups. All moot
+    // for mesh: mesh capture is TCP-only (SO_ORIGINAL_DST/REDIRECT; UDP/H3 are
+    // out of mesh scope) and these are DestinationRule-derived (mesh-only) — see
     // `docs/mesh.md` "Dispatch-path coverage".
     // PASSTHROUGH orig-dst is `None` on H3: mesh capture is TCP-only
     // (SO_ORIGINAL_DST/REDIRECT; H3/UDP are out of mesh scope), so an H3
@@ -1874,7 +1876,10 @@ async fn handle_h3_request(
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
     let mut backend_admission_start: std::time::Instant;
 
-    let (cb_target_key, cb_is_half_open_probe) =
+    // H3 records the circuit-breaker outcome at header time (it does not defer the
+    // dispatch outcome like the direct-H2 path), so the admission open-epoch is
+    // unused here.
+    let (cb_target_key, cb_is_half_open_probe, _cb_admission_open_epoch) =
         match crate::proxy::backend_dispatch::check_circuit_breaker(
             &proxy,
             &state,
@@ -1977,11 +1982,7 @@ async fn handle_h3_request(
                 .get("origin")
                 .map(String::as_str)
                 .unwrap_or("");
-            if !proxy
-                .allowed_ws_origins
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(origin))
-            {
+            if !crate::proxy::websocket_origin_allowed(&proxy.allowed_ws_origins, origin) {
                 warn!(
                     "H3 WebSocket upgrade rejected: Origin '{}' not in allowed_ws_origins for proxy {}",
                     origin, proxy.id
@@ -2505,6 +2506,12 @@ async fn handle_h3_request(
         let mut response_headers = h3_resp.headers;
 
         // Hop-by-hop headers already filtered during collection in the H3 pool.
+
+        // Capture the original range decision before `after_proxy` runs on this
+        // default native-H3 streaming path; `compression.after_proxy` honors the
+        // marker so a streamed range body is never mislabeled `Content-Encoding`
+        // even if a `response_transformer` strips `Content-Range` first.
+        stamp_h3_range_response_metadata(&mut ctx, response_status, &response_headers);
 
         // Enforce response body size limit via Content-Length fast path
         if state.max_response_body_size_bytes > 0
@@ -3804,6 +3811,17 @@ async fn handle_h3_request(
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
         let mut response_body = response_body;
 
+        // Capture the original range decision before `after_proxy` runs on this
+        // buffered native-H3 path. Unlike the streamed paths, the body here IS
+        // buffered, so `compression.transform_response_body` would actually
+        // compress it; a `response_transformer` that strips `Content-Range`
+        // before `compression.after_proxy` (4000 < 4050) would otherwise let
+        // compression both set `Content-Encoding` and rewrite the partial body,
+        // corrupting byte-range semantics. The marker makes `after_proxy` honor
+        // the pristine range decision. Range-only insertion keeps the common
+        // path allocation-free.
+        stamp_h3_range_response_metadata(&mut ctx, response_status, &response_headers);
+
         // after_proxy hooks
         let mut after_proxy_rejected = false;
         {
@@ -4374,21 +4392,12 @@ pub(crate) fn inject_sticky_cookie(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
     {
-        let has_port_override = crate::proxy::backend_dispatch::has_effective_port_override(
+        let strategy = crate::proxy::backend_dispatch::hash_on_strategy_for_selected_target(
             proxy,
             &epoch.load_balancer,
             upstream_id,
             target.port,
         );
-        let strategy = if has_port_override {
-            LoadBalancerCache::get_hash_on_strategy_for_port_from(
-                &epoch.load_balancer,
-                upstream_id,
-                target.port,
-            )
-        } else {
-            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id)
-        };
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
@@ -4593,6 +4602,30 @@ fn h3_backend_unavailable_stream_result(
     }
 }
 
+/// Record the ORIGINAL backend range decision before any `after_proxy` hook can
+/// rewrite the response headers, mirroring the H1/H2 stamp in `proxy/mod.rs`.
+/// Called from every native-H3 streaming/buffered branch and the H3
+/// cross-protocol path before `after_proxy` runs, where `response_transformer`
+/// (ordering 4000) runs before `compression` (4050); if the transformer
+/// strips/renames `Content-Range` on a non-206 response, `compression.after_proxy`
+/// would otherwise no longer see the header (nor the marker) and could commit a
+/// `Content-Encoding` on a streamed range body whose buffered-only
+/// `transform_response_body` never runs (sending raw bytes mislabeled as
+/// gzip/br), or compress a buffered partial body and corrupt its byte offsets.
+/// Only inserted for range responses, so the common path stays allocation-free.
+pub(crate) fn stamp_h3_range_response_metadata(
+    ctx: &mut RequestContext,
+    response_status: u16,
+    response_headers: &HashMap<String, String>,
+) {
+    if response_status == 206 || response_headers.contains_key("content-range") {
+        ctx.metadata.insert(
+            crate::proxy::RANGE_RESPONSE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
+}
+
 async fn run_h3_streaming_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -4700,11 +4733,18 @@ async fn proxy_to_backend_h3_refined_response(
     let mut response_headers = h3_resp.headers;
     response_headers.retain(|name, _| !is_backend_response_strip_header(name));
 
+    // Stamp the original range decision before the buffer/stream refine and
+    // before any `after_proxy` hook can strip `Content-Range`. The streaming
+    // branch below runs `compression.after_proxy` later (via
+    // `stream_h3_open_response_to_client`), which honors this marker.
+    stamp_h3_range_response_metadata(ctx, response_status, &response_headers);
+
     if crate::proxy::refine_stream_response_for_content_type(
         false,
         proxy,
         plugins,
         Some(ctx),
+        response_status,
         &response_headers,
     ) {
         let result = stream_h3_open_response_to_client(
@@ -5377,6 +5417,11 @@ async fn proxy_to_backend_h3_streaming(
     // `proxy::headers` for the canonical predicate. Response-direction
     // set differs from the request-direction set.
     response_headers.retain(|name, _| !is_backend_response_strip_header(name));
+
+    // Capture the original range decision before `after_proxy` (below) can let a
+    // `response_transformer` strip `Content-Range`; `compression.after_proxy`
+    // honors this marker so a streamed range body is never mislabeled compressed.
+    stamp_h3_range_response_metadata(ctx, response_status, &response_headers);
 
     // Enforce response body size limit via Content-Length fast path
     if state.max_response_body_size_bytes > 0

@@ -5741,9 +5741,10 @@ components:
           type: [integer, "null"]
           format: uint32
           minimum: 1
+          maximum: 2147483647
           description: |
             Maximum concurrent HTTP/2 streams per backend connection (overrides global).
-            Must be at least 1. Default: 1000.
+            Range: 1–2147483647. Default: 1000.
         pool_http3_connections_per_backend:
           type: [integer, "null"]
           minimum: 1
@@ -5755,13 +5756,15 @@ components:
         pool_max_requests_per_connection:
           type: [integer, "null"]
           format: uint64
-          minimum: 1
+          minimum: 0
+          maximum: 2147483647
           description: |
             Reserved for Istio DestinationRule
             `connectionPool.http.maxRequestsPerConnection`. The field is
             validated and persisted for schema compatibility, but currently has
             no runtime effect because reqwest/hyper do not expose a stable
-            per-connection request cap for the shared client pool.
+            per-connection request cap for the shared client pool. Range:
+            0–2147483647, where 0 preserves Istio's explicit unlimited value.
         upstream_id:
           type: [string, "null"]
           description: |
@@ -7486,6 +7489,21 @@ components:
             SANs. Mesh DestinationRule `trafficPolicy.tls.subjectAltNames`
             projects to this field. Stored/projected only — SAN allow-list
             verification is not yet enforced (tracked by GAP-1C).
+        locality_lb_strict:
+          type: boolean
+          default: false
+          readOnly: true
+          description: >-
+            Strict local-first locality load balancing for this upstream. Mesh
+            slice apply projects this from the `FERRUM_MESH_LOCALITY_LB_STRICT`
+            environment flag onto mesh upstreams; it is `false` for non-mesh
+            upstreams. When `true` and no source locality resolves, the load
+            balancer restricts selection to local-cluster endpoints
+            (fail-closed-to-local), widening to remote endpoints only when no
+            local endpoint is healthy; when `false` (default) it returns the
+            mixed local+remote pool (fail-open). Read-only / projected — a direct
+            value in a create/update request body is REJECTED (set the env var
+            instead); it can appear in `GET`/list responses.
         api_spec_id:
           type: [string, "null"]
           description: |
@@ -7560,6 +7578,14 @@ components:
             Optional load-balancer algorithm override for this subset. When set,
             the subset uses this algorithm instead of the parent upstream's
             algorithm.
+        hash_on:
+          oneOf:
+            - type: string
+            - type: "null"
+          description: |
+            Optional hash-key source for subset-scoped consistent hashing. Uses
+            the same syntax as `Upstream.hash_on`: `ip`, `header:<name>`, or
+            `cookie:<name>`.
 
     LoadBalancerAlgorithm:
       type: string
@@ -14078,6 +14104,10 @@ components:
           type: string
           default: ai
           description: Prefix for metadata keys
+        buffer_streaming_responses:
+          type: boolean
+          default: false
+          description: Buffer text/event-stream responses so final SSE usage events can be parsed; disables streaming delivery for those responses
         cost_per_prompt_token:
           type: number
           format: double

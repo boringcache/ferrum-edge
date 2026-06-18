@@ -63,9 +63,12 @@ use tracing::{debug, info, warn};
 
 use crate::grpc::dp_client::{DpGrpcTlsConfig, GrpcJwtSecret};
 use crate::identity::{SpiffeId, TrustDomain};
-use crate::modes::mesh::config::{AppProtocol, MeshService, MultiClusterConfig, Workload};
+use crate::modes::mesh::config::{
+    AppProtocol, MAX_MESH_REMOTE_CLUSTERS, MeshService, MultiClusterConfig, Workload,
+};
 use crate::modes::mesh::config_consumer::common::{
-    BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs as common_next_backoff_secs,
+    BACKOFF_INITIAL_SECS, MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE, jittered_backoff,
+    next_backoff_secs as common_next_backoff_secs,
 };
 
 /// Backoff bounds shared with [`super::federation`] and
@@ -202,6 +205,48 @@ impl RemoteEndpointSnapshot {
     }
 }
 
+/// Outcome of a [`RemoteEndpointStore::install`] call.
+///
+/// `install` returns more than a simple `bool` so the poll loop can tell a
+/// *live* poll (endpoints changed, or an unchanged-but-still-registered dedup
+/// whose `fetched_at` was refreshed) apart from a poll that landed after the
+/// cluster's generation was retired (removed / trust withdrawn). Only the first
+/// two are a genuinely successful poll worth recording in the success / age
+/// metrics; a [`RemoteInstallOutcome::Retired`] no-op must NOT mark the cluster
+/// freshly-polled, or `/metrics` would advertise a healthy remote cluster whose
+/// endpoints were intentionally dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteInstallOutcome {
+    /// Endpoints changed and were committed (the apply task was woken).
+    Installed,
+    /// Generation still matches but the endpoints were identical to what is
+    /// stored, so only the poll timestamp was refreshed (F2 dedup). Still a
+    /// successful live poll.
+    Deduped,
+    /// The task's cluster generation was retired mid-flight (the cluster was
+    /// removed or its trust was withdrawn): a true no-op. Nothing was installed
+    /// and the cluster is no longer live.
+    Retired,
+}
+
+impl RemoteInstallOutcome {
+    /// Whether endpoints were actually committed (used for "installed" logging
+    /// and revision/first-ready bookkeeping).
+    fn installed(self) -> bool {
+        matches!(self, RemoteInstallOutcome::Installed)
+    }
+
+    /// Whether this poll reflects a live, registered cluster — i.e. it should
+    /// refresh the success / last-success / endpoint-age metrics. A retired
+    /// generation is excluded.
+    fn is_live_poll(self) -> bool {
+        matches!(
+            self,
+            RemoteInstallOutcome::Installed | RemoteInstallOutcome::Deduped
+        )
+    }
+}
+
 /// Lock-free shared state populated by the discovery poller and consumed by the
 /// slice-apply path. Mirrors [`super::federation::FederationStore`].
 #[derive(Clone)]
@@ -222,6 +267,19 @@ pub struct RemoteEndpointStore {
     /// Generation at which each cluster was last registered. Stored alongside
     /// the snapshot so `install` can compare atomically.
     cluster_generation: Arc<ArcSwap<HashMap<String, u64>>>,
+    /// Serializes the remote-discovery success-metric *record* (in the poll
+    /// task) against the success-metric *clear* + generation retire (in the
+    /// reconcile task). The generation check that authorizes a metric record is
+    /// lock-free inside `install`, but the metric write itself lands in a
+    /// separate `DashMap` from `cluster_generation`, so without this lock a poll
+    /// that observed a live generation could resurrect the success / last-success
+    /// / endpoint-age series *after* a concurrent `remove` cleared it — leaving a
+    /// freshly-polled, endpoint-less cluster visible on unauthenticated
+    /// `/metrics`. Holding this lock across the generation-retire+clear and the
+    /// generation-check+record makes the two mutually exclusive, so removal can
+    /// never lose the race. This is the multi-second discovery/reconcile control
+    /// path, never the request hot path, so a mutex here is fine.
+    metrics_ordering: Arc<std::sync::Mutex<()>>,
 }
 
 impl Default for RemoteEndpointStore {
@@ -233,6 +291,7 @@ impl Default for RemoteEndpointStore {
             revision_tx: Arc::new(revision_tx),
             generation: Arc::new(AtomicU64::new(0)),
             cluster_generation: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
+            metrics_ordering: Arc::new(std::sync::Mutex::new(())),
         }
     }
 }
@@ -308,17 +367,19 @@ impl RemoteEndpointStore {
     /// "no reconcile on unchanged endpoints" optimization without the
     /// steady-state per-poll deep-clone the previous in-`rcu` refresh incurred.
     ///
-    /// Returns `true` only when this call actually changed the endpoint set (a
-    /// real install), so callers can avoid logging "installed" on a deduped
-    /// (timestamp-only refresh) or retired-cluster no-op.
-    fn install(&self, entry: RemoteClusterEntry, task_generation: u64) -> bool {
+    /// Returns a [`RemoteInstallOutcome`] distinguishing a real install, a
+    /// dedup (timestamp-only refresh of a still-registered cluster), and a
+    /// retired-generation no-op (cluster removed / trust withdrawn). Callers use
+    /// this both to avoid logging "installed" on a no-op and to avoid recording
+    /// a successful-poll metric for a cluster whose endpoints were dropped.
+    fn install(&self, entry: RemoteClusterEntry, task_generation: u64) -> RemoteInstallOutcome {
         let name = entry.cluster_name.clone();
         // Fast-path generation check: bail out early if the task's cluster slot
         // was already retired, avoiding the swap for stale tasks. This is
         // re-validated below — it is only an optimization, not the authoritative
         // check.
         if !self.cluster_generation_matches(&name, task_generation) {
-            return false;
+            return RemoteInstallOutcome::Retired;
         }
         // No-op dedup: endpoints identical to what is stored. Refresh only the
         // poll timestamp (so `age_seconds` tracks polls) via the entry's shared
@@ -341,12 +402,18 @@ impl RemoteEndpointStore {
             if let Some(existing) = current.clusters.get(&name)
                 && existing.endpoints == entry.endpoints
             {
+                // Re-check the generation immediately before the timestamp
+                // refresh: if the cluster was retired between the fast-path
+                // check and here, this poll lands on an entry about to be
+                // dropped and is NOT a live refresh — report it as retired so
+                // the success metric is not bumped for a removed cluster.
                 if self.cluster_generation_matches(&name, task_generation) {
                     existing
                         .fetched_at
                         .store(entry.fetched_at_unix_seconds(), Ordering::Relaxed);
+                    return RemoteInstallOutcome::Deduped;
                 }
-                return false;
+                return RemoteInstallOutcome::Retired;
             }
         }
         // First sight or CHANGED endpoints: full install via a CAS loop so two
@@ -361,35 +428,37 @@ impl RemoteEndpointStore {
         // generation, and skips — never reintroducing endpoints for a removed
         // cluster. Without the in-closure recheck, a stale task could insert
         // after `remove` had already cleared the cluster (the F6 race, widened
-        // to the trust-withdrawal case). `installed` is computed fresh on every
+        // to the trust-withdrawal case). `outcome` is computed fresh on every
         // closure iteration so a CAS retry never carries a stale verdict.
-        let mut installed = false;
+        let mut outcome = RemoteInstallOutcome::Retired;
         self.inner.rcu(|current| {
-            installed = false;
             if !self.cluster_generation_matches(&name, task_generation) {
+                outcome = RemoteInstallOutcome::Retired;
                 return Arc::clone(current);
             }
             // Re-confirm the endpoints still differ: a concurrent poll for the
             // same cluster may have installed identical endpoints between our
             // pre-check above and this CAS attempt. If so, this is a no-op (the
-            // timestamp refresh raced ahead) — do not wake the apply task.
+            // timestamp refresh raced ahead) — do not wake the apply task, but
+            // it is still a live (deduped) poll since the generation matches.
             if current
                 .clusters
                 .get(&name)
                 .is_some_and(|existing| existing.endpoints == entry.endpoints)
             {
+                outcome = RemoteInstallOutcome::Deduped;
                 return Arc::clone(current);
             }
             let mut next = (**current).clone();
             next.clusters.insert(name.clone(), entry.clone());
-            installed = true;
+            outcome = RemoteInstallOutcome::Installed;
             Arc::new(next)
         });
-        if installed {
+        if outcome.installed() {
             self.first_ready.store(true, Ordering::Release);
             self.revision_tx.send_modify(|revision| *revision += 1);
         }
-        installed
+        outcome
     }
 
     /// Whether `task_generation` still matches the cluster's registered
@@ -433,6 +502,63 @@ impl RemoteEndpointStore {
             self.revision_tx.send_modify(|revision| *revision += 1);
         }
     }
+
+    /// Record a successful, still-live remote-discovery poll's success /
+    /// last-success / endpoint-age metrics — but only while holding the metrics
+    /// ordering lock and re-confirming the cluster's generation under it.
+    ///
+    /// The poll task computes its live/retired verdict inside `install`, but the
+    /// metric write happens in a separate `DashMap` from `cluster_generation`,
+    /// so a bare post-`install` record could resurrect the series *after* a
+    /// concurrent reconcile already retired the generation and cleared the
+    /// metrics (see [`Self::remove_and_clear_metrics`]). Taking the same lock
+    /// and re-checking the generation here makes the record mutually exclusive
+    /// with the retire+clear: either this record observes a live generation
+    /// (and any later clear removes it) or it observes the retired generation
+    /// (and skips), so removal can never lose the race and leave a
+    /// freshly-polled, endpoint-less cluster on unauthenticated `/metrics`.
+    fn record_remote_discovery_success_if_live(
+        &self,
+        cluster: &str,
+        trust_domain: &str,
+        fetched_at_unix_seconds: u64,
+        task_generation: u64,
+    ) {
+        // Poison is impossible: the critical sections are panic-free (atomic
+        // map ops + an ArcSwap load). Recover the guard either way rather than
+        // propagating, since a poisoned ordering lock must not wedge polling.
+        let _guard = self
+            .metrics_ordering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.cluster_generation_matches(cluster, task_generation) {
+            crate::plugins::mesh::prometheus_helpers::record_mesh_remote_discovery_poll_success(
+                cluster,
+                trust_domain,
+                fetched_at_unix_seconds,
+            );
+        }
+    }
+
+    /// Remove a remote cluster's endpoints **and** prune its discovery metric
+    /// series, retiring the generation and clearing the metrics under the
+    /// metrics ordering lock so the clear cannot race a concurrent
+    /// [`Self::record_remote_discovery_success_if_live`].
+    pub(crate) fn remove_and_clear_metrics(&self, cluster_name: &str, trust_domain: &str) {
+        let _guard = self
+            .metrics_ordering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Retire the generation + drop the endpoints first, then clear the
+        // metric series — all while holding the lock, so a poll task's
+        // generation-checked record (which takes the same lock) is serialized
+        // against this clear and cannot re-create the cleared series.
+        self.remove(cluster_name);
+        crate::plugins::mesh::prometheus_helpers::clear_mesh_remote_discovery_metrics(
+            cluster_name,
+            trust_domain,
+        );
+    }
 }
 
 /// Abstracts the remote-cluster endpoint fetch so the discovery loop is
@@ -452,14 +578,138 @@ pub trait RemoteServiceSource: Send + Sync {
 /// `remote-<cluster>` that can never collide with a real local region.
 fn default_remote_locality(cluster_name: &str, network: Option<&str>) -> String {
     match network {
-        Some(network) if !network.is_empty() => format!("remote-{cluster_name}/{network}"),
-        _ => format!("remote-{cluster_name}"),
+        Some(network) if !network.is_empty() => {
+            format!("{REMOTE_LOCALITY_PREFIX}{cluster_name}/{network}")
+        }
+        _ => format!("{REMOTE_LOCALITY_PREFIX}{cluster_name}"),
+    }
+}
+
+/// Region prefix stamped on remote-cluster endpoints by
+/// [`default_remote_locality`] so a remote workload that carries no locality of
+/// its own still tiers BELOW the local source region in the priority-tier load
+/// balancer. This is a LOCALITY fallback only — it is NOT used to decide whether
+/// a target is remote (a real local region could legitimately be named
+/// `remote-foo`). Remote provenance is keyed on the explicit [`MESH_REMOTE_TAG`]
+/// stamped from the workload's cross-cluster identity.
+pub(crate) const REMOTE_LOCALITY_PREFIX: &str = "remote-";
+
+/// Per-target tag key marking a target as a REMOTE-cluster-discovered endpoint —
+/// a RESERVED provenance marker the data plane sets and trusts. Stamped
+/// (`= "true"`) at materialization time in [`crate::service_discovery::mesh`] from
+/// the workload's [`Workload::remote_provenance`] flag ([`workload_is_remote`]),
+/// which `tag_remote_workloads` set at remote-poll INGESTION (so it reflects real
+/// cross-cluster provenance, NOT `cluster`-name equality or a locality string).
+/// It is UN-SPOOFABLE: it never rides a wire/file payload (`#[serde(skip)]` on the
+/// flag), and every target builder that copies operator/workload labels into tags
+/// strips the reserved `mesh.*` namespace first ([`strip_reserved_mesh_tags`]), so
+/// a hand-authored `mesh.remote: "true"` label can never reach a target.
+/// Strict local-first locality LB (`Upstream.locality_lb_strict`) keys local vs.
+/// remote on the ABSENCE of this tag (checking the exact value), so a real local
+/// Kubernetes region whose name happens to begin with `remote-` is never
+/// misclassified as remote. Absent on local-cluster and non-mesh targets.
+pub(crate) const MESH_REMOTE_TAG: &str = "mesh.remote";
+
+/// The EXACT value the discoverer stamps for [`MESH_REMOTE_TAG`] when a target
+/// is a remote-cluster endpoint. Strict local-first locality LB classifies a
+/// target as remote ONLY when the tag equals this value, NOT on mere key
+/// presence. Single source of truth shared by the stamp site
+/// ([`crate::service_discovery::mesh`]) and the check site
+/// ([`crate::load_balancer`]) so they can never drift.
+pub(crate) const MESH_REMOTE_TAG_VALUE: &str = "true";
+
+/// RESERVED tag-key namespace owned exclusively by Ferrum mesh internals
+/// (`mesh.remote`, `mesh.hbone`, `mesh.mtls`, `mesh.spiffe_id`, …). These tags
+/// are PROVENANCE / transport markers the data plane sets and trusts; an operator
+/// or workload label must never be able to forge one. Any target builder that
+/// COPIES workload/operator labels wholesale into `UpstreamTarget.tags` (e.g. the
+/// east-west `workload.selector.labels` copy, the egress ServiceEntry endpoint
+/// `labels` copy) must strip this namespace first via
+/// [`strip_reserved_mesh_tags`] so a user label literally named `mesh.remote:
+/// "true"` can never make a LOCAL target masquerade as remote (and so no copied
+/// label collides with a transport marker).
+pub(crate) const RESERVED_MESH_TAG_PREFIX: &str = "mesh.";
+
+/// Drop every reserved `mesh.*` key (see [`RESERVED_MESH_TAG_PREFIX`]) from a
+/// label map copied from operator/workload-controlled input, in place. Mesh
+/// internals re-stamp the legitimate `mesh.*` provenance/transport tags
+/// themselves (e.g. the discoverer's `mesh.remote`, the egress tag builders'
+/// `mesh.hbone`/`mesh.mtls`), so this only removes forge attempts, never a real
+/// marker.
+pub(crate) fn strip_reserved_mesh_tags(tags: &mut std::collections::HashMap<String, String>) {
+    tags.retain(|key, _| !key.starts_with(RESERVED_MESH_TAG_PREFIX));
+}
+
+/// Whether a workload is a REMOTE-cluster endpoint.
+///
+/// Classification is by **discovery provenance**, NOT a locality string prefix:
+///
+/// 1. **Authoritative signal — [`Workload::remote_provenance`]**: set `true` by
+///    [`tag_remote_workloads`] at the DP-side remote-poll ingestion point, which
+///    KNOWS the endpoint came from a remote discovery slice. This is checked FIRST
+///    and is independent of any `cluster`-name matching, so a genuinely-remote
+///    endpoint whose Istio WorkloadEntry translation stamped a `cluster` that does
+///    NOT equal the configured [`RemoteCluster::name`] is STILL classified remote
+///    (the former cluster-name-equality-only path misclassified it LOCAL, so
+///    strict local-first LB kept sending to it while locals were healthy).
+///
+/// 2. **Fallback — `cluster`-name vs [`MultiClusterConfig`]** (cannot cause a
+///    false-LOCAL for a genuinely-remote endpoint, since provenance already
+///    covers those): retained so a workload carrying a cross-cluster `cluster`
+///    identity is still classified remote even on a code path that did not run
+///    `tag_remote_workloads` (defense in depth). Depends on `local_cluster`:
+///    - `local_cluster` set: remote iff `workload.cluster` differs from it.
+///    - `local_cluster` UNSET: remote iff `workload.cluster` matches a configured
+///      `remote_clusters[].name`.
+///    - No workload cluster, or no `MultiClusterConfig`: LOCAL.
+///
+/// Single source of truth shared by the materialization path
+/// ([`crate::service_discovery::mesh`]) and the east-west / outbound local-only
+/// filters ([`super::matched_local_service_workloads`]) so they never drift on
+/// what "remote" means.
+#[inline]
+pub(crate) fn workload_is_remote(
+    workload: &Workload,
+    multi_cluster: Option<&MultiClusterConfig>,
+) -> bool {
+    // Authoritative: the reserved provenance marker stamped at remote ingestion.
+    if workload.remote_provenance {
+        return true;
+    }
+    // Fallback (defense in depth): cluster-name vs configured clusters. Can only
+    // promote LOCAL→REMOTE, never the reverse, so it cannot misclassify a
+    // genuinely-remote (provenance-marked) endpoint as local.
+    let Some(workload_cluster) = workload.cluster.as_deref() else {
+        // A workload with no cluster identity is always local.
+        return false;
+    };
+    let Some(multi_cluster) = multi_cluster else {
+        // No multi-cluster config: single-cluster posture, treat as local.
+        return false;
+    };
+    match multi_cluster.local_cluster.as_deref() {
+        // Relative to a known local cluster: remote iff it differs.
+        Some(local_cluster) => workload_cluster != local_cluster,
+        // No local cluster name: classify by discovery provenance — the workload
+        // is remote iff its stamped cluster is a configured remote cluster.
+        None => multi_cluster
+            .remote_clusters
+            .iter()
+            .any(|remote| remote.name == workload_cluster),
     }
 }
 
 /// Tag a remote cluster's workloads with provenance and a fail-safe locality.
 ///
-/// - `cluster` is stamped so introspection / metrics can attribute the target.
+/// - `remote_provenance` is set `true` — the RESERVED, un-spoofable remote marker.
+///   This is the AUTHORITATIVE remote signal: it is stamped HERE, at the DP-side
+///   remote-poll ingestion point that KNOWS the source is the remote slice, so a
+///   genuinely-remote endpoint is marked regardless of what `cluster` name an
+///   Istio WorkloadEntry translation may have stamped on it. The discoverer copies
+///   this into the `mesh.remote=true` target tag strict local-first LB keys on; it
+///   never crosses a wire/file boundary (`#[serde(skip)]`), so it cannot be forged.
+/// - `cluster` is stamped (only when absent) so introspection / metrics can
+///   attribute the target.
 /// - `network` is preserved (multi-network routing).
 /// - `locality` is always rewritten to a synthetic `remote-<cluster>` locality.
 ///   A remote CP can legitimately report the same region/zone strings as the
@@ -475,6 +725,23 @@ fn tag_remote_workloads(
     network: Option<&str>,
 ) {
     for workload in &mut endpoints.workloads {
+        // RESERVED provenance: this workload came from the remote discovery slice.
+        // Independent of `cluster`-name matching so a WorkloadEntry-translated
+        // `cluster` that diverges from the configured `RemoteCluster.name` still
+        // marks the endpoint remote.
+        workload.remote_provenance = true;
+        // Fill cluster/network only when the remote payload omitted them: the
+        // payload value is the workload's OWN identity (e.g. a WorkloadEntry's
+        // real cluster, which may legitimately diverge from this entry's alias)
+        // and `remote_provenance` above — not the cluster field — is what
+        // classifies the endpoint as remote, so it must be preserved. The
+        // merge-layer registry dedup (`WorkloadEndpointKey`) includes
+        // cluster/network, so two same-address endpoints on distinct networks
+        // stay as distinct WORKLOADS for provenance/introspection. The runtime
+        // target dedup in `service_discovery::mesh` deliberately collapses them
+        // back on `host:port` (they are not independently dial-able until a
+        // network-gateway address rewrite exists — issue #1719 — and the
+        // health/CB/LB keys are `host:port`).
         if workload.cluster.is_none() {
             workload.cluster = Some(cluster_name.to_string());
         }
@@ -507,6 +774,8 @@ fn workload_endpoint_key(workload: &Workload) -> WorkloadEndpointKey {
         spiffe_id: workload.spiffe_id.as_str().to_string(),
         namespace: workload.namespace.clone(),
         service_name: workload.service_name.clone(),
+        cluster: workload.cluster.clone(),
+        network: workload.network.clone(),
         addresses,
         ports,
     }
@@ -533,6 +802,8 @@ struct WorkloadEndpointKey {
     spiffe_id: String,
     namespace: String,
     service_name: String,
+    cluster: Option<String>,
+    network: Option<String>,
     addresses: Vec<String>,
     ports: Vec<(u16, AppProtocol, Option<String>)>,
 }
@@ -818,7 +1089,16 @@ impl RemoteDiscoveryManager {
             let _ = running.shutdown_tx.send(true);
             running.handle.abort();
             if remove_endpoints {
-                self.store.remove(cluster_name);
+                // Drop the endpoints (retiring the generation) AND prune the
+                // success / last-success / endpoint-age series so a removed (or
+                // trust-withdrawn) cluster does not linger as a freshly-polled,
+                // endpoint-less entry on `/metrics`. Keyed by
+                // (cluster, trust_domain) to match the metric maps. The retire +
+                // clear run under the store's metrics ordering lock so an
+                // in-flight poll's generation-checked success record cannot race
+                // this clear and re-create the series.
+                self.store
+                    .remove_and_clear_metrics(cluster_name, running.target.trust_domain.as_str());
             }
         }
     }
@@ -908,42 +1188,55 @@ fn poll_targets_for_multi_cluster(
     multi_cluster: &MultiClusterConfig,
     trust_bundle_domains: &std::collections::HashSet<TrustDomain>,
 ) -> Vec<RemoteClusterPollTarget> {
-    multi_cluster
-        .remote_clusters
-        .iter()
-        .filter_map(|remote| {
-            let url = remote.control_plane_url.as_deref()?.trim();
-            if url.is_empty() {
-                return None;
-            }
-            if !trust_bundle_domains.contains(&remote.trust_domain) {
-                warn!(
-                    cluster = %remote.name,
-                    trust_domain = %remote.trust_domain,
-                    "Skipping remote-cluster discovery: no federated trust bundle for the remote \
-                     trust domain (cross-cluster discovery is fail-closed). Configure trust \
-                     federation for this cluster first."
-                );
-                return None;
-            }
-            if let Err(err) = validate_control_plane_url(url) {
-                warn!(
-                    cluster = %remote.name,
-                    error = %err,
-                    "Dropping remote-cluster control_plane_url that failed validation"
-                );
-                return None;
-            }
-            Some(RemoteClusterPollTarget {
-                cluster_name: remote.name.clone(),
-                trust_domain: remote.trust_domain.clone(),
-                network: remote.network.clone(),
-                // Normalize grpc:// → http:// and grpcs:// → https:// so the
-                // dialer and TLS-selection logic always see canonical schemes.
-                control_plane_url: normalize_control_plane_url(url),
-            })
-        })
-        .collect()
+    let mut targets = Vec::with_capacity(
+        multi_cluster
+            .remote_clusters
+            .len()
+            .min(MAX_MESH_REMOTE_CLUSTERS),
+    );
+    for remote in &multi_cluster.remote_clusters {
+        let Some(url) = remote.control_plane_url.as_deref().map(str::trim) else {
+            continue;
+        };
+        if url.is_empty() {
+            continue;
+        }
+        if !trust_bundle_domains.contains(&remote.trust_domain) {
+            warn!(
+                cluster = %remote.name,
+                trust_domain = %remote.trust_domain,
+                "Skipping remote-cluster discovery: no federated trust bundle for the remote \
+                 trust domain (cross-cluster discovery is fail-closed). Configure trust \
+                 federation for this cluster first."
+            );
+            continue;
+        }
+        if let Err(err) = validate_control_plane_url(url) {
+            warn!(
+                cluster = %remote.name,
+                error = %err,
+                "Dropping remote-cluster control_plane_url that failed validation"
+            );
+            continue;
+        }
+        if targets.len() >= MAX_MESH_REMOTE_CLUSTERS {
+            warn!(
+                cluster = %remote.name,
+                max_remote_clusters = MAX_MESH_REMOTE_CLUSTERS,
+                "Skipping remote-cluster discovery beyond remote-cluster target cap"
+            );
+            continue;
+        }
+        targets.push(RemoteClusterPollTarget {
+            cluster_name: remote.name.clone(),
+            trust_domain: remote.trust_domain.clone(),
+            network: remote.network.clone(),
+            // Normalize grpc:// → http:// and grpcs:// → https:// so the
+            // dialer and TLS-selection logic always see canonical schemes.
+            control_plane_url: normalize_control_plane_url(url),
+        });
+    }
+    targets
 }
 
 /// Normalize a `control_plane_url` for dialing.
@@ -1097,8 +1390,8 @@ async fn remote_discovery_loop(
                 let log_trust_domain = entry.trust_domain.clone();
                 let log_network = entry.network.clone();
                 let log_fetched_at = entry.fetched_at_unix_seconds();
-                let installed = store.install(entry, task_generation);
-                if installed {
+                let outcome = store.install(entry, task_generation);
+                if outcome.installed() {
                     info!(
                         cluster = %ctx.cluster_name,
                         trust_domain = %log_trust_domain,
@@ -1121,6 +1414,26 @@ async fn remote_discovery_loop(
                         "Remote-cluster poll succeeded with no endpoint change; not re-installing"
                     );
                 }
+                // Only mark the cluster freshly-polled when the poll reflects a
+                // live, still-registered cluster. A retired-generation no-op
+                // (the cluster was removed / trust withdrawn while this poll was
+                // in flight) must not refresh the success / last-success /
+                // endpoint-age gauges, or `/metrics` would advertise a healthy
+                // remote cluster whose endpoints were intentionally dropped.
+                //
+                // `install`'s live/retired verdict is computed lock-free, but the
+                // metric write lands in a separate map; recording through the
+                // store re-checks the generation under the metrics ordering lock
+                // so this record cannot resurrect the series after a concurrent
+                // reconcile retired the generation and cleared the metrics.
+                if outcome.is_live_poll() {
+                    store.record_remote_discovery_success_if_live(
+                        &ctx.cluster_name,
+                        ctx.trust_domain.as_str(),
+                        now,
+                        task_generation,
+                    );
+                }
                 backoff_secs = REMOTE_BACKOFF_INITIAL_SECS;
                 let elapsed = attempt_started_at.elapsed();
                 (true, ctx.config.poll_interval.saturating_sub(elapsed))
@@ -1131,6 +1444,11 @@ async fn remote_discovery_loop(
                     control_plane = %url_for_logs,
                     error = %err,
                     "Remote-cluster endpoint discovery failed; keeping last-good endpoints if any"
+                );
+                crate::plugins::mesh::prometheus_helpers::increment_mesh_remote_discovery_poll_failure(
+                    &ctx.cluster_name,
+                    ctx.trust_domain.as_str(),
+                    &url_for_logs,
                 );
                 (false, jittered_backoff(backoff_secs))
             }
@@ -1416,7 +1734,8 @@ async fn fetch_remote_slice_endpoints(
             MeshConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
                 req.metadata_mut().insert("authorization", token.clone());
                 Ok(req)
-            });
+            })
+            .max_decoding_message_size(MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE);
         let request = tonic::Request::new(MeshSubscribeRequest {
             node_id: node_id.to_string(),
             ferrum_version: crate::FERRUM_VERSION.to_string(),
@@ -1490,7 +1809,103 @@ mod tests {
             locality: locality.map(str::to_string),
             service_account: None,
             pod_uid: None,
+            remote_provenance: false,
         }
+    }
+
+    /// Local-cluster-relative `MultiClusterConfig` fixture: `local_cluster`
+    /// set, plus `west` declared as a remote cluster (so the provenance branch
+    /// has something to match when `local_cluster` is later cleared).
+    fn relative_to(local: &str) -> MultiClusterConfig {
+        MultiClusterConfig {
+            local_cluster: Some(local.to_string()),
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("west.local"),
+                network: None,
+                control_plane_url: None,
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        }
+    }
+
+    #[test]
+    fn workload_is_remote_keys_on_cross_cluster_identity_not_locality() {
+        let east_local = relative_to("east");
+        let mut local = workload("spiffe://cluster.local/ns/d/sa/a", "svc", "10.0.0.1", None);
+        local.cluster = Some("east".to_string());
+        // A workload whose cluster matches the local cluster is LOCAL.
+        assert!(!workload_is_remote(&local, Some(&east_local)));
+        // A workload whose cluster differs from the local cluster is REMOTE.
+        let mut from_west = local.clone();
+        from_west.cluster = Some("west".to_string());
+        assert!(workload_is_remote(&from_west, Some(&east_local)));
+
+        // No `cluster` on the workload → local regardless of config.
+        let no_cluster = workload("spiffe://cluster.local/ns/d/sa/b", "svc", "10.0.0.2", None);
+        assert!(!workload_is_remote(&no_cluster, Some(&east_local)));
+
+        // No `MultiClusterConfig` at all → nothing is classified remote
+        // (single-cluster posture).
+        assert!(!workload_is_remote(&local, None));
+
+        // Regression guard for the codex finding: a LOCAL workload whose region
+        // is literally named `remote-us` (carrying NO foreign cluster) must NOT
+        // be classified remote — provenance is the cluster identity, not the
+        // locality string prefix.
+        let local_named_remote = workload(
+            "spiffe://cluster.local/ns/d/sa/c",
+            "svc",
+            "10.0.0.3",
+            Some("remote-us/zone-a"),
+        );
+        assert!(!workload_is_remote(&local_named_remote, Some(&east_local)));
+        assert!(!workload_is_remote(&local_named_remote, None));
+    }
+
+    /// codex r2 finding #1: remote provenance must NOT require
+    /// `MultiClusterConfig.local_cluster`. When `local_cluster` is omitted, a
+    /// workload is remote iff its stamped cluster matches a configured remote
+    /// cluster — so remote-discovered endpoints are still classified remote and
+    /// the egress local-only filter / strict locality LB still fail over
+    /// local→remote correctly.
+    #[test]
+    fn workload_is_remote_provenance_without_local_cluster() {
+        // `local_cluster` UNSET, `west` declared remote.
+        let no_local = MultiClusterConfig {
+            local_cluster: None,
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("west.local"),
+                network: None,
+                control_plane_url: None,
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+
+        // A workload stamped with a configured remote cluster's name is REMOTE
+        // even though no `local_cluster` is set.
+        let mut from_west = workload("spiffe://cluster.local/ns/d/sa/a", "svc", "10.0.0.1", None);
+        from_west.cluster = Some("west".to_string());
+        assert!(
+            workload_is_remote(&from_west, Some(&no_local)),
+            "a workload from a configured remote cluster must be REMOTE even with local_cluster unset"
+        );
+
+        // A workload stamped with a cluster the config does NOT list as remote
+        // stays LOCAL (single-cluster / local-tagged posture).
+        let mut from_other = from_west.clone();
+        from_other.cluster = Some("east".to_string());
+        assert!(
+            !workload_is_remote(&from_other, Some(&no_local)),
+            "a cluster not declared remote stays LOCAL when local_cluster is unset"
+        );
+
+        // No `cluster` on the workload → still LOCAL.
+        let no_cluster = workload("spiffe://cluster.local/ns/d/sa/b", "svc", "10.0.0.2", None);
+        assert!(!workload_is_remote(&no_cluster, Some(&no_local)));
     }
 
     fn service(name: &str, refs: &[&str]) -> MeshService {
@@ -1703,6 +2118,32 @@ mod tests {
         assert!(!local.same_region(&remote));
     }
 
+    /// codex r3 Finding C: the reserved-namespace stripper drops every `mesh.*`
+    /// key from a label map copied from operator/workload-controlled input so a
+    /// forged provenance/transport marker can never reach an `UpstreamTarget`.
+    #[test]
+    fn strip_reserved_mesh_tags_drops_mesh_namespace_only() {
+        let mut tags: std::collections::HashMap<String, String> = [
+            ("app", "reviews"),
+            ("version", "v2"),
+            (MESH_REMOTE_TAG, MESH_REMOTE_TAG_VALUE), // forged provenance marker
+            ("mesh.hbone", "true"),                   // forged transport marker
+            ("mesh.anything", "x"),                   // any reserved key
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        strip_reserved_mesh_tags(&mut tags);
+        // Operator labels survive.
+        assert_eq!(tags.get("app").map(String::as_str), Some("reviews"));
+        assert_eq!(tags.get("version").map(String::as_str), Some("v2"));
+        // Every reserved `mesh.*` key is gone.
+        assert!(!tags.contains_key(MESH_REMOTE_TAG));
+        assert!(!tags.contains_key("mesh.hbone"));
+        assert!(!tags.contains_key("mesh.anything"));
+        assert_eq!(tags.len(), 2);
+    }
+
     #[test]
     fn tag_remote_workloads_applies_locality_and_cluster() {
         let mut endpoints = RemoteClusterEndpoints {
@@ -1735,6 +2176,69 @@ mod tests {
             endpoints.workloads[1].locality.as_deref(),
             Some("remote-west/net2")
         );
+        // codex r3 Finding B: ingestion stamps the RESERVED provenance marker on
+        // every remote-discovered workload.
+        assert!(endpoints.workloads[0].remote_provenance);
+        assert!(endpoints.workloads[1].remote_provenance);
+    }
+
+    /// codex r3 Finding B: a genuinely-remote endpoint whose PRESERVED
+    /// `workload.cluster` does NOT equal the configured `RemoteCluster.name` (an
+    /// Istio WorkloadEntry translation can stamp such a `cluster`) must STILL be
+    /// classified remote. Before the fix, `workload_is_remote` keyed solely on
+    /// cluster-name equality, so this endpoint was misclassified LOCAL and strict
+    /// locality LB kept sending to it while locals were healthy. The reserved
+    /// `remote_provenance` marker — stamped at ingestion, independent of the
+    /// cluster name — fixes it.
+    #[test]
+    fn remote_provenance_overrides_divergent_cluster_name() {
+        // Workload pre-stamped (e.g. by WorkloadEntry translation) with a cluster
+        // name that does NOT match the configured remote alias `west`.
+        let mut diverged = workload(
+            "spiffe://remote.local/ns/default/sa/a",
+            "reviews",
+            "10.2.0.1",
+            None,
+        );
+        diverged.cluster = Some("some-other-cluster-id".to_string());
+        let mut endpoints = RemoteClusterEndpoints {
+            workloads: vec![diverged],
+            services: vec![],
+        };
+        // Ingest from the remote slice for configured cluster `west`.
+        tag_remote_workloads(&mut endpoints, "west", None);
+        let ingested = &endpoints.workloads[0];
+
+        // Provenance is stamped; the divergent cluster name is preserved.
+        assert!(ingested.remote_provenance);
+        assert_eq!(ingested.cluster.as_deref(), Some("some-other-cluster-id"));
+
+        // Config declares `west` as remote with NO local_cluster; the workload's
+        // cluster name does not match it, so the cluster-name fallback alone would
+        // say LOCAL. Provenance must win → REMOTE.
+        let cfg = MultiClusterConfig {
+            local_cluster: None,
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: td("remote.local"),
+                network: None,
+                control_plane_url: None,
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        assert!(
+            workload_is_remote(ingested, Some(&cfg)),
+            "a provenance-marked remote endpoint must classify remote even when its \
+             cluster name diverges from the configured alias"
+        );
+        // Sanity: the SAME divergent-cluster workload WITHOUT the provenance marker
+        // (never ingested from the remote slice) falls back to cluster-name match
+        // and is LOCAL — proving the provenance flag, not the cluster name, is what
+        // flips classification here.
+        let mut not_ingested = ingested.clone();
+        not_ingested.remote_provenance = false;
+        assert!(!workload_is_remote(&not_ingested, Some(&cfg)));
     }
 
     #[test]
@@ -1806,6 +2310,81 @@ mod tests {
         assert_eq!(workloads.len(), 2);
         assert_eq!(workloads[0].addresses, vec!["10.1.0.1".to_string()]);
         assert_eq!(workloads[1].addresses, vec!["10.9.9.9".to_string()]);
+    }
+
+    #[test]
+    fn merge_keeps_same_remote_endpoint_on_distinct_networks() {
+        let remote_spiffe = "spiffe://remote.local/ns/default/sa/shared";
+        let remote_workload = |cluster: &str, network: &str| Workload {
+            cluster: Some(cluster.to_string()),
+            network: Some(network.to_string()),
+            locality: Some(default_remote_locality(cluster, Some(network))),
+            ..workload(remote_spiffe, "reviews", "10.9.9.9", None)
+        };
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            "east".to_string(),
+            RemoteClusterEntry::new(
+                "east".to_string(),
+                td("remote.local"),
+                Some("net-a".to_string()),
+                Some("https://cp-east.remote.example:15010".to_string()),
+                RemoteClusterEndpoints {
+                    workloads: vec![remote_workload("east", "net-a")],
+                    services: vec![],
+                },
+                1,
+            ),
+        );
+        clusters.insert(
+            "west".to_string(),
+            RemoteClusterEntry::new(
+                "west".to_string(),
+                td("remote.local"),
+                Some("net-b".to_string()),
+                Some("https://cp-west.remote.example:15010".to_string()),
+                RemoteClusterEndpoints {
+                    workloads: vec![remote_workload("west", "net-b")],
+                    services: vec![],
+                },
+                1,
+            ),
+        );
+        let snapshot = RemoteEndpointSnapshot { clusters };
+        let candidate = MultiClusterConfig {
+            remote_clusters: vec![
+                RemoteCluster {
+                    name: "east".to_string(),
+                    trust_domain: td("remote.local"),
+                    network: Some("net-a".to_string()),
+                    control_plane_url: Some("https://cp-east.remote.example:15010".to_string()),
+                    federation_endpoint: None,
+                },
+                RemoteCluster {
+                    name: "west".to_string(),
+                    trust_domain: td("remote.local"),
+                    network: Some("net-b".to_string()),
+                    control_plane_url: Some("https://cp-west.remote.example:15010".to_string()),
+                    federation_endpoint: None,
+                },
+            ],
+            ..MultiClusterConfig::default()
+        };
+
+        let (workloads, _) =
+            merge_remote_endpoints_into_mesh(&[], &[], &snapshot, Some(&candidate));
+
+        assert_eq!(
+            workloads.len(),
+            2,
+            "same address/SPIFFE endpoints from distinct networks must not collapse"
+        );
+        let networks: HashSet<_> = workloads
+            .iter()
+            .filter_map(|workload| workload.network.as_deref())
+            .collect();
+        assert!(networks.contains("net-a"));
+        assert!(networks.contains("net-b"));
     }
 
     #[test]
@@ -2179,6 +2758,36 @@ mod tests {
         assert_eq!(targets[0].cluster_name, "trusted");
     }
 
+    #[test]
+    fn poll_targets_cap_remote_discovery_clusters() {
+        let remote_clusters: Vec<RemoteCluster> = (0..=MAX_MESH_REMOTE_CLUSTERS)
+            .map(|index| RemoteCluster {
+                name: format!("cluster-{index}"),
+                trust_domain: td(&format!("remote-{index}.test")),
+                network: None,
+                control_plane_url: Some(format!("https://cp-{index}.remote.example:15010")),
+                federation_endpoint: None,
+            })
+            .collect();
+        let trusted: std::collections::HashSet<TrustDomain> = remote_clusters
+            .iter()
+            .map(|remote| remote.trust_domain.clone())
+            .collect();
+        let mc = MultiClusterConfig {
+            remote_clusters,
+            ..MultiClusterConfig::default()
+        };
+
+        let targets = poll_targets_for_multi_cluster(&mc, &trusted);
+
+        assert_eq!(targets.len(), MAX_MESH_REMOTE_CLUSTERS);
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.cluster_name != format!("cluster-{MAX_MESH_REMOTE_CLUSTERS}"))
+        );
+    }
+
     #[tokio::test]
     async fn manager_reconciles_trust_changes_and_removes_stale_endpoints() {
         let store = RemoteEndpointStore::new();
@@ -2233,6 +2842,76 @@ mod tests {
         assert!(
             store.snapshot().is_empty(),
             "trust withdrawal removes stale remote endpoints"
+        );
+        manager.shutdown();
+    }
+
+    /// codex finding: removing a cluster (trust withdrawal / reconcile drop)
+    /// must also prune its remote-discovery success / last-success / endpoint-age
+    /// metrics, not just its cached endpoints — otherwise a stale, endpoint-less
+    /// cluster keeps advertising a fresh poll on unauthenticated `/metrics`.
+    #[tokio::test]
+    async fn manager_clears_remote_discovery_metrics_on_removal() {
+        // Unique cluster/trust-domain so the shared global metric maps don't
+        // collide with other tests rendering the same output.
+        let suffix = format!("{}-{}", std::process::id(), line!());
+        let cluster = format!("metricclear-{suffix}");
+        let trust_domain_str = format!("td-{suffix}.example");
+        let trust_domain = td(&trust_domain_str);
+
+        let store = RemoteEndpointStore::new();
+        let config = RemoteDiscoveryConfig {
+            poll_interval: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(1),
+            jwt_secret: None,
+            node_id: "dp-1".to_string(),
+            namespace: "default".to_string(),
+            tls_config: RemoteDiscoveryTlsConfig::default(),
+        };
+        let mut manager = RemoteDiscoveryManager::new(Some(config), store.clone(), |ctx| {
+            Arc::new(MissingSecretSource {
+                cluster_name: ctx.cluster_name.clone(),
+            })
+        });
+        let mc = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: cluster.clone(),
+                trust_domain: trust_domain.clone(),
+                network: None,
+                control_plane_url: Some("https://cp.remote.example:15010".to_string()),
+                federation_endpoint: None,
+            }],
+            ..MultiClusterConfig::default()
+        };
+        let mut trusted = std::collections::HashSet::new();
+        trusted.insert(trust_domain.clone());
+
+        manager.reconcile(Some(&mc), trusted);
+        assert_eq!(manager.running_cluster_names(), vec![cluster.clone()]);
+
+        // Simulate a successful poll having recorded the cluster's metrics.
+        crate::plugins::mesh::prometheus_helpers::record_mesh_remote_discovery_poll_success(
+            &cluster,
+            &trust_domain_str,
+            1,
+        );
+        let mut before = String::new();
+        crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(&mut before);
+        assert!(
+            before.contains(&format!("cluster=\"{cluster}\"")),
+            "precondition: success metric should be present before removal: {before}"
+        );
+
+        // Withdraw trust → reconcile removes the cluster (stop_cluster with
+        // remove_endpoints = true), which must also clear the metric series.
+        manager.reconcile(Some(&mc), std::collections::HashSet::new());
+        assert!(manager.running_cluster_names().is_empty());
+
+        let mut after = String::new();
+        crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(&mut after);
+        assert!(
+            !after.contains(&format!("cluster=\"{cluster}\"")),
+            "removing a cluster must prune its remote-discovery metric series: {after}"
         );
         manager.shutdown();
     }
@@ -2630,9 +3309,10 @@ mod tests {
 
         // First poll at t=100 installs and bumps the revision.
         let gen1 = store.register_cluster("west");
-        assert!(
+        assert_eq!(
             store.install(entry_at(100), gen1),
-            "first install changes endpoints → returns true"
+            RemoteInstallOutcome::Installed,
+            "first install changes endpoints → Installed"
         );
         assert!(rx.has_changed().unwrap(), "first install bumps revision");
         rx.mark_unchanged();
@@ -2647,11 +3327,12 @@ mod tests {
 
         // Second poll at t=160: SAME endpoints, NEWER timestamp. Must refresh
         // the stored timestamp but NOT wake the apply task and NOT report a
-        // change.
+        // change. Still a live (deduped) poll, not a retired no-op.
         let gen2 = store.register_cluster("west");
-        assert!(
-            !store.install(entry_at(160), gen2),
-            "no-op poll (same endpoints) returns false even though it refreshed the timestamp"
+        assert_eq!(
+            store.install(entry_at(160), gen2),
+            RemoteInstallOutcome::Deduped,
+            "no-op poll (same endpoints) is Deduped even though it refreshed the timestamp"
         );
         assert!(
             !rx.has_changed().unwrap(),
@@ -2701,7 +3382,7 @@ mod tests {
         };
 
         let gen1 = store.register_cluster("west");
-        assert!(store.install(entry_at(100), gen1));
+        assert!(store.install(entry_at(100), gen1).installed());
 
         // Capture the live snapshot Arc and a handle to the shared atomic.
         let snapshot_before = store.snapshot();
@@ -2710,7 +3391,10 @@ mod tests {
 
         // No-op poll: identical endpoints, newer timestamp.
         let gen2 = store.register_cluster("west");
-        assert!(!store.install(entry_at(160), gen2));
+        assert_eq!(
+            store.install(entry_at(160), gen2),
+            RemoteInstallOutcome::Deduped
+        );
 
         // (1) The published snapshot Arc is unchanged → no clone+swap happened.
         let snapshot_after = store.snapshot();
@@ -2752,15 +3436,75 @@ mod tests {
         };
         // Install once, then retire the cluster.
         let stale_gen = store.register_cluster("west");
-        assert!(store.install(entry_at(100), stale_gen));
+        assert!(store.install(entry_at(100), stale_gen).installed());
         store.remove("west");
         assert!(store.snapshot().is_empty(), "remove clears the cluster");
         // The stale task's next (no-op) poll must be dropped, not refresh a
-        // resurrected entry.
-        assert!(!store.install(entry_at(160), stale_gen));
+        // resurrected entry, and must report Retired (NOT Deduped) so the
+        // success metric is not bumped for a removed cluster.
+        assert_eq!(
+            store.install(entry_at(160), stale_gen),
+            RemoteInstallOutcome::Retired,
+            "a no-op poll on a retired generation must report Retired, not Deduped"
+        );
         assert!(
             store.snapshot().is_empty(),
             "retired cluster must not be reinstated by a no-op timestamp refresh"
+        );
+    }
+
+    /// codex finding (removal race): a poll task's success-metric record must be
+    /// dropped when its cluster's generation has been retired — so a poll that
+    /// completed `install` as live, but whose reconcile concurrently removed the
+    /// cluster and cleared the metric series, cannot RESURRECT the
+    /// success / last-success / endpoint-age series on unauthenticated
+    /// `/metrics`. The store re-checks the generation under the metrics ordering
+    /// lock before writing.
+    #[test]
+    fn success_metric_record_is_blocked_for_retired_cluster() {
+        // Unique cluster/trust-domain so the shared global metric maps don't
+        // collide with other tests rendering the same output.
+        let suffix = format!("{}-{}", std::process::id(), line!());
+        let cluster = format!("recordrace-{suffix}");
+        let trust_domain = format!("td-{suffix}.example");
+
+        let store = RemoteEndpointStore::new();
+        // Register the cluster, then retire it (reconcile remove + metric clear).
+        let stale_gen = store.register_cluster(&cluster);
+        store.remove_and_clear_metrics(&cluster, &trust_domain);
+
+        // The stale poll task — which observed a live generation inside
+        // `install` before the removal landed — now tries to record success with
+        // its (now retired) generation. The store must drop it.
+        store.record_remote_discovery_success_if_live(&cluster, &trust_domain, 1234, stale_gen);
+        let mut after_retired = String::new();
+        crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(
+            &mut after_retired,
+        );
+        assert!(
+            !after_retired.contains(&format!("cluster=\"{cluster}\"")),
+            "a retired-generation success record must NOT resurrect the metric series: {after_retired}"
+        );
+
+        // Sanity: a record on a freshly-registered (live) generation DOES write,
+        // proving the guard rejects only the retired case (not all records).
+        let live_gen = store.register_cluster(&cluster);
+        store.record_remote_discovery_success_if_live(&cluster, &trust_domain, 5678, live_gen);
+        let mut after_live = String::new();
+        crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(
+            &mut after_live,
+        );
+        assert!(
+            after_live.contains(&format!(
+                "ferrum_mesh_remote_discovery_last_success_timestamp_seconds{{cluster=\"{cluster}\",trust_domain=\"{trust_domain}\"}} 5678"
+            )),
+            "a live-generation success record must write the last-success gauge: {after_live}"
+        );
+
+        // Clean up the global metric maps so this test leaves no residue.
+        crate::plugins::mesh::prometheus_helpers::clear_mesh_remote_discovery_metrics(
+            &cluster,
+            &trust_domain,
         );
     }
 

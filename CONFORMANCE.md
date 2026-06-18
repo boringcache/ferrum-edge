@@ -168,8 +168,10 @@ The current run records these `deferred` entries:
 
 - `istio_destination_rule` —
   `trafficPolicy.connectionPool.http.{http1MaxPendingRequests, maxRetries,
-  h2UpgradePolicy}` are translator-acknowledged (`debug!`) but not
-  projected today. Tracked as T1-C follow-ons.
+  h2UpgradePolicy}` are projected and enforced at top-level /
+  `portLevelSettings` (F5.1 — all three now `supported`); they remain deferred
+  ONLY when set inside a `subsets[].trafficPolicy` (the subset apply path builds
+  a `SubsetTrafficPolicy` that carries no `connectionPool.http`).
 
 Previously deferred and now flipped to `supported`:
 

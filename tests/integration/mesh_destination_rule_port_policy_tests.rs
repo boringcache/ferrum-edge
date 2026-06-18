@@ -56,6 +56,7 @@ fn runtime() -> MeshRuntimeConfig {
         egress_stream_enabled: false,
         egress_stream_allow_plaintext: false,
         request_auth_require_exp: true,
+        locality_lb_strict: false,
     }
 }
 
@@ -81,6 +82,7 @@ fn upstream() -> Upstream {
         subsets: None,
         port_overrides: HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -89,6 +91,7 @@ fn upstream() -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: now,
         updated_at: now,
@@ -428,6 +431,7 @@ fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
                             ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade,
                         ),
                         max_retries: Some(2),
+                        http1_max_pending_requests: Some(128),
                     }),
                     ..MeshTrafficPolicy::default()
                 }),
@@ -472,6 +476,175 @@ fn destination_rule_top_level_connection_pool_http_fans_out_to_target_ports() {
 }
 
 #[test]
+fn destination_rule_top_level_connection_pool_http_on_sd_upstream_goes_to_fallback() {
+    use ferrum_edge::config::types::{DnsSdConfig, SdProvider, ServiceDiscoveryConfig};
+    use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
+
+    // #1806: a SERVICE-DISCOVERY upstream cannot fan the top-level
+    // `connectionPool.http` overlay onto a known apply-time port set (targets
+    // resolve at runtime). The overlay must instead be captured on
+    // `dispatch_port_override_fallback` and projected onto the referencing
+    // proxy, where the HTTP dispatch resolvers apply it by the LB-selected
+    // port. It must NOT silently land on (or skip) `port_overrides`.
+    let mut sd_upstream = upstream();
+    sd_upstream.service_discovery = Some(ServiceDiscoveryConfig {
+        provider: SdProvider::DnsSd,
+        dns_sd: Some(DnsSdConfig {
+            service_name: "_http._tcp.reviews.default.svc.cluster.local".to_string(),
+            poll_interval_seconds: 30,
+        }),
+        kubernetes: None,
+        consul: None,
+        mesh: None,
+        default_weight: 1,
+    });
+
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![sd_upstream],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connection_pool_http: Some(MeshConnectionPoolHttp {
+                        idle_timeout_ms: Some(45_000),
+                        http2_max_requests: Some(250),
+                        max_retries: Some(2),
+                        ..MeshConnectionPoolHttp::default()
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings: HashMap::new(),
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+
+    // The SD upstream's top-level overlay landed on the fallback, NOT fanned
+    // onto a (declared static target) port_overrides entry.
+    let fallback = prepared.upstreams[0]
+        .dispatch_port_override_fallback
+        .as_ref()
+        .expect("SD top-level connectionPool.http must populate the fallback overlay");
+    assert_eq!(fallback.http_idle_timeout_ms, Some(45_000));
+    assert_eq!(fallback.h2_max_concurrent_streams, Some(250));
+    assert_eq!(fallback.max_retries, Some(2));
+    assert!(
+        prepared.upstreams[0].port_overrides.is_empty(),
+        "SD upstream top-level overlay must not fan out onto port_overrides"
+    );
+
+    // The fallback is projected onto the referencing proxy for runtime
+    // resolution; the per-port dispatch map stays None (no explicit port entries).
+    assert!(prepared.proxies[0].dispatch_port_overrides.is_none());
+    let proxy_fallback = prepared.proxies[0]
+        .dispatch_port_override_fallback
+        .as_ref()
+        .expect("SD fallback must project onto the referencing proxy");
+    assert_eq!(proxy_fallback.http_idle_timeout_ms, Some(45_000));
+    assert_eq!(proxy_fallback.h2_max_concurrent_streams, Some(250));
+    assert_eq!(proxy_fallback.max_retries, Some(2));
+}
+
+#[test]
+fn destination_rule_named_target_port_sd_falls_back_to_top_level_connection_pool_http() {
+    use ferrum_edge::config::types::{DnsSdConfig, SdProvider, ServiceDiscoveryConfig};
+    use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
+
+    // #1806 (narrowed; follow-up #1816): an SD upstream whose Service uses a NAMED
+    // `targetPort` keeps the per-port `portLevelSettings` entry under the DECLARED
+    // service port (80) — named targetPorts can't be remapped at apply time — while
+    // the discovered target carries the RESOLVED workload port (8080). The SD
+    // fallback carries the TOP-LEVEL `connectionPool.http` overlay ONLY (it does NOT
+    // fold per-port entries — folding cross-leaks between ports on a multi-port
+    // upstream). So for a named-targetPort SD upstream the per-port lookup misses the
+    // resolved port and the TOP-LEVEL value applies; honoring the explicit per-port
+    // value here is a DEFERRED accepted limitation (#1816).
+    let mut sd_upstream = upstream();
+    // Resolved workload target port differs from the declared service port (80).
+    sd_upstream.targets[0].port = 8080;
+    sd_upstream.service_discovery = Some(ServiceDiscoveryConfig {
+        provider: SdProvider::DnsSd,
+        dns_sd: Some(DnsSdConfig {
+            service_name: "_http._tcp.reviews.default.svc.cluster.local".to_string(),
+            poll_interval_seconds: 30,
+        }),
+        kubernetes: None,
+        consul: None,
+        mesh: None,
+        default_weight: 1,
+    });
+
+    // Per-port entry on the DECLARED service port (80): conflicting maxRetries (5)
+    // that must WIN over the top-level (2), plus an inherited-only field.
+    let mut port_level_settings = HashMap::new();
+    port_level_settings.insert(
+        80,
+        MeshTrafficPolicy {
+            connection_pool_http: Some(MeshConnectionPoolHttp {
+                max_retries: Some(5),
+                ..MeshConnectionPoolHttp::default()
+            }),
+            ..MeshTrafficPolicy::default()
+        },
+    );
+
+    let mut config = GatewayConfig {
+        proxies: vec![proxy()],
+        upstreams: vec![sd_upstream],
+        mesh: Some(Box::new(MeshConfig {
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews-dr".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: Some(MeshTrafficPolicy {
+                    connection_pool_http: Some(MeshConnectionPoolHttp {
+                        idle_timeout_ms: Some(45_000),
+                        max_retries: Some(2),
+                        ..MeshConnectionPoolHttp::default()
+                    }),
+                    ..MeshTrafficPolicy::default()
+                }),
+                port_level_settings,
+                subsets: Vec::new(),
+            }],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+    config.normalize_fields();
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
+
+    // The projected proxy fallback carries the TOP-LEVEL overlay ONLY (no per-port
+    // folding): the top-level maxRetries (2) and idleTimeout (45s). The explicit
+    // per-port maxRetries (5) keyed on the declared service port (80) is NOT folded,
+    // so for the resolved port 8080 the top-level value applies — named-targetPort
+    // per-port precedence is the DEFERRED accepted limitation (#1816).
+    let proxy_fallback = prepared.proxies[0]
+        .dispatch_port_override_fallback
+        .as_ref()
+        .expect("SD fallback must project onto the referencing proxy");
+    assert_eq!(
+        proxy_fallback.max_retries,
+        Some(2),
+        "named-targetPort SD: the TOP-LEVEL fallback applies on the resolved port (per-port deferred to #1816)"
+    );
+    assert_eq!(
+        proxy_fallback.http_idle_timeout_ms,
+        Some(45_000),
+        "a top-level-only field is inherited by the fallback"
+    );
+}
+
+#[test]
 fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out() {
     use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
 
@@ -507,6 +680,7 @@ fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out(
                         http2_max_requests: Some(250),
                         h2_upgrade_policy: None,
                         max_retries: None,
+                        http1_max_pending_requests: None,
                     }),
                     ..MeshTrafficPolicy::default()
                 }),
@@ -548,6 +722,7 @@ fn destination_rule_connection_pool_http_only_per_port_no_fan_out() {
                 http2_max_requests: Some(20),
                 h2_upgrade_policy: None,
                 max_retries: None,
+                http1_max_pending_requests: None,
             }),
             ..MeshTrafficPolicy::default()
         },
