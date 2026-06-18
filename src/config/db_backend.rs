@@ -640,6 +640,15 @@ pub fn extract_db_hostname(db_url: &str) -> Option<String> {
 
     let host = parsed.host_str()?;
 
+    // MongoDB seed lists without explicit ports (e.g.
+    // `mongodb://user:pass@mongo1,mongo2/ferrum`) are accepted by `url` as a
+    // single comma-joined host. Re-route through the multi-host extractor so
+    // DNS rotation tracks the first seed host instead of an unresolvable
+    // combined authority.
+    if host.contains(',') {
+        return extract_mongodb_multi_host_hostname(db_url);
+    }
+
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     if bare.parse::<std::net::IpAddr>().is_ok() {
         return None;
@@ -658,23 +667,13 @@ pub fn redact_url(url: &str) -> String {
             if !parsed.username().is_empty() && parsed.set_username("***").is_err() {
                 return "<invalid-url>".to_string();
             }
-            if parsed.query().is_some() {
-                let redacted_pairs: Vec<(String, String)> = parsed
-                    .query_pairs()
-                    .map(|(key, value)| {
-                        let value = if is_sensitive_url_query_key(&key) {
-                            "***".to_string()
-                        } else {
-                            value.into_owned()
-                        };
-                        (key.into_owned(), value)
-                    })
-                    .collect();
-                parsed.query_pairs_mut().clear().extend_pairs(
-                    redacted_pairs
-                        .iter()
-                        .map(|(key, value)| (key.as_str(), value.as_str())),
-                );
+            if let Some(query) = parsed.query() {
+                // Redact via the shared option-aware scrubber rather than
+                // `query_pairs()`, which only splits on `&` and would leak
+                // credentials carried in MongoDB `;`-separated options or in
+                // `authMechanismProperties` token lists.
+                let redacted_query = redact_query_string(query);
+                parsed.set_query(Some(&redacted_query));
             }
             parsed.to_string()
         }
@@ -766,18 +765,60 @@ fn redact_url_suffix_query(suffix: &str) -> String {
     format!("{before_query}{redacted_query}{fragment}")
 }
 
+/// Redact credential-bearing values from a URL query string.
+///
+/// Splits on both `&` and `;`. MongoDB documents `;` as an accepted option
+/// separator, and `url`'s `form_urlencoded` parser only splits on `&`, so a
+/// `;`-joined option such as `replicaSet=rs0;password=secret` would otherwise be
+/// treated as a single non-sensitive `replicaSet` value and leak the password.
+/// Re-serialization normalizes the separator to `&`, which every driver accepts.
 fn redact_query_string(query: &str) -> String {
-    let pairs = url::form_urlencoded::parse(query.as_bytes()).map(|(key, value)| {
-        let value = if is_sensitive_url_query_key(&key) {
-            std::borrow::Cow::Borrowed("***")
-        } else {
-            value
-        };
-        (key, value)
-    });
-    url::form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(pairs)
-        .finish()
+    query
+        .split(['&', ';'])
+        .filter(|option| !option.is_empty())
+        .map(redact_query_option)
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Redact a single `name[=value]` query option according to its key.
+fn redact_query_option(option: &str) -> String {
+    let (key, value) = match option.split_once('=') {
+        Some((key, value)) => (key, Some(value)),
+        None => (option, None),
+    };
+
+    let Some(value) = value else {
+        return key.to_string();
+    };
+
+    if is_sensitive_url_query_key(key) {
+        return format!("{key}=***");
+    }
+
+    // MongoDB's `authMechanismProperties` carries a comma-separated list of
+    // `NAME:VALUE` properties; with MONGODB-AWS the AWS session token rides in
+    // `AWS_SESSION_TOKEN:<secret>`. The key itself is not sensitive, so redact
+    // any credential-bearing property value within it while keeping benign
+    // properties (e.g. `CANONICALIZE_HOST_NAME:true`) for observability.
+    if normalize_query_key(key) == "authmechanismproperties" {
+        return format!("{key}={}", redact_mechanism_properties(value));
+    }
+
+    format!("{key}={value}")
+}
+
+/// Redact credential-bearing properties inside a MongoDB
+/// `authMechanismProperties` value (`NAME:VALUE` pairs separated by `,`).
+fn redact_mechanism_properties(value: &str) -> String {
+    value
+        .split(',')
+        .map(|property| match property.split_once(':') {
+            Some((name, _)) if is_sensitive_url_query_key(name) => format!("{name}:***"),
+            _ => property.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn is_sensitive_url_query_key(key: &str) -> bool {

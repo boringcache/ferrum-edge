@@ -60,6 +60,24 @@ fn extract_hostname_mongodb_multi_host_first_ip_literal_returns_none() {
     assert_eq!(extract_db_hostname(url), None);
 }
 
+#[test]
+fn extract_hostname_mongodb_multi_host_without_ports_uses_first_host() {
+    // Seed lists that omit explicit ports are accepted by the `url` crate as a
+    // single comma-joined host; DNS rotation must still track the first seed
+    // host rather than the unresolvable combined authority.
+    let url = "mongodb://user:pass@mongo1.internal,mongo2.internal,mongo3.internal/ferrum";
+    assert_eq!(
+        extract_db_hostname(url),
+        Some("mongo1.internal".to_string())
+    );
+}
+
+#[test]
+fn extract_hostname_mongodb_multi_host_without_ports_first_ip_returns_none() {
+    let url = "mongodb://user:pass@192.0.2.10,mongo2.internal/ferrum?replicaSet=rs0";
+    assert_eq!(extract_db_hostname(url), None);
+}
+
 // ---------------------------------------------------------------------------
 // redact_url — tests for MongoDB URLs
 // ---------------------------------------------------------------------------
@@ -205,6 +223,69 @@ fn redact_url_redacts_credential_substring_aliases() {
     assert_eq!(pairs.get("credential").map(String::as_str), Some("***"));
     // Non-secret TLS options remain untouched.
     assert_eq!(pairs.get("sslmode").map(String::as_str), Some("require"));
+}
+
+#[test]
+fn redact_url_redacts_mongodb_semicolon_separated_options() {
+    // MongoDB accepts `;` as an option separator; the `url` crate's query parser
+    // only splits on `&`, so a `;`-joined credential must still be redacted.
+    // No-port seed list parses successfully and flows through the OK arm.
+    let redacted = redact_url(
+        "mongodb://u:p@db0,db1/ferrum?replicaSet=rs0;password=query-secret;authSource=admin",
+    );
+    assert!(
+        !redacted.contains("query-secret"),
+        "semicolon password leaked: {redacted}"
+    );
+    assert!(redacted.contains("replicaSet=rs0"));
+    assert!(redacted.contains("password=***"));
+    assert!(redacted.contains("authSource=admin"));
+
+    // Explicit ports make the authority unparseable, exercising the multi-host
+    // fallback redactor on the same `;`-separated option string.
+    let redacted_ports =
+        redact_url("mongodb://u:p@db0:27017,db1:27017/ferrum?replicaSet=rs0;password=query-secret");
+    assert!(
+        !redacted_ports.contains("query-secret"),
+        "semicolon password leaked via fallback: {redacted_ports}"
+    );
+    assert!(redacted_ports.contains("password=***"));
+    assert!(redacted_ports.contains("replicaSet=rs0"));
+}
+
+#[test]
+fn redact_url_redacts_mongodb_auth_mechanism_properties_tokens() {
+    // MONGODB-AWS temporary credentials carry the session token inside the
+    // `authMechanismProperties` value; the key itself is not sensitive, so the
+    // credential-bearing property values must be redacted.
+    let redacted = redact_url(concat!(
+        "mongodb://u:p@db0,db1/ferrum?authMechanism=MONGODB-AWS&",
+        "authMechanismProperties=AWS_SESSION_TOKEN:sessiontoken,",
+        "AWS_SECRET_ACCESS_KEY:topsecret,CANONICALIZE_HOST_NAME:true"
+    ));
+    assert!(
+        !redacted.contains("sessiontoken"),
+        "AWS session token leaked: {redacted}"
+    );
+    assert!(
+        !redacted.contains("topsecret"),
+        "AWS secret access key leaked: {redacted}"
+    );
+    assert!(redacted.contains("AWS_SESSION_TOKEN:***"));
+    assert!(redacted.contains("AWS_SECRET_ACCESS_KEY:***"));
+    // Benign properties remain for observability.
+    assert!(redacted.contains("CANONICALIZE_HOST_NAME:true"));
+
+    // Same option carried through the multi-host fallback (explicit ports).
+    let redacted_ports = redact_url(concat!(
+        "mongodb://u:p@db0:27017,db1:27017/ferrum?authMechanism=MONGODB-AWS&",
+        "authMechanismProperties=AWS_SESSION_TOKEN:sessiontoken"
+    ));
+    assert!(
+        !redacted_ports.contains("sessiontoken"),
+        "AWS session token leaked via fallback: {redacted_ports}"
+    );
+    assert!(redacted_ports.contains("AWS_SESSION_TOKEN:***"));
 }
 
 // ---------------------------------------------------------------------------
