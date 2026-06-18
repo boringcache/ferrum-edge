@@ -7527,15 +7527,28 @@ fn start_mesh_inbound_svid_rotation_republisher(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // Republish once up front. A file/CA rotation can bump
+        // Snapshot the rotation revision *before* the initial publish, then
+        // republish once up front. A file/CA rotation can bump
         // `backend_svid_rotation_tx` after this receiver was subscribed but
-        // before this task runs; the watch channel coalesces that into the
-        // baseline read below, so without an initial publish the inbound
-        // verifier could keep serving the OLD roots until the NEXT rotation or
-        // slice apply. Republishing the current bundle is idempotent, so doing
-        // it unconditionally here is safe and closes the subscribe→run race.
-        publish_runtime_svid_to_inbound_slot(&proxy_state, &inbound_slot, &trust_overlay_slot);
+        // before this task runs; the initial publish covers that case because
+        // `publish_runtime_svid_to_inbound_slot` re-reads `gateway_file_svid_bundle`
+        // live under `gateway_svid_update_lock`, so it picks up any already
+        // installed bundle.
+        //
+        // The ordering matters for the narrow window where a rotation lands
+        // *between* the baseline read and the publish (or just after it).
+        // The loop dedups on the `observed_revision` integer compare below;
+        // if the baseline were taken AFTER the publish it could capture a
+        // bump whose bundle the publish had NOT yet read, and then
+        // `next_revision == observed_revision` would skip the follow-up
+        // republish, pinning the inbound verifier to OLD roots until the next
+        // rotation or slice apply. Reading the baseline first guarantees any
+        // rotation that could change the bundle is either already reflected in
+        // the publish or strictly greater than `observed_revision` (forcing a
+        // republish). The publish is idempotent, so the occasional redundant
+        // republish is harmless.
         let mut observed_revision = *revision_rx.borrow();
+        publish_runtime_svid_to_inbound_slot(&proxy_state, &inbound_slot, &trust_overlay_slot);
         loop {
             tokio::select! {
                 changed = revision_rx.changed() => {
@@ -17934,6 +17947,77 @@ mod tests {
                 .contains_key(&TrustDomain::new("partner.file-rotation").unwrap()),
             "accepted federated overlay must survive file-backed SVID republish"
         );
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(1), republisher)
+            .await
+            .expect("republisher observed shutdown")
+            .expect("republisher task joined");
+    }
+
+    // Regression for the file-SVID rotation republish race (#1707 / #1728 P3):
+    // a rotation can install the new gateway bundle and bump
+    // `backend_svid_rotation_tx` after the republisher subscribed but before its
+    // task first runs. The initial publish must read the freshly installed
+    // bundle, and the baseline revision must be captured *before* that publish so
+    // a later interleaving cannot be deduped away. We model the pre-run rotation
+    // deterministically on a single-threaded executor: install the new bundle and
+    // bump the revision while the spawned task is still parked, then drive it. A
+    // correct republisher pins the verifier to the NEW roots without waiting for a
+    // second rotation; the pre-fix order (publish-then-baseline) could leave it on
+    // the old roots.
+    #[tokio::test(flavor = "current_thread")]
+    async fn inbound_svid_rotation_republisher_picks_up_pre_run_rotation() {
+        use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let inbound_slot: tls::SharedBundleSlot = Arc::new(arc_swap::ArcSwap::new(Arc::new(None)));
+        let overlay_slot = empty_mesh_inbound_trust_overlay_slot();
+        let td = TrustDomain::new("td.pre-run-rotation").unwrap();
+        let id = SpiffeId::from_parts(&td, "ns/foo/sa/bar").unwrap();
+
+        let svid_bundle = |local_roots: Vec<Vec<u8>>| SvidBundle {
+            spiffe_id: id.clone(),
+            cert_chain_der: vec![vec![1, 2, 3]],
+            private_key_pkcs8_der: Vec::new(),
+            trust_bundles: TrustBundleSet::local_only(TrustBundle {
+                trust_domain: td.clone(),
+                x509_authorities: local_roots,
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }),
+        };
+
+        // Old roots in place when the republisher subscribes.
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![1]]));
+        let (revision_tx, revision_rx) = tokio::sync::watch::channel(0u64);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let republisher = start_mesh_inbound_svid_rotation_republisher(
+            state.clone(),
+            inbound_slot.clone(),
+            overlay_slot.clone(),
+            revision_rx,
+            shutdown_rx,
+        );
+
+        // Rotation lands while the spawned task is still parked (no yield yet):
+        // new bundle installed AND the revision bumped before the task runs.
+        state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![9]]));
+        revision_tx.send_replace(1);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let active = inbound_slot.load_full();
+                if active.as_ref().as_ref().is_some_and(|bundle| {
+                    bundle.trust_bundles.local.x509_authorities == vec![vec![9]]
+                }) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("republisher must pin the inbound verifier to the new roots");
 
         let _ = shutdown_tx.send(true);
         tokio::time::timeout(Duration::from_secs(1), republisher)
