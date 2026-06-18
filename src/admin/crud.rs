@@ -13,8 +13,8 @@ use crate::admin::jwt_auth::AdminRole;
 use crate::config::db_backend::{DatabaseBackend, PaginatedResult};
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, RetryConfig, Upstream,
-    mesh_transport_retry_conflict_message, proxy_retry_is_effective,
-    retry_is_effective_for_mesh_target, upstream_required_mesh_transport, validate_resource_id,
+    first_effective_mesh_transport_conflict, mesh_transport_retry_conflict_message,
+    proxy_retry_is_effective, validate_resource_id,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 
@@ -557,11 +557,20 @@ async fn validate_mesh_route_dispatch_plugin_retry_conflicts(
                     .map_err(AfterValidateError::Db)?;
                 let items_len = page.items.len() as i64;
                 for proxy in &page.items {
-                    let applies = plugin_config.scope == PluginScope::Global
-                        || proxy
+                    let applies = if plugin_config.scope == PluginScope::Global {
+                        // A global instance is shadowed on any proxy that attaches
+                        // its own enabled `mesh_route_dispatch` (PluginCache removes
+                        // globals of the same name), so it never runs there.
+                        !proxy_shadows_global_mesh_route_dispatch(db, namespace, proxy)
+                            .await
+                            .map_err(AfterValidateError::Db)?
+                    } else {
+                        // proxy_group: only proxies that associate this plugin id.
+                        proxy
                             .plugins
                             .iter()
-                            .any(|assoc| assoc.plugin_config_id == plugin_config.id);
+                            .any(|assoc| assoc.plugin_config_id == plugin_config.id)
+                    };
                     if applies {
                         evaluate_mesh_route_dispatch_rules_for_proxy(
                             db,
@@ -604,9 +613,13 @@ async fn evaluate_mesh_route_dispatch_rules_for_proxy(
         let Some(override_uid) = rule.destination.upstream_id.as_deref() else {
             continue;
         };
-        if override_uid == proxy.upstream_id.as_deref().unwrap_or("") {
-            // Same as the default upstream: covered by the proxy/upstream
-            // default-target checks, not a route override.
+        // A rule pointing at the proxy's default upstream that leaves retry
+        // untouched is covered by the proxy/upstream default-target checks. But a
+        // same-upstream rule that adds or disables retry still has the runtime
+        // overwrite `proxy.retry` via `route_override_retry` before dispatch, so
+        // it must be evaluated here too.
+        let rule_changes_retry = rule.retry.is_some() || rule.retry_disabled;
+        if override_uid == proxy.upstream_id.as_deref().unwrap_or("") && !rule_changes_retry {
             continue;
         }
         let effective_retry = if rule.retry.is_some() {
@@ -622,14 +635,13 @@ async fn evaluate_mesh_route_dispatch_rules_for_proxy(
         }
         match db.get_upstream(override_uid).await {
             Ok(Some(upstream)) if upstream.namespace == namespace => {
-                if let Some(conflict) = upstream_required_mesh_transport(&upstream, None)
-                    && retry_is_effective_for_mesh_target(
-                        proxy,
-                        effective_retry.as_ref(),
-                        proxy.allowed_methods.as_deref(),
-                        &conflict,
-                    )
-                {
+                if let Some(conflict) = first_effective_mesh_transport_conflict(
+                    proxy,
+                    &upstream,
+                    None,
+                    effective_retry.as_ref(),
+                    proxy.allowed_methods.as_deref(),
+                ) {
                     errors.push(mesh_transport_retry_conflict_message(
                         &proxy.id,
                         override_uid,
@@ -654,9 +666,14 @@ struct MeshRouteOverrideDest {
 }
 
 /// List the enabled, namespace-local `mesh_route_dispatch` plugin configs whose
-/// rules apply to `proxy`: its proxy-scoped associations plus every **global**
-/// instance (the plugin cache merges globals into every proxy chain). Used by the
-/// admin-side retry/mesh-transport conflict checks.
+/// rules apply to `proxy`: its proxy-scoped/proxy_group associations plus every
+/// **global** instance (the plugin cache merges globals into every proxy chain).
+/// Used by the admin-side retry/mesh-transport conflict checks.
+///
+/// When the proxy attaches its own enabled `mesh_route_dispatch` instance,
+/// `PluginCache::build_cache` shadows the globals of the same name, so they never
+/// run for this proxy and are excluded here — otherwise a conflict in a shadowed
+/// global would produce a spurious admission rejection.
 async fn applicable_mesh_route_dispatch_plugins(
     db: &dyn DatabaseBackend,
     namespace: &str,
@@ -664,50 +681,77 @@ async fn applicable_mesh_route_dispatch_plugins(
 ) -> DbResult<Vec<PluginConfig>> {
     let mut plugins: Vec<PluginConfig> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut consider = |plugin: PluginConfig| {
-        if plugin.namespace == namespace
+    let mut shadows_global_dispatch = false;
+    for assoc in &proxy.plugins {
+        if let Some(plugin) = db.get_plugin_config(&assoc.plugin_config_id).await?
+            && plugin.namespace == namespace
             && plugin.enabled
             && plugin.plugin_name == "mesh_route_dispatch"
             && seen.insert(plugin.id.clone())
         {
+            shadows_global_dispatch = true;
             plugins.push(plugin);
         }
-    };
-    for assoc in &proxy.plugins {
-        if let Some(plugin) = db.get_plugin_config(&assoc.plugin_config_id).await? {
-            consider(plugin);
-        }
     }
-    // Global mesh_route_dispatch instances run on every proxy regardless of
-    // local association.
-    let mut offset = 0_i64;
-    const PAGE_SIZE: i64 = 1_000;
-    loop {
-        let page = db
-            .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
-            .await?;
-        let items_len = page.items.len() as i64;
-        for plugin in page.items {
-            if plugin.scope == PluginScope::Global {
-                consider(plugin);
+    // Global mesh_route_dispatch instances run on every proxy that does not
+    // shadow them with a local instance of the same name.
+    if !shadows_global_dispatch {
+        let mut offset = 0_i64;
+        const PAGE_SIZE: i64 = 1_000;
+        loop {
+            let page = db
+                .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
+                .await?;
+            let items_len = page.items.len() as i64;
+            for plugin in page.items {
+                if plugin.scope == PluginScope::Global
+                    && plugin.namespace == namespace
+                    && plugin.enabled
+                    && plugin.plugin_name == "mesh_route_dispatch"
+                    && seen.insert(plugin.id.clone())
+                {
+                    plugins.push(plugin);
+                }
             }
-        }
-        if items_len == 0 {
-            break;
-        }
-        offset += items_len;
-        if offset >= page.total {
-            break;
+            if items_len == 0 {
+                break;
+            }
+            offset += items_len;
+            if offset >= page.total {
+                break;
+            }
         }
     }
     Ok(plugins)
 }
 
+/// Whether `proxy` attaches its own enabled, namespace-local `mesh_route_dispatch`
+/// instance via `proxy.plugins`. Such a local instance shadows every global
+/// `mesh_route_dispatch` of the same name in `PluginCache::build_cache`, so the
+/// globals never run for this proxy.
+async fn proxy_shadows_global_mesh_route_dispatch(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxy: &Proxy,
+) -> DbResult<bool> {
+    for assoc in &proxy.plugins {
+        if let Some(plugin) = db.get_plugin_config(&assoc.plugin_config_id).await?
+            && plugin.namespace == namespace
+            && plugin.enabled
+            && plugin.plugin_name == "mesh_route_dispatch"
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Collect the upstream overrides a proxy's enabled `mesh_route_dispatch` plugin
 /// instances can route matched traffic to (via `route_override_upstream_id`),
-/// excluding the proxy's own default `upstream_id`, each paired with the rule's
-/// effective retry policy. Considers proxy-scoped and global instances. Used by
-/// the admin-side retry/mesh-transport conflict checks for single-resource writes.
+/// each paired with the rule's effective retry policy. Considers proxy-scoped and
+/// non-shadowed global instances, and includes same-default-upstream rules that
+/// change retry. Used by the admin-side retry/mesh-transport conflict checks for
+/// single-resource writes.
 async fn mesh_route_dispatch_override_destinations(
     db: &dyn DatabaseBackend,
     namespace: &str,
@@ -723,7 +767,13 @@ async fn mesh_route_dispatch_override_destinations(
             let Some(override_uid) = rule.destination.upstream_id.as_deref() else {
                 continue;
             };
-            if override_uid == default_uid {
+            // A rule pointing at the proxy's own default upstream is already
+            // covered by the default-upstream conflict check when it inherits the
+            // base retry. When it changes retry (adds its own or disables it),
+            // runtime overwrites `proxy.retry` via `route_override_retry` before
+            // dispatch, so it must still be evaluated here.
+            let rule_changes_retry = rule.retry.is_some() || rule.retry_disabled;
+            if override_uid == default_uid && !rule_changes_retry {
                 continue;
             }
             let effective_retry = if rule.retry.is_some() {
@@ -1070,15 +1120,13 @@ impl AdminResource for Upstream {
                     // requests fail closed with 502 (issue #1669). Mirrors the
                     // full-config and proxy-write checks for the reverse write
                     // order.
-                    if let Some(conflict) =
-                        upstream_required_mesh_transport(resource, proxy.upstream_subset.as_deref())
-                        && retry_is_effective_for_mesh_target(
-                            &proxy,
-                            proxy.retry.as_ref(),
-                            proxy.allowed_methods.as_deref(),
-                            &conflict,
-                        )
-                    {
+                    if let Some(conflict) = first_effective_mesh_transport_conflict(
+                        &proxy,
+                        resource,
+                        proxy.upstream_subset.as_deref(),
+                        proxy.retry.as_ref(),
+                        proxy.allowed_methods.as_deref(),
+                    ) {
                         errors.push(mesh_transport_retry_conflict_message(
                             &proxy.id,
                             &resource.id,
@@ -1100,14 +1148,13 @@ impl AdminResource for Upstream {
                     if override_dest.upstream_id != resource.id {
                         continue;
                     }
-                    if let Some(conflict) = upstream_required_mesh_transport(resource, None)
-                        && retry_is_effective_for_mesh_target(
-                            &proxy,
-                            override_dest.effective_retry.as_ref(),
-                            proxy.allowed_methods.as_deref(),
-                            &conflict,
-                        )
-                    {
+                    if let Some(conflict) = first_effective_mesh_transport_conflict(
+                        &proxy,
+                        resource,
+                        None,
+                        override_dest.effective_retry.as_ref(),
+                        proxy.allowed_methods.as_deref(),
+                    ) {
                         errors.push(mesh_transport_retry_conflict_message(
                             &proxy.id,
                             &resource.id,
@@ -1539,14 +1586,12 @@ impl AdminResource for Proxy {
                     // full-config `validate_upstream_references` check. A per-port
                     // `maxRetries = 0` cap on the mesh port disarms retry there,
                     // so `retry_is_effective_for_mesh_target` allows that config.
-                    if let Some(conflict) = upstream_required_mesh_transport(
+                    if let Some(conflict) = first_effective_mesh_transport_conflict(
+                        resource,
                         &upstream,
                         resource.upstream_subset.as_deref(),
-                    ) && retry_is_effective_for_mesh_target(
-                        resource,
                         resource.retry.as_ref(),
                         resource.allowed_methods.as_deref(),
-                        &conflict,
                     ) {
                         return Err(AfterValidateError::BadRequest(vec![
                             mesh_transport_retry_conflict_message(
@@ -1578,14 +1623,13 @@ impl AdminResource for Proxy {
         {
             match db.get_upstream(&override_dest.upstream_id).await {
                 Ok(Some(upstream)) if upstream.namespace == namespace => {
-                    if let Some(conflict) = upstream_required_mesh_transport(&upstream, None)
-                        && retry_is_effective_for_mesh_target(
-                            resource,
-                            override_dest.effective_retry.as_ref(),
-                            resource.allowed_methods.as_deref(),
-                            &conflict,
-                        )
-                    {
+                    if let Some(conflict) = first_effective_mesh_transport_conflict(
+                        resource,
+                        &upstream,
+                        None,
+                        override_dest.effective_retry.as_ref(),
+                        resource.allowed_methods.as_deref(),
+                    ) {
                         return Err(AfterValidateError::BadRequest(vec![
                             mesh_transport_retry_conflict_message(
                                 &resource.id,

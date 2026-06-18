@@ -1908,6 +1908,239 @@ fn retry_proxy_rejects_mesh_target_when_status_retries_hit_allowed_methods() {
     );
 }
 
+fn mesh_target(host: &str, port: u16) -> UpstreamTarget {
+    UpstreamTarget {
+        host: host.into(),
+        port,
+        weight: 100,
+        tags: HashMap::from([("mesh.hbone".to_string(), "true".to_string())]),
+        locality: None,
+        path: None,
+    }
+}
+
+#[test]
+fn retry_proxy_rejects_when_a_later_mesh_target_port_escapes_the_cap() {
+    // The LB can select ANY mesh target. Capping retry to 0 on the FIRST mesh
+    // target's port but leaving a second mesh target's port uncapped still 502s
+    // when the LB picks the second, so the conflict must be reported.
+    use ferrum_edge::config::types::ResolvedPortOverride;
+    let mut upstream = make_upstream("mesh-upstream");
+    upstream.targets = vec![mesh_target("a.local", 8080), mesh_target("b.local", 9090)];
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    // Cap only the first target's port (8080) to zero.
+    proxy.dispatch_port_overrides = Some(HashMap::from([(
+        8080_u16,
+        ResolvedPortOverride {
+            max_retries: Some(0),
+            ..ResolvedPortOverride::default()
+        },
+    )]));
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter()
+            .any(|msg| msg.contains("enables retry") && msg.contains("9090")),
+        "expected conflict from the uncapped mesh target on port 9090, got {err:?}"
+    );
+}
+
+#[test]
+fn retry_proxy_allows_when_every_mesh_target_port_is_capped_to_zero() {
+    // When every selectable mesh target's port zeroes retry, runtime never
+    // engages retry on any of them, so HBONE dispatch is preserved end-to-end.
+    use ferrum_edge::config::types::ResolvedPortOverride;
+    let mut upstream = make_upstream("mesh-upstream");
+    upstream.targets = vec![mesh_target("a.local", 8080), mesh_target("b.local", 9090)];
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    let zero = || ResolvedPortOverride {
+        max_retries: Some(0),
+        ..ResolvedPortOverride::default()
+    };
+    proxy.dispatch_port_overrides = Some(HashMap::from([(8080_u16, zero()), (9090_u16, zero())]));
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "every mesh target's retry is capped to zero; no 502 path remains"
+    );
+}
+
+#[test]
+fn retry_proxy_rejects_same_upstream_dispatch_rule_that_adds_retry() {
+    // Base proxy has NO retry, but a mesh_route_dispatch rule pointing at the
+    // SAME (mesh-tagged) default upstream adds its own retry. Runtime applies
+    // that rule retry via `route_override_retry` before dispatch, so those
+    // matched requests 502 — the same-upstream rule must be evaluated.
+    let mut mesh = make_upstream("mesh-upstream");
+    mesh.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+
+    let dispatch = PluginConfig {
+        id: "route-dispatch".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "mesh_route_dispatch".into(),
+        config: serde_json::json!({
+            "rules": [
+                {
+                    "match": {},
+                    "destination": { "upstream_id": "mesh-upstream" },
+                    "retry": { "max_retries": 3 }
+                }
+            ]
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("p1".into()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-upstream".into());
+    proxy.retry = None;
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "route-dispatch".into(),
+    }];
+
+    let mut config = empty_config();
+    config.upstreams = vec![mesh];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![dispatch];
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter().any(|msg| msg.contains("enables retry")
+            && msg.contains("mesh-upstream")
+            && msg.contains("mesh.hbone")),
+        "expected same-upstream rule-added-retry conflict, got {err:?}"
+    );
+}
+
+#[test]
+fn retry_proxy_allows_when_local_dispatch_shadows_conflicting_global() {
+    // A global mesh_route_dispatch routes to a mesh upstream, but the proxy
+    // attaches its OWN mesh_route_dispatch (which shadows the global of the same
+    // name in PluginCache). The global never runs for this proxy, so its rule
+    // must not trigger a spurious rejection.
+    let plain = make_upstream("plain-upstream");
+    let mut mesh = make_upstream("mesh-upstream");
+    mesh.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+
+    let global_dispatch = PluginConfig {
+        id: "global-dispatch".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "mesh_route_dispatch".into(),
+        config: serde_json::json!({
+            "rules": [
+                { "match": {}, "destination": { "upstream_id": "mesh-upstream" } }
+            ]
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    // Local instance that shadows the global; routes only to the plain upstream.
+    let local_dispatch = PluginConfig {
+        id: "local-dispatch".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "mesh_route_dispatch".into(),
+        config: serde_json::json!({
+            "rules": [
+                { "match": {}, "destination": { "upstream_id": "plain-upstream" } }
+            ]
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("p1".into()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("plain-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "local-dispatch".into(),
+    }];
+
+    let mut config = empty_config();
+    config.upstreams = vec![plain, mesh];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![global_dispatch, local_dispatch];
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "shadowed global dispatch must not trigger a retry/mesh rejection"
+    );
+}
+
+#[test]
+fn retry_proxy_still_rejects_unshadowed_global_dispatch_to_mesh() {
+    // Control for the shadow test: with NO local dispatch, the global rule does
+    // apply and the conflict must be reported.
+    let plain = make_upstream("plain-upstream");
+    let mut mesh = make_upstream("mesh-upstream");
+    mesh.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+
+    let global_dispatch = PluginConfig {
+        id: "global-dispatch".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "mesh_route_dispatch".into(),
+        config: serde_json::json!({
+            "rules": [
+                { "match": {}, "destination": { "upstream_id": "mesh-upstream" } }
+            ]
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("plain-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+
+    let mut config = empty_config();
+    config.upstreams = vec![plain, mesh];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![global_dispatch];
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter().any(|msg| msg.contains("enables retry")
+            && msg.contains("mesh-upstream")
+            && msg.contains("mesh.hbone")),
+        "expected unshadowed global dispatch conflict, got {err:?}"
+    );
+}
+
 // ---- priority_override validation tests ----
 
 #[test]

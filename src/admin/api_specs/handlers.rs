@@ -1508,6 +1508,46 @@ async fn validate_bundle(
                     Err(e) => return Err(classify_db_error(e)),
                 }
             }
+
+            // Mirrors Proxy::after_validate in crud.rs: a retry-enabled proxy
+            // whose selected default-upstream targets require a mesh transport
+            // (`mesh.hbone` / `mesh.mtls`) 502s at runtime because retry forces
+            // that transport off (issue #1669). Reject it at import rather than
+            // persist a config the next load rejects. The upstream is the bundled
+            // one (when its id matches) or the existing same-namespace DB row.
+            let resolved_upstream = if bundled_id_matches {
+                bundle.upstream.clone()
+            } else {
+                match db.get_upstream(upstream_id).await {
+                    Ok(Some(existing))
+                        if existing.namespace == namespace && existing.api_spec_id.is_none() =>
+                    {
+                        Some(existing)
+                    }
+                    Ok(_) => None,
+                    Err(e) => return Err(classify_db_error(e)),
+                }
+            };
+            if let Some(upstream) = resolved_upstream
+                && let Some(conflict) =
+                    crate::config::types::first_effective_mesh_transport_conflict(
+                        proxy,
+                        &upstream,
+                        proxy.upstream_subset.as_deref(),
+                        proxy.retry.as_ref(),
+                        proxy.allowed_methods.as_deref(),
+                    )
+            {
+                failures.push(ValidationFailure {
+                    resource_type: "proxy",
+                    id: proxy.id.clone(),
+                    errors: vec![crate::config::types::mesh_transport_retry_conflict_message(
+                        &proxy.id,
+                        upstream_id,
+                        &conflict,
+                    )],
+                });
+            }
         }
 
         if proxy.dispatch_kind.is_stream() {

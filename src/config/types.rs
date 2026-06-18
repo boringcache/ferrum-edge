@@ -2404,22 +2404,29 @@ pub(crate) fn retry_is_effective_for_mesh_target(
     }
 }
 
-/// The mesh transport an upstream's selected targets require, if any.
+/// Every mesh transport an upstream's selected targets require.
 ///
-/// Returns the conflicting transport tag (`"mesh.hbone"` / `"mesh.mtls"`)
-/// together with a human-readable detail describing which target (or
-/// service-discovery provider) triggered it. Uses the *runtime* tag predicates
+/// Returns one [`MeshTransportConflict`] per selectable target that needs a mesh
+/// transport (`"mesh.hbone"` / `"mesh.mtls"`), each carrying a human-readable
+/// detail and the target's dispatch port. Uses the *runtime* tag predicates
 /// ([`crate::proxy::hbone_pool::target_hbone_enabled`] /
 /// [`crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled`]) so it matches the
 /// boolish truthiness (`true`/`yes`/`on`/`1`) the dispatch path actually honors.
 ///
+/// Every selectable mesh target is returned (not just the first) because the load
+/// balancer can pick any of them, and each target's port carries its own
+/// `cap_proxy_retry_for_target` cap: a config that zeroes retry on one mesh
+/// target's port but leaves another mesh target uncapped still 502s when the LB
+/// selects the uncapped one. Callers pair this with
+/// [`retry_is_effective_for_mesh_target`] per entry.
+///
 /// Mesh service-discovery upstreams (`service_discovery.provider = Mesh`) are
 /// treated as HBONE-requiring even with no static targets, because discovered
 /// targets are stamped `mesh.hbone=true` by the mesh discoverer.
-pub(crate) fn upstream_required_mesh_transport(
+pub(crate) fn upstream_required_mesh_transports(
     upstream: &Upstream,
     selected_subset: Option<&str>,
-) -> Option<MeshTransportConflict> {
+) -> Vec<MeshTransportConflict> {
     // Mesh service-discovery upstreams publish HBONE-required targets
     // dynamically; their static `targets` list is typically empty at admission.
     if upstream
@@ -2427,14 +2434,14 @@ pub(crate) fn upstream_required_mesh_transport(
         .as_ref()
         .is_some_and(|sd| sd.provider == SdProvider::Mesh)
     {
-        return Some(MeshTransportConflict {
+        return vec![MeshTransportConflict {
             transport: "mesh.hbone",
             detail: "mesh service discovery".to_string(),
             // Discovered targets (and thus their dispatch ports) are not present
             // at admission, so a per-port retry cap can't be proven to disarm
             // retry here; keep the conflict unconditional.
             port: None,
-        });
+        }];
     }
 
     let subset = selected_subset.and_then(|subset_name| {
@@ -2451,6 +2458,7 @@ pub(crate) fn upstream_required_mesh_transport(
         None => true,
     };
 
+    let mut conflicts = Vec::new();
     for target in upstream.targets.iter().filter(|t| target_selected(t)) {
         let transport = if crate::proxy::hbone_pool::target_hbone_enabled(target) {
             Some("mesh.hbone")
@@ -2460,14 +2468,38 @@ pub(crate) fn upstream_required_mesh_transport(
             None
         };
         if let Some(transport) = transport {
-            return Some(MeshTransportConflict {
+            conflicts.push(MeshTransportConflict {
                 transport,
                 detail: format!("target '{}:{}'", target.host, target.port),
                 port: Some(target.port),
             });
         }
     }
-    None
+    conflicts
+}
+
+/// The first selectable mesh target of `upstream` whose required transport still
+/// conflicts with `retry` after that target's own per-port cap is applied, or
+/// `None` if no selectable mesh target keeps retry effective (so runtime never
+/// 502s).
+///
+/// This is the admission-time equivalent of the runtime sequence: the load
+/// balancer selects one target, [`crate::proxy::cap_proxy_retry_for_target`]
+/// caps retry for that target's port, and only then does an effective retry
+/// disable HBONE/SVID-mTLS dispatch. Because the LB may select *any* mesh target,
+/// the conflict is reported when *any* selectable mesh target survives its cap.
+pub(crate) fn first_effective_mesh_transport_conflict(
+    proxy: &Proxy,
+    upstream: &Upstream,
+    selected_subset: Option<&str>,
+    retry: Option<&RetryConfig>,
+    allowed_methods: Option<&[String]>,
+) -> Option<MeshTransportConflict> {
+    upstream_required_mesh_transports(upstream, selected_subset)
+        .into_iter()
+        .find(|conflict| {
+            retry_is_effective_for_mesh_target(proxy, retry, allowed_methods, conflict)
+        })
 }
 
 /// A mesh-transport requirement that conflicts with an effective retry policy.
@@ -3081,14 +3113,12 @@ impl GatewayConfig {
                                 ));
                             }
                         }
-                        if let Some(required) = upstream_required_mesh_transport(
+                        if let Some(required) = first_effective_mesh_transport_conflict(
+                            proxy,
                             upstream,
                             proxy.upstream_subset.as_deref(),
-                        ) && retry_is_effective_for_mesh_target(
-                            proxy,
                             proxy.retry.as_ref(),
                             proxy.allowed_methods.as_deref(),
-                            &required,
                         ) {
                             errors.push(mesh_transport_retry_conflict_message(
                                 &proxy.id, uid, &required,
@@ -3114,12 +3144,12 @@ impl GatewayConfig {
             // runtime applies via `route_override_retry` before dispatch).
             for override_dest in self.mesh_route_dispatch_override_destinations(proxy) {
                 if let Some(upstream) = upstreams_by_id.get(override_dest.upstream_id.as_str())
-                    && let Some(required) = upstream_required_mesh_transport(upstream, None)
-                    && retry_is_effective_for_mesh_target(
+                    && let Some(required) = first_effective_mesh_transport_conflict(
                         proxy,
+                        upstream,
+                        None,
                         override_dest.effective_retry.as_ref(),
                         proxy.allowed_methods.as_deref(),
-                        &required,
                     )
                 {
                     errors.push(mesh_transport_retry_conflict_message(
@@ -3143,15 +3173,25 @@ impl GatewayConfig {
     /// `route_override_upstream_id`), each paired with the EFFECTIVE retry the
     /// runtime applies for that rule.
     ///
-    /// Both proxy-scoped associations (`proxy.plugins`) and **global**
+    /// Both proxy-scoped/proxy_group associations (`proxy.plugins`) and **global**
     /// `mesh_route_dispatch` plugin configs are considered, because the plugin
     /// cache merges global plugins into every proxy's chain — a global dispatch
     /// rule routes matched requests even when the proxy has no local association.
+    /// The one exception: when this proxy attaches its own enabled
+    /// `mesh_route_dispatch` instance, `PluginCache::build_cache` shadows the
+    /// globals of the same name, so they never run for this proxy and their rules
+    /// must NOT be collected (otherwise a conflict in a shadowed global produces a
+    /// spurious admission rejection).
     ///
     /// The rule's effective retry mirrors `MeshRouteDispatchPlugin`'s
     /// `route_override_retry` semantics: a rule with `retry` replaces the base
     /// policy, `retry_disabled` clears it, and an unset rule inherits the proxy's
-    /// base `retry`. Returns an empty vec when no rule overrides the upstream.
+    /// base `retry`. A rule that names the proxy's own default upstream is skipped
+    /// *only* when it leaves retry untouched (the default-upstream check already
+    /// covers that base retry); a same-upstream rule that adds or replaces retry
+    /// is still collected, because the runtime applies `route_override_retry`
+    /// before dispatch regardless of whether the upstream changed. Returns an
+    /// empty vec when no rule contributes a conflict to check.
     fn mesh_route_dispatch_override_destinations(
         &self,
         proxy: &Proxy,
@@ -3173,10 +3213,31 @@ impl GatewayConfig {
                 let Some(override_uid) = rule.destination.upstream_id.as_deref() else {
                     continue;
                 };
-                if override_uid == default_uid {
+                // A rule that points at the proxy's own default upstream but
+                // leaves retry untouched is already covered by the
+                // default-upstream conflict check; skip it to avoid a duplicate.
+                // When the rule changes retry (adds its own or disables it),
+                // runtime still overwrites `proxy.retry` via `route_override_retry`
+                // before dispatch, so it must be evaluated even for the default
+                // upstream.
+                let rule_changes_retry = rule.retry.is_some() || rule.retry_disabled;
+                if override_uid == default_uid && !rule_changes_retry {
                     continue;
                 }
                 // Effective retry the runtime would apply for this matched rule.
+                //
+                // Residual (accepted): when a rule restricts itself to specific
+                // request methods (`rule.match.methods`) AND the rule's retry only
+                // engages status-code retries for methods outside that predicate,
+                // no request reaching this override can actually retry, so the
+                // conflict is theoretical. We intentionally do not intersect the
+                // rule's method predicate with `retryable_methods` here:
+                // `match.methods` supports prefix/regex matchers that cannot be
+                // statically intersected with a concrete method list, so a partial
+                // (exact-only) model would still over-reject the open-ended cases.
+                // `proxy_retry_is_effective` still gates on `allowed_methods`, so
+                // the only over-rejection is the narrow status-only + restricted
+                // rule-method + mesh-override combination.
                 let effective_retry = if rule.retry.is_some() {
                     rule.retry.clone()
                 } else if rule.retry_disabled {
@@ -3195,18 +3256,28 @@ impl GatewayConfig {
                 }
             }
         };
+        // A proxy-scoped or proxy_group-scoped `mesh_route_dispatch` instance
+        // attached via `proxy.plugins` shadows every global of the same name
+        // (`PluginCache::build_cache` removes globals whose `name()` matches a
+        // local instance), so the globals' rules never run for this proxy.
+        let mut shadows_global_dispatch = false;
         for assoc in &proxy.plugins {
             if let Some(plugin) = self
                 .plugin_configs
                 .iter()
                 .find(|pc| pc.id == assoc.plugin_config_id)
             {
+                if plugin.enabled && plugin.plugin_name == "mesh_route_dispatch" {
+                    shadows_global_dispatch = true;
+                }
                 collect(plugin);
             }
         }
-        for plugin in &self.plugin_configs {
-            if plugin.scope == PluginScope::Global {
-                collect(plugin);
+        if !shadows_global_dispatch {
+            for plugin in &self.plugin_configs {
+                if plugin.scope == PluginScope::Global {
+                    collect(plugin);
+                }
             }
         }
         overrides

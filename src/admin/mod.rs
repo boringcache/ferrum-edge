@@ -3093,6 +3093,50 @@ async fn handle_batch_create(
             }
         }
 
+        // Reject a retry-enabled proxy whose selected default-upstream targets
+        // require a mesh transport (`mesh.hbone` / `mesh.mtls`): retry forces that
+        // transport off at runtime and the request 502s (issue #1669). The
+        // per-resource CRUD paths reject this, so the batch import must too rather
+        // than persist a config the next load rejects. The upstream is resolved
+        // from the batch payload first, then the DB. (Route-dispatch override
+        // conflicts introduced entirely within a single batch payload are caught
+        // at config-load time by `validate_upstream_references`.)
+        if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+            let resolved_upstream = if let Some(upstream) = batch_upstreams.get(upstream_id) {
+                Some((*upstream).clone())
+            } else {
+                match db.get_upstream(upstream_id).await {
+                    Ok(Some(upstream)) if upstream.namespace == namespace => Some(upstream),
+                    Ok(_) => None,
+                    Err(err) => {
+                        validation_errors.push(format!(
+                            "Proxy '{}' upstream mesh-transport check failed: {}",
+                            proxy.id, err
+                        ));
+                        None
+                    }
+                }
+            };
+            if let Some(upstream) = resolved_upstream
+                && let Some(conflict) =
+                    crate::config::types::first_effective_mesh_transport_conflict(
+                        proxy,
+                        &upstream,
+                        proxy.upstream_subset.as_deref(),
+                        proxy.retry.as_ref(),
+                        proxy.allowed_methods.as_deref(),
+                    )
+            {
+                validation_errors.push(
+                    crate::config::types::mesh_transport_retry_conflict_message(
+                        &proxy.id,
+                        upstream_id,
+                        &conflict,
+                    ),
+                );
+            }
+        }
+
         let mut unresolved = Vec::new();
 
         for assoc in &proxy.plugins {
