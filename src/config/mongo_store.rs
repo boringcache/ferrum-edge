@@ -732,6 +732,47 @@ mod inner {
             }
         }
 
+        /// Count `api_specs` rows that the floored `updated_at` prefilter
+        /// over-matched: those in the boundary second `[floor(since), since)`
+        /// whose exact `updated_at` is chronologically `< since`.
+        ///
+        /// `base_filter` is the caller's full list filter (namespace plus any
+        /// proxy_id/tag/etc. predicates) including the floored `updated_at`
+        /// `$gte`; this restricts the scan to the same logical set. The
+        /// `updated_at` predicate is then narrowed to the single boundary
+        /// second so only that window is fetched (one second of resource
+        /// writes, normally empty). Only the `updated_at` field is projected.
+        async fn count_updated_before_in_boundary_second(
+            &self,
+            base_filter: &Document,
+            since: DateTime<Utc>,
+        ) -> Result<i64, anyhow::Error> {
+            // Restrict to `[floor(since), floor(since)+1s)` — the only window
+            // the whole-second floor can over-include.
+            let floor = mongo_updated_at_lower_bound(since);
+            let next = mongo_updated_at_lower_bound(since + chrono::Duration::seconds(1));
+            let mut filter = base_filter.clone();
+            filter.insert("updated_at", doc! { "$gte": &floor, "$lt": &next });
+
+            let options = FindOptions::builder()
+                .projection(doc! { "_id": 0, "updated_at": 1 })
+                .build();
+            let mut cursor = self.api_specs().find(filter).with_options(options).await?;
+            let mut overage: i64 = 0;
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                // Parse the stored RFC 3339 string exactly (faithful across
+                // every AutoSi fractional width) and apply `< since`.
+                if let Ok(raw) = doc.get_str("updated_at")
+                    && let Ok(parsed) = DateTime::parse_from_rfc3339(raw)
+                    && parsed.with_timezone(&Utc) < since
+                {
+                    overage += 1;
+                }
+            }
+            Ok(overage)
+        }
+
         /// Delete proxy_group-scoped plugin configs that are no longer referenced
         /// by any proxy's embedded `plugins` array. Called after proxy deletion or
         /// update (which may remove associations).
@@ -1542,6 +1583,11 @@ mod inner {
             // RFC 3339 strings (chrono `AutoSi`), so use a whole-second-floor
             // lower bound that orders correctly against every fractional width.
             // See `mongo_updated_at_lower_bound`.
+            //
+            // Unlike `list_api_specs`, the poll path *wants* the floored bound's
+            // over-inclusion: re-emitting an already-known row is idempotent and
+            // the explicit 1s margin above already over-includes by design, so
+            // no exact `>= since` post-filter is applied here.
             let since_with_margin = since - chrono::Duration::seconds(1);
             let since_str = mongo_updated_at_lower_bound(since_with_margin);
             let filter = doc! { "namespace": namespace, "updated_at": { "$gte": &since_str } };
@@ -3583,9 +3629,17 @@ mod inner {
                 );
             }
             if let Some(ref since) = filter.updated_since {
-                // `updated_at` is a variable-precision RFC 3339 string; use a
-                // whole-second-floor bound so `$gte` does not drop same-second
-                // sub-second rows. See `mongo_updated_at_lower_bound`.
+                // `updated_at` is a variable-precision RFC 3339 string
+                // (chrono `AutoSi`), so no single lexicographic `$gte` bound is
+                // chronologically faithful at the sub-second boundary. Use the
+                // whole-second-floor bound as an index *prefilter* only: it
+                // includes every row that is chronologically `>= since` (never
+                // drops newer rows) at the cost of also matching rows in the
+                // boundary second `[floor(since), since)`. The exact
+                // `updated_at >= since` predicate (the documented/trait
+                // semantics, matching the SQL backend) is then re-applied in
+                // app code below against the parsed `DateTime`. See
+                // `mongo_updated_at_lower_bound`.
                 filter_doc.insert(
                     "updated_at",
                     doc! { "$gte": mongo_updated_at_lower_bound(*since) },
@@ -3601,7 +3655,24 @@ mod inner {
             }
 
             // --- COUNT query (same filter, no pagination) --------------------
-            let total = self.api_specs().count_documents(filter_doc.clone()).await? as i64;
+            let prefilter_total =
+                self.api_specs().count_documents(filter_doc.clone()).await? as i64;
+
+            // The floored `updated_at` prefilter is over-inclusive only when
+            // `updated_since` carries a sub-second component: it then also
+            // matches rows in the boundary second `[floor(since), since)`.
+            // Count those spurious rows exactly so `total` reflects the
+            // documented `updated_at >= since` semantics. The boundary window
+            // is at most one second of resource writes (typically empty), so
+            // this is a small, index-bounded scan that fetches only timestamps.
+            let boundary_overage = match filter.updated_since {
+                Some(since) if since.timestamp_subsec_nanos() != 0 => {
+                    self.count_updated_before_in_boundary_second(&filter_doc, since)
+                        .await?
+                }
+                _ => 0,
+            };
+            let total = prefilter_total - boundary_overage;
 
             // --- Data query (sort + skip + limit) ----------------------------
             // Sort document
@@ -3630,7 +3701,17 @@ mod inner {
             let mut specs = Vec::new();
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                specs.push(doc_to_api_spec_summary(doc)?);
+                let spec = doc_to_api_spec_summary(doc)?;
+                // Re-apply the exact `updated_at >= since` predicate against the
+                // parsed timestamp to drop any boundary-second rows the floored
+                // prefilter over-matched. `updated_at` parsing is exact across
+                // every stored fractional width (unlike string `$gte`).
+                if let Some(since) = filter.updated_since
+                    && spec.updated_at < since
+                {
+                    continue;
+                }
+                specs.push(spec);
             }
             self.check_slow_query("list_api_specs", start);
             Ok(PaginatedResult {
@@ -4238,6 +4319,63 @@ mod inner {
                     "stored {stored} must be < bound {bound} (chronologically < bound)"
                 );
             }
+        }
+
+        // Mirrors the exact `updated_at >= since` post-filter that
+        // `list_api_specs` re-applies after the floored index prefilter, plus
+        // the bounded boundary-second overage count. The floored `$gte` bound
+        // matches every chronologically-`>= since` row but over-includes rows
+        // in `[floor(since), since)`; these helpers reproduce the decision the
+        // store makes on parsed timestamps (faithful across AutoSi widths).
+        fn parse_stored(stored: &str) -> DateTime<Utc> {
+            DateTime::parse_from_rfc3339(stored)
+                .expect("stored timestamp")
+                .with_timezone(&Utc)
+        }
+        fn in_boundary_window(stored: &str, since: DateTime<Utc>) -> bool {
+            // `[floor(since), floor(since)+1s)` — the only over-included window.
+            let lo = mongo_updated_at_lower_bound(since);
+            let hi = mongo_updated_at_lower_bound(since + chrono::Duration::seconds(1));
+            let s = stored_updated_at(parse_stored(stored));
+            s.as_str() >= lo.as_str() && s.as_str() < hi.as_str()
+        }
+
+        #[test]
+        fn list_api_specs_exact_updated_since_semantics() {
+            // Finding: `GET /api-specs?updated_since=2026-05-18T01:00:00.900Z`
+            // must NOT return/count a spec stored at `2026-05-18T01:00:00.100Z`
+            // even though the floored prefilter (`...T01:00:00`) matches it.
+            let since = parse_stored("2026-05-18T01:00:00.900Z");
+
+            // Spurious boundary-second row: prefilter-matched but `< since`.
+            let earlier = "2026-05-18T01:00:00.100Z";
+            assert!(in_boundary_window(earlier, since));
+            assert!(
+                parse_stored(earlier) < since,
+                "earlier row must be excluded by the exact post-filter"
+            );
+
+            // Same-instant and later rows are retained.
+            for kept in [
+                "2026-05-18T01:00:00.900Z",    // exact boundary
+                "2026-05-18T01:00:00.900001Z", // just after, micros
+                "2026-05-18T01:00:01Z",        // next second
+            ] {
+                assert!(
+                    parse_stored(kept) >= since,
+                    "row {kept} must be retained (chronologically >= since)"
+                );
+            }
+
+            // Whole-second `since`: the floor is already exact, so the boundary
+            // window holds nothing `< since` and no overage is subtracted.
+            let whole = parse_stored("2026-05-18T01:00:00Z");
+            assert_eq!(whole.timestamp_subsec_nanos(), 0);
+            assert!(in_boundary_window("2026-05-18T01:00:00.000000001Z", whole));
+            assert!(
+                parse_stored("2026-05-18T01:00:00.000000001Z") >= whole,
+                "with whole-second since, same-second sub-second rows are kept"
+            );
         }
 
         #[test]
