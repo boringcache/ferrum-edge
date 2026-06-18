@@ -1213,16 +1213,55 @@ impl std::fmt::Display for InternalSource {
     }
 }
 
+/// Zero-based field offsets of the backend mTLS client cert and key components
+/// inside a direct-H2 pool key. The key is built as
+/// `host|port|dns_override|subset|ca|cert|key|sni|san_digest|verify+svid` by
+/// `write_http2_pool_key` -> `append_backend_tls_pool_key_fields`; the cert and
+/// key fields are credential paths (or inline-PEM digests). Pool-key components
+/// escape literal `|` as `%7C` (see `append_pool_key_component`), so splitting on
+/// `|` recovers exactly these fields without a separator ever bleeding across a
+/// boundary.
+const POOL_KEY_CLIENT_CERT_FIELD: usize = 5;
+const POOL_KEY_CLIENT_KEY_FIELD: usize = 6;
+
+/// Render a direct-H2 pool key with its backend mTLS client cert/key components
+/// scrubbed for safe inclusion in logs and error displays.
+///
+/// The pool key itself must retain the real cert/key components so pools stay
+/// partitioned by client identity (see `append_backend_tls_pool_key_fields`); we
+/// redact only at the log/Display boundary because the repo rule forbids logging
+/// unredacted credential metadata — and a configured cert/key path counts. This
+/// runs off the request hot path: it is only reached when a `BackendSelectedHttp1`
+/// error is formatted on the H2->reqwest fallback, never during pool-key build.
+fn redact_pool_key_tls_material(pool_key: &str) -> String {
+    let mut out = String::with_capacity(pool_key.len());
+    for (idx, field) in pool_key.split('|').enumerate() {
+        if idx != 0 {
+            out.push('|');
+        }
+        if (idx == POOL_KEY_CLIENT_CERT_FIELD || idx == POOL_KEY_CLIENT_KEY_FIELD)
+            && !field.is_empty()
+        {
+            out.push_str("<redacted>");
+        } else {
+            out.push_str(field);
+        }
+    }
+    out
+}
+
 impl std::fmt::Display for Http2PoolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BackendUnavailable { message, .. } => write!(f, "{}", message),
             Self::BackendTimeout { message, .. } => write!(f, "{}", message),
             Self::Internal { message, .. } => write!(f, "{}", message),
+            // The pool key embeds backend mTLS client cert/key components, so
+            // redact them before they can reach a log line via this Display.
             Self::BackendSelectedHttp1 { pool_key } => write!(
                 f,
                 "backend negotiated http/1.1 via ALPN (pool key: {}); falling back to reqwest",
-                pool_key
+                redact_pool_key_tls_material(pool_key)
             ),
         }
     }
@@ -1568,6 +1607,56 @@ mod tests {
         assert!(
             key.contains("|/global/client.pem|/global/client.key|"),
             "runtime H2 pool key must include global backend mTLS fallback: {key}"
+        );
+
+        // The pool key partitions correctly on the cert/key paths above, but
+        // those paths are credential metadata and must never reach a log line.
+        // The H2->reqwest fallback formats `BackendSelectedHttp1` via Display,
+        // so that rendering must scrub the cert/key components.
+        let displayed = Http2PoolError::BackendSelectedHttp1 {
+            pool_key: key.clone(),
+        }
+        .to_string();
+        assert!(
+            !displayed.contains("/global/client.pem"),
+            "mTLS client cert path leaked into H2 fallback log/Display: {displayed}"
+        );
+        assert!(
+            !displayed.contains("/global/client.key"),
+            "mTLS client key path leaked into H2 fallback log/Display: {displayed}"
+        );
+        assert!(
+            displayed.contains("<redacted>"),
+            "redaction marker missing from H2 fallback Display: {displayed}"
+        );
+        // Non-credential fields must survive so the log stays useful.
+        assert!(
+            displayed.contains(&proxy.backend_host),
+            "backend host should remain in the redacted fallback Display: {displayed}"
+        );
+    }
+
+    /// Redaction operates field-positionally on the `|`-delimited pool key:
+    /// only the cert (idx 5) and key (idx 6) slots are scrubbed, empty slots
+    /// stay empty (no spurious `<redacted>`), and non-TLS fields are preserved.
+    #[test]
+    fn redact_pool_key_scrubs_only_cert_and_key_fields() {
+        // host|port|dns|subset|ca|cert|key|sni|san|verify+svid
+        let key = "backend.test|443||sub|/etc/ca.pem|/etc/client.crt|/etc/client.key|sni.test|deadbeef|1|svidg=17";
+        let redacted = redact_pool_key_tls_material(key);
+        assert_eq!(
+            redacted,
+            "backend.test|443||sub|/etc/ca.pem|<redacted>|<redacted>|sni.test|deadbeef|1|svidg=17",
+            "only the cert and key fields should be scrubbed"
+        );
+
+        // Empty cert/key (the common global-fallback-absent case) must not be
+        // replaced with a marker — an empty field carries no credential.
+        let empty_tls = "backend.test|443|||/etc/ca.pem||||deadbeef|1|svidg=static";
+        assert_eq!(
+            redact_pool_key_tls_material(empty_tls),
+            empty_tls,
+            "empty cert/key fields must remain empty"
         );
     }
 
