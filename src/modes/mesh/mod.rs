@@ -6590,13 +6590,64 @@ fn inject_mesh_request_auth_plugin(
 ) {
     use crate::modes::mesh::config::scope_applies_to_workload;
 
+    // FAIL CLOSED on an ambiguous shared-SPIFFE slice. When `labels_ambiguous`
+    // is set, `mesh_slice.labels` is only the partial intersection of the
+    // divergent candidates sharing this SPIFFE, NOT this workload's
+    // authoritative labels, and `request_authentications` carries the
+    // candidate-any superset (a JWT RequestAuthentication that matches only ONE
+    // candidate rode in). Filtering solely by the partial intersection would
+    // silently DROP such a selector-scoped RA, so a forged token for that issuer
+    // would pass unvalidated — a fail-OPEN. Since we cannot prove the selector
+    // does NOT apply to this workload, INCLUDE candidate-any selector-scoped RAs
+    // the intersection cannot resolve so their JWT providers are still installed
+    // (Istio RequestAuthentication stays permissive: a request with no token
+    // passes; only a forged/invalid token for that issuer is rejected). A
+    // non-ambiguous slice (unique SPIFFE / concrete labels / a DP that resolved
+    // its authoritative labels) is enforcement-IDENTICAL: only the partial-
+    // intersection branch runs. The operator pins
+    // `FERRUM_MESH_WORKLOAD_LABELS` / `mesh_slice.labels` to clear the marker and
+    // re-filter the superset deterministically.
+    let mut included_fail_closed = false;
     let applicable: Vec<&MeshRequestAuthentication> = mesh_slice
         .request_authentications
         .iter()
         .filter(|ra| {
-            scope_applies_to_workload(&ra.scope, &mesh_slice.namespace, &mesh_slice.labels)
+            if scope_applies_to_workload(&ra.scope, &mesh_slice.namespace, &mesh_slice.labels) {
+                return true;
+            }
+            // Unresolvable candidate-only selector RA on an ambiguous slice:
+            // include it fail-closed. Only WorkloadSelector scopes are at risk —
+            // MeshWide always matched above, and Namespace resolves against the
+            // authoritative `mesh_slice.namespace`, not the ambiguous labels. A
+            // selector whose NAMESPACE does not match is also authoritatively
+            // non-applicable (namespace is never ambiguous), so escalate ONLY on
+            // label divergence within this workload's namespace.
+            let unresolvable_selector = mesh_slice.labels_ambiguous
+                && match &ra.scope {
+                    crate::modes::mesh::config::PolicyScope::WorkloadSelector { selector } => {
+                        selector
+                            .namespace
+                            .as_deref()
+                            .is_none_or(|ns| ns == mesh_slice.namespace)
+                    }
+                    _ => false,
+                };
+            if unresolvable_selector {
+                included_fail_closed = true;
+            }
+            unresolvable_selector
         })
         .collect();
+
+    if included_fail_closed {
+        warn!(
+            "mesh RequestAuthentication: ambiguous shared-SPIFFE slice carries a candidate-only \
+             selector RequestAuthentication the partial label intersection cannot resolve; \
+             installing its JWT provider(s) (fail closed) so forged tokens cannot bypass \
+             validation. Set FERRUM_MESH_WORKLOAD_LABELS / mesh_slice.labels to pin this \
+             workload's identity for deterministic resolution"
+        );
+    }
 
     if applicable.is_empty() {
         // No applicable RequestAuthentication — remove any previously injected
@@ -7881,7 +7932,13 @@ fn resolve_inbound_mtls_mode(
     let Some(slice) = initial_slice else {
         return config::MtlsMode::Permissive;
     };
-    slice.resolve_effective_mtls_mode(inbound_mtls_resolution_port(runtime))
+    // Fail-closed variant: on an ambiguous shared-SPIFFE slice whose partial
+    // label intersection cannot confirm a candidate-only selector
+    // PeerAuthentication, escalate to the most-restrictive candidate mTLS mode
+    // rather than silently dropping a selector STRICT and falling back to
+    // Permissive (a fail-open). Enforcement-identical to the plain resolver on a
+    // non-ambiguous slice.
+    slice.resolve_inbound_mtls_mode_fail_closed(inbound_mtls_resolution_port(runtime))
 }
 
 /// Pick the port used to resolve PeerAuthentication `port_overrides` for the
@@ -16253,6 +16310,7 @@ mod tests {
             workload_spiffe_id: None,
             waypoint_name: None,
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            labels_ambiguous: false,
             version: "test".to_string(),
             workloads: Vec::new(),
             services: Vec::new(),
@@ -19577,6 +19635,125 @@ mod tests {
                 .iter()
                 .any(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID),
             "jwks_auth should not be injected for non-matching workload"
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_request_auth_fails_closed_on_ambiguous_unresolvable_selector() {
+        // Codex P1: an ambiguous shared-SPIFFE slice carries a candidate-only
+        // selector RequestAuthentication keyed on the divergent `role=api` as a
+        // superset, but `labels` is only the partial intersection `app=shared`,
+        // which does NOT match the selector. Filtering solely by the partial
+        // intersection would DROP the RA, leaving forged tokens for that issuer
+        // unvalidated — a fail-OPEN. The fail-closed path must still INSTALL the
+        // JWT provider because it cannot prove the selector does not apply.
+        let runtime = test_mesh_runtime_config();
+        let mesh_slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
+            labels_ambiguous: true,
+            version: chrono::Utc::now().to_rfc3339(),
+            request_authentications: vec![test_request_authentication(
+                "role-api-jwt",
+                PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
+            )],
+            ..MeshSlice::default()
+        };
+
+        let prepared = gateway_config_from_mesh_slice(&mesh_slice, &runtime, None, None)
+            .expect("mesh slice config");
+        let jwks = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID)
+            .expect("jwks_auth must be injected fail-closed for an unresolvable selector RA");
+        let providers = jwks
+            .config
+            .get("providers")
+            .and_then(|v| v.as_array())
+            .expect("providers array");
+        assert_eq!(
+            providers[0].get("issuer").and_then(|v| v.as_str()),
+            Some("https://role-api-jwt.example.com"),
+            "the candidate-only RequestAuthentication's JWT provider must be installed fail-closed"
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_request_auth_non_ambiguous_does_not_install_non_matching_selector() {
+        // Guardrail: enforcement-identical on a non-ambiguous slice. Same slice
+        // shape as the fail-closed test but NOT flagged ambiguous (labels are
+        // authoritative), so a non-matching selector RA must be DROPPED — the
+        // fail-closed inclusion fires only while the marker is set.
+        let runtime = test_mesh_runtime_config();
+        let mesh_slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
+            labels_ambiguous: false,
+            version: chrono::Utc::now().to_rfc3339(),
+            request_authentications: vec![test_request_authentication(
+                "role-api-jwt",
+                PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
+            )],
+            ..MeshSlice::default()
+        };
+
+        let prepared = gateway_config_from_mesh_slice(&mesh_slice, &runtime, None, None)
+            .expect("mesh slice config");
+        assert!(
+            !prepared
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID),
+            "a non-matching selector RA on a non-ambiguous slice must be dropped (enforcement-identical)"
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_request_auth_ambiguous_does_not_install_other_namespace_selector() {
+        // Fail-closed inclusion must escalate ONLY on label divergence within the
+        // workload's namespace. A candidate-only selector RA targeting a DIFFERENT
+        // namespace is authoritatively non-applicable (namespace is never
+        // ambiguous), so it must NOT be installed even on an ambiguous slice.
+        let runtime = test_mesh_runtime_config();
+        let mesh_slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
+            labels_ambiguous: true,
+            version: chrono::Utc::now().to_rfc3339(),
+            request_authentications: vec![test_request_authentication(
+                "other-ns-jwt",
+                PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                        namespace: Some("other-namespace".to_string()),
+                    },
+                },
+            )],
+            ..MeshSlice::default()
+        };
+
+        let prepared = gateway_config_from_mesh_slice(&mesh_slice, &runtime, None, None)
+            .expect("mesh slice config");
+        assert!(
+            !prepared
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID),
+            "a selector RA in another namespace is authoritatively non-applicable; not installed"
         );
     }
 

@@ -97,6 +97,14 @@ pub const FERRUM_ECDS_WORKLOADS_TYPE_URL: &str =
 /// Inner `type_url` for the effective workload-label context carrier.
 pub const FERRUM_ECDS_LABELS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.WorkloadLabelsCarrier";
+/// Inner `type_url` for the "labels are an ambiguous shared-SPIFFE intersection"
+/// marker. Carried SEPARATELY from `WorkloadLabelsCarrier` because it changes how
+/// the DP treats the labels: when set, the intersection in `WorkloadLabelsCarrier`
+/// is NOT authoritative, so the DP re-filters the candidate-any policy superset
+/// against its local `FERRUM_MESH_WORKLOAD_LABELS` instead of letting the
+/// intersection replace them. `false` is the DP default, so it is never emitted.
+pub const FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.WorkloadLabelsAmbiguousCarrier";
 /// Inner `type_url` for the authorization-policy carrier (`MeshPolicy` list).
 pub const FERRUM_ECDS_MESH_POLICIES_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.MeshPoliciesCarrier";
@@ -153,6 +161,10 @@ pub enum MeshSliceCarrier {
     SidecarIngressDeclaredPorts(usize),
     Workloads(Vec<Workload>),
     WorkloadLabels(BTreeMap<String, String>),
+    /// Marker: `WorkloadLabels` is an ambiguous shared-SPIFFE intersection, not
+    /// the workload's authoritative labels. Always `true` when emitted (the CP
+    /// only emits it when set); see [`FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL`].
+    LabelsAmbiguous(bool),
     MeshPolicies(Vec<MeshPolicy>),
     PeerAuthentications(Vec<PeerAuthentication>),
     RequestAuthentications(Vec<MeshRequestAuthentication>),
@@ -187,6 +199,7 @@ impl MeshSliceCarrier {
             }
             MeshSliceCarrier::Workloads(_) => FERRUM_ECDS_WORKLOADS_TYPE_URL,
             MeshSliceCarrier::WorkloadLabels(_) => FERRUM_ECDS_LABELS_TYPE_URL,
+            MeshSliceCarrier::LabelsAmbiguous(_) => FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL,
             MeshSliceCarrier::MeshPolicies(_) => FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
             MeshSliceCarrier::PeerAuthentications(_) => FERRUM_ECDS_PEER_AUTH_TYPE_URL,
             MeshSliceCarrier::RequestAuthentications(_) => FERRUM_ECDS_REQUEST_AUTH_TYPE_URL,
@@ -211,6 +224,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::SidecarIngressDeclaredPorts(_) => "sidecar-ingress-declared-ports",
             MeshSliceCarrier::Workloads(_) => "workloads",
             MeshSliceCarrier::WorkloadLabels(_) => "workload-labels",
+            MeshSliceCarrier::LabelsAmbiguous(_) => "workload-labels-ambiguous",
             MeshSliceCarrier::MeshPolicies(_) => "mesh-policies",
             MeshSliceCarrier::PeerAuthentications(_) => "peer-authentications",
             MeshSliceCarrier::RequestAuthentications(_) => "request-authentications",
@@ -236,6 +250,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::SidecarIngressDeclaredPorts(value) => encode(value),
             MeshSliceCarrier::Workloads(value) => encode(value),
             MeshSliceCarrier::WorkloadLabels(value) => encode(value),
+            MeshSliceCarrier::LabelsAmbiguous(value) => encode(value),
             MeshSliceCarrier::MeshPolicies(value) => encode(value),
             MeshSliceCarrier::PeerAuthentications(value) => encode(value),
             MeshSliceCarrier::RequestAuthentications(value) => encode(value),
@@ -282,6 +297,9 @@ impl MeshSliceCarrier {
             }
             FERRUM_ECDS_WORKLOADS_TYPE_URL => MeshSliceCarrier::Workloads(decode_json(value)?),
             FERRUM_ECDS_LABELS_TYPE_URL => MeshSliceCarrier::WorkloadLabels(decode_json(value)?),
+            FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL => {
+                MeshSliceCarrier::LabelsAmbiguous(decode_json(value)?)
+            }
             FERRUM_ECDS_MESH_POLICIES_TYPE_URL => {
                 MeshSliceCarrier::MeshPolicies(decode_json(value)?)
             }
@@ -340,6 +358,9 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         }
         FERRUM_ECDS_WORKLOADS_TYPE_URL => Some("ferrum-mesh-carrier/workloads"),
         FERRUM_ECDS_LABELS_TYPE_URL => Some("ferrum-mesh-carrier/workload-labels"),
+        FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL => {
+            Some("ferrum-mesh-carrier/workload-labels-ambiguous")
+        }
         FERRUM_ECDS_MESH_POLICIES_TYPE_URL => Some("ferrum-mesh-carrier/mesh-policies"),
         FERRUM_ECDS_PEER_AUTH_TYPE_URL => Some("ferrum-mesh-carrier/peer-authentications"),
         FERRUM_ECDS_REQUEST_AUTH_TYPE_URL => Some("ferrum-mesh-carrier/request-authentications"),
@@ -434,6 +455,14 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     // set `slice_carrier_seen=false` and silently fall back to reconstructing
     // services the carrier path intended to be empty.
     carriers.push(MeshSliceCarrier::WorkloadLabels(slice.labels.clone()));
+    // Ambiguous-labels marker: emitted only when set (the DP defaults it to
+    // false). It tells the DP that the `WorkloadLabels` carrier above is a
+    // shared-SPIFFE intersection rather than authoritative labels, so the DP
+    // prefers its local `FERRUM_MESH_WORKLOAD_LABELS` when re-filtering the
+    // candidate-any policy superset — see `try_build_mesh_slice`.
+    if slice.labels_ambiguous {
+        carriers.push(MeshSliceCarrier::LabelsAmbiguous(true));
+    }
     if !slice.mesh_policies.is_empty() {
         carriers.push(MeshSliceCarrier::MeshPolicies(slice.mesh_policies.clone()));
     }
@@ -496,6 +525,7 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
         }
         MeshSliceCarrier::Workloads(value) => slice.workloads = value,
         MeshSliceCarrier::WorkloadLabels(value) => slice.labels = value,
+        MeshSliceCarrier::LabelsAmbiguous(value) => slice.labels_ambiguous = value,
         MeshSliceCarrier::MeshPolicies(value) => slice.mesh_policies = value,
         MeshSliceCarrier::PeerAuthentications(value) => slice.peer_authentications = value,
         MeshSliceCarrier::RequestAuthentications(value) => slice.request_authentications = value,
@@ -587,6 +617,7 @@ mod tests {
                 "app".to_string(),
                 "api".to_string(),
             )])),
+            MeshSliceCarrier::LabelsAmbiguous(true),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::PeerAuthentications(Vec::new()),
             MeshSliceCarrier::RequestAuthentications(Vec::new()),
@@ -671,6 +702,7 @@ mod tests {
                 "app".to_string(),
                 "api".to_string(),
             )])),
+            MeshSliceCarrier::LabelsAmbiguous(true),
             MeshSliceCarrier::MeshPolicies(Vec::new()),
             MeshSliceCarrier::PeerAuthentications(Vec::new()),
             MeshSliceCarrier::RequestAuthentications(Vec::new()),

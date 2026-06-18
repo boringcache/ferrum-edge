@@ -189,7 +189,7 @@ fn mesh_authz_rejects_label_selector_direct_policy_without_labels() {
         Err(err) => err,
     };
 
-    assert!(err.contains("workload selector labels"));
+    assert!(err.contains("workload selector with labels"));
     assert!(err.contains("proxy labels"));
 }
 

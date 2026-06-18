@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use super::mesh_test_support::{
     DEFAULT_NAMESPACE, DEFAULT_TRUST_DOMAIN, default_mesh_runtime, mesh_config_with,
-    policy_allow_principal, policy_deny_principal,
+    policy_allow_principal, policy_audit_principal, policy_deny_principal,
 };
 use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::modes::mesh::{MESH_AUTHZ_PLUGIN_ID, prepare_gateway_config_for_mesh};
@@ -843,13 +843,16 @@ async fn allow_then_deny_for_different_principal_lets_target_through() {
 }
 
 #[test]
-fn mesh_authz_construction_fails_when_selector_labels_set_but_workload_labels_missing() {
-    // The plugin's construction-time scope filter requires workload
-    // identity context. If a policy with a label-based selector is
-    // injected but the slice carries no labels for this workload, the
-    // plugin construction must error out — production catches the
-    // misconfiguration at startup, not silently degrades into an
-    // implicit-deny death-spiral.
+fn mesh_authz_construction_tolerates_selector_labels_without_proxy_labels() {
+    // Non-ambiguous slice (no `labels_ambiguous` marker) that nonetheless
+    // resolved empty proxy labels — e.g. a single-candidate or label-less
+    // workload. The slice's labels are authoritative for THIS workload, so a
+    // label-based selector simply does not apply and dropping it via the
+    // cold-path `retain` is correct (not a fail-open). Construction must NOT
+    // error (a hard error would reject the whole slice or drop authz entirely —
+    // issue #1708); it warns and the cold-path `retain` drops the un-evaluable
+    // policy from enforcement (covered behaviorally by
+    // `mesh_authz_construction_filters_policies_for_workload_at_build_time`).
     let policy = policy_allow_principal(
         "labels-required",
         DEFAULT_NAMESPACE,
@@ -861,22 +864,371 @@ fn mesh_authz_construction_fails_when_selector_labels_set_but_workload_labels_mi
         },
         CLIENT_SPIFFE,
     );
-    // Bypass the prepare path so we feed mesh_policies directly into
-    // MeshAuthz::new — the construction-time validator must catch the
-    // missing-labels condition without help from the upstream prepare
-    // pipeline.
+    // Feed the policy through a `mesh_slice` (the slice-apply shape the
+    // production prepare pipeline builds) with no proxy labels and the labels
+    // NOT flagged ambiguous, so construction must tolerate.
+    let slice = json!({
+        "node_id": "node-a",
+        "namespace": DEFAULT_NAMESPACE,
+        "version": "v1",
+        "mesh_policies": [policy],
+        // labels: intentionally omitted; labels_ambiguous defaults to false
+    });
+    let config = json!({ "mesh_slice": slice });
+    assert!(
+        MeshAuthz::new(&config).is_ok(),
+        "slice-path construction must tolerate an unevaluable non-ambiguous selector policy, not error"
+    );
+}
+
+#[test]
+fn mesh_authz_construction_rejects_ambiguous_slice_selector_policy_without_labels() {
+    // Ambiguous shared-SPIFFE slice (`labels_ambiguous = true`) carrying a
+    // label-based selector policy as a candidate-any superset, but the slice
+    // resolved EMPTY proxy labels here. Reaching mesh_authz `new()` in this
+    // state means recovery already failed (the per-pod NodeWaypoint consumer
+    // skips this validation; the xDS DP only leaves `labels` empty when it had
+    // no local `FERRUM_MESH_WORKLOAD_LABELS` to prefer). There is no further
+    // consumer, so the cold-path `retain` would drop the policy and
+    // `evaluate_mesh_authorization_policies` would allow by default — a silent
+    // fail-open for a selector DENY/ALLOW that applies to a candidate workload.
+    // Construction must fail closed (Codex P1).
+    let policy = policy_allow_principal(
+        "labels-required",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "ratings".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
+    let slice = json!({
+        "node_id": "node-a",
+        "namespace": DEFAULT_NAMESPACE,
+        "version": "v1",
+        "mesh_policies": [policy],
+        "labels_ambiguous": true,
+        // labels: intentionally omitted (empty intersection, recovery failed)
+    });
+    let config = json!({ "mesh_slice": slice });
+    match MeshAuthz::new(&config) {
+        Ok(_) => {
+            panic!("ambiguous slice with unrecoverable selector labels must fail closed")
+        }
+        Err(err) => assert!(
+            err.contains("ambiguous shared-SPIFFE"),
+            "expected an ambiguous-slice fail-closed construction error, got: {err}"
+        ),
+    }
+}
+
+#[test]
+fn mesh_authz_construction_rejects_ambiguous_slice_candidate_only_selector_with_nonempty_intersection()
+ {
+    // Ambiguous shared-SPIFFE slice with a NON-EMPTY label intersection: both
+    // candidates share `app=shared` but only one has `role=api`. The slice
+    // labels here are just that partial intersection (`app=shared`), NOT this
+    // workload's authoritative labels, and the slice carried the candidate-only
+    // `role=api` selector policy as a superset. Because the selector is not
+    // satisfied by the partial intersection, the cold-path `retain` would DROP
+    // it and `evaluate_mesh_authorization_policies` would allow by default — the
+    // non-empty-intersection fail-open (Codex P1). Construction must fail closed.
+    let policy = policy_allow_principal(
+        "role-api-allow",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
+    let slice = json!({
+        "node_id": "node-a",
+        "namespace": DEFAULT_NAMESPACE,
+        "version": "v1",
+        "mesh_policies": [policy],
+        "labels": { "app": "shared" },
+        "labels_ambiguous": true,
+    });
+    let config = json!({ "mesh_slice": slice });
+    match MeshAuthz::new(&config) {
+        Ok(_) => panic!(
+            "ambiguous slice with a candidate-only selector the partial intersection cannot resolve must fail closed"
+        ),
+        Err(err) => assert!(
+            err.contains("partial label intersection"),
+            "expected a partial-intersection fail-closed construction error, got: {err}"
+        ),
+    }
+}
+
+#[test]
+fn mesh_authz_construction_tolerates_ambiguous_slice_selector_satisfied_by_intersection() {
+    // Ambiguous shared-SPIFFE slice with a non-empty intersection where the
+    // selector IS satisfied by the intersection (`app=shared` selector against
+    // `app=shared` intersection labels). The cold-path `retain` keeps the
+    // policy, so there is no fail-open and construction must NOT over-reject —
+    // the labels-ambiguous fail-closed guard only fires for selectors the
+    // partial intersection cannot resolve.
+    let policy = policy_allow_principal(
+        "app-shared-allow",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "shared".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
+    let slice = json!({
+        "node_id": "node-a",
+        "namespace": DEFAULT_NAMESPACE,
+        "version": "v1",
+        "mesh_policies": [policy],
+        "labels": { "app": "shared" },
+        "labels_ambiguous": true,
+    });
+    let config = json!({ "mesh_slice": slice });
+    assert!(
+        MeshAuthz::new(&config).is_ok(),
+        "an ambiguous slice whose selector is satisfied by the intersection must construct (no over-rejection)"
+    );
+}
+
+#[test]
+fn mesh_authz_construction_tolerates_ambiguous_slice_audit_only_selector_without_labels() {
+    // Same shape as
+    // `mesh_authz_construction_rejects_ambiguous_slice_selector_policy_without_labels`
+    // (ambiguous slice, empty intersection, candidate-only selector the labels
+    // cannot resolve) — but the policy is AUDIT-only. AUDIT is non-enforcing per
+    // Istio semantics (records `mesh_authz.audit_policy` and continues), so
+    // dropping it via the cold-path `retain` is NOT the allow-by-default
+    // fail-open the guard protects against. Construction must TOLERATE it, not
+    // fail closed (Codex P2). Mirrors the per-pod missing-scope audit exemption.
+    let policy = policy_audit_principal(
+        "audit-role-api",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
+    let slice = json!({
+        "node_id": "node-a",
+        "namespace": DEFAULT_NAMESPACE,
+        "version": "v1",
+        "mesh_policies": [policy],
+        "labels_ambiguous": true,
+        // labels: intentionally omitted (empty intersection, recovery failed)
+    });
+    let config = json!({ "mesh_slice": slice });
+    assert!(
+        MeshAuthz::new(&config).is_ok(),
+        "an ambiguous slice carrying only an AUDIT selector policy must construct (audit is \
+         non-enforcing — dropping it is not a fail-open), not fail closed"
+    );
+}
+
+#[test]
+fn mesh_authz_construction_tolerates_ambiguous_slice_audit_only_selector_with_nonempty_intersection()
+ {
+    // Same shape as
+    // `mesh_authz_construction_rejects_ambiguous_slice_candidate_only_selector_with_nonempty_intersection`
+    // (ambiguous slice, `app=shared` intersection, candidate-only `role=api`
+    // selector the intersection cannot resolve) — but AUDIT-only. The
+    // non-empty-intersection fail-closed guard must also EXEMPT audit-only
+    // policies: dropping an audit no-op never opens an allow-by-default hole
+    // (Codex P2). Construction must tolerate it.
+    let policy = policy_audit_principal(
+        "audit-role-api",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
+    let slice = json!({
+        "node_id": "node-a",
+        "namespace": DEFAULT_NAMESPACE,
+        "version": "v1",
+        "mesh_policies": [policy],
+        "labels": { "app": "shared" },
+        "labels_ambiguous": true,
+    });
+    let config = json!({ "mesh_slice": slice });
+    assert!(
+        MeshAuthz::new(&config).is_ok(),
+        "an ambiguous slice with a candidate-only AUDIT selector the intersection cannot resolve \
+         must construct (audit is non-enforcing), not fail closed"
+    );
+}
+
+#[test]
+fn mesh_authz_construction_still_fails_closed_on_ambiguous_slice_mixed_audit_and_enforcing() {
+    // Defense-in-depth: an ambiguous slice carrying BOTH an audit-only
+    // candidate-only selector AND an ENFORCING (DENY) candidate-only selector
+    // the intersection cannot resolve must STILL fail closed — the audit
+    // exemption must not mask a real enforcing fail-open in the same slice.
+    let audit = policy_audit_principal(
+        "audit-role-api",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
+    let deny = policy_deny_principal(
+        "deny-role-worker",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("role".to_string(), "worker".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        ROGUE_SPIFFE,
+    );
+    let slice = json!({
+        "node_id": "node-a",
+        "namespace": DEFAULT_NAMESPACE,
+        "version": "v1",
+        "mesh_policies": [audit, deny],
+        "labels": { "app": "shared" },
+        "labels_ambiguous": true,
+    });
+    let config = json!({ "mesh_slice": slice });
+    match MeshAuthz::new(&config) {
+        Ok(_) => panic!(
+            "an ambiguous slice with an unresolvable enforcing DENY selector must fail closed even \
+             when an audit-only selector is also present"
+        ),
+        Err(err) => assert!(
+            err.contains("partial label intersection"),
+            "expected a partial-intersection fail-closed construction error, got: {err}"
+        ),
+    }
+}
+
+#[test]
+fn mesh_authz_construction_rejects_operator_selector_policy_without_labels() {
+    // Operator-direct config (flat `mesh_policies`, no `mesh_slice` context): a
+    // workload-selector policy with selector labels but no proxy `labels`. There
+    // is no downstream consumer to recover the labels, so the cold-path `retain`
+    // would drop the policy and `evaluate_mesh_authorization_policies` would
+    // allow the request by default — a silent fail-open. Construction must fail
+    // closed instead, forcing the operator to supply the proxy identity.
+    let policy = policy_allow_principal(
+        "labels-required",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "ratings".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
     let config = json!({
         "mesh_policies": [policy],
         "namespace": DEFAULT_NAMESPACE,
         // labels: intentionally omitted
     });
-    let err = match MeshAuthz::new(&config) {
-        Err(e) => e,
-        Ok(_) => panic!("expected construction error"),
-    };
+    // `MeshAuthz` does not implement `Debug`, so inspect the `Result` directly
+    // instead of `expect_err`.
+    match MeshAuthz::new(&config) {
+        Ok(_) => panic!("operator-direct selector policy without labels must fail closed"),
+        Err(err) => assert!(
+            err.contains("no proxy labels are configured"),
+            "expected a labels-required construction error, got: {err}"
+        ),
+    }
+}
+
+#[test]
+fn mesh_authz_construction_tolerates_operator_audit_only_selector_without_labels() {
+    // Operator-direct config (flat `mesh_policies`) with an AUDIT-only
+    // workload-selector policy and no proxy `labels`. AUDIT is non-enforcing per
+    // Istio semantics, so dropping it via the cold-path `retain` is a no-op, not
+    // a fail-open. Construction must TOLERATE it, not fail closed (Codex P2 — the
+    // audit exemption applies on the operator path too, consistent with the
+    // slice path and the per-pod missing-scope check).
+    let policy = policy_audit_principal(
+        "audit-labels-optional",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "ratings".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
+    let config = json!({
+        "mesh_policies": [policy],
+        "namespace": DEFAULT_NAMESPACE,
+        // labels: intentionally omitted
+    });
     assert!(
-        err.contains("no proxy labels are configured"),
-        "construction error should mention missing proxy labels, got {err:?}"
+        MeshAuthz::new(&config).is_ok(),
+        "an operator-direct AUDIT-only selector policy without labels must construct (audit is \
+         non-enforcing), not fail closed"
+    );
+}
+
+#[test]
+fn mesh_authz_construction_clears_ambiguous_marker_on_explicit_labels_override() {
+    // An ambiguous shared-SPIFFE slice (`labels_ambiguous = true`) carries a
+    // candidate-only `role=api` selector policy as a superset, but the operator
+    // pins the proxy identity with an explicit top-level `labels` override of
+    // `role=worker` (the documented way to resolve authoritative labels — see
+    // docs/mesh.md "The marker is cleared on the recovered slice once the DP has
+    // resolved its authoritative labels"). The override IS authoritative, so the
+    // stale ambiguous marker must be cleared: the `role=api` policy simply does
+    // not apply to `role=worker` and the cold-path `retain` drops it. Construction
+    // must NOT reject the workload (Codex P2: the recommended pin mechanism must
+    // not fail closed against a non-applicable candidate-only superset policy).
+    let policy = policy_allow_principal(
+        "role-api-allow",
+        DEFAULT_NAMESPACE,
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            },
+        },
+        CLIENT_SPIFFE,
+    );
+    let slice = json!({
+        "node_id": "node-a",
+        "namespace": DEFAULT_NAMESPACE,
+        "version": "v1",
+        "mesh_policies": [policy],
+        "labels_ambiguous": true,
+        // No slice-embedded labels: the operator pins identity via the top-level
+        // `labels` override below, which must clear the ambiguous marker.
+    });
+    let config = json!({
+        "mesh_slice": slice,
+        "labels": { "role": "worker" },
+    });
+    assert!(
+        MeshAuthz::new(&config).is_ok(),
+        "an explicit `labels` override pins authoritative identity and must clear the \
+         ambiguous marker so a non-applicable candidate-only selector policy is dropped, not rejected"
     );
 }
 

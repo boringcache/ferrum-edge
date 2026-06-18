@@ -227,6 +227,38 @@ pub fn policy_deny_principal(
     }
 }
 
+/// Build an AUDIT-only `MeshPolicy` for a specific SPIFFE ID glob. AUDIT is
+/// non-enforcing per Istio semantics (records metadata and continues), so it is
+/// used to assert the construction-time fail-closed scope guards EXEMPT
+/// audit-only selector policies.
+pub fn policy_audit_principal(
+    name: &str,
+    namespace: &str,
+    scope: PolicyScope,
+    principal_glob: &str,
+) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        scope,
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some(principal_glob.to_string()),
+                namespace_pattern: None,
+                trust_domain: Some(TrustDomain::new(DEFAULT_TRUST_DOMAIN).expect("trust domain")),
+                trust_domain_pattern: None,
+            }],
+            to: Vec::new(),
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Audit,
+        }],
+    }
+}
+
 /// Build an ALLOW policy that also constrains the request path/method.
 pub fn policy_allow_request(
     name: &str,
