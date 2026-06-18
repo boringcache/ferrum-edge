@@ -1784,9 +1784,12 @@ mod live_netns_tests {
     /// transparent capture socket on [`CAPTURE_PORT`]. This mirrors the rule set
     /// `crate::capture::udp_tproxy_commands_for_family` emits for a catch-all
     /// outbound config (the `OUTPUT_MARK` + `REINJECT` chains, collapsed to bare
-    /// rules for the test). Exits 97 when `iptables` / `ip` is unavailable inside
-    /// the netns so the test can skip; the `set -e` aborts (non-97 exit) if any
-    /// load-bearing rule fails to install.
+    /// rules for the test). A `default dev lo` route is added FIRST so the initial
+    /// route lookup for the remote dst resolves (a bare netns has no such route —
+    /// a real pod gets one from its CNI); the marked-packet output reroute then
+    /// overrides it with the fwmark rule's local-delivery table. Exits 97 when
+    /// `iptables` / `ip` is unavailable inside the netns so the test can skip; the
+    /// `set -e` aborts (non-97 exit) if any load-bearing rule fails to install.
     fn spawn_tproxy_netns_child() -> Option<Child> {
         // Constants pulled from production (NOT hardcoded from memory): a default
         // change in `src/capture/mod.rs` flows through here.
@@ -1795,11 +1798,21 @@ mod live_netns_tests {
         let table = crate::capture::TPROXY_ROUTE_TABLE;
         let prio = crate::capture::TPROXY_ROUTE_RULE_PRIORITY;
         let mark_arg = format!("0x{mark:x}/0x{mask:x}");
+        // A default route via `lo` so the INITIAL `ip_route_output` for the
+        // remote dst succeeds (a bare netns has only `lo` up and no route to the
+        // TEST-NET dst, so `send_to` would fail ENETUNREACH BEFORE the mangle
+        // OUTPUT chain ever runs). This route only needs to make the first lookup
+        // resolve; once the OUTPUT MARK fires, the marked-packet output reroute
+        // (`ip_route_me_harder`) consults the higher-priority fwmark `ip rule`
+        // and steers the datagram to table {table}'s `local 0.0.0.0/0 dev lo`
+        // for local delivery instead — exactly the production reroute path. A
+        // real pod gets this initial route from its CNI default route.
         let script = format!(
             "set -e; \
              command -v iptables >/dev/null 2>&1 || exit 97; \
              command -v ip >/dev/null 2>&1 || exit 97; \
              ip link set lo up 2>/dev/null || true; \
+             ip route add default dev lo || exit 97; \
              ip rule add priority {prio} fwmark {mark_arg} lookup {table} || exit 97; \
              ip route add local 0.0.0.0/0 dev lo table {table} || exit 97; \
              iptables -t mangle -A OUTPUT -p udp -m addrtype ! --dst-type LOCAL \
