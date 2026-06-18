@@ -6431,12 +6431,20 @@ fn inject_mesh_request_auth_plugin(
             // Unresolvable candidate-only selector RA on an ambiguous slice:
             // include it fail-closed. Only WorkloadSelector scopes are at risk —
             // MeshWide always matched above, and Namespace resolves against the
-            // authoritative `mesh_slice.namespace`, not the ambiguous labels.
+            // authoritative `mesh_slice.namespace`, not the ambiguous labels. A
+            // selector whose NAMESPACE does not match is also authoritatively
+            // non-applicable (namespace is never ambiguous), so escalate ONLY on
+            // label divergence within this workload's namespace.
             let unresolvable_selector = mesh_slice.labels_ambiguous
-                && matches!(
-                    ra.scope,
-                    crate::modes::mesh::config::PolicyScope::WorkloadSelector { .. }
-                );
+                && match &ra.scope {
+                    crate::modes::mesh::config::PolicyScope::WorkloadSelector { selector } => {
+                        selector
+                            .namespace
+                            .as_deref()
+                            .is_none_or(|ns| ns == mesh_slice.namespace)
+                    }
+                    _ => false,
+                };
             if unresolvable_selector {
                 included_fail_closed = true;
             }
@@ -19273,6 +19281,42 @@ mod tests {
                 .iter()
                 .any(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID),
             "a non-matching selector RA on a non-ambiguous slice must be dropped (enforcement-identical)"
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_request_auth_ambiguous_does_not_install_other_namespace_selector() {
+        // Fail-closed inclusion must escalate ONLY on label divergence within the
+        // workload's namespace. A candidate-only selector RA targeting a DIFFERENT
+        // namespace is authoritatively non-applicable (namespace is never
+        // ambiguous), so it must NOT be installed even on an ambiguous slice.
+        let runtime = test_mesh_runtime_config();
+        let mesh_slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
+            labels_ambiguous: true,
+            version: chrono::Utc::now().to_rfc3339(),
+            request_authentications: vec![test_request_authentication(
+                "other-ns-jwt",
+                PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("role".to_string(), "api".to_string())]),
+                        namespace: Some("other-namespace".to_string()),
+                    },
+                },
+            )],
+            ..MeshSlice::default()
+        };
+
+        let prepared = gateway_config_from_mesh_slice(&mesh_slice, &runtime, None, None)
+            .expect("mesh slice config");
+        assert!(
+            !prepared
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID),
+            "a selector RA in another namespace is authoritatively non-applicable; not installed"
         );
     }
 

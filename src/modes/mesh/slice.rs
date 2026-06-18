@@ -591,7 +591,10 @@ impl MeshSlice {
         // partial intersection could NOT confirm (the plain resolver dropped
         // them). Only WorkloadSelector-scoped entries with non-empty selector
         // labels are at risk: namespace/mesh-wide scopes resolve against the
-        // authoritative `self.namespace`, not the ambiguous labels.
+        // authoritative `self.namespace`, not the ambiguous labels. A selector
+        // whose NAMESPACE does not match `self.namespace` is also authoritatively
+        // non-applicable (namespace is not ambiguous), so only LABEL divergence
+        // is escalated here.
         let mut effective = resolved;
         for pa in &self.peer_authentications {
             if classify_peer_auth_scope(pa) != PeerAuthScope::WorkloadSelector {
@@ -599,6 +602,15 @@ impl MeshSlice {
             }
             if peer_auth_applies_to_workload(pa, &self.namespace, &self.labels) {
                 // Already accounted for by the normal resolution above.
+                continue;
+            }
+            // Skip selectors that fail to apply for a reason OTHER than the
+            // ambiguous labels — i.e. a namespace mismatch, which is
+            // authoritative. Re-test the selector against the workload labels but
+            // with the namespace constraint honored: if it still does not match
+            // even when the slice IS this workload (label superset assumption),
+            // the mismatch is the namespace, not the labels.
+            if !peer_auth_selector_namespace_matches(pa, &self.namespace) {
                 continue;
             }
             let candidate = peer_auth_effective_mode(pa, port);
@@ -2542,6 +2554,30 @@ fn classify_peer_auth_scope(pa: &PeerAuthentication) -> PeerAuthScope {
     }
 }
 
+/// Whether a `WorkloadSelector`-scoped PeerAuthentication's namespace constraint
+/// is compatible with `proxy_namespace`. Used by the ambiguous-slice fail-closed
+/// resolver to escalate ONLY on label divergence: a selector whose namespace does
+/// not match is authoritatively non-applicable (namespace is never ambiguous), so
+/// it must not force a more-restrictive mTLS mode for an unrelated namespace.
+fn peer_auth_selector_namespace_matches(pa: &PeerAuthentication, proxy_namespace: &str) -> bool {
+    let selector_namespace = match &pa.scope {
+        Some(PolicyScope::WorkloadSelector { selector }) => selector.namespace.as_deref(),
+        _ => pa
+            .selector
+            .as_ref()
+            .and_then(|selector| selector.namespace.as_deref()),
+    };
+    // A scope-form selector with no explicit selector namespace is mesh-wide for
+    // namespace purposes; the legacy `pa.selector` form additionally requires the
+    // policy's own namespace to match the workload (Istio scopes a bare selector
+    // to the policy namespace).
+    match (&pa.scope, selector_namespace) {
+        (_, Some(ns)) => ns == proxy_namespace,
+        (Some(PolicyScope::WorkloadSelector { .. }), None) => true,
+        (Some(_), None) | (None, None) => pa.namespace == proxy_namespace,
+    }
+}
+
 fn peer_auth_applies_to_workload<L: WorkloadLabels + ?Sized>(
     pa: &PeerAuthentication,
     namespace: &str,
@@ -3196,6 +3232,31 @@ mod tests {
             slice.resolve_inbound_mtls_mode_fail_closed(8080),
             MtlsMode::Permissive,
             "no STRICT candidate exists, so fail-closed resolution stays Permissive"
+        );
+    }
+
+    #[test]
+    fn fail_closed_mtls_does_not_escalate_selector_in_other_namespace() {
+        // A candidate-only STRICT PeerAuth whose selector targets a DIFFERENT
+        // namespace must NOT escalate: namespace is authoritative (never
+        // ambiguous), so the policy genuinely does not apply to this workload.
+        // Only LABEL divergence within this namespace is escalated fail-closed.
+        let mut pa = selector_peer_auth("other-ns-strict", "role", "api", MtlsMode::Strict);
+        pa.selector = Some(WorkloadSelector {
+            labels: HashMap::from([("role".to_string(), "api".to_string())]),
+            namespace: Some("other-namespace".to_string()),
+        });
+        let slice = MeshSlice {
+            namespace: "default".into(),
+            labels: BTreeMap::from([("app".to_string(), "shared".to_string())]),
+            labels_ambiguous: true,
+            peer_authentications: vec![pa],
+            ..MeshSlice::default()
+        };
+        assert_eq!(
+            slice.resolve_inbound_mtls_mode_fail_closed(8080),
+            MtlsMode::Permissive,
+            "a selector in another namespace is authoritatively non-applicable; no escalation"
         );
     }
 
