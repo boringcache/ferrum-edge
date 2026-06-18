@@ -2936,6 +2936,9 @@ mod inner {
                 Err(e) => return Err(e.into()),
             }
             self.api_specs()
+                .create_index(IndexModel::builder().keys(doc! { "proxy_id": 1 }).build())
+                .await?;
+            self.api_specs()
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "updated_at": 1 })
@@ -2987,7 +2990,21 @@ mod inner {
             self.audit_events()
                 .create_index(
                     IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "action": 1 })
+                        .build(),
+                )
+                .await?;
+            self.audit_events()
+                .create_index(
+                    IndexModel::builder()
                         .keys(doc! { "resource_type": 1 })
+                        .build(),
+                )
+                .await?;
+            self.audit_events()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "resource_id": 1 })
                         .build(),
                 )
                 .await?;
@@ -4325,6 +4342,7 @@ mod inner {
                 backend_tls_server_ca_cert_path: None,
                 resolved_tls: Default::default(),
                 dispatch_port_overrides: None,
+                dispatch_port_override_fallback: None,
                 dns_override: None,
                 dns_cache_ttl_seconds: None,
                 auth_mode: crate::config::types::AuthMode::Single,
@@ -4343,6 +4361,7 @@ mod inner {
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
                 pool_max_requests_per_connection: None,
+                pool_http1_max_pending_requests: None,
                 upstream_id: None,
                 upstream_subset: None,
                 api_spec_id: None,
@@ -4453,6 +4472,7 @@ mod inner {
                 subsets: None,
                 port_overrides: std::collections::HashMap::new(),
                 source_locality: None,
+                locality_lb_strict: false,
                 locality_lb_setting: None,
                 backend_tls_client_cert_path: None,
                 backend_tls_client_key_path: None,
@@ -4464,6 +4484,7 @@ mod inner {
                     "spiffe://cluster.local/ns/default/sa/reviews".to_string(),
                 ],
                 resolved_subset_tls: std::collections::HashMap::new(),
+                dispatch_port_override_fallback: None,
                 api_spec_id: None,
                 created_at: now,
                 updated_at: now,
@@ -4519,6 +4540,7 @@ mod inner {
                 backend_tls_server_ca_cert_path: None,
                 resolved_tls: Default::default(),
                 dispatch_port_overrides: None,
+                dispatch_port_override_fallback: None,
                 dns_override: None,
                 dns_cache_ttl_seconds: None,
                 auth_mode: crate::config::types::AuthMode::Single,
@@ -4537,6 +4559,7 @@ mod inner {
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
                 pool_max_requests_per_connection: None,
+                pool_http1_max_pending_requests: None,
                 upstream_id: None,
                 upstream_subset: None,
                 api_spec_id: None,
@@ -4619,6 +4642,7 @@ mod inner {
                 backend_tls_server_ca_cert_path: None,
                 resolved_tls: Default::default(),
                 dispatch_port_overrides: None,
+                dispatch_port_override_fallback: None,
                 dns_override: None,
                 dns_cache_ttl_seconds: None,
                 auth_mode: crate::config::types::AuthMode::Single,
@@ -4637,6 +4661,7 @@ mod inner {
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
                 pool_max_requests_per_connection: None,
+                pool_http1_max_pending_requests: None,
                 upstream_id: None,
                 upstream_subset: None,
                 api_spec_id: None,
@@ -4707,6 +4732,7 @@ mod inner {
                 subsets: None,
                 port_overrides: std::collections::HashMap::new(),
                 source_locality: None,
+                locality_lb_strict: false,
                 locality_lb_setting: None,
                 backend_tls_client_cert_path: None,
                 backend_tls_client_key_path: None,
@@ -4715,6 +4741,7 @@ mod inner {
                 backend_tls_sni: None,
                 backend_tls_san_allow_list: Vec::new(),
                 resolved_subset_tls: std::collections::HashMap::new(),
+                dispatch_port_override_fallback: None,
                 api_spec_id: None,
                 created_at: now,
                 updated_at: now,
@@ -4784,6 +4811,7 @@ mod inner {
                 backend_tls_server_ca_cert_path: None,
                 resolved_tls: Default::default(),
                 dispatch_port_overrides: None,
+                dispatch_port_override_fallback: None,
                 dns_override: None,
                 dns_cache_ttl_seconds: None,
                 auth_mode: crate::config::types::AuthMode::Single,
@@ -4809,6 +4837,7 @@ mod inner {
                 pool_http3_connections_per_backend: None,
                 h2_upgrade_policy: None,
                 pool_max_requests_per_connection: None,
+                pool_http1_max_pending_requests: None,
                 upstream_id: Some("my-upstream".to_string()),
                 upstream_subset: None,
                 api_spec_id: None,

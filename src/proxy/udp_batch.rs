@@ -52,6 +52,19 @@ pub struct RecvMmsgBatch {
     /// IPv6 replies (notably link-local `fe80::/10`) egress the correct
     /// interface zone on send; for IPv4 it's informational.
     local_addrs: Vec<Option<crate::socket_opts::PktinfoLocal>>,
+    /// Per-slot original (pre-`TPROXY`) destination address parsed from the
+    /// IP(v6)_RECVORIGDSTADDR cmsg. `None` unless the socket has
+    /// `IP_RECVORIGDSTADDR` / `IPV6_RECVORIGDSTADDR` enabled (the mesh UDP
+    /// capture listener does; plain UDP proxy listeners do not). This is how a
+    /// TPROXY-captured datagram recovers the `service:port` the pod dialed,
+    /// since TPROXY delivers without rewriting the destination.
+    orig_dsts: Vec<Option<SocketAddr>>,
+    /// Whether to parse the IP(v6)_RECVORIGDSTADDR cmsg per datagram. Enabled
+    /// ONLY for the mesh UDP capture listener (which sets `IP_RECVORIGDSTADDR`);
+    /// plain UDP proxy listeners leave it `false` so they do not pay an
+    /// ancillary-data scan on every datagram for a value that is always `None`
+    /// there (codex r2 P2).
+    parse_orig_dst: bool,
     /// Maximum datagrams per recvmmsg call.
     capacity: usize,
     /// Number of datagrams received in the last `recv()` call.
@@ -74,7 +87,12 @@ impl RecvMmsgBatch {
     ///
     /// Allocates `capacity * 65535` bytes for datagram buffers plus bookkeeping
     /// arrays. This is a one-time allocation at listener startup.
-    pub fn new(capacity: usize) -> Self {
+    ///
+    /// `parse_orig_dst` opts this batch into per-datagram
+    /// `IP_RECVORIGDSTADDR` cmsg parsing; pass `true` only for the mesh UDP
+    /// capture listener and `false` for plain UDP proxy listeners (which never
+    /// enable the socket option and so would scan ancillary data for nothing).
+    pub fn new(capacity: usize, parse_orig_dst: bool) -> Self {
         let capacity = capacity.max(1);
         // cmsg buffer must hold UDP_GRO (u16) + IP_PKTINFO / IPV6_PKTINFO in the
         // same allocation; sized for the v6 worst case so both families fit.
@@ -95,6 +113,8 @@ impl RecvMmsgBatch {
             cmsg_bufs: (0..capacity).map(|_| vec![0u8; cmsg_space]).collect(),
             gro_segments: vec![None; capacity],
             local_addrs: vec![None; capacity],
+            orig_dsts: vec![None; capacity],
+            parse_orig_dst,
             capacity,
             count: 0,
         }
@@ -135,6 +155,16 @@ impl RecvMmsgBatch {
     pub fn local_addr(&self, i: usize) -> Option<crate::socket_opts::PktinfoLocal> {
         debug_assert!(i < self.count);
         self.local_addrs[i]
+    }
+
+    /// Returns the original (pre-`TPROXY`) destination address for slot `i`,
+    /// parsed from the IP(v6)_RECVORIGDSTADDR cmsg. `None` when the socket does
+    /// not have `IP_RECVORIGDSTADDR` / `IPV6_RECVORIGDSTADDR` enabled or the
+    /// datagram carried no such cmsg. The mesh UDP capture listener keys each
+    /// session by `(client, orig-dst)` from this value.
+    pub fn orig_dst(&self, i: usize) -> Option<SocketAddr> {
+        debug_assert!(i < self.count);
+        self.orig_dsts[i]
     }
 
     /// Receive up to `max_count` datagrams in a single `recvmmsg` syscall.
@@ -201,6 +231,9 @@ impl RecvMmsgBatch {
         }
 
         let received = ret as usize;
+        // Hoisted (Copy bool) so the per-datagram loop never re-reads the field
+        // and so plain UDP proxy listeners skip the orig-dst cmsg scan entirely.
+        let parse_orig_dst = self.parse_orig_dst;
         for i in 0..received {
             self.result_lens[i] = self.msgs[i].msg_len;
             self.result_addrs[i] = sockaddr_storage_to_std(&self.raw_addrs[i])?;
@@ -212,6 +245,16 @@ impl RecvMmsgBatch {
             // `None` otherwise (non-Linux, pktinfo disabled, or connected socket).
             self.local_addrs[i] =
                 crate::socket_opts::extract_pktinfo_local_addr(&self.msgs[i].msg_hdr);
+            // Parse IP(v6)_RECVORIGDSTADDR cmsg to recover the original
+            // (pre-TPROXY) destination. Only the mesh UDP capture socket enables
+            // `IP_RECVORIGDSTADDR`, so gate the scan on `parse_orig_dst`: plain
+            // UDP proxy listeners would always get `None` and must not pay the
+            // ancillary-data walk per datagram on the hot path (codex r2 P2).
+            self.orig_dsts[i] = if parse_orig_dst {
+                crate::socket_opts::extract_origdst(&self.msgs[i].msg_hdr)
+            } else {
+                None
+            };
         }
         self.count = received;
         Ok(received)
@@ -282,6 +325,13 @@ pub struct SendMmsgBatch {
     capacity: usize,
     /// Number of datagrams queued for the next flush.
     count: usize,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct SendMmsgFlush {
+    pub datagrams: usize,
+    pub bytes: usize,
 }
 
 // SAFETY: Same reasoning as RecvMmsgBatch — raw pointers in iovecs/msgs point
@@ -356,16 +406,27 @@ impl SendMmsgBatch {
         self.count == 0
     }
 
+    /// Return the queued datagram and byte counts that would be lost if a
+    /// final best-effort flush fails and the caller drops the remainder.
+    pub fn pending_stats(&self) -> SendMmsgFlush {
+        SendMmsgFlush {
+            datagrams: self.count,
+            bytes: self.lens.iter().take(self.count).sum(),
+        }
+    }
+
     /// Send all queued datagrams in a single `sendmmsg` syscall.
     ///
-    /// Returns the number of datagrams successfully sent. On partial send,
+    /// Returns the datagrams/bytes successfully sent. On partial send,
     /// the caller should handle the unsent remainder (or accept the loss for
     /// UDP best-effort semantics).
     ///
-    /// Resets the batch count to 0 after the call.
-    pub fn flush(&mut self, fd: std::os::fd::RawFd) -> std::io::Result<usize> {
+    /// Successful partial sends keep the unsent remainder queued at the front
+    /// for a retry. Errors clear the queue because UDP is best-effort and
+    /// preserving stale datagrams would reorder/requeue across iterations.
+    pub fn flush(&mut self, fd: std::os::fd::RawFd) -> std::io::Result<SendMmsgFlush> {
         if self.count == 0 {
-            return Ok(0);
+            return Ok(SendMmsgFlush::default());
         }
 
         // Rebuild pointer arrays before the syscall.
@@ -476,6 +537,7 @@ impl SendMmsgBatch {
         }
 
         let sent = ret as usize;
+        let sent_bytes = self.lens.iter().take(sent).sum();
         let remaining = self.count - sent;
         if remaining > 0 {
             // Shift unsent datagrams to the front so a retry sends them.
@@ -488,7 +550,31 @@ impl SendMmsgBatch {
             }
         }
         self.count = remaining;
-        Ok(sent)
+        Ok(SendMmsgFlush {
+            datagrams: sent,
+            bytes: sent_bytes,
+        })
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod sendmmsg_batch_tests {
+    use std::net::SocketAddr;
+
+    use super::SendMmsgBatch;
+
+    #[test]
+    fn pending_stats_reports_queued_datagrams_and_bytes() {
+        let mut batch = SendMmsgBatch::new(4);
+        let dest: SocketAddr = "127.0.0.1:5353".parse().expect("valid socket addr");
+
+        assert_eq!(batch.pending_stats().datagrams, 0);
+        assert!(batch.push_with_local(b"abc", dest, None));
+        assert!(batch.push_with_local(b"de", dest, None));
+
+        let stats = batch.pending_stats();
+        assert_eq!(stats.datagrams, 2);
+        assert_eq!(stats.bytes, 5);
     }
 }
 

@@ -435,6 +435,7 @@ fn workload_in_namespace(namespace: &str, spiffe: &str) -> Workload {
         locality: None,
         service_account: None,
         pod_uid: None,
+        remote_provenance: false,
     }
 }
 

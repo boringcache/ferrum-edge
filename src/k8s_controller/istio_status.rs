@@ -569,13 +569,15 @@ fn destination_rule_status(
     let (accepted, reason, message, detail) = match result {
         Ok(_translation) => {
             // Deferred fields: the parsed-but-dropped connectionPool.http knobs
-            // the translator only warns on. Universally deferred:
-            // http1MaxPendingRequests (the only one remaining; maxRetries +
-            // h2UpgradePolicy became APPLIED in F5.1). Subset-scoped deferred
-            // (codex round-1 Finding 4): h2UpgradePolicy + maxRetries set inside
-            // a `subsets[].trafficPolicy` are applied at top-level/port but NOT
-            // for subsets (subset -> SubsetTrafficPolicy has no
-            // connectionPool.http), so they are surfaced as deferred there.
+            // the translator only warns on. There are NO universally deferred
+            // connectionPool.http knobs anymore (all of maxRequestsPerConnection
+            // / idleTimeout / http2MaxRequests / maxRetries / h2UpgradePolicy /
+            // http1MaxPendingRequests are projected/enforced at top-level/port).
+            // Subset-scoped deferred (codex round-1 Finding 4): h2UpgradePolicy +
+            // maxRetries + http1MaxPendingRequests set inside a
+            // `subsets[].trafficPolicy` are applied at top-level/port but NOT for
+            // subsets (subset -> SubsetTrafficPolicy has no connectionPool.http),
+            // so they are surfaced as deferred there.
             // Now APPLIED (no longer deferred): per-subset
             // connectionPool.tcp.connectTimeout (overrides backend_connect_timeout_ms
             // for subset-bound proxies), portLevelSettings[].tls (per-port backend
@@ -630,14 +632,15 @@ fn destination_rule_status(
 /// operator-visible warning IN EVERY SCOPE (top-level / `portLevelSettings` /
 /// subset) — see `translate_connection_pool_http` in
 /// `src/config_sources/k8s/istio.rs`. Keep this list in sync with the
-/// translator's always-deferred loop. `maxRetries` and `h2UpgradePolicy` are
-/// now projected and enforced at top-level/port scope, so only
-/// `http1MaxPendingRequests` remains universally deferred (it needs a
-/// Ferrum-side pending-request gauge).
-const DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[(
-    "http1MaxPendingRequests",
-    "trafficPolicy.connectionPool.http.http1MaxPendingRequests (parsed but not enforced)",
-)];
+/// translator's always-deferred loop.
+///
+/// EMPTY as of F5.1's final knob: `maxRequestsPerConnection` (wire-projected),
+/// `idleTimeout`, `http2MaxRequests`, `maxRetries`, `h2UpgradePolicy`, AND
+/// `http1MaxPendingRequests` are now all projected/enforced at top-level/port
+/// scope. The three of those that a subset's `SubsetTrafficPolicy` cannot carry
+/// (`h2UpgradePolicy` / `maxRetries` / `http1MaxPendingRequests`) are deferred
+/// ONLY for subsets — see `SUBSET_DEFERRED_CONNECTION_POOL_HTTP_FIELDS`.
+const DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[];
 
 /// `connectionPool.http` knobs that ARE applied at top-level /
 /// `portLevelSettings` but are deferred ONLY when set inside a
@@ -654,6 +657,10 @@ const SUBSET_DEFERRED_CONNECTION_POOL_HTTP_FIELDS: &[(&str, &str)] = &[
     (
         "maxRetries",
         "subsets[].trafficPolicy.connectionPool.http.maxRetries (not applied for subsets)",
+    ),
+    (
+        "http1MaxPendingRequests",
+        "subsets[].trafficPolicy.connectionPool.http.http1MaxPendingRequests (not applied for subsets)",
     ),
 ];
 
@@ -1890,10 +1897,12 @@ mod tests {
     }
 
     #[test]
-    fn destination_rule_with_port_level_http_deferred_field_surfaces_deferred_field() {
-        // `http1MaxPendingRequests` is the only remaining deferred HTTP knob
-        // (maxRetries / h2UpgradePolicy became applied in F5.1). It must still
-        // surface in `deferred_fields` when set at the port level.
+    fn destination_rule_port_level_http1_max_pending_requests_is_applied_not_deferred() {
+        // F5.1 final knob: `http1MaxPendingRequests` is now PROJECTED and
+        // ENFORCED at top-level / `portLevelSettings` (per-`(host,port)` pending
+        // gate on the reqwest/H1 path), so it must NOT appear in
+        // `deferred_fields` at port level. There are no longer any universally
+        // deferred connectionPool.http knobs.
         let obj = object(
             "networking.istio.io/v1",
             "DestinationRule",
@@ -1921,19 +1930,25 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(
-            deferred
+            !deferred
                 .iter()
                 .any(|f| f.contains("http1MaxPendingRequests")),
-            "deferred_fields should mention port-level http1MaxPendingRequests, got {deferred:?}"
+            "port-level http1MaxPendingRequests is applied now and must NOT be deferred, got {deferred:?}"
+        );
+        assert!(
+            deferred.is_empty(),
+            "a port-level connectionPool.http with only applied knobs must defer nothing, got {deferred:?}"
         );
     }
 
     #[test]
-    fn destination_rule_subset_scoped_h2_upgrade_and_max_retries_surface_as_deferred() {
-        // codex round-1 Finding 4: h2UpgradePolicy / maxRetries are APPLIED at
-        // top-level (must NOT be deferred there), but the same fields inside a
-        // SUBSET trafficPolicy are not applied, so the status writer must list
-        // them as deferred.
+    fn destination_rule_subset_scoped_http_connection_pool_knobs_surface_as_deferred() {
+        // codex round-1 Finding 4 (+ F5.1 final knob): h2UpgradePolicy /
+        // maxRetries / http1MaxPendingRequests are APPLIED at top-level (must
+        // NOT be deferred there), but the same fields inside a SUBSET
+        // trafficPolicy are not applied (subset -> SubsetTrafficPolicy carries
+        // no connectionPool.http), so the status writer must list them as
+        // deferred.
         let obj = object(
             "networking.istio.io/v1",
             "DestinationRule",
@@ -1942,14 +1957,14 @@ mod tests {
                 "host": "reviews.default.svc.cluster.local",
                 "trafficPolicy": {
                     // Top-level: applied — must NOT appear as deferred.
-                    "connectionPool": { "http": { "h2UpgradePolicy": "UPGRADE", "maxRetries": 4 } }
+                    "connectionPool": { "http": { "h2UpgradePolicy": "UPGRADE", "maxRetries": 4, "http1MaxPendingRequests": 32 } }
                 },
                 "subsets": [{
                     "name": "v1",
                     "labels": { "version": "v1" },
                     // Subset: ignored — must appear as deferred.
                     "trafficPolicy": {
-                        "connectionPool": { "http": { "h2UpgradePolicy": "DO_NOT_UPGRADE", "maxRetries": 9 } }
+                        "connectionPool": { "http": { "h2UpgradePolicy": "DO_NOT_UPGRADE", "maxRetries": 9, "http1MaxPendingRequests": 16 } }
                     }
                 }]
             }),
@@ -1962,8 +1977,8 @@ mod tests {
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        // Both subset-scoped knobs are listed, tagged as subset-scoped.
-        for field in ["h2UpgradePolicy", "maxRetries"] {
+        // All three subset-scoped knobs are listed, tagged as subset-scoped.
+        for field in ["h2UpgradePolicy", "maxRetries", "http1MaxPendingRequests"] {
             assert!(
                 deferred
                     .iter()
@@ -1972,12 +1987,12 @@ mod tests {
             );
         }
         // The top-level (applied) values must NOT appear as deferred. The only
-        // deferred entries should be the two subset-scoped ones.
+        // deferred entries should be the subset-scoped ones.
         assert!(
             !deferred
                 .iter()
                 .any(|f| f.starts_with("trafficPolicy.connectionPool.http")),
-            "top-level applied h2UpgradePolicy/maxRetries must not be deferred, got {deferred:?}"
+            "top-level applied h2UpgradePolicy/maxRetries/http1MaxPendingRequests must not be deferred, got {deferred:?}"
         );
     }
 

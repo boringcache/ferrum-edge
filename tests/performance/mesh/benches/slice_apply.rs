@@ -38,6 +38,8 @@ fn build_gateway_config(n_workloads: usize) -> GatewayConfig {
             weight: None,
             locality: None,
             service_account: None,
+            pod_uid: None,
+            remote_provenance: false,
         });
 
         mesh.services.push(MeshService {

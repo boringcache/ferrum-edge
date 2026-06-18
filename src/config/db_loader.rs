@@ -5525,6 +5525,10 @@ fn row_to_proxy(
             .try_get::<i64, _>("pool_max_requests_per_connection")
             .ok()
             .map(|v| v.max(0) as u64),
+        // Derived-only: `pool_http1_max_pending_requests` is projected from the
+        // mesh DestinationRule port overrides at dispatch time, never persisted
+        // as a proxy column, so a DB-loaded proxy always starts at `None`.
+        pool_http1_max_pending_requests: None,
         upstream_subset: row.try_get::<String, _>("upstream_subset").ok(),
         listen_port: row
             .try_get::<i32, _>("listen_port")
@@ -5575,6 +5579,7 @@ fn row_to_proxy(
         // Populated by `GatewayConfig::resolve_dispatch_port_overrides()` after
         // upstreams are loaded and any mesh DR overrides applied.
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })
@@ -5793,6 +5798,10 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         // backends do not persist it (no column), and `Upstream::validate_fields`
         // rejects operator writes via the admin API. SQL rows always start `None`.
         source_locality: None,
+        // Mesh-only projection (`FERRUM_MESH_LOCALITY_LB_STRICT`): SQL backends
+        // do not persist it and `Upstream::validate_fields` rejects operator
+        // writes, so SQL rows always start `false`.
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
         backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
@@ -5804,6 +5813,7 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         // `apply_destination_rules`; SQL backends do not persist them, so SQL
         // rows always start with an empty map.
         resolved_subset_tls: std::collections::HashMap::new(),
+        dispatch_port_override_fallback: None,
         // See row_to_proxy for the rationale: preserve here so admin reads
         // get the real owning spec id; runtime callers strip via
         // strip_api_spec_id_from_runtime_config.

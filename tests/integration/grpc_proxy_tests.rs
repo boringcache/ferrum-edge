@@ -52,6 +52,7 @@ fn create_grpc_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         backend_tls_server_ca_cert_path: None,
         resolved_tls: Default::default(),
         dispatch_port_overrides: None,
+        dispatch_port_override_fallback: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
@@ -71,6 +72,7 @@ fn create_grpc_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         pool_http3_connections_per_backend: None,
         h2_upgrade_policy: None,
         pool_max_requests_per_connection: None,
+        pool_http1_max_pending_requests: None,
         upstream_id: None,
         upstream_subset: None,
         api_spec_id: None,
@@ -1469,6 +1471,76 @@ async fn start_streaming_response_backend(
     (addr, handle)
 }
 
+/// A representative clean gRPC streaming backend: 200 headers, one DATA frame,
+/// then a real `grpc-status: 0` TRAILERS frame, with NO `content-length` — the
+/// wire shape an actual gRPC server produces. Unlike `start_mock_grpc_backend`
+/// (which packs `grpc-status` into the response *headers* with a fixed-length
+/// `Full` body), this yields a trailers frame, so the gateway's response body
+/// reaches a clean terminal (`ProxyBody::poll_frame` observes the trailers /
+/// EOF) instead of being dropped after a satisfied `content-length`. The
+/// #1649-item-3 deferred backend-dispatch outcome heals the breaker on that
+/// clean terminal.
+async fn start_clean_grpc_streaming_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            let _ = stream.set_nodelay(true);
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let builder = Http2ServerBuilder::new(TokioExecutor::new());
+                let service = service_fn(|req: Request<Incoming>| async move {
+                    let mut req_body = req.into_body();
+                    tokio::spawn(async move {
+                        while let Some(frame) = req_body.frame().await {
+                            if frame.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    let (tx, rx) = tokio::sync::mpsc::channel::<
+                        Result<Frame<Bytes>, std::convert::Infallible>,
+                    >(2);
+                    tokio::spawn(async move {
+                        // One empty gRPC data frame, then the grpc-status trailer.
+                        let _ = tx
+                            .send(Ok(Frame::data(Bytes::from_static(&[0, 0, 0, 0, 0]))))
+                            .await;
+                        let mut trailers = hyper::HeaderMap::new();
+                        trailers.insert(
+                            hyper::header::HeaderName::from_static("grpc-status"),
+                            hyper::header::HeaderValue::from_static("0"),
+                        );
+                        let _ = tx.send(Ok(Frame::trailers(trailers))).await;
+                    });
+                    let body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+                    Ok::<_, hyper::Error>(
+                        Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .body(body)
+                            .unwrap(),
+                    )
+                });
+                if let Err(e) = builder.serve_connection(io, service).await {
+                    eprintln!("Clean gRPC streaming backend connection error: {}", e);
+                }
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (addr, handle)
+}
+
 /// Issue #1412: a gRPC streaming client-upload overflow that trips DURING
 /// response-body streaming (bidi / client-streaming) must record NEUTRAL for the
 /// circuit breaker — it must NOT falsely heal a HALF_OPEN probe — and it must
@@ -1615,17 +1687,19 @@ async fn grpc_streaming_late_upload_overflow_during_response_records_neutral() {
 }
 
 /// Companion to the late-overflow test: a CLEAN streaming probe (no overflow)
-/// must still heal a HALF_OPEN breaker through the deferred recorder. The
-/// recorder classifies by backend status at request-upload termination; here the
-/// upload EOFs before the backend responds, so the heal resolves at the
-/// `note_status` side of the join. This guards against the deferral accidentally
-/// dropping the success classification (acceptance criterion: "a clean upload +
-/// 2xx backend still heals").
+/// must still heal a HALF_OPEN breaker. Since #1649 item 3 the recorder only
+/// releases the probe slot (NEUTRAL) at request-upload termination; the
+/// backend-health SUCCESS that heals the breaker is recorded by the deferred
+/// backend-dispatch outcome when the response body reaches a clean terminal.
+/// This guards against the deferral accidentally dropping the success
+/// classification (acceptance criterion: "a clean upload + 2xx backend still
+/// heals"). Uses a representative streaming backend (real `grpc-status: 0`
+/// trailers, no `content-length`) so the gateway observes a clean body terminal.
 #[tokio::test(flavor = "multi_thread")]
-async fn grpc_streaming_clean_probe_heals_breaker_via_deferred_recorder() {
+async fn grpc_streaming_clean_probe_heals_breaker_at_body_completion() {
     use ferrum_edge::config::types::CircuitBreakerConfig;
 
-    let (backend_addr, _backend_handle) = start_mock_grpc_backend().await;
+    let (backend_addr, _backend_handle) = start_clean_grpc_streaming_backend().await;
 
     let mut proxy = create_grpc_proxy("grpc-clean-heal", "/grpc", backend_addr.port());
     proxy.circuit_breaker = Some(CircuitBreakerConfig {
@@ -1660,7 +1734,7 @@ async fn grpc_streaming_clean_probe_heals_breaker_via_deferred_recorder() {
 
     // A normal streaming probe: the backend replies 200 (grpc-status 0). This
     // still uses the streaming fast path (no retry, no body plugins), so the
-    // deferred recorder owns the outcome.
+    // deferred backend-dispatch outcome owns the CB result.
     let (status, _headers, _body) = send_grpc_request(
         gateway_addr,
         "/grpc/my.Service/Echo",
@@ -1671,8 +1745,11 @@ async fn grpc_streaming_clean_probe_heals_breaker_via_deferred_recorder() {
     .expect("request failed");
     assert_eq!(status, 200);
 
-    // The recorder records the backend 200 at upload termination → success →
-    // the breaker heals (success_threshold = 1) and releases the probe slot.
+    // The recorder releases the probe slot (NEUTRAL) at upload termination; the
+    // deferred backend-dispatch outcome then records the backend 200 success when
+    // the response body completes cleanly → the breaker heals (success_threshold
+    // = 1). `send_grpc_request` collects the full body + trailers, so the
+    // gateway's response body reaches its clean terminal.
     let mut healed = false;
     for _ in 0..200 {
         if cb.state_name() == "closed" {
@@ -1684,7 +1761,7 @@ async fn grpc_streaming_clean_probe_heals_breaker_via_deferred_recorder() {
     assert!(
         healed,
         "a clean 2xx streaming probe must heal the breaker via the deferred \
-         recorder (state was {})",
+         backend-dispatch outcome at body completion (state was {})",
         cb.state_name()
     );
     assert_eq!(
