@@ -435,6 +435,7 @@ fn workload_from_pod(
         // Per-pod UID for node-waypoint scope keying; `None` when the pod
         // object carried no UID so the resolver falls back to SPIFFE scope.
         pod_uid: (!pod.uid.is_empty()).then(|| pod.uid.clone()),
+        remote_provenance: false,
     })
 }
 

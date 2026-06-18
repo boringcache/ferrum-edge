@@ -43,6 +43,7 @@ fn make_upstream(
         subsets: None,
         port_overrides: std::collections::HashMap::new(),
         source_locality: None,
+        locality_lb_strict: false,
         locality_lb_setting: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -51,6 +52,7 @@ fn make_upstream(
         backend_tls_sni: None,
         backend_tls_san_allow_list: Vec::new(),
         resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
         api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -91,6 +93,7 @@ fn mesh_workload(id: &str, service_name: &str, address: &str, port: u16) -> Work
         locality: None,
         service_account: None,
         pod_uid: None,
+        remote_provenance: false,
     }
 }
 
