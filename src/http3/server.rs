@@ -3810,6 +3810,17 @@ async fn handle_h3_request(
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
         let mut response_body = response_body;
 
+        // Capture the original range decision before `after_proxy` runs on this
+        // buffered native-H3 path. Unlike the streamed paths, the body here IS
+        // buffered, so `compression.transform_response_body` would actually
+        // compress it; a `response_transformer` that strips `Content-Range`
+        // before `compression.after_proxy` (4000 < 4050) would otherwise let
+        // compression both set `Content-Encoding` and rewrite the partial body,
+        // corrupting byte-range semantics. The marker makes `after_proxy` honor
+        // the pristine range decision. Range-only insertion keeps the common
+        // path allocation-free.
+        stamp_h3_range_response_metadata(&mut ctx, response_status, &response_headers);
+
         // after_proxy hooks
         let mut after_proxy_rejected = false;
         {
@@ -4601,15 +4612,16 @@ fn h3_backend_unavailable_stream_result(
 
 /// Record the ORIGINAL backend range decision before any `after_proxy` hook can
 /// rewrite the response headers, mirroring the H1/H2 stamp in `proxy/mod.rs`.
-/// On every native-H3 streaming branch `after_proxy` runs after this point, and
-/// `response_transformer` (ordering 4000) runs before `compression` (4050); if
-/// the transformer strips/renames `Content-Range` on a non-206 response,
-/// `compression.after_proxy` would otherwise no longer see the header (nor the
-/// marker) and could commit a `Content-Encoding` on a streamed range body whose
-/// buffered-only `transform_response_body` never runs — sending raw bytes
-/// mislabeled as gzip/br. Only inserted for range responses, so the common path
-/// stays allocation-free.
-fn stamp_h3_range_response_metadata(
+/// Called from every native-H3 streaming/buffered branch and the H3
+/// cross-protocol path before `after_proxy` runs, where `response_transformer`
+/// (ordering 4000) runs before `compression` (4050); if the transformer
+/// strips/renames `Content-Range` on a non-206 response, `compression.after_proxy`
+/// would otherwise no longer see the header (nor the marker) and could commit a
+/// `Content-Encoding` on a streamed range body whose buffered-only
+/// `transform_response_body` never runs (sending raw bytes mislabeled as
+/// gzip/br), or compress a buffered partial body and corrupt its byte offsets.
+/// Only inserted for range responses, so the common path stays allocation-free.
+pub(crate) fn stamp_h3_range_response_metadata(
     ctx: &mut RequestContext,
     response_status: u16,
     response_headers: &HashMap<String, String>,

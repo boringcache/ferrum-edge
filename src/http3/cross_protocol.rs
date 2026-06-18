@@ -1584,6 +1584,16 @@ where
         return Ok(outcome);
     }
 
+    // Capture the original range decision before `after_proxy` rewrites the
+    // headers below. On this H3 cross-protocol path the body is later either
+    // streamed or buffered (range responses stream — see the refine call
+    // below), so a `response_transformer` (ordering 4000) that strips
+    // `Content-Range` ahead of `compression` (4050) would otherwise let
+    // compression mislabel a streamed range body `Content-Encoding` (its
+    // buffered-only `transform_response_body` never runs) or compress a
+    // buffered partial body. `compression.after_proxy` honors this marker.
+    crate::http3::server::stamp_h3_range_response_metadata(ctx, status, &response_headers);
+
     // Run `after_proxy` hooks so response-transformer, CORS, compression-
     // advertise, and other hooks that modify response headers see the
     // cross-protocol path. A rejection here cancels the backend response

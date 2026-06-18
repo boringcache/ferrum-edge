@@ -19741,6 +19741,27 @@ async fn proxy_to_backend_http3(
             }
         }
     } else {
+        // RESIDUAL (range/SSE buffering downgrade): unlike the reqwest and
+        // direct-H2/HBONE backend paths — which call
+        // `refine_stream_response_for_content_type` once the response headers
+        // are known and downgrade a buffered decision to streaming for a
+        // `206`/`Content-Range` (or SSE) body — the H3 pool's `.request()` /
+        // `.request_with_target()` methods drain the whole body internally and
+        // only hand back already-buffered `response.body`, so the response
+        // content-type/status are not observable before the drain. A large
+        // ranged H3-backend download therefore stays buffered here and is
+        // capped by the pool's size limit (graceful `502 ResponseBodyTooLarge`,
+        // never an OOM) rather than streamed through. This is a
+        // graceful-degradation gap, NOT a correctness bug: the range mislabel /
+        // byte-offset corruption that motivated the marker is already prevented
+        // because the sole caller stamps `RANGE_RESPONSE_METADATA_KEY` from the
+        // pristine headers before its `after_proxy` phase (see the H1/H2 stamp
+        // in `handle_proxy_request_inner`), so `compression.after_proxy` declines
+        // to compress regardless. Closing this fully needs the H3 buffered pool
+        // call to expose pre-drain headers + `recv_stream` (as
+        // `request_streaming_incoming_body` already does) so the same
+        // header-time downgrade can run before draining; deferred to keep this
+        // hot-path/pool change out of a guard-hardening PR.
         let h3_result = if let Some(target) = upstream_target {
             let target_host = target.host.clone();
             let target_port = target.port;
