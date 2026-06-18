@@ -627,6 +627,33 @@ fn websocket_origin_does_not_normalize_path_query_or_fragment() {
     ));
 }
 
+#[test]
+fn websocket_origin_rejects_userinfo_smuggling() {
+    let allowed = vec!["https://good.example".to_string()];
+
+    // An Origin carrying userinfo must not be normalized down to the
+    // allow-listed host and waved through admission. RFC 6454 serialized
+    // origins never contain credentials, so these fail closed.
+    assert!(!websocket_origin_allowed(
+        &allowed,
+        "https://attacker@good.example"
+    ));
+    assert!(!websocket_origin_allowed(
+        &allowed,
+        "https://attacker:secret@good.example"
+    ));
+    assert!(!websocket_origin_allowed(
+        &allowed,
+        "https://attacker@good.example:443"
+    ));
+    // A userinfo-bearing entry on the allow-list side must not match a
+    // bare origin either.
+    assert!(!websocket_origin_allowed(
+        &["https://user@good.example".to_string()],
+        "https://good.example"
+    ));
+}
+
 // ============================================================================
 // is_valid_websocket_key tests
 // ============================================================================

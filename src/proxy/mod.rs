@@ -1387,6 +1387,13 @@ fn normalized_websocket_origin(raw: &str) -> Option<String> {
     if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
         return None;
     }
+    // RFC 6454 serialized origins are scheme://host[:port] and never carry
+    // userinfo. Fail closed on credentials so an Origin like
+    // `https://attacker@good.example` is not normalized down to the
+    // allow-listed `https://good.example` and waved through admission.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
     let default_port = match parsed.scheme() {
         "http" | "ws" => 80,
         "https" | "wss" => 443,
