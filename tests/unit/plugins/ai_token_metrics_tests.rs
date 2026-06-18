@@ -74,11 +74,23 @@ fn test_response_buffering_is_narrowed_by_response_content_type() {
     assert!(plugin.should_buffer_response_body(&ctx));
     assert!(plugin.should_buffer_response_body_for_content_type(
         &ctx,
-        Some("application/json; charset=utf-8")
+        Some("application/json; charset=utf-8"),
+        200,
+        &HashMap::new()
     ));
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/plain")));
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream")));
-    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/plain"),
+        200,
+        &HashMap::new()
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &HashMap::new()));
 }
 
 #[test]
@@ -88,12 +100,19 @@ fn test_streaming_response_buffering_requires_explicit_opt_in() {
     let ctx = ctx_with_content_type("POST", "application/json");
 
     assert!(
-        !default_plugin
-            .should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream"))
+        !default_plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("text/event-stream"),
+            200,
+            &HashMap::new()
+        )
     );
-    assert!(
-        opt_in_plugin.should_buffer_response_body_for_content_type(&ctx, Some("text/event-stream"))
-    );
+    assert!(opt_in_plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
 }
 
 // The pre-header `should_buffer_response_body` decision drives every backend
