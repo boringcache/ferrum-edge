@@ -5589,6 +5589,7 @@ impl ProxyState {
     fn delta_routes_changed(
         delta: &crate::config_delta::ConfigDelta,
         old_config: &GatewayConfig,
+        new_config: &GatewayConfig,
     ) -> bool {
         let is_route_indexed = |proxy: &Proxy| !proxy.dispatch_kind.is_stream();
 
@@ -5599,7 +5600,7 @@ impl ProxyState {
         }
 
         if delta.modified_proxies.is_empty() && delta.removed_proxy_ids.is_empty() {
-            return false;
+            return Self::projected_route_proxy_content_changed(old_config, new_config);
         }
 
         let old_route_indexed_proxy_ids: std::collections::HashSet<&str> = old_config
@@ -5615,6 +5616,65 @@ impl ProxyState {
             .map(|proxy| proxy.id.as_str())
             .chain(delta.removed_proxy_ids.iter().map(String::as_str))
             .any(|id| old_route_indexed_proxy_ids.contains(id))
+            || Self::projected_route_proxy_content_changed(old_config, new_config)
+    }
+
+    /// Whether a route-indexed proxy's effective route-table content changed
+    /// without a serialized proxy delta.
+    ///
+    /// `ConfigDelta` detects proxy changes by `updated_at`, but DR-derived
+    /// projections such as `dispatch_port_overrides` and
+    /// `dispatch_port_override_fallback` are `#[serde(skip)]` fields populated by
+    /// `GatewayConfig::resolve_dispatch_port_overrides()`. A DestinationRule-only
+    /// edit can therefore leave `delta.modified_proxies` empty while the route
+    /// table's stored `Arc<Proxy>` needs to carry new dispatch policy.
+    fn projected_route_proxy_content_changed(
+        old_config: &GatewayConfig,
+        new_config: &GatewayConfig,
+    ) -> bool {
+        let old_route_indexed: HashMap<&str, &Proxy> = old_config
+            .proxies
+            .iter()
+            .filter(|proxy| !proxy.dispatch_kind.is_stream())
+            .map(|proxy| (proxy.id.as_str(), proxy))
+            .collect();
+
+        new_config
+            .proxies
+            .iter()
+            .filter(|proxy| !proxy.dispatch_kind.is_stream())
+            .any(|new_proxy| {
+                old_route_indexed
+                    .get(new_proxy.id.as_str())
+                    .is_some_and(|old_proxy| !Self::proxy_content_eq(old_proxy, new_proxy))
+            })
+    }
+
+    /// Timestamp-neutral proxy content comparison for route-table reuse.
+    ///
+    /// Serialized proxy content catches ordinary route/backend/policy edits while
+    /// ignoring volatile timestamps. The two DR-derived dispatch projection fields
+    /// are skipped by serde and therefore compared explicitly.
+    fn proxy_content_eq(a: &Proxy, b: &Proxy) -> bool {
+        if a.dispatch_port_overrides != b.dispatch_port_overrides
+            || a.dispatch_port_override_fallback != b.dispatch_port_override_fallback
+        {
+            return false;
+        }
+
+        fn content_value(proxy: &Proxy) -> Option<serde_json::Value> {
+            let mut normalized = proxy.clone();
+            let epoch = chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
+                .unwrap_or_else(chrono::Utc::now);
+            normalized.created_at = epoch;
+            normalized.updated_at = epoch;
+            serde_json::to_value(&normalized).ok()
+        }
+
+        match (content_value(a), content_value(b)) {
+            (Some(a_value), Some(b_value)) => a_value == b_value,
+            _ => false,
+        }
     }
 
     /// Whether the `config.mesh` block changed in a way that requires a route
@@ -5674,7 +5734,7 @@ impl ProxyState {
         // inputs (e.g. `mesh.local_inbound_tcp_routes`, invisible to `ConfigDelta`)
         // must rebuild the route table; otherwise the stale snapshot's mesh maps
         // (raw-TCP inbound port map, VIP egress tables, sibling port groups) leak.
-        let route_changed = Self::delta_routes_changed(delta, &current.config)
+        let route_changed = Self::delta_routes_changed(delta, &current.config, new_config)
             || Self::mesh_route_table_inputs_changed(&current.config, new_config);
         let consumer_changed = Self::delta_consumers_changed(delta);
         let lb_changed = Self::delta_load_balancers_changed(delta);
@@ -23593,6 +23653,59 @@ mod tests {
         }
     }
 
+    fn route_delta_config_with_upstream(proxy: Proxy, upstream: Upstream) -> GatewayConfig {
+        GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![upstream],
+            ..GatewayConfig::default()
+        }
+    }
+
+    fn route_delta_upstream(updated_at: chrono::DateTime<chrono::Utc>) -> Upstream {
+        let mut upstream = upstream_with_targets("u-dr", &[("127.0.0.1", 8080)]);
+        upstream.created_at = updated_at;
+        upstream.updated_at = updated_at;
+        upstream
+    }
+
+    fn route_delta_upstream_change_delta(
+        old_proxy: Proxy,
+        new_proxy: Proxy,
+    ) -> (
+        crate::config_delta::ConfigDelta,
+        GatewayConfig,
+        GatewayConfig,
+    ) {
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+        let old_config = route_delta_config_with_upstream(old_proxy, route_delta_upstream(t0));
+        let new_config = route_delta_config_with_upstream(new_proxy, route_delta_upstream(t1));
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
+        assert!(
+            delta.modified_proxies.is_empty(),
+            "DR-only edits must not rely on a Proxy resource modification"
+        );
+        assert!(
+            !delta.modified_upstreams.is_empty(),
+            "test setup must simulate the upstream timestamp delta from the DR edit"
+        );
+        (delta, old_config, new_config)
+    }
+
+    fn http_route_proxy_with_upstream() -> Proxy {
+        let t0 = chrono::Utc::now();
+        let mut proxy = route_delta_proxy("http", DispatchKind::HttpPool, t0);
+        proxy.upstream_id = Some("u-dr".to_string());
+        proxy
+    }
+
+    fn resolved_http_override(idle_ms: u64) -> crate::config::types::ResolvedPortOverride {
+        crate::config::types::ResolvedPortOverride {
+            http_idle_timeout_ms: Some(idle_ms),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn delta_routes_changed_ignores_stream_only_proxy_changes() {
         let t0 = chrono::Utc::now();
@@ -23605,18 +23718,30 @@ mod tests {
             route_delta_proxy("tcp-added", DispatchKind::TcpRaw, t1),
         ]);
         let delta = crate::config_delta::ConfigDelta::compute(&old_config, &added_stream);
-        assert!(!ProxyState::delta_routes_changed(&delta, &old_config));
+        assert!(!ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &added_stream
+        ));
 
         let mut modified_stream = old_config.proxies[0].clone();
         modified_stream.backend_port = 9443;
         modified_stream.updated_at = t1;
         let modified_config = route_delta_config(vec![modified_stream]);
         let delta = crate::config_delta::ConfigDelta::compute(&old_config, &modified_config);
-        assert!(!ProxyState::delta_routes_changed(&delta, &old_config));
+        assert!(!ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &modified_config
+        ));
 
         let removed_stream = route_delta_config(vec![]);
         let delta = crate::config_delta::ConfigDelta::compute(&old_config, &removed_stream);
-        assert!(!ProxyState::delta_routes_changed(&delta, &old_config));
+        assert!(!ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &removed_stream
+        ));
     }
 
     #[test]
@@ -23628,7 +23753,11 @@ mod tests {
         let added_http =
             route_delta_config(vec![route_delta_proxy("http", DispatchKind::HttpPool, t1)]);
         let delta = crate::config_delta::ConfigDelta::compute(&empty_config, &added_http);
-        assert!(ProxyState::delta_routes_changed(&delta, &empty_config));
+        assert!(ProxyState::delta_routes_changed(
+            &delta,
+            &empty_config,
+            &added_http
+        ));
 
         let old_http = route_delta_config(vec![route_delta_proxy(
             "transition",
@@ -23641,7 +23770,11 @@ mod tests {
             t1,
         )]);
         let delta = crate::config_delta::ConfigDelta::compute(&old_http, &new_stream);
-        assert!(ProxyState::delta_routes_changed(&delta, &old_http));
+        assert!(ProxyState::delta_routes_changed(
+            &delta,
+            &old_http,
+            &new_stream
+        ));
 
         let old_stream = route_delta_config(vec![route_delta_proxy(
             "transition",
@@ -23654,7 +23787,141 @@ mod tests {
             t1,
         )]);
         let delta = crate::config_delta::ConfigDelta::compute(&old_stream, &new_http);
-        assert!(ProxyState::delta_routes_changed(&delta, &old_stream));
+        assert!(ProxyState::delta_routes_changed(
+            &delta,
+            &old_stream,
+            &new_http
+        ));
+    }
+
+    #[test]
+    fn delta_routes_changed_detects_projected_fallback_change_without_proxy_delta() {
+        let mut old_proxy = http_route_proxy_with_upstream();
+        old_proxy.dispatch_port_override_fallback = Some(resolved_http_override(1_000));
+        let mut new_proxy = old_proxy.clone();
+        new_proxy.dispatch_port_override_fallback = Some(resolved_http_override(2_000));
+
+        let (delta, old_config, new_config) =
+            route_delta_upstream_change_delta(old_proxy, new_proxy);
+
+        assert!(ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &new_config
+        ));
+
+        let old_route = crate::router_cache::RouterCache::new(&old_config, 32)
+            .find_proxy(None, "/http")
+            .expect("old route");
+        let new_route = crate::router_cache::RouterCache::new(&new_config, 32)
+            .find_proxy(None, "/http")
+            .expect("new route");
+        assert_eq!(
+            old_route
+                .proxy
+                .dispatch_port_override_fallback
+                .as_ref()
+                .and_then(|override_config| override_config.http_idle_timeout_ms),
+            Some(1_000)
+        );
+        assert_eq!(
+            new_route
+                .proxy
+                .dispatch_port_override_fallback
+                .as_ref()
+                .and_then(|override_config| override_config.http_idle_timeout_ms),
+            Some(2_000),
+            "rebuilding the route table swaps in the effective DR-derived policy"
+        );
+    }
+
+    #[test]
+    fn delta_routes_changed_detects_projected_per_port_override_change_without_proxy_delta() {
+        let mut old_proxy = http_route_proxy_with_upstream();
+        old_proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080,
+            crate::config::types::ResolvedPortOverride {
+                max_retries: Some(1),
+                ..Default::default()
+            },
+        )]));
+        let mut new_proxy = old_proxy.clone();
+        new_proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080,
+            crate::config::types::ResolvedPortOverride {
+                max_retries: Some(3),
+                ..Default::default()
+            },
+        )]));
+
+        let (delta, old_config, new_config) =
+            route_delta_upstream_change_delta(old_proxy, new_proxy);
+
+        assert!(ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &new_config
+        ));
+    }
+
+    #[test]
+    fn delta_routes_changed_detects_projected_override_removal_without_proxy_delta() {
+        let mut old_proxy = http_route_proxy_with_upstream();
+        old_proxy.dispatch_port_override_fallback = Some(resolved_http_override(1_000));
+        let mut new_proxy = old_proxy.clone();
+        new_proxy.dispatch_port_override_fallback = None;
+        let (delta, old_config, new_config) =
+            route_delta_upstream_change_delta(old_proxy, new_proxy);
+        assert!(ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &new_config
+        ));
+        let new_route = crate::router_cache::RouterCache::new(&new_config, 32)
+            .find_proxy(None, "/http")
+            .expect("new route");
+        assert!(
+            new_route.proxy.dispatch_port_override_fallback.is_none(),
+            "rebuilt route must clear removed top-level fallback state"
+        );
+
+        let mut old_proxy = http_route_proxy_with_upstream();
+        old_proxy.dispatch_port_overrides =
+            Some(HashMap::from([(8080, resolved_http_override(1_000))]));
+        let mut new_proxy = old_proxy.clone();
+        new_proxy.dispatch_port_overrides = None;
+        let (delta, old_config, new_config) =
+            route_delta_upstream_change_delta(old_proxy, new_proxy);
+        assert!(ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &new_config
+        ));
+        let new_route = crate::router_cache::RouterCache::new(&new_config, 32)
+            .find_proxy(None, "/http")
+            .expect("new route");
+        assert!(
+            new_route.proxy.dispatch_port_overrides.is_none(),
+            "rebuilt route must clear removed per-port projected state"
+        );
+    }
+
+    #[test]
+    fn delta_routes_changed_ignores_semantically_equivalent_dr_update() {
+        let mut old_proxy = http_route_proxy_with_upstream();
+        old_proxy.dispatch_port_override_fallback = Some(resolved_http_override(1_000));
+        old_proxy.dispatch_port_overrides =
+            Some(HashMap::from([(8080, resolved_http_override(2_000))]));
+        let new_proxy = old_proxy.clone();
+
+        let (delta, old_config, new_config) =
+            route_delta_upstream_change_delta(old_proxy, new_proxy);
+
+        assert!(!ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &new_config
+        ));
     }
 
     #[test]
