@@ -21,7 +21,7 @@ pub const DEFAULT_UDP_OUTBOUND_PORT: u16 = 15011;
 
 /// Default firewall mark (a.k.a. `fwmark`) stamped on TPROXY'd UDP datagrams so
 /// the policy routing rule (`ip rule add fwmark <mark> lookup <table>`) steers
-/// them to the local-delivery table. `0xFE3` == 4067 decimal.
+/// them to the local-delivery table. `0x733` == 1843 decimal.
 ///
 /// **Ferrum-owned, deliberately NOT Istio's `0x539` (codex r3).** The default
 /// must NOT collide with a co-resident Istio install's marks. Ferrum's higher-
@@ -29,8 +29,8 @@ pub const DEFAULT_UDP_OUTBOUND_PORT: u16 = 15011;
 /// below `main`) matches this mark and steers it to the Ferrum-owned table
 /// [`TPROXY_ROUTE_TABLE`]; if the default were Istio's conventional TPROXY mark
 /// `0x539`, Istio's own marked packets would be hijacked into Ferrum's table and
-/// Istio traffic would break. `0xFE3` ("FE" = Ferrum Edge, `3` = F3 §3.3) sits
-/// in a gap clear of Istio (`0x539`/`0x53a`/`0x111`/`0x222`), Cilium
+/// Istio traffic would break. `0x733` sits outside Istio
+/// (`0x539`/`0x53a`/`0x111`/`0x222`), Cilium masked mark classes
 /// (`0x200`/`0xA00`/`0xF00`/`0x800`), and Calico (`0x10000`+) marks.
 ///
 /// Collision analysis (within Ferrum): Ferrum uses NO other packet marks
@@ -38,7 +38,41 @@ pub const DEFAULT_UDP_OUTBOUND_PORT: u16 = 15011;
 /// owner* match in a disjoint namespace from `skb->mark`, and
 /// `node_agent_hbone_redirect_port` `16008` is a port, not a mark). Operators
 /// can override via `FERRUM_MESH_TPROXY_MARK`.
-pub const DEFAULT_TPROXY_MARK: u32 = 0xFE3;
+pub const DEFAULT_TPROXY_MARK: u32 = 0x733;
+
+// Compile-time guards on the default mark, at MODULE level (NOT `cfg(test)`) so a
+// regression fails ANY build — `cargo build`/release — not only `cargo test`:
+//  - codex r3: the default must be Ferrum-owned and NOT Istio's conventional
+//    TPROXY mark `0x539`. With Ferrum's higher-priority fwmark rule (priority
+//    100) matching the mark, defaulting to `0x539` would hijack a co-resident
+//    Istio's marked packets into Ferrum's table and break Istio traffic.
+//  - the default must not ALIAS a co-resident CNI's masked magic-mark class:
+//    Cilium matches `skb->mark & 0xF00`, so the prior `0xFE3` aliased the `0xF00`
+//    class (`0xFE3 & 0xF00 == 0xF00`); `0x733 & 0xF00 == 0x700` does not.
+const _: () = assert!(
+    DEFAULT_TPROXY_MARK != 0x539,
+    "default TPROXY mark must not collide with Istio's conventional `0x539`"
+);
+const _: () = assert!(
+    DEFAULT_TPROXY_MARK == 0x733,
+    "default TPROXY mark is the Ferrum-owned `0x733` (1843)"
+);
+const _: () = assert!(
+    (DEFAULT_TPROXY_MARK & 0xF00) != 0xF00,
+    "default TPROXY mark must not alias CNI 0xF00/0xF00 masked mark class"
+);
+const _: () = assert!(
+    (DEFAULT_TPROXY_MARK & 0xF00) != 0xA00,
+    "default TPROXY mark must not alias CNI 0xA00/0xF00 masked mark class"
+);
+const _: () = assert!(
+    (DEFAULT_TPROXY_MARK & 0xF00) != 0x800,
+    "default TPROXY mark must not alias CNI 0x800/0xF00 masked mark class"
+);
+const _: () = assert!(
+    (DEFAULT_TPROXY_MARK & 0xF00) != 0x200,
+    "default TPROXY mark must not alias CNI 0x200/0xF00 masked mark class"
+);
 
 /// `skb->mark` mask matched alongside [`DEFAULT_TPROXY_MARK`]. A full-width mask
 /// keeps the TPROXY mark from aliasing onto other mark bits a co-resident CNI
@@ -4091,20 +4125,6 @@ mod tests {
             assert!(CaptureConfig::from_env().is_err());
         });
     }
-
-    // codex r3: the DEFAULT mark must be Ferrum-owned and NOT Istio's conventional
-    // TPROXY mark `0x539`. With Ferrum's higher-priority fwmark rule (priority 100)
-    // matching the mark, defaulting to `0x539` would hijack a co-resident Istio's
-    // marked packets into Ferrum's table and break Istio traffic. Compile-time so a
-    // regression to `0x539` fails the build, not just a test run.
-    const _: () = assert!(
-        DEFAULT_TPROXY_MARK != 0x539,
-        "default TPROXY mark must not collide with Istio's conventional `0x539`"
-    );
-    const _: () = assert!(
-        DEFAULT_TPROXY_MARK == 0xFE3,
-        "default TPROXY mark is the Ferrum-owned `0xFE3` (4067)"
-    );
 
     #[test]
     fn from_env_accepts_repo_wide_bool_forms_for_udp_enabled() {

@@ -2243,6 +2243,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "crossbeam-queue",
  "crossbeam-utils",
  "cryptoki",
  "dashmap",

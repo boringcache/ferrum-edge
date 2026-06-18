@@ -1846,14 +1846,29 @@ pub async fn log_with_mirror(
     summary: &TransactionSummary,
     ctx: &RequestContext,
 ) {
+    let precompute_mesh_key = plugins
+        .iter()
+        .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));
+    let mesh_key = if precompute_mesh_key {
+        crate::plugins::mesh::prometheus_helpers::mesh_request_key(summary)
+    } else {
+        None
+    };
     for plugin in plugins {
-        plugin.log(summary).await;
+        plugin.log_with_mesh_key(summary, mesh_key.as_ref()).await;
     }
     crate::runtime_metrics::global_ref().record_transaction(summary);
     if let Some(mirror_result) = ctx.collect_mirror_result().await {
         let mirror_summary = summary.as_mirror_entry(mirror_result);
+        let mirror_mesh_key = if precompute_mesh_key {
+            crate::plugins::mesh::prometheus_helpers::mesh_request_key(&mirror_summary)
+        } else {
+            None
+        };
         for plugin in plugins {
-            plugin.log(&mirror_summary).await;
+            plugin
+                .log_with_mesh_key(&mirror_summary, mirror_mesh_key.as_ref())
+                .await;
         }
     }
 }
@@ -2587,6 +2602,16 @@ pub trait Plugin: Send + Sync {
 
     /// Called for transaction logging.
     async fn log(&self, _summary: &TransactionSummary) {}
+
+    /// Called for transaction logging with a precomputed mesh RED key when
+    /// multiple built-in mesh observability sinks need the same labels.
+    async fn log_with_mesh_key(
+        &self,
+        summary: &TransactionSummary,
+        _mesh_key: Option<&crate::plugins::mesh::prometheus_helpers::MeshRequestKey>,
+    ) {
+        self.log(summary).await;
+    }
 
     /// Returns `true` if this plugin participates in the authentication phase.
     ///
