@@ -2698,6 +2698,7 @@ fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
             .map(|(h, p)| UpstreamTarget {
                 host: h.to_string(),
                 port: *p,
+                service_port_policy_key: None,
                 weight: 100,
                 tags: HashMap::new(),
                 locality: None,

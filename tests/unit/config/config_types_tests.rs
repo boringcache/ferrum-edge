@@ -95,6 +95,7 @@ fn make_upstream(id: &str) -> Upstream {
         targets: vec![UpstreamTarget {
             host: "localhost".into(),
             port: 3000,
+            service_port_policy_key: None,
             weight: 100,
             tags: HashMap::new(),
             locality: None,
@@ -122,6 +123,37 @@ fn make_upstream(id: &str) -> Upstream {
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
+}
+
+#[test]
+fn upstream_target_service_port_policy_key_is_derived_not_serialized() {
+    let target = UpstreamTarget {
+        host: "10.0.0.1".to_string(),
+        port: 8080,
+        service_port_policy_key: Some(80),
+        weight: 1,
+        tags: HashMap::new(),
+        locality: None,
+        path: None,
+    };
+
+    let serialized = serde_json::to_value(&target).expect("serialize target");
+    assert!(
+        serialized.get("service_port_policy_key").is_none(),
+        "derived policy key must not be emitted into config JSON"
+    );
+
+    let deserialized: UpstreamTarget = serde_json::from_value(serde_json::json!({
+        "host": "10.0.0.1",
+        "port": 8080,
+        "service_port_policy_key": 80,
+        "weight": 1
+    }))
+    .expect("deserialize target");
+    assert!(
+        deserialized.service_port_policy_key.is_none(),
+        "config JSON must not be able to set the derived policy key"
+    );
 }
 
 #[test]
@@ -1708,6 +1740,7 @@ fn retry_proxy_allows_mesh_transport_target_outside_selected_subset() {
         UpstreamTarget {
             host: "plain.local".into(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 100,
             tags: HashMap::from([("version".to_string(), "plain".to_string())]),
             locality: None,
@@ -1716,6 +1749,7 @@ fn retry_proxy_allows_mesh_transport_target_outside_selected_subset() {
         UpstreamTarget {
             host: "mesh.local".into(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 100,
             tags: HashMap::from([
                 ("version".to_string(), "mesh".to_string()),
@@ -1912,6 +1946,7 @@ fn mesh_target(host: &str, port: u16) -> UpstreamTarget {
     UpstreamTarget {
         host: host.into(),
         port,
+        service_port_policy_key: None,
         weight: 100,
         tags: HashMap::from([("mesh.hbone".to_string(), "true".to_string())]),
         locality: None,

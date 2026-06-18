@@ -1635,6 +1635,7 @@ mod tests {
         let target_with = |tags: &[(&str, &str)]| UpstreamTarget {
             host: "10.0.0.9".to_string(),
             port: 53,
+            service_port_policy_key: None,
             weight: 1,
             tags: tags
                 .iter()

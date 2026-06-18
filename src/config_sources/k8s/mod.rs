@@ -2128,6 +2128,7 @@ pub(crate) fn upstream_for_route(
             .map(|backend| UpstreamTarget {
                 host: backend.host,
                 port: backend.port,
+                service_port_policy_key: None,
                 weight: backend.weight,
                 tags: HashMap::new(),
                 locality: None,

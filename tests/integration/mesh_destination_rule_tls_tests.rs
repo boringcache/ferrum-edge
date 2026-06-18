@@ -122,6 +122,7 @@ fn build_matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
         targets: vec![UpstreamTarget {
             host: host_fqdn.to_string(),
             port: 8080,
+            service_port_policy_key: None,
             weight: MAX_TARGET_WEIGHT.min(1),
             tags: HashMap::new(),
             locality: None,

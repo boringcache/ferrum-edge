@@ -1391,6 +1391,7 @@ fn backend_capability_key_uses_target_host_and_port() {
     let target = UpstreamTarget {
         host: "target.backend.internal".to_string(),
         port: 9443,
+        service_port_policy_key: None,
         weight: 1,
         tags: Default::default(),
         locality: None,
@@ -1526,6 +1527,7 @@ fn backend_capability_key_prefers_upstream_target_over_proxy_backend() {
     let target = UpstreamTarget {
         host: "lb-member.internal".to_string(),
         port: 7443,
+        service_port_policy_key: None,
         weight: 1,
         tags: Default::default(),
         locality: None,

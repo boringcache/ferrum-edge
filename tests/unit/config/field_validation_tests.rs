@@ -97,6 +97,7 @@ fn make_upstream(id: &str) -> Upstream {
         targets: vec![UpstreamTarget {
             host: "localhost".into(),
             port: 3000,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,
@@ -730,6 +731,7 @@ fn test_upstream_too_many_targets() {
         .map(|i| UpstreamTarget {
             host: format!("host{}.example.com", i),
             port: 3000,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,
@@ -2212,6 +2214,7 @@ fn test_validate_backend_ip_policy_upstream_target_denied() {
         targets: vec![UpstreamTarget {
             host: "169.254.169.254".to_string(),
             port: 80,
+            service_port_policy_key: None,
             weight: 100,
             path: None,
             tags: HashMap::new(),

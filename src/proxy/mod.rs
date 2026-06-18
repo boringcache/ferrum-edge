@@ -577,6 +577,7 @@ fn target_uses_direct_h2_pool(
     let target = UpstreamTarget {
         host: host.to_string(),
         port,
+        service_port_policy_key: None,
         weight: 1,
         tags: HashMap::new(),
         locality: None,
@@ -7010,11 +7011,19 @@ async fn handle_websocket_request_authenticated(
         // dedicated backend connection, so capping concurrent open connections
         // per `(host, port)` here matches Envoy `maxConnections` semantics. No
         // cap configured => `Ok(None)`, a single check with no map touch.
-        let (ws_dial_host, ws_dial_port) = match &current_target {
-            Some(target) => (target.host.as_str(), target.port),
-            None => (proxy.backend_host.as_str(), proxy.backend_port),
+        let (ws_dial_host, ws_dial_port, ws_policy_port) = match &current_target {
+            Some(target) => (
+                target.host.as_str(),
+                target.port,
+                target.dispatch_policy_port(),
+            ),
+            None => (
+                proxy.backend_host.as_str(),
+                proxy.backend_port,
+                proxy.backend_port,
+            ),
         };
-        let ws_max_connections = resolve_backend_max_connections(&proxy, ws_dial_port);
+        let ws_max_connections = resolve_backend_max_connections(&proxy, ws_policy_port);
         let conn_slot = match state.backend_conn_limit.try_acquire(
             ws_dial_host,
             ws_dial_port,
@@ -7531,7 +7540,7 @@ async fn handle_websocket_request_authenticated(
             &proxy,
             &epoch.load_balancer,
             upstream_id,
-            target.port,
+            target,
         );
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
@@ -14220,7 +14229,7 @@ async fn handle_proxy_request_inner(
                         &proxy,
                         &epoch.load_balancer,
                         upstream_id,
-                        target.port,
+                        target,
                     );
                     if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
                         let upstream =
@@ -15382,7 +15391,7 @@ async fn handle_proxy_request_inner(
             &proxy,
             &epoch.load_balancer,
             upstream_id,
-            target.port,
+            target,
         );
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
@@ -15999,7 +16008,7 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     let Some(target) = upstream_target else {
         return std::borrow::Cow::Borrowed(proxy);
     };
-    // Per-port override for the LB-selected target port and the service-discovery
+    // Per-port override for the LB-selected target's policy port and the service-discovery
     // top-level `connectionPool.http` overlay (`Proxy.dispatch_port_override_fallback`)
     // are FIELD-MERGED, not wholesale-replaced: a per-port `connectionPool.http`
     // field wins when set, otherwise the top-level overlay's value is inherited —
@@ -16012,7 +16021,7 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     let per_port = proxy
         .dispatch_port_overrides
         .as_ref()
-        .and_then(|overrides| overrides.get(&target.port));
+        .and_then(|overrides| overrides.get(&target.dispatch_policy_port()));
     let fallback = proxy.dispatch_port_override_fallback.as_ref();
     let merged: Option<std::borrow::Cow<'_, crate::config::types::ResolvedPortOverride>> =
         match (per_port, fallback) {
@@ -16199,7 +16208,7 @@ pub(crate) fn cap_proxy_retry_for_target(
     let Some(target) = upstream_target else {
         return proxy;
     };
-    // Cap from the SELECTED dispatch target's port override. Retries stay in
+    // Cap from the SELECTED dispatch target's policy-port override. Retries stay in
     // this port's lane (see docstring), so this cap governs the whole sequence.
     // FIELD-level fallback: the per-port `maxRetries` wins when set, otherwise
     // the service-discovery top-level `connectionPool.http.maxRetries` overlay
@@ -16210,7 +16219,7 @@ pub(crate) fn cap_proxy_retry_for_target(
     let cap = proxy
         .dispatch_port_overrides
         .as_ref()
-        .and_then(|overrides| overrides.get(&target.port))
+        .and_then(|overrides| overrides.get(&target.dispatch_policy_port()))
         .and_then(|o| o.max_retries)
         .or_else(|| {
             proxy
@@ -16378,7 +16387,7 @@ pub(crate) fn retry_port_override_dispatch_port(
     proxy: &Proxy,
     prev_target: &UpstreamTarget,
 ) -> Option<u16> {
-    let dispatch_port = prev_target.port;
+    let dispatch_port = prev_target.dispatch_policy_port();
     proxy
         .dispatch_port_overrides
         .as_ref()
@@ -16593,14 +16602,17 @@ pub(crate) async fn proxy_to_backend_retry(
     // counts, so there is no body-shape exclusion. The slot is released the
     // instant this attempt's `send()` returns (the `drop` below), so it spans
     // only this attempt's in-flight window and an attempt never double-counts.
-    let retry_dispatch_port = upstream_target
+    let retry_dial_port = upstream_target
         .map(|t| t.port)
         .unwrap_or(proxy.backend_port);
-    let retry_pending_cap = resolve_backend_http1_max_pending_requests(proxy, retry_dispatch_port)
+    let retry_policy_port = upstream_target
+        .map(UpstreamTarget::dispatch_policy_port)
+        .unwrap_or(proxy.backend_port);
+    let retry_pending_cap = resolve_backend_http1_max_pending_requests(proxy, retry_policy_port)
         .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
     let retry_pending_slot = match state.backend_pending_limit.try_acquire(
         effective_host,
-        retry_dispatch_port,
+        retry_dial_port,
         retry_pending_cap,
     ) {
         Ok(slot) => slot,
@@ -16608,7 +16620,7 @@ pub(crate) async fn proxy_to_backend_retry(
             warn!(
                 proxy_id = %proxy.id,
                 backend_host = %effective_host,
-                backend_port = retry_dispatch_port,
+                backend_port = retry_dial_port,
                 pending_requests = limit.current,
                 max_pending_requests = limit.cap,
                 "Shedding HTTP/1.1 retry: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
@@ -17797,16 +17809,19 @@ async fn proxy_to_backend(
     // path (`proxy_to_backend_retry`) re-enters this same gate per attempt (see
     // its own acquire); the initial slot is already released before the retry
     // loop runs, so an attempt and its retry never double-count.
-    let pending_dispatch_port = upstream_target
+    let pending_dial_port = upstream_target
         .map(|t| t.port)
         .unwrap_or(proxy.backend_port);
-    let pending_cap = resolve_backend_http1_max_pending_requests(proxy, pending_dispatch_port)
+    let pending_policy_port = upstream_target
+        .map(UpstreamTarget::dispatch_policy_port)
+        .unwrap_or(proxy.backend_port);
+    let pending_cap = resolve_backend_http1_max_pending_requests(proxy, pending_policy_port)
         // Only an HTTP/1.1-determined reqwest dispatch consults the gate; a
         // reqwest fallback that may ALPN-negotiate h2 ignores the `http1*` cap.
         .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
     let pending_slot = match state.backend_pending_limit.try_acquire(
         effective_host,
-        pending_dispatch_port,
+        pending_dial_port,
         pending_cap,
     ) {
         Ok(slot) => slot,
@@ -17814,7 +17829,7 @@ async fn proxy_to_backend(
             warn!(
                 proxy_id = %proxy.id,
                 backend_host = %effective_host,
-                backend_port = pending_dispatch_port,
+                backend_port = pending_dial_port,
                 pending_requests = limit.current,
                 max_pending_requests = limit.cap,
                 "Shedding HTTP/1.1 request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
@@ -22296,6 +22311,7 @@ mod tests {
         let target = UpstreamTarget {
             host: "selected.example.com".to_string(),
             port: 8443,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,
@@ -22709,6 +22725,7 @@ mod tests {
         let selected_overridden_target = UpstreamTarget {
             host: "a".to_string(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,
@@ -22717,6 +22734,7 @@ mod tests {
         let selected_non_overridden_target = UpstreamTarget {
             host: "b".to_string(),
             port: 9090,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,
@@ -25669,6 +25687,7 @@ mod tests {
         let target = UpstreamTarget {
             host: "10.0.0.8".to_string(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::from([
                 (
@@ -26724,10 +26743,18 @@ mod tests {
         UpstreamTarget {
             host: host.to_string(),
             port,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,
             path: None,
+        }
+    }
+
+    fn target_for_test_with_policy_port(port: u16, policy_port: u16) -> UpstreamTarget {
+        UpstreamTarget {
+            service_port_policy_key: Some(policy_port),
+            ..target_for_test(port)
         }
     }
 
@@ -27896,17 +27923,12 @@ mod tests {
         assert_eq!(fallback.h2_max_concurrent_streams, Some(64));
     }
 
-    /// #1806 (narrowed; follow-up #1816): an SD upstream whose Service uses a
-    /// NAMED `targetPort` stores the explicit per-port `connectionPool.http` entry
-    /// under the DECLARED service port (named targetPorts can't be remapped at
-    /// apply time), while the LB-selected target carries the RESOLVED workload
-    /// port. When the resolved port MATCHES the service port the per-port entry
-    /// wins (field-merged over the top-level fallback); when it does NOT (the
-    /// named-targetPort case) the per-port lookup MISSES and the TOP-LEVEL fallback
-    /// applies instead — applying the explicit per-port value to a named-targetPort
-    /// SD upstream is a DEFERRED accepted limitation (#1816). This test pins both.
+    /// A service-discovery target can dial a resolved workload port while still
+    /// being governed by its owning declared Service port. The explicit
+    /// `portLevelSettings` entry for that declared port must win, while a target
+    /// without the internal policy key still falls back by its dial port.
     #[test]
-    fn sd_named_target_port_falls_back_to_top_level_connection_pool_http() {
+    fn sd_named_target_port_uses_service_port_policy_key() {
         use crate::config::types::{Upstream, UpstreamPortOverride};
         // SD upstream: service port 80 carries an explicit per-port
         // `http1MaxPendingRequests: 1` (and `maxRetries: 5`); the top-level
@@ -27981,23 +28003,24 @@ mod tests {
             "pending gate sees the per-port cap when the resolved port matches"
         );
 
-        // Case B — named targetPort resolves to a DIFFERENT workload port (8080)
-        // with no per-port entry: the per-port lookup MISSES, so the TOP-LEVEL
-        // fallback applies. Applying the explicit per-port value here is the
-        // DEFERRED accepted limitation (#1816).
-        let resolved = target_for_test(8080);
+        // Case B — named targetPort resolves to a DIFFERENT workload port (8080),
+        // but the discovery target carries the owning declared Service port
+        // (80). The per-port entry must still win for its own target, with
+        // unset fields inherited from the top-level fallback.
+        let resolved = target_for_test_with_policy_port(8080, 80);
         let eff_resolved = resolve_effective_proxy_for_target(proxy, Some(&resolved));
         assert_eq!(
             eff_resolved.pool_http1_max_pending_requests,
-            Some(32),
-            "named-targetPort SD: top-level fallback applies on the resolved port (#1816)"
+            Some(1),
+            "named-targetPort SD: explicit service-port policy wins on the resolved workload port"
         );
         assert_eq!(
-            resolve_backend_http1_max_pending_requests(proxy, 8080),
-            Some(32),
-            "pending gate sees the top-level fallback on the resolved (named) port (#1816)"
+            resolve_backend_http1_max_pending_requests(proxy, resolved.dispatch_policy_port()),
+            Some(1),
+            "pending gate sees the service-port cap through the target policy key"
         );
-        // `maxRetries` on the resolved (named) port comes from the top-level (2).
+        // `maxRetries` on the resolved (named) port comes from the per-port
+        // service policy (5), not the top-level fallback (2).
         let mut with_retry = proxy.clone();
         with_retry.retry = Some(crate::config::types::RetryConfig {
             max_retries: 10,
@@ -28006,14 +28029,26 @@ mod tests {
         let capped = cap_proxy_retry_for_target(Arc::new(with_retry), Some(&resolved));
         assert_eq!(
             capped.retry.as_ref().map(|r| r.max_retries),
-            Some(2),
-            "named-targetPort SD: maxRetries comes from the top-level fallback (#1816)"
+            Some(5),
+            "named-targetPort SD: maxRetries comes from the service-port policy"
         );
         // The top-level-only field is inherited on the resolved port.
         assert_eq!(
             eff_resolved.pool_idle_timeout_seconds,
             Some(120),
             "a top-level-only field is inherited on the resolved port"
+        );
+
+        // Case C — the same dial port without the service-port identity has no
+        // explicit port 8080 entry, so it still falls back. This proves the
+        // mapping is target-specific rather than inferred globally from the
+        // workload port or a port name.
+        let plain_resolved = target_for_test(8080);
+        let eff_plain = resolve_effective_proxy_for_target(proxy, Some(&plain_resolved));
+        assert_eq!(
+            eff_plain.pool_http1_max_pending_requests,
+            Some(32),
+            "without the service-port policy key, the same dial port uses the top-level fallback"
         );
     }
 

@@ -189,6 +189,7 @@ fn make_upstream(subsets: Option<Vec<SubsetDefinition>>) -> Upstream {
         targets: vec![UpstreamTarget {
             host: "10.0.0.1".into(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,

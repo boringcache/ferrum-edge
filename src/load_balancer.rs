@@ -1736,7 +1736,9 @@ impl LoadBalancer {
                 let target_indices: Vec<usize> = targets
                     .iter()
                     .enumerate()
-                    .filter_map(|(idx, target)| (target.port == *port).then_some(idx))
+                    .filter_map(|(idx, target)| {
+                        (target.dispatch_policy_port() == *port).then_some(idx)
+                    })
                     .collect();
                 if target_indices.is_empty() {
                     continue;
@@ -4538,6 +4540,7 @@ mod tests {
         UpstreamTarget {
             host: host.to_string(),
             port,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,

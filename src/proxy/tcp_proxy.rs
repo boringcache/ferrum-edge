@@ -3228,6 +3228,7 @@ fn try_next_target(
     let exclude = crate::config::types::UpstreamTarget {
         host: current_host.to_string(),
         port: current_port,
+        service_port_policy_key: None,
         weight: 1,
         path: None,
         tags: std::collections::HashMap::new(),

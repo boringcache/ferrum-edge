@@ -621,17 +621,17 @@ impl ResolvedPortOverride {
 pub(crate) fn dispatch_port_override_fallback_from_upstream(
     upstream: &Upstream,
 ) -> Option<ResolvedPortOverride> {
-    // TOP-LEVEL `connectionPool.http` overlay ONLY (#1806 narrowed; follow-up #1816).
+    // TOP-LEVEL `connectionPool.http` overlay ONLY.
     // An explicit per-port `portLevelSettings` still WINS via the dispatch-time
-    // per-port lookup (by resolved dial port) in `resolve_effective_proxy_for_target`.
+    // per-port lookup in `resolve_effective_proxy_for_target`: discovered mesh
+    // targets carry their owning declared Service port in
+    // `UpstreamTarget.service_port_policy_key`, while ordinary targets key by
+    // their resolved dial port.
     // We deliberately do NOT fold the upstream's `port_overrides` into this fallback:
     // a multi-port upstream would cross-leak one port's `connectionPool.http` onto a
-    // different port (codex r3). The residual — applying an EXPLICIT per-port value to
-    // an SD upstream whose NAMED `targetPort` resolves to a different dial port (so the
-    // per-port lookup misses and only this top-level fallback is consulted) — is a
-    // DEFERRED accepted limitation (see #1816), as is immediate route-rebuild on a
-    // DR-only edit (a `#[serde(skip)]` DR-derived field, like the established per-port
-    // `dispatch_port_overrides`).
+    // different port (codex r3). Immediate route-rebuild on a DR-only edit remains
+    // tracked separately because this is a `#[serde(skip)]` DR-derived field, like
+    // the established per-port `dispatch_port_overrides`.
     upstream
         .dispatch_port_override_fallback
         .as_ref()
@@ -712,6 +712,14 @@ impl ResolvedSubsetTrafficPolicy {
 pub struct UpstreamTarget {
     pub host: String,
     pub port: u16,
+    /// Internal DestinationRule policy key for discovered mesh targets whose
+    /// declared Service port differs from the resolved workload dial port.
+    ///
+    /// `port` remains the actual connection destination. This field is derived
+    /// during materialization and skipped by serde so file/admin config cannot
+    /// set it.
+    #[serde(default, skip)]
+    pub service_port_policy_key: Option<u16>,
     #[serde(default = "default_weight")]
     pub weight: u32,
     #[serde(default)]
@@ -723,6 +731,18 @@ pub struct UpstreamTarget {
     /// target is selected by the load balancer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+}
+
+impl UpstreamTarget {
+    /// DestinationRule `portLevelSettings` key that governs this target.
+    ///
+    /// Static targets and ordinary discovery targets use their dial port. Mesh
+    /// Service discovery can stamp the owning declared Service port when
+    /// Kubernetes `targetPort` resolves to a different workload port.
+    #[inline]
+    pub fn dispatch_policy_port(&self) -> u16 {
+        self.service_port_policy_key.unwrap_or(self.port)
+    }
 }
 
 /// Parsed locality preference used by the load balancer.

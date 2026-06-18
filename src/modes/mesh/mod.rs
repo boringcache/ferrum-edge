@@ -1782,6 +1782,7 @@ fn build_east_west_service_targets(
             targets.push(UpstreamTarget {
                 host: address.clone(),
                 port: target_port,
+                service_port_policy_key: service.ports.first().map(|sp| sp.port),
                 weight: 1,
                 tags,
                 locality: workload.locality.clone(),
@@ -3643,6 +3644,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
             // Dial the workload's own (canonicalized) IP, not the VIP.
             host: spec.canonical_ip.to_string(),
             port: spec.target_port,
+            service_port_policy_key: None,
             weight: 1,
             tags,
             locality: spec.workload.locality.clone(),
@@ -4056,6 +4058,7 @@ fn build_outbound_mesh_targets(
             targets.push(UpstreamTarget {
                 host: address.clone(),
                 port: app_port,
+                service_port_policy_key: Some(service_port.port),
                 weight: 1,
                 tags: tags.clone(),
                 locality: workload.locality.clone(),
@@ -5897,6 +5900,7 @@ fn build_egress_upstream_targets(
                 Some(UpstreamTarget {
                     host: ep.address.clone(),
                     port: target_port,
+                    service_port_policy_key: Some(port_number),
                     weight: 1,
                     tags,
                     locality: None,
@@ -5910,6 +5914,7 @@ fn build_egress_upstream_targets(
         vec![UpstreamTarget {
             host: host.to_string(),
             port: port_number,
+            service_port_policy_key: Some(port_number),
             weight: 1,
             tags: std::collections::HashMap::new(),
             locality: None,
@@ -14429,6 +14434,7 @@ mod tests {
             targets: vec![UpstreamTarget {
                 host: host.to_string(),
                 port: 8080,
+                service_port_policy_key: None,
                 weight: 1,
                 tags: HashMap::new(),
                 locality: None,
@@ -16127,6 +16133,7 @@ mod tests {
         upstream.targets.push(UpstreamTarget {
             host: "reviews.default.svc.cluster.local".to_string(),
             port: 9090,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,
@@ -18031,6 +18038,7 @@ mod tests {
             targets: vec![UpstreamTarget {
                 host: "10.0.0.5".to_string(),
                 port: 8080,
+                service_port_policy_key: None,
                 weight: 1,
                 tags: HashMap::new(),
                 locality: Some("us-east/us-east-1/b".to_string()),
@@ -18099,6 +18107,7 @@ mod tests {
             targets: vec![UpstreamTarget {
                 host: "10.0.0.5".to_string(),
                 port,
+                service_port_policy_key: None,
                 weight: 1,
                 tags: HashMap::new(),
                 locality: Some("us-east/us-east-1/b".to_string()),

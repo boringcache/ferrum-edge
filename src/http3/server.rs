@@ -4396,7 +4396,7 @@ pub(crate) fn inject_sticky_cookie(
             proxy,
             &epoch.load_balancer,
             upstream_id,
-            target.port,
+            target,
         );
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);

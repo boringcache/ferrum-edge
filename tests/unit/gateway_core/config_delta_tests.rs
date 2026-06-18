@@ -102,6 +102,7 @@ fn make_target(host: &str, port: u16) -> UpstreamTarget {
     UpstreamTarget {
         host: host.to_string(),
         port,
+        service_port_policy_key: None,
         weight: 100,
         tags: HashMap::new(),
         locality: None,

@@ -1925,6 +1925,7 @@ mod tests {
         UpstreamTarget {
             host: "orders.default.svc.cluster.local".to_string(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 100,
             tags: tags
                 .iter()

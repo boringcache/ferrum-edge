@@ -229,6 +229,7 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
             UpstreamTarget {
                 host: "10.1.0.1".to_string(),
                 port: 8080,
+                service_port_policy_key: None,
                 weight: 1,
                 tags: HashMap::new(),
                 locality: Some("us-east-1/zone-a".to_string()),
@@ -237,6 +238,7 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
             UpstreamTarget {
                 host: "10.2.0.1".to_string(),
                 port: 8080,
+                service_port_policy_key: None,
                 weight: 1,
                 tags: HashMap::new(),
                 locality: Some("remote-west/net2".to_string()),

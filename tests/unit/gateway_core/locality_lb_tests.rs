@@ -16,6 +16,7 @@ fn target_on_port(host: &str, port: u16, locality: Option<&str>) -> UpstreamTarg
     UpstreamTarget {
         host: host.to_string(),
         port,
+        service_port_policy_key: None,
         weight: 1,
         tags: HashMap::new(),
         locality: locality.map(str::to_string),
@@ -38,6 +39,7 @@ fn tagged_target(
     UpstreamTarget {
         host: host.to_string(),
         port,
+        service_port_policy_key: None,
         weight: 1,
         tags: HashMap::from([(tag.0.to_string(), tag.1.to_string())]),
         locality: locality.map(str::to_string),

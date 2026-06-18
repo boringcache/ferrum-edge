@@ -190,6 +190,7 @@ fn create_test_upstream(id: &str, name: &str) -> Upstream {
         targets: vec![UpstreamTarget {
             host: "10.0.0.1".to_string(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 100,
             tags: HashMap::new(),
             locality: None,

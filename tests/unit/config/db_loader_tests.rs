@@ -17,6 +17,7 @@ fn make_upstream(id: &str) -> Upstream {
         targets: vec![UpstreamTarget {
             host: "reviews.default.svc.cluster.local".to_string(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 100,
             tags: Default::default(),
             locality: None,

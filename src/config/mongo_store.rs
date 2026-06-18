@@ -4868,6 +4868,7 @@ mod inner {
                 targets: vec![crate::config::types::UpstreamTarget {
                     host: "target1.example.com".to_string(),
                     port: 8080,
+                    service_port_policy_key: None,
                     weight: 100,
                     tags: std::collections::HashMap::new(),
                     locality: None,
