@@ -1143,22 +1143,38 @@ fn materialize_east_west_gateway_proxies(
     // lowercased and the skip below uses the SAME overlap semantics — an exact
     // membership test would miss a wildcard explicit entry like
     // `*.ns.svc.cluster.local` that still owns the concrete auto host.
+    //
+    // The set must reflect only the gateways that ACTUALLY materialized a proxy.
+    // The loop above collapses entries by generated proxy id (`find().map() ->
+    // overwrite`), so two same-namespace gateways sharing a `name` leave only the
+    // last one's proxy bound. Collecting SNI hosts from the raw list would also
+    // keep the overwritten entry's hosts, suppressing an auto local-service proxy
+    // that no surviving explicit proxy actually owns — silently dropping that
+    // service from east-west routing. Dedup by the same generated id (last wins)
+    // so an overwritten entry's hosts never suppress autos.
     let explicit_sni_hosts: Vec<String> = config
         .mesh
         .as_ref()
         .and_then(|mesh| mesh.multi_cluster.as_ref())
         .map(|multi_cluster| {
-            multi_cluster
+            let mut hosts_by_proxy_id: HashMap<String, Vec<String>> = HashMap::new();
+            for gateway in multi_cluster
                 .east_west_gateways
                 .iter()
                 .filter(|gateway| gateway.namespace == runtime.namespace)
-                .flat_map(|gateway| {
+            {
+                // Last write wins, mirroring the materialization loop's
+                // overwrite-by-id behavior above.
+                hosts_by_proxy_id.insert(
+                    mesh_east_west_proxy_id(&gateway.namespace, &gateway.name),
                     gateway
                         .sni_hosts
                         .iter()
                         .map(|host| host.to_ascii_lowercase())
-                })
-                .collect()
+                        .collect(),
+                );
+            }
+            hosts_by_proxy_id.into_values().flatten().collect()
         })
         .unwrap_or_default();
 
