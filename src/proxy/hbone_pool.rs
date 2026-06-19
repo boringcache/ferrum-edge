@@ -566,6 +566,7 @@ impl HboneConnectionPool {
     /// SVID rotation is automatic because every new session dials with the
     /// current SVID. The dial PINS `expected_peer`; a missing gateway SVID fails
     /// closed before the dial.
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_ws_byte_tunnel(
         &self,
         proxy: &Proxy,
@@ -637,6 +638,7 @@ impl HboneConnectionPool {
     // Callers: the mesh UDP capture egress datapath (Linux-only, `IP_TRANSPARENT`)
     // AND the cross-platform UDP capability probe ([`Self::warmup_datagram_connection`]),
     // so this is reachable on every platform.
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_datagram_tunnel(
         &self,
         proxy: &Proxy,
@@ -2647,6 +2649,7 @@ mod tests {
             .get_or_create_sender(
                 &proxy,
                 "orders.default.svc.cluster.local",
+                8080,
                 8080,
                 ISTIO_HBONE_PORT,
                 None,

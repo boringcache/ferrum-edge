@@ -595,7 +595,9 @@ pub fn targets_equal(a: &[UpstreamTarget], b: &[UpstreamTarget]) -> bool {
         return false;
     }
     // Build sortable borrowed tuples — no String allocations.
-    fn to_key(t: &UpstreamTarget) -> (&str, u16, Option<u16>, u32, Vec<(&str, &str)>) {
+    type TargetSortKey<'a> = (&'a str, u16, Option<u16>, u32, Vec<(&'a str, &'a str)>);
+
+    fn to_key(t: &UpstreamTarget) -> TargetSortKey<'_> {
         let mut tag_pairs: Vec<(&str, &str)> = t
             .tags
             .iter()
