@@ -7019,8 +7019,9 @@ async fn handle_websocket_request_authenticated(
         // Enforce DestinationRule `connectionPool.tcp.maxConnections` for this
         // destination port BEFORE dialing. A proxied WebSocket opens one
         // dedicated backend connection, so capping concurrent open connections
-        // per `(host, port)` here matches Envoy `maxConnections` semantics. No
-        // cap configured => `Ok(None)`, a single check with no map touch.
+        // per `(host, policy-port)` keeps targetPort-remapped service lanes
+        // isolated while the socket still dials `(host, dial-port)`. No cap
+        // configured => `Ok(None)`, a single check with no map touch.
         let (ws_dial_host, ws_dial_port, ws_policy_port) = match &current_target {
             Some(target) => (
                 target.host.as_str(),
@@ -7036,7 +7037,7 @@ async fn handle_websocket_request_authenticated(
         let ws_max_connections = resolve_backend_max_connections(&proxy, ws_policy_port);
         let conn_slot = match state.backend_conn_limit.try_acquire(
             ws_dial_host,
-            ws_dial_port,
+            ws_policy_port,
             ws_max_connections,
         ) {
             Ok(slot) => slot,
@@ -16643,7 +16644,7 @@ pub(crate) async fn proxy_to_backend_retry(
     }
 
     // DestinationRule `connectionPool.http.http1MaxPendingRequests`: re-enter the
-    // same per-`(host, port)` pending gate as the initial attempt
+    // same per-`(host, policy-port)` pending gate as the initial attempt
     // (`proxy_to_backend`). The initial attempt's slot was already released
     // before the retry loop ran (it drops the moment that attempt's `send()`
     // returns), so a retry no longer overlaps it — without acquiring here, a
@@ -16664,7 +16665,7 @@ pub(crate) async fn proxy_to_backend_retry(
         .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
     let retry_pending_slot = match state.backend_pending_limit.try_acquire(
         effective_host,
-        retry_dial_port,
+        retry_policy_port,
         retry_pending_cap,
     ) {
         Ok(slot) => slot,
@@ -17853,7 +17854,7 @@ async fn proxy_to_backend(
     // Envoy's true pending-queue depth over reqwest. Mirroring how this repo
     // honestly reinterprets DR `maxRetries` as a per-request cap, the knob is
     // reframed as a **max concurrent in-flight HTTP/1.1 requests per
-    // `(host, port)`** cap (measured dispatch → response-headers), shedding
+    // `(host, policy-port)`** cap (measured dispatch → response-headers), shedding
     // excess with a 503 ("upstream overflow"). Under that framing a streamed
     // upload IS legitimately in-flight, so there is NO body-shape exclusion —
     // bodyless GET/HEAD/OPTIONS (where `stream_request_body` is true) are capped
@@ -17873,7 +17874,7 @@ async fn proxy_to_backend(
         .filter(|_| reqwest_dispatch_is_http1_only(state, proxy, upstream_target));
     let pending_slot = match state.backend_pending_limit.try_acquire(
         effective_host,
-        pending_dial_port,
+        pending_policy_port,
         pending_cap,
     ) {
         Ok(slot) => slot,

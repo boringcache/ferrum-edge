@@ -13,7 +13,7 @@ use crate::admin::jwt_auth::AdminRole;
 use crate::config::db_backend::{DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult};
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, RetryConfig, Upstream,
-    first_effective_mesh_transport_conflict, mesh_transport_retry_conflict_message,
+    first_effective_mesh_transport_conflict_with_mesh, mesh_transport_retry_conflict_message,
     proxy_retry_is_effective, proxy_with_resolved_port_caps, validate_resource_id,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
@@ -506,6 +506,7 @@ async fn validate_mesh_route_dispatch_plugin_retry_conflicts(
     db: &dyn DatabaseBackend,
     namespace: &str,
     plugin_config: &PluginConfig,
+    mesh_model: Option<&crate::modes::mesh::config::MeshConfig>,
 ) -> Result<Vec<String>, AfterValidateError> {
     if !plugin_config.enabled || plugin_config.plugin_name != "mesh_route_dispatch" {
         // Disabling (or renaming away from `mesh_route_dispatch`) a proxy-scoped /
@@ -522,7 +523,13 @@ async fn validate_mesh_route_dispatch_plugin_retry_conflicts(
             plugin_config.scope,
             PluginScope::Proxy | PluginScope::ProxyGroup
         ) {
-            return validate_unshadowed_globals_for_plugin(db, namespace, plugin_config).await;
+            return validate_unshadowed_globals_for_plugin(
+                db,
+                namespace,
+                plugin_config,
+                mesh_model,
+            )
+            .await;
         }
         return Ok(Vec::new());
     }
@@ -567,6 +574,7 @@ async fn validate_mesh_route_dispatch_plugin_retry_conflicts(
                     namespace,
                     &proxy,
                     &override_rules,
+                    mesh_model,
                     &mut errors,
                 )
                 .await
@@ -605,6 +613,7 @@ async fn validate_mesh_route_dispatch_plugin_retry_conflicts(
                             namespace,
                             proxy,
                             &override_rules,
+                            mesh_model,
                             &mut errors,
                         )
                         .await
@@ -645,6 +654,7 @@ async fn validate_unshadowed_globals_for_plugin(
     db: &dyn DatabaseBackend,
     namespace: &str,
     plugin_config: &PluginConfig,
+    mesh_model: Option<&crate::modes::mesh::config::MeshConfig>,
 ) -> Result<Vec<String>, AfterValidateError> {
     // Collect the override rules of every enabled global `mesh_route_dispatch`.
     // Parsed configs are kept owned so the borrowed rule slice stays valid.
@@ -723,6 +733,7 @@ async fn validate_unshadowed_globals_for_plugin(
                 namespace,
                 proxy,
                 &global_override_rules,
+                mesh_model,
                 &mut errors,
             )
             .await
@@ -775,6 +786,7 @@ async fn evaluate_mesh_route_dispatch_rules_for_proxy(
     namespace: &str,
     proxy: &Proxy,
     override_rules: &[&crate::plugins::mesh_route_dispatch::RouteRule],
+    mesh_model: Option<&crate::modes::mesh::config::MeshConfig>,
     errors: &mut Vec<String>,
 ) -> DbResult<()> {
     for rule in override_rules {
@@ -813,12 +825,13 @@ async fn evaluate_mesh_route_dispatch_rules_for_proxy(
                 // Runtime recomputes the per-port retry cap from the OVERRIDE
                 // destination upstream, so derive the temporary proxy's port caps
                 // from it before checking effectiveness.
-                if let Some(conflict) = first_effective_mesh_transport_conflict(
+                if let Some(conflict) = first_effective_mesh_transport_conflict_with_mesh(
                     &proxy_with_resolved_port_caps(proxy, &upstream),
                     &upstream,
                     selected_subset,
                     effective_retry.as_ref(),
                     proxy.allowed_methods.as_deref(),
+                    mesh_model,
                 ) {
                     errors.push(mesh_transport_retry_conflict_message(
                         &proxy.id,
@@ -1275,12 +1288,16 @@ impl AdminResource for Upstream {
 
     async fn after_validate(
         db: &dyn DatabaseBackend,
-        _state: &AdminState,
+        state: &AdminState,
         namespace: &str,
         resource: &Self,
         _existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
+        let cached_config = state.cached_gateway_config();
+        let mesh_model = cached_config
+            .as_ref()
+            .and_then(|config| config.mesh.as_deref());
         let subset_names: HashSet<&str> = resource
             .subsets
             .as_deref()
@@ -1317,12 +1334,13 @@ impl AdminResource for Upstream {
                     // order. The proxy loaded from the DB has no resolved
                     // `dispatch_port_overrides`, so derive its per-port retry caps
                     // from the edited upstream definition (`resource`).
-                    if let Some(conflict) = first_effective_mesh_transport_conflict(
+                    if let Some(conflict) = first_effective_mesh_transport_conflict_with_mesh(
                         &proxy_with_resolved_port_caps(&proxy, resource),
                         resource,
                         proxy.upstream_subset.as_deref(),
                         proxy.retry.as_ref(),
                         proxy.allowed_methods.as_deref(),
+                        mesh_model,
                     ) {
                         errors.push(mesh_transport_retry_conflict_message(
                             &proxy.id,
@@ -1345,12 +1363,13 @@ impl AdminResource for Upstream {
                     if override_dest.upstream_id != resource.id {
                         continue;
                     }
-                    if let Some(conflict) = first_effective_mesh_transport_conflict(
+                    if let Some(conflict) = first_effective_mesh_transport_conflict_with_mesh(
                         &proxy_with_resolved_port_caps(&proxy, resource),
                         resource,
                         override_dest.selected_subset.as_deref(),
                         override_dest.effective_retry.as_ref(),
                         proxy.allowed_methods.as_deref(),
+                        mesh_model,
                     ) {
                         errors.push(mesh_transport_retry_conflict_message(
                             &proxy.id,
@@ -1481,7 +1500,7 @@ impl AdminResource for PluginConfig {
 
     async fn after_validate(
         db: &dyn DatabaseBackend,
-        _state: &AdminState,
+        state: &AdminState,
         namespace: &str,
         resource: &Self,
         _existing: Option<&Self>,
@@ -1515,7 +1534,7 @@ impl AdminResource for PluginConfig {
             }
         }
 
-        if let Err(error) = validate_plugin_config_definition(_state, resource) {
+        if let Err(error) = validate_plugin_config_definition(state, resource) {
             return Err(AfterValidateError::BadRequest(vec![format!(
                 "Invalid plugin config: {}",
                 error
@@ -1537,8 +1556,14 @@ impl AdminResource for PluginConfig {
         // exists (e.g. repointing a rule at a mesh.hbone upstream). The reference
         // validator above only checks existence, so run the retry conflict check
         // for the proxies this plugin applies to.
-        let retry_errors =
-            validate_mesh_route_dispatch_plugin_retry_conflicts(db, namespace, resource).await?;
+        let cached_config = state.cached_gateway_config();
+        let mesh_model = cached_config
+            .as_ref()
+            .and_then(|config| config.mesh.as_deref());
+        let retry_errors = validate_mesh_route_dispatch_plugin_retry_conflicts(
+            db, namespace, resource, mesh_model,
+        )
+        .await?;
         if !retry_errors.is_empty() {
             return Err(AfterValidateError::BadRequest(retry_errors));
         }
@@ -1753,12 +1778,16 @@ impl AdminResource for Proxy {
 
     async fn after_validate(
         db: &dyn DatabaseBackend,
-        _state: &AdminState,
+        state: &AdminState,
         namespace: &str,
         resource: &Self,
         existing: Option<&Self>,
         ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
+        let cached_config = state.cached_gateway_config();
+        let mesh_model = cached_config
+            .as_ref()
+            .and_then(|config| config.mesh.as_deref());
         if let Some(upstream_id) = resource.upstream_id.as_deref() {
             match db.get_upstream(upstream_id).await {
                 Ok(Some(upstream)) if upstream.namespace != namespace => {
@@ -1802,12 +1831,13 @@ impl AdminResource for Proxy {
                     // `#[serde(skip)]` `dispatch_port_overrides` resolved, so derive
                     // them from the referenced upstream first (the full-config path
                     // gets them via `resolve_dispatch_port_overrides`).
-                    if let Some(conflict) = first_effective_mesh_transport_conflict(
+                    if let Some(conflict) = first_effective_mesh_transport_conflict_with_mesh(
                         &proxy_with_resolved_port_caps(resource, &upstream),
                         &upstream,
                         resource.upstream_subset.as_deref(),
                         resource.retry.as_ref(),
                         resource.allowed_methods.as_deref(),
+                        mesh_model,
                     ) {
                         return Err(AfterValidateError::BadRequest(vec![
                             mesh_transport_retry_conflict_message(
@@ -1839,12 +1869,13 @@ impl AdminResource for Proxy {
         {
             match db.get_upstream(&override_dest.upstream_id).await {
                 Ok(Some(upstream)) if upstream.namespace == namespace => {
-                    if let Some(conflict) = first_effective_mesh_transport_conflict(
+                    if let Some(conflict) = first_effective_mesh_transport_conflict_with_mesh(
                         &proxy_with_resolved_port_caps(resource, &upstream),
                         &upstream,
                         override_dest.selected_subset.as_deref(),
                         override_dest.effective_retry.as_ref(),
                         resource.allowed_methods.as_deref(),
+                        mesh_model,
                     ) {
                         return Err(AfterValidateError::BadRequest(vec![
                             mesh_transport_retry_conflict_message(

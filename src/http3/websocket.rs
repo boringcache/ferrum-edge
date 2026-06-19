@@ -613,9 +613,9 @@ pub(crate) async fn handle_h3_websocket(
     let backend_conn_guard;
     let backend_handshake = loop {
         // Enforce DestinationRule `connectionPool.tcp.maxConnections` for this
-        // destination port BEFORE dialing — same semantics and ordering as the
-        // H1/H2 path in `src/proxy/mod.rs`. No cap => `Ok(None)`, a single
-        // check with no map touch.
+        // destination policy port BEFORE dialing — same semantics and ordering
+        // as the H1/H2 path in `src/proxy/mod.rs`. No cap => `Ok(None)`, a
+        // single check with no map touch.
         let (ws_dial_host, ws_dial_port, ws_policy_port) = match &current_target {
             Some(target) => (
                 target.host.as_str(),
@@ -632,7 +632,7 @@ pub(crate) async fn handle_h3_websocket(
             crate::proxy::resolve_backend_max_connections(&proxy, ws_policy_port);
         let conn_slot = match state.backend_conn_limit.try_acquire(
             ws_dial_host,
-            ws_dial_port,
+            ws_policy_port,
             ws_max_connections,
         ) {
             Ok(slot) => slot,

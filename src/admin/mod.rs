@@ -2204,6 +2204,7 @@ async fn validate_batch_route_override_conflicts(
     proxy: &Proxy,
     batch_upstreams: &std::collections::HashMap<&str, &crate::config::types::Upstream>,
     batch_plugin_configs: &std::collections::HashMap<&str, &PluginConfig>,
+    mesh_model: Option<&crate::modes::mesh::config::MeshConfig>,
     validation_errors: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
@@ -2323,12 +2324,13 @@ async fn validate_batch_route_override_conflicts(
             };
             if let Some(upstream) = resolved
                 && let Some(conflict) =
-                    crate::config::types::first_effective_mesh_transport_conflict(
+                    crate::config::types::first_effective_mesh_transport_conflict_with_mesh(
                         &crate::config::types::proxy_with_resolved_port_caps(proxy, &upstream),
                         &upstream,
                         selected_subset,
                         effective_retry.as_ref(),
                         proxy.allowed_methods.as_deref(),
+                        mesh_model,
                     )
             {
                 validation_errors.push(
@@ -3149,6 +3151,9 @@ async fn handle_batch_create(
         upstreams: batch.upstreams.clone(),
         loaded_at: now,
         known_namespaces: Vec::new(),
+        mesh: state
+            .cached_gateway_config()
+            .and_then(|config| config.mesh.clone()),
         ..Default::default()
     };
 
@@ -3276,7 +3281,7 @@ async fn handle_batch_create(
             };
             if let Some(upstream) = resolved_upstream
                 && let Some(conflict) =
-                    crate::config::types::first_effective_mesh_transport_conflict(
+                    crate::config::types::first_effective_mesh_transport_conflict_with_mesh(
                         // Per-resource batch proxies arrive without their
                         // `#[serde(skip)]` `dispatch_port_overrides` resolved;
                         // derive them from the referenced upstream so a
@@ -3287,6 +3292,7 @@ async fn handle_batch_create(
                         proxy.upstream_subset.as_deref(),
                         proxy.retry.as_ref(),
                         proxy.allowed_methods.as_deref(),
+                        batch_config.mesh.as_deref(),
                     )
             {
                 validation_errors.push(
@@ -3311,6 +3317,7 @@ async fn handle_batch_create(
             proxy,
             &batch_upstreams,
             &batch_plugin_configs,
+            batch_config.mesh.as_deref(),
             &mut validation_errors,
         )
         .await
@@ -3669,6 +3676,9 @@ async fn handle_restore(
             upstreams: payload.upstreams.clone(),
             loaded_at: Utc::now(),
             known_namespaces: Vec::new(),
+            mesh: state
+                .cached_gateway_config()
+                .and_then(|config| config.mesh.clone()),
             ..Default::default()
         };
         temp_config.normalize_fields();

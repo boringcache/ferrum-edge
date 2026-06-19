@@ -2102,7 +2102,7 @@ async fn handle_tcp_connection_inner(
             passthrough_port_override,
             metrics,
             &params.backend_host,
-            params.backend_port,
+            params.backend_policy_port,
         ) {
             Ok(guard) => guard,
             Err(reason) => {
@@ -2455,6 +2455,7 @@ async fn handle_tcp_connection_inner(
                             &params,
                             &current_host,
                             current_port,
+                            current_policy_port,
                             &epoch.load_balancer,
                             mesh_outbound_enforcement,
                             stream_ctx.listen_port,
@@ -2514,6 +2515,7 @@ async fn handle_tcp_connection_inner(
                         &params,
                         &current_host,
                         current_port,
+                        current_policy_port,
                         &epoch.load_balancer,
                         mesh_outbound_enforcement,
                         stream_ctx.listen_port,
@@ -2560,17 +2562,18 @@ async fn handle_tcp_connection_inner(
         // so failed dials don't consume slots; the guard's `Drop` impl
         // releases the slot when the relay future ends.
         //
-        // The slot is rebuilt on each retry against `current_host` /
-        // `current_port` so that a load-balancer rotation to a sibling
-        // target counts against the new target's counter, not the failed
-        // one. `_backend_inflight_guard_attempt` is shadowed at every loop
-        // entry — only the latest successful guard survives past the `break`.
+        // The slot is rebuilt on each retry against `current_host` and the
+        // current target's policy port, so sibling service-port lanes that
+        // share a workload dial port keep independent caps. The actual socket
+        // still dials `current_port`. `_backend_inflight_guard_attempt` is
+        // shadowed at every loop entry — only the latest successful guard
+        // survives past the `break`.
         let current_port_override = resolve_port_override(&params, current_policy_port);
         let backend_inflight_guard_attempt = match acquire_backend_inflight_slot(
             current_port_override,
             metrics,
             &current_host,
-            current_port,
+            current_policy_port,
         ) {
             Ok(guard) => guard,
             Err(reason) => {
@@ -2594,6 +2597,7 @@ async fn handle_tcp_connection_inner(
                         &params,
                         &current_host,
                         current_port,
+                        current_policy_port,
                         &epoch.load_balancer,
                         mesh_outbound_enforcement,
                         stream_ctx.listen_port,
@@ -2679,6 +2683,7 @@ async fn handle_tcp_connection_inner(
                         &params,
                         &current_host,
                         current_port,
+                        current_policy_port,
                         &epoch.load_balancer,
                         mesh_outbound_enforcement,
                         stream_ctx.listen_port,
@@ -3051,6 +3056,7 @@ fn resolve_backend_target(
 mod backend_target_selection_tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashMap;
 
     fn proxy_with_subset(subset: Option<&str>) -> Proxy {
         serde_json::from_value(json!({
@@ -3184,6 +3190,7 @@ mod backend_target_selection_tests {
             &params,
             "allowed.local",
             5432,
+            5432,
             &snapshot,
             Some(&enforcement),
             15001,
@@ -3207,6 +3214,7 @@ mod backend_target_selection_tests {
             &params,
             "allowed.local",
             5432,
+            5432,
             &snapshot,
             Some(&enforcement),
             8080,
@@ -3219,6 +3227,50 @@ mod backend_target_selection_tests {
         assert_eq!(host, "blocked.local");
         assert_eq!(port, 5432);
         assert_eq!(policy_port, 5432);
+    }
+
+    #[test]
+    fn tcp_retry_exclusion_uses_current_policy_port() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].targets = vec![
+            UpstreamTarget {
+                host: "shared.local".into(),
+                port: 6380,
+                service_port_policy_key: Some(6379),
+                weight: 1,
+                tags: HashMap::new(),
+                locality: None,
+                path: None,
+            },
+            UpstreamTarget {
+                host: "shared.local".into(),
+                port: 6380,
+                service_port_policy_key: Some(6381),
+                weight: 1,
+                tags: HashMap::new(),
+                locality: None,
+                path: None,
+            },
+        ];
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let params = retry_params();
+
+        let next = try_next_target(&params, "shared.local", 6380, 6379, &snapshot);
+
+        assert!(
+            next.is_some(),
+            "the sibling policy lane remains selectable when excluding lane 6379"
+        );
+        let (host, port, policy_port) = next.expect("sibling lane selected");
+        assert_eq!(host, "shared.local");
+        assert_eq!(port, 6380);
+        assert_eq!(policy_port, 6381);
+
+        assert!(
+            try_next_target(&params, "shared.local", 6380, 6381, &snapshot).is_some(),
+            "lane 6379 remains selectable when excluding lane 6381"
+        );
     }
 }
 
@@ -3242,13 +3294,14 @@ fn try_next_target(
     params: &TcpConnParams,
     current_host: &str,
     current_port: u16,
+    current_policy_port: u16,
     lb_snapshot: &LoadBalancerCacheInner,
 ) -> Option<(String, u16, u16)> {
     let upstream_id = params.upstream_id.as_ref()?;
     let exclude = crate::config::types::UpstreamTarget {
         host: current_host.to_string(),
         port: current_port,
-        service_port_policy_key: None,
+        service_port_policy_key: Some(current_policy_port),
         weight: 1,
         path: None,
         tags: std::collections::HashMap::new(),
@@ -3280,15 +3333,20 @@ fn try_next_enforced_target(
     params: &TcpConnParams,
     current_host: &str,
     current_port: u16,
+    current_policy_port: u16,
     lb_snapshot: &LoadBalancerCacheInner,
     enforcement: Option<&Arc<MeshOutboundEnforcement>>,
     listen_port: u16,
     proxy_id: &str,
     client_ip: IpAddr,
 ) -> Result<Option<(String, u16, u16)>, anyhow::Error> {
-    let Some((next_host, next_port, next_policy_port)) =
-        try_next_target(params, current_host, current_port, lb_snapshot)
-    else {
+    let Some((next_host, next_port, next_policy_port)) = try_next_target(
+        params,
+        current_host,
+        current_port,
+        current_policy_port,
+        lb_snapshot,
+    ) else {
         return Ok(None);
     };
     enforce_mesh_tcp_outbound_target(

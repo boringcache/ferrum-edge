@@ -2567,7 +2567,7 @@ pub(crate) fn first_effective_mesh_transport_conflict(
     )
 }
 
-fn first_effective_mesh_transport_conflict_with_mesh(
+pub(crate) fn first_effective_mesh_transport_conflict_with_mesh(
     proxy: &Proxy,
     upstream: &Upstream,
     selected_subset: Option<&str>,
