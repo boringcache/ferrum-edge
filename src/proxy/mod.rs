@@ -7390,9 +7390,8 @@ async fn handle_websocket_request_authenticated(
     let max_ws_frame = state.max_websocket_frame_size_bytes;
     let ws_write_buf = state.websocket_write_buffer_size;
     let ws_tunnel = state.websocket_tunnel_mode;
-    let ws_tunnel_idle_disabled_safety_cap = websocket_tunnel_idle_disabled_safety_cap(
-        state.env_config.tcp_half_close_max_wait_seconds,
-    );
+    let ws_tunnel_idle_disabled_safety_cap =
+        websocket_tunnel_idle_disabled_safety_cap(state.env_config.tcp_half_close_max_wait_seconds);
     let adaptive_buf = state.adaptive_buffer.clone();
     // Track the upgraded WebSocket session in `OverloadState.active_connections`
     // so graceful drain waits for in-flight WS sessions before exiting.
