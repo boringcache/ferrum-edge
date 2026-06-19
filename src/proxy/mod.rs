@@ -67,7 +67,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -1013,93 +1013,6 @@ fn warn_if_h3_backend_tls_policy_incompatible(
             err
         );
     }
-}
-
-/// Emit a one-time startup warning when `FERRUM_WEBSOCKET_TUNNEL_MODE` is
-/// enabled and the loaded config has HTTP-family proxies that could carry
-/// WebSocket traffic.
-///
-/// Tunnel mode (raw `copy_bidirectional` after the upgrade, taken only when a
-/// proxy has no frame-level WebSocket plugins) cannot recover backend frame
-/// bytes that tokio-tungstenite coalesced into its internal read buffer while
-/// parsing the backend `101 Switching Protocols` response: `into_inner()`
-/// returns only the underlying socket and discards the codec's buffered tail.
-/// tokio-tungstenite/tungstenite expose no accessor for that residual (verified
-/// against the pinned 0.29 release and upstream `master`), so the first
-/// backend→client push frame can be silently dropped for backends that send
-/// immediately after upgrade (stock tickers, Socket.IO server broadcasts,
-/// MQTT-over-WS). The caveat is documented in code comments and `ferrum.conf`;
-/// surfacing it as a structured startup `warn!` makes the risk visible in
-/// operational logs without reading source.
-///
-/// Returns the number of HTTP-family proxies the caveat applies to (the proxies
-/// that would actually take the lossy raw-tunnel path) so the decision is
-/// unit-testable; returns `0` (and logs nothing) when tunnel mode is disabled or
-/// no such proxy is configured. The warning is intentionally per-instance, not
-/// per-session: tunnel mode is a global flag and per-session residual cannot be
-/// detected (no buffer accessor), so this is a coarse, once-at-startup signal.
-///
-/// A proxy is only exposed to the frame-loss caveat when it would take the raw
-/// `copy_bidirectional` fast path, which `run_websocket_proxy` enters only when
-/// `websocket_tunnel_mode && ws_frame_plugins.is_empty()` — i.e. the proxy has
-/// no plugin that opted into per-frame WebSocket hooks. Proxies whose effective
-/// plugin set requires WS frame hooks parse every frame and never hit the lossy
-/// path, so they are excluded from the count. The same `PluginCache` predicate
-/// that `run_websocket_proxy` uses to populate `ws_frame_plugins`
-/// (`requires_ws_frame_hooks(proxy_id)`) is the source of truth here so the
-/// reported count and the actual fast-path condition cannot drift.
-/// Count the HTTP-family proxies exposed to the tunnel-mode first-frame-loss
-/// risk: those that would take the raw-copy fast path in `run_websocket_proxy`.
-///
-/// Only HTTP-family proxies (http/https + ws/wss/grpc runtime flavors) can serve
-/// a WebSocket upgrade; stream-family proxies (tcp/udp/dtls) never reach the
-/// tunnel-mode raw-copy branch. `DispatchKind::is_http_family()` is exactly
-/// `HttpPool | HttpsPool`. Of those, exclude proxies whose plugin set requires
-/// per-frame WS hooks — they parse frames instead of taking the raw-copy fast
-/// path, so they carry no first-frame-loss exposure. Shared by the warning
-/// emitter and the one-time latch so the count and the actual fast-path
-/// condition (`requires_ws_frame_hooks`) cannot drift.
-pub(crate) fn websocket_tunnel_mode_frame_loss_affected_count(
-    config: &GatewayConfig,
-    plugin_cache: &PluginCache,
-) -> usize {
-    config
-        .proxies
-        .iter()
-        .filter(|proxy| {
-            proxy.dispatch_kind.is_http_family() && !plugin_cache.requires_ws_frame_hooks(&proxy.id)
-        })
-        .count()
-}
-
-pub(crate) fn warn_if_websocket_tunnel_mode_frame_loss_risk(
-    config: &GatewayConfig,
-    plugin_cache: &PluginCache,
-    websocket_tunnel_mode: bool,
-) -> usize {
-    if !websocket_tunnel_mode {
-        return 0;
-    }
-
-    let affected_proxy_count =
-        websocket_tunnel_mode_frame_loss_affected_count(config, plugin_cache);
-    if affected_proxy_count == 0 {
-        return 0;
-    }
-
-    warn!(
-        affected_proxy_count,
-        "FERRUM_WEBSOCKET_TUNNEL_MODE is enabled: WebSocket sessions on \
-         HTTP-family proxies without a frame-level plugin use raw TCP copy and \
-         can drop the first backend push frame if the backend coalesces it into \
-         the same TCP segment as the 101 Switching Protocols response (residual \
-         bytes buffered by tokio-tungstenite during the backend handshake are \
-         not recoverable). Disable FERRUM_WEBSOCKET_TUNNEL_MODE or attach a \
-         frame-level WebSocket plugin for any backend that pushes immediately \
-         after upgrade; request/response protocols are unaffected."
-    );
-
-    affected_proxy_count
 }
 
 /// Check if the request is a WebSocket upgrade request.
@@ -2620,15 +2533,6 @@ pub struct ProxyState {
     pub max_websocket_frame_size_bytes: usize,
     pub websocket_write_buffer_size: usize,
     pub websocket_tunnel_mode: bool,
-    /// One-time latch for the `FERRUM_WEBSOCKET_TUNNEL_MODE` first-frame-loss
-    /// startup warning (issue #1619). Set to `true` once the warning has been
-    /// evaluated against a non-empty config — by the constructor for db/file
-    /// modes, or by the first non-empty config-apply for DP mode (which starts
-    /// with an empty default config and receives its real config from the CP
-    /// later). Guards `warn_websocket_tunnel_mode_frame_loss_once` so the
-    /// periodic DB/CP poll/apply loop cannot re-emit the warning on every
-    /// reload.
-    pub tunnel_mode_frame_loss_warned: Arc<AtomicBool>,
     /// Parsed trusted proxy CIDRs for X-Forwarded-For client IP resolution.
     /// Pre-parsed from `env_config.trusted_proxies` to avoid re-parsing on every request.
     pub trusted_proxies: Arc<client_ip::TrustedProxies>,
@@ -3979,34 +3883,6 @@ impl ProxyState {
             PluginCache::with_http_client(&config, plugin_http_client.clone())
                 .map_err(|e| anyhow::anyhow!("{}", e))?,
         );
-        // Surface the WebSocket tunnel-mode first-frame-loss caveat once at
-        // startup (issue #1619). db/file modes hand the constructor the real
-        // config, so the warning evaluates here. DP starts with an empty
-        // `GatewayConfig::default()` and installs its real config later via
-        // `update_config`/`apply_incremental` — for that case the latch below
-        // stays unset so the first non-empty apply emits the warning instead.
-        // The `compare_exchange` in `warn_websocket_tunnel_mode_frame_loss_once`
-        // keeps the two paths idempotent (at most one warning per instance).
-        let config_has_proxies = !config.proxies.is_empty();
-        // Emit the one-time warning here for modes that hand the constructor the
-        // real config (db/file). `warn_if_...` returns the affected-proxy count
-        // (0 when tunnel mode is off OR no exposed proxy), and we latch the
-        // one-time warning as "already emitted" ONLY when it actually warned.
-        // If the constructor config has proxies but none are affected (all
-        // stream-family, or every HTTP proxy carries a frame-level plugin), the
-        // latch stays open so a later reload that introduces a pluginless HTTP
-        // proxy still warns exactly once. The empty-config DP path also leaves
-        // it unset, emitting on the first non-empty apply instead. The
-        // `compare_exchange` in `warn_websocket_tunnel_mode_frame_loss_once`
-        // keeps the two paths idempotent (at most one warning per instance).
-        let constructor_warned = websocket_tunnel_mode
-            && config_has_proxies
-            && warn_if_websocket_tunnel_mode_frame_loss_risk(
-                &config,
-                &plugin_cache,
-                websocket_tunnel_mode,
-            ) > 0;
-        let tunnel_mode_frame_loss_warned = Arc::new(AtomicBool::new(constructor_warned));
         let plugin_http_client_for_state = plugin_http_client.clone();
         // Build credential-indexed consumer lookup for O(1) auth
         let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
@@ -4290,7 +4166,6 @@ impl ProxyState {
             max_websocket_frame_size_bytes,
             websocket_write_buffer_size,
             websocket_tunnel_mode,
-            tunnel_mode_frame_loss_warned,
             trusted_proxies,
             websocket_conn_limit,
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
@@ -5743,53 +5618,6 @@ impl ProxyState {
         self.config.store(Arc::clone(&published.config));
     }
 
-    /// Emit the `FERRUM_WEBSOCKET_TUNNEL_MODE` first-frame-loss startup warning
-    /// at most once per instance (issue #1619).
-    ///
-    /// The constructor evaluates this for db/file modes, where the real config
-    /// is present at construction. DP starts with an empty
-    /// `GatewayConfig::default()` and installs its real config later via the CP
-    /// gRPC stream, so the constructor's empty-config evaluation never warns;
-    /// this hook lets the first non-empty config-apply emit the warning instead.
-    /// The `compare_exchange` latch makes the two paths idempotent and stops the
-    /// periodic DB/CP poll/apply loop from re-emitting on every reload.
-    ///
-    /// `config` and `plugin_cache` MUST be the freshly applied ones so the
-    /// affected-proxy count reflects the new state. Callers in the apply path
-    /// invoke this only after `mirror_request_epoch_wrappers` has published the
-    /// new plugin cache.
-    fn warn_websocket_tunnel_mode_frame_loss_once(
-        &self,
-        config: &GatewayConfig,
-        plugin_cache: &PluginCache,
-    ) {
-        if !self.websocket_tunnel_mode {
-            return;
-        }
-        // Fast path: already warned once.
-        if self.tunnel_mode_frame_loss_warned.load(Ordering::Acquire) {
-            return;
-        }
-        // Count affected proxies WITHOUT emitting, and latch only when there is
-        // at least one. Otherwise the first config that happens to expose no
-        // affected proxy (a DP whose first CP delta carried only stream proxies,
-        // or whose HTTP proxies all had frame-level plugins) would flip the latch
-        // and a later reload that introduces a pluginless HTTP proxy would skip
-        // the warning entirely.
-        if websocket_tunnel_mode_frame_loss_affected_count(config, plugin_cache) == 0 {
-            return;
-        }
-        // Latch now (winner emits) so concurrent appliers can never double-warn.
-        if self
-            .tunnel_mode_frame_loss_warned
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        warn_if_websocket_tunnel_mode_frame_loss_risk(config, plugin_cache, true);
-    }
-
     /// Update the proxy configuration. Returns `true` if changes were applied.
     pub fn update_config(&self, mut new_config: GatewayConfig) -> bool {
         use crate::config_delta::ConfigDelta;
@@ -5904,11 +5732,6 @@ impl ProxyState {
             }
 
             warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
-            // First non-empty config-apply (e.g. a DP receiving its first full
-            // CP snapshot): emit the tunnel-mode first-frame-loss warning now
-            // that the new plugin cache is published. No-op for db/file (the
-            // latch was set in the constructor) and on every later reload.
-            self.warn_websocket_tunnel_mode_frame_loss_once(&new_config, &self.plugin_cache);
             self.spawn_backend_capability_refresh();
 
             // Reconcile stream proxy listeners (TCP/UDP)
@@ -6133,10 +5956,6 @@ impl ProxyState {
         }
 
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
-        // Idempotent one-time tunnel-mode frame-loss warning. Covers a gateway
-        // that started with an empty config and first becomes non-empty via a
-        // delta-shaped reload; the latch makes it a no-op once already emitted.
-        self.warn_websocket_tunnel_mode_frame_loss_once(&new_config, &self.plugin_cache);
         self.spawn_backend_capability_refresh();
 
         // Reconcile stream proxy listeners if any proxies changed.
@@ -6520,11 +6339,6 @@ impl ProxyState {
         }
 
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
-        // Idempotent one-time tunnel-mode frame-loss warning. A DP whose first
-        // CP message is a DELTA against the empty startup config lands here; the
-        // latch keeps it to a single emission across this and the full-snapshot
-        // path, and a no-op on every subsequent incremental poll/apply.
-        self.warn_websocket_tunnel_mode_frame_loss_once(&new_config, &self.plugin_cache);
 
         // Trigger a coalesced capability refresh so added/modified HTTPS
         // backends get classified immediately instead of waiting up to the
@@ -7576,6 +7390,8 @@ async fn handle_websocket_request_authenticated(
     let max_ws_frame = state.max_websocket_frame_size_bytes;
     let ws_write_buf = state.websocket_write_buffer_size;
     let ws_tunnel = state.websocket_tunnel_mode;
+    let ws_tunnel_idle_disabled_safety_cap =
+        websocket_tunnel_idle_disabled_safety_cap(state.env_config.tcp_half_close_max_wait_seconds);
     let adaptive_buf = state.adaptive_buffer.clone();
     // Track the upgraded WebSocket session in `OverloadState.active_connections`
     // so graceful drain waits for in-flight WS sessions before exiting.
@@ -7667,6 +7483,7 @@ async fn handle_websocket_request_authenticated(
                             max_ws_frame,
                             ws_write_buf,
                             ws_tunnel,
+                            ws_tunnel_idle_disabled_safety_cap,
                             // H1/H2: RFC 6455 / RFC 8441 mandate masked
                             // client-to-server frames. The H3 caller in
                             // `src/http3/websocket.rs` passes `true` for
@@ -7691,6 +7508,7 @@ async fn handle_websocket_request_authenticated(
                             max_ws_frame,
                             ws_write_buf,
                             ws_tunnel,
+                            ws_tunnel_idle_disabled_safety_cap,
                             false,
                             ws_idle_tracker,
                             &adaptive_buf,
@@ -7719,6 +7537,8 @@ async fn handle_websocket_request_authenticated(
                     &ws_disconnect_plugins,
                     &proxy_id,
                     &session_meta,
+                    0,
+                    0,
                     Some((
                         crate::plugins::Direction::Unknown,
                         retry::ErrorClass::ConnectionClosed,
@@ -8538,10 +8358,10 @@ pub struct WsSessionMeta {
 ///
 /// Tunnel mode does not track frame counts (all bytes flow as raw TCP), so
 /// `frames_client_to_backend` / `frames_backend_to_client` are reported as
-/// `0`. Direction attribution is best-effort: drain-phase write errors to
-/// the client are attributed to `BackendToClient`; the `copy_bidirectional`
-/// error path has no per-direction attribution and reports
-/// `Direction::Unknown`. Observers that require direction/count fidelity
+/// `0`. Callers pass raw byte counts from the relay. Direction attribution is
+/// best-effort: residual-byte write errors to the client are attributed to
+/// `BackendToClient`, and the raw relay supplies the first failure's
+/// direction/side when available. Observers that require frame-count fidelity
 /// should disable tunnel mode for the proxy.
 ///
 /// The helper takes `ws_disconnect_plugins` by slice and `session_meta` by
@@ -8551,6 +8371,8 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
     ws_disconnect_plugins: &[Arc<dyn Plugin>],
     proxy_id: &str,
     session_meta: &WsSessionMeta,
+    bytes_client_to_backend: u64,
+    bytes_backend_to_client: u64,
     failure: Option<(
         crate::plugins::Direction,
         retry::ErrorClass,
@@ -8573,8 +8395,8 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
         duration_ms: disconnect_duration_ms,
         frames_client_to_backend: 0,
         frames_backend_to_client: 0,
-        bytes_client_to_backend: 0,
-        bytes_backend_to_client: 0,
+        bytes_client_to_backend,
+        bytes_backend_to_client,
         direction: failure.as_ref().map(|(d, _, _)| *d),
         io_side: failure.as_ref().and_then(|(_, _, side)| *side),
         error_class: failure.map(|(_, c, _)| c),
@@ -8608,6 +8430,19 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
 /// on a healthy TCP connection, so 100ms is generous for the happy path while
 /// still bounding teardown for pathological peers.
 const WS_CANCEL_CLOSE_TIMEOUT_MS: u64 = 100;
+
+/// Drain grace used after one WebSocket relay half exits and the other half is
+/// cancelled. Also acts as the fallback safety bound for tunnel-mode residual
+/// forwarding when both the WebSocket idle timeout and TCP half-close cap are
+/// disabled by configuration.
+pub(crate) const WS_DRAIN_GRACE: Duration = Duration::from_secs(30);
+
+fn websocket_tunnel_idle_disabled_safety_cap(tcp_half_close_max_wait_seconds: u64) -> Duration {
+    if tcp_half_close_max_wait_seconds == 0 {
+        return WS_DRAIN_GRACE;
+    }
+    Duration::from_secs(tcp_half_close_max_wait_seconds).min(WS_DRAIN_GRACE)
+}
 
 #[inline]
 fn ws_message_payload_bytes(msg: &Message) -> u64 {
@@ -8835,12 +8670,11 @@ where
 /// the same frame relay, plugin pipeline, and disconnect bookkeeping —
 /// only the bytes-on-the-wire transport differs.
 ///
-/// `websocket_tunnel_mode` is a no-op for transports that aren't underpinned by
-/// a single TCP socket (the early-return below still works generically — both
-/// frontends pass `AsyncRead + AsyncWrite + Unpin + Send`, so
-/// `copy_bidirectional_with_sizes` accepts both — but the tunnel-mode
-/// caveats about server-push frame loss only apply to the H1 path that
-/// drops down to raw TCP). H3 callers pass `websocket_tunnel_mode = false`.
+/// `websocket_tunnel_mode` takes over the backend raw stream immediately after
+/// the backend handshake boundary and replays any recovered backend bytes before
+/// starting the bidirectional relay. H3 callers pass `websocket_tunnel_mode =
+/// false` because RFC 9220 is already bridged as WebSocket frames over QUIC, not
+/// a raw TCP socket.
 ///
 /// `accept_unmasked_client_frames` controls whether the WebSocket framer
 /// accepts client-to-server frames without the RFC 6455 mask bit set.
@@ -8853,7 +8687,7 @@ where
 /// masked H3 frame) is a future-work follow-up.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_websocket_proxy<C, B>(
-    client_io: C,
+    mut client_io: C,
     backend_ws_stream: WebSocketStream<B>,
     proxy_id: &str,
     connection_id: u64,
@@ -8864,6 +8698,7 @@ pub(crate) async fn run_websocket_proxy<C, B>(
     max_websocket_frame_size_bytes: usize,
     websocket_write_buffer_size: usize,
     websocket_tunnel_mode: bool,
+    websocket_tunnel_idle_disabled_safety_cap: Duration,
     accept_unmasked_client_frames: bool,
     ws_idle_tracker: Option<Arc<WsIdleTracker>>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
@@ -8906,40 +8741,94 @@ where
             connection_id,
             "WebSocket tunnel mode: no frame plugins, using raw bidirectional copy"
         );
-        // Unwrap both WebSocket wrappers back to their raw transports for
-        // raw bidirectional copy. We intentionally do NOT drain buffered
-        // frames from `backend_ws_stream` here: `poll_next` can partially
-        // consume a fragmented frame into tungstenite's internal read buffer
-        // and return `Pending` before yielding the frame; those bytes would
-        // then be silently discarded by `into_inner()`. By skipping the
-        // drain we keep any pending bytes in the kernel TCP socket buffer
-        // where `copy_bidirectional` forwards them intact.
-        //
-        // Known limitation: if the backend's handshake response coincidentally
-        // carried WebSocket frame bytes in the same TCP segment as the 101
-        // Switching Protocols response, tungstenite may have already pulled
-        // those bytes into its internal read buffer during handshake parsing,
-        // and `into_inner()` will drop them. This residual is NOT recoverable
-        // through tokio-tungstenite's public API: `WebSocketStream::into_inner`
-        // / `get_ref` only expose the underlying socket, and the codec's
-        // `in_buffer` (`tungstenite::protocol::frame::FrameCodec`) is reachable
-        // only through the private `WebSocket.context` field — verified against
-        // the pinned 0.29 release and upstream `master`. Fully recovering it
-        // would require hand-rolling the backend HTTP/1.1 Upgrade (so the
-        // gateway owns the read buffer) or vendoring a tungstenite patch that
-        // exposes the tail; both are out of scope for this fast path. The risk
-        // is surfaced operationally by `warn_if_websocket_tunnel_mode_frame_loss_risk`,
-        // which logs a one-time startup `warn!` when tunnel mode is enabled.
-        // Deployments where the backend sends immediately after upgrade should
-        // use frame-parsing mode (set a frame-level plugin or disable
-        // `FERRUM_WEBSOCKET_TUNNEL_MODE`).
-        let backend = backend_ws_stream.into_inner();
+        // The backend handshake has completed and no WebSocket frame has been
+        // polled yet, so this is a frame-codec boundary. Recover any bytes the
+        // backend coalesced with the 101 response and forward them before the
+        // raw relay can read later backend bytes.
+        let (backend, backend_read_buffer) = backend_ws_stream.into_inner_with_read_buffer();
+        let recovered_backend_bytes_written;
+        let residual_write_timeout =
+            websocket_idle_timeout.unwrap_or(websocket_tunnel_idle_disabled_safety_cap);
+        let pre_relay_failure = {
+            use tokio::io::AsyncWriteExt;
+            let mut offset = 0usize;
+            let write_result = tokio::time::timeout(residual_write_timeout, async {
+                while offset < backend_read_buffer.len() {
+                    match client_io.write(&backend_read_buffer[offset..]).await {
+                        Ok(0) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "client accepted zero bytes while forwarding WebSocket backend residual bytes",
+                            ));
+                        }
+                        Ok(n) => {
+                            offset = offset.saturating_add(n);
+                        }
+                        Err(err) => {
+                            return Err(err);
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .await;
+            recovered_backend_bytes_written = offset as u64;
+            match write_result {
+                Ok(Ok(())) => None,
+                Ok(Err(err)) => Some((
+                    crate::plugins::Direction::BackendToClient,
+                    crate::retry::ErrorClass::ClientDisconnect,
+                    Some(tcp_proxy::StreamIoSide::Write),
+                    format!("failed forwarding WebSocket backend residual bytes to client: {err}"),
+                )),
+                Err(_) => Some((
+                    crate::plugins::Direction::BackendToClient,
+                    crate::retry::ErrorClass::ReadWriteTimeout,
+                    Some(tcp_proxy::StreamIoSide::Write),
+                    format!(
+                        "timed out after {}ms forwarding WebSocket backend residual bytes to client",
+                        residual_write_timeout.as_millis()
+                    ),
+                )),
+            }
+        };
+        if let Some((direction, class, side, message)) = pre_relay_failure {
+            debug!(
+                proxy_id = %proxy_id,
+                connection_id,
+                direction = ?direction,
+                error_class = %class,
+                io_side = ?side,
+                error = %message,
+                "WebSocket tunnel residual forward failed"
+            );
+            adaptive_buffer.record_connection(proxy_id, recovered_backend_bytes_written);
+            fire_ws_tunnel_disconnect_hooks(
+                &ws_disconnect_plugins,
+                proxy_id,
+                &session_meta,
+                0,
+                recovered_backend_bytes_written,
+                Some((direction, class, side)),
+            )
+            .await;
+            return Ok(());
+        }
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+        // With the WebSocket idle timeout disabled, pass a non-zero relay cap
+        // so the shared TCP relay uses its direction-tracking path instead of
+        // Tokio's opaque fast path. That preserves per-direction byte counters
+        // when the relay exits with an error.
+        let tunnel_half_close_cap = if websocket_idle_timeout.is_none() {
+            Some(websocket_tunnel_idle_disabled_safety_cap)
+        } else {
+            None
+        };
         let copy_result = tcp_proxy::bidirectional_copy_for_relay(
             client_io,
             backend,
             websocket_idle_timeout,
-            None,
+            tunnel_half_close_cap,
             None,
             None,
             buf_size,
@@ -8947,9 +8836,11 @@ where
         .await;
         adaptive_buffer.record_connection(
             proxy_id,
-            copy_result
-                .bytes_client_to_backend
-                .saturating_add(copy_result.bytes_backend_to_client),
+            copy_result.bytes_client_to_backend.saturating_add(
+                copy_result
+                    .bytes_backend_to_client
+                    .saturating_add(recovered_backend_bytes_written),
+            ),
         );
         let tunnel_failure =
             copy_result
@@ -8974,6 +8865,10 @@ where
             &ws_disconnect_plugins,
             proxy_id,
             &session_meta,
+            copy_result.bytes_client_to_backend,
+            copy_result
+                .bytes_backend_to_client
+                .saturating_add(recovered_backend_bytes_written),
             tunnel_failure,
         )
         .await;
@@ -9425,7 +9320,6 @@ where
     // then wait on the remaining half with a bounded drain grace. If the
     // grace expires the remaining future is dropped — in-flight plugin calls
     // are cancelled and all captured sockets are released.
-    const WS_DRAIN_GRACE: Duration = Duration::from_secs(30);
     let mut c2b = Box::pin(client_to_backend);
     let mut b2c = Box::pin(backend_to_client);
     let client_done = tokio::select! {
