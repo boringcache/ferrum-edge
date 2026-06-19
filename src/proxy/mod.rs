@@ -5665,8 +5665,7 @@ impl ProxyState {
         ) || !Self::route_dispatch_override_options_eq(
             a.dispatch_port_override_fallback.as_ref(),
             b.dispatch_port_override_fallback.as_ref(),
-        )
-        {
+        ) {
             return false;
         }
 
@@ -23980,10 +23979,8 @@ mod tests {
                 .port_overrides
                 .insert(8080, upstream_http_override(2_000));
         };
-        let (delta, old_config, new_config) = route_delta_projected_upstream_change_delta(
-            apply_equivalent_dr,
-            apply_equivalent_dr,
-        );
+        let (delta, old_config, new_config) =
+            route_delta_projected_upstream_change_delta(apply_equivalent_dr, apply_equivalent_dr);
 
         assert!(!ProxyState::delta_routes_changed(
             &delta,
