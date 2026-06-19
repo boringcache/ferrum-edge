@@ -2550,23 +2550,6 @@ fn upstream_required_mesh_transports(
 /// caps retry for that target's port, and only then does an effective retry
 /// disable HBONE/SVID-mTLS dispatch. Because the LB may select *any* mesh target,
 /// the conflict is reported when *any* selectable mesh target survives its cap.
-pub(crate) fn first_effective_mesh_transport_conflict(
-    proxy: &Proxy,
-    upstream: &Upstream,
-    selected_subset: Option<&str>,
-    retry: Option<&RetryConfig>,
-    allowed_methods: Option<&[String]>,
-) -> Option<MeshTransportConflict> {
-    first_effective_mesh_transport_conflict_with_mesh(
-        proxy,
-        upstream,
-        selected_subset,
-        retry,
-        allowed_methods,
-        None,
-    )
-}
-
 pub(crate) fn first_effective_mesh_transport_conflict_with_mesh(
     proxy: &Proxy,
     upstream: &Upstream,
