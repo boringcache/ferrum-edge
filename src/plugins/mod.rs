@@ -15,10 +15,9 @@
 //! The `PluginCache` pre-filters plugins per protocol at config reload time
 //! so the hot path does zero filtering.
 //!
-//! Security plugins (auth, ACL, IP restriction, WAF, and mesh policy gates)
-//! that fail config validation cause the gateway to refuse startup — they
-//! never silently degrade.
-//! Non-security plugins that fail validation are skipped with a warning.
+//! Enabled plugin configs that fail validation cause startup or config reload
+//! publication to fail; the gateway keeps the last known-good plugin cache on
+//! reload. Disabled plugin configs are not instantiated.
 
 pub mod a2a_gateway;
 pub mod access_control;
@@ -3270,6 +3269,7 @@ pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> 
 ///
 /// Validation failures for these plugins are fatal at startup — the gateway
 /// refuses to start rather than serving traffic without the intended security.
+#[allow(dead_code)]
 pub fn is_security_plugin(name: &str) -> bool {
     matches!(
         name,
