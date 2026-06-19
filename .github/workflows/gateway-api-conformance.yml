@@ -125,11 +125,19 @@ jobs:
           # Exercise the Gateway API controller only; do not install the
           # injector webhook because it can intercept pod admission before its
           # own TLS secret/endpoints exist in this single-node conformance lab.
+          admin_secret="$(openssl rand -hex 32)"
+          grpc_secret="$(openssl rand -hex 32)"
+          echo "::add-mask::${admin_secret}"
+          echo "::add-mask::${grpc_secret}"
+          kubectl -n ferrum create secret generic ferrum-mesh-gateway-api-credentials \
+            --from-literal=admin-jwt-secret="${admin_secret}" \
+            --from-literal=cp-dp-grpc-jwt-secret="${grpc_secret}"
           helm upgrade --install ferrum ./charts/ferrum-mesh \
             --namespace ferrum \
             --set image.repository=ferrum-edge \
             --set image.tag=gateway-api-conformance \
             --set image.pullPolicy=IfNotPresent \
+            --set controlPlane.enabled=true \
             --set injector.enabled=false \
             --set ca.enabled=false \
             --set controlPlane.rbac.create=true \
@@ -137,10 +145,12 @@ jobs:
             --set controlPlane.rbac.istio=false \
             --set controlPlane.rbac.meshConfig=false \
             --set controlPlane.rbac.podDiscovery=true \
-            --set controlPlane.env.FERRUM_DB_TYPE=sqlite \
-            --set-string 'controlPlane.env.FERRUM_DB_URL=sqlite:////tmp/ferrum-gateway-api-conformance.db?mode=rwc' \
-            --set controlPlane.env.FERRUM_ADMIN_JWT_SECRET=ferrum-edge-gateway-api-conformance-admin-secret \
-            --set controlPlane.env.FERRUM_CP_DP_GRPC_JWT_SECRET=ferrum-edge-gateway-api-conformance-grpc-secret \
+            --set controlPlane.database.type=sqlite \
+            --set-string 'controlPlane.database.url=sqlite:////tmp/ferrum-gateway-api-conformance.db?mode=rwc' \
+            --set controlPlane.credentials.adminJwtSecret.existingSecret.name=ferrum-mesh-gateway-api-credentials \
+            --set controlPlane.credentials.adminJwtSecret.existingSecret.key=admin-jwt-secret \
+            --set controlPlane.credentials.cpDpGrpcJwtSecret.existingSecret.name=ferrum-mesh-gateway-api-credentials \
+            --set controlPlane.credentials.cpDpGrpcJwtSecret.existingSecret.key=cp-dp-grpc-jwt-secret \
             --set-string 'controlPlane.env.FERRUM_CP_NAMESPACES=*' \
             --set controlPlane.env.FERRUM_LOG_LEVEL=info \
             --set controlPlane.env.FERRUM_K8S_CONTROLLER_ENABLED=true \

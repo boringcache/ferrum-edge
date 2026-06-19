@@ -917,11 +917,19 @@ jobs:
           # Exercise the Gateway API controller only; do not install the
           # injector webhook because it can intercept pod admission before its
           # own TLS secret/endpoints exist in this single-node conformance lab.
+          admin_secret="$(openssl rand -hex 32)"
+          grpc_secret="$(openssl rand -hex 32)"
+          echo "::add-mask::${admin_secret}"
+          echo "::add-mask::${grpc_secret}"
+          kubectl -n ferrum create secret generic ferrum-mesh-gateway-api-credentials \
+            --from-literal=admin-jwt-secret="${admin_secret}" \
+            --from-literal=cp-dp-grpc-jwt-secret="${grpc_secret}"
           helm upgrade --install ferrum ./charts/ferrum-mesh \
             --namespace ferrum \
             --set image.repository=ferrum-edge \
             --set image.tag=gateway-api-conformance \
             --set image.pullPolicy=IfNotPresent \
+            --set controlPlane.enabled=true \
             --set injector.enabled=false \
             --set ca.enabled=false \
             --set controlPlane.rbac.create=true \
@@ -929,10 +937,12 @@ jobs:
             --set controlPlane.rbac.istio=false \
             --set controlPlane.rbac.meshConfig=false \
             --set controlPlane.rbac.podDiscovery=true \
-            --set controlPlane.env.FERRUM_DB_TYPE=sqlite \
-            --set-string 'controlPlane.env.FERRUM_DB_URL=sqlite:////tmp/ferrum-gateway-api-conformance.db?mode=rwc' \
-            --set controlPlane.env.FERRUM_ADMIN_JWT_SECRET=ferrum-edge-gateway-api-conformance-admin-secret \
-            --set controlPlane.env.FERRUM_CP_DP_GRPC_JWT_SECRET=ferrum-edge-gateway-api-conformance-grpc-secret \
+            --set controlPlane.database.type=sqlite \
+            --set-string 'controlPlane.database.url=sqlite:////tmp/ferrum-gateway-api-conformance.db?mode=rwc' \
+            --set controlPlane.credentials.adminJwtSecret.existingSecret.name=ferrum-mesh-gateway-api-credentials \
+            --set controlPlane.credentials.adminJwtSecret.existingSecret.key=admin-jwt-secret \
+            --set controlPlane.credentials.cpDpGrpcJwtSecret.existingSecret.name=ferrum-mesh-gateway-api-credentials \
+            --set controlPlane.credentials.cpDpGrpcJwtSecret.existingSecret.key=cp-dp-grpc-jwt-secret \
             --set-string 'controlPlane.env.FERRUM_CP_NAMESPACES=*' \
             --set controlPlane.env.FERRUM_LOG_LEVEL=info \
             --set controlPlane.env.FERRUM_K8S_CONTROLLER_ENABLED=true \
@@ -1076,6 +1086,230 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Skipped: this PR does not touch Gateway API, mesh controller, chart, image, proto, or CI workflow surfaces." >> "$GITHUB_STEP_SUMMARY"
 
+  helm-chart:
+    name: Helm Chart
+    if: github.event_name == 'pull_request'
+    needs: build-gateway-binary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      FERRUM_IMAGE: ferrum-edge:helm-chart-ci
+      KIND_VERSION: v0.27.0
+      KUBECTL_VERSION: v1.32.3
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Kubernetes tools
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          sudo chmod +x /usr/local/bin/kind
+          sudo curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          sudo chmod +x /usr/local/bin/kubectl
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Helm static validation
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ferrum-helm-results"
+          helm lint ./charts/ferrum-mesh
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            > "$RUNNER_TEMP/ferrum-helm-results/default-rendered.yaml"
+          if grep -q 'ferrum-mesh-control-plane' "$RUNNER_TEMP/ferrum-helm-results/default-rendered.yaml"; then
+            echo "::error title=Default chart rendered a control plane::controlPlane.enabled must default to false until required values are supplied"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --set controlPlane.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/missing-config-rendered.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/missing-config.err"; then
+            echo "::error title=Missing CP settings rendered successfully::mandatory CP configuration must fail during Helm validation"
+            exit 1
+          fi
+          grep -F 'controlPlane.database.type is required' "$RUNNER_TEMP/ferrum-helm-results/missing-config.err"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/development-rendered.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/production-existing-secrets-values.yaml \
+            > "$RUNNER_TEMP/ferrum-helm-results/production-existing-secrets-rendered.yaml"
+          for name in FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET; do
+            if ! grep -A5 "name: ${name}" "$RUNNER_TEMP/ferrum-helm-results/production-existing-secrets-rendered.yaml" | grep -q 'valueFrom:'; then
+              echo "::error title=Secret env did not render with valueFrom::${name} must use a Secret reference in the production-style values file"
+              exit 1
+            fi
+          done
+
+      - name: Download prebuilt gateway binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ferrum-edge-debug-${{ runner.os }}-${{ runner.arch }}
+          path: target/debug
+
+      - name: Package Ferrum image
+        uses: ./.github/actions/package-ferrum-runtime-image
+        with:
+          binary-path: target/debug/ferrum-edge
+          image: ${{ env.FERRUM_IMAGE }}
+
+      - name: Create kind cluster
+        run: |
+          set -euo pipefail
+          chmod +x target/debug/ferrum-edge
+          kind create cluster --name ferrum-helm --wait 120s
+          kind load docker-image "$FERRUM_IMAGE" --name ferrum-helm
+
+      - name: Default install renders no unusable control plane
+        run: |
+          set -euo pipefail
+          kubectl create namespace ferrum-default
+          helm install ferrum-default ./charts/ferrum-mesh -n ferrum-default
+          kubectl -n ferrum-default get all -o wide > "$RUNNER_TEMP/ferrum-helm-results/default-install-resources.txt"
+          if kubectl -n ferrum-default get deployment ferrum-mesh-control-plane >/dev/null 2>&1; then
+            echo "::error title=Default install created a control plane::default install must not create an unusable CP"
+            exit 1
+          fi
+          if [ -n "$(kubectl -n ferrum-default get pods -o name)" ]; then
+            echo "::error title=Default install created runtime pods::default install should be scaffolding-only"
+            kubectl -n ferrum-default get pods -o wide
+            exit 1
+          fi
+
+      - name: Development values become Ready
+        run: |
+          set -euo pipefail
+          kubectl create namespace ferrum-dev
+          admin_secret="$(openssl rand -hex 32)"
+          grpc_secret="$(openssl rand -hex 32)"
+          echo "::add-mask::${admin_secret}"
+          echo "::add-mask::${grpc_secret}"
+          kubectl -n ferrum-dev create secret generic ferrum-mesh-dev-credentials \
+            --from-literal=admin-jwt-secret="${admin_secret}" \
+            --from-literal=cp-dp-grpc-jwt-secret="${grpc_secret}"
+          helm install ferrum-dev ./charts/ferrum-mesh -n ferrum-dev \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set image.repository=ferrum-edge \
+            --set image.tag=helm-chart-ci \
+            --set image.pullPolicy=IfNotPresent
+          kubectl -n ferrum-dev rollout status deployment/ferrum-mesh-control-plane --timeout=180s
+          kubectl -n ferrum-dev get pods -o wide > "$RUNNER_TEMP/ferrum-helm-results/development-pods.txt"
+          kubectl -n ferrum-dev describe deployment/ferrum-mesh-control-plane > "$RUNNER_TEMP/ferrum-helm-results/development-control-plane-deployment.txt"
+          kubectl -n ferrum-dev get events --sort-by=.lastTimestamp > "$RUNNER_TEMP/ferrum-helm-results/development-events.txt"
+          kubectl -n ferrum-dev logs deployment/ferrum-mesh-control-plane --all-containers --tail=1000 > "$RUNNER_TEMP/ferrum-helm-results/development-control-plane.log"
+          if grep -Fq "${admin_secret}" "$RUNNER_TEMP/ferrum-helm-results/development-control-plane.log" ||
+             grep -Fq "${grpc_secret}" "$RUNNER_TEMP/ferrum-helm-results/development-control-plane.log"; then
+            rm -f "$RUNNER_TEMP/ferrum-helm-results/development-control-plane.log"
+            echo "::error title=Secret leaked to logs::development control-plane logs contained a JWT secret"
+            exit 1
+          fi
+
+      - name: Existing Secret production-style values become Ready
+        run: |
+          set -euo pipefail
+          kubectl create namespace ferrum-prod
+          pg_password="$(openssl rand -hex 24)"
+          admin_secret="$(openssl rand -hex 32)"
+          grpc_secret="$(openssl rand -hex 32)"
+          echo "::add-mask::${pg_password}"
+          echo "::add-mask::${admin_secret}"
+          echo "::add-mask::${grpc_secret}"
+          kubectl -n ferrum-prod create secret generic ferrum-postgres \
+            --from-literal=password="${pg_password}"
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ferrum-postgres
+            namespace: ferrum-prod
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: ferrum-postgres
+            template:
+              metadata:
+                labels:
+                  app: ferrum-postgres
+              spec:
+                containers:
+                  - name: postgres
+                    image: postgres:16-alpine
+                    ports:
+                      - containerPort: 5432
+                    env:
+                      - name: POSTGRES_DB
+                        value: ferrum
+                      - name: POSTGRES_USER
+                        value: ferrum
+                      - name: POSTGRES_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: ferrum-postgres
+                            key: password
+                    readinessProbe:
+                      exec:
+                        command: ["pg_isready", "-U", "ferrum", "-d", "ferrum"]
+                      periodSeconds: 2
+                      timeoutSeconds: 2
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ferrum-postgres
+            namespace: ferrum-prod
+          spec:
+            selector:
+              app: ferrum-postgres
+            ports:
+              - name: postgres
+                port: 5432
+                targetPort: 5432
+          YAML
+          kubectl -n ferrum-prod rollout status deployment/ferrum-postgres --timeout=180s
+          db_url="postgres://ferrum:${pg_password}@ferrum-postgres.ferrum-prod.svc.cluster.local:5432/ferrum"
+          echo "::add-mask::${db_url}"
+          kubectl -n ferrum-prod create secret generic ferrum-mesh-production-db \
+            --from-literal=url="${db_url}"
+          kubectl -n ferrum-prod create secret generic ferrum-mesh-production-credentials \
+            --from-literal=admin-jwt-secret="${admin_secret}" \
+            --from-literal=cp-dp-grpc-jwt-secret="${grpc_secret}"
+          helm install ferrum-prod ./charts/ferrum-mesh -n ferrum-prod \
+            -f ./charts/ferrum-mesh/examples/production-existing-secrets-values.yaml \
+            --set image.repository=ferrum-edge \
+            --set image.tag=helm-chart-ci \
+            --set image.pullPolicy=IfNotPresent
+          kubectl -n ferrum-prod rollout status deployment/ferrum-mesh-control-plane --timeout=180s
+          kubectl -n ferrum-prod get pods -o wide > "$RUNNER_TEMP/ferrum-helm-results/production-pods.txt"
+          kubectl -n ferrum-prod describe deployment/ferrum-mesh-control-plane > "$RUNNER_TEMP/ferrum-helm-results/production-control-plane-deployment.txt"
+          kubectl -n ferrum-prod get events --sort-by=.lastTimestamp > "$RUNNER_TEMP/ferrum-helm-results/production-events.txt"
+          kubectl -n ferrum-prod logs deployment/ferrum-mesh-control-plane --all-containers --tail=1000 > "$RUNNER_TEMP/ferrum-helm-results/production-control-plane.log"
+          for secret in "$pg_password" "$db_url" "$admin_secret" "$grpc_secret"; do
+            if grep -Fq "$secret" "$RUNNER_TEMP/ferrum-helm-results/production-control-plane.log"; then
+              rm -f "$RUNNER_TEMP/ferrum-helm-results/production-control-plane.log"
+              echo "::error title=Secret leaked to logs::production-style control-plane logs contained a secret value"
+              exit 1
+            fi
+          done
+
+      - name: Collect Helm chart diagnostics
+        if: always()
+        run: |
+          set +e
+          mkdir -p "$RUNNER_TEMP/ferrum-helm-results"
+          for ns in ferrum-default ferrum-dev ferrum-prod; do
+            kubectl -n "$ns" get all -o wide > "$RUNNER_TEMP/ferrum-helm-results/${ns}-all.txt" 2>&1
+            kubectl -n "$ns" get events --sort-by=.lastTimestamp > "$RUNNER_TEMP/ferrum-helm-results/${ns}-events.txt" 2>&1
+            kubectl -n "$ns" get pods -o jsonpath='{range .items[*]}{.metadata.name}{" phase="}{.status.phase}{" ready="}{range .status.containerStatuses[*]}{.ready}{" restartCount="}{.restartCount}{" exitCode="}{.lastState.terminated.exitCode}{" reason="}{.lastState.terminated.reason}{";"}{end}{"\n"}{end}' \
+              > "$RUNNER_TEMP/ferrum-helm-results/${ns}-pod-status.txt" 2>&1
+          done
+
+      - name: Upload Helm chart diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ferrum-mesh-helm-chart
+          path: ${{ runner.temp }}/ferrum-helm-results
+          retention-days: 7
+
   test:
     name: Tests
     if: always() && github.event_name == 'pull_request'
@@ -1091,6 +1325,7 @@ jobs:
       - build-functional-tests-archive
       - test-functional
       - gateway-api-conformance
+      - helm-chart
     runs-on: ubuntu-latest
     steps:
       - name: Summarize test results
@@ -1110,6 +1345,7 @@ jobs:
           echo "| Functional archive build | ${{ needs.build-functional-tests-archive.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Functional shards | ${{ needs.test-functional.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Gateway API conformance | ${{ needs.gateway-api-conformance.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Helm chart | ${{ needs.helm-chart.result }} |" >> $GITHUB_STEP_SUMMARY
 
           if [ "${{ needs.test-unit.result }}" != "success" ] ||
              [ "${{ needs.test-lib.result }}" != "success" ] ||
@@ -1121,7 +1357,8 @@ jobs:
              [ "${{ needs.build-gateway-binary.result }}" != "success" ] ||
              [ "${{ needs.build-functional-tests-archive.result }}" != "success" ] ||
              [ "${{ needs.test-functional.result }}" != "success" ] ||
-             [ "${{ needs.gateway-api-conformance.result }}" != "success" ]; then
+             [ "${{ needs.gateway-api-conformance.result }}" != "success" ] ||
+             [ "${{ needs.helm-chart.result }}" != "success" ]; then
             exit 1
           fi
 
