@@ -5648,6 +5648,7 @@ impl ProxyState {
                     .get(new_proxy.id.as_str())
                     .is_some_and(|old_proxy| !Self::proxy_content_eq(old_proxy, new_proxy))
             })
+            || Self::projected_udp_relay_dispatch_content_changed(old_config, new_config)
     }
 
     /// Timestamp-neutral proxy content comparison for route-table reuse.
@@ -5659,6 +5660,10 @@ impl ProxyState {
     /// Load-balancer-only values are consumed by the LB cache and must not force
     /// a route-table rebuild when the effective override key set is unchanged.
     fn proxy_content_eq(a: &Proxy, b: &Proxy) -> bool {
+        if a.resolved_tls != b.resolved_tls {
+            return false;
+        }
+
         if !Self::route_dispatch_overrides_eq(
             &a.dispatch_port_overrides,
             &b.dispatch_port_overrides,
@@ -5682,6 +5687,78 @@ impl ProxyState {
             (Some(a_value), Some(b_value)) => a_value == b_value,
             _ => false,
         }
+    }
+
+    fn projected_udp_relay_dispatch_content_changed(
+        old_config: &GatewayConfig,
+        new_config: &GatewayConfig,
+    ) -> bool {
+        let old_projection = Self::mesh_udp_relay_dispatch_overrides(old_config);
+        let new_projection = Self::mesh_udp_relay_dispatch_overrides(new_config);
+        !Self::mesh_udp_relay_dispatch_overrides_eq(&old_projection, &new_projection)
+    }
+
+    fn mesh_udp_relay_dispatch_overrides(
+        config: &GatewayConfig,
+    ) -> HashMap<String, Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>> {
+        let Some(mesh) = config.mesh.as_deref() else {
+            return HashMap::new();
+        };
+        let upstream_ids: std::collections::HashSet<&str> =
+            config.upstreams.iter().map(|u| u.id.as_str()).collect();
+        let mut projection = HashMap::new();
+
+        for service in &mesh.services {
+            if service.cluster_ips.is_empty() {
+                continue;
+            }
+            for sp in crate::modes::mesh::service_udp_stream_ports(service) {
+                let upstream_id = crate::modes::mesh::mesh_outbound_udp_upstream_id(
+                    &service.namespace,
+                    &service.name,
+                    sp.port,
+                );
+                if upstream_ids.contains(upstream_id.as_str()) {
+                    projection.insert(
+                        upstream_id.clone(),
+                        Self::projected_dispatch_overrides_for_upstream(config, &upstream_id),
+                    );
+                }
+            }
+        }
+
+        projection
+    }
+
+    fn projected_dispatch_overrides_for_upstream(
+        config: &GatewayConfig,
+        upstream_id: &str,
+    ) -> Option<HashMap<u16, crate::config::types::ResolvedPortOverride>> {
+        let upstream = config.upstreams.iter().find(|u| u.id == upstream_id)?;
+        if upstream.port_overrides.is_empty() {
+            return None;
+        }
+        let resolved = upstream
+            .port_overrides
+            .iter()
+            .filter_map(|(port, override_config)| {
+                crate::config::types::ResolvedPortOverride::from_upstream_override(override_config)
+                    .map(|resolved| (*port, resolved))
+            })
+            .collect::<HashMap<_, _>>();
+        (!resolved.is_empty()).then_some(resolved)
+    }
+
+    fn mesh_udp_relay_dispatch_overrides_eq(
+        a: &HashMap<String, Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>>,
+        b: &HashMap<String, Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>>,
+    ) -> bool {
+        a.len() == b.len()
+            && a.iter().all(|(upstream_id, a_overrides)| {
+                b.get(upstream_id).is_some_and(|b_overrides| {
+                    Self::route_dispatch_overrides_eq(a_overrides, b_overrides)
+                })
+            })
     }
 
     fn route_dispatch_overrides_eq(
@@ -23739,6 +23816,8 @@ mod tests {
         let proxy = http_route_proxy_with_upstream();
         let mut old_config = route_delta_config_with_upstream(proxy.clone(), old_upstream);
         let mut new_config = route_delta_config_with_upstream(proxy, new_upstream);
+        old_config.resolve_upstream_tls();
+        new_config.resolve_upstream_tls();
         old_config.resolve_dispatch_port_overrides();
         new_config.resolve_dispatch_port_overrides();
 
@@ -23746,6 +23825,69 @@ mod tests {
         assert!(
             delta.modified_proxies.is_empty(),
             "DR-only edits must not rely on a Proxy resource modification"
+        );
+        assert!(
+            !delta.modified_upstreams.is_empty(),
+            "test setup must simulate the upstream timestamp delta from the DR edit"
+        );
+        (delta, old_config, new_config)
+    }
+
+    fn route_delta_projected_udp_relay_change_delta(
+        mutate_old_upstream: impl FnOnce(&mut Upstream),
+        mutate_new_upstream: impl FnOnce(&mut Upstream),
+    ) -> (
+        crate::config_delta::ConfigDelta,
+        GatewayConfig,
+        GatewayConfig,
+    ) {
+        use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+        let upstream_id = crate::modes::mesh::mesh_outbound_udp_upstream_id("default", "dns", 53);
+        let mut old_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.9", 53)]);
+        old_upstream.name = Some("dns.default.svc.cluster.local".to_string());
+        old_upstream.created_at = t0;
+        old_upstream.updated_at = t0;
+        mutate_old_upstream(&mut old_upstream);
+        let mut new_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.9", 53)]);
+        new_upstream.name = Some("dns.default.svc.cluster.local".to_string());
+        new_upstream.created_at = t1;
+        new_upstream.updated_at = t1;
+        mutate_new_upstream(&mut new_upstream);
+
+        let mesh = MeshConfig {
+            services: vec![MeshService {
+                name: "dns".to_string(),
+                namespace: "default".to_string(),
+                ports: vec![ServicePort {
+                    port: 53,
+                    protocol: AppProtocol::Udp,
+                    name: Some("dns".to_string()),
+                    target_port: None,
+                }],
+                workloads: Vec::new(),
+                protocol_overrides: HashMap::new(),
+                cluster_ips: vec!["10.96.0.10".to_string()],
+            }],
+            ..MeshConfig::default()
+        };
+        let old_config = GatewayConfig {
+            upstreams: vec![old_upstream],
+            mesh: Some(Box::new(mesh.clone())),
+            ..GatewayConfig::default()
+        };
+        let new_config = GatewayConfig {
+            upstreams: vec![new_upstream],
+            mesh: Some(Box::new(mesh)),
+            ..GatewayConfig::default()
+        };
+
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
+        assert!(
+            delta.modified_proxies.is_empty(),
+            "UDP relay projection changes must not rely on a Proxy resource modification"
         );
         assert!(
             !delta.modified_upstreams.is_empty(),
@@ -23899,6 +24041,40 @@ mod tests {
     }
 
     #[test]
+    fn delta_routes_changed_detects_projected_tls_change_without_proxy_delta() {
+        let (delta, old_config, new_config) = route_delta_projected_upstream_change_delta(
+            |upstream| {
+                upstream.backend_tls_sni = Some("old.backend.mesh.internal".to_string());
+            },
+            |upstream| {
+                upstream.backend_tls_sni = Some("new.backend.mesh.internal".to_string());
+            },
+        );
+
+        assert!(ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &new_config
+        ));
+
+        let old_route = crate::router_cache::RouterCache::new(&old_config, 32)
+            .find_proxy(None, "/http")
+            .expect("old route");
+        let new_route = crate::router_cache::RouterCache::new(&new_config, 32)
+            .find_proxy(None, "/http")
+            .expect("new route");
+        assert_eq!(
+            old_route.proxy.resolved_tls.sni.as_deref(),
+            Some("old.backend.mesh.internal")
+        );
+        assert_eq!(
+            new_route.proxy.resolved_tls.sni.as_deref(),
+            Some("new.backend.mesh.internal"),
+            "rebuilding the route table swaps in the effective DR-derived TLS policy"
+        );
+    }
+
+    #[test]
     fn delta_routes_changed_detects_projected_per_port_override_change_without_proxy_delta() {
         let (delta, old_config, new_config) = route_delta_projected_upstream_change_delta(
             |upstream| {
@@ -24017,6 +24193,58 @@ mod tests {
             &old_config,
             &new_config
         ));
+    }
+
+    #[test]
+    fn delta_routes_changed_detects_projected_udp_relay_override_change_without_proxy_delta() {
+        let (delta, old_config, new_config) = route_delta_projected_udp_relay_change_delta(
+            |upstream| {
+                upstream.port_overrides.insert(
+                    53,
+                    crate::config::types::UpstreamPortOverride {
+                        connect_timeout_ms: Some(1_000),
+                        ..Default::default()
+                    },
+                );
+            },
+            |upstream| {
+                upstream.port_overrides.insert(
+                    53,
+                    crate::config::types::UpstreamPortOverride {
+                        connect_timeout_ms: Some(2_000),
+                        ..Default::default()
+                    },
+                );
+            },
+        );
+
+        assert!(ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &new_config
+        ));
+
+        let old_snapshot =
+            crate::router_cache::RouterCache::build_route_table_snapshot(&old_config);
+        let new_snapshot =
+            crate::router_cache::RouterCache::build_route_table_snapshot(&new_config);
+        let relay_timeout = |table: &crate::router_cache::HostRouteTable| match table
+            .mesh_udp_egress_decision("10.96.0.10:53".parse().expect("addr"))
+        {
+            Some(crate::router_cache::MeshTcpEgressDecision::Relay(entry)) => entry
+                .relay_proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.get(&53))
+                .and_then(|override_config| override_config.connect_timeout_ms),
+            _ => None,
+        };
+        assert_eq!(relay_timeout(&old_snapshot), Some(1_000));
+        assert_eq!(
+            relay_timeout(&new_snapshot),
+            Some(2_000),
+            "rebuilding the route table swaps in the synthesized UDP relay policy"
+        );
     }
 
     #[test]
