@@ -87,25 +87,33 @@ invalid CP settings so an unusable control-plane pod is not rendered.
 {{- end }}
 {{- end -}}
 
+{{- define "ferrum-mesh.uriComponentEncode" -}}
+{{- . | toString | urlquery | replace "+" "%20" -}}
+{{- end -}}
+
 {{- define "ferrum-mesh.structuredDbUrl" -}}
 {{- $db := . -}}
 {{- $port := "" -}}
 {{- if $db.port -}}{{- $port = printf ":%v" $db.port -}}{{- end -}}
+{{- $host := $db.host -}}
+{{- if and (contains ":" $host) (not (hasPrefix "[" $host)) -}}
+{{- $host = printf "[%s]" $host -}}
+{{- end -}}
 {{- $auth := "" -}}
 {{- if and $db.username $db.password -}}
-{{- $auth = printf "%s:%s@" ($db.username | urlquery) ($db.password | urlquery) -}}
+{{- $auth = printf "%s:%s@" (include "ferrum-mesh.uriComponentEncode" $db.username) (include "ferrum-mesh.uriComponentEncode" $db.password) -}}
 {{- end -}}
 {{- $path := "" -}}
-{{- if $db.name -}}{{- $path = printf "/%s" $db.name -}}{{- end -}}
+{{- if $db.name -}}{{- $path = printf "/%s" (include "ferrum-mesh.uriComponentEncode" $db.name) -}}{{- end -}}
 {{- $query := "" -}}
 {{- if $db.params -}}
 {{- $pairs := list -}}
 {{- range $key := keys $db.params | sortAlpha -}}
-{{- $pairs = append $pairs (printf "%s=%s" ($key | urlquery) ((get $db.params $key) | toString | urlquery)) -}}
+{{- $pairs = append $pairs (printf "%s=%s" (include "ferrum-mesh.uriComponentEncode" $key) (include "ferrum-mesh.uriComponentEncode" (get $db.params $key))) -}}
 {{- end -}}
 {{- if $pairs -}}{{- $query = printf "?%s" (join "&" $pairs) -}}{{- end -}}
 {{- end -}}
-{{- printf "%s://%s%s%s%s%s" $db.type $auth $db.host $port $path $query -}}
+{{- printf "%s://%s%s%s%s%s" $db.type $auth $host $port $path $query -}}
 {{- end -}}
 
 {{- define "ferrum-mesh.renderDbUrlEnv" -}}

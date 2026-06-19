@@ -1141,17 +1141,17 @@ jobs:
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             --set controlPlane.enabled=true \
             --set controlPlane.database.type=postgres \
-            --set controlPlane.database.host=postgres.ferrum.svc \
+            --set-string 'controlPlane.database.host=2001:db8::1' \
             --set controlPlane.database.port=5432 \
-            --set controlPlane.database.name=ferrum \
+            --set-string 'controlPlane.database.name=ferrum/main db' \
             --set-string 'controlPlane.database.username=ferrum/user' \
-            --set-string 'controlPlane.database.password=p/a?s#word' \
+            --set-string 'controlPlane.database.password=p/a?s# word' \
             --set controlPlane.credentials.adminJwtSecret.existingSecret.name=ferrum-mesh-production-credentials \
             --set controlPlane.credentials.adminJwtSecret.existingSecret.key=admin-jwt-secret \
             --set controlPlane.credentials.cpDpGrpcJwtSecret.existingSecret.name=ferrum-mesh-production-credentials \
             --set controlPlane.credentials.cpDpGrpcJwtSecret.existingSecret.key=cp-dp-grpc-jwt-secret \
             > "$RUNNER_TEMP/ferrum-helm-results/structured-direct-credentials-rendered.yaml"
-          grep -F 'postgres://ferrum%2Fuser:p%2Fa%3Fs%23word@postgres.ferrum.svc:5432/ferrum' "$RUNNER_TEMP/ferrum-helm-results/structured-direct-credentials-rendered.yaml"
+          grep -F 'postgres://ferrum%2Fuser:p%2Fa%3Fs%23%20word@[2001:db8::1]:5432/ferrum%2Fmain%20db' "$RUNNER_TEMP/ferrum-helm-results/structured-direct-credentials-rendered.yaml"
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             -f ./charts/ferrum-mesh/examples/development-values.yaml \
             > "$RUNNER_TEMP/ferrum-helm-results/development-rendered.yaml"
