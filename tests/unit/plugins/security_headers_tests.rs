@@ -76,6 +76,29 @@ fn security_headers_is_a_security_plugin() {
     assert!(is_security_plugin("security_headers"));
 }
 
+#[test]
+fn may_add_no_transform_reports_conservative_capability() {
+    let mut headers = HashMap::from([("cache-control".to_string(), "max-age=60".to_string())]);
+    let ctx = ctx();
+    let set_only = SecurityHeaders::new(&json!({
+        "override_existing": false,
+        "set": { "Cache-Control": "no-transform" }
+    }))
+    .unwrap();
+    assert!(set_only.may_add_response_cache_control_no_transform(&ctx, &headers));
+
+    let remove_then_set = SecurityHeaders::new(&json!({
+        "override_existing": false,
+        "remove": ["Cache-Control"],
+        "set": { "Cache-Control": "no-transform" }
+    }))
+    .unwrap();
+    assert!(remove_then_set.may_add_response_cache_control_no_transform(&ctx, &headers));
+
+    headers.insert("cache-control".to_string(), "private".to_string());
+    assert!(remove_then_set.may_add_response_cache_control_no_transform(&ctx, &headers));
+}
+
 #[tokio::test]
 async fn applies_to_gateway_rejection_responses() {
     let plugin = SecurityHeaders::new(&json!({})).unwrap();

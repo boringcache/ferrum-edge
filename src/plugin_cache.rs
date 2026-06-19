@@ -115,6 +115,33 @@ impl Plugin for PriorityOverridePlugin {
             .after_proxy(ctx, response_status, response_headers)
             .await
     }
+    fn may_modify_response_content_type(
+        &self,
+        ctx: &RequestContext,
+        response_content_type: Option<&str>,
+    ) -> bool {
+        self.inner
+            .may_modify_response_content_type(ctx, response_content_type)
+    }
+    fn may_add_response_cache_control_no_transform(
+        &self,
+        ctx: &RequestContext,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        self.inner
+            .may_add_response_cache_control_no_transform(ctx, response_headers)
+    }
+    fn simulate_after_proxy_response_headers(
+        &self,
+        ctx: &mut RequestContext,
+        response_headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        self.inner
+            .simulate_after_proxy_response_headers(ctx, response_headers);
+    }
+    fn needs_later_response_cache_control_no_transform(&self) -> bool {
+        self.inner.needs_later_response_cache_control_no_transform()
+    }
     fn applies_after_proxy_on_reject(&self) -> bool {
         self.inner.applies_after_proxy_on_reject()
     }
@@ -123,6 +150,32 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.inner.should_buffer_response_body(ctx)
+    }
+    fn should_release_response_body_before_content_type_rewrite(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        self.inner
+            .should_release_response_body_before_content_type_rewrite(
+                ctx,
+                response_status,
+                response_headers,
+            )
+    }
+    fn should_release_response_body_for_later_no_transform(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        self.inner
+            .should_release_response_body_for_later_no_transform(
+                ctx,
+                response_status,
+                response_headers,
+            )
     }
     fn should_buffer_response_body_for_content_type(
         &self,
@@ -162,6 +215,17 @@ impl Plugin for PriorityOverridePlugin {
             .transform_request_body(body, content_type, request_headers)
             .await
     }
+    async fn transform_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+        request_headers: &std::collections::HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        self.inner
+            .transform_request_body_with_context(ctx, body, content_type, request_headers)
+            .await
+    }
     async fn on_final_request_body(
         &self,
         headers: &std::collections::HashMap<String, String>,
@@ -190,6 +254,17 @@ impl Plugin for PriorityOverridePlugin {
     ) -> Option<Vec<u8>> {
         self.inner
             .transform_response_body(body, content_type, response_headers)
+            .await
+    }
+    async fn transform_response_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        self.inner
+            .transform_response_body_with_context(ctx, body, content_type, response_headers)
             .await
     }
     async fn on_final_response_body(

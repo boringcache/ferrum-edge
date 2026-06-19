@@ -2654,11 +2654,14 @@ On-the-fly response compression and request decompression. Negotiates the best a
 
 **Skip conditions** (checked in order):
 1. Response status is 204 or 304
-2. Response already has `Content-Encoding` (no double-compression)
-3. `disable_on_etag` is true and response has an `ETag` header
-4. Response `Content-Type` is not in the whitelist
-5. Response `Content-Length` is below `min_content_length`
-6. Client did not send `Accept-Encoding` with a supported algorithm
+2. Request has `Cache-Control: no-transform`
+3. Response is a range response (`206`, `Content-Range`, or an internal range marker)
+4. Response has `Cache-Control: no-transform`
+5. Response already has `Content-Encoding` (no double-compression)
+6. `disable_on_etag` is true and response has an `ETag` header
+7. Response `Content-Type` is not in the whitelist
+8. Response `Content-Length` is below `min_content_length`
+9. Client did not send `Accept-Encoding` with a supported algorithm
 
 **Behavior:**
 - Strips `Accept-Encoding` from backend requests (configurable) so the backend sends uncompressed responses for the gateway to compress
@@ -2666,6 +2669,7 @@ On-the-fly response compression and request decompression. Negotiates the best a
 - Removes `Content-Length` after compression (the gateway recalculates it from the compressed body)
 - Forces response body buffering on proxies where this plugin is enabled
 - Request decompression removes `Content-Encoding` and `Content-Length` from the forwarded request headers
+- Requests with `Cache-Control: no-transform` bypass gateway compression/decompression and keep request representation headers intact
 
 ```yaml
 config:
