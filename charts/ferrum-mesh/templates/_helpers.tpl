@@ -57,17 +57,13 @@ invalid CP settings so an unusable control-plane pod is not rendered.
 {{- fail "controlPlane.database.name is required for structured postgres/mysql database URLs" -}}
 {{- end -}}
 {{- $credSecret := $db.existingCredentialsSecret | default dict -}}
-{{- $userSources := 0 -}}
-{{- if $db.username -}}{{- $userSources = add $userSources 1 -}}{{- end -}}
-{{- if $db.usernameFrom -}}{{- $userSources = add $userSources 1 -}}{{- end -}}
-{{- if $credSecret.name -}}{{- $userSources = add $userSources 1 -}}{{- end -}}
-{{- $passSources := 0 -}}
-{{- if $db.password -}}{{- $passSources = add $passSources 1 -}}{{- end -}}
-{{- if $db.passwordFrom -}}{{- $passSources = add $passSources 1 -}}{{- end -}}
-{{- if $credSecret.name -}}{{- $passSources = add $passSources 1 -}}{{- end -}}
-{{- if gt $userSources 1 -}}{{- fail "controlPlane.database username allows only one of username, usernameFrom, or existingCredentialsSecret.name" -}}{{- end -}}
-{{- if gt $passSources 1 -}}{{- fail "controlPlane.database password allows only one of password, passwordFrom, or existingCredentialsSecret.name" -}}{{- end -}}
-{{- if ne $userSources $passSources -}}{{- fail "controlPlane.database structured credentials require both username and password sources, or neither" -}}{{- end -}}
+{{- if or $db.usernameFrom $db.passwordFrom $credSecret.name -}}
+{{- fail "controlPlane.database structured Secret-backed username/password cannot be safely percent-encoded into FERRUM_DB_URL; use controlPlane.database.existingSecret or urlFrom with a fully encoded URL Secret instead" -}}
+{{- end -}}
+{{- if or $db.username $db.password -}}
+{{- if not $db.host -}}{{- fail "controlPlane.database username/password require structured host settings" -}}{{- end -}}
+{{- if not (and $db.username $db.password) -}}{{- fail "controlPlane.database structured credentials require both username and password, or neither" -}}{{- end -}}
+{{- end -}}
 {{- $creds := $cp.credentials | default dict -}}
 {{- include "ferrum-mesh.validateOneSource" (dict "label" "controlPlane.credentials.adminJwtSecret" "source" ($creds.adminJwtSecret | default dict) "minLength" 32) -}}
 {{- include "ferrum-mesh.validateOneSource" (dict "label" "controlPlane.credentials.cpDpGrpcJwtSecret" "source" ($creds.cpDpGrpcJwtSecret | default dict) "minLength" 32) -}}
@@ -91,46 +87,13 @@ invalid CP settings so an unusable control-plane pod is not rendered.
 {{- end }}
 {{- end -}}
 
-{{- define "ferrum-mesh.renderDbCredentialEnv" -}}
-{{- $db := .Values.controlPlane.database | default dict -}}
-{{- $existing := $db.existingCredentialsSecret | default dict -}}
-{{- $hasCredentials := or $db.username $db.usernameFrom $db.password $db.passwordFrom $existing.name -}}
-{{- if $hasCredentials }}
-- name: FERRUM_DB_USERNAME
-{{- if $db.usernameFrom }}
-  valueFrom:
-{{ toYaml $db.usernameFrom | nindent 4 }}
-{{- else if $existing.name }}
-  valueFrom:
-    secretKeyRef:
-      name: {{ $existing.name | quote }}
-      key: {{ default "username" $existing.usernameKey | quote }}
-{{- else }}
-  value: {{ $db.username | quote }}
-{{- end }}
-- name: FERRUM_DB_PASSWORD
-{{- if $db.passwordFrom }}
-  valueFrom:
-{{ toYaml $db.passwordFrom | nindent 4 }}
-{{- else if $existing.name }}
-  valueFrom:
-    secretKeyRef:
-      name: {{ $existing.name | quote }}
-      key: {{ default "password" $existing.passwordKey | quote }}
-{{- else }}
-  value: {{ $db.password | quote }}
-{{- end }}
-{{- end }}
-{{- end -}}
-
 {{- define "ferrum-mesh.structuredDbUrl" -}}
 {{- $db := . -}}
 {{- $port := "" -}}
 {{- if $db.port -}}{{- $port = printf ":%v" $db.port -}}{{- end -}}
-{{- $credSecret := $db.existingCredentialsSecret | default dict -}}
 {{- $auth := "" -}}
-{{- if or $db.username $db.usernameFrom $db.password $db.passwordFrom $credSecret.name -}}
-{{- $auth = "$(FERRUM_DB_USERNAME):$(FERRUM_DB_PASSWORD)@" -}}
+{{- if and $db.username $db.password -}}
+{{- $auth = printf "%s:%s@" ($db.username | urlquery) ($db.password | urlquery) -}}
 {{- end -}}
 {{- $path := "" -}}
 {{- if $db.name -}}{{- $path = printf "/%s" $db.name -}}{{- end -}}
@@ -138,7 +101,7 @@ invalid CP settings so an unusable control-plane pod is not rendered.
 {{- if $db.params -}}
 {{- $pairs := list -}}
 {{- range $key := keys $db.params | sortAlpha -}}
-{{- $pairs = append $pairs (printf "%s=%v" $key (get $db.params $key)) -}}
+{{- $pairs = append $pairs (printf "%s=%s" ($key | urlquery) ((get $db.params $key) | toString | urlquery)) -}}
 {{- end -}}
 {{- if $pairs -}}{{- $query = printf "?%s" (join "&" $pairs) -}}{{- end -}}
 {{- end -}}
@@ -173,7 +136,6 @@ invalid CP settings so an unusable control-plane pod is not rendered.
 {{- $creds := $cp.credentials | default dict -}}
 - name: FERRUM_DB_TYPE
   value: {{ $db.type | quote }}
-{{- include "ferrum-mesh.renderDbCredentialEnv" . }}
 {{ include "ferrum-mesh.renderDbUrlEnv" . }}
 {{ include "ferrum-mesh.renderSecretEnv" (dict "name" "FERRUM_ADMIN_JWT_SECRET" "source" ($creds.adminJwtSecret | default dict) "defaultKey" "admin-jwt-secret") }}
 {{ include "ferrum-mesh.renderSecretEnv" (dict "name" "FERRUM_CP_DP_GRPC_JWT_SECRET" "source" ($creds.cpDpGrpcJwtSecret | default dict) "defaultKey" "cp-dp-grpc-jwt-secret") }}

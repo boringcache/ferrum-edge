@@ -65,6 +65,7 @@ Development installs can use SQLite with operator-generated random JWT
 secrets:
 
 ```bash
+kubectl create namespace ferrum --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n ferrum create secret generic ferrum-mesh-dev-credentials \
   --from-literal=admin-jwt-secret="$(openssl rand -hex 32)" \
   --from-literal=cp-dp-grpc-jwt-secret="$(openssl rand -hex 32)"
@@ -77,8 +78,9 @@ Production-style installs should use existing Secrets for both JWT material and
 the database URL:
 
 ```bash
+kubectl create namespace ferrum --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n ferrum create secret generic ferrum-mesh-production-db \
-  --from-literal=url='postgres://ferrum:<password>@postgres.ferrum.svc:5432/ferrum'
+  --from-literal=url='postgres://ferrum:<percent-encoded-password>@postgres.ferrum.svc:5432/ferrum'
 kubectl -n ferrum create secret generic ferrum-mesh-production-credentials \
   --from-literal=admin-jwt-secret="$(openssl rand -hex 32)" \
   --from-literal=cp-dp-grpc-jwt-secret="$(openssl rand -hex 32)"
@@ -90,10 +92,11 @@ helm install ferrum ./charts/ferrum-mesh -n ferrum \
 The chart never generates JWT secrets. That avoids predictable credentials and
 also avoids Helm upgrade churn from random template functions. If you need
 structured database settings instead of a single URL Secret, `controlPlane.database`
-also supports `host`, `port`, `name`, `usernameFrom`, `passwordFrom`, and
-`existingCredentialsSecret`; the rendered `FERRUM_DB_URL` uses Kubernetes env
-expansion so Secret-backed credentials do not appear as plaintext Deployment
-values.
+also supports `host`, `port`, `name`, direct `username` / `password`, and
+`params`; direct credentials are percent-encoded into `FERRUM_DB_URL`. For
+Secret-backed database credentials, store the fully percent-encoded URL in a
+Secret and reference it through `controlPlane.database.existingSecret` or
+`controlPlane.database.urlFrom`.
 
 ## Mesh Injector Chart Defaults
 

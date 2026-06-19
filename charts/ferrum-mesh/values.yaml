@@ -59,20 +59,14 @@ controlPlane:
     sqlite:
       path: ""
       mode: rwc
-    # Structured network database form. When username/password Secret refs are
-    # used, the rendered Deployment contains only Secret references and uses
-    # Kubernetes env expansion in FERRUM_DB_URL.
+    # Structured network database form. Direct username/password values are
+    # percent-encoded into FERRUM_DB_URL. For Secret-backed database credentials,
+    # use urlFrom or existingSecret with a fully encoded database URL Secret.
     host: ""
     port: null
     name: ""
     username: ""
-    usernameFrom: {}
     password: ""
-    passwordFrom: {}
-    existingCredentialsSecret:
-      name: ""
-      usernameKey: username
-      passwordKey: password
     params: {}
   credentials:
     adminJwtSecret:
