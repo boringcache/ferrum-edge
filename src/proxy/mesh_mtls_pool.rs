@@ -394,6 +394,7 @@ impl MeshMtlsConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         app_port: u16,
+        app_policy_port: u16,
         mtls_port: u16,
         expected_peer: &SpiffeId,
     ) -> Result<MeshMtlsSender, HbonePoolError> {
@@ -428,6 +429,7 @@ impl MeshMtlsConnectionPool {
             proxy,
             target_host,
             app_port,
+            app_policy_port,
             mtls_port,
             expected_peer,
             &key,
@@ -463,6 +465,7 @@ impl MeshMtlsConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         target_port: u16,
+        target_policy_port: u16,
         mtls_port: u16,
         expected_peer: &SpiffeId,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
@@ -475,7 +478,7 @@ impl MeshMtlsConnectionPool {
         let keepalive_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&target_port))
+            .and_then(|m| m.get(&target_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
@@ -539,6 +542,7 @@ impl MeshMtlsConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         target_port: u16,
+        target_policy_port: u16,
         mtls_port: u16,
         expected_peer: &SpiffeId,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
@@ -568,7 +572,7 @@ impl MeshMtlsConnectionPool {
         let port_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&target_port));
+            .and_then(|m| m.get(&target_policy_port));
         let keepalive_override = port_override.and_then(|o| o.tcp_keepalive.as_ref());
         let effective_connect_timeout_ms = port_override
             .and_then(|o| o.connect_timeout_ms)
@@ -644,7 +648,8 @@ impl MeshMtlsConnectionPool {
         &self,
         proxy: &Proxy,
         dial_host: &str,
-        app_port: u16,
+        _app_port: u16,
+        app_policy_port: u16,
         mtls_port: u16,
         authority: &str,
         path_and_query: &str,
@@ -662,7 +667,7 @@ impl MeshMtlsConnectionPool {
         let keepalive_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&app_port))
+            .and_then(|m| m.get(&app_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
@@ -703,7 +708,8 @@ impl MeshMtlsConnectionPool {
         &self,
         proxy: &Proxy,
         target_host: &str,
-        app_port: u16,
+        _app_port: u16,
+        app_policy_port: u16,
         mtls_port: u16,
         expected_peer: &SpiffeId,
         key: &str,
@@ -750,7 +756,7 @@ impl MeshMtlsConnectionPool {
         let keepalive_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&app_port))
+            .and_then(|m| m.get(&app_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
         let sender = match tokio::time::timeout(
             remaining,
@@ -1147,6 +1153,7 @@ mod tests {
         UpstreamTarget {
             host: "10.0.0.1".to_string(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 1,
             tags: tags
                 .iter()
@@ -1231,7 +1238,14 @@ mod tests {
         // `H2ConnectTunnel` (the Ok type) is not `Debug`, so match rather than
         // `expect_err`.
         match pool
-            .open_datagram_tunnel(&proxy, "10.0.0.1", 53, ISTIO_SIDECAR_INBOUND_PORT, &peer)
+            .open_datagram_tunnel(
+                &proxy,
+                "10.0.0.1",
+                53,
+                53,
+                ISTIO_SIDECAR_INBOUND_PORT,
+                &peer,
+            )
             .await
         {
             Err(HbonePoolError::NoSvid) => {}

@@ -359,8 +359,9 @@ pub(crate) fn select_upstream_target(
             // port differs from the initial dispatch port — the target may
             // have landed in a port override lane with a different hash_on
             // strategy.
-            let needs_set = if selection.target.port != dispatch_port {
-                let tp = selection.target.port;
+            let selected_policy_port = selection.target.dispatch_policy_port();
+            let needs_set = if selected_policy_port != dispatch_port {
+                let tp = selected_policy_port;
                 let tp_override = has_effective_port_override(proxy, balancers, upstream_id, tp);
                 let tp_strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
                     balancers,
@@ -395,11 +396,11 @@ pub(crate) fn select_upstream_target(
 
 #[inline]
 pub(crate) fn initial_dispatch_port(proxy: &Proxy, upstream_port_override: u16) -> u16 {
-    if proxy.backend_port != 0 {
-        return proxy.backend_port;
+    if upstream_port_override != 0 {
+        return upstream_port_override;
     }
 
-    upstream_port_override
+    proxy.backend_port
 }
 
 #[inline]
@@ -421,8 +422,9 @@ pub(crate) fn hash_on_strategy_for_selected_target(
     proxy: &Proxy,
     balancers: &LoadBalancerCacheInner,
     upstream_id: &str,
-    target_port: u16,
+    target: &UpstreamTarget,
 ) -> HashOnStrategy {
+    let target_port = target.dispatch_policy_port();
     let port_scope = has_effective_port_override(proxy, balancers, upstream_id, target_port)
         .then_some(target_port);
     LoadBalancerCache::get_hash_on_strategy_for_selection_from(
@@ -935,7 +937,7 @@ pub(crate) fn passive_health_for_target<'a>(
     proxy
         .dispatch_port_overrides
         .as_ref()
-        .and_then(|overrides| overrides.get(&target.port))
+        .and_then(|overrides| overrides.get(&target.dispatch_policy_port()))
         .and_then(|override_config| override_config.passive_health_check.as_ref())
         .or_else(|| {
             // Subset-bound proxy: prefer the subset's resolved passive-health
@@ -1128,6 +1130,7 @@ mod tests {
         Arc::new(UpstreamTarget {
             host: host.to_string(),
             port: 443,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,
@@ -1186,6 +1189,18 @@ mod tests {
 
         assert_eq!(initial_dispatch_port(&proxy, 0), 0);
         assert_eq!(initial_dispatch_port(&proxy, 8080), 8080);
+
+        proxy.backend_port = 9090;
+        assert_eq!(
+            initial_dispatch_port(&proxy, 8080),
+            8080,
+            "a full-coverage upstream policy lane beats the proxy template backend_port"
+        );
+        assert_eq!(
+            initial_dispatch_port(&proxy, 0),
+            9090,
+            "without a full-coverage lane, the proxy template backend_port remains the fallback"
+        );
     }
 
     #[tokio::test]
@@ -1233,6 +1248,62 @@ mod tests {
 
         assert_eq!(selection.lb_hash_key.as_deref(), Some("alice"));
         assert_eq!(selection.target.as_ref().map(|t| t.port), Some(8080));
+    }
+
+    #[tokio::test]
+    async fn upstream_selection_prefers_policy_port_lane_over_template_backend_port() {
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "consumers": [],
+                "plugin_configs": [],
+                "proxies": [{
+                    "id": "mesh-egress",
+                    "listen_path": "/",
+                    "backend_scheme": "http",
+                    "backend_host": "unused.local",
+                    "backend_port": 8080,
+                    "upstream_id": "mesh-upstream"
+                }],
+                "upstreams": [{
+                    "id": "mesh-upstream",
+                    "targets": [
+                        {"host": "10.0.0.1", "port": 8080},
+                        {"host": "10.0.0.2", "port": 8080}
+                    ],
+                    "algorithm": "round_robin",
+                    "port_overrides": {
+                        "80": {
+                            "algorithm": "consistent_hashing",
+                            "hash_on": "header:x-user"
+                        }
+                    }
+                }]
+            }))
+            .expect("test config should deserialize");
+        for target in &mut config.upstreams[0].targets {
+            target.service_port_policy_key = Some(80);
+        }
+        config.normalize_fields();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let (state, _) = crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+            .expect("test proxy state should build");
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+        let mut headers = HashMap::new();
+        headers.insert("x-user".to_string(), "alice".to_string());
+
+        let selection = select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &headers, None);
+
+        let target = selection.target.as_ref().expect("target selected");
+        assert_eq!(
+            selection.lb_hash_key.as_deref(),
+            Some("alice"),
+            "selection must use the service-port lane policy, not the proxy template backend_port"
+        );
+        assert_eq!(target.port, 8080);
+        assert_eq!(target.dispatch_policy_port(), 80);
     }
 
     #[tokio::test]
@@ -1444,6 +1515,7 @@ mod tests {
         let first_target = UpstreamTarget {
             host: "10.0.0.1".to_string(),
             port: 9090,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,
@@ -1452,6 +1524,7 @@ mod tests {
         let second_target = UpstreamTarget {
             host: "10.0.0.2".to_string(),
             port: 9090,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,
@@ -1728,6 +1801,7 @@ mod tests {
         let target = UpstreamTarget {
             host: "10.0.0.1".to_string(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,

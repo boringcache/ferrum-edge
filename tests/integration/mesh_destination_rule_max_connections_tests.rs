@@ -125,6 +125,7 @@ fn ws_upstream(id: &str) -> Upstream {
             UpstreamTarget {
                 host: HOST_FQDN.to_string(),
                 port: 8080,
+                service_port_policy_key: None,
                 weight: MAX_TARGET_WEIGHT.min(1),
                 tags: HashMap::new(),
                 locality: None,
@@ -133,6 +134,7 @@ fn ws_upstream(id: &str) -> Upstream {
             UpstreamTarget {
                 host: HOST_FQDN.to_string(),
                 port: 9090,
+                service_port_policy_key: None,
                 weight: MAX_TARGET_WEIGHT.min(1),
                 tags: HashMap::new(),
                 locality: None,

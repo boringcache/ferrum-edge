@@ -69,6 +69,7 @@ fn upstream() -> Upstream {
         targets: vec![UpstreamTarget {
             host: "reviews.default.svc.cluster.local".to_string(),
             port: 8080,
+            service_port_policy_key: None,
             weight: MAX_TARGET_WEIGHT.min(1),
             tags: HashMap::new(),
             locality: None,
@@ -554,19 +555,15 @@ fn destination_rule_top_level_connection_pool_http_on_sd_upstream_goes_to_fallba
 }
 
 #[test]
-fn destination_rule_named_target_port_sd_falls_back_to_top_level_connection_pool_http() {
+fn destination_rule_named_target_port_sd_keeps_per_port_and_fallback_separate() {
     use ferrum_edge::config::types::{DnsSdConfig, SdProvider, ServiceDiscoveryConfig};
     use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
 
-    // #1806 (narrowed; follow-up #1816): an SD upstream whose Service uses a NAMED
-    // `targetPort` keeps the per-port `portLevelSettings` entry under the DECLARED
-    // service port (80) — named targetPorts can't be remapped at apply time — while
-    // the discovered target carries the RESOLVED workload port (8080). The SD
-    // fallback carries the TOP-LEVEL `connectionPool.http` overlay ONLY (it does NOT
-    // fold per-port entries — folding cross-leaks between ports on a multi-port
-    // upstream). So for a named-targetPort SD upstream the per-port lookup misses the
-    // resolved port and the TOP-LEVEL value applies; honoring the explicit per-port
-    // value here is a DEFERRED accepted limitation (#1816).
+    // SD upstreams keep explicit per-port policy keyed by the declared Service
+    // port and keep the top-level `connectionPool.http` overlay as the fallback.
+    // Runtime target materialization now carries the owning Service port on each
+    // discovered target, so the hot path can apply the explicit entry without
+    // folding it into the fallback and leaking it to sibling ports.
     let mut sd_upstream = upstream();
     // Resolved workload target port differs from the declared service port (80).
     sd_upstream.targets[0].port = 8080;
@@ -623,11 +620,19 @@ fn destination_rule_named_target_port_sd_falls_back_to_top_level_connection_pool
 
     let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
 
-    // The projected proxy fallback carries the TOP-LEVEL overlay ONLY (no per-port
-    // folding): the top-level maxRetries (2) and idleTimeout (45s). The explicit
-    // per-port maxRetries (5) keyed on the declared service port (80) is NOT folded,
-    // so for the resolved port 8080 the top-level value applies — named-targetPort
-    // per-port precedence is the DEFERRED accepted limitation (#1816).
+    let per_port = prepared.proxies[0]
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&80))
+        .expect("declared service port entry must project to the proxy");
+    assert_eq!(
+        per_port.max_retries,
+        Some(5),
+        "explicit per-port maxRetries stays keyed by the declared service port"
+    );
+
+    // The projected proxy fallback carries the TOP-LEVEL overlay ONLY (no
+    // per-port folding): the top-level maxRetries (2) and idleTimeout (45s).
     let proxy_fallback = prepared.proxies[0]
         .dispatch_port_override_fallback
         .as_ref()
@@ -635,7 +640,7 @@ fn destination_rule_named_target_port_sd_falls_back_to_top_level_connection_pool
     assert_eq!(
         proxy_fallback.max_retries,
         Some(2),
-        "named-targetPort SD: the TOP-LEVEL fallback applies on the resolved port (per-port deferred to #1816)"
+        "top-level fallback remains separate from explicit per-port policy"
     );
     assert_eq!(
         proxy_fallback.http_idle_timeout_ms,

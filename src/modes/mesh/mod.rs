@@ -911,8 +911,8 @@ fn prepare_normalized_gateway_config_for_mesh(
     materialize_sidecar_inbound_proxies(&mut config, runtime, mesh_slice);
     // Outbound (egress) runs after inbound and before `apply_destination_rules`
     // so the materialized outbound upstreams pick up port-level DR policy
-    // (re-keyed there to the resolved dial port). Topology-aware: Ambient emits
-    // HBONE routes; Sidecar emits SVID-mTLS routes.
+    // under the service-port key or dial-port key their dispatch path uses.
+    // Topology-aware: Ambient emits HBONE routes; Sidecar emits SVID-mTLS routes.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_tcp_upstreams(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_udp_upstreams(&mut config, runtime, mesh_slice);
@@ -1782,6 +1782,7 @@ fn build_east_west_service_targets(
             targets.push(UpstreamTarget {
                 host: address.clone(),
                 port: target_port,
+                service_port_policy_key: service.ports.first().map(|sp| sp.port),
                 weight: 1,
                 tags,
                 locality: workload.locality.clone(),
@@ -3643,6 +3644,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
             // Dial the workload's own (canonicalized) IP, not the VIP.
             host: spec.canonical_ip.to_string(),
             port: spec.target_port,
+            service_port_policy_key: Some(spec.service_port.port),
             weight: 1,
             tags,
             locality: spec.workload.locality.clone(),
@@ -4056,6 +4058,7 @@ fn build_outbound_mesh_targets(
             targets.push(UpstreamTarget {
                 host: address.clone(),
                 port: app_port,
+                service_port_policy_key: Some(service_port.port),
                 weight: 1,
                 tags: tags.clone(),
                 locality: workload.locality.clone(),
@@ -4150,13 +4153,11 @@ fn mesh_outbound_route_proxy(
 /// Mirrors the east-west service upstream. Top-level DR traffic policy applies
 /// (the upstream is FQDN-named so DestinationRules match it), and the
 /// `portLevelSettings` entry authored on this upstream's owning Service port
-/// is fanned out by `apply_destination_rules` onto every distinct target dial
-/// port — the targets dial the per-workload resolved `targetPort` (numeric or
-/// **named**, which can resolve differently across workloads), all owned by
-/// the one Service port this per-port upstream serves. Named `targetPort`
-/// per-port DR is therefore fully applied here (unlike the service-discovery /
-/// egress-ServiceEntry paths, where named ports resolve at runtime and their
-/// entries stay under the declared port).
+/// is stored by `apply_destination_rules` under that declared Service port
+/// when the targets carry `service_port_policy_key`. The targets still dial
+/// the per-workload resolved `targetPort` (numeric or **named**, which can
+/// resolve differently across workloads); dispatch maps each selected target
+/// back to its owning Service port before reading the override.
 fn mesh_outbound_route_upstream(
     upstream_id: &str,
     namespace: &str,
@@ -4199,6 +4200,24 @@ fn mesh_outbound_route_upstream(
 
 // ── DestinationRule application ────────────────────────────────────────
 
+/// Return the Service port a mesh-SD upstream will select when discovery runs.
+/// This mirrors `MeshServiceDiscoverer::selected_service_port` for apply-time
+/// policy projection before the dynamic targets exist.
+fn mesh_sd_selected_service_port(upstream: &Upstream, mesh_slice: &MeshSlice) -> Option<u16> {
+    let mesh = upstream.service_discovery.as_ref()?.mesh.as_ref()?;
+    if let Some(port) = mesh.port {
+        return Some(port);
+    }
+
+    let namespace = mesh.namespace.as_deref().unwrap_or(&upstream.namespace);
+    mesh_slice
+        .services
+        .iter()
+        .find(|svc| svc.name == mesh.service_name && svc.namespace == namespace)
+        .and_then(|svc| svc.ports.first())
+        .map(|port| port.port)
+}
+
 /// Apply DestinationRule traffic policies onto matching upstreams.
 ///
 /// For each DestinationRule, we find upstreams whose targets match the DR
@@ -4211,65 +4230,6 @@ fn mesh_outbound_route_upstream(
 /// Multiple DRs targeting the same upstream are applied in a deterministic
 /// order — sorted by `(namespace, name)` — so the last-writer-wins outcome
 /// is reproducible across CP restarts and DP subscribers.
-/// Resolve the in-mesh `MeshService` a service-discovery upstream routes to, for
-/// re-keying targetPort-remapped port-level policy (round-12 F2). A mesh-provider
-/// service-discovery upstream names the service in its config; the discoverer
-/// resolves its workload-address targets to the Service `targetPort` at runtime
-/// (`service_discovery::mesh`), so a DestinationRule `portLevelSettings` entry
-/// keyed on the Service port must be re-keyed to that dial port. Returns `None`
-/// for non-mesh-discovery upstreams.
-fn mesh_upstream_service<'a>(
-    upstream: &Upstream,
-    mesh_slice: &'a MeshSlice,
-) -> Option<&'a crate::modes::mesh::config::MeshService> {
-    let mesh_sd = upstream.service_discovery.as_ref()?.mesh.as_ref()?;
-    let namespace = mesh_sd.namespace.as_deref().unwrap_or(&upstream.namespace);
-    mesh_slice
-        .services
-        .iter()
-        .find(|s| s.name == mesh_sd.service_name && s.namespace == namespace)
-}
-
-/// Resolve ServiceEntry service-port→dial-port remaps for an egress upstream.
-///
-/// Egress upstream IDs intentionally stay keyed on the ServiceEntry service port
-/// while their targets may dial a numeric `targetPort`. Istio
-/// DestinationRule `portLevelSettings[].port.number` is service-port-scoped,
-/// but dispatch looks up Ferrum port overrides by the selected
-/// `UpstreamTarget.port` dial port. Re-key matching ServiceEntry ports here so
-/// per-port TLS/mTLS and pool policy cannot be dropped as a phantom port after
-/// targetPort materialization.
-fn egress_service_entry_port_remap(
-    upstream: &Upstream,
-    mesh_slice: &MeshSlice,
-) -> std::collections::HashMap<u16, u16> {
-    mesh_slice
-        .service_entries
-        .iter()
-        .filter(|entry| entry.location == ServiceEntryLocation::MeshExternal)
-        .flat_map(|entry| {
-            entry.hosts.iter().flat_map(move |host| {
-                entry.ports.iter().filter_map(move |port| {
-                    let upstream_id =
-                        mesh_egress_upstream_id(&entry.namespace, &entry.name, host, port.port);
-                    if upstream.id != upstream_id
-                        && upstream.name.as_deref() != Some(upstream_id.as_str())
-                    {
-                        return None;
-                    }
-
-                    match resolve_target_port(port.target_port.as_ref(), &[]) {
-                        Some(target_port) if target_port != port.port => {
-                            Some((port.port, target_port))
-                        }
-                        _ => None,
-                    }
-                })
-            })
-        })
-        .collect()
-}
-
 fn apply_destination_rules(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -4361,46 +4321,13 @@ fn apply_destination_rules(
                 apply_traffic_policy_to_upstream(upstream, policy, runtime)?;
             }
 
-            // Build a set of ports actually exposed by this upstream's
-            // targets. Used to filter phantom DR entries whose port is not
-            // served by any backend — misconfigured DRs (typo in port
-            // number) would otherwise silently bloat
-            // `Upstream.port_overrides`. Upstreams using service discovery
-            // resolve target ports at runtime, so we keep all entries when
-            // service_discovery is configured.
-            let upstream_target_ports: std::collections::HashSet<u16> =
-                upstream.targets.iter().map(|t| t.port).collect();
+            let upstream_policy_ports: std::collections::HashSet<u16> = upstream
+                .targets
+                .iter()
+                .map(UpstreamTarget::dispatch_policy_port)
+                .collect();
             let has_service_discovery = upstream.service_discovery.is_some();
-
-            // A mesh upstream can dial a numeric targetPort (T) while policy is
-            // still authored against the Service/ServiceEntry port (P). Dispatch
-            // keys port overrides by the dial port, so a DR `portLevelSettings`
-            // entry keyed on P must be re-keyed to T or it never matches the
-            // selected target. Map P→T for service-discovery MeshServices and
-            // materialized egress ServiceEntries with numeric targetPorts. Named
-            // targetPorts are workload/endpoint-specific and stay under P.
-            let mesh_port_remap: std::collections::HashMap<u16, u16> = if has_service_discovery {
-                mesh_upstream_service(upstream, mesh_slice)
-                    .map(|svc| {
-                        svc.ports
-                            .iter()
-                            .filter_map(|sp| match sp.target_port {
-                                Some(ServiceTargetPort::Number(t)) if t != 0 && t != sp.port => {
-                                    Some((sp.port, t))
-                                }
-                                _ => None,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            } else {
-                egress_service_entry_port_remap(upstream, mesh_slice)
-            };
-            // (Materialized per-port outbound upstreams — `__mesh-out-upstream-*` —
-            // need no remap here: the owner-gated branch in the per-port loop
-            // below fans their owning Service port's entry out to every
-            // distinct target dial port, which subsumes the former numeric
-            // P→T remap and additionally covers NAMED `targetPort`s.)
+            let mesh_sd_selected_port = mesh_sd_selected_service_port(upstream, mesh_slice);
 
             // Top-level `connectionPool.tcp.{maxConnections,tcpKeepalive}` fan
             // out to every port served by this upstream. Per-port
@@ -4413,7 +4340,7 @@ fn apply_destination_rules(
                 && (tp.max_connections.is_some() || tp.tcp_keepalive.is_some())
                 && !has_service_discovery
             {
-                for port in &upstream_target_ports {
+                for port in &upstream_policy_ports {
                     let override_slot = upstream.port_overrides.entry(*port).or_default();
                     if let Some(max_conn) = tp.max_connections {
                         override_slot.max_connections = Some(max_conn);
@@ -4450,7 +4377,7 @@ fn apply_destination_rules(
                         .get_or_insert_default();
                     apply_connection_pool_http_to_port_override(fallback, http);
                 } else {
-                    for port in &upstream_target_ports {
+                    for port in &upstream_policy_ports {
                         let override_slot = upstream.port_overrides.entry(*port).or_default();
                         apply_connection_pool_http_to_port_override(override_slot, http);
                     }
@@ -4477,24 +4404,14 @@ fn apply_destination_rules(
             let upstream_presents_dynamic_svid = upstream_uses_mesh_transport(upstream);
             for (port, port_policy) in &dr.port_level_settings {
                 // The `port_overrides` key(s) this Service-port-scoped entry
-                // must land on. A materialized per-port outbound upstream
-                // accepts ONLY its owning Service port's entry — an entry for
-                // any other service port belongs to that port's own sibling
-                // upstream, even when it numerically equals this upstream's
-                // dial port — and FANS IT OUT to every distinct target dial
-                // port: dispatch keys `port_overrides` by the LB-selected
-                // target's port, and the targets dial the per-workload
-                // resolved `targetPort` (numeric OR named — a named port can
-                // legitimately resolve to different container ports across
-                // workloads), all of which are owned by this one Service port
-                // by construction. This is what closes the former named-
-                // `targetPort` residual: one Service-port entry, one-to-many
-                // dial ports. Otherwise: a mesh service-discovery upstream
-                // whose Service remaps the port via a numeric `targetPort` is
-                // re-keyed P→T (round-12 F2); a direct target-port match
-                // needs no remap; a service-discovery upstream with no remap
-                // keeps the entry under the declared port (targets resolve at
-                // runtime); anything else is a phantom DR port.
+                // must land on. Targets that carry `service_port_policy_key`
+                // dispatch policy by their owning declared Service port, not
+                // by the resolved dial port. Static fallback targets on a mesh
+                // service-discovery upstream can still dispatch by their dial
+                // port, but only the SD upstream's requested Service-port entry
+                // may seed those fallback slots. Sibling DR entries must not
+                // leak onto this upstream merely because their service port
+                // number appears as a fallback target's dial port.
                 let store_ports: Vec<u16> = if let Some(owning_port) =
                     outbound_upstream_owner_port.get(&upstream.id)
                 {
@@ -4508,23 +4425,22 @@ fn apply_destination_rules(
                         );
                         continue;
                     }
-                    if upstream_target_ports.is_empty() {
-                        // Defensive: an owner-gated upstream always has the
-                        // targets it was materialized with; keep the entry
-                        // under the Service port rather than dropping policy.
-                        vec![*port]
-                    } else {
-                        let mut dial_ports: Vec<u16> =
-                            upstream_target_ports.iter().copied().collect();
-                        dial_ports.sort_unstable();
-                        dial_ports
-                    }
-                } else if upstream_target_ports.contains(port) {
                     vec![*port]
-                } else if let Some(dial) = mesh_port_remap.get(port) {
-                    vec![*dial]
+                } else if upstream_policy_ports.contains(port) {
+                    vec![*port]
                 } else if has_service_discovery {
-                    vec![*port]
+                    let mut ports = Vec::with_capacity(if mesh_sd_selected_port == Some(*port) {
+                        upstream_policy_ports.len() + 1
+                    } else {
+                        1
+                    });
+                    ports.push(*port);
+                    if mesh_sd_selected_port == Some(*port) {
+                        ports.extend(upstream_policy_ports.iter().copied());
+                    }
+                    ports.sort_unstable();
+                    ports.dedup();
+                    ports
                 } else {
                     warn!(
                         rule = %dr.name,
@@ -4685,19 +4601,26 @@ fn apply_destination_rules(
             // `hbone_pool::get_datagram_tunnel`, which reads the connect timeout
             // from `dispatch_port_overrides` (projected from `port_overrides`) and
             // otherwise falls back to the relay proxy's hardcoded default. Seed the
-            // top-level value onto each materialized target port carrying no
+            // top-level value onto each materialized target policy port carrying no
             // per-port `portLevelSettings.connectTimeout`, so the UDP relay honors
             // the operator's top-level connectTimeout instead of the 5s default.
             // Per-port entries written above already win (only unset slots are
             // seeded); other lanes are unaffected — raw-TCP relay proxies do not
             // read `dispatch_port_overrides`, and HTTP upstreams reach config
-            // proxies. Keyed by the materialized TARGET port (`get_datagram_tunnel`
-            // looks the override up by the dialed app port, not the service port).
+            // proxies. Keyed by the selected target's policy port because
+            // `get_datagram_tunnel` receives both the dial app port and the owning
+            // Service-port policy key for targetPort-remapped UDP services.
             if let Some(timeout_ms) = connect_timeout_ms
                 && upstream.id.starts_with("__mesh-out-udp-upstream-")
             {
-                let target_ports: Vec<u16> = upstream.targets.iter().map(|t| t.port).collect();
-                for port in target_ports {
+                let mut target_policy_ports: Vec<u16> = upstream
+                    .targets
+                    .iter()
+                    .map(UpstreamTarget::dispatch_policy_port)
+                    .collect();
+                target_policy_ports.sort_unstable();
+                target_policy_ports.dedup();
+                for port in target_policy_ports {
                     let slot = upstream.port_overrides.entry(port).or_default();
                     if slot.connect_timeout_ms.is_none() {
                         slot.connect_timeout_ms = Some(timeout_ms);
@@ -5663,7 +5586,13 @@ fn build_http_egress_for_entry(
             None => (port_spec.port, port_spec.name.clone()),
         };
     for host in proxy_hosts {
-        let targets = build_egress_upstream_targets(entry, host, backend_port, &backend_port_name);
+        let targets = build_egress_upstream_targets(
+            entry,
+            host,
+            port_spec.port,
+            backend_port,
+            &backend_port_name,
+        );
 
         if targets.is_empty() {
             debug!(
@@ -5777,8 +5706,13 @@ fn build_stream_egress_for_entry(
             Some(resolved) => (resolved, None),
             None => (port_spec.port, port_spec.name.clone()),
         };
-    let targets =
-        build_egress_upstream_targets(entry, representative_host, backend_port, &backend_port_name);
+    let targets = build_egress_upstream_targets(
+        entry,
+        representative_host,
+        port_spec.port,
+        backend_port,
+        &backend_port_name,
+    );
 
     if targets.is_empty() {
         debug!(
@@ -5872,7 +5806,8 @@ fn egress_health_checks() -> Option<HealthCheckConfig> {
 fn build_egress_upstream_targets(
     entry: &ServiceEntry,
     host: &str,
-    port_number: u16,
+    service_port: u16,
+    backend_port: u16,
     port_name: &Option<String>,
 ) -> Vec<UpstreamTarget> {
     if entry.resolution == Resolution::Static && !entry.endpoints.is_empty() {
@@ -5885,7 +5820,7 @@ fn build_egress_upstream_targets(
                 // service when endpoint port maps are partial.
                 let target_port = match port_name.as_ref() {
                     Some(name) => ep.ports.get(name).copied(),
-                    None => Some(port_number),
+                    None => Some(backend_port),
                 }?;
 
                 // Copy the ServiceEntry endpoint's operator-authored labels as
@@ -5897,6 +5832,7 @@ fn build_egress_upstream_targets(
                 Some(UpstreamTarget {
                     host: ep.address.clone(),
                     port: target_port,
+                    service_port_policy_key: Some(service_port),
                     weight: 1,
                     tags,
                     locality: None,
@@ -5909,7 +5845,8 @@ fn build_egress_upstream_targets(
         // SNI/Host expectations cannot be crossed by load balancing.
         vec![UpstreamTarget {
             host: host.to_string(),
-            port: port_number,
+            port: backend_port,
+            service_port_policy_key: Some(service_port),
             weight: 1,
             tags: std::collections::HashMap::new(),
             locality: None,
@@ -6207,10 +6144,9 @@ fn mesh_egress_upstream_id(namespace: &str, name: &str, host: &str, port: u16) -
 /// proxy/upstream id. Distinct inputs ALWAYS produce distinct outputs, AND the
 /// output never contains the segment delimiter `-`, so the assembled id
 /// `mesh-egress-{ns}-{name}-{host}-{port}` is unambiguous: `materialize_*`
-/// (and helpers like `egress_service_entry_port_remap`) merge/match
-/// proxies/upstreams by id, so two ServiceEntries that mapped to the same id
-/// would silently overwrite one another (and cross-apply each other's
-/// targetPort/port policy). K8s DNS-1123 forbids the offending characters in
+/// merges/matches proxies/upstreams by id, so two ServiceEntries that mapped
+/// to the same id would silently overwrite one another (and cross-apply each
+/// other's targetPort/port policy). K8s DNS-1123 forbids the offending characters in
 /// ns/name/host, but the FILE mesh-config path does not validate them.
 ///
 /// Encoding (alphabet `[A-Za-z0-9_]`, no `-`): an ASCII alphanumeric is emitted
@@ -12133,6 +12069,11 @@ mod tests {
             );
             assert_eq!(target.port, 6380, "dials the resolved targetPort");
             assert_eq!(
+                target.service_port_policy_key,
+                Some(6379),
+                "per-workload raw-TCP target keeps the declared Service port for DestinationRule policy"
+            );
+            assert_eq!(
                 target.tags.get(want_tag).map(String::as_str),
                 Some("true"),
                 "per-workload target rides the {want_tag} transport ({:?})",
@@ -12198,8 +12139,8 @@ mod tests {
     #[test]
     fn mesh_outbound_tcp_upstream_receives_port_level_dr() {
         // DestinationRule portLevelSettings authored on the TCP SERVICE port
-        // fan onto the targets' dial port, exactly like the HTTP per-port
-        // upstreams (shared owner-port map in apply_destination_rules).
+        // stay under the targets' owning service-policy port while the target
+        // still dials its resolved workload port.
         let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
         let mut svc = http_mesh_service("redis", 6379, spiffe);
         svc.ports[0].protocol = AppProtocol::Redis;
@@ -12237,14 +12178,14 @@ mod tests {
         assert_eq!(
             upstream
                 .port_overrides
-                .get(&6380)
+                .get(&6379)
                 .and_then(|slot| slot.connect_timeout_ms),
             Some(4321),
-            "TCP-port portLevelSettings must land on the dial port"
+            "TCP-port portLevelSettings must land on the service policy port"
         );
         assert!(
-            !upstream.port_overrides.contains_key(&6379),
-            "per-port policy must not remain under the service port"
+            !upstream.port_overrides.contains_key(&6380),
+            "per-port policy must not be keyed by the resolved dial port"
         );
     }
 
@@ -12331,10 +12272,10 @@ mod tests {
     #[test]
     fn mesh_outbound_udp_upstream_receives_port_level_dr() {
         // DestinationRule portLevelSettings authored on a UDP SERVICE port
-        // (`port: 53, targetPort: 5353`) fan onto the targets' dial port via the
-        // shared owner-port map — the UDP per-port upstreams join that map
-        // alongside the HTTP/TCP ones (codex r3). Ambient-only: the UDP egress
-        // materializer stamps HBONE and only runs under Ambient topology.
+        // (`port: 53, targetPort: 5353`) stay under the targets' owning service
+        // policy port while the target still dials the resolved workload port.
+        // Ambient-only: the UDP egress materializer stamps HBONE and only runs
+        // under Ambient topology.
         let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
         let mut svc = http_mesh_service("dns", 53, spiffe);
         svc.ports[0].protocol = AppProtocol::Udp;
@@ -12372,14 +12313,14 @@ mod tests {
         assert_eq!(
             upstream
                 .port_overrides
-                .get(&5353)
+                .get(&53)
                 .and_then(|slot| slot.connect_timeout_ms),
             Some(4321),
-            "UDP-port portLevelSettings must land on the dial port"
+            "UDP-port portLevelSettings must land on the service policy port"
         );
         assert!(
-            !upstream.port_overrides.contains_key(&53),
-            "per-port policy must not remain under the service port"
+            !upstream.port_overrides.contains_key(&5353),
+            "per-port policy must not be keyed by the resolved dial port"
         );
     }
 
@@ -12426,11 +12367,11 @@ mod tests {
                 .find(|u| u.id == "__mesh-out-udp-upstream-default-dns-53")
                 .expect("UDP upstream")
                 .port_overrides
-                .get(&5353)
+                .get(&53)
                 .and_then(|slot| slot.connect_timeout_ms)
         };
 
-        // Top-level only: seeded onto the dial port (5353), not the service port.
+        // Top-level only: seeded onto the service policy port (53), not the dial port.
         let top_level_only = make_slice(
             Some(MeshTrafficPolicy {
                 connect_timeout_ms: Some(7777),
@@ -12441,7 +12382,7 @@ mod tests {
         assert_eq!(
             dial_timeout(&top_level_only),
             Some(7777),
-            "top-level connectTimeout must seed the UDP dial port"
+            "top-level connectTimeout must seed the UDP service policy port"
         );
 
         // Per-port portLevelSettings WINS over the top-level on the same port.
@@ -12536,13 +12477,12 @@ mod tests {
     }
 
     #[test]
-    fn mesh_outbound_rekeys_port_policy_to_target_port() {
+    fn mesh_outbound_keeps_port_policy_on_service_port_for_numeric_target_port() {
         // A DestinationRule portLevelSettings entry is keyed on the SERVICE port
         // (80), but the materialized outbound HBONE upstream's target dials the
-        // numeric targetPort (8080). The per-port policy must be re-keyed onto the
-        // dial port so dispatch applies it — otherwise it is dropped as a phantom
-        // port (the egress-ServiceEntry bug class fixed in #1548, here for outbound
-        // HBONE upstreams).
+        // numeric targetPort (8080). The target carries its owning service-port
+        // policy key, so the override must stay under 80 and dispatch maps the
+        // selected target back to that key.
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
         let mut svc = http_mesh_service("reviews", 80, spiffe);
         svc.ports[0].target_port = Some(ServiceTargetPort::Number(8080));
@@ -12576,26 +12516,27 @@ mod tests {
             .iter()
             .find(|u| u.id == "__mesh-out-upstream-default-reviews-80")
             .expect("outbound upstream materialized");
+        assert_eq!(upstream.targets[0].port, 8080);
+        assert_eq!(upstream.targets[0].dispatch_policy_port(), 80);
         assert_eq!(
             upstream
                 .port_overrides
-                .get(&8080)
+                .get(&80)
                 .and_then(|slot| slot.connect_timeout_ms),
             Some(1234),
-            "service-port portLevelSettings must be re-keyed onto the dial port 8080"
+            "service-port portLevelSettings must stay under the policy port 80"
         );
         assert!(
-            !upstream.port_overrides.contains_key(&80),
-            "per-port policy must not remain under the service port 80"
+            !upstream.port_overrides.contains_key(&8080),
+            "per-port policy must not be keyed by the dial port 8080"
         );
     }
 
     #[test]
     fn mesh_outbound_applies_port_policy_for_named_target_port() {
-        // The former residual: a NAMED targetPort resolves per workload at
-        // materialization, so the DR entry authored on Service port 80 must
-        // land on the resolved container port's override slot — previously it
-        // stayed under 80 and never matched the dialing target.
+        // A NAMED targetPort resolves per workload at materialization. The
+        // DR entry authored on Service port 80 must stay under the owning
+        // service-port key while the target dials the resolved container port.
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
         let mut svc = http_mesh_service("reviews", 80, spiffe);
         svc.ports[0].target_port = Some(ServiceTargetPort::Name("http".to_string()));
@@ -12640,25 +12581,29 @@ mod tests {
             "the target dials the name-resolved container port"
         );
         assert_eq!(
+            upstream.targets[0].dispatch_policy_port(),
+            80,
+            "dispatch maps the selected target back to its owning service port"
+        );
+        assert_eq!(
             upstream
                 .port_overrides
-                .get(&8080)
+                .get(&80)
                 .and_then(|slot| slot.connect_timeout_ms),
             Some(1234),
-            "the Service-port entry must land on the name-resolved dial port"
+            "the Service-port entry must stay under the owning service port"
         );
         assert!(
-            !upstream.port_overrides.contains_key(&80),
-            "the entry must not be stranded under the service port"
+            !upstream.port_overrides.contains_key(&8080),
+            "the entry must not be duplicated under the dial port"
         );
     }
 
     #[test]
     fn mesh_outbound_fans_port_policy_to_heterogeneous_named_resolutions() {
         // Replica workloads may resolve the same NAMED targetPort to different
-        // container ports. The one Service-port DR entry fans out to every
-        // distinct dial port — dispatch keys overrides by the LB-selected
-        // target's port, and every target is owned by this Service port.
+        // container ports. The one Service-port DR entry stays under the owning
+        // service port, and each selected target maps back to that key.
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
         let mut svc = http_mesh_service("reviews", 80, spiffe);
         svc.ports[0].target_port = Some(ServiceTargetPort::Name("http".to_string()));
@@ -12730,25 +12675,29 @@ mod tests {
             vec![8080, 8081],
             "each replica dials its own name-resolved container port"
         );
-        for dial_port in [8080u16, 8081] {
+        for target in &upstream.targets {
             assert_eq!(
-                upstream
-                    .port_overrides
-                    .get(&dial_port)
-                    .and_then(|slot| slot.connect_timeout_ms),
-                Some(1234),
-                "the Service-port entry must fan out to dial port {dial_port}"
+                target.dispatch_policy_port(),
+                80,
+                "each dial target maps policy back to the owning service port"
             );
         }
+        assert_eq!(
+            upstream
+                .port_overrides
+                .get(&80)
+                .and_then(|slot| slot.connect_timeout_ms),
+            Some(1234),
+            "the Service-port entry must stay under the owning service port"
+        );
         assert!(
-            !upstream.port_overrides.contains_key(&80),
-            "the entry must not be stranded under the service port"
+            !upstream.port_overrides.contains_key(&8080)
+                && !upstream.port_overrides.contains_key(&8081),
+            "the entry must not fan out to heterogeneous dial ports"
         );
         // SELECTION-TIME policy must also land at the UPSTREAM level: with
-        // heterogeneous dial ports no per-port LB lane covers every target
-        // (`initial_dispatch_port_override` stays 0), so selection falls back
-        // to upstream-level LB — which must therefore carry the owning
-        // Service port's policy.
+        // Selection-time policy must also land at the upstream level so the
+        // owning service port's policy applies before any target is selected.
         assert_eq!(
             upstream.algorithm,
             LoadBalancerAlgorithm::Random,
@@ -12825,20 +12774,20 @@ mod tests {
             .expect("outbound upstream materialized");
         let slot_passive = upstream
             .port_overrides
-            .get(&8080)
+            .get(&80)
             .and_then(|slot| slot.passive_health_check.as_ref())
-            .expect("fanned slot carries passive health");
+            .expect("service-port slot carries passive health");
         assert_eq!(
             slot_passive.unhealthy_threshold, 7,
             "the per-port consecutiveErrors override applies"
         );
         assert_eq!(
             slot_passive.unhealthy_window_seconds, 33,
-            "the top-level detection interval must survive in the fanned slot"
+            "the top-level detection interval must survive in the service-port slot"
         );
         assert_eq!(
             slot_passive.healthy_after_seconds, 44,
-            "the top-level base ejection time must survive in the fanned slot"
+            "the top-level base ejection time must survive in the service-port slot"
         );
     }
 
@@ -12958,14 +12907,20 @@ mod tests {
             .iter()
             .find(|u| u.id == "__mesh-out-upstream-default-reviews-80")
             .expect("port-80 upstream materialized");
+        assert_eq!(upstream_80.targets[0].port, 8080);
+        assert_eq!(upstream_80.targets[0].dispatch_policy_port(), 80);
         assert_eq!(
             upstream_80
                 .port_overrides
-                .get(&8080)
+                .get(&80)
                 .and_then(|slot| slot.connect_timeout_ms),
             Some(1111),
-            "port 80's upstream carries ITS OWN service port's policy, \
-             re-keyed onto its dial port 8080"
+            "port 80's upstream carries ITS OWN service port's policy under port 80"
+        );
+        assert!(
+            !upstream_80.port_overrides.contains_key(&8080),
+            "service port 8080's policy must not leak onto port 80's upstream \
+             just because port 80 dials targetPort 8080"
         );
         assert_eq!(
             upstream_80.algorithm,
@@ -14429,6 +14384,7 @@ mod tests {
             targets: vec![UpstreamTarget {
                 host: host.to_string(),
                 port: 8080,
+                service_port_policy_key: None,
                 weight: 1,
                 tags: HashMap::new(),
                 locality: None,
@@ -16127,6 +16083,7 @@ mod tests {
         upstream.targets.push(UpstreamTarget {
             host: "reviews.default.svc.cluster.local".to_string(),
             port: 9090,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,
@@ -18031,6 +17988,7 @@ mod tests {
             targets: vec![UpstreamTarget {
                 host: "10.0.0.5".to_string(),
                 port: 8080,
+                service_port_policy_key: None,
                 weight: 1,
                 tags: HashMap::new(),
                 locality: Some("us-east/us-east-1/b".to_string()),
@@ -18099,6 +18057,7 @@ mod tests {
             targets: vec![UpstreamTarget {
                 host: "10.0.0.5".to_string(),
                 port,
+                service_port_policy_key: None,
                 weight: 1,
                 tags: HashMap::new(),
                 locality: Some("us-east/us-east-1/b".to_string()),
@@ -21935,11 +21894,10 @@ mod tests {
         // collapsed non-alnum runs to a single `-`; the first attempted fix
         // tokenized chars but wrapped tokens in `-` and trimmed, which still
         // collided (`"-"` and `"dash"`, or `(a-dash, c)` vs `(a, dash-c)`).
-        // Materialize merges/matches proxies + upstreams by id, and
-        // `egress_service_entry_port_remap` recomputes the upstream id across
-        // every ServiceEntry, so a collision silently overwrites one entry and
-        // can cross-apply its targetPort/port policy. The file mesh-config path
-        // does not validate these characters, so all of these are reachable.
+        // Materialize merges/matches proxies + upstreams by id, so a collision
+        // silently overwrites one entry and can cross-apply its targetPort/port
+        // policy. The file mesh-config path does not validate these characters,
+        // so all of these are reachable.
         let host = "ext.example.com";
         let port = 443;
 
@@ -22180,11 +22138,11 @@ mod tests {
     }
 
     #[test]
-    fn destination_rule_egress_service_entry_rekeys_port_policy_to_target_port() {
+    fn destination_rule_egress_service_entry_keeps_port_policy_on_service_port() {
         // Istio DestinationRule portLevelSettings are keyed by the ServiceEntry
         // service port (443), while the egress upstream target dials the numeric
-        // targetPort (8443). The port-level TLS policy must be stored under the
-        // dial port so dispatch applies it to the selected target.
+        // targetPort (8443). The target carries its owning service-port policy
+        // key, so the port-level TLS policy must stay under 443.
         let mut entry = test_external_service_entry(
             "dns-svc",
             vec!["primary.external.com".to_string()],
@@ -22234,20 +22192,22 @@ mod tests {
             .expect("destination rules apply");
 
         let upstream = &config.upstreams[0];
+        assert_eq!(upstream.targets[0].port, 8443);
+        assert_eq!(upstream.targets[0].dispatch_policy_port(), 443);
         assert!(
-            upstream.port_overrides.contains_key(&8443),
-            "service-port policy must be re-keyed onto targetPort 8443, got {:?}",
+            upstream.port_overrides.contains_key(&443),
+            "service-port policy must stay under service port 443, got {:?}",
             upstream.port_overrides.keys().collect::<Vec<_>>()
         );
         assert!(
-            !upstream.port_overrides.contains_key(&443),
-            "policy must not remain under service port 443"
+            !upstream.port_overrides.contains_key(&8443),
+            "policy must not be keyed by targetPort 8443"
         );
         let tls = upstream
             .port_overrides
-            .get(&8443)
+            .get(&443)
             .and_then(|slot| slot.tls.as_ref())
-            .expect("targetPort override carries resolved TLS policy");
+            .expect("service-port override carries resolved TLS policy");
         assert_eq!(
             tls.server_ca_cert_path.as_deref(),
             Some("/etc/certs/primary-ca.pem")
@@ -23014,6 +22974,115 @@ mod tests {
     }
 
     #[test]
+    fn egress_stream_service_entry_policy_uses_service_port_when_dial_ports_overlap() {
+        // Two stream ServiceEntry ports can legitimately dial the same backend
+        // port: `5432 -> targetPort 15432` and a separate service port `15432`.
+        // Policy must stay keyed by the owning ServiceEntry port, not by the
+        // shared dial port, or the two ports cross-apply each other's settings.
+        let entry = ServiceEntry {
+            name: "multi-db".to_string(),
+            namespace: "default".to_string(),
+            hosts: vec!["db.vendor.com".to_string()],
+            endpoints: Vec::new(),
+            resolution: Resolution::Dns,
+            location: ServiceEntryLocation::MeshExternal,
+            ports: vec![
+                ServicePort {
+                    port: 5432,
+                    protocol: AppProtocol::Postgres,
+                    name: Some("primary".to_string()),
+                    target_port: Some(ServiceTargetPort::Number(15432)),
+                },
+                ServicePort {
+                    port: 15432,
+                    protocol: AppProtocol::Postgres,
+                    name: Some("admin".to_string()),
+                    target_port: None,
+                },
+            ],
+            export_to: Vec::new(),
+            workload_selector: None,
+        };
+
+        let (_, upstreams) = build_egress_proxies_and_upstreams(
+            std::slice::from_ref(&entry),
+            "default",
+            &std::collections::HashSet::new(),
+            true,
+            false,
+        );
+        let mut config = GatewayConfig {
+            upstreams,
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            service_entries: vec![entry],
+            destination_rules: vec![MeshDestinationRule {
+                name: "db-policy".to_string(),
+                namespace: "default".to_string(),
+                host: "db.vendor.com".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::from([
+                    (
+                        5432u16,
+                        MeshTrafficPolicy {
+                            connect_timeout_ms: Some(1111),
+                            ..MeshTrafficPolicy::default()
+                        },
+                    ),
+                    (
+                        15432u16,
+                        MeshTrafficPolicy {
+                            connect_timeout_ms: Some(2222),
+                            ..MeshTrafficPolicy::default()
+                        },
+                    ),
+                ]),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let upstream_5432 = config
+            .upstreams
+            .iter()
+            .find(|u| u.id.ends_with("-5432"))
+            .expect("service port 5432 upstream");
+        assert_eq!(upstream_5432.targets[0].port, 15432);
+        assert_eq!(upstream_5432.targets[0].dispatch_policy_port(), 5432);
+        assert_eq!(
+            upstream_5432
+                .port_overrides
+                .get(&5432)
+                .and_then(|slot| slot.connect_timeout_ms),
+            Some(1111)
+        );
+        assert!(
+            !upstream_5432.port_overrides.contains_key(&15432),
+            "the distinct service port 15432 policy must not leak onto 5432"
+        );
+
+        let upstream_15432 = config
+            .upstreams
+            .iter()
+            .find(|u| u.id.ends_with("-15432"))
+            .expect("service port 15432 upstream");
+        assert_eq!(upstream_15432.targets[0].port, 15432);
+        assert_eq!(upstream_15432.targets[0].dispatch_policy_port(), 15432);
+        assert_eq!(
+            upstream_15432
+                .port_overrides
+                .get(&15432)
+                .and_then(|slot| slot.connect_timeout_ms),
+            Some(2222)
+        );
+    }
+
+    #[test]
     fn egress_static_service_entry_honors_numeric_target_port_for_named_port() {
         // A STATIC ServiceEntry with a NAMED port + numeric targetPort whose
         // endpoints carry no per-endpoint port map for that name must still dial
@@ -23063,11 +23132,11 @@ mod tests {
     }
 
     #[test]
-    fn service_discovery_upstream_rekeys_port_policy_to_numeric_target_port() {
+    fn service_discovery_upstream_keeps_port_policy_on_service_port_for_numeric_target_port() {
         // A mesh service-discovery upstream for a Service with port 80 ->
         // targetPort 8080 resolves its targets to 8080 at runtime; a DR
-        // portLevelSettings keyed on 80 must be re-keyed to 8080 so dispatch
-        // (which keys overrides by the dial port) applies it (round-12 F2).
+        // portLevelSettings keyed on 80 must stay under 80 because discovered
+        // targets map their resolved dial port back to the owning Service port.
         let mut upstream = destination_rule_test_upstream(
             "reviews.default.svc.cluster.local",
             "reviews.default.svc.cluster.local",
@@ -23122,13 +23191,106 @@ mod tests {
 
         let upstream = &config.upstreams[0];
         assert!(
-            upstream.port_overrides.contains_key(&8080),
-            "port-level policy must be re-keyed onto the dial port 8080, got {:?}",
+            upstream.port_overrides.contains_key(&80),
+            "port-level policy must stay under service port 80, got {:?}",
             upstream.port_overrides.keys().collect::<Vec<_>>()
         );
         assert!(
-            !upstream.port_overrides.contains_key(&80),
-            "policy must not stay under the service port 80"
+            !upstream.port_overrides.contains_key(&8080),
+            "policy must not be keyed by the resolved dial port 8080"
+        );
+    }
+
+    #[test]
+    fn service_discovery_static_fallback_limits_policy_to_requested_port() {
+        // A static fallback target on a mesh-SD upstream cannot carry the
+        // serde-skipped service-port policy key that runtime-discovered mesh
+        // targets carry. Keep the Service-port slot for discovered targets and
+        // also seed the static fallback's dispatch policy port, but only for the
+        // SD upstream's selected Service port (including the omitted-port default
+        // to the service's first declared port). A sibling Service-port entry must
+        // not leak onto the fallback just because it shares the fallback's dial
+        // port number.
+        let mut upstream = destination_rule_test_upstream(
+            "reviews.default.svc.cluster.local",
+            "reviews.default.svc.cluster.local",
+        );
+        upstream.service_discovery = Some(crate::config::types::ServiceDiscoveryConfig {
+            provider: crate::config::types::SdProvider::Mesh,
+            dns_sd: None,
+            kubernetes: None,
+            consul: None,
+            mesh: Some(crate::config::types::MeshSdConfig {
+                service_name: "reviews".to_string(),
+                namespace: Some("default".to_string()),
+                port: None,
+                poll_interval_seconds: 30,
+            }),
+            default_weight: 1,
+        });
+        let mut config = GatewayConfig {
+            upstreams: vec![upstream],
+            ..GatewayConfig::default()
+        };
+
+        let mut svc = http_mesh_service(
+            "reviews",
+            80,
+            "spiffe://cluster.local/ns/default/sa/reviews",
+        );
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(8080));
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            services: vec![svc],
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::from([
+                    (
+                        80u16,
+                        MeshTrafficPolicy {
+                            max_connections: Some(7),
+                            ..MeshTrafficPolicy::default()
+                        },
+                    ),
+                    (
+                        81u16,
+                        MeshTrafficPolicy {
+                            max_connections: Some(11),
+                            ..MeshTrafficPolicy::default()
+                        },
+                    ),
+                ]),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let upstream = &config.upstreams[0];
+        assert!(
+            upstream.port_overrides.contains_key(&80),
+            "discovered mesh targets still need the service-port policy slot"
+        );
+        assert_eq!(
+            upstream
+                .port_overrides
+                .get(&8080)
+                .and_then(|slot| slot.max_connections),
+            Some(7),
+            "static fallback target dispatches by its dial port 8080 for the requested service port"
+        );
+        assert_eq!(
+            upstream
+                .port_overrides
+                .get(&81)
+                .and_then(|slot| slot.max_connections),
+            Some(11),
+            "sibling service-port policy remains under its own explicit slot"
         );
     }
 

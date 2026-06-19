@@ -5203,6 +5203,7 @@ mod tests {
         UpstreamTarget {
             host: "backend.example".to_string(),
             port,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,

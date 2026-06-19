@@ -621,17 +621,17 @@ impl ResolvedPortOverride {
 pub(crate) fn dispatch_port_override_fallback_from_upstream(
     upstream: &Upstream,
 ) -> Option<ResolvedPortOverride> {
-    // TOP-LEVEL `connectionPool.http` overlay ONLY (#1806 narrowed; follow-up #1816).
+    // TOP-LEVEL `connectionPool.http` overlay ONLY.
     // An explicit per-port `portLevelSettings` still WINS via the dispatch-time
-    // per-port lookup (by resolved dial port) in `resolve_effective_proxy_for_target`.
+    // per-port lookup in `resolve_effective_proxy_for_target`: discovered mesh
+    // targets carry their owning declared Service port in
+    // `UpstreamTarget.service_port_policy_key`, while ordinary targets key by
+    // their resolved dial port.
     // We deliberately do NOT fold the upstream's `port_overrides` into this fallback:
     // a multi-port upstream would cross-leak one port's `connectionPool.http` onto a
-    // different port (codex r3). The residual — applying an EXPLICIT per-port value to
-    // an SD upstream whose NAMED `targetPort` resolves to a different dial port (so the
-    // per-port lookup misses and only this top-level fallback is consulted) — is a
-    // DEFERRED accepted limitation (see #1816), as is immediate route-rebuild on a
-    // DR-only edit (a `#[serde(skip)]` DR-derived field, like the established per-port
-    // `dispatch_port_overrides`).
+    // different port (codex r3). Immediate route-rebuild on a DR-only edit remains
+    // tracked separately because this is a `#[serde(skip)]` DR-derived field, like
+    // the established per-port `dispatch_port_overrides`.
     upstream
         .dispatch_port_override_fallback
         .as_ref()
@@ -712,6 +712,14 @@ impl ResolvedSubsetTrafficPolicy {
 pub struct UpstreamTarget {
     pub host: String,
     pub port: u16,
+    /// Internal DestinationRule policy key for discovered mesh targets whose
+    /// declared Service port differs from the resolved workload dial port.
+    ///
+    /// `port` remains the actual connection destination. This field is derived
+    /// during materialization and skipped by serde so file/admin config cannot
+    /// set it.
+    #[serde(default, skip)]
+    pub service_port_policy_key: Option<u16>,
     #[serde(default = "default_weight")]
     pub weight: u32,
     #[serde(default)]
@@ -723,6 +731,18 @@ pub struct UpstreamTarget {
     /// target is selected by the load balancer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+}
+
+impl UpstreamTarget {
+    /// DestinationRule `portLevelSettings` key that governs this target.
+    ///
+    /// Static targets and ordinary discovery targets use their dial port. Mesh
+    /// Service discovery can stamp the owning declared Service port when
+    /// Kubernetes `targetPort` resolves to a different workload port.
+    #[inline]
+    pub fn dispatch_policy_port(&self) -> u16 {
+        self.service_port_policy_key.unwrap_or(self.port)
+    }
 }
 
 /// Parsed locality preference used by the load balancer.
@@ -2380,18 +2400,15 @@ fn proxy_retry_cap_for_port(proxy: &Proxy, port: u16) -> Option<u32> {
 /// whether retry disables HBONE / SVID-mTLS dispatch.
 ///
 /// The conflicting target's dispatch port (`conflict.port`) drives the per-port
-/// cap. It is `None` for mesh service discovery (discovered targets — and thus
-/// their dispatch ports — are not present at admission), but the runtime's
+/// cap. It is `Some` for static targets and for mesh service-discovery upstreams
+/// whose selected declared Service port is known at admission. It remains `None`
+/// when admission cannot prove a concrete policy port, but the runtime's
 /// [`crate::proxy::cap_proxy_retry_for_target`] still applies the top-level
 /// service-discovery `connectionPool.http.maxRetries` overlay
-/// (`Proxy.dispatch_port_override_fallback`) to EVERY discovered target whose
+/// (`Proxy.dispatch_port_override_fallback`) to every discovered target whose
 /// per-port lookup misses. So a top-level DestinationRule `maxRetries = 0` on a
 /// mesh SD upstream disarms retry for every discovered target at dispatch time
-/// and must NOT be rejected here even though no concrete port is known yet.
-/// Likewise an operator who caps `dispatch_port_overrides[mesh_port].max_retries
-/// = 0` makes `cap_proxy_retry_for_target` zero `max_retries` for that target at
-/// runtime, so retry never engages and HBONE is not disabled — that config must
-/// also NOT be rejected.
+/// and must NOT be rejected here even when no concrete port is known yet.
 pub(crate) fn retry_is_effective_for_mesh_target(
     proxy: &Proxy,
     retry: Option<&RetryConfig>,
@@ -2405,11 +2422,11 @@ pub(crate) fn retry_is_effective_for_mesh_target(
         return false;
     }
     // Mirror `cap_proxy_retry_for_target`'s field-level fallback: the per-port
-    // `max_retries` for the selected port wins when present, otherwise the
-    // service-discovery top-level overlay (`dispatch_port_override_fallback`) is
-    // inherited. For an SD upstream `conflict.port` is `None` (no concrete port),
-    // so only the top-level fallback can be proven to govern — but it governs
-    // every discovered target, so honoring it here matches the runtime.
+    // `max_retries` for the selected policy port wins when present, otherwise
+    // the service-discovery top-level overlay (`dispatch_port_override_fallback`)
+    // is inherited. When no policy port is known, only the top-level fallback can
+    // be proven to govern — but it governs every discovered target, so honoring
+    // it here matches the runtime.
     let cap = conflict
         .port
         .and_then(|port| proxy_retry_cap_for_port(proxy, port))
@@ -2427,6 +2444,26 @@ pub(crate) fn retry_is_effective_for_mesh_target(
     }
 }
 
+fn mesh_sd_policy_port(
+    upstream: &Upstream,
+    mesh_model: Option<&crate::modes::mesh::config::MeshConfig>,
+) -> Option<u16> {
+    let mesh_sd = upstream.service_discovery.as_ref()?.mesh.as_ref()?;
+    if let Some(port) = mesh_sd.port {
+        return Some(port);
+    }
+    let namespace = mesh_sd.namespace.as_deref().unwrap_or(&upstream.namespace);
+    mesh_model?
+        .services
+        .iter()
+        .find(|service| {
+            service.name.as_str() == mesh_sd.service_name.as_str()
+                && service.namespace.as_str() == namespace
+        })
+        .and_then(|service| service.ports.first())
+        .map(|port| port.port)
+}
+
 /// Every mesh transport an upstream's selected targets require.
 ///
 /// Returns one [`MeshTransportConflict`] per selectable target that needs a mesh
@@ -2437,7 +2474,7 @@ pub(crate) fn retry_is_effective_for_mesh_target(
 /// boolish truthiness (`true`/`yes`/`on`/`1`) the dispatch path actually honors.
 ///
 /// Every selectable mesh target is returned (not just the first) because the load
-/// balancer can pick any of them, and each target's port carries its own
+/// balancer can pick any of them, and each target's policy port carries its own
 /// `cap_proxy_retry_for_target` cap: a config that zeroes retry on one mesh
 /// target's port but leaves another mesh target uncapped still 502s when the LB
 /// selects the uncapped one. Callers pair this with
@@ -2446,9 +2483,10 @@ pub(crate) fn retry_is_effective_for_mesh_target(
 /// Mesh service-discovery upstreams (`service_discovery.provider = Mesh`) are
 /// treated as HBONE-requiring even with no static targets, because discovered
 /// targets are stamped `mesh.hbone=true` by the mesh discoverer.
-pub(crate) fn upstream_required_mesh_transports(
+fn upstream_required_mesh_transports(
     upstream: &Upstream,
     selected_subset: Option<&str>,
+    mesh_model: Option<&crate::modes::mesh::config::MeshConfig>,
 ) -> Vec<MeshTransportConflict> {
     // Mesh service-discovery upstreams publish HBONE-required targets
     // dynamically; their static `targets` list is typically empty at admission.
@@ -2457,16 +2495,14 @@ pub(crate) fn upstream_required_mesh_transports(
         .as_ref()
         .is_some_and(|sd| sd.provider == SdProvider::Mesh)
     {
+        let policy_port = mesh_sd_policy_port(upstream, mesh_model);
         return vec![MeshTransportConflict {
             transport: "mesh.hbone",
             detail: "mesh service discovery".to_string(),
-            // Discovered targets (and thus their concrete dispatch ports) are not
-            // present at admission, so no PER-PORT cap can be proven here. The
-            // top-level SD `connectionPool.http.maxRetries` overlay
-            // (`dispatch_port_override_fallback`) still governs every discovered
-            // port at runtime, so `retry_is_effective_for_mesh_target` consults it
-            // for this `port: None` conflict.
-            port: None,
+            // Mirror mesh service discovery: explicit `mesh.port` wins, otherwise
+            // the first declared Service port owns the discovered targets. If no
+            // mesh model is available here, fall back to top-level SD policy only.
+            port: policy_port,
         }];
     }
 
@@ -2497,7 +2533,7 @@ pub(crate) fn upstream_required_mesh_transports(
             conflicts.push(MeshTransportConflict {
                 transport,
                 detail: format!("target '{}:{}'", target.host, target.port),
-                port: Some(target.port),
+                port: Some(target.dispatch_policy_port()),
             });
         }
     }
@@ -2514,14 +2550,15 @@ pub(crate) fn upstream_required_mesh_transports(
 /// caps retry for that target's port, and only then does an effective retry
 /// disable HBONE/SVID-mTLS dispatch. Because the LB may select *any* mesh target,
 /// the conflict is reported when *any* selectable mesh target survives its cap.
-pub(crate) fn first_effective_mesh_transport_conflict(
+pub(crate) fn first_effective_mesh_transport_conflict_with_mesh(
     proxy: &Proxy,
     upstream: &Upstream,
     selected_subset: Option<&str>,
     retry: Option<&RetryConfig>,
     allowed_methods: Option<&[String]>,
+    mesh_model: Option<&crate::modes::mesh::config::MeshConfig>,
 ) -> Option<MeshTransportConflict> {
-    upstream_required_mesh_transports(upstream, selected_subset)
+    upstream_required_mesh_transports(upstream, selected_subset, mesh_model)
         .into_iter()
         .find(|conflict| {
             retry_is_effective_for_mesh_target(proxy, retry, allowed_methods, conflict)
@@ -2568,10 +2605,11 @@ pub(crate) struct MeshTransportConflict {
     /// Human-readable source of the requirement (a target or `mesh service
     /// discovery`).
     detail: String,
-    /// The dispatch port of the conflicting static target, when known. `None`
-    /// for mesh service-discovery upstreams whose targets are not yet present.
-    /// Callers use this to apply the same per-port retry cap the runtime applies
-    /// via [`crate::proxy::cap_proxy_retry_for_target`] before treating retry as
+    /// The dispatch policy port of the conflicting target, when known. Mesh
+    /// service discovery can provide this before targets exist when admission
+    /// has the selected declared Service port. Callers use this to apply the
+    /// same per-port retry cap the runtime applies via
+    /// [`crate::proxy::cap_proxy_retry_for_target`] before treating retry as
     /// effective for this target.
     port: Option<u16>,
 }
@@ -3179,12 +3217,13 @@ impl GatewayConfig {
                                 ));
                             }
                         }
-                        if let Some(required) = first_effective_mesh_transport_conflict(
+                        if let Some(required) = first_effective_mesh_transport_conflict_with_mesh(
                             proxy,
                             upstream,
                             proxy.upstream_subset.as_deref(),
                             proxy.retry.as_ref(),
                             proxy.allowed_methods.as_deref(),
+                            self.mesh.as_deref(),
                         ) {
                             errors.push(mesh_transport_retry_conflict_message(
                                 &proxy.id, uid, &required,
@@ -3210,7 +3249,7 @@ impl GatewayConfig {
             // runtime applies via `route_override_retry` before dispatch).
             for override_dest in self.mesh_route_dispatch_override_destinations(proxy) {
                 if let Some(upstream) = upstreams_by_id.get(override_dest.upstream_id.as_str())
-                    && let Some(required) = first_effective_mesh_transport_conflict(
+                    && let Some(required) = first_effective_mesh_transport_conflict_with_mesh(
                         // The runtime recomputes `dispatch_port_overrides` from the
                         // OVERRIDE destination upstream when a rule swaps the
                         // upstream (`apply_route_overrides_inner`), so the per-port
@@ -3221,6 +3260,7 @@ impl GatewayConfig {
                         override_dest.selected_subset.as_deref(),
                         override_dest.effective_retry.as_ref(),
                         proxy.allowed_methods.as_deref(),
+                        self.mesh.as_deref(),
                     )
                 {
                     errors.push(mesh_transport_retry_conflict_message(

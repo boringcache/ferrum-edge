@@ -2,7 +2,9 @@
 
 use chrono::Utc;
 use dashmap::DashMap;
-use ferrum_edge::config::types::{GatewayConfig, LoadBalancerAlgorithm, Upstream, UpstreamTarget};
+use ferrum_edge::config::types::{
+    GatewayConfig, LoadBalancerAlgorithm, Upstream, UpstreamPortOverride, UpstreamTarget,
+};
 use ferrum_edge::load_balancer::{
     HealthContext, LoadBalancer, LoadBalancerCache, target_host_port_key,
 };
@@ -25,6 +27,7 @@ fn make_targets(n: usize) -> Vec<UpstreamTarget> {
         .map(|i| UpstreamTarget {
             host: format!("host{}", i),
             port: 8080,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,
@@ -38,6 +41,7 @@ fn make_weighted_targets() -> Vec<UpstreamTarget> {
         UpstreamTarget {
             host: "heavy".into(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 5,
             tags: HashMap::new(),
             locality: None,
@@ -46,6 +50,7 @@ fn make_weighted_targets() -> Vec<UpstreamTarget> {
         UpstreamTarget {
             host: "light".into(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::new(),
             locality: None,
@@ -914,6 +919,7 @@ fn test_least_latency_record_for_nonexistent_target() {
     let phantom = UpstreamTarget {
         host: "nonexistent".into(),
         port: 9999,
+        service_port_policy_key: None,
         weight: 1,
         tags: HashMap::new(),
         locality: None,
@@ -1171,6 +1177,142 @@ fn make_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
 }
 
 #[test]
+fn port_override_lanes_use_target_policy_port_not_dial_port() {
+    let mut upstream = make_upstream(
+        "u1",
+        vec![
+            UpstreamTarget {
+                host: "10.0.0.1".into(),
+                port: 8080,
+                service_port_policy_key: Some(80),
+                weight: 1,
+                tags: HashMap::new(),
+                locality: None,
+                path: None,
+            },
+            UpstreamTarget {
+                host: "10.0.0.1".into(),
+                port: 8080,
+                service_port_policy_key: Some(81),
+                weight: 1,
+                tags: HashMap::new(),
+                locality: None,
+                path: None,
+            },
+        ],
+    );
+    upstream.port_overrides = HashMap::from([
+        (
+            80,
+            UpstreamPortOverride {
+                algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+                ..UpstreamPortOverride::default()
+            },
+        ),
+        (
+            81,
+            UpstreamPortOverride {
+                algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+                ..UpstreamPortOverride::default()
+            },
+        ),
+    ]);
+    let cache = LoadBalancerCache::new(&GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    });
+    let snapshot = cache.load();
+
+    assert!(LoadBalancerCache::has_port_override_state_from(
+        &snapshot, "u1", 80
+    ));
+    assert!(LoadBalancerCache::has_port_override_state_from(
+        &snapshot, "u1", 81
+    ));
+
+    let p80 =
+        LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "", 80, None).unwrap();
+    let p81 =
+        LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "", 81, None).unwrap();
+
+    assert_eq!(p80.target.port, 8080);
+    assert_eq!(p81.target.port, 8080);
+    assert_eq!(p80.target.service_port_policy_key, Some(80));
+    assert_eq!(p81.target.service_port_policy_key, Some(81));
+}
+
+#[test]
+fn port_override_retry_exclusion_uses_policy_port_identity() {
+    let mut upstream = make_upstream(
+        "u1",
+        vec![
+            UpstreamTarget {
+                host: "10.0.0.1".into(),
+                port: 8080,
+                service_port_policy_key: Some(80),
+                weight: 1,
+                tags: HashMap::new(),
+                locality: None,
+                path: None,
+            },
+            UpstreamTarget {
+                host: "10.0.0.1".into(),
+                port: 8080,
+                service_port_policy_key: Some(81),
+                weight: 1,
+                tags: HashMap::new(),
+                locality: None,
+                path: None,
+            },
+        ],
+    );
+    upstream.port_overrides = HashMap::from([
+        (
+            80,
+            UpstreamPortOverride {
+                algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+                ..UpstreamPortOverride::default()
+            },
+        ),
+        (
+            81,
+            UpstreamPortOverride {
+                algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+                ..UpstreamPortOverride::default()
+            },
+        ),
+    ]);
+    let cache = LoadBalancerCache::new(&GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    });
+    let snapshot = cache.load();
+    let failed = UpstreamTarget {
+        host: "10.0.0.1".into(),
+        port: 8080,
+        service_port_policy_key: Some(81),
+        weight: 1,
+        tags: HashMap::new(),
+        locality: None,
+        path: None,
+    };
+
+    assert!(
+        LoadBalancerCache::select_next_target_for_port_from(
+            &snapshot, "u1", "retry", 81, &failed, None,
+        )
+        .is_none(),
+        "the failed target is the only target in policy lane 81"
+    );
+    let other_lane = LoadBalancerCache::select_next_target_for_port_from(
+        &snapshot, "u1", "retry", 80, &failed, None,
+    )
+    .expect("the sibling policy lane remains selectable");
+    assert_eq!(other_lane.port, 8080);
+    assert_eq!(other_lane.service_port_policy_key, Some(80));
+}
+
+#[test]
 fn test_apply_delta_add_upstream() {
     let config = GatewayConfig::default();
     let cache = LoadBalancerCache::new(&config);
@@ -1225,6 +1367,7 @@ fn test_apply_delta_modify_upstream_targets() {
     let new_target = UpstreamTarget {
         host: "new-backend".into(),
         port: 9999,
+        service_port_policy_key: None,
         weight: 1,
         tags: HashMap::new(),
         locality: None,
@@ -1405,6 +1548,7 @@ fn test_wrr_all_zero_weights_falls_back_to_round_robin() {
         UpstreamTarget {
             host: "a".into(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 0,
             tags: HashMap::new(),
             locality: None,
@@ -1413,6 +1557,7 @@ fn test_wrr_all_zero_weights_falls_back_to_round_robin() {
         UpstreamTarget {
             host: "b".into(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 0,
             tags: HashMap::new(),
             locality: None,
@@ -1444,6 +1589,7 @@ fn test_wrr_mixed_zero_and_nonzero_weights() {
         UpstreamTarget {
             host: "weighted".into(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 10,
             tags: HashMap::new(),
             locality: None,
@@ -1452,6 +1598,7 @@ fn test_wrr_mixed_zero_and_nonzero_weights() {
         UpstreamTarget {
             host: "zero".into(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 0,
             tags: HashMap::new(),
             locality: None,
@@ -1860,6 +2007,7 @@ fn passthrough_ejection_cap_scoped_to_candidate_pool_not_whole_upstream() {
     let mut t0 = UpstreamTarget {
         host: "10.0.0.1".into(),
         port: 8080,
+        service_port_policy_key: None,
         weight: 1,
         tags: HashMap::new(),
         locality: None,
@@ -1872,6 +2020,7 @@ fn passthrough_ejection_cap_scoped_to_candidate_pool_not_whole_upstream() {
             let mut t = UpstreamTarget {
                 host: format!("10.0.0.{i}"),
                 port: 8080,
+                service_port_policy_key: None,
                 weight: 1,
                 tags: HashMap::new(),
                 locality: None,
@@ -1970,6 +2119,7 @@ fn make_tagged_targets() -> Vec<UpstreamTarget> {
         UpstreamTarget {
             host: "v1-a".into(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::from([("version".to_string(), "v1".to_string())]),
             locality: None,
@@ -1978,6 +2128,7 @@ fn make_tagged_targets() -> Vec<UpstreamTarget> {
         UpstreamTarget {
             host: "v1-b".into(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::from([("version".to_string(), "v1".to_string())]),
             locality: None,
@@ -1986,6 +2137,7 @@ fn make_tagged_targets() -> Vec<UpstreamTarget> {
         UpstreamTarget {
             host: "v2-a".into(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::from([("version".to_string(), "v2".to_string())]),
             locality: None,
@@ -1994,6 +2146,7 @@ fn make_tagged_targets() -> Vec<UpstreamTarget> {
         UpstreamTarget {
             host: "v2-b".into(),
             port: 8080,
+            service_port_policy_key: None,
             weight: 1,
             tags: HashMap::from([
                 ("version".to_string(), "v2".to_string()),
@@ -2336,6 +2489,7 @@ fn update_targets_preserves_existing_subsets() {
     refreshed.push(UpstreamTarget {
         host: "v2-c".into(),
         port: 8080,
+        service_port_policy_key: None,
         weight: 1,
         tags: HashMap::from([("version".to_string(), "v2".to_string())]),
         locality: None,

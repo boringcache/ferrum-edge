@@ -1201,6 +1201,10 @@ async fn validate_bundle(
 
     use crate::admin::crud::ValidationCtx;
     let vctx = ValidationCtx::from_state(state);
+    let cached_config = state.cached_gateway_config();
+    let mesh_model = cached_config
+        .as_ref()
+        .and_then(|config| config.mesh.as_deref());
     let mut failures: Vec<ValidationFailure> = Vec::new();
 
     // Upstream
@@ -1538,12 +1542,13 @@ async fn validate_bundle(
                 // `maxRetries = 0` cap on the mesh port is honored here exactly as
                 // the runtime applies it.
                 if let Some(conflict) =
-                    crate::config::types::first_effective_mesh_transport_conflict(
+                    crate::config::types::first_effective_mesh_transport_conflict_with_mesh(
                         &crate::config::types::proxy_with_resolved_port_caps(proxy, &upstream),
                         &upstream,
                         proxy.upstream_subset.as_deref(),
                         proxy.retry.as_ref(),
                         proxy.allowed_methods.as_deref(),
+                        mesh_model,
                     )
                 {
                     failures.push(ValidationFailure {
@@ -1565,8 +1570,15 @@ async fn validate_bundle(
         // proxy's DEFAULT upstream exists or is plain. Mirror the CRUD proxy path:
         // reject when an override destination still has an effective retry over a
         // mesh transport.
-        validate_bundle_route_override_conflicts(db, namespace, proxy, &bundle, &mut failures)
-            .await?;
+        validate_bundle_route_override_conflicts(
+            db,
+            namespace,
+            proxy,
+            &bundle,
+            mesh_model,
+            &mut failures,
+        )
+        .await?;
 
         if proxy.dispatch_kind.is_stream() {
             // Stream-family: validate port uniqueness, reserved-port conflict, and
@@ -1717,6 +1729,7 @@ async fn validate_bundle_route_override_conflicts(
     namespace: &str,
     proxy: &crate::config::types::Proxy,
     bundle: &crate::admin::api_specs::extractor::ExtractedBundle,
+    mesh_model: Option<&crate::modes::mesh::config::MeshConfig>,
     failures: &mut Vec<ValidationFailure>,
 ) -> Result<(), ApiSpecError> {
     use crate::config::types::PluginScope;
@@ -1838,12 +1851,13 @@ async fn validate_bundle_route_override_conflicts(
             };
             if let Some(upstream) = resolved
                 && let Some(conflict) =
-                    crate::config::types::first_effective_mesh_transport_conflict(
+                    crate::config::types::first_effective_mesh_transport_conflict_with_mesh(
                         &crate::config::types::proxy_with_resolved_port_caps(proxy, &upstream),
                         &upstream,
                         selected_subset,
                         effective_retry.as_ref(),
                         proxy.allowed_methods.as_deref(),
+                        mesh_model,
                     )
             {
                 failures.push(ValidationFailure {

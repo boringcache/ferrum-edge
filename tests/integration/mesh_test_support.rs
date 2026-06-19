@@ -392,6 +392,7 @@ pub fn http_upstream(id: &str, host: &str, port: u16) -> Upstream {
         targets: vec![UpstreamTarget {
             host: host.to_string(),
             port,
+            service_port_policy_key: None,
             weight: MAX_TARGET_WEIGHT.min(1),
             tags: HashMap::new(),
             locality: None,
