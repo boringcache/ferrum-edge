@@ -21622,7 +21622,7 @@ fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::types::PluginAssociation;
+    use crate::config::types::{LoadBalancerAlgorithm, PluginAssociation};
     use crate::plugins::security_headers::SecurityHeaders;
     use async_trait::async_trait;
     use http::header::HeaderValue;
