@@ -1242,6 +1242,77 @@ fn port_override_lanes_use_target_policy_port_not_dial_port() {
 }
 
 #[test]
+fn port_override_retry_exclusion_uses_policy_port_identity() {
+    let mut upstream = make_upstream(
+        "u1",
+        vec![
+            UpstreamTarget {
+                host: "10.0.0.1".into(),
+                port: 8080,
+                service_port_policy_key: Some(80),
+                weight: 1,
+                tags: HashMap::new(),
+                locality: None,
+                path: None,
+            },
+            UpstreamTarget {
+                host: "10.0.0.1".into(),
+                port: 8080,
+                service_port_policy_key: Some(81),
+                weight: 1,
+                tags: HashMap::new(),
+                locality: None,
+                path: None,
+            },
+        ],
+    );
+    upstream.port_overrides = HashMap::from([
+        (
+            80,
+            UpstreamPortOverride {
+                algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+                ..UpstreamPortOverride::default()
+            },
+        ),
+        (
+            81,
+            UpstreamPortOverride {
+                algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+                ..UpstreamPortOverride::default()
+            },
+        ),
+    ]);
+    let cache = LoadBalancerCache::new(&GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    });
+    let snapshot = cache.load();
+    let failed = UpstreamTarget {
+        host: "10.0.0.1".into(),
+        port: 8080,
+        service_port_policy_key: Some(81),
+        weight: 1,
+        tags: HashMap::new(),
+        locality: None,
+        path: None,
+    };
+
+    assert!(
+        LoadBalancerCache::select_next_target_for_port_from(
+            &snapshot, "u1", "retry", 81, &failed, None,
+        )
+        .is_none(),
+        "the failed target is the only target in policy lane 81"
+    );
+    let other_lane = LoadBalancerCache::select_next_target_for_port_from(
+        &snapshot, "u1", "retry", 80, &failed, None,
+    )
+    .expect("the sibling policy lane remains selectable");
+    assert_eq!(other_lane.port, 8080);
+    assert_eq!(other_lane.service_port_policy_key, Some(80));
+}
+
+#[test]
 fn test_apply_delta_add_upstream() {
     let config = GatewayConfig::default();
     let cache = LoadBalancerCache::new(&config);

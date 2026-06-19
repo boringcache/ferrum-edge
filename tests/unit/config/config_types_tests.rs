@@ -1,11 +1,14 @@
 use chrono::Utc;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, Consumer, DispatchKind, GatewayConfig,
-    LocalityPreference, PluginAssociation, PluginConfig, PluginScope, Proxy,
-    ResolvedSubsetTrafficPolicy, RetryConfig, Upstream, UpstreamPortOverride, UpstreamTarget,
-    hosts_overlap, validate_host_entry, validate_resource_id, wildcard_matches,
+    LocalityPreference, MeshSdConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
+    ResolvedPortOverride, ResolvedSubsetTrafficPolicy, RetryConfig, SdProvider,
+    ServiceDiscoveryConfig, Upstream, UpstreamPortOverride, UpstreamTarget, hosts_overlap,
+    validate_host_entry, validate_resource_id, wildcard_matches,
 };
-use ferrum_edge::modes::mesh::config::{MeshTracingConfig, TracingProvider};
+use ferrum_edge::modes::mesh::config::{
+    AppProtocol, MeshConfig, MeshService, MeshTracingConfig, ServicePort, TracingProvider,
+};
 use std::collections::HashMap;
 
 /// Helper to create a minimal proxy with required fields.
@@ -2007,6 +2010,85 @@ fn retry_proxy_allows_when_every_mesh_target_port_is_capped_to_zero() {
     assert!(
         config.validate_upstream_references().is_ok(),
         "every mesh target's retry is capped to zero; no 502 path remains"
+    );
+}
+
+#[test]
+fn retry_proxy_allows_mesh_target_when_policy_port_cap_zeroes_retry() {
+    let mut upstream = make_upstream("mesh-upstream");
+    upstream.targets = vec![mesh_target("a.local", 8080)];
+    upstream.targets[0].service_port_policy_key = Some(80);
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    proxy.dispatch_port_overrides = Some(HashMap::from([(
+        80_u16,
+        ResolvedPortOverride {
+            max_retries: Some(0),
+            ..ResolvedPortOverride::default()
+        },
+    )]));
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "the static target dials 8080 but retry is capped by declared Service port 80"
+    );
+}
+
+#[test]
+fn retry_proxy_allows_mesh_service_discovery_when_selected_policy_port_caps_retry() {
+    let namespace = ferrum_edge::config::types::default_namespace();
+    let mut upstream = make_upstream("mesh-sd-upstream");
+    upstream.targets.clear();
+    upstream.service_discovery = Some(ServiceDiscoveryConfig {
+        provider: SdProvider::Mesh,
+        dns_sd: None,
+        kubernetes: None,
+        consul: None,
+        mesh: Some(MeshSdConfig {
+            service_name: "reviews".into(),
+            namespace: None,
+            port: None,
+            poll_interval_seconds: 30,
+        }),
+        default_weight: 1,
+    });
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("mesh-sd-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    proxy.dispatch_port_overrides = Some(HashMap::from([(
+        80_u16,
+        ResolvedPortOverride {
+            max_retries: Some(0),
+            ..ResolvedPortOverride::default()
+        },
+    )]));
+    let mut config = empty_config();
+    config.mesh = Some(Box::new(MeshConfig {
+        services: vec![MeshService {
+            name: "reviews".into(),
+            namespace,
+            ports: vec![ServicePort {
+                port: 80,
+                protocol: AppProtocol::Http,
+                name: Some("http".into()),
+                target_port: None,
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: HashMap::new(),
+            cluster_ips: Vec::new(),
+        }],
+        ..MeshConfig::default()
+    }));
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "omitted mesh.port selects Service port 80, whose cap disarms retry before HBONE dispatch"
     );
 }
 

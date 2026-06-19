@@ -1096,6 +1096,13 @@ pub(crate) fn write_target_host_port_key(buf: &mut String, target: &UpstreamTarg
     let _ = write!(buf, "{}:{}", target.host, target.port);
 }
 
+#[inline]
+fn retry_exclude_target_matches(target: &UpstreamTarget, exclude: &UpstreamTarget) -> bool {
+    target.host == exclude.host
+        && target.port == exclude.port
+        && target.dispatch_policy_port() == exclude.dispatch_policy_port()
+}
+
 /// Build the pre-computed locality-LB state from an operator's
 /// `UpstreamLocalityLbSetting` against the upstream's `source_locality`.
 ///
@@ -3482,7 +3489,7 @@ impl LoadBalancer {
         let exclude_idx = self
             .targets
             .iter()
-            .position(|t| t.host == exclude.host && t.port == exclude.port);
+            .position(|t| retry_exclude_target_matches(t, exclude));
 
         // For >128 targets, fall back to Vec-based path.
         if n > MAX_BITSET_TARGETS {
@@ -3537,7 +3544,7 @@ impl LoadBalancer {
         let exclude_idx = self
             .targets
             .iter()
-            .position(|t| t.host == exclude.host && t.port == exclude.port);
+            .position(|t| retry_exclude_target_matches(t, exclude));
 
         if n > MAX_BITSET_TARGETS {
             return self.select_excluding_port_vec_fallback(
@@ -3613,7 +3620,7 @@ impl LoadBalancer {
         let exclude_idx = self
             .targets
             .iter()
-            .position(|t| t.host == exclude.host && t.port == exclude.port);
+            .position(|t| retry_exclude_target_matches(t, exclude));
 
         if n > MAX_BITSET_TARGETS {
             return self.select_excluding_subset_vec_fallback(
@@ -3685,7 +3692,7 @@ impl LoadBalancer {
         let exclude_idx = self
             .targets
             .iter()
-            .position(|t| t.host == exclude.host && t.port == exclude.port);
+            .position(|t| retry_exclude_target_matches(t, exclude));
 
         if n > MAX_BITSET_TARGETS {
             return self.select_excluding_port_subset_vec_fallback(
