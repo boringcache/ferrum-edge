@@ -275,6 +275,7 @@ struct H3ProbeOutcome {
 struct HboneProbeTarget<'a> {
     host: &'a str,
     port: u16,
+    policy_port: u16,
     hbone_port: u16,
     /// Pinned destination identity for the probe handshake (mirrors dispatch).
     expected_peer: Option<&'a crate::identity::SpiffeId>,
@@ -4757,6 +4758,7 @@ impl ProxyState {
                 HboneProbeTarget {
                     host,
                     port,
+                    policy_port: target.dispatch_policy_port,
                     hbone_port: target.hbone_port,
                     expected_peer: target.hbone_expected_peer.as_ref(),
                     previous_hbone,
@@ -4896,13 +4898,21 @@ impl ProxyState {
                         probe_proxy,
                         host,
                         port,
+                        target.policy_port,
                         hbone_port,
                         target.expected_peer,
                     )
                     .await
             } else {
                 self.hbone_pool
-                    .warmup_connection(probe_proxy, host, port, hbone_port, target.expected_peer)
+                    .warmup_connection(
+                        probe_proxy,
+                        host,
+                        port,
+                        target.policy_port,
+                        hbone_port,
+                        target.expected_peer,
+                    )
                     .await
             }
         };
@@ -8404,6 +8414,7 @@ async fn connect_mesh_websocket_backend(
                     proxy,
                     &target.host,
                     target.port,
+                    target.dispatch_policy_port(),
                     mtls_port,
                     &authority,
                     path_and_query,
@@ -8442,6 +8453,7 @@ async fn connect_mesh_websocket_backend(
                     hbone_port,
                     &target.host,
                     target.port,
+                    target.dispatch_policy_port(),
                     expected_peer.as_ref(),
                 )
                 .await?;
@@ -11811,11 +11823,15 @@ async fn handle_proxy_request_inner(
     // the H3 frontend so both paths classify requests identically.
     let is_h2_ws = is_h2_websocket_connect(&req);
     let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
-    let grpc_web_request = req
+    let grpc_web_response_content_type = req
         .headers()
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(crate::plugins::grpc_web::is_grpc_web_content_type);
+        .and_then(|ct| {
+            crate::plugins::grpc_web::is_grpc_web_content_type(ct)
+                .then(|| crate::plugins::grpc_web::response_content_type(ct))
+        });
+    let grpc_web_request = grpc_web_response_content_type.is_some();
     let request_protocol = match flavor {
         HttpFlavor::WebSocket => ProxyProtocol::WebSocket,
         HttpFlavor::Grpc => ProxyProtocol::Grpc,
@@ -14007,6 +14023,23 @@ async fn handle_proxy_request_inner(
 
                 if !after_proxy_rejected {
                     let phase_start = Instant::now();
+                    // Keep buffered gRPC-Web conversion keyed to the original
+                    // request when the hook-visible response headers are still
+                    // native gRPC. The grpc_web body transform relies on this
+                    // relabel before it embeds terminal trailers in the body.
+                    if let Some(grpc_web_ct) = grpc_web_response_content_type
+                        && plugins.iter().any(|plugin| plugin.name() == "grpc_web")
+                        && plugin_response_headers
+                            .get("content-type")
+                            .is_some_and(|ct| {
+                                crate::proxy::backend_dispatch::is_native_grpc_content_type(
+                                    ct.as_bytes(),
+                                )
+                            })
+                    {
+                        plugin_response_headers
+                            .insert("content-type".to_string(), grpc_web_ct.to_string());
+                    }
                     let content_type = plugin_response_headers.get("content-type").cloned();
                     let ct_ref = content_type.as_deref();
                     for plugin in plugins.iter() {
@@ -19043,6 +19076,7 @@ async fn proxy_to_backend_hbone(
             proxy,
             &target.host,
             target.port,
+            target.dispatch_policy_port(),
             hbone_port,
             expected_peer.as_ref(),
         )
@@ -19528,7 +19562,14 @@ async fn proxy_to_backend_mesh_mtls(
     let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
     let mut sender = match state
         .mesh_mtls_pool
-        .get_sender(proxy, &target.host, target.port, mtls_port, &expected_peer)
+        .get_sender(
+            proxy,
+            &target.host,
+            target.port,
+            target.dispatch_policy_port(),
+            mtls_port,
+            &expected_peer,
+        )
         .await
     {
         Ok(sender) => sender,

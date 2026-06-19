@@ -919,6 +919,7 @@ async fn run_udp_egress_session(
                 hbone_port,
                 &target.host,
                 target.port,
+                target.dispatch_policy_port(),
                 expected_peer.as_ref(),
             )
             .await
@@ -958,7 +959,14 @@ async fn run_udp_egress_session(
         let mtls_port = crate::proxy::mesh_mtls_pool::target_mesh_mtls_port(&target);
         match state
             .mesh_mtls_pool
-            .open_datagram_tunnel(proxy, &target.host, target.port, mtls_port, &expected_peer)
+            .open_datagram_tunnel(
+                proxy,
+                &target.host,
+                target.port,
+                target.dispatch_policy_port(),
+                mtls_port,
+                &expected_peer,
+            )
             .await
         {
             Ok(tunnel) => tunnel,

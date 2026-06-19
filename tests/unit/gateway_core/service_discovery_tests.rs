@@ -452,6 +452,14 @@ fn test_targets_equal_different_content() {
 }
 
 #[test]
+fn test_targets_equal_different_policy_port() {
+    let mut a = vec![make_target("h1", 8080)];
+    a[0].service_port_policy_key = Some(80);
+    let b = vec![make_target("h1", 8080)];
+    assert!(!ferrum_edge::service_discovery::targets_equal(&a, &b));
+}
+
+#[test]
 fn test_targets_equal_empty() {
     let a: Vec<UpstreamTarget> = vec![];
     let b: Vec<UpstreamTarget> = vec![];

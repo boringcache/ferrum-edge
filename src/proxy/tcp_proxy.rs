@@ -1435,6 +1435,7 @@ async fn run_tcp_accept_loop(
 struct TcpConnParams {
     backend_host: String,
     backend_port: u16,
+    backend_policy_port: u16,
     backend_scheme: BackendScheme,
     dns_override: Option<String>,
     dns_cache_ttl_seconds: Option<u64>,
@@ -1857,7 +1858,8 @@ async fn handle_tcp_connection_inner(
         stream_ctx.proxy_name = proxy.name.clone();
         stream_ctx.backend_scheme = proxy.effective_scheme();
 
-        let (backend_host, backend_port) = resolve_backend_target(proxy, &epoch.load_balancer)?;
+        let (backend_host, backend_port, backend_policy_port) =
+            resolve_backend_target(proxy, &epoch.load_balancer)?;
 
         // Populate backend target as soon as it's known — even if DNS or connect fails,
         // the log will show which target was attempted.
@@ -1883,13 +1885,14 @@ async fn handle_tcp_connection_inner(
         let port_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&backend_port));
+            .and_then(|m| m.get(&backend_policy_port));
         let effective_backend_connect_timeout_ms = port_override
             .and_then(|override_config| override_config.connect_timeout_ms)
             .unwrap_or(proxy.backend_connect_timeout_ms);
         let params = TcpConnParams {
             backend_host,
             backend_port,
+            backend_policy_port,
             backend_scheme: proxy.effective_scheme(),
             dns_override: proxy.dns_override.clone(),
             dns_cache_ttl_seconds: proxy.dns_cache_ttl_seconds,
@@ -2094,7 +2097,7 @@ async fn handle_tcp_connection_inner(
         // the passthrough path. The cap is checked before connect so we don't
         // count failed handshakes against the cap. The guard's RAII drop
         // covers every relay exit (graceful EOF, idle timeout, error).
-        let passthrough_port_override = resolve_port_override(&params, params.backend_port);
+        let passthrough_port_override = resolve_port_override(&params, params.backend_policy_port);
         let _backend_inflight_guard = match acquire_backend_inflight_slot(
             passthrough_port_override,
             metrics,
@@ -2426,6 +2429,7 @@ async fn handle_tcp_connection_inner(
     let max_retries = params.retry.as_ref().map(|r| r.max_retries).unwrap_or(0);
     let mut current_host = params.backend_host.clone();
     let mut current_port = params.backend_port;
+    let mut current_policy_port = params.backend_policy_port;
     let mut current_cb_info = cb_info;
     let mut last_connect_err: Option<anyhow::Error> = None;
 
@@ -2465,6 +2469,7 @@ async fn handle_tcp_connection_inner(
                             );
                             current_host = next.0;
                             current_port = next.1;
+                            current_policy_port = next.2;
                             current_cb_info = TcpConnCbInfo {
                                 cb_config: current_cb_info.cb_config.clone(),
                                 cb_target_key: params.upstream_id.as_ref().map(|_| {
@@ -2524,6 +2529,7 @@ async fn handle_tcp_connection_inner(
                     );
                     current_host = next.0;
                     current_port = next.1;
+                    current_policy_port = next.2;
                     current_cb_info = TcpConnCbInfo {
                         cb_config: current_cb_info.cb_config.clone(),
                         cb_target_key: params.upstream_id.as_ref().map(|_| {
@@ -2559,7 +2565,7 @@ async fn handle_tcp_connection_inner(
         // target counts against the new target's counter, not the failed
         // one. `_backend_inflight_guard_attempt` is shadowed at every loop
         // entry — only the latest successful guard survives past the `break`.
-        let current_port_override = resolve_port_override(&params, current_port);
+        let current_port_override = resolve_port_override(&params, current_policy_port);
         let backend_inflight_guard_attempt = match acquire_backend_inflight_slot(
             current_port_override,
             metrics,
@@ -2597,6 +2603,7 @@ async fn handle_tcp_connection_inner(
                 {
                     current_host = next.0;
                     current_port = next.1;
+                    current_policy_port = next.2;
                     current_cb_info = TcpConnCbInfo {
                         cb_config: current_cb_info.cb_config.clone(),
                         cb_target_key: params.upstream_id.as_ref().map(|_| {
@@ -2688,6 +2695,7 @@ async fn handle_tcp_connection_inner(
                     );
                     current_host = next.0;
                     current_port = next.1;
+                    current_policy_port = next.2;
                     current_cb_info = TcpConnCbInfo {
                         cb_config: current_cb_info.cb_config.clone(),
                         cb_target_key: params.upstream_id.as_ref().map(|_| {
@@ -3004,7 +3012,7 @@ fn enforce_mesh_tcp_outbound_target(
 fn resolve_backend_target(
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
-) -> Result<(String, u16), anyhow::Error> {
+) -> Result<(String, u16, u16), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
         let selection = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
             LoadBalancerCache::select_target_subset_from(
@@ -3025,9 +3033,17 @@ fn resolve_backend_target(
                 .unwrap_or_else(|| format!("for upstream {upstream_id}"));
             StreamSetupError::new(StreamSetupKind::NoHealthyTargets, scope).into()
         })?;
-        Ok((selection.target.host.clone(), selection.target.port))
+        Ok((
+            selection.target.host.clone(),
+            selection.target.port,
+            selection.target.dispatch_policy_port(),
+        ))
     } else {
-        Ok((proxy.backend_host.clone(), proxy.backend_port))
+        Ok((
+            proxy.backend_host.clone(),
+            proxy.backend_port,
+            proxy.backend_port,
+        ))
     }
 }
 
@@ -3099,6 +3115,7 @@ mod backend_target_selection_tests {
         TcpConnParams {
             backend_host: "allowed.local".to_string(),
             backend_port: 5432,
+            backend_policy_port: 5432,
             backend_scheme: BackendScheme::Tcp,
             dns_override: None,
             dns_cache_ttl_seconds: None,
@@ -3135,10 +3152,12 @@ mod backend_target_selection_tests {
         let snapshot = cache.load();
         let proxy = proxy_with_subset(Some("canary"));
 
-        let (host, port) = resolve_backend_target(&proxy, &snapshot).expect("target selected");
+        let (host, port, policy_port) =
+            resolve_backend_target(&proxy, &snapshot).expect("target selected");
 
         assert_eq!(host, "canary.local");
         assert_eq!(port, 1002);
+        assert_eq!(policy_port, 1002);
     }
 
     #[test]
@@ -3184,7 +3203,7 @@ mod backend_target_selection_tests {
         let params = retry_params();
         let enforcement = enforcement(&["allowed.local:5432"]);
 
-        let (host, port) = try_next_enforced_target(
+        let (host, port, policy_port) = try_next_enforced_target(
             &params,
             "allowed.local",
             5432,
@@ -3199,6 +3218,7 @@ mod backend_target_selection_tests {
 
         assert_eq!(host, "blocked.local");
         assert_eq!(port, 5432);
+        assert_eq!(policy_port, 5432);
     }
 }
 
@@ -3223,7 +3243,7 @@ fn try_next_target(
     current_host: &str,
     current_port: u16,
     lb_snapshot: &LoadBalancerCacheInner,
-) -> Option<(String, u16)> {
+) -> Option<(String, u16, u16)> {
     let upstream_id = params.upstream_id.as_ref()?;
     let exclude = crate::config::types::UpstreamTarget {
         host: current_host.to_string(),
@@ -3252,7 +3272,7 @@ fn try_next_target(
             None,
         )
     }?;
-    Some((next.host.clone(), next.port))
+    Some((next.host.clone(), next.port, next.dispatch_policy_port()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3265,8 +3285,8 @@ fn try_next_enforced_target(
     listen_port: u16,
     proxy_id: &str,
     client_ip: IpAddr,
-) -> Result<Option<(String, u16)>, anyhow::Error> {
-    let Some((next_host, next_port)) =
+) -> Result<Option<(String, u16, u16)>, anyhow::Error> {
+    let Some((next_host, next_port, next_policy_port)) =
         try_next_target(params, current_host, current_port, lb_snapshot)
     else {
         return Ok(None);
@@ -3280,7 +3300,7 @@ fn try_next_enforced_target(
         proxy_id,
         client_ip,
     )?;
-    Ok(Some((next_host, next_port)))
+    Ok(Some((next_host, next_port, next_policy_port)))
 }
 
 fn resolve_port_override(

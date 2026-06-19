@@ -4396,10 +4396,11 @@ fn apply_destination_rules(
                 // The `port_overrides` key(s) this Service-port-scoped entry
                 // must land on. Targets that carry `service_port_policy_key`
                 // dispatch policy by their owning declared Service port, not
-                // by the resolved dial port. Older owner-gated stream targets
-                // that do not carry that identity keep the historical fan-out
-                // to every dial port because their relay paths still read
-                // policy by the dialed app port.
+                // by the resolved dial port. Static fallback targets on a mesh
+                // service-discovery upstream cannot carry that serde-skipped
+                // field, so SD upstreams keep the Service-port slot for
+                // discovered mesh targets and also seed present static target
+                // policy ports.
                 let store_ports: Vec<u16> = if let Some(owning_port) =
                     outbound_upstream_owner_port.get(&upstream.id)
                 {
@@ -4425,8 +4426,15 @@ fn apply_destination_rules(
                         dial_ports.sort_unstable();
                         dial_ports
                     }
-                } else if upstream_policy_ports.contains(port) || has_service_discovery {
+                } else if upstream_policy_ports.contains(port) {
                     vec![*port]
+                } else if has_service_discovery {
+                    let mut ports = Vec::with_capacity(upstream_policy_ports.len() + 1);
+                    ports.push(*port);
+                    ports.extend(upstream_policy_ports.iter().copied());
+                    ports.sort_unstable();
+                    ports.dedup();
+                    ports
                 } else {
                     warn!(
                         rule = %dr.name,
@@ -23172,6 +23180,78 @@ mod tests {
         assert!(
             !upstream.port_overrides.contains_key(&8080),
             "policy must not be keyed by the resolved dial port 8080"
+        );
+    }
+
+    #[test]
+    fn service_discovery_static_fallback_keeps_policy_on_dial_port() {
+        // A static fallback target on a mesh-SD upstream cannot carry the
+        // serde-skipped service-port policy key that runtime-discovered mesh
+        // targets carry. Keep the Service-port slot for discovered targets and
+        // also seed the static fallback's dispatch policy port.
+        let mut upstream = destination_rule_test_upstream(
+            "reviews.default.svc.cluster.local",
+            "reviews.default.svc.cluster.local",
+        );
+        upstream.service_discovery = Some(crate::config::types::ServiceDiscoveryConfig {
+            provider: crate::config::types::SdProvider::Mesh,
+            dns_sd: None,
+            kubernetes: None,
+            consul: None,
+            mesh: Some(crate::config::types::MeshSdConfig {
+                service_name: "reviews".to_string(),
+                namespace: Some("default".to_string()),
+                port: None,
+                poll_interval_seconds: 30,
+            }),
+            default_weight: 1,
+        });
+        let mut config = GatewayConfig {
+            upstreams: vec![upstream],
+            ..GatewayConfig::default()
+        };
+
+        let mut svc = http_mesh_service(
+            "reviews",
+            80,
+            "spiffe://cluster.local/ns/default/sa/reviews",
+        );
+        svc.ports[0].target_port = Some(ServiceTargetPort::Number(8080));
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            services: vec![svc],
+            destination_rules: vec![MeshDestinationRule {
+                name: "reviews".to_string(),
+                namespace: "default".to_string(),
+                host: "reviews.default.svc.cluster.local".to_string(),
+                traffic_policy: None,
+                port_level_settings: HashMap::from([(
+                    80u16,
+                    MeshTrafficPolicy {
+                        max_connections: Some(7),
+                        ..MeshTrafficPolicy::default()
+                    },
+                )]),
+                subsets: Vec::new(),
+            }],
+            ..MeshSlice::default()
+        };
+
+        apply_destination_rules(&mut config, &test_mesh_runtime_config(), &slice)
+            .expect("destination rules apply");
+
+        let upstream = &config.upstreams[0];
+        assert!(
+            upstream.port_overrides.contains_key(&80),
+            "discovered mesh targets still need the service-port policy slot"
+        );
+        assert_eq!(
+            upstream
+                .port_overrides
+                .get(&8080)
+                .and_then(|slot| slot.max_connections),
+            Some(7),
+            "static fallback target dispatches by its dial port 8080"
         );
     }
 

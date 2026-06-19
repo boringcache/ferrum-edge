@@ -247,6 +247,7 @@ impl HboneConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         target_port: u16,
+        target_policy_port: u16,
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
     ) -> Result<(), HbonePoolError> {
@@ -281,6 +282,7 @@ impl HboneConnectionPool {
                 proxy,
                 target_host,
                 target_port,
+                target_policy_port,
                 hbone_port,
                 expected_peer,
                 &key,
@@ -477,6 +479,7 @@ impl HboneConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         target_port: u16,
+        target_policy_port: u16,
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
@@ -511,6 +514,7 @@ impl HboneConnectionPool {
                 proxy,
                 target_host,
                 target_port,
+                target_policy_port,
                 hbone_port,
                 expected_peer,
                 &key,
@@ -569,6 +573,7 @@ impl HboneConnectionPool {
         hbone_port: u16,
         app_host: &str,
         app_port: u16,
+        app_policy_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
         let (source_identity, _fingerprint) = self.current_svid_identity_cached()?;
@@ -578,7 +583,7 @@ impl HboneConnectionPool {
         let keepalive_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&app_port))
+            .and_then(|m| m.get(&app_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
@@ -639,6 +644,7 @@ impl HboneConnectionPool {
         hbone_port: u16,
         app_host: &str,
         app_port: u16,
+        app_policy_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
         let (source_identity, _fingerprint) = self.current_svid_identity_cached()?;
@@ -655,7 +661,7 @@ impl HboneConnectionPool {
         let port_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&app_port));
+            .and_then(|m| m.get(&app_policy_port));
         let keepalive_override = port_override.and_then(|o| o.tcp_keepalive.as_ref());
         let effective_connect_timeout_ms = port_override
             .and_then(|o| o.connect_timeout_ms)
@@ -711,6 +717,7 @@ impl HboneConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         target_port: u16,
+        target_policy_port: u16,
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
     ) -> Result<(), HbonePoolError> {
@@ -723,6 +730,7 @@ impl HboneConnectionPool {
                 hbone_port,
                 target_host,
                 target_port,
+                target_policy_port,
                 expected_peer,
             )
             .await?;
@@ -735,6 +743,7 @@ impl HboneConnectionPool {
         proxy: &Proxy,
         target_host: &str,
         target_port: u16,
+        target_policy_port: u16,
         hbone_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
         key: &str,
@@ -862,7 +871,7 @@ impl HboneConnectionPool {
         let keepalive_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&target_port))
+            .and_then(|m| m.get(&target_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
         let sender = match tokio::time::timeout(
             remaining,
