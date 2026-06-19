@@ -396,11 +396,11 @@ pub(crate) fn select_upstream_target(
 
 #[inline]
 pub(crate) fn initial_dispatch_port(proxy: &Proxy, upstream_port_override: u16) -> u16 {
-    if proxy.backend_port != 0 {
-        return proxy.backend_port;
+    if upstream_port_override != 0 {
+        return upstream_port_override;
     }
 
-    upstream_port_override
+    proxy.backend_port
 }
 
 #[inline]
@@ -1189,6 +1189,18 @@ mod tests {
 
         assert_eq!(initial_dispatch_port(&proxy, 0), 0);
         assert_eq!(initial_dispatch_port(&proxy, 8080), 8080);
+
+        proxy.backend_port = 9090;
+        assert_eq!(
+            initial_dispatch_port(&proxy, 8080),
+            8080,
+            "a full-coverage upstream policy lane beats the proxy template backend_port"
+        );
+        assert_eq!(
+            initial_dispatch_port(&proxy, 0),
+            9090,
+            "without a full-coverage lane, the proxy template backend_port remains the fallback"
+        );
     }
 
     #[tokio::test]
@@ -1236,6 +1248,62 @@ mod tests {
 
         assert_eq!(selection.lb_hash_key.as_deref(), Some("alice"));
         assert_eq!(selection.target.as_ref().map(|t| t.port), Some(8080));
+    }
+
+    #[tokio::test]
+    async fn upstream_selection_prefers_policy_port_lane_over_template_backend_port() {
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "consumers": [],
+                "plugin_configs": [],
+                "proxies": [{
+                    "id": "mesh-egress",
+                    "listen_path": "/",
+                    "backend_scheme": "http",
+                    "backend_host": "unused.local",
+                    "backend_port": 8080,
+                    "upstream_id": "mesh-upstream"
+                }],
+                "upstreams": [{
+                    "id": "mesh-upstream",
+                    "targets": [
+                        {"host": "10.0.0.1", "port": 8080},
+                        {"host": "10.0.0.2", "port": 8080}
+                    ],
+                    "algorithm": "round_robin",
+                    "port_overrides": {
+                        "80": {
+                            "algorithm": "consistent_hashing",
+                            "hash_on": "header:x-user"
+                        }
+                    }
+                }]
+            }))
+            .expect("test config should deserialize");
+        for target in &mut config.upstreams[0].targets {
+            target.service_port_policy_key = Some(80);
+        }
+        config.normalize_fields();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let (state, _) = crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+            .expect("test proxy state should build");
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+        let mut headers = HashMap::new();
+        headers.insert("x-user".to_string(), "alice".to_string());
+
+        let selection = select_upstream_target(proxy, &state, &epoch, "192.0.2.10", &headers, None);
+
+        let target = selection.target.as_ref().expect("target selected");
+        assert_eq!(
+            selection.lb_hash_key.as_deref(),
+            Some("alice"),
+            "selection must use the service-port lane policy, not the proxy template backend_port"
+        );
+        assert_eq!(target.port, 8080);
+        assert_eq!(target.dispatch_policy_port(), 80);
     }
 
     #[tokio::test]

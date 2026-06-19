@@ -3644,7 +3644,7 @@ fn materialize_mesh_outbound_tcp_upstreams(
             // Dial the workload's own (canonicalized) IP, not the VIP.
             host: spec.canonical_ip.to_string(),
             port: spec.target_port,
-            service_port_policy_key: None,
+            service_port_policy_key: Some(spec.service_port.port),
             weight: 1,
             tags,
             locality: spec.workload.locality.clone(),
@@ -4200,6 +4200,24 @@ fn mesh_outbound_route_upstream(
 
 // ── DestinationRule application ────────────────────────────────────────
 
+/// Return the Service port a mesh-SD upstream will select when discovery runs.
+/// This mirrors `MeshServiceDiscoverer::selected_service_port` for apply-time
+/// policy projection before the dynamic targets exist.
+fn mesh_sd_selected_service_port(upstream: &Upstream, mesh_slice: &MeshSlice) -> Option<u16> {
+    let mesh = upstream.service_discovery.as_ref()?.mesh.as_ref()?;
+    if let Some(port) = mesh.port {
+        return Some(port);
+    }
+
+    let namespace = mesh.namespace.as_deref().unwrap_or(&upstream.namespace);
+    mesh_slice
+        .services
+        .iter()
+        .find(|svc| svc.name == mesh.service_name && svc.namespace == namespace)
+        .and_then(|svc| svc.ports.first())
+        .map(|port| port.port)
+}
+
 /// Apply DestinationRule traffic policies onto matching upstreams.
 ///
 /// For each DestinationRule, we find upstreams whose targets match the DR
@@ -4309,11 +4327,7 @@ fn apply_destination_rules(
                 .map(UpstreamTarget::dispatch_policy_port)
                 .collect();
             let has_service_discovery = upstream.service_discovery.is_some();
-            let mesh_sd_requested_port = upstream
-                .service_discovery
-                .as_ref()
-                .and_then(|sd| sd.mesh.as_ref())
-                .and_then(|mesh| mesh.port);
+            let mesh_sd_selected_port = mesh_sd_selected_service_port(upstream, mesh_slice);
 
             // Top-level `connectionPool.tcp.{maxConnections,tcpKeepalive}` fan
             // out to every port served by this upstream. Per-port
@@ -4415,13 +4429,13 @@ fn apply_destination_rules(
                 } else if upstream_policy_ports.contains(port) {
                     vec![*port]
                 } else if has_service_discovery {
-                    let mut ports = Vec::with_capacity(if mesh_sd_requested_port == Some(*port) {
+                    let mut ports = Vec::with_capacity(if mesh_sd_selected_port == Some(*port) {
                         upstream_policy_ports.len() + 1
                     } else {
                         1
                     });
                     ports.push(*port);
-                    if mesh_sd_requested_port == Some(*port) {
+                    if mesh_sd_selected_port == Some(*port) {
                         ports.extend(upstream_policy_ports.iter().copied());
                     }
                     ports.sort_unstable();
@@ -12054,6 +12068,11 @@ mod tests {
                 "dials the workload pod IP, not a VIP"
             );
             assert_eq!(target.port, 6380, "dials the resolved targetPort");
+            assert_eq!(
+                target.service_port_policy_key,
+                Some(6379),
+                "per-workload raw-TCP target keeps the declared Service port for DestinationRule policy"
+            );
             assert_eq!(
                 target.tags.get(want_tag).map(String::as_str),
                 Some("true"),
@@ -23188,7 +23207,8 @@ mod tests {
         // serde-skipped service-port policy key that runtime-discovered mesh
         // targets carry. Keep the Service-port slot for discovered targets and
         // also seed the static fallback's dispatch policy port, but only for the
-        // SD upstream's requested Service port. A sibling Service-port entry must
+        // SD upstream's selected Service port (including the omitted-port default
+        // to the service's first declared port). A sibling Service-port entry must
         // not leak onto the fallback just because it shares the fallback's dial
         // port number.
         let mut upstream = destination_rule_test_upstream(
@@ -23203,7 +23223,7 @@ mod tests {
             mesh: Some(crate::config::types::MeshSdConfig {
                 service_name: "reviews".to_string(),
                 namespace: Some("default".to_string()),
-                port: Some(80),
+                port: None,
                 poll_interval_seconds: 30,
             }),
             default_weight: 1,
