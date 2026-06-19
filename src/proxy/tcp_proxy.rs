@@ -3055,6 +3055,7 @@ fn resolve_backend_target(
 #[cfg(test)]
 mod backend_target_selection_tests {
     use super::*;
+    use crate::config::types::UpstreamTarget;
     use serde_json::json;
     use std::collections::HashMap;
 
