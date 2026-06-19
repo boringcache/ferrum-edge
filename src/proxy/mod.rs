@@ -16443,12 +16443,31 @@ pub(crate) fn resolve_backend_connection_proxy_for_target<'a>(
     upstream_target: Option<&UpstreamTarget>,
 ) -> std::borrow::Cow<'a, Proxy> {
     let mut effective = resolve_effective_proxy_for_target(proxy, upstream_target);
-    if let Some(target) = upstream_target
-        && (effective.backend_host != target.host || effective.backend_port != target.port)
-    {
-        let owned = effective.to_mut();
-        owned.backend_host = target.host.clone();
-        owned.backend_port = target.port;
+    if let Some(target) = upstream_target {
+        let policy_port = target.dispatch_policy_port();
+        if policy_port != target.port
+            && let Some(policy_override) = effective
+                .dispatch_port_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.get(&policy_port))
+                .cloned()
+        {
+            // Direct H2 and gRPC pools receive only this effective proxy, then
+            // look up socket keepalive by `proxy.backend_port`. Mirror the selected
+            // service-port policy onto that dial port in the per-dispatch clone so
+            // targetPort remaps keep the dial address and policy identity distinct
+            // without changing the serialized proxy or global projected map.
+            effective
+                .to_mut()
+                .dispatch_port_overrides
+                .get_or_insert_with(HashMap::new)
+                .insert(target.port, policy_override);
+        }
+        if effective.backend_host != target.host || effective.backend_port != target.port {
+            let owned = effective.to_mut();
+            owned.backend_host = target.host.clone();
+            owned.backend_port = target.port;
+        }
     }
     effective
 }
@@ -27534,6 +27553,50 @@ mod tests {
         assert_eq!(effective.backend_port, 9090);
         assert_eq!(effective.backend_connect_timeout_ms, 750);
         assert_eq!(proxy.backend_connect_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn resolve_backend_connection_proxy_aliases_policy_port_override_to_dial_port() {
+        let mut proxy = proxy_with_port_overrides_for_test(5000, &[]);
+        let keepalive = crate::config::types::TcpKeepaliveCfg {
+            time_seconds: Some(31),
+            interval_seconds: Some(7),
+            probes: Some(3),
+        };
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            443u16,
+            crate::config::types::ResolvedPortOverride {
+                connect_timeout_ms: Some(750),
+                tcp_keepalive: Some(keepalive.clone()),
+                ..Default::default()
+            },
+        )]));
+        let target = target_for_test_with_policy_port(8443, 443);
+
+        let effective = resolve_backend_connection_proxy_for_target(&proxy, Some(&target));
+
+        assert!(
+            matches!(effective, std::borrow::Cow::Owned(_)),
+            "targetPort policy-port remap must clone for pool-backed dispatch"
+        );
+        assert_eq!(effective.backend_port, 8443);
+        assert_eq!(effective.backend_connect_timeout_ms, 750);
+        assert_eq!(
+            effective
+                .dispatch_port_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.get(&8443))
+                .and_then(|slot| slot.tcp_keepalive.as_ref()),
+            Some(&keepalive),
+            "direct H2/gRPC pools look up keepalive by backend_port, so the selected policy-port slot must be mirrored onto the dial port"
+        );
+        assert!(
+            proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .is_some_and(|overrides| !overrides.contains_key(&8443)),
+            "the alias is per-dispatch only and must not mutate the projected proxy map"
+        );
     }
 
     #[test]

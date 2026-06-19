@@ -4303,21 +4303,17 @@ fn apply_destination_rules(
                 apply_traffic_policy_to_upstream(upstream, policy, runtime)?;
             }
 
-            // Build a set of ports actually exposed by this upstream's
-            // targets. Used to filter phantom DR entries whose port is not
-            // served by any backend — misconfigured DRs (typo in port
-            // number) would otherwise silently bloat
-            // `Upstream.port_overrides`. Upstreams using service discovery
-            // resolve target ports at runtime, so we keep all entries when
-            // service_discovery is configured.
-            let upstream_target_ports: std::collections::HashSet<u16> =
-                upstream.targets.iter().map(|t| t.port).collect();
             let upstream_policy_ports: std::collections::HashSet<u16> = upstream
                 .targets
                 .iter()
                 .map(UpstreamTarget::dispatch_policy_port)
                 .collect();
             let has_service_discovery = upstream.service_discovery.is_some();
+            let mesh_sd_requested_port = upstream
+                .service_discovery
+                .as_ref()
+                .and_then(|sd| sd.mesh.as_ref())
+                .and_then(|mesh| mesh.port);
 
             // Top-level `connectionPool.tcp.{maxConnections,tcpKeepalive}` fan
             // out to every port served by this upstream. Per-port
@@ -4397,10 +4393,11 @@ fn apply_destination_rules(
                 // must land on. Targets that carry `service_port_policy_key`
                 // dispatch policy by their owning declared Service port, not
                 // by the resolved dial port. Static fallback targets on a mesh
-                // service-discovery upstream cannot carry that serde-skipped
-                // field, so SD upstreams keep the Service-port slot for
-                // discovered mesh targets and also seed present static target
-                // policy ports.
+                // service-discovery upstream can still dispatch by their dial
+                // port, but only the SD upstream's requested Service-port entry
+                // may seed those fallback slots. Sibling DR entries must not
+                // leak onto this upstream merely because their service port
+                // number appears as a fallback target's dial port.
                 let store_ports: Vec<u16> = if let Some(owning_port) =
                     outbound_upstream_owner_port.get(&upstream.id)
                 {
@@ -4414,24 +4411,19 @@ fn apply_destination_rules(
                         );
                         continue;
                     }
-                    let raw_relay_owner = upstream.id.starts_with("__mesh-out-tcp-upstream-")
-                        || upstream.id.starts_with("__mesh-out-udp-upstream-");
-                    if (!raw_relay_owner && upstream_policy_ports.contains(port))
-                        || upstream_target_ports.is_empty()
-                    {
-                        vec![*port]
-                    } else {
-                        let mut dial_ports: Vec<u16> =
-                            upstream_target_ports.iter().copied().collect();
-                        dial_ports.sort_unstable();
-                        dial_ports
-                    }
+                    vec![*port]
                 } else if upstream_policy_ports.contains(port) {
                     vec![*port]
                 } else if has_service_discovery {
-                    let mut ports = Vec::with_capacity(upstream_policy_ports.len() + 1);
+                    let mut ports = Vec::with_capacity(if mesh_sd_requested_port == Some(*port) {
+                        upstream_policy_ports.len() + 1
+                    } else {
+                        1
+                    });
                     ports.push(*port);
-                    ports.extend(upstream_policy_ports.iter().copied());
+                    if mesh_sd_requested_port == Some(*port) {
+                        ports.extend(upstream_policy_ports.iter().copied());
+                    }
                     ports.sort_unstable();
                     ports.dedup();
                     ports
@@ -4595,19 +4587,26 @@ fn apply_destination_rules(
             // `hbone_pool::get_datagram_tunnel`, which reads the connect timeout
             // from `dispatch_port_overrides` (projected from `port_overrides`) and
             // otherwise falls back to the relay proxy's hardcoded default. Seed the
-            // top-level value onto each materialized target port carrying no
+            // top-level value onto each materialized target policy port carrying no
             // per-port `portLevelSettings.connectTimeout`, so the UDP relay honors
             // the operator's top-level connectTimeout instead of the 5s default.
             // Per-port entries written above already win (only unset slots are
             // seeded); other lanes are unaffected — raw-TCP relay proxies do not
             // read `dispatch_port_overrides`, and HTTP upstreams reach config
-            // proxies. Keyed by the materialized TARGET port (`get_datagram_tunnel`
-            // looks the override up by the dialed app port, not the service port).
+            // proxies. Keyed by the selected target's policy port because
+            // `get_datagram_tunnel` receives both the dial app port and the owning
+            // Service-port policy key for targetPort-remapped UDP services.
             if let Some(timeout_ms) = connect_timeout_ms
                 && upstream.id.starts_with("__mesh-out-udp-upstream-")
             {
-                let target_ports: Vec<u16> = upstream.targets.iter().map(|t| t.port).collect();
-                for port in target_ports {
+                let mut target_policy_ports: Vec<u16> = upstream
+                    .targets
+                    .iter()
+                    .map(UpstreamTarget::dispatch_policy_port)
+                    .collect();
+                target_policy_ports.sort_unstable();
+                target_policy_ports.dedup();
+                for port in target_policy_ports {
                     let slot = upstream.port_overrides.entry(port).or_default();
                     if slot.connect_timeout_ms.is_none() {
                         slot.connect_timeout_ms = Some(timeout_ms);
@@ -12121,8 +12120,8 @@ mod tests {
     #[test]
     fn mesh_outbound_tcp_upstream_receives_port_level_dr() {
         // DestinationRule portLevelSettings authored on the TCP SERVICE port
-        // fan onto the targets' dial port, exactly like the HTTP per-port
-        // upstreams (shared owner-port map in apply_destination_rules).
+        // stay under the targets' owning service-policy port while the target
+        // still dials its resolved workload port.
         let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
         let mut svc = http_mesh_service("redis", 6379, spiffe);
         svc.ports[0].protocol = AppProtocol::Redis;
@@ -12160,14 +12159,14 @@ mod tests {
         assert_eq!(
             upstream
                 .port_overrides
-                .get(&6380)
+                .get(&6379)
                 .and_then(|slot| slot.connect_timeout_ms),
             Some(4321),
-            "TCP-port portLevelSettings must land on the dial port"
+            "TCP-port portLevelSettings must land on the service policy port"
         );
         assert!(
-            !upstream.port_overrides.contains_key(&6379),
-            "per-port policy must not remain under the service port"
+            !upstream.port_overrides.contains_key(&6380),
+            "per-port policy must not be keyed by the resolved dial port"
         );
     }
 
@@ -12254,10 +12253,10 @@ mod tests {
     #[test]
     fn mesh_outbound_udp_upstream_receives_port_level_dr() {
         // DestinationRule portLevelSettings authored on a UDP SERVICE port
-        // (`port: 53, targetPort: 5353`) fan onto the targets' dial port via the
-        // shared owner-port map — the UDP per-port upstreams join that map
-        // alongside the HTTP/TCP ones (codex r3). Ambient-only: the UDP egress
-        // materializer stamps HBONE and only runs under Ambient topology.
+        // (`port: 53, targetPort: 5353`) stay under the targets' owning service
+        // policy port while the target still dials the resolved workload port.
+        // Ambient-only: the UDP egress materializer stamps HBONE and only runs
+        // under Ambient topology.
         let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
         let mut svc = http_mesh_service("dns", 53, spiffe);
         svc.ports[0].protocol = AppProtocol::Udp;
@@ -12295,14 +12294,14 @@ mod tests {
         assert_eq!(
             upstream
                 .port_overrides
-                .get(&5353)
+                .get(&53)
                 .and_then(|slot| slot.connect_timeout_ms),
             Some(4321),
-            "UDP-port portLevelSettings must land on the dial port"
+            "UDP-port portLevelSettings must land on the service policy port"
         );
         assert!(
-            !upstream.port_overrides.contains_key(&53),
-            "per-port policy must not remain under the service port"
+            !upstream.port_overrides.contains_key(&5353),
+            "per-port policy must not be keyed by the resolved dial port"
         );
     }
 
@@ -12349,11 +12348,11 @@ mod tests {
                 .find(|u| u.id == "__mesh-out-udp-upstream-default-dns-53")
                 .expect("UDP upstream")
                 .port_overrides
-                .get(&5353)
+                .get(&53)
                 .and_then(|slot| slot.connect_timeout_ms)
         };
 
-        // Top-level only: seeded onto the dial port (5353), not the service port.
+        // Top-level only: seeded onto the service policy port (53), not the dial port.
         let top_level_only = make_slice(
             Some(MeshTrafficPolicy {
                 connect_timeout_ms: Some(7777),
@@ -12364,7 +12363,7 @@ mod tests {
         assert_eq!(
             dial_timeout(&top_level_only),
             Some(7777),
-            "top-level connectTimeout must seed the UDP dial port"
+            "top-level connectTimeout must seed the UDP service policy port"
         );
 
         // Per-port portLevelSettings WINS over the top-level on the same port.
@@ -23184,11 +23183,14 @@ mod tests {
     }
 
     #[test]
-    fn service_discovery_static_fallback_keeps_policy_on_dial_port() {
+    fn service_discovery_static_fallback_limits_policy_to_requested_port() {
         // A static fallback target on a mesh-SD upstream cannot carry the
         // serde-skipped service-port policy key that runtime-discovered mesh
         // targets carry. Keep the Service-port slot for discovered targets and
-        // also seed the static fallback's dispatch policy port.
+        // also seed the static fallback's dispatch policy port, but only for the
+        // SD upstream's requested Service port. A sibling Service-port entry must
+        // not leak onto the fallback just because it shares the fallback's dial
+        // port number.
         let mut upstream = destination_rule_test_upstream(
             "reviews.default.svc.cluster.local",
             "reviews.default.svc.cluster.local",
@@ -23201,7 +23203,7 @@ mod tests {
             mesh: Some(crate::config::types::MeshSdConfig {
                 service_name: "reviews".to_string(),
                 namespace: Some("default".to_string()),
-                port: None,
+                port: Some(80),
                 poll_interval_seconds: 30,
             }),
             default_weight: 1,
@@ -23225,13 +23227,22 @@ mod tests {
                 namespace: "default".to_string(),
                 host: "reviews.default.svc.cluster.local".to_string(),
                 traffic_policy: None,
-                port_level_settings: HashMap::from([(
-                    80u16,
-                    MeshTrafficPolicy {
-                        max_connections: Some(7),
-                        ..MeshTrafficPolicy::default()
-                    },
-                )]),
+                port_level_settings: HashMap::from([
+                    (
+                        80u16,
+                        MeshTrafficPolicy {
+                            max_connections: Some(7),
+                            ..MeshTrafficPolicy::default()
+                        },
+                    ),
+                    (
+                        81u16,
+                        MeshTrafficPolicy {
+                            max_connections: Some(11),
+                            ..MeshTrafficPolicy::default()
+                        },
+                    ),
+                ]),
                 subsets: Vec::new(),
             }],
             ..MeshSlice::default()
@@ -23251,7 +23262,15 @@ mod tests {
                 .get(&8080)
                 .and_then(|slot| slot.max_connections),
             Some(7),
-            "static fallback target dispatches by its dial port 8080"
+            "static fallback target dispatches by its dial port 8080 for the requested service port"
+        );
+        assert_eq!(
+            upstream
+                .port_overrides
+                .get(&81)
+                .and_then(|slot| slot.max_connections),
+            Some(11),
+            "sibling service-port policy remains under its own explicit slot"
         );
     }
 
