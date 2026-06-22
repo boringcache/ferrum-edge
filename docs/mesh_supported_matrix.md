@@ -69,8 +69,12 @@ need them, or because they are blocked upstream / architecturally:
   handles IPv6, but the end-to-end NodeWaypoint capture path is not admitted yet:
   the in-netns listener is IPv4-loopback only and captured IPv6 egress is denied
   in `connect6`. Dual-stack **sidecar** serves IPv6 fully.
-- **UDP/DTLS per-pod authz scoping** — architectural (no UDP capture hooks);
-  mesh-wide + fail-closed is the safe invariant.
+- **UDP/DTLS per-pod authz scoping on NodeWaypoint** — architectural (no UDP
+  capture hooks); enforcing namespace/selector-scoped policies with UDP/DTLS
+  services or proxies force the NodeWaypoint UDP/DTLS path closed during config
+  preparation while the policy update still applies to supported TCP/HTTP
+  traffic. Mesh-wide UDP/DTLS policy stays supported, and Sidecar remains the
+  supported topology for workload-scoped UDP/DTLS authorization.
 - **DR `connectionPool.http.maxRequestsPerConnection`** — parsed and validated
   but **Deferred** in status; backend close-after-N-requests is unsupported, so
   it is not projected as effective policy. Use `http2MaxRequests`.
