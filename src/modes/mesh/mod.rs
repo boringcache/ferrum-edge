@@ -39,8 +39,9 @@ use crate::config::types::{
     BackendScheme, BackendTlsConfig, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm,
     MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
     PassiveHealthCheck, PluginAssociation, PluginConfig, PluginScope, Proxy,
-    ResolvedSubsetTrafficPolicy, ResponseBodyMode, SubsetDefinition, SubsetTrafficPolicy, Upstream,
-    UpstreamPortOverride, UpstreamTarget,
+    ResolvedSubsetTrafficPolicy, ResponseBodyMode, SubsetDefinition, SubsetTrafficPolicy,
+    UPSTREAM_TARGET_SERVICE_NAME_TAG, UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG,
+    UPSTREAM_TARGET_SERVICE_PORT_TAG, Upstream, UpstreamPortOverride, UpstreamTarget,
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{DpGrpcTlsReload, GrpcJwtSecret, build_dp_grpc_tls_config};
@@ -1947,7 +1948,7 @@ fn build_east_west_service_proxies_and_upstreams(
 /// remote-cluster endpoints before consuming a ref slot. Shared scaffold for
 /// the east-west and Ambient outbound target builders, which differ only in
 /// per-target port/tag policy.
-fn matched_local_service_workloads<'a>(
+pub(crate) fn matched_local_service_workloads<'a>(
     service: &crate::modes::mesh::config::MeshService,
     workloads: &'a [crate::modes::mesh::config::Workload],
     multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
@@ -2497,7 +2498,7 @@ pub(crate) fn mesh_ingress_listener_groups(
 /// [`mesh_route_direction`] / [`is_mesh_outbound_route_id`] — those predicates
 /// run on proxy ids, and a shared prefix would be a latent footgun if one were
 /// ever handed an upstream id. Parallels the east-west `__mesh-ew-upstream-` id.
-fn mesh_outbound_upstream_id(namespace: &str, name: &str, port: u16) -> String {
+pub(crate) fn mesh_outbound_upstream_id(namespace: &str, name: &str, port: u16) -> String {
     format!("__mesh-out-upstream-{namespace}-{name}-{port}").replace(['/', '.'], "-")
 }
 
@@ -6721,6 +6722,32 @@ fn sanitize_egress_host_id_part(value: &str) -> String {
     out
 }
 
+fn node_waypoint_route_upstream_for_authz(upstream_id: &str) -> bool {
+    upstream_id.starts_with("istio-vs-upstream-")
+        || upstream_id.starts_with("gwapi-route-upstream-")
+}
+
+fn push_node_waypoint_authz_cluster_domain(
+    domains: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    value: &str,
+) {
+    let domain = value.trim().trim_matches('.').to_ascii_lowercase();
+    if !domain.is_empty() && seen.insert(domain.clone()) {
+        domains.push(domain);
+    }
+}
+
+fn node_waypoint_authz_cluster_domains(primary_cluster_domain: &str) -> Vec<String> {
+    let mut domains = Vec::new();
+    let mut seen = HashSet::new();
+    push_node_waypoint_authz_cluster_domain(&mut domains, &mut seen, primary_cluster_domain);
+    let k8s_cluster_domain = resolve_ferrum_var("FERRUM_K8S_CLUSTER_DOMAIN")
+        .unwrap_or_else(|| dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string());
+    push_node_waypoint_authz_cluster_domain(&mut domains, &mut seen, &k8s_cluster_domain);
+    domains
+}
+
 fn inject_mesh_global_plugins(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -6753,9 +6780,52 @@ fn inject_mesh_global_plugins(
         .and_then(|cfg| cfg.get("trusted_hbone_assertors").cloned());
     let mut mesh_authz_config = serde_json::json!({
         "mesh_slice": mesh_slice,
+        "cluster_domain": runtime.cluster_domain,
         "trust_domain_aliases": trust_domain_aliases,
         "per_pod_policy_scoping": runtime.topology == MeshTopology::NodeWaypoint,
     });
+    if runtime.topology == MeshTopology::NodeWaypoint {
+        mesh_authz_config["cluster_domains"] =
+            serde_json::json!(node_waypoint_authz_cluster_domains(&runtime.cluster_domain));
+        let route_upstreams: Vec<_> = config
+            .upstreams
+            .iter()
+            .filter(|upstream| node_waypoint_route_upstream_for_authz(&upstream.id))
+            .map(|upstream| {
+                serde_json::json!({
+                    "id": upstream.id.clone(),
+                    "namespace": upstream.namespace.clone(),
+                    "targets": upstream.targets.iter().map(|target| {
+                        let service_port = target.service_port_policy_key.or_else(|| {
+                            target
+                                .tags
+                                .get(UPSTREAM_TARGET_SERVICE_PORT_TAG)
+                                .and_then(|value| value.parse::<u16>().ok())
+                                .filter(|port| *port != 0)
+                        });
+                        let mut target_config = serde_json::json!({
+                            "host": target.host.clone(),
+                            "port": target.port,
+                        });
+                        if let Some(service_port) = service_port {
+                            target_config["service_port"] = serde_json::json!(service_port);
+                        }
+                        if let Some(namespace) =
+                            target.tags.get(UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG)
+                        {
+                            target_config["service_namespace"] =
+                                serde_json::json!(namespace.clone());
+                        }
+                        if let Some(name) = target.tags.get(UPSTREAM_TARGET_SERVICE_NAME_TAG) {
+                            target_config["service_name"] = serde_json::json!(name.clone());
+                        }
+                        target_config
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        mesh_authz_config["node_waypoint_route_upstreams"] = serde_json::json!(route_upstreams);
+    }
     // Only thread the operator-set assertor list when present; otherwise
     // let mesh_authz fall back to its built-in defaults (ztunnel, waypoint).
     // Passing an empty array would lock baggage rewriting down entirely, so
@@ -11171,6 +11241,7 @@ mod tests {
             "FERRUM_MESH_DNS_MAX_CONCURRENT_QUERIES",
             "FERRUM_MESH_DNS_RESPONSE_CACHE_MAX_ENTRIES",
             "FERRUM_MESH_CLUSTER_DOMAIN",
+            "FERRUM_K8S_CLUSTER_DOMAIN",
             "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY",
             "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS",
             "FERRUM_MESH_SIDECAR_ENFORCED",
@@ -17996,6 +18067,88 @@ mod tests {
             .find(|plugin| plugin.id == MESH_BPF_METRICS_PLUGIN_ID)
             .expect("bpf_metrics plugin auto-injected on NodeWaypoint");
         assert_eq!(bpf_plugin.plugin_name, "__mesh_bpf_metrics");
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_threads_node_waypoint_route_upstreams_to_authz() {
+        let mut runtime = test_mesh_runtime_config();
+        runtime.topology = MeshTopology::NodeWaypoint;
+        let mut istio_route_upstream =
+            destination_rule_test_upstream("istio-vs-upstream-default-api-0", "dst");
+        istio_route_upstream.targets[0].port = 80;
+        let mut gwapi_route_upstream =
+            destination_rule_test_upstream("gwapi-route-upstream-default-api-1", "api.default");
+        gwapi_route_upstream.targets[0].port = 8080;
+        let mut custom_upstream = destination_rule_test_upstream("custom-upstream", "external");
+        custom_upstream.targets[0].port = 443;
+        let mut config = GatewayConfig {
+            upstreams: vec![istio_route_upstream, gwapi_route_upstream, custom_upstream],
+            ..GatewayConfig::default()
+        };
+
+        inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+
+        let authz = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+            .expect("mesh_authz plugin injected");
+        assert_eq!(
+            authz.config["node_waypoint_route_upstreams"],
+            serde_json::json!([
+                {
+                    "id": "istio-vs-upstream-default-api-0",
+                    "namespace": "default",
+                    "targets": [
+                        {"host": "dst", "port": 80}
+                    ]
+                },
+                {
+                    "id": "gwapi-route-upstream-default-api-1",
+                    "namespace": "default",
+                    "targets": [
+                        {"host": "api.default", "port": 8080}
+                    ]
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_threads_node_waypoint_route_cluster_domains_to_authz() {
+        with_mesh_env(&[("FERRUM_K8S_CLUSTER_DOMAIN", "corp.example")], || {
+            let mut runtime = test_mesh_runtime_config();
+            runtime.topology = MeshTopology::NodeWaypoint;
+            let mesh_slice = MeshSlice {
+                services: vec![MeshService {
+                    name: "dst".to_string(),
+                    namespace: "default".to_string(),
+                    ports: vec![ServicePort {
+                        port: 80,
+                        protocol: AppProtocol::Http,
+                        name: None,
+                        target_port: None,
+                    }],
+                    workloads: Vec::new(),
+                    protocol_overrides: HashMap::new(),
+                    cluster_ips: Vec::new(),
+                }],
+                ..MeshSlice::default()
+            };
+            let mut config = GatewayConfig::default();
+
+            inject_mesh_global_plugins(&mut config, &runtime, &mesh_slice);
+
+            let authz = config
+                .plugin_configs
+                .iter()
+                .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+                .expect("mesh_authz plugin injected");
+            assert_eq!(
+                authz.config["cluster_domains"],
+                serde_json::json!(["cluster.local", "corp.example"])
+            );
+        });
     }
 
     #[test]
