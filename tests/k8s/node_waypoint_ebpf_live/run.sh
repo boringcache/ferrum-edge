@@ -21,6 +21,7 @@ source "$SPIRE_HELPER"
 
 MESH_NS="${FERRUM_LIVE_MESH_NAMESPACE:-ferrum}"
 WORKLOAD_NS="${FERRUM_LIVE_WORKLOAD_NAMESPACE:-ferrum-ebpf-live}"
+UNMANAGED_NS="${FERRUM_LIVE_UNMANAGED_NAMESPACE:-$WORKLOAD_NS-unmanaged}"
 RELEASE="${FERRUM_LIVE_RELEASE:-ferrum-live}"
 IMAGE_REPOSITORY="${FERRUM_LIVE_IMAGE_REPOSITORY:-ferrumedge/ferrum-edge}"
 IMAGE_TAG="${FERRUM_LIVE_IMAGE_TAG:-0.9.0}"
@@ -43,6 +44,7 @@ LIVE_ASSERTIONS_FILE="${FERRUM_LIVE_ASSERTIONS_FILE:-$RESULTS_DIR/live-assertion
 LIVE_PLATFORM_PROFILE="${FERRUM_LIVE_PLATFORM_PROFILE:-kind-dual-stack-node-waypoint-ebpf}"
 LIVE_ASSERTIONS_INITIALIZED=false
 RECORDED_LIVE_ASSERTIONS=" "
+TRUSTED_KUBELET_PROBE_IPS=""
 REQUIRED_LIVE_ASSERTIONS=(
   node_waypoint.ebpf.chart_profile
   node_waypoint.ebpf.capture_ready
@@ -55,6 +57,8 @@ REQUIRED_LIVE_ASSERTIONS=(
   node_waypoint.ipv4.service_deny_cross_node
   node_waypoint.ipv4.pod_ip_bypass_guard_same_node
   node_waypoint.ipv4.pod_ip_bypass_guard_cross_node
+  node_waypoint.ipv4.direct_inbound_guard_same_node
+  node_waypoint.ipv4.direct_inbound_guard_cross_node
   node_waypoint.identity.stale_cleanup
   node_waypoint.identity.spire_chart_profile
 )
@@ -64,6 +68,7 @@ if [[ "$REQUIRE_DUAL_STACK" == "true" ]]; then
     node_waypoint.ipv6.service_allow
     node_waypoint.ipv6.service_deny
     node_waypoint.ipv6.pod_ip_bypass_guard
+    node_waypoint.ipv6.direct_inbound_guard
   )
 fi
 if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
@@ -78,6 +83,11 @@ if [[ "${FERRUM_EBPF_LIVE_ACK_DISPOSABLE:-}" != "true" ]]; then
   echo "Refusing to run against the current kube-context without FERRUM_EBPF_LIVE_ACK_DISPOSABLE=true" >&2
   exit 1
 fi
+
+helm_set_string_escape() {
+  local value="$1"
+  printf '%s' "${value//,/\\,}"
+}
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -447,9 +457,29 @@ render_chart_assertions() {
     --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR")"
   if [[ "$(grep -c "image: \"$IMAGE_REPOSITORY:$IMAGE_TAG-ebpf\"" <<<"$rendered" || true)" -lt 2 ]] ||
     ! grep -A1 "name: FERRUM_NODE_AGENT_PROXY_MODE" <<<"$rendered" | grep -q 'value: "node_waypoint"' ||
+    grep -q "name: FERRUM_NODE_AGENT_NODE_IP" <<<"$rendered" ||
+    grep -q "name: FERRUM_NODE_AGENT_NODE_IPS" <<<"$rendered" ||
     [[ "$(grep -c "name: node-waypoint-pod-registry" <<<"$rendered" || true)" -lt 4 ]]; then
-    echo "NodeWaypoint eBPF render did not normalize node-waypoint aliases" >&2
-    grep -nE 'image:|FERRUM_MESH_TOPOLOGY|FERRUM_NODE_AGENT_PROXY_MODE|node-waypoint-pod-registry' <<<"$rendered" >&2 || true
+    echo "NodeWaypoint eBPF render did not normalize node-waypoint aliases or rendered implicit probe source trust" >&2
+    grep -nE 'image:|FERRUM_MESH_TOPOLOGY|FERRUM_NODE_AGENT_PROXY_MODE|FERRUM_NODE_AGENT_NODE_IP|FERRUM_NODE_AGENT_NODE_IPS|status.hostIP|node-waypoint-pod-registry' <<<"$rendered" >&2 || true
+    exit 1
+  fi
+
+  local trusted_probe_render_ips="10.244.1.1,10.244.2.1"
+  local trusted_probe_render_ips_helm
+  trusted_probe_render_ips_helm="$(helm_set_string_escape "$trusted_probe_render_ips")"
+  rendered="$(helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set ambient.enabled=true \
+    --set ambient.captureMode=ebpf \
+    --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set nodeAgent.proxyMode=node_waypoint \
+    --set-string "nodeAgent.trustedKubeletProbeSourceIps=$trusted_probe_render_ips_helm")"
+  if ! grep -A1 "name: FERRUM_NODE_AGENT_NODE_IPS" <<<"$rendered" | grep -q "value: \"$trusted_probe_render_ips\""; then
+    echo "NodeWaypoint render did not emit explicit trusted kubelet probe source IPs" >&2
+    grep -nE 'FERRUM_NODE_AGENT_NODE_IPS|trustedKubeletProbeSourceIps' <<<"$rendered" >&2 || true
     exit 1
   fi
 
@@ -586,6 +616,21 @@ render_chart_assertions() {
 
   if helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
+    --set nodeAgent.enabled=true \
+    --set nodeAgent.captureMode=ebpf \
+    --set-string nodeAgent.env.FERRUM_NODE_AGENT_NODE_IPS=10.244.1.1 >/tmp/ferrum-node-agent-managed-probe-env-render.out 2>&1; then
+    echo "Node-agent render accepted a chart-managed probe source env override" >&2
+    cat /tmp/ferrum-node-agent-managed-probe-env-render.out >&2 || true
+    exit 1
+  fi
+  if ! grep -q "nodeAgent.env.FERRUM_NODE_AGENT_NODE_IPS is chart-managed" /tmp/ferrum-node-agent-managed-probe-env-render.out; then
+    echo "Node-agent render rejected managed probe env override without a clear error" >&2
+    cat /tmp/ferrum-node-agent-managed-probe-env-render.out >&2 || true
+    exit 1
+  fi
+
+  if helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
     --set ambient.enabled=true \
     --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
     --set nodeAgent.enabled=true \
@@ -653,6 +698,42 @@ label_nodes() {
   log "labeling test nodes"
   kubectl label node "$NODE_A" ferrum.io/live-node=a --overwrite
   kubectl label node "$NODE_B" ferrum.io/live-node=b --overwrite
+}
+
+discover_trusted_kubelet_probe_ips() {
+  log "deriving trusted kubelet probe source IPs from node PodCIDRs"
+  TRUSTED_KUBELET_PROBE_IPS="$(kubectl get node "$NODE_A" "$NODE_B" -o json | python3 -c '
+import ipaddress
+import json
+import sys
+
+data = json.load(sys.stdin)
+items = data.get("items") or [data]
+seen = set()
+out = []
+for node in items:
+    spec = node.get("spec") or {}
+    cidrs = spec.get("podCIDRs") or []
+    if not cidrs and spec.get("podCIDR"):
+        cidrs = [spec["podCIDR"]]
+    for raw in cidrs:
+        try:
+            network = ipaddress.ip_network(raw, strict=False)
+            ip = next(network.hosts())
+        except (StopIteration, ValueError):
+            continue
+        text = str(ip)
+        if text not in seen:
+            seen.add(text)
+            out.append(text)
+print(",".join(out))
+')"
+  if [[ -z "$TRUSTED_KUBELET_PROBE_IPS" ]]; then
+    echo "could not derive trusted kubelet probe source IPs from node PodCIDRs" >&2
+    kubectl get node "$NODE_A" "$NODE_B" -o json >&2 || true
+    exit 1
+  fi
+  log "trusted kubelet probe source IPs: $TRUSTED_KUBELET_PROBE_IPS"
 }
 
 node_waypoint_spiffe_template() {
@@ -737,6 +818,8 @@ install_spire_production_identity() {
 install_ferrum() {
   log "installing Ferrum chart"
   local -a identity_args=()
+  local trusted_probe_ips_helm
+  trusted_probe_ips_helm="$(helm_set_string_escape "$TRUSTED_KUBELET_PROBE_IPS")"
   if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
     local spire_id_template
     spire_id_template="$(node_waypoint_spiffe_template)"
@@ -797,6 +880,7 @@ install_ferrum() {
     --set nodeAgent.proxyMode=node_waypoint \
     --set nodeAgent.env.FERRUM_LOG_LEVEL=info \
     --set-string "nodeAgent.env.FERRUM_K8S_TRUST_DOMAIN=$TRUST_DOMAIN" \
+    --set-string "nodeAgent.trustedKubeletProbeSourceIps=$trusted_probe_ips_helm" \
     --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR" \
     --set nodeAgent.fallbackMode=fail \
     --wait \
@@ -1144,6 +1228,56 @@ apply_workloads() {
   kubectl -n "$WORKLOAD_NS" rollout status deploy/src-b --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/dst-a --timeout=3m
   kubectl -n "$WORKLOAD_NS" rollout status deploy/dst-b --timeout=3m
+
+  log "applying unmanaged direct-inbound probe workloads"
+  kubectl create namespace "$UNMANAGED_NS" --dry-run=client -o yaml | kubectl apply -f -
+  kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unmanaged-a
+  namespace: $UNMANAGED_NS
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: unmanaged-a
+  template:
+    metadata:
+      labels:
+        app: unmanaged-a
+    spec:
+      nodeSelector:
+        ferrum.io/live-node: a
+      containers:
+        - name: curl
+          image: curlimages/curl:8.10.1
+          command: ["sh", "-c", "sleep 365d"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unmanaged-b
+  namespace: $UNMANAGED_NS
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: unmanaged-b
+  template:
+    metadata:
+      labels:
+        app: unmanaged-b
+    spec:
+      nodeSelector:
+        ferrum.io/live-node: b
+      containers:
+        - name: curl
+          image: curlimages/curl:8.10.1
+          command: ["sh", "-c", "sleep 365d"]
+EOF
+  kubectl -n "$UNMANAGED_NS" rollout status deploy/unmanaged-a --timeout=3m
+  kubectl -n "$UNMANAGED_NS" rollout status deploy/unmanaged-b --timeout=3m
 }
 
 admin_bearer_token() {
@@ -1723,17 +1857,25 @@ svc_ipv6() {
   kubectl -n "$WORKLOAD_NS" get svc "$1" -o go-template='{{range .spec.clusterIPs}}{{.}}{{"\n"}}{{end}}' | grep ':' | head -n1 || true
 }
 
+curl_family_from_namespace() {
+  local namespace="$1"
+  local family="$2"
+  local deploy="$3"
+  local url="$4"
+  if [[ -n "$family" ]]; then
+    kubectl -n "$namespace" exec "deploy/$deploy" -- \
+      sh -c 'curl "$1" -g -sS -m 8 -w "\n%{http_code}" "$2"' -- "$family" "$url"
+  else
+    kubectl -n "$namespace" exec "deploy/$deploy" -- \
+      sh -c 'curl -g -sS -m 8 -w "\n%{http_code}" "$1"' -- "$url"
+  fi
+}
+
 curl_family_from() {
   local family="$1"
   local deploy="$2"
   local url="$3"
-  if [[ -n "$family" ]]; then
-    kubectl -n "$WORKLOAD_NS" exec "deploy/$deploy" -- \
-      sh -c 'curl "$1" -g -sS -m 8 -w "\n%{http_code}" "$2"' -- "$family" "$url"
-  else
-    kubectl -n "$WORKLOAD_NS" exec "deploy/$deploy" -- \
-      sh -c 'curl -g -sS -m 8 -w "\n%{http_code}" "$1"' -- "$url"
-  fi
+  curl_family_from_namespace "$WORKLOAD_NS" "$family" "$deploy" "$url"
 }
 
 curl_from() {
@@ -1758,10 +1900,18 @@ curl_for_family_from() {
   local family="$1"
   local deploy="$2"
   local url="$3"
+  curl_for_family_from_namespace "$WORKLOAD_NS" "$family" "$deploy" "$url"
+}
+
+curl_for_family_from_namespace() {
+  local namespace="$1"
+  local family="$2"
+  local deploy="$3"
+  local url="$4"
   case "$family" in
-    4) curl4_from "$deploy" "$url" ;;
-    6) curl6_from "$deploy" "$url" ;;
-    "") curl_from "$deploy" "$url" ;;
+    4) curl_family_from_namespace "$namespace" "-4" "$deploy" "$url" ;;
+    6) curl_family_from_namespace "$namespace" "-6" "$deploy" "$url" ;;
+    "") curl_family_from_namespace "$namespace" "" "$deploy" "$url" ;;
     *)
       echo "unsupported curl address family '$family'" >&2
       exit 1
@@ -1930,15 +2080,55 @@ recorded_expect_blocked() {
   fi
 }
 
+recorded_expect_blocked_unmanaged() {
+  local assertion_id="$1"
+  local namespace="$2"
+  local from="$3"
+  local destination="$4"
+  local label="$5"
+  local url="$6"
+  local family="${7:-}"
+  local outcome="${8:-unmanaged-direct-pod-ip-fail-closed}"
+  if expect_blocked_from_namespace "$namespace" "$from" "$label" "$url" "$family"; then
+    record_live_assertion \
+      "$assertion_id" \
+      pass \
+      "$from" \
+      "$destination" \
+      "$outcome" \
+      "none" \
+      "$(spiffe_for_sa "$destination")"
+  else
+    record_live_assertion \
+      "$assertion_id" \
+      fail \
+      "$from" \
+      "$destination" \
+      "unexpected-http-200" \
+      "none" \
+      "$(spiffe_for_sa "$destination")"
+    return 1
+  fi
+}
+
 expect_blocked() {
   local from="$1"
   local label="$2"
   local url="$3"
   local family="${4:-}"
+  expect_blocked_from_namespace "$WORKLOAD_NS" "$from" "$label" "$url" "$family"
+}
+
+expect_blocked_from_namespace() {
+  local namespace="$1"
+  local from="$2"
+  local label="$3"
+  local url="$4"
+  local family="${5:-}"
   local output code err
   err="$(mktemp)"
   set +e
-  output="$(curl_for_family_from "$family" "$from" "$url" 2>"$err")"
+  output="$(curl_for_family_from_namespace "$namespace" "$family" "$from" "$url" 2>"$err")"
   local status=$?
   set -e
   code="${output##*$'\n'}"
@@ -2011,6 +2201,23 @@ run_traffic_checks() {
     "http://$dst_a_ip:8080/" \
     4 \
     "direct-pod-ip-fail-closed"
+
+  recorded_expect_blocked_unmanaged \
+    node_waypoint.ipv4.direct_inbound_guard_same_node \
+    "$UNMANAGED_NS" \
+    unmanaged-a \
+    dst-a \
+    "same-node unmanaged direct Pod IP inbound guard" \
+    "http://$dst_a_ip:8080/" \
+    4
+  recorded_expect_blocked_unmanaged \
+    node_waypoint.ipv4.direct_inbound_guard_cross_node \
+    "$UNMANAGED_NS" \
+    unmanaged-b \
+    dst-a \
+    "cross-node unmanaged direct Pod IP inbound guard" \
+    "http://$dst_a_ip:8080/" \
+    4
 
   log "checking stale identity cleanup across source workload recreation"
   local old_src_a_uid old_src_a_node
@@ -2101,6 +2308,14 @@ run_ipv6_checks() {
       "$(spiffe_for_sa src-b)" \
       "$(spiffe_for_sa dst-a)"
     record_live_assertion \
+      node_waypoint.ipv6.direct_inbound_guard \
+      skip \
+      unmanaged-b \
+      dst-a \
+      "cluster-not-dual-stack" \
+      "none" \
+      "$(spiffe_for_sa dst-a)"
+    record_live_assertion \
       node_waypoint.ipv6.pod_ip_fail_closed \
       skip \
       src-a \
@@ -2167,10 +2382,20 @@ run_ipv6_checks() {
     "http://[$dst_a_v6]:8080/" \
     6 \
     "direct-ipv6-pod-ip-fail-closed"
+  recorded_expect_blocked_unmanaged \
+    node_waypoint.ipv6.direct_inbound_guard \
+    "$UNMANAGED_NS" \
+    unmanaged-b \
+    dst-a \
+    "IPv6 unmanaged direct Pod IP inbound guard" \
+    "http://[$dst_a_v6]:8080/" \
+    6 \
+    "unmanaged-direct-ipv6-pod-ip-fail-closed"
 }
 
 cleanup() {
   if [[ "${FERRUM_LIVE_KEEP_RESOURCES:-false}" != "true" ]]; then
+    kubectl --context "$KUBE_CONTEXT" delete namespace "$UNMANAGED_NS" --ignore-not-found=true >/dev/null 2>&1 || true
     kubectl --context "$KUBE_CONTEXT" delete namespace "$WORKLOAD_NS" --ignore-not-found=true >/dev/null 2>&1 || true
     helm uninstall "$RELEASE" -n "$MESH_NS" --kube-context "$KUBE_CONTEXT" >/dev/null 2>&1 || true
     if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
@@ -2186,6 +2411,7 @@ init_live_assertions
 render_chart_assertions
 validate_cluster
 label_nodes
+discover_trusted_kubelet_probe_ips
 install_spire_production_identity
 install_ferrum
 verify_ambient_spire_identity
