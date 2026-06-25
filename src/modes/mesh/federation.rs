@@ -55,6 +55,8 @@ use crate::util::backoff::{
 pub(crate) const FEDERATION_BACKOFF_INITIAL_SECS: u64 = BACKOFF_INITIAL_SECS;
 #[cfg(test)]
 const FEDERATION_BACKOFF_MAX_SECS: u64 = BACKOFF_MAX_SECS;
+#[allow(dead_code)]
+pub(crate) const DEFAULT_FEDERATION_MAX_STALE_SECONDS: u64 = 3600;
 
 /// Hard cap on federation response body size. A real SPIFFE bundle is
 /// kilobytes — even a generous JWKS with several authorities fits well
@@ -77,6 +79,17 @@ const FEDERATION_MAX_JWT_AUTHORITIES: usize = 256;
 #[derive(Debug, Default, Clone)]
 pub struct FederationSnapshot {
     pub bundles: HashMap<TrustDomain, FederatedBundle>,
+    /// Trust domains that have committed at least one successful poll in this
+    /// process. Once a domain is recorded here, `FERRUM_MESH_FEDERATION_FAIL_OPEN`
+    /// no longer grants it CP-supplied bootstrap-fallback trust: fail-open is a
+    /// *bootstrap* policy (before the first poll), not unlimited post-expiry
+    /// retention. So a domain that polled successfully and then aged out of its
+    /// bounded staleness window fails closed instead of silently reverting to the
+    /// stale CP fallback. The tombstone persists for the process lifetime (a
+    /// recovered poll re-overlays its live bundle); it is intentionally not
+    /// cleared on cluster removal so a removed-then-readded peer cannot resurrect
+    /// fallback trust for a domain already proven pollable.
+    pub ever_polled: HashSet<TrustDomain>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +123,16 @@ pub struct FederationStore {
     /// Generation at which each cluster was last registered, in an
     /// `ArcSwap` so `install` can re-check it atomically inside its rcu.
     cluster_generation: Arc<ArcSwap<HashMap<String, u64>>>,
+    /// Serializes federation last-success / bundle-age gauge writes against the
+    /// staleness-expiry clear. The gauge map is keyed by trust domain ONLY, so
+    /// when two `RemoteCluster`s federate the same domain, a stale cluster's
+    /// expiry-clear could otherwise wipe the gauge a *different* cluster just
+    /// recorded for a freshly installed live bundle. Taking this lock in both
+    /// `record_poll_success_if_live` and `expire_stale_bundle` makes the
+    /// record-vs-clear ordering deterministic (the record always re-establishes
+    /// the gauge after a racing clear), mirroring the remote-discovery
+    /// `metrics_ordering` lock.
+    metrics_ordering: Arc<std::sync::Mutex<()>>,
 }
 
 impl Default for FederationStore {
@@ -121,6 +144,7 @@ impl Default for FederationStore {
             revision_tx: Arc::new(revision_tx),
             generation: Arc::new(AtomicU64::new(0)),
             cluster_generation: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
+            metrics_ordering: Arc::new(std::sync::Mutex::new(())),
         }
     }
 }
@@ -198,6 +222,9 @@ impl FederationStore {
             }
             let mut next = (**current).clone();
             next.bundles.insert(trust_domain.clone(), bundle.clone());
+            // Record the bootstrap tombstone so fail-open can no longer grant
+            // this domain CP-fallback trust once it has been polled.
+            next.ever_polled.insert(trust_domain.clone());
             installed = true;
             Arc::new(next)
         });
@@ -274,6 +301,94 @@ impl FederationStore {
         if published_snapshot {
             self.revision_tx.send_modify(|revision| *revision += 1);
         }
+    }
+
+    /// Record a successful poll's last-success / bundle-age gauge — but only
+    /// while holding the metrics-ordering lock and re-confirming the cluster's
+    /// generation under it.
+    ///
+    /// The federation gauge map is keyed by trust domain only, so a stale
+    /// cluster's [`Self::expire_stale_bundle`] clear and another cluster's
+    /// success record for the same domain race on one key. Taking the same lock
+    /// (and skipping when the generation was retired) serializes them: a clear
+    /// that runs first is immediately followed by this record re-establishing
+    /// the gauge for the live bundle; a record that runs first cannot be wiped
+    /// because the expiry only removes a bundle this same cluster still owns.
+    pub(crate) fn record_poll_success_if_live(
+        &self,
+        cluster_name: &str,
+        trust_domain: &TrustDomain,
+        fetched_at_unix_seconds: u64,
+        task_generation: u64,
+    ) {
+        // Poison is impossible (panic-free critical sections); recover the guard
+        // rather than wedging the poller on a poisoned ordering lock.
+        let _guard = self
+            .metrics_ordering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.cluster_generation_matches(cluster_name, task_generation) {
+            crate::plugins::mesh::prometheus_helpers::record_mesh_federation_poll_success(
+                trust_domain.as_str(),
+                fetched_at_unix_seconds,
+            );
+        }
+    }
+
+    /// Remove a last-good bundle after its bounded staleness window expires
+    /// without retiring the cluster's poll generation. The poller keeps running
+    /// and can reinstall a fresh bundle if the remote endpoint recovers.
+    pub(crate) fn expire_stale_bundle(
+        &self,
+        cluster_name: &str,
+        trust_domain: &TrustDomain,
+        now_unix_seconds: u64,
+        max_stale_age: Duration,
+    ) -> bool {
+        let max_stale_seconds = max_stale_age.as_secs();
+        if max_stale_seconds == 0 {
+            return false;
+        }
+        // Serialize the gauge clear against concurrent success-metric writes
+        // (`record_poll_success_if_live`). The federation gauge key is
+        // trust-domain-only, so without this a cluster sharing the trust domain
+        // could have its freshly recorded last-success/age gauge wiped by this
+        // expiry. Held across the rcu and the clear below.
+        let _guard = self
+            .metrics_ordering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut expired = false;
+        self.inner.rcu(|current| {
+            // Recompute the outcome on every CAS attempt: a lost CAS retries the
+            // closure against a newer snapshot, so a stale `true` from an earlier
+            // attempt must not survive a retry that removes nothing (mirrors
+            // `install`'s per-attempt reset of `installed`).
+            expired = false;
+            let Some(bundle) = current.bundles.get(trust_domain) else {
+                return Arc::clone(current);
+            };
+            if bundle.cluster_name != cluster_name {
+                return Arc::clone(current);
+            }
+            let age_seconds = now_unix_seconds.saturating_sub(bundle.fetched_at_unix_seconds);
+            if age_seconds <= max_stale_seconds {
+                return Arc::clone(current);
+            }
+            // The bundle map drops the entry; `ever_polled` deliberately retains
+            // the domain so fail-open stays suppressed after expiry.
+            let mut next = (**current).clone();
+            next.bundles.remove(trust_domain);
+            expired = true;
+            Arc::new(next)
+        });
+        if expired {
+            self.revision_tx.send_modify(|revision| *revision += 1);
+            crate::plugins::mesh::prometheus_helpers::clear_mesh_federation_poll_success(
+                trust_domain.as_str(),
+            );
+        }
+        expired
     }
 }
 
@@ -467,6 +582,10 @@ struct RemoteClusterPollTarget {
 pub struct FederationPollerConfig {
     pub poll_interval: Duration,
     pub request_timeout: Duration,
+    /// Maximum age for a last-good polled bundle after poll failures. `None`
+    /// keeps the pre-existing indefinite retention behavior (dev/test only in
+    /// production validation).
+    pub max_stale_age: Option<Duration>,
     /// Federation bootstrap policy. When true, a remote trust domain with a
     /// configured federation endpoint may use a CP-supplied fallback bundle
     /// before the first successful poll. When false, that remote trust domain
@@ -477,13 +596,29 @@ pub struct FederationPollerConfig {
 impl FederationPollerConfig {
     /// Returns `None` when the poller should be disabled (interval 0 or no
     /// federated remote clusters configured).
+    #[allow(dead_code)]
     pub fn from_env(interval_seconds: u64, timeout_seconds: u64, fail_open: bool) -> Option<Self> {
+        Self::from_env_with_max_stale(
+            interval_seconds,
+            timeout_seconds,
+            fail_open,
+            DEFAULT_FEDERATION_MAX_STALE_SECONDS,
+        )
+    }
+
+    pub fn from_env_with_max_stale(
+        interval_seconds: u64,
+        timeout_seconds: u64,
+        fail_open: bool,
+        max_stale_seconds: u64,
+    ) -> Option<Self> {
         if interval_seconds == 0 {
             return None;
         }
         Some(Self {
             poll_interval: Duration::from_secs(interval_seconds),
             request_timeout: Duration::from_secs(timeout_seconds.max(1)),
+            max_stale_age: (max_stale_seconds > 0).then(|| Duration::from_secs(max_stale_seconds)),
             fail_open,
         })
     }
@@ -581,6 +716,7 @@ pub fn spawn_federation_poller(
             trust_domain = %trust_domain,
             endpoint = %endpoint_for_logs,
             poll_interval_seconds = task_config.poll_interval.as_secs(),
+            max_stale_seconds = task_config.max_stale_age.map(|age| age.as_secs()),
             fail_open = task_config.fail_open,
             "Spawning SPIFFE federation poller"
         );
@@ -711,6 +847,7 @@ impl FederationPollerManager {
             trust_domain = %target.trust_domain,
             endpoint = %endpoint_for_logs,
             poll_interval_seconds = config.poll_interval.as_secs(),
+            max_stale_seconds = config.max_stale_age.map(|age| age.as_secs()),
             fail_open = config.fail_open,
             "Spawning SPIFFE federation poller"
         );
@@ -837,6 +974,13 @@ async fn poll_federation_loop(
                     trust_domain.as_str(),
                     &endpoint_for_logs,
                 );
+                expire_stale_bundle_after_failure(
+                    &store,
+                    &cluster_name,
+                    &trust_domain,
+                    config.max_stale_age,
+                    &endpoint_for_logs,
+                );
                 (false, jittered_backoff(backoff_secs))
             }
         };
@@ -849,6 +993,28 @@ async fn poll_federation_loop(
             _ = tokio::time::sleep(sleep_duration) => {}
             _ = wait_for_federation_shutdown(&mut shutdown_rx) => return,
         }
+    }
+}
+
+fn expire_stale_bundle_after_failure(
+    store: &FederationStore,
+    cluster_name: &str,
+    trust_domain: &TrustDomain,
+    max_stale_age: Option<Duration>,
+    endpoint_for_logs: &str,
+) {
+    let Some(max_stale_age) = max_stale_age else {
+        return;
+    };
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    if store.expire_stale_bundle(cluster_name, trust_domain, now, max_stale_age) {
+        warn!(
+            cluster = %cluster_name,
+            trust_domain = %trust_domain,
+            endpoint = %endpoint_for_logs,
+            max_stale_seconds = max_stale_age.as_secs(),
+            "Expired last-good SPIFFE federation bundle after bounded staleness window"
+        );
     }
 }
 
@@ -920,10 +1086,7 @@ async fn fetch_and_install_bundle(
     if !installed {
         return Ok(false);
     }
-    crate::plugins::mesh::prometheus_helpers::record_mesh_federation_poll_success(
-        trust_domain.as_str(),
-        now,
-    );
+    store.record_poll_success_if_live(cluster_name, trust_domain, now, task_generation);
     info!(
         cluster = %cluster_name,
         trust_domain = %trust_domain,
@@ -1112,14 +1275,24 @@ pub fn merge_federation_into_trust_bundles(
 ) -> Option<TrustBundleSet> {
     let mut set = trust_bundles?;
 
-    if !fail_open {
-        let dynamic_domains = dynamic_federation_trust_domains(multi_cluster, poll_enabled);
-        if !dynamic_domains.is_empty() {
-            set.federated.retain(|fed| {
-                !dynamic_domains.contains(&fed.trust_domain)
-                    || snapshot.bundles.contains_key(&fed.trust_domain)
-            });
-        }
+    let dynamic_domains = dynamic_federation_trust_domains(multi_cluster, poll_enabled);
+    if !dynamic_domains.is_empty() {
+        set.federated.retain(|fed| {
+            // Non-dynamic (purely CP-supplied) domains are never pruned here.
+            if !dynamic_domains.contains(&fed.trust_domain) {
+                return true;
+            }
+            // A live polled bundle keeps the domain trusted (and is overlaid
+            // below, winning on conflict).
+            if snapshot.bundles.contains_key(&fed.trust_domain) {
+                return true;
+            }
+            // No live polled bundle. Fail-open keeps the CP bootstrap fallback
+            // ONLY until the domain's first successful poll; once it has ever
+            // been polled, fail-open is consumed (bootstrap is over) and an
+            // expired/withdrawn domain fails closed. Fail-closed prunes always.
+            fail_open && !snapshot.ever_polled.contains(&fed.trust_domain)
+        });
     }
 
     overlay_polled_federation_bundles(&mut set, snapshot);
@@ -1573,6 +1746,64 @@ mod tests {
     }
 
     #[test]
+    fn merge_fail_open_drops_cp_fallback_after_polled_bundle_expires() {
+        // Fail-open is a BOOTSTRAP policy: it may serve the CP-supplied fallback
+        // bundle only until a domain's first successful poll. Once a domain has
+        // ever polled and then aged out of its bounded staleness window (its
+        // bundle removed from the snapshot but its `ever_polled` tombstone
+        // retained), fail-open must NOT silently revert to the stale CP fallback —
+        // the expired domain fails closed (roadmap M5: fail-open must not become
+        // unlimited post-bootstrap retention).
+        use crate::modes::mesh::config::RemoteCluster;
+
+        let remote_td = td("remote.example.com");
+        let cp_bundle = TrustBundleSet {
+            local: TrustBundle {
+                trust_domain: td("local"),
+                x509_authorities: vec![sample_cert_base64()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: vec![TrustBundle {
+                trust_domain: remote_td.clone(),
+                x509_authorities: vec!["cp_value".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            }],
+        };
+        let mc = MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "remote".to_string(),
+                trust_domain: remote_td.clone(),
+                network: None,
+                control_plane_url: None,
+                federation_endpoint: Some("https://remote/.well-known/spiffe".to_string()),
+            }],
+            ..MultiClusterConfig::default()
+        };
+
+        // Domain polled successfully once, then its bundle aged out: no live
+        // bundle remains, but the bootstrap tombstone is retained.
+        let mut expired_snapshot = FederationSnapshot::default();
+        expired_snapshot.ever_polled.insert(remote_td.clone());
+
+        let merged = merge_federation_into_trust_bundles(
+            Some(cp_bundle),
+            &expired_snapshot,
+            Some(&mc),
+            true, // fail_open
+            true, // poll_enabled
+        )
+        .expect("merge result");
+
+        assert!(
+            merged.federated.is_empty(),
+            "fail-open must not resurrect the CP fallback for an ever-polled, expired domain: {:?}",
+            merged.federated
+        );
+    }
+
+    #[test]
     fn merge_polled_bundle_wins_in_fail_closed_mode() {
         use crate::modes::mesh::config::RemoteCluster;
 
@@ -1699,7 +1930,15 @@ mod tests {
         let cfg = FederationPollerConfig::from_env(60, 10, true).expect("enabled");
         assert_eq!(cfg.poll_interval, Duration::from_secs(60));
         assert_eq!(cfg.request_timeout, Duration::from_secs(10));
+        assert_eq!(
+            cfg.max_stale_age,
+            Some(Duration::from_secs(DEFAULT_FEDERATION_MAX_STALE_SECONDS))
+        );
         assert!(cfg.fail_open);
+
+        let cfg =
+            FederationPollerConfig::from_env_with_max_stale(60, 10, false, 0).expect("enabled");
+        assert_eq!(cfg.max_stale_age, None);
     }
 
     #[test]
@@ -1904,6 +2143,153 @@ mod tests {
         assert!(!store.snapshot().bundles.contains_key(&domain));
     }
 
+    #[test]
+    fn expire_stale_bundle_drops_cache_without_retiring_generation() {
+        let store = FederationStore::new();
+        let suffix = format!("{}-{}", std::process::id(), line!());
+        let domain = td(&format!("stale-{suffix}.example.com"));
+        let mut rx = store.subscribe();
+        let task_generation = store.register("stale-cluster");
+        let federated = |ts: u64| FederatedBundle {
+            bundle: TrustBundle {
+                trust_domain: domain.clone(),
+                x509_authorities: vec!["a".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            fetched_at_unix_seconds: ts,
+            endpoint: "https://stale/.well-known/spiffe".to_string(),
+            cluster_name: "stale-cluster".to_string(),
+        };
+
+        assert!(store.install(
+            "stale-cluster",
+            domain.clone(),
+            federated(100),
+            task_generation,
+        ));
+        assert!(
+            store.snapshot().ever_polled.contains(&domain),
+            "a successful install records the bootstrap tombstone"
+        );
+        crate::plugins::mesh::prometheus_helpers::record_mesh_federation_poll_success(
+            domain.as_str(),
+            100,
+        );
+        rx.mark_unchanged();
+        assert!(
+            !store.expire_stale_bundle("stale-cluster", &domain, 120, Duration::from_secs(20),),
+            "age equal to max stale is still usable"
+        );
+        assert!(store.snapshot().bundles.contains_key(&domain));
+
+        assert!(store.expire_stale_bundle("stale-cluster", &domain, 121, Duration::from_secs(20),));
+        assert!(
+            !store.snapshot().bundles.contains_key(&domain),
+            "expired bundle is withdrawn from the active snapshot"
+        );
+        assert!(
+            store.snapshot().ever_polled.contains(&domain),
+            "the ever-polled tombstone is retained across expiry so fail-open stays suppressed"
+        );
+        assert!(
+            rx.has_changed().unwrap(),
+            "expiration wakes the apply loop so effective trust is recomputed"
+        );
+        let mut rendered = String::new();
+        crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(&mut rendered);
+        assert!(
+            !rendered.contains(&format!("trust_domain=\"{}\"", domain.as_str())),
+            "expiration clears federation last-success/age metrics for stale trust: {rendered}"
+        );
+
+        assert!(
+            store.install(
+                "stale-cluster",
+                domain.clone(),
+                federated(130),
+                task_generation,
+            ),
+            "staleness expiration must not retire the poll generation; a later successful poll can reinstall"
+        );
+        assert!(store.snapshot().bundles.contains_key(&domain));
+    }
+
+    #[test]
+    fn federation_record_success_skips_after_generation_retired() {
+        let store = FederationStore::new();
+        let suffix = format!("{}-{}", std::process::id(), line!());
+        let domain = td(&format!("retired-{suffix}.example.com"));
+        let generation = store.register("retiring-cluster");
+        // Retire the cluster generation (e.g. its RemoteCluster was removed)
+        // before the in-flight poll task records its success metric.
+        store.remove_cluster("retiring-cluster", &domain, true);
+        store.record_poll_success_if_live("retiring-cluster", &domain, 1000, generation);
+        let mut rendered = String::new();
+        crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(&mut rendered);
+        assert!(
+            !rendered.contains(&format!("trust_domain=\"{}\"", domain.as_str())),
+            "a record from a retired generation must not resurrect the federation gauge: {rendered}"
+        );
+    }
+
+    #[test]
+    fn expire_stale_bundle_ignores_domain_owned_by_another_cluster() {
+        // Two RemoteClusters federate the same trust domain. Cluster A installs
+        // first; cluster B then reinstalls a fresh bundle for the same domain and
+        // records its gauge. Cluster A's long-stale poller must NOT remove B's
+        // live bundle or wipe B's freshly recorded gauge — the bundle is owned by
+        // B now, so A's expiry is a no-op (the ownership guard + the
+        // metrics-ordering lock keep the trust-domain-keyed gauge consistent).
+        let store = FederationStore::new();
+        let suffix = format!("{}-{}", std::process::id(), line!());
+        let domain = td(&format!("shared-{suffix}.example.com"));
+        let federated = |cluster: &str, ts: u64| FederatedBundle {
+            bundle: TrustBundle {
+                trust_domain: domain.clone(),
+                x509_authorities: vec!["a".to_string()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            fetched_at_unix_seconds: ts,
+            endpoint: "https://shared/.well-known/spiffe".to_string(),
+            cluster_name: cluster.to_string(),
+        };
+        let gen_a = store.register("cluster-a");
+        assert!(store.install(
+            "cluster-a",
+            domain.clone(),
+            federated("cluster-a", 100),
+            gen_a
+        ));
+        let gen_b = store.register("cluster-b");
+        assert!(store.install(
+            "cluster-b",
+            domain.clone(),
+            federated("cluster-b", 200),
+            gen_b
+        ));
+        store.record_poll_success_if_live("cluster-b", &domain, 200, gen_b);
+
+        assert!(
+            !store.expire_stale_bundle("cluster-a", &domain, 1_000_000, Duration::from_secs(20)),
+            "A's expiry must not remove a bundle now owned by cluster B"
+        );
+        assert!(
+            store.snapshot().bundles.contains_key(&domain),
+            "B's live bundle survives A's stale expiry"
+        );
+        let mut rendered = String::new();
+        crate::plugins::mesh::prometheus_helpers::render_mesh_observability_metrics(&mut rendered);
+        assert!(
+            rendered.contains(&format!("trust_domain=\"{}\"", domain.as_str())),
+            "B's freshly recorded federation gauge is not wiped by A's stale expiry: {rendered}"
+        );
+        crate::plugins::mesh::prometheus_helpers::clear_mesh_federation_poll_success(
+            domain.as_str(),
+        );
+    }
+
     #[tokio::test]
     async fn manager_reconcile_starts_poller_and_removes_bundle_on_withdrawal() {
         use crate::modes::mesh::config::RemoteCluster;
@@ -1930,6 +2316,7 @@ mod tests {
         let config = FederationPollerConfig {
             poll_interval: Duration::from_secs(3600),
             request_timeout: Duration::from_secs(1),
+            max_stale_age: None,
             fail_open: false,
         };
         let mut manager =
@@ -1982,6 +2369,7 @@ mod tests {
         let config = FederationPollerConfig {
             poll_interval: Duration::from_secs(3600),
             request_timeout: Duration::from_secs(1),
+            max_stale_age: None,
             fail_open: false,
         };
         let mut manager =
@@ -2065,6 +2453,7 @@ mod tests {
         let config = FederationPollerConfig {
             poll_interval: Duration::from_secs(3600),
             request_timeout: Duration::from_secs(1),
+            max_stale_age: None,
             fail_open: false,
         };
         let mut manager =
@@ -2130,6 +2519,7 @@ mod tests {
         let config = FederationPollerConfig {
             poll_interval: Duration::from_secs(3600),
             request_timeout: Duration::from_secs(1),
+            max_stale_age: None,
             fail_open: false,
         };
         let mut manager =

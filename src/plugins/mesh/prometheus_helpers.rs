@@ -304,6 +304,13 @@ pub fn record_mesh_federation_poll_success(
         .store(fetched_at_unix_seconds, Ordering::Relaxed);
 }
 
+/// Drop the federation last-success / bundle-age series once a polled bundle
+/// is withdrawn. Failure counters are preserved, but the gauges must not keep
+/// advertising a cached bundle after bounded staleness expires.
+pub fn clear_mesh_federation_poll_success(trust_domain: impl AsRef<str>) {
+    MESH_FEDERATION_LAST_SUCCESS.remove(trust_domain.as_ref());
+}
+
 pub fn increment_mesh_remote_discovery_poll_failure(
     cluster: impl AsRef<str>,
     trust_domain: impl AsRef<str>,
@@ -369,6 +376,28 @@ pub fn clear_mesh_remote_discovery_metrics(
         trust_domain: Arc::from(trust_domain.as_ref()),
     };
     MESH_REMOTE_DISCOVERY_POLL_SUCCESSES.remove(&key);
+    MESH_REMOTE_DISCOVERY_LAST_SUCCESS.remove(&key);
+}
+
+/// Withdraw only the remote-discovery **freshness gauges** (the last-success
+/// timestamp, plus the derived `endpoint_age_seconds`) for a cluster whose
+/// endpoints aged out of the bounded staleness window — while preserving the
+/// monotonic poll-success counter.
+///
+/// Unlike [`clear_mesh_remote_discovery_metrics`] (used when a cluster is
+/// removed/ineligible), staleness expiry is transient: the same poller stays
+/// live and can reinstall endpoints later. Resetting
+/// `ferrum_mesh_remote_discovery_poll_successes_total` to zero would corrupt
+/// `rate()`/`increase()` with a counter reset and undercount successful polls.
+/// Only the freshness gauges must stop advertising a cached, now-expired bundle.
+pub fn withdraw_mesh_remote_discovery_freshness(
+    cluster: impl AsRef<str>,
+    trust_domain: impl AsRef<str>,
+) {
+    let key = MeshRemoteDiscoveryPollSuccessKey {
+        cluster: Arc::from(cluster.as_ref()),
+        trust_domain: Arc::from(trust_domain.as_ref()),
+    };
     MESH_REMOTE_DISCOVERY_LAST_SUCCESS.remove(&key);
 }
 
