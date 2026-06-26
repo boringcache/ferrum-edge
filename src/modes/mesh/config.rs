@@ -1711,6 +1711,15 @@ pub struct RemoteCluster {
     pub control_plane_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub federation_endpoint: Option<String>,
+    /// Optional reference naming the per-remote discovery credential the data
+    /// plane uses to authenticate to THIS remote cluster's control plane. The
+    /// reference is resolved data-plane-side against
+    /// `FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS` (a JSON map of ref -> secret,
+    /// itself resolvable through the external-secret backends). The raw secret
+    /// is NEVER serialized into the slice/config — only this reference. When
+    /// unset, discovery falls back to the shared CP-DP JWT secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_credential_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3291,6 +3300,16 @@ fn validate_multi_cluster(
         {
             errors.push(format!(
                 "RemoteCluster '{}': federation_endpoint must not be empty when set",
+                remote.name
+            ));
+        }
+        if remote
+            .discovery_credential_ref
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            errors.push(format!(
+                "RemoteCluster '{}': discovery_credential_ref must not be empty when set",
                 remote.name
             ));
         }

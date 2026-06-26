@@ -99,6 +99,7 @@ fn remote_snapshot(endpoints: RemoteClusterEndpoints) -> RemoteEndpointSnapshot 
             // Matches `admitting_candidate`'s declared (normalized) URL so the
             // full-poll-identity merge filter admits these endpoints.
             Some("https://cp.remote.example:15010".to_string()),
+            None,
             endpoints,
             1,
         ),
@@ -118,6 +119,7 @@ fn admitting_candidate() -> MultiClusterConfig {
             network: Some("net2".to_string()),
             control_plane_url: Some("https://cp.remote.example:15010".to_string()),
             federation_endpoint: None,
+            discovery_credential_ref: None,
         }],
         ..MultiClusterConfig::default()
     }

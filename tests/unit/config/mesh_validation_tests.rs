@@ -882,6 +882,7 @@ fn multi_cluster_remote_cluster_requires_federated_trust_bundle_when_bundles_are
                 network: Some("network-b".to_string()),
                 control_plane_url: None,
                 federation_endpoint: None,
+                discovery_credential_ref: None,
             }],
             ..MultiClusterConfig::default()
         }),
@@ -910,6 +911,33 @@ fn multi_cluster_remote_cluster_requires_federated_trust_bundle_when_bundles_are
 }
 
 #[test]
+fn multi_cluster_rejects_blank_discovery_credential_ref() {
+    let mesh = MeshConfig {
+        multi_cluster: Some(MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "cluster-b".to_string(),
+                trust_domain: TrustDomain::new("remote.test").unwrap(),
+                network: None,
+                control_plane_url: None,
+                federation_endpoint: None,
+                // Blank-when-set must fail the slice at validation rather than
+                // resolving to a credential that cannot be found at runtime.
+                discovery_credential_ref: Some("   ".to_string()),
+            }],
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshConfig::default()
+    };
+    let errors = mesh.validate();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("discovery_credential_ref") && e.contains("must not be empty")),
+        "blank discovery_credential_ref must be rejected at validation, got: {errors:?}"
+    );
+}
+
+#[test]
 fn multi_cluster_rejects_too_many_remote_clusters() {
     let remote_clusters: Vec<RemoteCluster> = (0..=MAX_MESH_REMOTE_CLUSTERS)
         .map(|index| RemoteCluster {
@@ -918,6 +946,7 @@ fn multi_cluster_rejects_too_many_remote_clusters() {
             network: None,
             control_plane_url: None,
             federation_endpoint: None,
+            discovery_credential_ref: None,
         })
         .collect();
     let mesh = MeshConfig {
