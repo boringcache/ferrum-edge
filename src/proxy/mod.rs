@@ -1232,6 +1232,104 @@ fn warn_if_h3_backend_tls_policy_incompatible(
     }
 }
 
+/// IDs of HTTP-family proxies whose effective WebSocket idle timeout resolves to
+/// `0` (disabled) — i.e. an upgraded WebSocket on them would have no idle bound.
+/// The effective timeout is the per-proxy `websocket_idle_timeout_seconds`
+/// override when set, else the global `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS`.
+fn websocket_idle_disabled_proxy_ids(
+    config: &GatewayConfig,
+    global_ws_idle_timeout_seconds: u64,
+) -> Vec<&str> {
+    config
+        .proxies
+        .iter()
+        .filter(|proxy| {
+            matches!(
+                proxy.dispatch_kind,
+                DispatchKind::HttpPool | DispatchKind::HttpsPool
+            ) && proxy.effective_websocket_idle_timeout_seconds(global_ws_idle_timeout_seconds) == 0
+        })
+        .map(|proxy| proxy.id.as_str())
+        .collect()
+}
+
+/// Emit the resource-hoarding warning for a set of proxies with a disabled
+/// WebSocket idle bound. An upgraded WebSocket holds a dedicated backend
+/// connection plus a `websocket_max_connections` slot for its entire lifetime;
+/// with the idle timeout disabled, a silent (non-heartbeating) client can hoard
+/// that slot indefinitely. Activity from either direction — including Ping/Pong
+/// — refreshes the timer, so the disabled state is the only exposure.
+fn emit_websocket_idle_disabled_warning(
+    disabled_proxy_ids: &[&str],
+    global_ws_idle_timeout_seconds: u64,
+) {
+    let sample = disabled_proxy_ids
+        .iter()
+        .take(3)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    warn!(
+        ws_idle_disabled_proxy_count = disabled_proxy_ids.len(),
+        ws_idle_disabled_proxy_sample = %sample,
+        global_websocket_idle_timeout_seconds = global_ws_idle_timeout_seconds,
+        "WebSocket idle timeout is disabled (0) for one or more HTTP-family proxies. \
+         Idle upgraded WebSocket sessions will hold a backend connection and a \
+         FERRUM_WEBSOCKET_MAX_CONNECTIONS slot indefinitely (resource-hoarding risk). \
+         Set FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS (global) or the per-proxy \
+         websocket_idle_timeout_seconds to a non-zero value to bound idle lifetime."
+    );
+}
+
+/// Warn at startup when WebSocket sessions on HTTP-family proxies have no idle
+/// bound. Fires only when an operator has explicitly opted out (the global
+/// default is 300s), so the warning maps to a deliberate opt-out rather than
+/// spamming default deployments.
+fn warn_if_websocket_idle_disabled(config: &GatewayConfig, global_ws_idle_timeout_seconds: u64) {
+    let disabled = websocket_idle_disabled_proxy_ids(config, global_ws_idle_timeout_seconds);
+    if disabled.is_empty() {
+        return;
+    }
+    emit_websocket_idle_disabled_warning(&disabled, global_ws_idle_timeout_seconds);
+}
+
+/// IDs of HTTP-family proxies whose WebSocket idle bound becomes *newly* disabled
+/// in `next` relative to `previous` — i.e. a proxy added with an effective `0`
+/// timeout, or one whose effective timeout changed from a bound value to `0`.
+/// Proxies already disabled in `previous` are excluded so a persistent opt-out
+/// is not reported again. The returned slices borrow from `next`.
+fn websocket_idle_newly_disabled_proxy_ids<'a>(
+    previous: &GatewayConfig,
+    next: &'a GatewayConfig,
+    global_ws_idle_timeout_seconds: u64,
+) -> Vec<&'a str> {
+    let previously_disabled: std::collections::HashSet<&str> =
+        websocket_idle_disabled_proxy_ids(previous, global_ws_idle_timeout_seconds)
+            .into_iter()
+            .collect();
+    websocket_idle_disabled_proxy_ids(next, global_ws_idle_timeout_seconds)
+        .into_iter()
+        .filter(|id| !previously_disabled.contains(id))
+        .collect()
+}
+
+/// Warn on config reload when a reload makes a proxy's WebSocket idle bound
+/// *newly* disabled. Hot-reloaded `websocket_idle_timeout_seconds` changes are
+/// otherwise invisible because reload swaps config in place rather than
+/// rebuilding `ProxyState` (where the startup warning lives).
+fn warn_if_websocket_idle_newly_disabled(
+    previous: &GatewayConfig,
+    next: &GatewayConfig,
+    global_ws_idle_timeout_seconds: u64,
+) {
+    let newly_disabled =
+        websocket_idle_newly_disabled_proxy_ids(previous, next, global_ws_idle_timeout_seconds);
+    if newly_disabled.is_empty() {
+        return;
+    }
+    emit_websocket_idle_disabled_warning(&newly_disabled, global_ws_idle_timeout_seconds);
+}
+
 /// Check if the request is a WebSocket upgrade request.
 ///
 /// Uses ASCII case-insensitive comparisons to avoid per-request `to_lowercase()`
@@ -4094,6 +4192,7 @@ impl ProxyState {
         } else {
             None
         };
+        warn_if_websocket_idle_disabled(&config, env_config.websocket_idle_timeout_seconds);
         // Create connection pools with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
         let tls_policy_arc = tls_policy.map(Arc::new);
@@ -6188,6 +6287,18 @@ impl ProxyState {
             .store_inner(Arc::clone(&published.consumer_index));
         self.load_balancer_cache
             .store_inner(Arc::clone(&published.load_balancer));
+        // Single chokepoint for every config apply path (initial-load, delta,
+        // and incremental). Reload swaps config in place here rather than
+        // rebuilding `ProxyState`, so the startup-only `warn_if_websocket_idle_disabled`
+        // never sees runtime opt-outs. Diff against the still-live config so a
+        // reload that makes a proxy's WebSocket idle bound *newly* disabled emits
+        // the same resource-hoarding warning, without re-warning on every
+        // unrelated reload while a persistent opt-out is in place.
+        warn_if_websocket_idle_newly_disabled(
+            &self.config.load_full(),
+            &published.config,
+            self.env_config.websocket_idle_timeout_seconds,
+        );
         self.config.store(Arc::clone(&published.config));
     }
 
@@ -7401,7 +7512,9 @@ async fn handle_websocket_request_authenticated(
     // under the client framer by `run_websocket_proxy`. `None` disables the
     // idle bound entirely.
     let ws_idle_tracker =
-        WsIdleTracker::from_timeout_seconds(state.env_config.websocket_idle_timeout_seconds);
+        WsIdleTracker::from_timeout_seconds(proxy.effective_websocket_idle_timeout_seconds(
+            state.env_config.websocket_idle_timeout_seconds,
+        ));
     // The backend WebSocket connection acquired below is held for the full
     // session lifetime (moved into the spawned task), so this guard's slot is
     // released exactly when the dedicated backend connection closes. Captured
@@ -24054,6 +24167,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ws_idle_tracker_from_timeout_seconds_disabled_when_zero() {
+        // 0 must produce no tracker (idle bound disabled).
+        assert!(WsIdleTracker::from_timeout_seconds(0).is_none());
+    }
+
+    #[test]
+    fn ws_idle_tracker_from_timeout_seconds_builds_tracker_when_nonzero() {
+        let tracker = WsIdleTracker::from_timeout_seconds(300)
+            .expect("non-zero timeout must build a tracker");
+        assert_eq!(tracker.timeout, Duration::from_secs(300));
+        // A fresh tracker has its full window remaining.
+        assert!(tracker.remaining().is_some());
+    }
+
+    #[tokio::test]
+    async fn next_websocket_message_no_tracker_never_times_out() {
+        // Disabled idle bound: a pending (silent) stream must park forever, not
+        // resolve to IdleTimeout. We assert it does not complete within a window
+        // that would have elapsed several times over for a 5ms tracker.
+        let mut stream = futures_util::stream::pending::<
+            Result<Message, tokio_tungstenite::tungstenite::Error>,
+        >();
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            next_websocket_message(&mut stream, None),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "with idle timeout disabled (None), next_websocket_message must never resolve on a silent stream"
+        );
+    }
+
     #[tokio::test]
     async fn next_websocket_message_times_out_when_idle_bound_elapsed() {
         let mut stream = futures_util::stream::pending::<
@@ -29314,6 +29461,60 @@ mod tests {
             trust_bundles: None,
             mesh: None,
         }
+    }
+
+    #[test]
+    fn websocket_idle_disabled_collector_filters_http_family_zero_effective() {
+        let mut disabled = make_validation_proxy("disabled", "/a");
+        disabled.websocket_idle_timeout_seconds = Some(0);
+        let mut bounded = make_validation_proxy("bounded", "/b");
+        bounded.websocket_idle_timeout_seconds = Some(120);
+        let mut inherit = make_validation_proxy("inherit", "/c");
+        inherit.websocket_idle_timeout_seconds = None; // inherits the global value
+
+        let mut config = make_validation_config(vec![disabled, bounded, inherit]);
+        // Resolve `dispatch_kind` exactly as `update_config` does before the
+        // collector runs in `mirror_request_epoch_wrappers`.
+        config.normalize_fields();
+
+        // Global bounded (300): only the explicit `Some(0)` override is disabled.
+        assert_eq!(
+            websocket_idle_disabled_proxy_ids(&config, 300),
+            vec!["disabled"]
+        );
+
+        // Global disabled (0): the `Some(0)` override AND the inheriting proxy
+        // are disabled; the explicit `Some(120)` override stays bounded.
+        let mut ids = websocket_idle_disabled_proxy_ids(&config, 0);
+        ids.sort();
+        assert_eq!(ids, vec!["disabled", "inherit"]);
+    }
+
+    #[test]
+    fn websocket_idle_newly_disabled_reports_only_transitions() {
+        let mut prev_a = make_validation_proxy("a", "/a");
+        prev_a.websocket_idle_timeout_seconds = Some(0); // already disabled
+        let prev_b = make_validation_proxy("b", "/b"); // bounded (inherits global)
+        let mut previous = make_validation_config(vec![prev_a, prev_b]);
+        previous.normalize_fields();
+
+        let mut next_a = make_validation_proxy("a", "/a");
+        next_a.websocket_idle_timeout_seconds = Some(0); // still disabled
+        let mut next_b = make_validation_proxy("b", "/b");
+        next_b.websocket_idle_timeout_seconds = Some(0); // newly disabled
+        let mut next_c = make_validation_proxy("c", "/c");
+        next_c.websocket_idle_timeout_seconds = Some(0); // added, disabled
+        let mut next = make_validation_config(vec![next_a, next_b, next_c]);
+        next.normalize_fields();
+
+        // "a" was already disabled -> excluded; only the transitions report.
+        let mut newly = websocket_idle_newly_disabled_proxy_ids(&previous, &next, 300);
+        newly.sort();
+        assert_eq!(newly, vec!["b", "c"]);
+
+        // Steady state (no new transitions) reports nothing, so a persistent
+        // opt-out does not re-warn on every unrelated reload.
+        assert!(websocket_idle_newly_disabled_proxy_ids(&next, &next, 300).is_empty());
     }
 
     fn test_runtime_trust_bundles(
