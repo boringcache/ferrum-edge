@@ -14383,6 +14383,10 @@ components:
             type: string
           default: []
           description: Required fields in request body
+        fail_on_uninspectable_body:
+          type: boolean
+          default: true
+          description: Reject JSON POST requests whose body cannot be inspected because the buffered body is missing, empty, non-UTF-8, malformed JSON, or still compressed after request transforms (no compression/decompress_request decoded it). Set false only for compatibility when the backend must handle such uninspectable bodies itself.
 
     AiRateLimiterConfig:
       type: object
