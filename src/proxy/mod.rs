@@ -151,6 +151,23 @@ fn http1_parser_max_buf_size(configured_header_limit: usize) -> usize {
 /// invoked on a backend response" path (response_headers came from upstream).
 pub(crate) const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 
+/// Marker recorded in `ctx.metadata` for the duration of
+/// [`apply_synthetic_response_body_hooks`] — i.e. while the response-body hook
+/// pipeline (`on_response_body`, `transform_response_body_with_context`,
+/// `on_final_response_body`) runs over a synthetic 2xx plugin short-circuit body
+/// rather than a real backend response. Unlike
+/// [`REJECTION_RESPONSE_METADATA_KEY`] (scoped to the `after_proxy` reject hooks
+/// only), this marker stays set across the body-hook phase so that a storing
+/// plugin's `on_final_response_body` can tell apart "this body was produced by a
+/// later `before_proxy`/backend-admission short-circuit" from a genuine backend
+/// response. `request_deduplication` reads this to avoid caching+replaying a
+/// synthetic short-circuit body (e.g. a `fault_injection`/`mesh_route_dispatch`
+/// 2xx abort) under the idempotency key — mirroring `response_caching`'s
+/// served-from-cache guard and `ai_semantic_cache`'s miss-only buffering key.
+/// Only ever set on the synthetic short-circuit path, so its presence is a
+/// precise signal; the normal buffered backend-response path never sets it.
+pub(crate) const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
+
 /// Marker recorded in `ctx.metadata` when the ORIGINAL backend response was a
 /// range/partial response (`206` or carrying `Content-Range`), captured before
 /// any `after_proxy` hook can mutate the response headers. A plugin whose
@@ -11357,9 +11374,23 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
     }
 }
 
-pub(crate) async fn apply_plugin_rejection_response(
-    plugins: &[Arc<dyn Plugin>],
-    ctx: &mut RequestContext,
+/// Rebuild `response_status` / `response_headers` for a plugin rejection
+/// **without** running the `after_proxy` reject hooks, returning the rejection
+/// body. This is the header/body half of [`apply_plugin_rejection_response`],
+/// split out so the synthetic-response-body-hook path can replace the response
+/// for a body rejection while deferring the `after_proxy` reject hooks to a
+/// single application point (see
+/// [`apply_reject_after_proxy_and_synthetic_body_hooks`]).
+///
+/// Deferring matters because several reject-path `after_proxy` hooks consume
+/// one-shot state on their first invocation — `oidc_relying_party` does
+/// `ctx.metadata.remove(SESSION_SET_COOKIE_METADATA_KEY)` to stage the rotated
+/// session cookie, and `response_transformer` does
+/// `ctx.route_override_response_transform.take()`. If `after_proxy` ran once
+/// over the synthetic 2xx and then again here (after `response_headers.clear()`),
+/// that one-shot state would already be gone and could not be re-applied to the
+/// rejection response, silently dropping the rotated cookie / route overrides.
+fn rebuild_plugin_rejection_response_headers(
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
     reject: RejectedResponseParts,
@@ -11370,8 +11401,249 @@ pub(crate) async fn apply_plugin_rejection_response(
     for (key, value) in reject.headers {
         response_headers.insert(key, value);
     }
-    apply_after_proxy_hooks_to_rejection(plugins, ctx, *response_status, response_headers).await;
     reject.body
+}
+
+pub(crate) async fn apply_plugin_rejection_response(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    reject: RejectedResponseParts,
+) -> Vec<u8> {
+    let body = rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
+    apply_after_proxy_hooks_to_rejection(plugins, ctx, *response_status, response_headers).await;
+    body
+}
+
+/// Decide whether response-body guardrails / transforms should run over a
+/// synthetic 2xx plugin short-circuit body (e.g. `ai_federation` /
+/// `ai_semantic_cache` synthetic responses surfaced via `RejectBinary{200}`).
+///
+/// General rule: these hooks (`on_response_body`,
+/// `transform_response_body_with_context`, `on_final_response_body`) run over a
+/// 2xx short-circuit body **only** when there is a body to inspect and the same
+/// response-body-buffering capability gate the normal response path uses is
+/// satisfied. Specifically we skip when:
+/// - the request is gRPC (synthetic gRPC bodies are handled as trailers-only),
+/// - the status is not 2xx,
+/// - the status is 204 (a body-emitting transform there is protocol-incorrect —
+///   `204 No Content` MUST NOT carry a body; 304 is already outside the 2xx
+///   range checked above),
+/// - the synthetic body is empty (nothing to inspect/transform), or
+/// - no active plugin wants to buffer this response. We mirror the normal
+///   response path's two-tier gate exactly: a plugin's per-request
+///   `should_buffer_response_body(ctx)` is only consulted when that plugin
+///   advertised the config-time `requires_response_body_buffering()` capability
+///   upper bound (the documented precondition on
+///   [`Plugin::should_buffer_response_body`], and the same ordering
+///   [`should_stream_response_body`] uses). This both honors the capability
+///   contract and keeps preflight/mock-heavy proxies from paying three extra
+///   async plugin sweeps per request.
+///
+/// [`Plugin::should_buffer_response_body`]: crate::plugins::Plugin::should_buffer_response_body
+fn should_apply_synthetic_response_body_hooks(
+    status_code: u16,
+    is_grpc_request: bool,
+    response_body: &[u8],
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+) -> bool {
+    !is_grpc_request
+        && (200..300).contains(&status_code)
+        && status_code != 204
+        && !response_body.is_empty()
+        && plugins.iter().any(|plugin| {
+            plugin.requires_response_body_buffering() && plugin.should_buffer_response_body(ctx)
+        })
+}
+
+/// Run the synthetic 2xx short-circuit response-body hook pipeline
+/// (`on_response_body`, `transform_response_body_with_context`,
+/// `on_final_response_body`) over a plugin-generated body, replacing the
+/// response when a body guardrail rejects it.
+///
+/// A body rejection here rebuilds the response headers via
+/// [`rebuild_plugin_rejection_response_headers`] — it deliberately does **not**
+/// run the `after_proxy` reject hooks. The caller
+/// ([`apply_reject_after_proxy_and_synthetic_body_hooks`]) runs those hooks
+/// exactly once after this function returns, over whatever the final response
+/// turned out to be (the synthetic 2xx or the body-rejection response), so
+/// one-shot `after_proxy` response state (e.g. the `oidc_relying_party` rotated
+/// session cookie, `response_transformer` route overrides) lands on the final
+/// response exactly once instead of being consumed by an earlier pass and lost
+/// when this path replaces the response.
+async fn apply_synthetic_response_body_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Vec<u8>,
+) {
+    // Mark the context for the duration of this body-hook phase so that storing
+    // plugins (e.g. `request_deduplication`) can tell this body is a synthetic
+    // plugin short-circuit and skip caching/replaying it. Saved/restored so a
+    // pre-existing value is preserved and the marker never leaks past this phase.
+    let previous_synthetic_marker = ctx.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+
+    let mut response_body_reject = None;
+    for plugin in plugins.iter() {
+        let result = plugin
+            .on_response_body(ctx, *response_status, response_headers, response_body)
+            .await;
+        match result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let reject = plugin_result_into_reject_parts(reject)
+                    .expect("reject result should convert to rejection parts");
+                debug!(
+                    plugin = plugin.name(),
+                    status_code = reject.status_code,
+                    "Plugin rejected synthetic response body"
+                );
+                response_body_reject = Some(reject);
+                break;
+            }
+        }
+    }
+    if let Some(reject) = response_body_reject {
+        // Rebuild headers/body only; the after_proxy reject hooks run once in
+        // the caller so one-shot response state survives this replacement.
+        *response_body =
+            rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
+    }
+
+    let content_type = response_headers.get("content-type").cloned();
+    let ct_ref = content_type.as_deref();
+    for plugin in plugins.iter() {
+        if let Some(transformed) = plugin
+            .transform_response_body_with_context(ctx, response_body, ct_ref, response_headers)
+            .await
+        {
+            response_headers.insert("content-length".to_string(), transformed.len().to_string());
+            *response_body = transformed;
+        }
+    }
+
+    let mut response_body_reject = None;
+    for plugin in plugins.iter() {
+        let result = plugin
+            .on_final_response_body(ctx, *response_status, response_headers, response_body)
+            .await;
+        match result {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let reject = plugin_result_into_reject_parts(reject)
+                    .expect("reject result should convert to rejection parts");
+                debug!(
+                    plugin = plugin.name(),
+                    status_code = reject.status_code,
+                    "Plugin rejected finalized synthetic response body"
+                );
+                response_body_reject = Some(reject);
+                break;
+            }
+        }
+    }
+    if let Some(reject) = response_body_reject {
+        // Rebuild headers/body only; the after_proxy reject hooks run once in
+        // the caller so one-shot response state survives this replacement.
+        *response_body =
+            rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
+    }
+
+    // Restore the synthetic short-circuit marker to its prior state so it does
+    // not leak past this body-hook phase into later logging/metrics hooks.
+    if let Some(previous_synthetic_marker) = previous_synthetic_marker {
+        ctx.metadata.insert(
+            SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+            previous_synthetic_marker,
+        );
+    } else {
+        ctx.metadata.remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
+    }
+}
+
+/// Run the rejection-response plugin pipeline over a plugin short-circuit:
+/// the synthetic response-body guardrail/transform hooks (when the gate in
+/// [`should_apply_synthetic_response_body_hooks`] is satisfied) followed by the
+/// `after_proxy` reject hooks (`applies_after_proxy_on_reject()`), applied
+/// **exactly once** over the final response.
+///
+/// This is the shared core used by both the H1/H2/HBONE rejection path
+/// ([`finalize_reject_response_with_after_proxy_hooks`]) and the HTTP/3
+/// `before_proxy` rejection path, so AI guardrails (`ai_response_guard` /
+/// `ai_semantic_firewall`) see synthetic 2xx bodies (e.g. `ai_federation` /
+/// `ai_semantic_cache` hits surfaced via `RejectBinary{200}`) identically
+/// across all frontends. It mutates `status`, `headers`, and `body` in place;
+/// any normalization of the final wire form (gRPC trailers, content-length) is
+/// the caller's responsibility.
+///
+/// Ordering: the synthetic body hooks run first (they may *replace* the
+/// response when `ai_response_guard` / `ai_semantic_firewall` rejects the
+/// synthetic 2xx body — see [`apply_synthetic_response_body_hooks`], which
+/// rebuilds headers via [`rebuild_plugin_rejection_response_headers`] without
+/// running `after_proxy`). The `after_proxy` reject hooks then run a single
+/// time over whatever the FINAL response is (the synthetic 2xx OR the
+/// body-rejection response). Running `after_proxy` exactly once — and last —
+/// preserves one-shot response state that those hooks emit: the
+/// `oidc_relying_party` rotated session cookie and `response_transformer`
+/// route-override headers are staged from metadata that the hook consumes on
+/// first invocation, so they must be applied to the final response, not
+/// consumed against a synthetic 2xx that a later body rejection discards. The
+/// reject-path `after_proxy` hooks are header-only and do not depend on the
+/// body-hook output (`compression::after_proxy` deliberately no-ops on the
+/// rejection path), so deferring them past the body hooks is safe.
+pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status: &mut u16,
+    headers: &mut HashMap<String, String>,
+    body: &mut Vec<u8>,
+    is_grpc_request: bool,
+) {
+    if !plugins.is_empty()
+        && should_apply_synthetic_response_body_hooks(*status, is_grpc_request, body, plugins, ctx)
+    {
+        // KNOWN ORDERING DIVERGENCE (accepted, documented trade-off):
+        //
+        // On the synthetic short-circuit path the response-BODY hooks
+        // (`on_response_body` / `transform_response_body_with_context` /
+        // `on_final_response_body`) run HERE, BEFORE the `after_proxy` reject
+        // hooks below. On the NORMAL backend path the order is reversed —
+        // `after_proxy` runs before the body transforms. So a body transform that
+        // depends on a header/metadata mutation made by an `after_proxy` hook
+        // (e.g. `response_transformer`'s `after_proxy` rewriting `Content-Type`
+        // to `application/json` before its JSON body rules, or `compression`
+        // choosing an encoding) can see a different input on a synthetic 2xx than
+        // it would on an equivalent backend 2xx.
+        //
+        // This is INTENTIONAL and must NOT be "fixed" by moving `after_proxy`
+        // ahead of the body hooks: doing so would re-break the one-shot
+        // `after_proxy` response-state contract that the caller relies on. The
+        // body hooks may REPLACE the response when a guardrail rejects the
+        // synthetic 2xx body (`apply_synthetic_response_body_hooks` rebuilds
+        // headers via `rebuild_plugin_rejection_response_headers`). The
+        // `after_proxy` reject hooks therefore have to run exactly once and LAST,
+        // over the FINAL response, so one-shot state emitted from consumed
+        // metadata — the `oidc_relying_party` rotated session cookie, the
+        // `response_transformer` route override — lands on whatever the client
+        // actually receives instead of being consumed against a synthetic 2xx
+        // that a later body rejection discards (see commit 36de1bf0 and the
+        // function-level doc on `apply_reject_after_proxy_and_synthetic_body_hooks`).
+        // The two requirements directly conflict; we keep the one-shot guarantee
+        // and accept the minor body-transform divergence on the synthetic path.
+        apply_synthetic_response_body_hooks(plugins, ctx, status, headers, body).await;
+    }
+    // Apply the after_proxy reject hooks exactly once, over the final response
+    // (the synthetic 2xx or the body-rejection response produced above), so
+    // one-shot response state (rotated session cookie, route overrides) is
+    // emitted onto whatever the client actually receives. Runs LAST by design —
+    // see the divergence note above.
+    apply_after_proxy_hooks_to_rejection(plugins, ctx, *status, headers).await;
 }
 
 pub(crate) struct AfterProxyReject {
@@ -11670,8 +11942,19 @@ async fn finalize_reject_response_with_after_proxy_hooks(
     mut headers: HashMap<String, String>,
     is_grpc_request: bool,
 ) -> NormalizedRejectResponse {
-    apply_after_proxy_hooks_to_rejection(plugins, ctx, status.as_u16(), &mut headers).await;
-    normalize_reject_response(status, body, &headers, is_grpc_request)
+    let mut response_status = status.as_u16();
+    let mut response_body = body.to_vec();
+    apply_reject_after_proxy_and_synthetic_body_hooks(
+        plugins,
+        ctx,
+        &mut response_status,
+        &mut headers,
+        &mut response_body,
+        is_grpc_request,
+    )
+    .await;
+    let status = StatusCode::from_u16(response_status).unwrap_or(status);
+    normalize_reject_response(status, &response_body, &headers, is_grpc_request)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -22707,11 +22990,19 @@ fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 mod tests {
     use super::*;
     use crate::config::types::{LoadBalancerAlgorithm, PluginAssociation};
+    use crate::plugins::PluginHttpClient;
+    use crate::plugins::ai_federation::AiFederation;
+    use crate::plugins::ai_rate_limiter::AiRateLimiter;
+    use crate::plugins::ai_response_guard::AiResponseGuard;
+    use crate::plugins::ai_semantic_cache::AiSemanticCache;
+    use crate::plugins::ai_semantic_firewall::AiSemanticFirewall;
     use crate::plugins::compression::CompressionPlugin;
     use crate::plugins::security_headers::SecurityHeaders;
     use async_trait::async_trait;
     use http::header::HeaderValue;
     use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn streaming_dispatch_test_proxy() -> Proxy {
         serde_json::from_value(json!({
@@ -23664,6 +23955,47 @@ mod tests {
         }
     }
 
+    /// Metadata key the [`OneShotCookieAfterProxyPlugin`] consumes on its first
+    /// `after_proxy` invocation, mirroring `oidc_relying_party`'s rotated-session
+    /// cookie handoff (`SESSION_SET_COOKIE_METADATA_KEY`).
+    const ONE_SHOT_COOKIE_METADATA_KEY: &str = "test:one_shot_cookie";
+
+    /// Stages a one-shot `Set-Cookie` from metadata onto the response during a
+    /// rejection `after_proxy` pass — modeled on `oidc_relying_party.after_proxy`,
+    /// which `ctx.metadata.remove(...)`s the rotated cookie (so a second pass
+    /// cannot re-emit it) and appends it onto `set-cookie`. Used to prove the
+    /// rotated cookie survives a synthetic-2xx body rejection.
+    struct OneShotCookieAfterProxyPlugin;
+
+    #[async_trait]
+    impl Plugin for OneShotCookieAfterProxyPlugin {
+        fn name(&self) -> &str {
+            "one_shot_cookie_after_proxy"
+        }
+
+        fn applies_after_proxy_on_reject(&self) -> bool {
+            true
+        }
+
+        async fn after_proxy(
+            &self,
+            ctx: &mut RequestContext,
+            _response_status: u16,
+            response_headers: &mut HashMap<String, String>,
+        ) -> PluginResult {
+            if let Some(cookie) = ctx.metadata.remove(ONE_SHOT_COOKIE_METADATA_KEY) {
+                response_headers
+                    .entry("set-cookie".to_string())
+                    .and_modify(|existing| {
+                        existing.push('\n');
+                        existing.push_str(&cookie);
+                    })
+                    .or_insert(cookie);
+            }
+            PluginResult::Continue
+        }
+    }
+
     fn test_proxy(response_body_mode: ResponseBodyMode) -> Proxy {
         serde_json::from_value(json!({
             "backend_host": "example.com",
@@ -23836,6 +24168,446 @@ mod tests {
         );
         assert_eq!(body, br#"{"error":"blocked"}"#);
         assert!(!ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY));
+    }
+
+    fn ai_json_response(content: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 4,
+                "total_tokens": 7
+            }
+        }))
+        .unwrap()
+    }
+
+    fn request_ctx_with_ai_body(body: serde_json::Value) -> RequestContext {
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        ctx.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            serde_json::to_string(&body).unwrap(),
+        );
+        ctx
+    }
+
+    fn response_guard_rejecting_leak_phrase() -> AiResponseGuard {
+        AiResponseGuard::new(&json!({
+            "action": "reject",
+            "blocked_phrases": ["DO_NOT_LEAK"]
+        }))
+        .unwrap()
+    }
+
+    fn response_firewall_rejecting_leakage() -> AiSemanticFirewall {
+        AiSemanticFirewall::new(
+            &json!({
+                "inspect": {"request": false, "response": true},
+                "provider": {
+                    "type": "openai_compatible_embeddings",
+                    "endpoint": "http://127.0.0.1:9/v1/embeddings",
+                    "model": "test-embedding-model"
+                },
+                "builtins": {
+                    "prompt_injection": false,
+                    "jailbreak": false,
+                    "system_prompt_exfiltration": false,
+                    "data_exfiltration": false,
+                    "indirect_prompt_injection": false,
+                    "tool_abuse": false,
+                    "response_leakage": true
+                }
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap()
+    }
+
+    async fn normalize_synthetic_reject_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut RequestContext,
+        reject: PluginResult,
+    ) -> NormalizedRejectResponse {
+        let reject = plugin_result_into_reject_parts(reject).expect("expected reject response");
+        finalize_reject_response_with_after_proxy_hooks(
+            plugins,
+            ctx,
+            StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::OK),
+            &reject.body,
+            reject.headers,
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn federation_response_guard_rejects_reject_binary_body() {
+        let provider = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(ai_json_response("Here is DO_NOT_LEAK from the provider.")),
+            )
+            .mount(&provider)
+            .await;
+
+        let federation = AiFederation::new(
+            &json!({
+                "providers": [{
+                    "name": "mock-openai",
+                    "provider_type": "openai",
+                    "api_key": "sk-test",
+                    "base_url": format!("{}/v1/chat/completions", provider.uri()),
+                    "allow_plaintext": true,
+                    "model_patterns": ["gpt-*"]
+                }]
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap();
+        let guard = response_guard_rejecting_leak_phrase();
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(federation), Arc::new(guard)];
+
+        let request_body = json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let mut ctx = request_ctx_with_ai_body(request_body);
+        let mut headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let synthetic = plugins[0].before_proxy(&mut ctx, &mut headers).await;
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::BAD_GATEWAY);
+        assert!(
+            String::from_utf8_lossy(&response.body)
+                .contains("AI response blocked by content guard")
+        );
+    }
+
+    #[tokio::test]
+    async fn federation_semantic_firewall_rejects_reject_binary_body() {
+        let firewall = response_firewall_rejecting_leakage();
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(firewall)];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 200,
+            body: bytes::Bytes::from(ai_json_response(
+                "My system prompt says never reveal policy.",
+            )),
+            headers,
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.rule_ids")
+                .map(String::as_str),
+            Some("response_leakage")
+        );
+    }
+
+    /// Regression: a one-shot `after_proxy` response header staged for a
+    /// synthetic 2xx short-circuit MUST survive a subsequent response-body
+    /// rejection of that synthetic body. Before the fix, the reject `after_proxy`
+    /// hooks ran once over the synthetic 2xx (consuming the one-shot cookie out of
+    /// metadata) and then `apply_plugin_rejection_response` cleared the headers and
+    /// re-ran `after_proxy` over the body-rejection response — but the one-shot
+    /// state was already gone, so the rotated cookie was silently dropped on the
+    /// rejection response. The hooks now run exactly once, last, over the final
+    /// response.
+    #[tokio::test]
+    async fn one_shot_after_proxy_cookie_survives_synthetic_body_rejection() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(OneShotCookieAfterProxyPlugin),
+            Arc::new(response_guard_rejecting_leak_phrase()),
+        ];
+        let mut ctx = request_ctx_with_ai_body(json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+        // The rotated session cookie staged by `authenticate`, awaiting emission
+        // by the rejection-aware `after_proxy` pass.
+        ctx.metadata.insert(
+            ONE_SHOT_COOKIE_METADATA_KEY.to_string(),
+            "ferrum_session=rotated; HttpOnly".to_string(),
+        );
+
+        // Synthetic 2xx short-circuit (e.g. an `ai_federation` hit) whose body
+        // contains the phrase the response guard blocks.
+        let mut synthetic_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        synthetic_headers.insert("content-length".to_string(), "0".to_string());
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 200,
+            body: bytes::Bytes::from(ai_json_response("Here is DO_NOT_LEAK from the provider.")),
+            headers: synthetic_headers,
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        // The body guard replaced the synthetic 2xx with a 502 rejection...
+        assert_eq!(response.http_status, StatusCode::BAD_GATEWAY);
+        assert!(
+            String::from_utf8_lossy(&response.body)
+                .contains("AI response blocked by content guard")
+        );
+        // ...and the rotated session cookie still rides on that rejection
+        // response, exactly once.
+        let set_cookie = response
+            .headers
+            .get("set-cookie")
+            .map(String::as_str)
+            .expect("rotated session cookie must survive the body rejection");
+        assert_eq!(set_cookie, "ferrum_session=rotated; HttpOnly");
+        // One-shot state was consumed (no leak past the response build).
+        assert!(!ctx.metadata.contains_key(ONE_SHOT_COOKIE_METADATA_KEY));
+    }
+
+    /// Companion to the rejection case: when the synthetic 2xx body is NOT
+    /// rejected, the one-shot `after_proxy` cookie must still appear on the
+    /// surviving 2xx response exactly once (no loss, no duplication).
+    #[tokio::test]
+    async fn one_shot_after_proxy_cookie_applied_once_on_accepted_synthetic_body() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(OneShotCookieAfterProxyPlugin),
+            Arc::new(response_guard_rejecting_leak_phrase()),
+        ];
+        let mut ctx = request_ctx_with_ai_body(json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+        ctx.metadata.insert(
+            ONE_SHOT_COOKIE_METADATA_KEY.to_string(),
+            "ferrum_session=rotated; HttpOnly".to_string(),
+        );
+
+        // Synthetic 2xx whose body contains nothing the guard blocks.
+        let mut synthetic_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        synthetic_headers.insert("content-length".to_string(), "0".to_string());
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 200,
+            body: bytes::Bytes::from(ai_json_response("A perfectly benign answer.")),
+            headers: synthetic_headers,
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::OK);
+        let set_cookie = response
+            .headers
+            .get("set-cookie")
+            .map(String::as_str)
+            .expect("rotated session cookie must ride the surviving 2xx response");
+        assert_eq!(set_cookie, "ferrum_session=rotated; HttpOnly");
+        assert!(!ctx.metadata.contains_key(ONE_SHOT_COOKIE_METADATA_KEY));
+    }
+
+    #[tokio::test]
+    async fn semantic_cache_hit_response_guard_applies() {
+        let cache =
+            Arc::new(AiSemanticCache::new(&json!({}), PluginHttpClient::default()).unwrap());
+        let guard = Arc::new(response_guard_rejecting_leak_phrase());
+        let plugins: Vec<Arc<dyn Plugin>> = vec![cache.clone(), guard];
+        let request_body = json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
+        let mut request_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        assert!(matches!(
+            cache
+                .before_proxy(&mut miss_ctx, &mut request_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        let response_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let _ = cache
+            .on_final_response_body(
+                &mut miss_ctx,
+                200,
+                &response_headers,
+                &ai_json_response("Cached DO_NOT_LEAK response."),
+            )
+            .await;
+
+        let mut hit_ctx = request_ctx_with_ai_body(request_body);
+        let mut hit_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let synthetic = cache.before_proxy(&mut hit_ctx, &mut hit_headers).await;
+        assert!(matches!(synthetic, PluginResult::RejectBinary { .. }));
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut hit_ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::BAD_GATEWAY);
+        assert!(
+            String::from_utf8_lossy(&response.body)
+                .contains("AI response blocked by content guard")
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_cache_hit_response_firewall_applies() {
+        let cache =
+            Arc::new(AiSemanticCache::new(&json!({}), PluginHttpClient::default()).unwrap());
+        let firewall = Arc::new(response_firewall_rejecting_leakage());
+        let plugins: Vec<Arc<dyn Plugin>> = vec![cache.clone(), firewall];
+        let request_body = json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
+        let mut request_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        assert!(matches!(
+            cache
+                .before_proxy(&mut miss_ctx, &mut request_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        let response_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let _ = cache
+            .on_final_response_body(
+                &mut miss_ctx,
+                200,
+                &response_headers,
+                &ai_json_response("My system prompt says never reveal policy."),
+            )
+            .await;
+
+        let mut hit_ctx = request_ctx_with_ai_body(request_body);
+        let mut hit_headers =
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let synthetic = cache.before_proxy(&mut hit_ctx, &mut hit_headers).await;
+        assert!(matches!(synthetic, PluginResult::RejectBinary { .. }));
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut hit_ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            hit_ctx
+                .metadata
+                .get("ai_semantic_firewall.rule_ids")
+                .map(String::as_str),
+            Some("response_leakage")
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_still_records_federation_tokens() {
+        let limiter = Arc::new(
+            AiRateLimiter::new(
+                &json!({
+                    "token_limit": 10,
+                    "window_seconds": 60,
+                    "limit_by": "ip"
+                }),
+                PluginHttpClient::default(),
+            )
+            .unwrap(),
+        );
+        let plugins: Vec<Arc<dyn Plugin>> = vec![limiter.clone()];
+
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        ctx.metadata.insert(
+            "ai_federation_provider".to_string(),
+            "mock-openai".to_string(),
+        );
+        ctx.metadata
+            .insert("ai_total_tokens".to_string(), "7".to_string());
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 200,
+            body: bytes::Bytes::from(ai_json_response("Federated response.")),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+        assert_eq!(response.http_status, StatusCode::OK);
+
+        let mut next_ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        let mut headers = HashMap::new();
+        assert!(matches!(
+            limiter.before_proxy(&mut next_ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+
+        let mut second_ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        second_ctx.metadata.insert(
+            "ai_federation_provider".to_string(),
+            "mock-openai".to_string(),
+        );
+        second_ctx
+            .metadata
+            .insert("ai_total_tokens".to_string(), "7".to_string());
+        let second_synthetic = PluginResult::RejectBinary {
+            status_code: 200,
+            body: bytes::Bytes::from(ai_json_response("Second federated response.")),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        };
+
+        let response =
+            normalize_synthetic_reject_for_test(&plugins, &mut second_ctx, second_synthetic).await;
+        assert_eq!(response.http_status, StatusCode::OK);
+
+        let mut over_limit_ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        let mut headers = HashMap::new();
+        assert!(matches!(
+            limiter
+                .before_proxy(&mut over_limit_ctx, &mut headers)
+                .await,
+            PluginResult::Reject {
+                status_code: 429,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

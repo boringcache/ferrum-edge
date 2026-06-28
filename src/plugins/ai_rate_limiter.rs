@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::{debug, warn};
 
@@ -35,7 +36,18 @@ const RESERVATION_ID_METADATA_KEY: &str = "ai_ratelimit_reservation_id";
 const RESERVED_WINDOW_INDEX_METADATA_KEY: &str = "ai_ratelimit_reserved_window_index";
 const ACTUAL_TOKENS_METADATA_KEY: &str = "ai_ratelimit_actual_tokens";
 const UNMETERED_ACTION_METADATA_KEY: &str = "ai_ratelimit_unmetered_action";
-const FEDERATION_TOKENS_RECORDED_METADATA_KEY: &str = "ai_ratelimit_federation_tokens_recorded";
+/// Base prefix for the per-request idempotency flag that marks a federated
+/// response's tokens as already reconciled by `after_proxy` (the sole federation
+/// charger — `on_response_body` always skips federation traffic). The flag guards
+/// the case where `after_proxy` runs twice for one request (a synthetic 2xx
+/// short-circuit followed by a response-body rejection that re-runs the reject
+/// hooks). The full key is per-limiter-instance (see
+/// [`AiRateLimiter::federation_flag_key`]) so that multiple `ai_rate_limiter`
+/// instances on one proxy (e.g. a per-consumer and a per-IP budget) each
+/// reconcile the federation tokens against their own window exactly once, instead
+/// of the first instance's flag suppressing the others.
+const FEDERATION_TOKENS_RECORDED_METADATA_KEY_PREFIX: &str =
+    "ai_ratelimit_federation_tokens_recorded";
 /// Idempotency marker for the reservation-RELEASE paths only: set the first time
 /// this request *releases* its reservation (any `reconcile_usage` call with
 /// `actual_tokens == None`), then checked before a later release so no second
@@ -49,9 +61,9 @@ const FEDERATION_TOKENS_RECORDED_METADATA_KEY: &str = "ai_ratelimit_federation_t
 /// double-release double-subtracts and under-counts the consumer's own window,
 /// permitting oversubscription (the exact bypass class this reservation model
 /// closes). This marker makes the *release* idempotent across BOTH backends,
-/// mirroring the `FEDERATION_TOKENS_RECORDED_METADATA_KEY` dedup. Like that key it
-/// is a plain shared `ctx.metadata` entry (not per-instance) — a single
-/// `ai_rate_limiter` instance owns the reservation lifecycle for a request.
+/// mirroring the per-instance federation dedup ([`AiRateLimiter::federation_flag_key`]).
+/// Unlike that key it is a plain shared `ctx.metadata` entry (not per-instance) — a
+/// single `ai_rate_limiter` instance owns the reservation lifecycle for a request.
 ///
 /// Scope is deliberately narrow: the authoritative actual-token *charge* path
 /// (`reconcile_usage` with `Some(actual_tokens)`) does NOT consult or set this
@@ -61,6 +73,13 @@ const FEDERATION_TOKENS_RECORDED_METADATA_KEY: &str = "ai_ratelimit_federation_t
 /// never about charging real usage or about window maintenance.
 const RESERVATION_RECONCILED_METADATA_KEY: &str = "ai_ratelimit_reservation_reconciled";
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+
+/// Process-wide monotonic counter used to give every `AiRateLimiter` instance a
+/// unique id. The id is folded into [`AiRateLimiter::federation_flag_key`] so the
+/// per-request federation idempotency flag is scoped to ONE limiter instance,
+/// never to a budget-config fingerprint that two intentionally-separate budgets
+/// could share. Mirrors the `INSTANCE_ID_COUNTER` idiom in `openapi_validator`.
+static INSTANCE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnUnmeteredResponse {
@@ -96,6 +115,13 @@ pub struct AiRateLimiter {
     expose_headers: bool,
     provider: String,
     on_unmetered_response: OnUnmeteredResponse,
+    /// Per-instance metadata key for the federation-tokens-recorded idempotency
+    /// flag. Scoped to this limiter instance via a process-unique id so that two
+    /// `ai_rate_limiter` instances — even with byte-identical budget config but
+    /// intentionally separate budgets (distinct `sync_mode`/`redis_key_prefix`,
+    /// or simply two local instances) — never share the flag. Each instance
+    /// reconciles the federation tokens against its own window exactly once.
+    federation_flag_key: String,
     limiter: RateLimitBackend<String, AiTokenRateAlgorithm>,
 }
 
@@ -165,6 +191,24 @@ impl AiRateLimiter {
             None => OnUnmeteredResponse::ChargeEstimate,
         };
 
+        // Scope the per-request federation idempotency flag to THIS limiter
+        // instance via a process-unique id, not to a budget-config fingerprint.
+        // Each instance owns its own token window (a separate in-memory map for
+        // the local backend, or a distinct `redis_key_prefix` for the centralized
+        // backend), so the idempotency flag — which guards against `after_proxy`
+        // running twice for ONE request — must be per instance too. A
+        // config-derived key would be shared by two limiters with identical
+        // budget config that are nonetheless SEPARATE budgets (e.g. different
+        // `sync_mode`/`redis_key_prefix`, or just two local instances): the first
+        // to run would set the flag and the second would skip its own federation
+        // reconcile, under-counting its own window for `ai_federation` traffic and
+        // contradicting the documented per-instance accounting contract. The id
+        // keeps the within-request, within-instance dedup semantics intact while
+        // never cross-suppressing a sibling instance.
+        let instance_id = INSTANCE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let federation_flag_key =
+            format!("{FEDERATION_TOKENS_RECORDED_METADATA_KEY_PREFIX}:{instance_id}");
+
         Ok(Self {
             token_limit,
             window_seconds,
@@ -173,6 +217,7 @@ impl AiRateLimiter {
             expose_headers,
             provider,
             on_unmetered_response,
+            federation_flag_key,
             limiter: RateLimitBackend::from_plugin_config(
                 "ai_rate_limiter",
                 config,
@@ -455,13 +500,13 @@ impl AiRateLimiter {
         // The actual-token charge path (`Some(actual_tokens)`) is the authoritative
         // reconcile and runs at most once per request in production — it is reached
         // only from `on_response_body`'s 2xx branch (once) or the federation
-        // `after_proxy` branch (once, itself guarded by
-        // `FEDERATION_TOKENS_RECORDED_METADATA_KEY`), and the two are mutually
-        // exclusive. It must NOT consult or set the release-dedup marker below:
-        // `adjust_usage` advances the sliding window's running-sum/eviction
-        // bookkeeping (via `current_usage`), so suppressing it would silently drop a
-        // legitimate usage record and corrupt the window accounting. The release
-        // dedup is exclusively about the duplicate *release* of a reservation
+        // `after_proxy` branch (once, itself guarded by the per-instance
+        // `federation_flag_key`), and the two are mutually exclusive. It must NOT
+        // consult or set the release-dedup marker below: `adjust_usage` advances
+        // the sliding window's running-sum/eviction bookkeeping (via
+        // `current_usage`), so suppressing it would silently drop a legitimate
+        // usage record and corrupt the window accounting. The release dedup is
+        // exclusively about the duplicate *release* of a reservation
         // (`actual_tokens == None`), not about charging real usage.
         if let Some(actual_tokens) = actual_tokens {
             ctx.metadata.insert(
@@ -1153,23 +1198,41 @@ impl Plugin for AiRateLimiter {
             );
         }
 
+        // `after_proxy` is the SOLE federation-token charger. It runs exactly once
+        // per request on whichever path applies — first on the normal path, and
+        // LAST on the synthetic short-circuit reject path
+        // (`apply_reject_after_proxy_and_synthetic_body_hooks` runs the body hooks
+        // first and this hook once afterwards). `on_response_body` deliberately
+        // skips ALL federation traffic (it returns early when
+        // `ai_federation_provider` is present), so there is no second federation
+        // charger to coordinate with.
+        //
+        // The only remaining double-charge risk is `after_proxy` itself running
+        // twice for ONE request (e.g. a synthetic 2xx short-circuit followed by a
+        // response-body rejection that re-runs the reject hooks). The per-instance
+        // `federation_flag_key` guards against that: the first run reconciles and
+        // sets it, any later run skips. The flag is per limiter instance so
+        // multiple `ai_rate_limiter` budgets on one proxy each reconcile their own
+        // window once. The federation reconcile itself goes through
+        // `reconcile_usage`, which charges the actual provider tokens (or releases
+        // the reservation on a non-2xx federation response).
         if ctx.metadata.contains_key("ai_federation_provider") {
-            let actual_tokens = self.read_tokens_from_metadata(&ctx.metadata);
-            let result = self
-                .reconcile_usage(
-                    ctx,
-                    response_status,
-                    actual_tokens,
-                    "ai_federation_metadata",
-                )
-                .await;
-            if !matches!(result, PluginResult::Continue) {
-                return result;
+            if !ctx.metadata.contains_key(&self.federation_flag_key) {
+                let actual_tokens = self.read_tokens_from_metadata(&ctx.metadata);
+                let result = self
+                    .reconcile_usage(
+                        ctx,
+                        response_status,
+                        actual_tokens,
+                        "ai_federation_metadata",
+                    )
+                    .await;
+                if !matches!(result, PluginResult::Continue) {
+                    return result;
+                }
+                ctx.metadata
+                    .insert(self.federation_flag_key.clone(), "true".to_string());
             }
-            ctx.metadata.insert(
-                FEDERATION_TOKENS_RECORDED_METADATA_KEY.to_string(),
-                "true".to_string(),
-            );
         } else if Self::should_release_gateway_rejection(ctx) {
             let result = self
                 .reconcile_usage(ctx, 500, None, "gateway_rejection")
@@ -1204,11 +1267,56 @@ impl Plugin for AiRateLimiter {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        // Federation tokens are reconciled EXCLUSIVELY by `after_proxy`, never
+        // here. `after_proxy` is the single authoritative federation charger: it
+        // runs exactly once per request — first on the normal response path, and
+        // LAST on the synthetic short-circuit reject path
+        // (`apply_reject_after_proxy_and_synthetic_body_hooks` runs the body
+        // hooks, i.e. this `on_response_body`, FIRST and the reject `after_proxy`
+        // hook once afterwards). If `on_response_body` also reconciled the same
+        // `ai_federation` tokens the consumer would be double-charged for one
+        // synthetic response (and a *blocked* response could be pushed over the
+        // limit). The federation marker is present BEFORE its `after_proxy`
+        // idempotency flag is set (the flag is written after `after_proxy` runs,
+        // which is after this hook on the synthetic path), so gating on the marker
+        // — not the flag — is the correct, race-free guard. `after_proxy` carries
+        // its own per-instance idempotency guard (`federation_flag_key`) for the
+        // case where it runs twice for one request, so the only thing this hook
+        // must do for federation traffic is stay out of the way (no charge AND no
+        // release; the federation reconcile, including any non-2xx release, is
+        // owned by `after_proxy`).
+        if ctx.metadata.contains_key("ai_federation_provider") {
+            return PluginResult::Continue;
+        }
+
+        // Do not reconcile (charge OR release) for ANY synthetic short-circuit
+        // body. A synthetic body is a plugin-generated 2xx that never reached the
+        // upstream model (cache hit, dedup replay, `response_mock`,
+        // `serverless_function`, `request_termination`, federation, …). All of
+        // them flow through `on_response_body` via the `RejectBinary`
+        // short-circuit, and the proxy sets `ferrum:synthetic_short_circuit` in
+        // `ctx.metadata` for the duration of that body-hook phase (see
+        // `apply_synthetic_response_body_hooks`). Without this guard a synthetic
+        // body that happens to carry an OpenAI-shaped `usage` block — e.g. a
+        // `response_mock` returning a canned chat-completion — would be charged
+        // against the window even though no provider tokens were consumed,
+        // silently shrinking the user's budget; equally, a synthetic body must not
+        // trigger a spurious reservation RELEASE here (the genuine request's
+        // reservation lifecycle is owned by its own real-response reconcile /
+        // `after_proxy`). The synthetic marker is the correct exemption signal
+        // precisely BECAUSE it is internal and unspoofable: it is set only on the
+        // synthetic path and never on a real backend response, so a backend (or a
+        // `response_transformer` rewrite) emitting a `usage` block, an
+        // `x-idempotent-replayed`, or any cache header on a genuine model response
+        // cannot satisfy it. A FRESH backend response carries no synthetic marker
+        // and is reconciled normally below.
         if ctx
             .metadata
-            .get(FEDERATION_TOKENS_RECORDED_METADATA_KEY)
-            .is_some_and(|value| value == "true")
+            .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
         {
+            debug!(
+                "ai_rate_limiter: skipping synthetic short-circuit response (no model tokens consumed)"
+            );
             return PluginResult::Continue;
         }
 
