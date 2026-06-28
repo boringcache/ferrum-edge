@@ -3317,11 +3317,34 @@ Universal AI gateway that routes requests in OpenAI Chat Completions format to a
 
 **Fail-closed defaults make `ai_federation` greedy in the `before_proxy` chain.** With the defaults, an instance now claims every `POST` + `application/json` request on its proxy — the resulting `RejectBinary` from `before_proxy` returns immediately and short-circuits later `before_proxy` plugins (serverless, response_mock, request/response transformers, caching, compression) as well as any second federation/router instance scoped to a different model family. Mixed-traffic proxies that need those other plugins to run on the same JSON POSTs should use the `fail_on_missing_model: false` / `fail_on_no_matching_provider: false` opt-outs, or isolate AI traffic on a dedicated proxy.
 
+**Multimodal content is explicit.** OpenAI Chat Completions content arrays may contain text plus non-text parts such as `image_url`. Provider configs accept `multimodal_mode`:
+
+| Mode | Behavior |
+|---|---|
+| `reject` | Reject matched requests containing non-text content parts with HTTP `400`. |
+| `translate` | Preserve supported non-text parts by converting them to the provider-native request format. Unsupported parts are rejected with HTTP `400`. |
+| `text_only_with_warning` | Intentionally drop non-text parts, send only text, log a warning, and set `ai_federation_multimodal_*` metadata. |
+
+Translated providers default to `reject` unless configured otherwise. OpenAI-compatible providers and Cohere default to `translate` because their outbound request shape preserves OpenAI-style content parts instead of flattening them.
+
+Multimodal capability is provider-specific, so a per-provider multimodal rejection (a `reject`-mode provider, or a `translate`-mode provider that cannot translate a specific part — e.g. AWS Bedrock with an HTTP(S) image URL or an unsupported image format) does **not** abort the fallback chain when `fallback_enabled` is set. The request falls through to the next matching provider exactly like a translation failure does, so a mixed list (e.g. a `reject`-mode provider followed by a `translate`-mode one) can still serve the image from the later provider. If **every** matching provider declines the request at the multimodal policy gate and no provider was ever dialed, the caller receives the final HTTP `400`.
+
 **Priority:** 2985
 
 **Supported providers:**
 - **OpenAI-compatible** (send OpenAI format directly): OpenAI, Mistral, xAI (Grok), DeepSeek, Meta Llama, Hugging Face, Azure OpenAI
 - **Requires translation**: Anthropic (Messages API), Google Gemini, Google Vertex AI (OAuth2), AWS Bedrock (Converse API, SigV4), Cohere v2
+
+**Multimodal support matrix:**
+
+| Provider type | Default mode | `translate` support |
+|---|---|---|
+| `openai`, `azure_openai`, `mistral`, `xai`, `deepseek`, `meta_llama`, `hugging_face` | `translate` | Sends OpenAI content parts unchanged; provider/model decides whether each part is supported. |
+| `cohere` | `translate` | Preserves OpenAI-style content parts in the Cohere v2 Chat request; provider/model decides whether each part is supported. |
+| `anthropic` | `reject` | Converts user/assistant `image_url` parts to Anthropic image blocks: HTTP(S) URLs use URL sources and data URLs use base64 sources. Only `jpeg`/`png`/`gif`/`webp` data-URL media types are accepted; other types (e.g. `svg+xml`) are rejected with HTTP `400`. Non-text system/developer parts are rejected. |
+| `google_gemini` | `reject` | Converts user/assistant `image_url` parts to Gemini parts: data URLs become `inlineData` blocks and `gs://` GCS URIs / Files API URIs become `fileData` blocks. Only `jpeg`/`png`/`webp`/`heic`/`heif` image media types are accepted (`svg+xml`/`bmp`/`tiff`/`gif` are rejected with HTTP `400`). `fileData.mimeType` is required by Google whenever `fileUri` is set, so it is resolved from the URI extension or an explicit `image_url.mime_type` field; an extensionless Files API URI without `mime_type` is rejected with HTTP `400`. Arbitrary HTTP(S) image URLs are rejected with HTTP `400` because the plugin does not fetch/inline remote images. Non-text system/developer parts are rejected. |
+| `google_vertex` | `reject` | Same Gemini `generateContent` request shape, media-type set, and `fileData.mimeType` handling as `google_gemini`; arbitrary HTTP(S) image URLs rejected with HTTP `400`. Non-text system/developer parts are rejected. |
+| `aws_bedrock` | `reject` | Converts **user-message** data URL `image_url` parts to Bedrock Converse image blocks; only `png`/`jpeg`/`gif`/`webp` media types are accepted. Images in `assistant` (or system/developer) messages are rejected with HTTP `400` because the Converse `Message` API only allows image content on `user` messages. HTTP(S) image URLs and unsupported formats are rejected with HTTP `400` because Converse requires supported image bytes. |
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -3343,6 +3366,7 @@ Universal AI gateway that routes requests in OpenAI Chat Completions format to a
 | `model_patterns` | Array | `[]` (catch-all) | Glob patterns to match model names (e.g., `["claude-*"]`) |
 | `model_mapping` | Object | `{}` | Map client model names to provider-native names |
 | `default_model` | String | _(none)_ | Default model when no mapping matches |
+| `multimodal_mode` | String | Provider-specific | One of `reject`, `translate`, `text_only_with_warning`; controls handling of non-text OpenAI content parts |
 | `connect_timeout_seconds` | Integer | `5` | Per-provider TCP + TLS handshake timeout for outbound provider calls |
 | `read_timeout_seconds` | Integer | `60` | Overall per-request deadline for outbound provider calls |
 | `base_url` | String | _(provider default)_ | Custom endpoint URL (for self-hosted or proxy endpoints) |
@@ -3414,7 +3438,7 @@ Use this only when the normal backend has equivalent authentication, model allow
 - `ai_federation` (2985) routes to provider, writes token metadata to `ctx.metadata`
 - `ai_rate_limiter` (4200) records token usage from federation metadata via `applies_after_proxy_on_reject`
 
-**Metadata keys written:** `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`, `ai_federation_provider` — same keys as `ai_token_metrics` for downstream compatibility.
+**Metadata keys written:** `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`, `ai_federation_provider` — same keys as `ai_token_metrics` for downstream compatibility. When `multimodal_mode: text_only_with_warning` drops non-text parts, the plugin also writes `ai_federation_multimodal_mode`, `ai_federation_multimodal_dropped_parts`, `ai_federation_multimodal_dropped_types`, `ai_federation_multimodal_dropped_roles`, and `ai_federation_multimodal_provider`.
 
 **TLS trust chain:** Because this plugin bypasses the normal proxy dispatch and makes outbound HTTP calls via the shared `PluginHttpClient`, it uses **global TLS settings only** — `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`. Per-proxy backend TLS overrides (`backend_tls_server_ca_cert_path`, `backend_tls_client_cert_path`, `backend_tls_verify_server_cert`) and CRL checking do not apply. For providers behind private endpoints (e.g., Azure Private Link, VPC endpoints), add the internal CA to the global CA bundle PEM file. Note that when `FERRUM_TLS_CA_BUNDLE_PATH` is set, webpki/system roots are excluded (CA exclusivity) — include public root CAs in the bundle if some providers are public and others use internal CAs.
 
