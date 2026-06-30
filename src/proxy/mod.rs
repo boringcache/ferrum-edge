@@ -16495,10 +16495,17 @@ async fn handle_proxy_request_inner(
     // streamable-status-then-stall/reset response-body failures trip backend
     // health while a late client-upload overflow remains neutral instead of being
     // misclassified as a backend fault.
-    // Whether the H2 response body is already end-of-stream at header time (empty
-    // 200 / `content-length: 0` / END_STREAM-in-headers). Such a body is dropped
-    // without being polled, so deferring it would be misread as a client
+    // Whether the H2 response body is already end-of-stream at header time
+    // (empty 200 / `content-length: 0` / END_STREAM-in-headers). Such a body is
+    // dropped without being polled, so deferring it would be misread as a client
     // disconnect — record it eagerly instead (#1649 round-2 finding C).
+    //
+    // Keep native-H3 out of this defer gate for now. hyper can finish an HTTP/1
+    // downstream response after writing a known Content-Length without polling
+    // the H3 body to its terminal FIN, so a deferred H3 dispatch outcome can be
+    // mis-recorded as ClientDisconnect. H3 streaming still gets per-frame
+    // `backend_read_timeout_ms`; CB / passive-health dispatch accounting remains
+    // eager until #1901 has body-driving-safe terminal accounting.
     let streaming_h2_body_ended = match &response_body {
         ResponseBody::StreamingH2(resp) => http_body::Body::is_end_stream(resp.body()),
         _ => false,
@@ -16522,7 +16529,7 @@ async fn handle_proxy_request_inner(
     // recorded synchronously (an after_proxy reject replaced the streaming body)
     // or at body completion, matching the synchronous path's
     // `backend_start.elapsed()` least-latency sample.
-    let streaming_h2_dispatch_elapsed = backend_start.elapsed();
+    let streaming_dispatch_elapsed = backend_start.elapsed();
     if defer_streaming_h2_dispatch {
         // Release the half-open probe slot promptly without recording a health
         // outcome; the deferred dispatch records the real outcome at body
@@ -16654,7 +16661,7 @@ async fn handle_proxy_request_inner(
             backend_admission_error_class,
             false,
             skip_final_cb_record || cb_stale,
-            streaming_h2_dispatch_elapsed,
+            streaming_dispatch_elapsed,
         );
     }
 
@@ -17252,7 +17259,7 @@ async fn handle_proxy_request_inner(
                         None,
                         false,
                         skip_final_cb_record,
-                        streaming_h2_dispatch_elapsed,
+                        streaming_dispatch_elapsed,
                     )
                     // #1649 round-4 B: skip the deferred CB record if the breaker
                     // opened a new cycle since admission (stale stream must not
@@ -17282,6 +17289,7 @@ async fn handle_proxy_request_inner(
                     h3_method,
                     response_status,
                     cl,
+                    proxy.backend_read_timeout_ms,
                 )
             } else if state.max_response_body_size_bytes > 0 {
                 crate::proxy::body::size_limited_streaming_h3_body(
@@ -17293,6 +17301,7 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
+                    proxy.backend_read_timeout_ms,
                 )
             } else {
                 crate::proxy::body::coalescing_h3_body(
@@ -17303,6 +17312,7 @@ async fn handle_proxy_request_inner(
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
+                    proxy.backend_read_timeout_ms,
                 )
             };
             let mut body = body.with_lb_connection_guard(lb_connection_guard);
@@ -22857,16 +22867,12 @@ async fn proxy_to_backend_http3(
 /// H1 (chunked trailers) and H2 (trailers frame) downstream clients receive
 /// them.
 ///
-/// KNOWN LIMITATION (pre-existing, shared with every native-H3 streaming
-/// response): unlike the `StreamingH2` arm, the downstream `StreamingH3` body
-/// builders do NOT yet apply the per-frame `backend_read_timeout_ms` idle
-/// regime, and the dispatch site does NOT defer the CB / passive-health
-/// outcome to body completion. So a 2xx/206 H3 response that stalls or resets
-/// AFTER headers banks a header-time success and relies on the QUIC idle
-/// timeout rather than a 504. This downgrade widens the set of responses on
-/// that streaming path (a `compression`-released `206`/SSE used to take the
-/// buffered drain's 504 + failure accounting); bringing the H3 streaming path
-/// to `StreamingH2` parity is tracked in issue #1901.
+/// Native-H3 streaming responses use the same per-frame
+/// `backend_read_timeout_ms` idle regime as direct-H2 streaming responses, so a
+/// backend that sends headers and then stalls is cut by the response-body
+/// wrapper instead of waiting for the QUIC idle timeout. CB / passive-health
+/// dispatch accounting remains eager at header time for native H3 until #1901
+/// has a body-driving-safe terminal accounting design.
 fn h3_streaming_backend_response(
     response: crate::http3::client::H3StreamingResponse,
     proxy: &Proxy,
@@ -23003,6 +23009,31 @@ async fn drain_h3_streaming_response_to_buffered(
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(error_class),
+            }
+        }
+        Err(crate::http3::client::H3BodyDrainError::Truncated { received, declared }) => {
+            // The backend FIN'd before delivering its declared Content-Length —
+            // a framing violation. The request was on the wire and the backend
+            // responded, so `connection_error=false` (respect `retry_on_methods`);
+            // `ConnectionClosed` is a post-wire backend failure, so the dispatch
+            // outcome trips CB / passive-health rather than banking a short body
+            // as a success.
+            error!(
+                proxy_id = %proxy.id,
+                backend_url = %strip_query_params(backend_url),
+                received = received,
+                declared = ?declared,
+                "HTTP/3 backend buffered response truncated (FIN before declared Content-Length)"
+            );
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"HTTP/3 backend response truncated"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ConnectionClosed),
             }
         }
     }
