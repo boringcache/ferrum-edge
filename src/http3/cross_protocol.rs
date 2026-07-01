@@ -127,6 +127,7 @@ use crate::retry::ErrorClass;
 /// whether the client disconnected mid-stream.
 pub struct CrossProtocolOutcome {
     pub response_status: u16,
+    pub response_streamed: bool,
     pub bytes_streamed: u64,
     pub bytes_sent: u64,
     pub backend_target: Option<String>,
@@ -264,13 +265,18 @@ fn record_cross_protocol_header_write_disconnect(
 
 fn cross_protocol_header_write_disconnect_outcome(
     response_status: u16,
+    response_streamed: bool,
     bytes_sent: u64,
     backend_start: Instant,
     backend_target: Option<String>,
     backend_resolved_ip: Option<String>,
 ) -> CrossProtocolOutcome {
+    // `response_streamed` describes the selected response path, not whether any
+    // body bytes reached the client. A disconnect before response HEADERS on a
+    // streaming path still needs streamed-response terminal hooks to run.
     CrossProtocolOutcome {
         response_status,
+        response_streamed,
         bytes_streamed: 0,
         bytes_sent,
         backend_target,
@@ -2165,6 +2171,7 @@ where
             );
             return Ok(cross_protocol_header_write_disconnect_outcome(
                 response_status,
+                false,
                 bytes_sent,
                 backend_start,
                 Some(strip_query_from_backend_url(&current_url)),
@@ -2222,6 +2229,7 @@ where
 
         return Ok(CrossProtocolOutcome {
             response_status,
+            response_streamed: false,
             bytes_streamed,
             bytes_sent,
             backend_target: Some(strip_query_from_backend_url(&current_url)),
@@ -2278,6 +2286,7 @@ where
         );
         return Ok(cross_protocol_header_write_disconnect_outcome(
             status,
+            true,
             bytes_sent,
             backend_start,
             Some(strip_query_from_backend_url(&current_url)),
@@ -2323,6 +2332,7 @@ where
 
     Ok(CrossProtocolOutcome {
         response_status: status,
+        response_streamed: true,
         bytes_streamed,
         bytes_sent,
         backend_target: Some(strip_query_from_backend_url(&current_url)),
@@ -2597,6 +2607,7 @@ where
                 );
                 return Ok(cross_protocol_header_write_disconnect_outcome(
                     reject_status,
+                    true,
                     bytes_sent,
                     backend_start,
                     Some(strip_query_from_backend_url(backend_target_url)),
@@ -2658,6 +2669,7 @@ where
         );
         return Ok(cross_protocol_header_write_disconnect_outcome(
             streaming.status,
+            true,
             bytes_sent,
             backend_start,
             Some(strip_query_from_backend_url(backend_target_url)),
@@ -2780,6 +2792,7 @@ where
     );
     Ok(CrossProtocolOutcome {
         response_status: streaming.status,
+        response_streamed: true,
         bytes_streamed,
         bytes_sent,
         backend_target: Some(strip_query_from_backend_url(backend_target_url)),
@@ -3207,6 +3220,7 @@ where
                         );
                         return Ok(cross_protocol_header_write_disconnect_outcome(
                             reject_status,
+                            false,
                             bytes_sent,
                             backend_start,
                             Some(strip_query_from_backend_url(&current_url)),
@@ -3429,6 +3443,7 @@ where
                 );
                 return Ok(cross_protocol_header_write_disconnect_outcome(
                     response_status,
+                    false,
                     bytes_sent,
                     backend_start,
                     Some(strip_query_from_backend_url(&current_url)),
@@ -3494,6 +3509,7 @@ where
             );
             Ok(CrossProtocolOutcome {
                 response_status,
+                response_streamed: false,
                 bytes_streamed: bytes_total,
                 bytes_sent,
                 backend_target: Some(strip_query_from_backend_url(&current_url)),
@@ -4704,6 +4720,7 @@ where
     crate::http3::stream_util::halt_request_body(stream);
     Ok(CrossProtocolOutcome {
         response_status: status.as_u16(),
+        response_streamed: false,
         bytes_streamed: len,
         bytes_sent,
         backend_target: None,
@@ -4760,6 +4777,7 @@ where
     crate::http3::stream_util::halt_request_body(stream);
     Ok(CrossProtocolOutcome {
         response_status: status.as_u16(),
+        response_streamed: false,
         bytes_streamed: len,
         bytes_sent,
         backend_target: None,
@@ -4918,6 +4936,7 @@ where
     let _ = stream.finish().await;
     Ok(CrossProtocolOutcome {
         response_status: reject.http_status.as_u16(),
+        response_streamed: false,
         bytes_streamed: 0,
         bytes_sent,
         backend_target: None,
@@ -5067,6 +5086,7 @@ where
     let _ = stream.finish().await;
     Ok(CrossProtocolOutcome {
         response_status: 200,
+        response_streamed: false,
         bytes_streamed: 0,
         bytes_sent,
         backend_target: None,
@@ -5148,6 +5168,7 @@ mod tests {
     fn header_write_disconnect_outcome_marks_client_disconnect_without_backend_error() {
         let outcome = cross_protocol_header_write_disconnect_outcome(
             200,
+            false,
             42,
             Instant::now(),
             Some("https://backend.example/path".to_string()),
@@ -5155,6 +5176,7 @@ mod tests {
         );
 
         assert_eq!(outcome.response_status, 200);
+        assert!(!outcome.response_streamed);
         assert_eq!(outcome.bytes_streamed, 0);
         assert_eq!(outcome.bytes_sent, 42);
         assert_eq!(
@@ -5166,6 +5188,24 @@ mod tests {
         assert!(outcome.client_disconnected);
         assert!(!outcome.connection_error);
         assert_eq!(outcome.error_class, None);
+        assert_eq!(outcome.body_error_class, Some(ErrorClass::ClientDisconnect));
+    }
+
+    #[test]
+    fn header_write_disconnect_outcome_preserves_streamed_response_path() {
+        let outcome = cross_protocol_header_write_disconnect_outcome(
+            200,
+            true,
+            7,
+            Instant::now(),
+            None,
+            None,
+        );
+
+        assert!(outcome.response_streamed);
+        assert_eq!(outcome.bytes_streamed, 0);
+        assert!(!outcome.body_completed);
+        assert!(outcome.client_disconnected);
         assert_eq!(outcome.body_error_class, Some(ErrorClass::ClientDisconnect));
     }
 

@@ -78,6 +78,19 @@ impl BodyOutcome {
     }
 }
 
+pub async fn run_response_stream_termination_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    response_status: u16,
+    outcome: &BodyOutcome,
+) {
+    for plugin in plugins {
+        plugin
+            .on_response_stream_terminated(ctx, response_status, outcome)
+            .await;
+    }
+}
+
 /// Logger that defers a `log_with_mirror()` call until the response body
 /// reaches a terminal state. Clone-friendly via [`Arc`].
 ///
@@ -243,6 +256,14 @@ impl DeferredTransactionLogger {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
+                    let response_status = summary.response_status_code;
+                    run_response_stream_termination_hooks(
+                        plugins.as_slice(),
+                        &ctx,
+                        response_status,
+                        &outcome,
+                    )
+                    .await;
                     log_with_mirror(plugins.as_slice(), &summary, &ctx).await;
                 });
             }

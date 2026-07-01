@@ -31,6 +31,7 @@ use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
     RequestContext, ResponseStreamAction, TransactionSummary,
 };
+use crate::proxy::deferred_log::{BodyOutcome, run_response_stream_termination_hooks};
 use crate::proxy::headers::{
     apply_response_headers, is_backend_request_strip_header, is_backend_response_strip_header,
     is_proxy_generated_forwarding_header, parse_connection_listed_from_str_map,
@@ -2495,7 +2496,7 @@ async fn handle_h3_request(
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: (gateway_processing_ms - plugin_execution_ms).max(0.0),
             request_user_agent: proxy_headers.get("user-agent").cloned(),
-            response_streamed: true,
+            response_streamed: outcome.response_streamed,
             client_disconnected: outcome.client_disconnected,
             body_error_class: outcome.body_error_class,
             body_completed: outcome.body_completed,
@@ -2505,6 +2506,21 @@ async fn handle_h3_request(
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
         };
+        if outcome.response_streamed {
+            let stream_outcome = BodyOutcome {
+                body_completed: outcome.body_completed,
+                body_error_class: outcome.body_error_class,
+                bytes_streamed: outcome.bytes_streamed,
+                client_disconnected: outcome.client_disconnected,
+            };
+            run_response_stream_termination_hooks(
+                &plugins,
+                &ctx,
+                summary.response_status_code,
+                &stream_outcome,
+            )
+            .await;
+        }
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
 
         return Ok(());
@@ -3420,6 +3436,19 @@ async fn handle_h3_request(
             metadata: crate::proxy::clone_log_metadata(&ctx),
         };
 
+        let stream_outcome = BodyOutcome {
+            body_completed,
+            body_error_class,
+            bytes_streamed,
+            client_disconnected,
+        };
+        run_response_stream_termination_hooks(
+            &plugins,
+            &ctx,
+            summary.response_status_code,
+            &stream_outcome,
+        )
+        .await;
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
         record_request(&state, response_status);
         return Ok(());
@@ -3863,6 +3892,19 @@ async fn handle_h3_request(
             metadata: crate::proxy::clone_log_metadata(&ctx),
         };
 
+        let stream_outcome = BodyOutcome {
+            body_completed: h3_stream_result.body_completed,
+            body_error_class: h3_stream_result.body_error_class,
+            bytes_streamed: h3_stream_result.bytes_streamed,
+            client_disconnected: h3_stream_result.client_disconnected,
+        };
+        run_response_stream_termination_hooks(
+            &plugins,
+            &ctx,
+            summary.response_status_code,
+            &stream_outcome,
+        )
+        .await;
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
 
         record_request(&state, response_status);
