@@ -7585,7 +7585,13 @@ async fn handle_connection(
                 "Client disconnected before response completed"
             );
         } else {
-            debug!(error = %e, "Connection error");
+            error!(
+                remote_addr = %remote_addr,
+                listen_port = frontend_listen_port,
+                tls = false,
+                error = %e,
+                "HTTP connection error"
+            );
         }
     }
 
@@ -7594,6 +7600,7 @@ async fn handle_connection(
 
 /// Check if a hyper connection error indicates a client disconnect.
 fn is_client_disconnect_error(err: &str) -> bool {
+    let err = err.to_ascii_lowercase();
     err.contains("connection reset")
         || err.contains("broken pipe")
         || err.contains("connection abort")
