@@ -665,11 +665,13 @@ async fn test_response_buffering_releases_event_stream_content_type() {
 
 /// A keyed request whose response is streamed as `text/event-stream` is handed
 /// to the client incrementally, so `on_final_response_body` (which transitions
-/// the `InFlight` marker to a cached `Completed` entry) never runs. The marker
-/// stays in-flight for the lifetime of the stream, then the streamed-terminal
-/// hook releases it without storing a replay body.
+/// the `InFlight` marker to a cached `Completed` entry) never runs. On a clean
+/// stream completion the marker stays in-flight for the lifetime of the stream,
+/// then `on_response_stream_terminated` releases it without storing a replay
+/// body — so the next matching key re-executes instead of eating a stale 409
+/// for the rest of `inflight_ttl_seconds`.
 #[tokio::test]
-async fn test_streamed_event_stream_releases_inflight_marker_on_stream_end() {
+async fn test_streamed_event_stream_releases_inflight_marker_on_clean_completion() {
     let config = json!({});
     let plugin = make_plugin(config);
 
@@ -723,7 +725,7 @@ async fn test_streamed_event_stream_releases_inflight_marker_on_stream_end() {
     assert_eq!(
         plugin.tracked_keys_count(),
         Some(0),
-        "finite streamed SSE completion must release the in-flight marker instead of waiting for TTL"
+        "a cleanly completed streamed SSE response must release the in-flight marker instead of waiting for TTL"
     );
 
     let mut after_ctx = RequestContext::new(
@@ -738,7 +740,62 @@ async fn test_streamed_event_stream_releases_inflight_marker_on_stream_end() {
         .await;
     assert!(
         matches!(result, PluginResult::Continue),
-        "duplicate after streamed SSE completion should re-execute, not get stale 409 or cached replay; got {result:?}"
+        "duplicate after a cleanly completed streamed SSE response should re-execute, not get stale 409 or cached replay; got {result:?}"
+    );
+}
+
+/// An interrupted streamed SSE response — client disconnect or mid-stream error,
+/// i.e. `!body_completed` — delivered no full response to the client and is the
+/// case most likely to be retried with the same idempotency key. Releasing the
+/// marker there would let that retry re-execute a side-effecting backend
+/// operation with no replay/tombstone protection, so the marker is retained
+/// until `inflight_ttl_seconds` and duplicates keep receiving 409.
+#[tokio::test]
+async fn test_streamed_event_stream_retains_inflight_marker_on_client_disconnect() {
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("idempotency-key".to_string(), "sse-key".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+
+    // The client stopped consuming mid-stream (Drop safety net): the body never
+    // completed, so the marker must survive to block an immediate retry.
+    plugin
+        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::client_disconnect(32))
+        .await;
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(1),
+        "an interrupted streamed SSE response must keep the in-flight marker until TTL so a same-key retry cannot re-execute"
+    );
+
+    let mut after_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut after_headers = HashMap::new();
+    after_headers.insert("idempotency-key".to_string(), "sse-key".to_string());
+    let result = plugin
+        .before_proxy(&mut after_ctx, &mut after_headers)
+        .await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "duplicate after an interrupted streamed SSE response must stay blocked until TTL, got {result:?}"
     );
 }
 
@@ -806,7 +863,11 @@ async fn test_stale_stream_end_does_not_clear_successor_inflight_marker() {
     plugin
         .on_response_stream_terminated(&successor_ctx, 200, &BodyOutcome::success(32))
         .await;
-    assert_eq!(plugin.tracked_keys_count(), Some(0));
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(0),
+        "the successor's own clean completion releases its marker via token-matched removal"
+    );
 }
 
 /// A buffered (non-SSE) keyed response keeps the marker in-flight through the

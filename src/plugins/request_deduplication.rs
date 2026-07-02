@@ -1564,9 +1564,11 @@ impl Plugin for RequestDeduplication {
         // on the buffered path with no benefit. Streaming it instead keeps the
         // `InFlight` marker active for the lifetime of the still-in-flight
         // stream — which is exactly the concurrent-duplicate protection this
-        // plugin promises. The streamed-body terminal hook releases the marker
-        // once the stream ends; `inflight_ttl` remains only the crash/leak
-        // backstop for streams that never deliver a terminal signal.
+        // plugin promises. `on_response_stream_terminated` then releases the
+        // marker on clean completion (no replay body is stored), while an
+        // interrupted stream (client disconnect or backend error) retains it
+        // until `inflight_ttl` so a same-key retry cannot re-execute a
+        // side-effecting operation that has no replay value.
         self.should_buffer_response_body(ctx)
             && !content_type.is_some_and(is_event_stream_content_type)
     }
@@ -1786,11 +1788,29 @@ impl Plugin for RequestDeduplication {
         &self,
         ctx: &RequestContext,
         _response_status: u16,
-        _outcome: &crate::proxy::deferred_log::BodyOutcome,
+        outcome: &crate::proxy::deferred_log::BodyOutcome,
     ) {
-        // Release regardless of terminal outcome. Streamed responses have no
-        // replayable body, so success, backend error, and client disconnect all
-        // leave the next matching request to execute normally.
+        // A streamed response has no whole body to cache, so this hook cannot
+        // transition the marker to a replayable `Completed` entry the way
+        // `on_final_response_body` does on the buffered path. What it does with
+        // the in-flight lock depends on how the stream ended:
+        //
+        // - Clean completion (`body_completed`): the full response reached the
+        //   client, so there is nothing left to protect. Release the marker
+        //   (local map + Redis lock) so the next matching key executes normally
+        //   instead of eating a stale 409 for the rest of `inflight_ttl`, and
+        //   so finished streams don't pile up non-evictable `InFlight` markers
+        //   above `max_entries`.
+        // - Client disconnect or mid-stream error (`!body_completed`): the
+        //   client did NOT receive the full response and is the case most
+        //   likely to be retried with the same idempotency key. Releasing here
+        //   would let that retry re-execute a side-effecting backend operation
+        //   with no replay/tombstone protection, so keep the local marker and
+        //   Redis lock until `inflight_ttl` expires as the backstop.
+        if !outcome.body_completed {
+            return;
+        }
+
         let Some(key) = ctx.metadata.get(DEDUP_KEY_METADATA) else {
             return;
         };
