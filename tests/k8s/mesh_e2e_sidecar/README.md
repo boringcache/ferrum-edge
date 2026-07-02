@@ -18,6 +18,13 @@ cluster runs SPIRE plus three hand-crafted sidecar workloads:
   same-trust-domain mTLS and is then denied by the destination's
   identity-scoped AuthorizationPolicy (`mesh_authz` 403) — a
   destination-sourced negative, not an incidental client-side TLS failure.
+- **wssvc** — a second destination pod (`sa/wssvc`, **its own identity**: one
+  local pod backs exactly one service, so the WS listener must not be a
+  second local `service_name` on `sa/svc` — `resolve_local_workloads` fails
+  closed on that ambiguity and materializes no inbound routes) running a
+  minimal RFC 6455 echo that answers upgrades with a correct
+  `Sec-WebSocket-Accept` and **holds** the session — the target of the DR
+  `maxConnections=1` probe.
 
 ## What it asserts
 
@@ -35,14 +42,17 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 | `sidecar.request_auth.missing_jwt_rejected` | token-less request on the gated path → 403 (RequestAuth is permissive; the authz `request_principals` ALLOW does not match) |
 | `sidecar.request_auth.invalid_jwt_rejected` | wrong-key signature → 401 `Invalid or unrecognized JWT` (`jwks_auth`) |
 | `sidecar.destination_rule.tcp_connect_timeout` | two-phase timing: the black-holed mesh-mTLS dial fails at ~8s under `connect_timeout_ms: 8000`, then ~2s after a re-render + rollout restart to `2000` — the observed time must **track** the configured value (both windows exclude the built-in 5000ms default) |
+| `sidecar.destination_rule.tcp_max_connections` | WebSocket flow (`wssvc`, maxConnections=1): one **held** WS session admitted (101), a concurrent second upgrade rejected **503** by the client sidecar's `BackendConnectionGuard` before dialing, and a fresh upgrade admitted after the held session closes — cap enforcement **and** release |
 
-`sidecar.destination_rule.tcp_connect_timeout` is a GA-contract live
-assertion (`tests/conformance/ga_contract.yaml`); the artifact is validated
-against the contract by `tests/conformance/live_contract.rs` (the live
-workflow runs it right after the fixture). The remaining assertions are
-suite-required here pending the Stable-surface contract enrollment stage. The
-contract's other two seeded sidecar live ids are `live_deferred` with written
-rationale (issues #1973 CORS, #1974 maxConnections).
+Every assertion except `sidecar.spire.workload_entries` (fixture
+infrastructure) backs a GA-contract capability row in
+`tests/conformance/ga_contract.yaml` — STRICT mTLS, AuthorizationPolicy
+allow/deny, RequestAuthentication JWT, DR connectTimeout, and DR
+maxConnections; the artifact is validated against the contract by
+`tests/conformance/live_contract.rs` (the live workflow runs it right after
+the fixture). The one remaining `live_deferred` contract id is VS CORS
+(issue #1973 — the mesh slice carries no VirtualService-derived route
+plugins).
 
 ## JWT material
 

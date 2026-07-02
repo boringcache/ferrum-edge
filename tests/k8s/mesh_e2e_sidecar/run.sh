@@ -30,6 +30,11 @@ set -euo pipefail
 #                                               DR connectTimeout provably
 #                                               bounds the mesh-mTLS dial
 #                                               (two-phase timing, see below)
+#   sidecar.destination_rule.tcp_max_connections
+#                                               DR maxConnections=1 admits one
+#                                               HELD WebSocket session, rejects
+#                                               a concurrent upgrade 503, and
+#                                               recovers after release
 #
 # The DestinationRule probe is TWO-PHASE on purpose: a black-holed dial (the
 # client pod's own OUTPUT DROP, so SYNs vanish deterministically with no
@@ -78,6 +83,7 @@ LIVE_SUITE_NAME="mesh-e2e-sidecar"
 
 SVC_HOST="svc.$NS.svc.cluster.local"
 SLOW_HOST="slowsvc.$NS.svc.cluster.local"
+WS_HOST="wssvc.$NS.svc.cluster.local"
 JWT_ISSUER="mesh-e2e-issuer"
 JWT_KID="fixture-key"
 # Two-phase DR connectTimeout values + accepted observation windows (seconds).
@@ -95,6 +101,7 @@ PHASE2_WINDOW_HI=4.5
 
 # Discovered at runtime.
 SVC_POD_IP=""
+WSSVC_POD_IP=""
 # Minted at startup (mint_jwt_material).
 JWKS_JSON=""
 JWT_VALID=""
@@ -110,12 +117,12 @@ REQUIRED_LIVE_ASSERTIONS=(
   sidecar.request_auth.missing_jwt_rejected
   sidecar.request_auth.invalid_jwt_rejected
   sidecar.destination_rule.tcp_connect_timeout
+  sidecar.destination_rule.tcp_max_connections
 )
-# NOTE: only `sidecar.destination_rule.tcp_connect_timeout` is a GA-contract
-# live assertion today; the rest are suite-required here (run.sh-local gate,
-# like the multicluster fixture's `multicluster.*` ids) pending the
-# Stable-surface contract enrollment stage. The contract's other two seeded
-# live ids are `live_deferred` in ga_contract.yaml (issues #1973, #1974).
+# NOTE: every id except `sidecar.spire.workload_entries` (fixture
+# infrastructure, suite-local) backs a GA-contract capability row in
+# tests/conformance/ga_contract.yaml — keep the id strings in lock-step. The
+# one remaining `live_deferred` contract id is VS CORS (issue #1973).
 
 mkdir -p "$ARTIFACT_DIR" "$RESULTS_DIR"
 
@@ -287,7 +294,7 @@ install_spire() {
 }
 
 register_spire_workloads() {
-  log "registering SPIRE workload entries (svc, client, rogue)"
+  log "registering SPIRE workload entries (svc, wssvc, client, rogue)"
   local registered_ok=true
   local -a spire_nodes
   mapfile -t spire_nodes < <(ferrum_spire_agent_nodes "$CONTEXT" "$SPIRE_NS")
@@ -306,7 +313,7 @@ register_spire_workloads() {
     fi
     # slowsvc has NO entry on purpose: its dial is black-holed and never
     # completes a handshake, so no SVID is ever presented for it.
-    for sa in svc client rogue; do
+    for sa in svc wssvc client rogue; do
       ferrum_spire_register_k8s_workload \
         "$CONTEXT" "$SPIRE_NS" \
         "spiffe://$TRUST_DOMAIN/ns/$NS/sa/$sa" \
@@ -320,7 +327,7 @@ register_spire_workloads() {
 
   if [[ "$registered_ok" == "true" ]]; then
     record_live_assertion sidecar.spire.workload_entries pass \
-      "" "" "svc-client-rogue-entries-registered" "spire-entries.txt"
+      "" "" "svc-wssvc-client-rogue-entries-registered" "spire-entries.txt"
   else
     record_live_assertion sidecar.spire.workload_entries fail \
       "" "" "workload-entry-registration-failed"
@@ -359,13 +366,15 @@ apply_configmap() {
     --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f -
 }
 
-# Select a Running, Ready, NON-terminating svc pod's IP. `Terminating` is NOT
-# a pod phase — a deleting pod keeps phase=Running with a deletionTimestamp —
-# so a phase filter alone can pick a dying pod's IP during a rollout.
-wait_for_svc_pod_ip() {
+# Select a Running, Ready, NON-terminating pod IP for the given app label.
+# `Terminating` is NOT a pod phase — a deleting pod keeps phase=Running with a
+# deletionTimestamp — so a phase filter alone can pick a dying pod's IP during
+# a rollout.
+wait_for_pod_ip() {
+  local app_label="$1"
   local ip="" _
   for _ in $(seq 1 60); do
-    ip="$(kubectl --context "$CONTEXT" -n "$NS" get pod -l app=svc -o json 2>/dev/null |
+    ip="$(kubectl --context "$CONTEXT" -n "$NS" get pod -l "app=$app_label" -o json 2>/dev/null |
       python3 -c '
 import json, sys
 try:
@@ -393,7 +402,7 @@ for pod in data.get("items", []):
     fi
     sleep 2
   done
-  echo "svc pod never reported a ready non-terminating pod IP" >&2
+  echo "$app_label pod never reported a ready non-terminating pod IP" >&2
   return 1
 }
 
@@ -482,6 +491,48 @@ YAML
 )"
 }
 
+# WebSocket destination sidecar mesh document: wssvc is its OWN pod +
+# identity (sa/wssvc) because one local pod backs exactly ONE service —
+# declaring wssvc as a second local service_name on sa/svc makes
+# resolve_local_workloads fail closed (ambiguous local workload) and the dest
+# sidecar materializes NO inbound routes (proven live: every probe 404'd).
+# STRICT inbound only; the authz/JWT policies stay on the svc destination.
+render_wsdest_config() {
+  apply_configmap ferrum-mesh-wsdest "$(cat <<YAML
+mesh:
+  workloads:
+    - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/wssvc
+      service_name: wssvc
+      namespace: $NS
+      trust_domain: $TRUST_DOMAIN
+      service_account: wssvc
+      addresses:
+        - 127.0.0.1
+      ports:
+        - port: 8080
+          protocol: http
+          name: ws
+      selector:
+        labels:
+          app: wssvc
+        namespace: $NS
+  services:
+    - name: wssvc
+      namespace: $NS
+      ports:
+        - port: 8080
+          protocol: http
+          name: ws
+      workloads:
+        - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/wssvc
+  peer_authentications:
+    - name: mesh-strict
+      namespace: $NS
+      mtls_mode: strict
+YAML
+)"
+}
+
 # Client/rogue sidecar mesh document: the svc workload at its REAL pod IP
 # (sidecar egress dials workload_address:15006 over mesh-mTLS) plus the
 # `slowsvc` workload at the black-holed IP with a DestinationRule
@@ -489,7 +540,7 @@ YAML
 # after the svc pod IP is known; a svc pod replacement would need a re-render
 # + client restart (this fixture never replaces svc).
 render_client_config() {
-  local svc_pod_ip="$1" slow_connect_timeout_ms="$2"
+  local svc_pod_ip="$1" wssvc_pod_ip="$2" slow_connect_timeout_ms="$3"
   apply_configmap ferrum-mesh-client "$(cat <<YAML
 mesh:
   workloads:
@@ -504,6 +555,19 @@ mesh:
         - port: 8080
           protocol: http
           name: http
+      selector:
+        namespace: $NS
+    - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/wssvc
+      service_name: wssvc
+      namespace: $NS
+      trust_domain: $TRUST_DOMAIN
+      service_account: wssvc
+      addresses:
+        - "$wssvc_pod_ip"
+      ports:
+        - port: 8080
+          protocol: http
+          name: ws
       selector:
         namespace: $NS
     - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/slowsvc
@@ -528,6 +592,14 @@ mesh:
           name: http
       workloads:
         - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/svc
+    - name: wssvc
+      namespace: $NS
+      ports:
+        - port: 8080
+          protocol: http
+          name: ws
+      workloads:
+        - spiffe_id: spiffe://$TRUST_DOMAIN/ns/$NS/sa/wssvc
     - name: slowsvc
       namespace: $NS
       ports:
@@ -542,13 +614,22 @@ mesh:
       host: slowsvc.$NS.svc.cluster.local
       traffic_policy:
         connect_timeout_ms: $slow_connect_timeout_ms
+    # maxConnections=1 on the WS service: one held WebSocket session occupies
+    # the sole slot (BackendConnectionGuard held for the session in the WS
+    # connect loop), a concurrent second upgrade is rejected 503 before
+    # dialing, and the slot frees on session close.
+    - name: wssvc-max-connections
+      namespace: $NS
+      host: wssvc.$NS.svc.cluster.local
+      traffic_policy:
+        max_connections: 1
 YAML
 )"
 }
 
 wait_for_rollouts() {
   local deploy
-  for deploy in svc client rogue; do
+  for deploy in svc wssvc client rogue; do
     kubectl --context "$CONTEXT" -n "$NS" rollout status "deploy/$deploy" --timeout=5m
   done
 }
@@ -736,6 +817,103 @@ probe_request_auth() {
   fi
 }
 
+# DR maxConnections over a WebSocket flow: maxConnections is enforced on
+# stream-family and WebSocket backend connections only (a WS session holds one
+# dedicated backend connection for its lifetime), so the probe drives
+# hand-rolled RFC 6455 upgrades from the client pod's python container at the
+# outbound capture listener:
+#   1. upgrade #1 -> 101 (retried until the wssvc route settles) and HELD;
+#   2. upgrade #2 while #1 is held -> the client sidecar rejects it 503
+#      (backend_max_connections) before dialing — the cap observation;
+#   3. close #1 -> the slot frees on session teardown -> upgrade #3 -> 101
+#      (retried briefly), proving the cap releases rather than leaking.
+# Echoes "<first>\t<second>\t<third>" status codes.
+probe_ws_max_connections() {
+  log "probing DR maxConnections=1 over WebSocket (wssvc)"
+  local out first second third rest
+  # shellcheck disable=SC2016
+  out="$(kubectl --context "$CONTEXT" -n "$NS" exec deploy/client -c probe -- \
+    python3 -c '
+import base64
+import os
+import socket
+import sys
+import time
+
+host = sys.argv[1]
+
+
+def upgrade(timeout=10):
+    s = socket.create_connection(("127.0.0.1", 15001), timeout=timeout)
+    key = base64.b64encode(os.urandom(16)).decode()
+    req = (
+        "GET /ws HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    ).encode()
+    s.sendall(req)
+    s.settimeout(timeout)
+    data = b""
+    try:
+        while b"\r\n\r\n" not in data:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        pass
+    code = "000"
+    if data.startswith(b"HTTP/"):
+        parts = data.split(b" ", 2)
+        if len(parts) >= 2:
+            code = parts[1][:3].decode(errors="replace")
+    return s, code
+
+
+first_sock = None
+first = "000"
+for _ in range(30):
+    first_sock, first = upgrade()
+    if first == "101":
+        break
+    first_sock.close()
+    time.sleep(2)
+
+second = "000"
+third = "000"
+if first == "101":
+    s2, second = upgrade()
+    s2.close()
+    first_sock.close()
+    for _ in range(15):
+        s3, third = upgrade()
+        s3.close()
+        if third == "101":
+            break
+        time.sleep(2)
+print(f"{first}\t{second}\t{third}")
+' "$WS_HOST" 2>/dev/null | tail -1 || printf 'EXECFAIL\tEXECFAIL\tEXECFAIL')"
+  first="${out%%$'\t'*}"
+  rest="${out#*$'\t'}"
+  second="${rest%%$'\t'*}"
+  third="${rest#*$'\t'}"
+  log "WS maxConnections: first=$first second=$second third=$third"
+  # The cap proof is EXACTLY: held session admitted (101), concurrent second
+  # upgrade rejected with the WS backend_max_connections 503 (a real sidecar
+  # response — 000/EXECFAIL never satisfies it), and recovery after release.
+  if [[ "$first" == "101" && "$second" == "503" && "$third" == "101" ]]; then
+    record_live_assertion sidecar.destination_rule.tcp_max_connections pass \
+      client wssvc "held=101 concurrent=$second released=$third (maxConnections=1)"
+  else
+    record_live_assertion sidecar.destination_rule.tcp_max_connections fail \
+      client wssvc "unexpected-sequence first=$first second=$second third=$third"
+    return 1
+  fi
+}
+
 # One timed probe at the black-holed slowsvc. Retries only while the response
 # is a NON-5xx (a route-materialization blip); settles on the first 5xx and
 # echoes "<status>\t<time_total>\t<body>". curl's own -m must sit ABOVE the
@@ -790,7 +968,7 @@ probe_connect_timeout_two_phase() {
   log "re-rendering client config with ${CONNECT_TIMEOUT_PHASE2_MS}ms and restarting client"
   # Distroless runtime image: no shell/kill, so config reload is a rollout
   # restart (the new pod reads the updated ConfigMap at startup).
-  render_client_config "$SVC_POD_IP" "$CONNECT_TIMEOUT_PHASE2_MS"
+  render_client_config "$SVC_POD_IP" "$WSSVC_POD_IP" "$CONNECT_TIMEOUT_PHASE2_MS"
   kubectl --context "$CONTEXT" -n "$NS" rollout restart deploy/client
   kubectl --context "$CONTEXT" -n "$NS" rollout status deploy/client --timeout=3m
   # Re-settle the positive route first so phase 2 never times a request that
@@ -851,7 +1029,7 @@ collect_diagnostics() {
   kubectl --context "$CONTEXT" -n "$NS" get configmap -o yaml \
     > "$ARTIFACT_DIR/configmaps.yaml" 2>&1 || true
   local deploy
-  for deploy in svc client rogue; do
+  for deploy in svc wssvc client rogue; do
     kubectl --context "$CONTEXT" -n "$NS" logs "deploy/$deploy" \
       --all-containers --tail=500 \
       > "$ARTIFACT_DIR/${deploy}.log" 2>&1 || true
@@ -893,15 +1071,17 @@ main() {
   ensure_namespace
   mint_jwt_material
   render_dest_config
+  render_wsdest_config
   apply_workloads
   register_spire_workloads
 
   # svc rolls out first (its ConfigMap exists); client/rogue block in
   # ContainerCreating until the client ConfigMap — rendered with the
   # discovered svc pod IP — is applied.
-  SVC_POD_IP="$(wait_for_svc_pod_ip)"
-  log "svc pod IP=$SVC_POD_IP"
-  render_client_config "$SVC_POD_IP" "$CONNECT_TIMEOUT_PHASE1_MS"
+  SVC_POD_IP="$(wait_for_pod_ip svc)"
+  WSSVC_POD_IP="$(wait_for_pod_ip wssvc)"
+  log "svc pod IP=$SVC_POD_IP   wssvc pod IP=$WSSVC_POD_IP"
+  render_client_config "$SVC_POD_IP" "$WSSVC_POD_IP" "$CONNECT_TIMEOUT_PHASE1_MS"
   wait_for_rollouts
 
   if [[ "${FERRUM_MESH_E2E_DEPLOY_ONLY:-0}" == "1" ]]; then
@@ -913,6 +1093,7 @@ main() {
   probe_plaintext_rejected
   probe_rogue_denied
   probe_request_auth
+  probe_ws_max_connections
   probe_connect_timeout_two_phase
 
   require_live_assertions
