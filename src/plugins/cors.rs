@@ -644,13 +644,19 @@ impl Plugin for CorsPlugin {
     }
 }
 
-fn validate_method(key: &str, value: &str) -> Result<(), String> {
+/// `pub(crate)` like [`validate_exact_origin`]: the K8s translator's
+/// `cors_policy_translatable` and the native/file mesh source's
+/// `validate_virtual_service_cors_policies` run the same method/header-name
+/// admission the plugin applies at construction, so a policy that passes those
+/// boundaries can never fail `CorsPlugin` construction later. Do not fork.
+pub(crate) fn validate_method(key: &str, value: &str) -> Result<(), String> {
     Method::from_bytes(value.as_bytes())
         .map(|_| ())
         .map_err(|_| format!("cors: '{key}' contains an invalid HTTP method: {value}"))
 }
 
-fn validate_header_name(key: &str, value: &str) -> Result<(), String> {
+/// Shared admission gate — see [`validate_method`].
+pub(crate) fn validate_header_name(key: &str, value: &str) -> Result<(), String> {
     HeaderName::from_bytes(value.as_bytes())
         .map(|_| ())
         .map_err(|_| format!("cors: '{key}' contains an invalid HTTP header name: {value}"))
@@ -675,7 +681,16 @@ fn validate_wildcard_origin(origin: &str) -> Result<String, String> {
     Ok(format!(".{}", suffix.to_ascii_lowercase()))
 }
 
-fn validate_exact_origin(origin: &str) -> Result<(), String> {
+/// Validate one exact (plain-string, non-wildcard) allowed origin:
+/// `scheme://host[:port]` with an http(s) scheme and no path, query, fragment,
+/// or credentials. `pub(crate)` because it is the SHARED admission gate for
+/// every surface that projects Istio `StringMatch.exact` origins into this
+/// plugin's plain-string form — the K8s translator's
+/// `cors_origin_matcher_value` (defers non-translatable policies) and the
+/// native/file mesh source's `validate_virtual_service_cors_policies`
+/// (rejects the slice fail-closed) — so a value that passes those boundaries
+/// can never fail `CorsPlugin` construction later. Do not fork this predicate.
+pub(crate) fn validate_exact_origin(origin: &str) -> Result<(), String> {
     let url = Url::parse(origin).map_err(|e| format!("cors: invalid origin '{origin}': {e}"))?;
     match url.scheme() {
         "http" | "https" => {}

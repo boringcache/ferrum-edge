@@ -928,6 +928,10 @@ fn prepare_normalized_gateway_config_for_mesh(
     // under the service-port key or dial-port key their dispatch path uses.
     // Topology-aware: Ambient emits HBONE routes; Sidecar emits SVID-mTLS routes.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
+    // VirtualService-derived CORS attaches to the just-materialized outbound
+    // routes (issue #1973) — after materialization so the proxy ids exist,
+    // before DR application like every other route-policy overlay.
+    synthesize_mesh_outbound_cors_plugins(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_tcp_upstreams(&mut config, runtime, mesh_slice);
     materialize_mesh_outbound_udp_upstreams(&mut config, runtime, mesh_slice);
     fail_closed_node_waypoint_udp_dtls_scoped_policies(&mut config, runtime);
@@ -1621,6 +1625,7 @@ fn gateway_config_from_mesh_slice_with_federation(
             request_authentications: slice.request_authentications.clone(),
             telemetry_resources: slice.telemetry_resources.clone(),
             destination_rules: slice.destination_rules.clone(),
+            virtual_service_cors_policies: slice.virtual_service_cors_policies.clone(),
             proxy_configs: slice.proxy_configs.clone(),
             // Slice-narrowing is applied CP-side at `MeshSlice::from_gateway_config`.
             // DPs receive the already-narrowed set of services / service-entries /
@@ -5698,6 +5703,123 @@ fn mesh_sd_selected_service_port(upstream: &Upstream, mesh_slice: &MeshSlice) ->
 /// Multiple DRs targeting the same upstream are applied in a deterministic
 /// order — sorted by `(namespace, name)` — so the last-writer-wins outcome
 /// is reproducible across CP restarts and DP subscribers.
+/// Synthesize per-route `cors` plugin instances onto materialized sidecar
+/// OUTBOUND routes from the slice's VirtualService-derived CORS policies
+/// (issue #1973). Istio applies VirtualService policy on the client sidecar,
+/// so the policy attaches to the egress routes; application is HOST-LEVEL
+/// (materialized routes are host-routed `/`). Policy hosts resolve against
+/// each service's FQDN with DestinationRule host semantics
+/// (`destination_rule_host_matches`: bare name, `name.namespace`, FQDN).
+///
+/// Determinism + conflict handling mirror `apply_destination_rules`: policies
+/// are sorted by `(namespace, name)` and the FIRST match per service wins
+/// (additional matches warn — Istio would merge VS routes; host-level mesh
+/// application takes one policy per host). Runs AFTER outbound
+/// materialization (the proxy ids must exist for `validate_plugin_references`)
+/// and touches only `__mesh-outbound-*` proxies plus its own reserved
+/// `__mesh-cors-*` plugin ids — operator plugin configs are never modified.
+fn synthesize_mesh_outbound_cors_plugins(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
+    // Client-SIDECAR scope only (the GA row and docs promise exactly that):
+    // Ambient/waypoint topologies also materialize `__mesh-outbound-*` routes,
+    // but VS policy application for them is a waypoint concern — do not hand
+    // sidecar-style CORS behavior to sidecarless clients.
+    if runtime.topology != MeshTopology::Sidecar {
+        return;
+    }
+    if mesh_slice.virtual_service_cors_policies.is_empty() {
+        return;
+    }
+    // Normalize the host MATCH KEY here, not just in `MeshConfig::normalize()`:
+    // a slice arriving over the native/xDS carriers never passes config-source
+    // normalization on this DP, and `destination_rule_host_matches` lowercases
+    // and strips trailing dots but does NOT trim whitespace — a padded carried
+    // host would silently match no service and synthesize no plugin.
+    let mut sorted_policies: Vec<(String, &config::MeshVirtualServiceCorsPolicy)> = mesh_slice
+        .virtual_service_cors_policies
+        .iter()
+        .map(|policy| (config::normalize_mesh_hostname_like(&policy.host), policy))
+        .collect();
+    sorted_policies.sort_by(|a, b| (&a.1.namespace, &a.1.name).cmp(&(&b.1.namespace, &b.1.name)));
+    let cluster_domain = runtime.cluster_domain.trim_matches('.');
+
+    let mut synthesized: Vec<PluginConfig> = Vec::new();
+    for service in &mesh_slice.services {
+        let service_fqdn = format!(
+            "{}.{}.svc.{}",
+            service.name, service.namespace, cluster_domain
+        );
+        let matching: Vec<&(String, &config::MeshVirtualServiceCorsPolicy)> = sorted_policies
+            .iter()
+            .filter(|(host, policy)| {
+                destination_rule_host_matches(host, &policy.namespace, &service_fqdn)
+            })
+            .collect();
+        let Some((_, policy)) = matching.first() else {
+            continue;
+        };
+        if matching.len() > 1 {
+            warn!(
+                service = %service_fqdn,
+                applied = %format!("{}/{}", policy.namespace, policy.name),
+                total_matches = matching.len(),
+                "Multiple VirtualService CORS policies target one service; applying the \
+                 first by (namespace, name) — host-level mesh CORS takes one policy per host"
+            );
+        }
+        for service_port in service_http_family_ports(service) {
+            let proxy_id =
+                mesh_outbound_proxy_id(&service.namespace, &service.name, service_port.port);
+            let Some(proxy) = config.proxies.iter_mut().find(|proxy| proxy.id == proxy_id) else {
+                // Not every declared HTTP port materializes (e.g. an
+                // unresolved named targetPort skips its sibling) — nothing to
+                // attach CORS to on a route that does not exist.
+                continue;
+            };
+            // Reserved id derived from the materialized route id so it is
+            // collision-free by construction and idempotent across prepares.
+            let plugin_id = format!(
+                "__mesh-cors-{}",
+                proxy_id.trim_start_matches(MESH_OUTBOUND_PROXY_ID_PREFIX)
+            );
+            if proxy
+                .plugins
+                .iter()
+                .any(|association| association.plugin_config_id == plugin_id)
+            {
+                continue;
+            }
+            proxy.plugins.push(PluginAssociation {
+                plugin_config_id: plugin_id.clone(),
+            });
+            let now = chrono::Utc::now();
+            synthesized.push(PluginConfig {
+                id: plugin_id,
+                plugin_name: "cors".to_string(),
+                namespace: service.namespace.clone(),
+                config: config::cors_plugin_config_from_mesh_policy(&policy.cors),
+                scope: PluginScope::Proxy,
+                proxy_id: Some(proxy_id),
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: now,
+                updated_at: now,
+            });
+        }
+    }
+    if !synthesized.is_empty() {
+        info!(
+            plugins = synthesized.len(),
+            "Synthesized VirtualService CORS plugins onto materialized mesh outbound routes"
+        );
+        config.plugin_configs.extend(synthesized);
+    }
+}
+
 fn apply_destination_rules(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -13741,6 +13863,50 @@ mod tests {
     }
 
     #[test]
+    fn mesh_outbound_cors_synthesis_normalizes_carried_host() {
+        // A slice arriving over the native/xDS carriers never passes
+        // MeshConfig::normalize() on this DP, so the synthesis match key must
+        // be normalized locally — a padded/mixed-case carried host would
+        // otherwise silently match no service and attach no plugin.
+        let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_with_address("reviews", "reviews", "10.0.0.1")],
+            services: vec![http_mesh_service("reviews", 80, spiffe)],
+            virtual_service_cors_policies: vec![config::MeshVirtualServiceCorsPolicy {
+                name: "reviews-cors".to_string(),
+                namespace: "default".to_string(),
+                host: " Reviews.Default.SVC.Cluster.Local. ".to_string(),
+                export_to: Vec::new(),
+                cors: config::MeshCorsPolicy {
+                    allowed_origins: vec![config::MeshCorsOriginMatch::Exact(
+                        "https://a.example".to_string(),
+                    )],
+                    allowed_methods: Vec::new(),
+                    allowed_headers: Vec::new(),
+                    exposed_headers: Vec::new(),
+                    max_age_seconds: None,
+                    allow_credentials: None,
+                },
+            }],
+            ..MeshSlice::default()
+        };
+        let runtime = test_mesh_runtime_config();
+        assert_eq!(runtime.topology, MeshTopology::Sidecar);
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &runtime, &slice);
+        synthesize_mesh_outbound_cors_plugins(&mut config, &runtime, &slice);
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id == "__mesh-cors-default-reviews-80"
+                    && plugin.plugin_name == "cors"),
+            "padded/mixed-case carried host must still synthesize the cors plugin"
+        );
+    }
+
+    #[test]
     fn http_tcp_and_udp_stream_port_predicates_partition_protocols() {
         // The three routability predicates must form a STRICT 3-WAY PARTITION
         // of AppProtocol: every protocol is claimed by exactly one of
@@ -18959,6 +19125,7 @@ mod tests {
                 },
             ],
             destination_rules: Vec::new(),
+            virtual_service_cors_policies: Vec::new(),
             proxy_configs: Vec::new(),
             trust_bundles: None,
             multi_cluster: None,
