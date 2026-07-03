@@ -8466,6 +8466,22 @@ pub async fn run(
         "Mesh mode starting"
     );
 
+    // Deliberately a warning, not a refusal: the NodeWaypoint eBPF live gate
+    // runs the production identity profile on this topology, and the
+    // production identity guardrails (dev CA/attestor/no-identity refusals,
+    // inbound mTLS fail-closed) all still apply. The warning exists so an
+    // operator running an Experimental topology under the production flag has
+    // an explicit, greppable signal of the maturity mismatch.
+    if runtime.topology == MeshTopology::NodeWaypoint && crate::identity::production_mode() {
+        warn!(
+            topology = runtime.topology.as_str(),
+            "FERRUM_MESH_TOPOLOGY=node_waypoint is an Experimental topology running under \
+             FERRUM_MESH_PRODUCTION_MODE=true. Experimental surfaces are excluded from the GA \
+             contract (docs/mesh_supported_matrix.md); production identity guardrails still \
+             apply."
+        );
+    }
+
     // Configure the process-singleton policy-deny recorder before anything can
     // record into it. This is idempotent and a no-op on subsequent calls
     // (e.g., a restart-without-fork test harness) so we never wipe history
@@ -11132,8 +11148,14 @@ fn enforce_mesh_inbound_fail_closed(
          FERRUM_FRONTEND_TLS_CERT_PATH / KEY_PATH), so it would accept unauthenticated plaintext"
     };
     match decide_mesh_inbound_fail_closed(frontend_tls.is_none(), production) {
-        MeshInboundFailClosed::Ok => Ok(()),
+        MeshInboundFailClosed::Ok => {
+            crate::plugins::mesh::prometheus_helpers::set_mesh_inbound_plaintext_allowed(false);
+            Ok(())
+        }
         MeshInboundFailClosed::AllowWithWarning => {
+            // Coarse posture gauge only — the reason detail stays in the
+            // `warn!` below (security detail goes to logs, not /metrics).
+            crate::plugins::mesh::prometheus_helpers::set_mesh_inbound_plaintext_allowed(true);
             warn!(
                 topology = runtime.topology.as_str(),
                 ?mtls_mode,
@@ -11407,6 +11429,12 @@ fn plan_mesh_inbound_tls_reload_with_federation(
                         return None;
                     }
                     MeshInboundFailClosed::AllowWithWarning => {
+                        // Warn here at the decision site, but do NOT touch the
+                        // coarse posture gauge yet: this is still plan time, and
+                        // `proxy_state.update_config()` may reject the candidate
+                        // slice. The gauge is written only on the accepted-apply
+                        // path in `apply_mesh_inbound_tls_reload`, derived from
+                        // the swapped `tls_config`.
                         warn!(
                             mesh_slice_version = %slice.version,
                             ?mtls_mode,
@@ -11487,6 +11515,22 @@ async fn apply_mesh_inbound_tls_reload(
                 ),
                 Ordering::Release,
             );
+            // Coarse posture gauge, written only here on the accepted-apply
+            // path so a candidate slice that `update_config()` rejects leaves
+            // the gauge at its pre-reload value (fail-closed by retention,
+            // matching the rest of this reload contract). Derived from the
+            // swapped config rather than carried on the plan: a Swap that
+            // clears the termination listener's ServerConfig is exactly the
+            // dev plaintext posture (production planning rejects that swap as
+            // a whole-slice `None`, which never reaches this function), and a
+            // Swap that restores one heals it. Topologies without a
+            // TLS-terminating inbound listener (EastWestGateway SNI
+            // passthrough) never move the gauge.
+            if has_termination_listener {
+                crate::plugins::mesh::prometheus_helpers::set_mesh_inbound_plaintext_allowed(
+                    tls_config.is_none(),
+                );
+            }
             // Extend the live carve-out to mesh-shared TCP+TLS stream
             // listeners: swap the shared `rustls::ServerConfig` slot that
             // every TCP+TLS accept loop snapshots per accept. Existing
@@ -22401,7 +22445,12 @@ mod tests {
         );
 
         // Dev (non-production) tolerates the downgrade (warns + swaps to None) —
-        // an explicit DISABLE reload is an intentional operator choice.
+        // an explicit DISABLE reload is an intentional operator choice. Planning
+        // is side-effect-free: the `ferrum_mesh_inbound_plaintext_allowed`
+        // posture gauge is written only when this plan is applied after slice
+        // acceptance (`apply_mesh_inbound_tls_reload`), never here. Not asserted
+        // in this test: the gauge is a process-global static that the parallel
+        // apply-task tests legitimately write, so reading it here would race.
         let plan = plan_mesh_inbound_tls_reload(
             &proxy_state,
             &runtime,
