@@ -17780,6 +17780,7 @@ mod tests {
                 namespace: Some("default".to_string()),
                 port: None,
                 poll_interval_seconds: 30,
+                topology: Default::default(),
             }),
             default_weight: 1,
         });
@@ -17832,6 +17833,7 @@ mod tests {
                 namespace: Some("default".to_string()),
                 port: None,
                 poll_interval_seconds: 30,
+                topology: Default::default(),
             }),
             default_weight: 1,
         });
@@ -26639,6 +26641,7 @@ mod tests {
                 namespace: Some("default".to_string()),
                 port: None,
                 poll_interval_seconds: 30,
+                topology: Default::default(),
             }),
             default_weight: 1,
         });
@@ -26712,6 +26715,7 @@ mod tests {
                 namespace: Some("default".to_string()),
                 port: None,
                 poll_interval_seconds: 30,
+                topology: Default::default(),
             }),
             default_weight: 1,
         });
