@@ -2050,6 +2050,30 @@ pub struct Proxy {
     /// (default: 300s / 5 min). Set to 0 to disable (rely on OS TCP timeouts only).
     #[serde(default)]
     pub tcp_idle_timeout_seconds: Option<u64>,
+    /// Enable inbound PROXY protocol (v1 text or v2 binary, auto-detected) on
+    /// this stream proxy listener. When `true`, every inbound TCP connection
+    /// **must** begin with a valid PROXY header; connections that do not are
+    /// closed immediately (fail closed).
+    ///
+    /// **Trust requirement**: the forwarded address is honoured only when the
+    /// socket peer (the load balancer's own IP) belongs to the
+    /// `FERRUM_TRUSTED_PROXIES` CIDR set. A connection from an untrusted peer
+    /// on a PROXY-protocol-enabled listener is also closed, preventing
+    /// direct-connect clients from spoofing their source IP.
+    ///
+    /// After a successful trusted parse, `client_ip` in the
+    /// `StreamConnectionContext` (and in stream logs and authz plugins) is
+    /// the forwarded source IP from the PROXY header; `direct_client_ip` is
+    /// still the raw socket peer (the LB's own IP). This mirrors how
+    /// `FERRUM_TRUSTED_PROXIES` + XFF work on the HTTP path.
+    ///
+    /// Only valid for `tcp` / `tcp_tls` stream proxies. Setting it on a UDP,
+    /// DTLS, or HTTP proxy produces a validation error: PROXY protocol is
+    /// TCP-borne and cannot carry UDP session addressing.
+    ///
+    /// Default: `false` (PROXY protocol disabled; socket peer is always used).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_proxy_protocol: Option<bool>,
     /// WebSocket relay idle timeout in seconds for upgraded sessions on this
     /// proxy. After this duration with no activity in EITHER direction (frames,
     /// including Ping/Pong, or transport bytes), the session is closed. Applies
@@ -3859,6 +3883,23 @@ impl GatewayConfig {
                     proxy.scheme_display()
                 ));
             }
+            // stream_proxy_protocol is only valid for TCP/TCP-TLS stream
+            // proxies. UDP/DTLS cannot carry a PROXY protocol header (it is
+            // TCP-borne), and HTTP proxies use XFF instead.
+            if proxy.stream_proxy_protocol == Some(true) {
+                let is_tcp_stream = matches!(
+                    proxy.dispatch_kind,
+                    DispatchKind::TcpRaw | DispatchKind::TcpTls
+                );
+                if !is_tcp_stream {
+                    errors.push(format!(
+                        "Proxy '{}' (scheme {}) sets stream_proxy_protocol but PROXY protocol \
+                         is only valid for tcp/tcp_tls stream proxies",
+                        proxy.id,
+                        proxy.scheme_display()
+                    ));
+                }
+            }
         }
 
         // Validate port sharing rules
@@ -3887,6 +3928,25 @@ impl GatewayConfig {
                     non_pt.join(", ")
                 ));
                 continue;
+            }
+
+            // All proxies sharing a port must agree on stream_proxy_protocol:
+            // the PROXY header is read from the raw stream BEFORE the TLS
+            // ClientHello, so SNI-based proxy resolution has not happened yet
+            // and the accept loop can only apply one per-listener decision.
+            let pp_enabled: Vec<&str> = proxies_on_port
+                .iter()
+                .filter(|p| p.stream_proxy_protocol == Some(true))
+                .map(|p| p.id.as_str())
+                .collect();
+            if !pp_enabled.is_empty() && pp_enabled.len() != proxies_on_port.len() {
+                errors.push(format!(
+                    "Shared listen_port {} mixes stream_proxy_protocol settings ({} enable it) — \
+                     the PROXY header is parsed before SNI resolution, so every proxy sharing a \
+                     port must agree on stream_proxy_protocol",
+                    port,
+                    pp_enabled.join(", ")
+                ));
             }
 
             // At most one proxy per port may have empty hosts (catch-all)
@@ -4528,6 +4588,20 @@ impl Proxy {
         // rule at validation time without depending on dispatch_kind.
         let effective_scheme = self.effective_scheme();
         let is_stream_proxy = effective_scheme.is_stream();
+
+        // Inbound PROXY protocol is TCP-borne: valid only on tcp/tcps stream
+        // proxies. Enforced here (single-proxy admin writes: POST/PUT
+        // /proxies and the API-spec proxy path) in addition to
+        // `GatewayConfig::validate_stream_proxies`, so a bad row can never
+        // persist and then wedge the next full-config load/reconcile.
+        if self.stream_proxy_protocol == Some(true)
+            && !matches!(effective_scheme, BackendScheme::Tcp | BackendScheme::Tcps)
+        {
+            errors.push(
+                "stream_proxy_protocol is only valid for tcp/tcps stream proxies                  (PROXY protocol is TCP-borne)"
+                    .to_string(),
+            );
+        }
 
         // Passthrough mode validation
         if self.passthrough {

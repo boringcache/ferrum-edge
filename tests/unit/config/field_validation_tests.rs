@@ -73,6 +73,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
+        stream_proxy_protocol: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -151,6 +152,50 @@ fn make_plugin_config(id: &str) -> PluginConfig {
 fn test_proxy_valid_fields_passes() {
     let proxy = make_proxy("test", "/api");
     assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_proxy_stream_proxy_protocol_rejected_on_http_proxy() {
+    // Per-proxy admin writes (POST/PUT /proxies) validate via
+    // `validate_fields`; the TCP-only PROXY protocol check must run there
+    // too, or a bad row persists and wedges the next full-config load.
+    let mut proxy = make_proxy("test", "/api");
+    proxy.stream_proxy_protocol = Some(true);
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("stream_proxy_protocol") && e.contains("tcp")),
+        "expected TCP-only rejection, got: {errs:?}"
+    );
+}
+
+#[test]
+fn test_proxy_stream_proxy_protocol_rejected_on_udp_proxy() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.listen_path = None;
+    proxy.backend_scheme = Some(BackendScheme::Udp);
+    proxy.listen_port = Some(5353);
+    proxy.stream_proxy_protocol = Some(true);
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("stream_proxy_protocol") && e.contains("TCP-borne")),
+        "expected TCP-only rejection, got: {errs:?}"
+    );
+}
+
+#[test]
+fn test_proxy_stream_proxy_protocol_accepted_on_tcp_proxy() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.listen_path = None;
+    proxy.backend_scheme = Some(BackendScheme::Tcp);
+    proxy.listen_port = Some(5432);
+    proxy.stream_proxy_protocol = Some(true);
+    assert!(
+        proxy.validate_fields().is_ok(),
+        "tcp stream proxy must accept stream_proxy_protocol: {:?}",
+        proxy.validate_fields()
+    );
 }
 
 #[test]
