@@ -4,7 +4,8 @@ use chrono::Utc;
 use dashmap::DashMap;
 use ferrum_edge::config::types::{
     GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm, PassiveHealthCheck, Proxy,
-    ResolvedSubsetTrafficPolicy, SubsetDefinition, Upstream, UpstreamPortOverride, UpstreamTarget,
+    ResolvedSubsetTrafficPolicy, SubsetDefinition, SubsetTrafficPolicy, Upstream,
+    UpstreamPortOverride, UpstreamTarget,
 };
 use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::load_balancer::{
@@ -344,6 +345,71 @@ fn port_subset_vec_fallback_filters_intersection_for_large_upstreams() {
     assert_ne!(
         retry.host, selection.target.host,
         "retry should exclude the original target while staying in the port/subset intersection"
+    );
+}
+
+#[test]
+fn hash_on_only_port_override_preserves_subset_algorithm_with_port_hash_key() {
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            hash_on: Some("cookie:port-affinity".to_string()),
+            ..Default::default()
+        },
+    );
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![
+            tagged_target("a", 8080, &[("version", "v1")]),
+            tagged_target("b", 8080, &[("version", "v1")]),
+            tagged_target("c", 9090, &[("version", "v1")]),
+            tagged_target("d", 8080, &[("version", "v2")]),
+        ],
+        port_overrides,
+    );
+    upstream.subsets = Some(vec![SubsetDefinition {
+        name: "v1".to_string(),
+        labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+        traffic_policy: Some(SubsetTrafficPolicy {
+            load_balancer_algorithm: Some(LoadBalancerAlgorithm::ConsistentHashing),
+            hash_on: Some("header:x-subset".to_string()),
+            tls: None,
+            connect_timeout_ms: None,
+            passive_health_check: None,
+        }),
+    }]);
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    assert_eq!(
+        LoadBalancerCache::effective_algorithm_from(&snapshot, "u1", Some(8080), Some("v1")),
+        Some(LoadBalancerAlgorithm::ConsistentHashing),
+        "a hash_on-only port override must not replace the subset algorithm"
+    );
+    assert_eq!(
+        LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+            &snapshot,
+            "u1",
+            Some(8080),
+            Some("v1"),
+        ),
+        HashOnStrategy::Cookie("port-affinity".to_string()),
+        "an explicit per-port hash_on must override the subset hash key"
+    );
+    assert_eq!(
+        LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+            &snapshot,
+            "u1",
+            None,
+            Some("v1"),
+        ),
+        HashOnStrategy::Header("x-subset".to_string()),
+        "subset-only selection still uses the subset hash key"
     );
 }
 
@@ -1418,6 +1484,427 @@ fn port_subset_retry_excludes_previous_target_before_ejection_cap() {
         retry.port, 8080,
         "retry must stay within the dispatch port's subset∩port pool"
     );
+}
+
+// ── Stream-path per-port policy tests ────────────────────────────────────────
+// These tests verify the stream-family (TCP/UDP/DTLS) target-selection logic
+// that was added to mirror the HTTP dispatch path's per-port policy engagement.
+// The stream paths use `initial_dispatch_port_override_from` to determine
+// whether a single dispatch port is resolvable, then call
+// `select_target_for_port_from` (or the subset variant) when it is — falling
+// back to the plain `select_target_from` otherwise.
+
+/// A stream upstream where all targets share one port and a per-port algorithm
+/// override is in effect should have its per-port algorithm engaged.
+#[test]
+fn stream_path_engages_per_port_algorithm_when_all_targets_on_one_port() {
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        9000,
+        UpstreamPortOverride {
+            algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+            ..Default::default()
+        },
+    );
+    let upstream = upstream_with_overrides(
+        // Upstream-level uses Random; per-port 9000 overrides to RoundRobin.
+        LoadBalancerAlgorithm::Random,
+        vec![target("a", 9000), target("b", 9000), target("c", 9000)],
+        port_overrides,
+    );
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    // All targets are on port 9000 → initial_dispatch_port_override is 9000.
+    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "u1");
+    assert_eq!(
+        dispatch_port, 9000,
+        "single-port upstream must expose its port as the initial dispatch override"
+    );
+
+    // Simulate the stream-path selection: use the per-port lane.
+    let results: Vec<String> = (0..3)
+        .map(|_| {
+            LoadBalancerCache::select_target_for_port_from(
+                &snapshot,
+                "u1",
+                "stream-key",
+                dispatch_port,
+                None,
+            )
+            .expect("selection must succeed with healthy targets")
+            .target
+            .host
+            .clone()
+        })
+        .collect();
+
+    // RoundRobin counter is independent of the parent (Random) counter, so
+    // three consecutive calls cycle {a, b, c} in order.
+    assert_eq!(results, vec!["a", "b", "c"]);
+}
+
+/// A stream upstream whose targets span multiple ports must NOT engage
+/// the per-port lane — the hint resolves to zero and the stream path falls
+/// back to upstream-level selection (preserving pre-PR behaviour).
+#[test]
+fn stream_path_hint_is_zero_for_mixed_port_upstream() {
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(9000, UpstreamPortOverride::default());
+
+    let upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![target("a", 9000), target("b", 9100)], // two different ports
+        port_overrides,
+    );
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "u1");
+    assert_eq!(
+        dispatch_port, 0,
+        "mixed-port upstream must not resolve a pre-selection dispatch port"
+    );
+}
+
+/// Pinning the port-pool confinement invariant: when a stream upstream has a
+/// per-port override, explicit `select_target_for_port_from` returns only
+/// targets whose port matches the requested port.  This is a PRIMITIVE-level
+/// invariant that applies to both HTTP and stream selection; the stream paths
+/// engage it when `initial_dispatch_port_override` is non-zero.
+#[test]
+fn stream_path_per_port_selection_excludes_off_port_targets() {
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        9000,
+        UpstreamPortOverride {
+            algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+            ..Default::default()
+        },
+    );
+    // One target on port 9000 and one on 9001. Only 9000 has an override
+    // entry; `initial_dispatch_port_override` returns 0 (mixed-port) so the
+    // per-port lane is NOT engaged pre-selection. This test confirms the
+    // invariant: the hint stays 0, and the plain select_target_from is used.
+    let upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![target("a", 9000), target("b", 9001)],
+        port_overrides,
+    );
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "u1");
+    assert_eq!(
+        dispatch_port, 0,
+        "mixed-port upstream: per-port lane must not engage pre-selection"
+    );
+
+    // Explicit per-port selection on 9000 only returns targets on that port.
+    let selected =
+        LoadBalancerCache::select_target_for_port_from(&snapshot, "u1", "key", 9000, None)
+            .expect("port-9000 target must be selectable");
+    assert_eq!(
+        selected.target.host, "a",
+        "per-port selection must only return the 9000-port target"
+    );
+    assert_eq!(selected.target.port, 9000);
+}
+
+/// Pin the per-port LB primitive's health-context behavior: when a
+/// `HealthContext` IS provided, ejected targets are excluded by the
+/// `maxEjectionPercent` cap.  This is the path HTTP dispatch takes and the
+/// path that issue #2018 will wire for stream selection; it is NOT current
+/// stream behavior (see the companion test below).
+#[test]
+fn per_port_lane_filters_ejected_targets_when_health_context_provided() {
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        9000,
+        UpstreamPortOverride {
+            passive_health_check: Some(PassiveHealthCheck {
+                unhealthy_threshold: 1,
+                max_ejection_percent: Some(50), // allows 1 of 2 to be ejected
+                ..PassiveHealthCheck::default()
+            }),
+            algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+            ..Default::default()
+        },
+    );
+    let targets_list = vec![target("a", 9000), target("b", 9000)];
+    let upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        targets_list.clone(),
+        port_overrides,
+    );
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    // Active-unhealthy keys use the upstream-scoped format "upstream_id::host:port".
+    // This is how HTTP dispatch records active ejection state (via `target_key`).
+    active_unhealthy.insert("u1::a:9000".to_string(), 0);
+    let health = HealthContext {
+        active_unhealthy: &active_unhealthy,
+        proxy_passive: None,
+        max_ejection_percent: Some(50),
+    };
+
+    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "u1");
+    assert_eq!(
+        dispatch_port, 9000,
+        "single-port upstream resolves dispatch port"
+    );
+
+    // Calling select_target_for_port_from WITH a health context (as HTTP
+    // dispatch does, and as issue #2018 will wire for stream paths) must
+    // exclude the ejected target.
+    for _ in 0..4 {
+        let selected = LoadBalancerCache::select_target_for_port_from(
+            &snapshot,
+            "u1",
+            "http-key",
+            dispatch_port,
+            Some(&health),
+        )
+        .expect("healthy target 'b' must always be available");
+        assert_eq!(
+            selected.target.host, "b",
+            "ejected target 'a' must not be selected when health context is provided"
+        );
+    }
+}
+
+/// Pin CURRENT stream behavior: stream paths call `select_target_for_port_from`
+/// with `health: None`, so ejection state and `maxEjectionPercent` have NO
+/// effect on stream target selection.  This is pre-existing, unchanged by PR
+/// #2016, and tracked in issue #2018.
+#[test]
+fn stream_path_per_port_selection_ignores_ejection_without_health_context() {
+    // Same upstream setup as the companion test above.
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        9000,
+        UpstreamPortOverride {
+            passive_health_check: Some(PassiveHealthCheck {
+                unhealthy_threshold: 1,
+                max_ejection_percent: Some(50),
+                ..PassiveHealthCheck::default()
+            }),
+            algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+            ..Default::default()
+        },
+    );
+    let targets_list = vec![target("a", 9000), target("b", 9000)];
+    let upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        targets_list.clone(),
+        port_overrides,
+    );
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    // Record ejection for "a" using the upstream-scoped key format — but the
+    // stream call site passes `None`, so this map is never consulted.
+    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    active_unhealthy.insert("u1::a:9000".to_string(), 0);
+
+    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "u1");
+    assert_eq!(dispatch_port, 9000);
+
+    // Stream call sites pass `health: None` — ejection state is NOT consulted.
+    // Both "a" and "b" must remain selectable, even though "a" is ejected in
+    // the active_unhealthy map above (issue #2018: stream ejection wiring is a
+    // follow-up).
+    let mut saw_a = false;
+    let mut saw_b = false;
+    for i in 0..8 {
+        let selected = LoadBalancerCache::select_target_for_port_from(
+            &snapshot,
+            "u1",
+            &format!("stream-key-{i}"),
+            dispatch_port,
+            None, // no health context — current stream behavior
+        )
+        .expect("all targets selectable when no health context is provided");
+        match selected.target.host.as_str() {
+            "a" => saw_a = true,
+            "b" => saw_b = true,
+            other => panic!("unexpected host: {other}"),
+        }
+    }
+    assert!(
+        saw_a,
+        "ejected target 'a' IS still selectable: stream paths carry no health context \
+         (issue #2018)"
+    );
+    assert!(saw_b, "target 'b' must also be selectable");
+}
+
+/// A stream upstream with a subset and a single port engages the
+/// per-port-subset lane (mirrors HTTP subset routing with a port hint).
+#[test]
+fn stream_path_per_port_subset_engages_when_single_port() {
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        9000,
+        UpstreamPortOverride {
+            algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+            ..Default::default()
+        },
+    );
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::Random,
+        vec![
+            tagged_target("a", 9000, &[("env", "prod")]),
+            tagged_target("b", 9000, &[("env", "prod")]),
+            tagged_target("c", 9000, &[("env", "staging")]),
+        ],
+        port_overrides,
+    );
+    upstream.subsets = Some(vec![SubsetDefinition {
+        name: "prod".to_string(),
+        labels: HashMap::from([("env".to_string(), "prod".to_string())]),
+        traffic_policy: None,
+    }]);
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "u1");
+    assert_eq!(dispatch_port, 9000);
+
+    // Simulate the stream subset path: select_target_for_port_subset_from.
+    let results: Vec<String> = (0..2)
+        .map(|_| {
+            LoadBalancerCache::select_target_for_port_subset_from(
+                &snapshot,
+                "u1",
+                "stream-subset-key",
+                dispatch_port,
+                "prod",
+                None,
+            )
+            .expect("prod subset has healthy targets")
+            .target
+            .host
+            .clone()
+        })
+        .collect();
+
+    // Only "a" and "b" (prod subset) must be selected; "c" (staging) must not.
+    for host in &results {
+        assert!(
+            host == "a" || host == "b",
+            "per-port subset selection must not escape to non-subset target 'c', got '{host}'"
+        );
+    }
+}
+
+/// The per-port lane engages the port's LB algorithm independently of the
+/// upstream-level algorithm.  Specifically: an upstream-level `RoundRobin`
+/// upstream with a per-port `ConsistentHashing` override (inheriting the
+/// upstream's `hash_on` key) must route the SAME ctx_key to the SAME target
+/// on every call via the port lane, while the upstream-level lane rotates.
+/// This exercises a real per-port policy knob beyond mere port-pool confinement
+/// and applies to both HTTP dispatch and the stream paths (which call
+/// `select_target_for_port_from` when `initial_dispatch_port_override` is
+/// non-zero).
+#[test]
+fn per_port_consistent_hash_overrides_upstream_round_robin() {
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        9000,
+        UpstreamPortOverride {
+            algorithm: Some(LoadBalancerAlgorithm::ConsistentHashing),
+            // No per-port hash_on: inherits the upstream's `hash_on` key
+            // (cookie:srv) via `get_hash_on_strategy_for_port_from` semantics.
+            ..Default::default()
+        },
+    );
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![target("a", 9000), target("b", 9000), target("c", 9000)],
+        port_overrides,
+    );
+    // Set a hash_on key at the upstream level; the per-port ConsistentHashing
+    // override without its own hash_on inherits it.
+    upstream.hash_on = Some("header:x-session-id".to_string());
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    // The per-port lane must engage ConsistentHashing (inherited hash key),
+    // so the same ctx_key always selects the same target.
+    let first = LoadBalancerCache::select_target_for_port_from(
+        &snapshot,
+        "u1",
+        "sticky-session-abc",
+        9000,
+        None,
+    )
+    .expect("port selection must succeed")
+    .target
+    .host
+    .clone();
+
+    for _ in 0..4 {
+        let again = LoadBalancerCache::select_target_for_port_from(
+            &snapshot,
+            "u1",
+            "sticky-session-abc",
+            9000,
+            None,
+        )
+        .expect("port selection must succeed")
+        .target
+        .host
+        .clone();
+        assert_eq!(
+            again, first,
+            "per-port ConsistentHashing must return the same target for the same ctx_key"
+        );
+    }
+
+    // The upstream-level lane uses RoundRobin and MUST rotate across targets,
+    // proving the two lanes are independent.
+    let rr: Vec<String> = (0..3)
+        .map(|_| {
+            LoadBalancerCache::select_target_from(&snapshot, "u1", "rr-key", None)
+                .expect("upstream-level selection must succeed")
+                .target
+                .host
+                .clone()
+        })
+        .collect();
+    // RoundRobin rotates a, b, c in order.
+    assert_eq!(rr, vec!["a", "b", "c"]);
 }
 
 #[test]

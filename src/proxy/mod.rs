@@ -5082,12 +5082,14 @@ impl ProxyState {
                 let Some(upstream) = upstream_map.get(upstream_id.as_str()) else {
                     continue;
                 };
-                let relay_proxy = crate::modes::mesh::mesh_outbound_tcp_relay_proxy(
+                let mut relay_proxy = crate::modes::mesh::mesh_outbound_tcp_relay_proxy(
                     &service.namespace,
                     &service.name,
                     sp.port,
                     &upstream_id,
                 );
+                relay_proxy.dispatch_port_overrides =
+                    Self::projected_dispatch_overrides_for_upstream(config, &upstream_id);
                 for target in &upstream.targets {
                     // Only Ambient `mesh.hbone` targets use the HBONE capability
                     // registry. Sidecar `mesh.mtls` raw-TCP targets dispatch over
@@ -5129,13 +5131,15 @@ impl ProxyState {
             let Some(upstream) = upstream_map.get(spec.upstream_id.as_str()) else {
                 continue;
             };
-            let relay_proxy = crate::modes::mesh::mesh_outbound_tcp_bywl_relay_proxy(
+            let mut relay_proxy = crate::modes::mesh::mesh_outbound_tcp_bywl_relay_proxy(
                 &spec.service.namespace,
                 &spec.service.name,
                 spec.service_port.port,
                 spec.canonical_ip,
                 &spec.upstream_id,
             );
+            relay_proxy.dispatch_port_overrides =
+                Self::projected_dispatch_overrides_for_upstream(config, &spec.upstream_id);
             for target in &upstream.targets {
                 // Ambient `mesh.hbone` per-workload targets only; Sidecar
                 // `mesh.mtls` (no probe) and cross-cluster east-west targets
@@ -5176,12 +5180,14 @@ impl ProxyState {
                 let Some(upstream) = upstream_map.get(upstream_id.as_str()) else {
                     continue;
                 };
-                let relay_proxy = crate::modes::mesh::mesh_outbound_udp_relay_proxy(
+                let mut relay_proxy = crate::modes::mesh::mesh_outbound_udp_relay_proxy(
                     &service.namespace,
                     &service.name,
                     sp.port,
                     &upstream_id,
                 );
+                relay_proxy.dispatch_port_overrides =
+                    Self::projected_dispatch_overrides_for_upstream(config, &upstream_id);
                 for target in &upstream.targets {
                     // Ambient `mesh.hbone` UDP targets only; Sidecar `mesh.mtls`
                     // (no probe) and cross-cluster east-west targets
@@ -5295,6 +5301,20 @@ impl ProxyState {
         probe_proxy.backend_connect_timeout_ms = probe_proxy
             .backend_connect_timeout_ms
             .clamp(1, BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP);
+        if let Some(overrides) = probe_proxy.dispatch_port_overrides.as_mut() {
+            for override_config in overrides.values_mut() {
+                if let Some(connect_timeout_ms) = override_config.connect_timeout_ms.as_mut() {
+                    *connect_timeout_ms =
+                        (*connect_timeout_ms).clamp(1, BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP);
+                }
+            }
+        }
+        if let Some(fallback) = probe_proxy.dispatch_port_override_fallback.as_mut()
+            && let Some(connect_timeout_ms) = fallback.connect_timeout_ms.as_mut()
+        {
+            *connect_timeout_ms =
+                (*connect_timeout_ms).clamp(1, BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP);
+        }
         probe_proxy
     }
 
@@ -5369,7 +5389,6 @@ impl ProxyState {
         {
             self.probe_hbone(
                 &probe_proxy,
-                probe_timeout,
                 HboneProbeTarget {
                     host,
                     dial_host: target.hbone_dial_host.as_str(),
@@ -5486,7 +5505,6 @@ impl ProxyState {
     async fn probe_hbone(
         &self,
         probe_proxy: &Proxy,
-        probe_timeout: Duration,
         target: HboneProbeTarget<'_>,
         record: &mut BackendCapabilityRecord,
     ) {
@@ -5535,7 +5553,11 @@ impl ProxyState {
                     .await
             }
         };
-        match tokio::time::timeout(probe_timeout, warmup).await {
+        let probe_timeout_ms = hbone_pool::effective_connect_timeout_ms_for_policy_port(
+            probe_proxy,
+            target.policy_port,
+        );
+        match tokio::time::timeout(Duration::from_millis(probe_timeout_ms), warmup).await {
             Ok(Ok(())) => {
                 record.hbone = ProtocolSupport::Supported;
             }
@@ -5562,12 +5584,12 @@ impl ProxyState {
                     record,
                     format!(
                         "HBONE probe timed out for {}:{} via port {} after {}ms",
-                        host, port, hbone_port, probe_proxy.backend_connect_timeout_ms
+                        host, port, hbone_port, probe_timeout_ms
                     ),
                 );
                 debug!(
                     "HBONE probe for {}:{} via port {} timed out after {}ms; leaving unknown",
-                    host, port, hbone_port, probe_proxy.backend_connect_timeout_ms
+                    host, port, hbone_port, probe_timeout_ms
                 );
             }
         }
@@ -6311,17 +6333,16 @@ impl ProxyState {
                     .get(new_proxy.id.as_str())
                     .is_some_and(|old_proxy| !Self::proxy_content_eq(old_proxy, new_proxy))
             })
-            || Self::projected_udp_relay_dispatch_content_changed(old_config, new_config)
+            || Self::projected_mesh_stream_relay_dispatch_content_changed(old_config, new_config)
     }
 
     /// Timestamp-neutral proxy content comparison for route-table reuse.
     ///
     /// Serialized proxy content catches ordinary route/backend/policy edits while
     /// ignoring volatile timestamps. The two DR-derived dispatch projection
-    /// fields are skipped by serde and therefore compared explicitly, but only
-    /// for keys and values read from the route-carried `Proxy` at dispatch time.
-    /// Load-balancer-only values are consumed by the LB cache and must not force
-    /// a route-table rebuild when the effective override key set is unchanged.
+    /// fields are skipped by serde and therefore compared explicitly for every
+    /// value that can alter dispatch, including LB fields used to decide whether
+    /// stream-family mesh relays enter a per-port selection lane.
     fn proxy_content_eq(a: &Proxy, b: &Proxy) -> bool {
         if a.resolved_tls != b.resolved_tls {
             return false;
@@ -6352,16 +6373,16 @@ impl ProxyState {
         }
     }
 
-    fn projected_udp_relay_dispatch_content_changed(
+    fn projected_mesh_stream_relay_dispatch_content_changed(
         old_config: &GatewayConfig,
         new_config: &GatewayConfig,
     ) -> bool {
-        let old_projection = Self::mesh_udp_relay_dispatch_overrides(old_config);
-        let new_projection = Self::mesh_udp_relay_dispatch_overrides(new_config);
-        !Self::mesh_udp_relay_dispatch_overrides_eq(&old_projection, &new_projection)
+        let old_projection = Self::mesh_stream_relay_dispatch_overrides(old_config);
+        let new_projection = Self::mesh_stream_relay_dispatch_overrides(new_config);
+        !Self::mesh_stream_relay_dispatch_overrides_eq(&old_projection, &new_projection)
     }
 
-    fn mesh_udp_relay_dispatch_overrides(
+    fn mesh_stream_relay_dispatch_overrides(
         config: &GatewayConfig,
     ) -> HashMap<String, Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>> {
         let Some(mesh) = config.mesh.as_deref() else {
@@ -6375,6 +6396,19 @@ impl ProxyState {
             if service.cluster_ips.is_empty() {
                 continue;
             }
+            for sp in crate::modes::mesh::service_tcp_stream_ports(service) {
+                let upstream_id = crate::modes::mesh::mesh_outbound_tcp_upstream_id(
+                    &service.namespace,
+                    &service.name,
+                    sp.port,
+                );
+                if upstream_ids.contains(upstream_id.as_str()) {
+                    projection.insert(
+                        upstream_id.clone(),
+                        Self::projected_dispatch_overrides_for_upstream(config, &upstream_id),
+                    );
+                }
+            }
             for sp in crate::modes::mesh::service_udp_stream_ports(service) {
                 let upstream_id = crate::modes::mesh::mesh_outbound_udp_upstream_id(
                     &service.namespace,
@@ -6387,6 +6421,19 @@ impl ProxyState {
                         Self::projected_dispatch_overrides_for_upstream(config, &upstream_id),
                     );
                 }
+            }
+        }
+
+        for spec in crate::modes::mesh::mesh_outbound_tcp_bywl_upstreams(
+            &mesh.services,
+            &mesh.workloads,
+            mesh.multi_cluster.as_ref(),
+        ) {
+            if upstream_ids.contains(spec.upstream_id.as_str()) {
+                projection.insert(
+                    spec.upstream_id.clone(),
+                    Self::projected_dispatch_overrides_for_upstream(config, &spec.upstream_id),
+                );
             }
         }
 
@@ -6412,7 +6459,7 @@ impl ProxyState {
         (!resolved.is_empty()).then_some(resolved)
     }
 
-    fn mesh_udp_relay_dispatch_overrides_eq(
+    fn mesh_stream_relay_dispatch_overrides_eq(
         a: &HashMap<String, Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>>,
         b: &HashMap<String, Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>>,
     ) -> bool {
@@ -6458,7 +6505,10 @@ impl ProxyState {
         b: &crate::config::types::ResolvedPortOverride,
     ) -> bool {
         a.connect_timeout_ms == b.connect_timeout_ms
+            && a.algorithm == b.algorithm
+            && a.hash_on == b.hash_on
             && a.passive_health_check == b.passive_health_check
+            && a.locality_lb_setting == b.locality_lb_setting
             && a.max_connections == b.max_connections
             && a.tcp_keepalive == b.tcp_keepalive
             && a.http_max_requests_per_connection == b.http_max_requests_per_connection
@@ -25195,6 +25245,61 @@ mod tests {
     }
 
     #[test]
+    fn backend_capability_probe_proxy_clamps_per_port_connect_timeouts() {
+        let mut proxy = streaming_dispatch_test_proxy();
+        proxy.backend_connect_timeout_ms = 30_000;
+        proxy.dispatch_port_overrides = Some(HashMap::from([
+            (
+                8080,
+                crate::config::types::ResolvedPortOverride {
+                    connect_timeout_ms: Some(60_000),
+                    ..Default::default()
+                },
+            ),
+            (
+                9090,
+                crate::config::types::ResolvedPortOverride {
+                    connect_timeout_ms: Some(0),
+                    ..Default::default()
+                },
+            ),
+        ]));
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            connect_timeout_ms: Some(120_000),
+            ..Default::default()
+        });
+
+        let probe_proxy = ProxyState::build_backend_capability_probe_proxy(&proxy);
+
+        assert_eq!(
+            probe_proxy.backend_connect_timeout_ms,
+            BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP
+        );
+        assert_eq!(
+            hbone_pool::effective_connect_timeout_ms_for_policy_port(&probe_proxy, 8080),
+            BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP,
+            "HBONE probes must not wait longer than the capability probe cap"
+        );
+        assert_eq!(
+            hbone_pool::effective_connect_timeout_ms_for_policy_port(&probe_proxy, 9090),
+            1,
+            "probe timeouts retain the existing lower-bound clamp"
+        );
+        assert_eq!(
+            probe_proxy
+                .dispatch_port_override_fallback
+                .as_ref()
+                .and_then(|override_config| override_config.connect_timeout_ms),
+            Some(BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP)
+        );
+        assert_eq!(
+            hbone_pool::effective_connect_timeout_ms_for_policy_port(&proxy, 8080),
+            60_000,
+            "real request dials keep the operator's per-port timeout"
+        );
+    }
+
+    #[test]
     fn node_waypoint_outbound_prefers_ebpf_original_destination() {
         let socket_capture_endpoint: SocketAddr = "127.0.0.1:15001".parse().unwrap();
         let ebpf_original_dst: SocketAddr = "10.244.1.4:8080".parse().unwrap();
@@ -25418,7 +25523,7 @@ mod tests {
         );
         // The single-target HBONE-tagged, identity-pinned upstream the Ambient
         // materializer would emit.
-        let upstream: Upstream = serde_json::from_value(json!({
+        let mut upstream: Upstream = serde_json::from_value(json!({
             "id": bywl_id,
             "name": "redis.default.svc.cluster.local",
             "targets": [{
@@ -25428,6 +25533,17 @@ mod tests {
             }],
         }))
         .expect("upstream deserializes");
+        upstream.port_overrides.insert(
+            6379,
+            crate::config::types::UpstreamPortOverride {
+                tcp_keepalive: Some(crate::config::types::TcpKeepaliveCfg {
+                    time_seconds: Some(10),
+                    interval_seconds: Some(2),
+                    probes: Some(3),
+                }),
+                ..Default::default()
+            },
+        );
         let config = GatewayConfig {
             upstreams: vec![upstream],
             mesh: Some(Box::new(MeshConfig {
@@ -25475,6 +25591,16 @@ mod tests {
             enrolled.hbone_expected_peer.as_ref().map(|p| p.as_str()),
             Some(spiffe),
             "the HBONE probe pins the same destination identity dispatch uses"
+        );
+        assert!(
+            enrolled
+                .proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.get(&6379))
+                .and_then(|override_config| override_config.tcp_keepalive.as_ref())
+                .is_some(),
+            "the HBONE probe relay must carry the same per-port TCP policy as dispatch"
         );
     }
 
@@ -28524,6 +28650,170 @@ mod tests {
         (delta, old_config, new_config)
     }
 
+    fn route_delta_projected_tcp_relay_change_delta(
+        mutate_old_upstream: impl FnOnce(&mut Upstream),
+        mutate_new_upstream: impl FnOnce(&mut Upstream),
+    ) -> (
+        crate::config_delta::ConfigDelta,
+        GatewayConfig,
+        GatewayConfig,
+    ) {
+        use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+        let upstream_id =
+            crate::modes::mesh::mesh_outbound_tcp_upstream_id("default", "mysql", 3306);
+        let mut old_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.9", 3306)]);
+        old_upstream.name = Some("mysql.default.svc.cluster.local".to_string());
+        old_upstream.created_at = t0;
+        old_upstream.updated_at = t0;
+        mutate_old_upstream(&mut old_upstream);
+        let mut new_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.9", 3306)]);
+        new_upstream.name = Some("mysql.default.svc.cluster.local".to_string());
+        new_upstream.created_at = t1;
+        new_upstream.updated_at = t1;
+        mutate_new_upstream(&mut new_upstream);
+
+        let mesh = MeshConfig {
+            services: vec![MeshService {
+                name: "mysql".to_string(),
+                namespace: "default".to_string(),
+                ports: vec![ServicePort {
+                    port: 3306,
+                    protocol: AppProtocol::Tcp,
+                    name: Some("mysql".to_string()),
+                    target_port: None,
+                }],
+                workloads: Vec::new(),
+                protocol_overrides: HashMap::new(),
+                cluster_ips: vec!["10.96.0.20".to_string()],
+            }],
+            ..MeshConfig::default()
+        };
+        let old_config = GatewayConfig {
+            upstreams: vec![old_upstream],
+            mesh: Some(Box::new(mesh.clone())),
+            ..GatewayConfig::default()
+        };
+        let new_config = GatewayConfig {
+            upstreams: vec![new_upstream],
+            mesh: Some(Box::new(mesh)),
+            ..GatewayConfig::default()
+        };
+
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
+        assert!(
+            delta.modified_proxies.is_empty(),
+            "TCP relay projection changes must not rely on a Proxy resource modification"
+        );
+        assert!(
+            !delta.modified_upstreams.is_empty(),
+            "test setup must simulate the upstream timestamp delta from the DR edit"
+        );
+        (delta, old_config, new_config)
+    }
+
+    fn route_delta_projected_tcp_bywl_relay_change_delta(
+        mutate_old_upstream: impl FnOnce(&mut Upstream),
+        mutate_new_upstream: impl FnOnce(&mut Upstream),
+    ) -> (
+        crate::config_delta::ConfigDelta,
+        GatewayConfig,
+        GatewayConfig,
+        String,
+    ) {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{
+            AppProtocol, MeshConfig, MeshService, ServicePort, ServiceTargetPort, Workload,
+            WorkloadPort, WorkloadRef, WorkloadSelector,
+        };
+
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+        let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
+        let workload_ip: std::net::IpAddr = "10.0.0.7".parse().expect("workload ip");
+        let upstream_id = crate::modes::mesh::mesh_outbound_tcp_bywl_upstream_id(
+            "default",
+            "redis",
+            6379,
+            workload_ip,
+        );
+        let mut old_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.7", 6380)]);
+        old_upstream.name = Some("redis.default.svc.cluster.local".to_string());
+        old_upstream.created_at = t0;
+        old_upstream.updated_at = t0;
+        mutate_old_upstream(&mut old_upstream);
+        let mut new_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.7", 6380)]);
+        new_upstream.name = Some("redis.default.svc.cluster.local".to_string());
+        new_upstream.created_at = t1;
+        new_upstream.updated_at = t1;
+        mutate_new_upstream(&mut new_upstream);
+
+        let service = MeshService {
+            name: "redis".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 6379,
+                protocol: AppProtocol::Redis,
+                name: Some("redis".to_string()),
+                target_port: Some(ServiceTargetPort::Number(6380)),
+            }],
+            workloads: vec![WorkloadRef {
+                spiffe_id: SpiffeId::new(spiffe).unwrap(),
+            }],
+            protocol_overrides: HashMap::new(),
+            cluster_ips: Vec::new(),
+        };
+        let workload = Workload {
+            spiffe_id: SpiffeId::new(spiffe).unwrap(),
+            selector: WorkloadSelector::default(),
+            service_name: "redis".to_string(),
+            addresses: vec!["10.0.0.7".to_string()],
+            ports: vec![WorkloadPort {
+                port: 6380,
+                protocol: AppProtocol::Redis,
+                name: Some("redis".to_string()),
+            }],
+            trust_domain: TrustDomain::new("cluster.local").unwrap(),
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
+            pod_uid: None,
+            node_waypoint: None,
+            remote_provenance: false,
+        };
+        let mesh = MeshConfig {
+            services: vec![service],
+            workloads: vec![workload],
+            ..MeshConfig::default()
+        };
+        let old_config = GatewayConfig {
+            upstreams: vec![old_upstream],
+            mesh: Some(Box::new(mesh.clone())),
+            ..GatewayConfig::default()
+        };
+        let new_config = GatewayConfig {
+            upstreams: vec![new_upstream],
+            mesh: Some(Box::new(mesh)),
+            ..GatewayConfig::default()
+        };
+
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
+        assert!(
+            delta.modified_proxies.is_empty(),
+            "by-workload TCP relay projection changes must not rely on a Proxy resource modification"
+        );
+        assert!(
+            !delta.modified_upstreams.is_empty(),
+            "test setup must simulate the upstream timestamp delta from the DR edit"
+        );
+        (delta, old_config, new_config, upstream_id)
+    }
+
     fn http_route_proxy_with_upstream() -> Proxy {
         let t0 = chrono::Utc::now();
         let mut proxy = route_delta_proxy("http", DispatchKind::HttpPool, t0);
@@ -28794,7 +29084,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_routes_changed_ignores_lb_only_override_value_change() {
+    fn delta_routes_changed_detects_projected_lb_override_change_without_proxy_delta() {
         let (delta, old_config, new_config) = route_delta_projected_upstream_change_delta(
             |upstream| {
                 upstream.port_overrides.insert(
@@ -28816,7 +29106,39 @@ mod tests {
             },
         );
 
-        assert!(!ProxyState::delta_routes_changed(
+        assert!(ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &new_config
+        ));
+    }
+
+    #[test]
+    fn delta_routes_changed_detects_projected_hash_override_change_without_proxy_delta() {
+        let (delta, old_config, new_config) = route_delta_projected_tcp_relay_change_delta(
+            |upstream| {
+                upstream.port_overrides.insert(
+                    3306,
+                    crate::config::types::UpstreamPortOverride {
+                        algorithm: Some(LoadBalancerAlgorithm::ConsistentHashing),
+                        hash_on: Some("header:x-tenant".to_string()),
+                        ..Default::default()
+                    },
+                );
+            },
+            |upstream| {
+                upstream.port_overrides.insert(
+                    3306,
+                    crate::config::types::UpstreamPortOverride {
+                        algorithm: Some(LoadBalancerAlgorithm::ConsistentHashing),
+                        hash_on: Some("header:x-user".to_string()),
+                        ..Default::default()
+                    },
+                );
+            },
+        );
+
+        assert!(ProxyState::delta_routes_changed(
             &delta,
             &old_config,
             &new_config
@@ -28872,6 +29194,111 @@ mod tests {
             relay_timeout(&new_snapshot),
             Some(2_000),
             "rebuilding the route table swaps in the synthesized UDP relay policy"
+        );
+    }
+
+    #[test]
+    fn delta_routes_changed_detects_projected_tcp_relay_override_change_without_proxy_delta() {
+        let (delta, old_config, new_config) = route_delta_projected_tcp_relay_change_delta(
+            |upstream| {
+                upstream.port_overrides.insert(
+                    3306,
+                    crate::config::types::UpstreamPortOverride {
+                        connect_timeout_ms: Some(30),
+                        ..Default::default()
+                    },
+                );
+            },
+            |upstream| {
+                upstream.port_overrides.insert(
+                    3306,
+                    crate::config::types::UpstreamPortOverride {
+                        connect_timeout_ms: Some(60),
+                        ..Default::default()
+                    },
+                );
+            },
+        );
+
+        assert!(ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &new_config
+        ));
+
+        let old_snapshot =
+            crate::router_cache::RouterCache::build_route_table_snapshot(&old_config);
+        let new_snapshot =
+            crate::router_cache::RouterCache::build_route_table_snapshot(&new_config);
+        let relay_timeout = |table: &crate::router_cache::HostRouteTable| match table
+            .mesh_tcp_egress_decision("10.96.0.20:3306".parse().expect("addr"))
+        {
+            Some(crate::router_cache::MeshTcpEgressDecision::Relay(entry)) => entry
+                .relay_proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.get(&3306))
+                .and_then(|override_config| override_config.connect_timeout_ms),
+            _ => None,
+        };
+        assert_eq!(relay_timeout(&old_snapshot), Some(30));
+        assert_eq!(
+            relay_timeout(&new_snapshot),
+            Some(60),
+            "rebuilding the route table swaps in the synthesized TCP relay policy"
+        );
+    }
+
+    #[test]
+    fn delta_routes_changed_detects_projected_tcp_bywl_relay_override_change_without_proxy_delta() {
+        let (delta, old_config, new_config, _upstream_id) =
+            route_delta_projected_tcp_bywl_relay_change_delta(
+                |upstream| {
+                    upstream.port_overrides.insert(
+                        6379,
+                        crate::config::types::UpstreamPortOverride {
+                            connect_timeout_ms: Some(40),
+                            ..Default::default()
+                        },
+                    );
+                },
+                |upstream| {
+                    upstream.port_overrides.insert(
+                        6379,
+                        crate::config::types::UpstreamPortOverride {
+                            connect_timeout_ms: Some(80),
+                            ..Default::default()
+                        },
+                    );
+                },
+            );
+
+        assert!(ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &new_config
+        ));
+
+        let old_snapshot =
+            crate::router_cache::RouterCache::build_route_table_snapshot(&old_config);
+        let new_snapshot =
+            crate::router_cache::RouterCache::build_route_table_snapshot(&new_config);
+        let relay_timeout = |table: &crate::router_cache::HostRouteTable| match table
+            .mesh_tcp_egress_by_workload_decision("10.0.0.7:6380".parse().expect("addr"))
+        {
+            Some(crate::router_cache::MeshTcpEgressDecision::Relay(entry)) => entry
+                .relay_proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.get(&6379))
+                .and_then(|override_config| override_config.connect_timeout_ms),
+            _ => None,
+        };
+        assert_eq!(relay_timeout(&old_snapshot), Some(40));
+        assert_eq!(
+            relay_timeout(&new_snapshot),
+            Some(80),
+            "rebuilding the route table swaps in the synthesized by-workload TCP relay policy"
         );
     }
 

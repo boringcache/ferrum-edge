@@ -40,6 +40,7 @@ use crate::plugins::{
     Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind, StreamConnectionContext,
     StreamTransactionSummary,
 };
+use crate::proxy::backend_dispatch::has_effective_port_override;
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 use crate::retry::ErrorClass;
@@ -349,6 +350,7 @@ pub(crate) const STREAM_ERR_REJECTED_BY_PLUGIN: &str = "rejected by plugin";
 pub(crate) const STREAM_ERR_NO_HEALTHY_TARGETS: &str = "No healthy targets";
 pub(crate) const STREAM_ERR_CIRCUIT_BREAKER_OPEN: &str = "circuit breaker open";
 pub(crate) const STREAM_ERR_BACKEND_MAX_CONNECTIONS: &str = "Backend maxConnections reached";
+pub(crate) const STREAM_ERR_UNSUPPORTED_STREAM_POLICY: &str = "Unsupported stream policy";
 
 /// Sentinel prefix used by the Linux splice paths
 /// (`io_uring_splice_direction`, `libc_splice_loop`) to signal that the
@@ -1660,6 +1662,10 @@ struct TcpConnParams {
     upstream_id: Option<String>,
     /// Optional upstream subset for DestinationRule-style retry target selection.
     upstream_subset: Option<String>,
+    /// Stable per-flow key used for initial LB selection. Retries reuse this
+    /// key while excluding the failed target so consistent-hash failover stays
+    /// distributed by client flow instead of by failed backend hostname.
+    lb_hash_key: String,
     /// When true, forward encrypted client bytes directly without TLS termination.
     passthrough: bool,
     /// Whether TCP Fast Open is enabled (gated on `FERRUM_TCP_FASTOPEN_ENABLED`).
@@ -1667,6 +1673,11 @@ struct TcpConnParams {
     /// Flattened per-port dispatch overrides used by retry attempts.
     dispatch_port_overrides:
         Option<std::collections::HashMap<u16, crate::config::types::ResolvedPortOverride>>,
+    /// Per-port LB selection lane engaged for the initial target selection
+    /// (single-port upstream with an effective override). Connection-phase
+    /// retries must rotate inside the same lane so a per-port algorithm /
+    /// locality policy is not escaped by `retry_on_connect_failure`.
+    lb_port_lane: Option<u16>,
 }
 
 /// Lightweight snapshot of the proxy fields needed per TCP connection.
@@ -2072,8 +2083,9 @@ async fn handle_tcp_connection_inner(
         stream_ctx.proxy_name = proxy.name.clone();
         stream_ctx.backend_scheme = proxy.effective_scheme();
 
-        let (backend_host, backend_port, backend_policy_port) =
-            resolve_backend_target(proxy, &epoch.load_balancer)?;
+        let lb_hash_key = stream_lb_hash_key_for_client_ip(remote_addr.ip());
+        let (backend_host, backend_port, backend_policy_port, lb_port_lane) =
+            resolve_backend_target(proxy, &epoch.load_balancer, &lb_hash_key)?;
 
         // Populate backend target as soon as it's known — even if DNS or connect fails,
         // the log will show which target was attempted.
@@ -2120,9 +2132,11 @@ async fn handle_tcp_connection_inner(
             retry: proxy.retry.clone(),
             upstream_id: proxy.upstream_id.clone(),
             upstream_subset: proxy.upstream_subset.clone(),
+            lb_hash_key,
             passthrough: proxy.passthrough,
             tcp_fastopen_enabled: tcp_fastopen,
             dispatch_port_overrides: proxy.dispatch_port_overrides.clone(),
+            lb_port_lane,
         };
 
         (params, cb_info)
@@ -3249,21 +3263,66 @@ fn enforce_mesh_tcp_outbound_target(
 }
 
 /// Resolve the backend target — either direct from proxy config or via load balancer.
+///
+/// Per-port DestinationRule policy (LB algorithm, locality-LB) is engaged only when
+/// every upstream target shares a single dispatch port (a non-zero
+/// `initial_dispatch_port_override`) — the same pre-selection semantics the HTTP
+/// dispatch path uses for single-port upstreams. The HTTP path's `backend_port`
+/// fallback (`backend_dispatch::initial_dispatch_port`) is deliberately NOT used
+/// here: for a stream proxy referencing an upstream, `backend_port` is a
+/// placeholder, and a coincidental match with one overridden port of a mixed-port
+/// upstream would silently pin selection to that port's targets.
+///
+/// Returns `(host, port, policy_port, port_lane)` where `port_lane` is the engaged
+/// per-port selection lane (if any) — connection-phase retries must rotate inside
+/// the same lane (`try_next_target`). Stream paths carry no `HealthContext`, so the
+/// `health` parameter stays `None` (see issue #2018).
 fn resolve_backend_target(
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
-) -> Result<(String, u16, u16), anyhow::Error> {
+    lb_hash_key: &str,
+) -> Result<(String, u16, u16, Option<u16>), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
+        let override_port =
+            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
+        let port_lane = if override_port != 0
+            && has_effective_port_override(proxy, lb_snapshot, upstream_id, override_port)
+            && tcp_port_lane_selection_supported(proxy, lb_snapshot, upstream_id, override_port)?
+        {
+            Some(override_port)
+        } else {
+            None
+        };
+
         let selection = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
-            LoadBalancerCache::select_target_subset_from(
+            if let Some(port) = port_lane {
+                LoadBalancerCache::select_target_for_port_subset_from(
+                    lb_snapshot,
+                    upstream_id,
+                    lb_hash_key,
+                    port,
+                    subset_name,
+                    None,
+                )
+            } else {
+                LoadBalancerCache::select_target_subset_from(
+                    lb_snapshot,
+                    upstream_id,
+                    lb_hash_key,
+                    subset_name,
+                    None,
+                )
+            }
+        } else if let Some(port) = port_lane {
+            LoadBalancerCache::select_target_for_port_from(
                 lb_snapshot,
                 upstream_id,
-                &proxy.id,
-                subset_name,
+                lb_hash_key,
+                port,
                 None,
             )
         } else {
-            LoadBalancerCache::select_target_from(lb_snapshot, upstream_id, &proxy.id, None)
+            LoadBalancerCache::select_target_from(lb_snapshot, upstream_id, lb_hash_key, None)
         }
         .ok_or_else(|| -> anyhow::Error {
             let scope = proxy
@@ -3277,14 +3336,105 @@ fn resolve_backend_target(
             selection.target.host.clone(),
             selection.target.port,
             selection.target.dispatch_policy_port(),
+            port_lane,
         ))
     } else {
         Ok((
             proxy.backend_host.clone(),
             proxy.backend_port,
             proxy.backend_port,
+            None,
         ))
     }
+}
+
+fn tcp_port_lane_selection_supported(
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    port: u16,
+) -> Result<bool, anyhow::Error> {
+    let Some(override_config) = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&port))
+    else {
+        return Ok(false);
+    };
+    let unsupported_algorithm = match override_config.algorithm {
+        Some(crate::config::types::LoadBalancerAlgorithm::LeastConnections) => Some("LEAST_CONN"),
+        Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency) => Some("LEAST_LATENCY"),
+        _ => None,
+    };
+    if let Some(algorithm) = unsupported_algorithm {
+        return Err(StreamSetupError::new(
+            StreamSetupKind::UnsupportedStreamPolicy,
+            format!(
+                "for TCP port {port}: per-port {algorithm} requires stream load-balancer accounting"
+            ),
+        )
+        .into());
+    }
+    let selection_affecting = stream_port_override_affects_selection(
+        proxy,
+        lb_snapshot,
+        upstream_id,
+        port,
+        override_config,
+    );
+    if selection_affecting {
+        validate_stream_hash_on(proxy, lb_snapshot, upstream_id, port)?;
+    }
+    Ok(selection_affecting)
+}
+
+fn stream_port_override_affects_selection(
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    port: u16,
+    override_config: &crate::config::types::ResolvedPortOverride,
+) -> bool {
+    if proxy.upstream_subset.is_some() && override_config.algorithm.is_none() {
+        return override_config.locality_lb_setting.is_some()
+            || (override_config.hash_on.is_some()
+                && LoadBalancerCache::effective_algorithm_from(
+                    lb_snapshot,
+                    upstream_id,
+                    Some(port),
+                    proxy.upstream_subset.as_deref(),
+                ) == Some(crate::config::types::LoadBalancerAlgorithm::ConsistentHashing));
+    }
+    override_config.algorithm.is_some()
+        || override_config.hash_on.is_some()
+        || override_config.locality_lb_setting.is_some()
+}
+
+fn stream_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
+    ip.to_canonical().to_string()
+}
+
+fn validate_stream_hash_on(
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    port: u16,
+) -> Result<(), anyhow::Error> {
+    let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+        lb_snapshot,
+        upstream_id,
+        Some(port),
+        proxy.upstream_subset.as_deref(),
+    );
+    if matches!(strategy, crate::load_balancer::HashOnStrategy::Ip) {
+        return Ok(());
+    }
+    let protocol = proxy.effective_scheme();
+    Err(StreamSetupError::new(
+        StreamSetupKind::UnsupportedStreamPolicy,
+        format!("for {protocol} port {port}: stream per-port consistent hashing supports only source-IP hash keys"),
+    )
+    .into())
 }
 
 #[cfg(test)]
@@ -3369,10 +3519,26 @@ mod backend_target_selection_tests {
             retry: None,
             upstream_id: Some("orders".to_string()),
             upstream_subset: None,
+            lb_hash_key: "192.0.2.10".to_string(),
             passthrough: false,
             tcp_fastopen_enabled: false,
             dispatch_port_overrides: None,
+            lb_port_lane: None,
         }
+    }
+
+    #[test]
+    fn stream_lb_hash_key_canonicalizes_ipv4_mapped_clients() {
+        let mapped: std::net::IpAddr = "::ffff:192.0.2.10".parse().expect("mapped IPv4");
+        let plain: std::net::IpAddr = "192.0.2.10".parse().expect("plain IPv4");
+        let v6: std::net::IpAddr = "2001:db8::10".parse().expect("plain IPv6");
+
+        assert_eq!(
+            stream_lb_hash_key_for_client_ip(mapped),
+            stream_lb_hash_key_for_client_ip(plain),
+            "IPv4-mapped clients must hash like their plain IPv4 form"
+        );
+        assert_eq!(stream_lb_hash_key_for_client_ip(v6), "2001:db8::10");
     }
 
     fn enforcement(entries: &[&str]) -> std::sync::Arc<MeshOutboundEnforcement> {
@@ -3394,12 +3560,13 @@ mod backend_target_selection_tests {
         let snapshot = cache.load();
         let proxy = proxy_with_subset(Some("canary"));
 
-        let (host, port, policy_port) =
-            resolve_backend_target(&proxy, &snapshot).expect("target selected");
+        let (host, port, policy_port, port_lane) =
+            resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
 
         assert_eq!(host, "canary.local");
         assert_eq!(port, 1002);
         assert_eq!(policy_port, 1002);
+        assert_eq!(port_lane, None, "no port override configured");
     }
 
     #[test]
@@ -3409,7 +3576,8 @@ mod backend_target_selection_tests {
         let snapshot = cache.load();
         let proxy = proxy_with_subset(Some("missing"));
 
-        let err = resolve_backend_target(&proxy, &snapshot).expect_err("missing subset rejected");
+        let err = resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("missing subset rejected");
 
         assert!(err.to_string().contains("subset missing"));
     }
@@ -3508,6 +3676,618 @@ mod backend_target_selection_tests {
             "lane 6379 remains selectable when excluding lane 6381"
         );
     }
+
+    /// A stream proxy's `backend_port` is a placeholder when an upstream is
+    /// configured. On a mixed-port upstream it must NOT engage the per-port
+    /// lane even when it coincides with an overridden target port (codex
+    /// round-1 P2 on PR #2016).
+    #[test]
+    fn resolve_backend_target_ignores_backend_port_placeholder_on_mixed_port_upstream() {
+        let mut config = config_with_subset();
+        // Targets sit on 1001 and 1002; add a per-port override on 1001 and
+        // make the proxy's placeholder backend_port coincide with it.
+        config.upstreams[0].port_overrides.insert(
+            1001,
+            crate::config::types::UpstreamPortOverride {
+                algorithm: Some(crate::config::types::LoadBalancerAlgorithm::RoundRobin),
+                ..Default::default()
+            },
+        );
+        // `resolve_dispatch_port_overrides` projects upstream overrides onto
+        // every referencing proxy — mirror the load path.
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let mut proxy = proxy_with_subset(None);
+        proxy.backend_port = 1001;
+        config.proxies.push(proxy);
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies.pop().expect("proxy pushed above");
+        assert!(
+            proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .is_some_and(|o| o.contains_key(&1001)),
+            "projection must land the 1001 override on the proxy"
+        );
+
+        let mut hosts = std::collections::HashSet::new();
+        for _ in 0..8 {
+            let (host, _, _, port_lane) =
+                resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
+            assert_eq!(
+                port_lane, None,
+                "mixed-port upstream must not resolve a per-port lane from the placeholder"
+            );
+            hosts.insert(host);
+        }
+        assert!(
+            hosts.contains("stable.local") && hosts.contains("canary.local"),
+            "selection must rotate across ALL targets, not pin to the placeholder port: {hosts:?}"
+        );
+    }
+
+    /// Connection-phase retry rotation must stay inside the engaged per-port
+    /// lane (codex round-1 P2 on PR #2016): with `lb_port_lane` set, the
+    /// port-scoped next-target variant is used and still rotates to the
+    /// sibling target on that port.
+    #[test]
+    fn tcp_retry_rotation_stays_in_port_lane() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].port_overrides.insert(
+            5432,
+            crate::config::types::UpstreamPortOverride {
+                algorithm: Some(crate::config::types::LoadBalancerAlgorithm::RoundRobin),
+                ..Default::default()
+            },
+        );
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let mut params = retry_params();
+        params.lb_port_lane = Some(5432);
+
+        let (host, port, policy_port) =
+            try_next_target(&params, "allowed.local", 5432, 5432, &snapshot)
+                .expect("alternate target inside the port lane");
+        assert_eq!(host, "blocked.local");
+        assert_eq!(port, 5432);
+        assert_eq!(policy_port, 5432);
+    }
+
+    #[test]
+    fn tcp_port_lane_retry_reuses_original_hash_key() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].targets.push(UpstreamTarget {
+            host: "backup.local".into(),
+            port: 5432,
+            service_port_policy_key: None,
+            weight: 1,
+            tags: HashMap::new(),
+            locality: None,
+            path: None,
+        });
+        config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+        config.upstreams[0].port_overrides.insert(
+            5432,
+            crate::config::types::UpstreamPortOverride {
+                algorithm: Some(crate::config::types::LoadBalancerAlgorithm::ConsistentHashing),
+                ..Default::default()
+            },
+        );
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let (flow_key, failed) = (1..=256)
+            .find_map(|i| {
+                let key = format!("198.51.100.{i}");
+                let initial = LoadBalancerCache::select_target_for_port_from(
+                    &snapshot, "orders", &key, 5432, None,
+                )?;
+                let exclude = UpstreamTarget {
+                    host: initial.target.host.clone(),
+                    port: initial.target.port,
+                    service_port_policy_key: Some(initial.target.dispatch_policy_port()),
+                    weight: 1,
+                    path: None,
+                    tags: HashMap::new(),
+                    locality: None,
+                };
+                let expected = LoadBalancerCache::select_next_target_for_port_from(
+                    &snapshot, "orders", &key, 5432, &exclude, None,
+                )?;
+                let failed_host_key = LoadBalancerCache::select_next_target_for_port_from(
+                    &snapshot,
+                    "orders",
+                    &initial.target.host,
+                    5432,
+                    &exclude,
+                    None,
+                )?;
+                (expected.host != failed_host_key.host)
+                    .then(|| (key, (initial.target.host.clone(), initial.target.port)))
+            })
+            .expect("test fixture should expose distinct retry hash outcomes");
+
+        let mut params = retry_params();
+        params.lb_port_lane = Some(5432);
+        params.lb_hash_key = flow_key.clone();
+
+        let (host, port, policy_port) =
+            try_next_target(&params, &failed.0, failed.1, 5432, &snapshot)
+                .expect("alternate target inside the port lane");
+
+        let exclude = UpstreamTarget {
+            host: failed.0,
+            port: failed.1,
+            service_port_policy_key: Some(5432),
+            weight: 1,
+            path: None,
+            tags: HashMap::new(),
+            locality: None,
+        };
+        let expected = LoadBalancerCache::select_next_target_for_port_from(
+            &snapshot, "orders", &flow_key, 5432, &exclude, None,
+        )
+        .expect("expected retry target");
+        assert_eq!(host, expected.host);
+        assert_eq!(port, expected.port);
+        assert_eq!(policy_port, expected.dispatch_policy_port());
+    }
+
+    #[test]
+    fn resolve_backend_target_hashes_port_lane_by_client_key() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+        config.upstreams[0].port_overrides.insert(
+            5432,
+            crate::config::types::UpstreamPortOverride {
+                algorithm: Some(crate::config::types::LoadBalancerAlgorithm::ConsistentHashing),
+                ..Default::default()
+            },
+        );
+        let mut proxy = proxy_with_subset(None);
+        proxy.upstream_id = Some("orders".to_string());
+        config.proxies.push(proxy);
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies.pop().expect("proxy pushed above");
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let mut hosts = std::collections::HashSet::new();
+        for i in 1..=64 {
+            let key = format!("192.0.2.{i}");
+            let (host, _, _, port_lane) =
+                resolve_backend_target(&proxy, &snapshot, &key).expect("target selected");
+            assert_eq!(port_lane, Some(5432));
+            hosts.insert(host);
+        }
+
+        assert!(
+            hosts.contains("allowed.local") && hosts.contains("blocked.local"),
+            "per-port consistent hashing must use the per-flow key, not a constant proxy id: {hosts:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_target_rejects_tcp_port_lane_for_least_connections() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+        config.upstreams[0].port_overrides.insert(
+            5432,
+            crate::config::types::UpstreamPortOverride {
+                algorithm: Some(crate::config::types::LoadBalancerAlgorithm::LeastConnections),
+                ..Default::default()
+            },
+        );
+        let mut proxy = proxy_with_subset(None);
+        proxy.upstream_id = Some("orders".to_string());
+        config.proxies.push(proxy);
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies.pop().expect("proxy pushed above");
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let err = resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("per-port LEAST_CONN must be rejected explicitly");
+        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+        assert!(
+            setup.message.contains("per-port LEAST_CONN"),
+            "error should make the unsupported policy explicit: {}",
+            setup.message
+        );
+    }
+
+    #[test]
+    fn resolve_backend_target_rejects_tcp_port_lane_for_least_latency() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+        config.upstreams[0].port_overrides.insert(
+            5432,
+            crate::config::types::UpstreamPortOverride {
+                algorithm: Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency),
+                ..Default::default()
+            },
+        );
+        let mut proxy = proxy_with_subset(None);
+        proxy.upstream_id = Some("orders".to_string());
+        config.proxies.push(proxy);
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies.pop().expect("proxy pushed above");
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let err = resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("per-port LEAST_LATENCY must be rejected explicitly");
+        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+        assert!(
+            setup.message.contains("per-port LEAST_LATENCY"),
+            "error should make the unsupported policy explicit: {}",
+            setup.message
+        );
+    }
+
+    #[test]
+    fn resolve_backend_target_rejects_tcp_port_lane_for_non_ip_hash_on() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+        config.upstreams[0].port_overrides.insert(
+            5432,
+            crate::config::types::UpstreamPortOverride {
+                algorithm: Some(crate::config::types::LoadBalancerAlgorithm::ConsistentHashing),
+                hash_on: Some("header:x-user-id".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut proxy = proxy_with_subset(None);
+        proxy.upstream_id = Some("orders".to_string());
+        config.proxies.push(proxy);
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies.pop().expect("proxy pushed above");
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let err = resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("stream hash_on header must be rejected explicitly");
+        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+        assert!(
+            setup.message.contains("source-IP hash keys"),
+            "error should make the unsupported hash key explicit: {}",
+            setup.message
+        );
+    }
+
+    #[test]
+    fn resolve_backend_target_rejects_tcp_port_lane_for_inherited_non_ip_hash_on() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+        config.upstreams[0].hash_on = Some("cookie:ferrum-affinity".to_string());
+        config.upstreams[0].port_overrides.insert(
+            5432,
+            crate::config::types::UpstreamPortOverride {
+                algorithm: Some(crate::config::types::LoadBalancerAlgorithm::ConsistentHashing),
+                ..Default::default()
+            },
+        );
+        let mut proxy = proxy_with_subset(None);
+        proxy.upstream_id = Some("orders".to_string());
+        config.proxies.push(proxy);
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies.pop().expect("proxy pushed above");
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let err = resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("inherited stream hash_on cookie must be rejected explicitly");
+        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+        assert!(
+            setup.message.contains("source-IP hash keys"),
+            "error should make the inherited unsupported hash key explicit: {}",
+            setup.message
+        );
+    }
+
+    #[test]
+    fn resolve_backend_target_preserves_subset_lb_for_non_lb_port_override() {
+        let mut config: GatewayConfig = serde_json::from_value(json!({
+            "version": "1",
+            "proxies": [{
+                "id": "orders-proxy",
+                "backend_scheme": "tcp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 15432,
+                "upstream_id": "orders",
+                "upstream_subset": "canary"
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "orders",
+                "algorithm": "round_robin",
+                "targets": [
+                    {
+                        "host": "canary-a.local",
+                        "port": 5432,
+                        "tags": { "version": "canary" }
+                    },
+                    {
+                        "host": "canary-b.local",
+                        "port": 5432,
+                        "tags": { "version": "canary" }
+                    }
+                ],
+                "subsets": [{
+                    "name": "canary",
+                    "labels": { "version": "canary" },
+                    "traffic_policy": { "load_balancer_algorithm": "consistent_hashing" }
+                }],
+                "port_overrides": {
+                    "5432": { "connect_timeout_ms": 250 }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let (_, _, _, port_lane) =
+            resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
+
+        assert_eq!(
+            port_lane, None,
+            "a connect-timeout-only port override must not bypass the subset LB lane"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_target_honors_hash_only_subset_port_override() {
+        let mut config: GatewayConfig = serde_json::from_value(json!({
+            "version": "1",
+            "proxies": [{
+                "id": "orders-proxy",
+                "backend_scheme": "tcp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 15432,
+                "upstream_id": "orders",
+                "upstream_subset": "canary"
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "orders",
+                "algorithm": "round_robin",
+                "targets": [
+                    {
+                        "host": "canary-a.local",
+                        "port": 5432,
+                        "tags": { "version": "canary" }
+                    },
+                    {
+                        "host": "canary-b.local",
+                        "port": 5432,
+                        "tags": { "version": "canary" }
+                    }
+                ],
+                "subsets": [{
+                    "name": "canary",
+                    "labels": { "version": "canary" },
+                    "traffic_policy": { "load_balancer_algorithm": "consistent_hashing" }
+                }],
+                "port_overrides": {
+                    "5432": { "hash_on": "ip" }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let (_, _, _, port_lane) =
+            resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
+
+        assert_eq!(
+            port_lane,
+            Some(5432),
+            "a source-IP hash-only port override should engage the port lane while preserving the subset algorithm"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_target_rejects_hash_only_subset_port_override_for_non_ip_hash() {
+        let mut config: GatewayConfig = serde_json::from_value(json!({
+            "version": "1",
+            "proxies": [{
+                "id": "orders-proxy",
+                "backend_scheme": "tcp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 15432,
+                "upstream_id": "orders",
+                "upstream_subset": "canary"
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "orders",
+                "algorithm": "round_robin",
+                "targets": [
+                    {
+                        "host": "canary-a.local",
+                        "port": 5432,
+                        "tags": { "version": "canary" }
+                    },
+                    {
+                        "host": "canary-b.local",
+                        "port": 5432,
+                        "tags": { "version": "canary" }
+                    }
+                ],
+                "subsets": [{
+                    "name": "canary",
+                    "labels": { "version": "canary" },
+                    "traffic_policy": { "load_balancer_algorithm": "consistent_hashing" }
+                }],
+                "port_overrides": {
+                    "5432": { "hash_on": "cookie:session" }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let err = resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("stream hash_on cookie must be rejected explicitly");
+        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+        assert!(
+            setup.message.contains("source-IP hash keys"),
+            "error should make the unsupported hash key explicit: {}",
+            setup.message
+        );
+    }
+
+    #[test]
+    fn resolve_backend_target_honors_locality_only_port_lane_without_bypassing_subset_lb() {
+        let mut config: GatewayConfig = serde_json::from_value(json!({
+            "version": "1",
+            "proxies": [{
+                "id": "orders-proxy",
+                "backend_scheme": "tcp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 15432,
+                "upstream_id": "orders",
+                "upstream_subset": "canary"
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "orders",
+                "algorithm": "round_robin",
+                "targets": [
+                    {
+                        "host": "canary-a.local",
+                        "port": 5432,
+                        "tags": { "version": "canary" },
+                        "locality": "region-a/zone-a"
+                    },
+                    {
+                        "host": "canary-b.local",
+                        "port": 5432,
+                        "tags": { "version": "canary" },
+                        "locality": "region-b/zone-b"
+                    }
+                ],
+                "subsets": [{
+                    "name": "canary",
+                    "labels": { "version": "canary" },
+                    "traffic_policy": { "load_balancer_algorithm": "consistent_hashing" }
+                }],
+                "port_overrides": {
+                    "5432": { "locality_lb_setting": { "enabled": true } }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let (first_host, _, _, port_lane) =
+            resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
+        let (second_host, _, _, second_port_lane) =
+            resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
+
+        assert_eq!(
+            port_lane,
+            Some(5432),
+            "locality-only port policy must engage the port lane"
+        );
+        assert_eq!(second_port_lane, Some(5432));
+        assert_eq!(
+            first_host, second_host,
+            "port+subset selection must keep the subset consistent-hash algorithm when the \
+             port override supplies only locality policy"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_target_preserves_subset_lb_for_passive_health_only_port_override() {
+        let mut config: GatewayConfig = serde_json::from_value(json!({
+            "version": "1",
+            "proxies": [{
+                "id": "orders-proxy",
+                "backend_scheme": "tcp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 15432,
+                "upstream_id": "orders",
+                "upstream_subset": "canary"
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "orders",
+                "algorithm": "round_robin",
+                "targets": [
+                    {
+                        "host": "canary-a.local",
+                        "port": 5432,
+                        "tags": { "version": "canary" }
+                    },
+                    {
+                        "host": "canary-b.local",
+                        "port": 5432,
+                        "tags": { "version": "canary" }
+                    }
+                ],
+                "subsets": [{
+                    "name": "canary",
+                    "labels": { "version": "canary" },
+                    "traffic_policy": { "load_balancer_algorithm": "consistent_hashing" }
+                }],
+                "port_overrides": {
+                    "5432": {
+                        "passive_health_check": {
+                            "unhealthy_threshold": 3,
+                            "max_ejection_percent": 50
+                        }
+                    }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let (_, _, _, port_lane) =
+            resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
+
+        assert_eq!(
+            port_lane, None,
+            "a passive-health-only port override cannot apply without HealthContext and must not \
+             bypass the subset LB lane"
+        );
+    }
 }
 
 /// Backend stream type for the connection-phase retry loop.
@@ -3543,23 +4323,44 @@ fn try_next_target(
         tags: std::collections::HashMap::new(),
         locality: None,
     };
-    let next = if let Some(subset_name) = params.upstream_subset.as_deref() {
-        LoadBalancerCache::select_next_target_subset_from(
+    // Rotate inside the per-port lane the initial selection used (if any), so
+    // a per-port algorithm/locality override is not escaped on connect retry.
+    let lb_hash_key = params.lb_hash_key.as_str();
+    let next = match (params.upstream_subset.as_deref(), params.lb_port_lane) {
+        (Some(subset_name), Some(port)) => {
+            LoadBalancerCache::select_next_target_for_port_subset_from(
+                lb_snapshot,
+                upstream_id,
+                lb_hash_key,
+                port,
+                subset_name,
+                &exclude,
+                None,
+            )
+        }
+        (Some(subset_name), None) => LoadBalancerCache::select_next_target_subset_from(
             lb_snapshot,
             upstream_id,
-            current_host,
+            lb_hash_key,
             subset_name,
             &exclude,
             None,
-        )
-    } else {
-        LoadBalancerCache::select_next_target_from(
+        ),
+        (None, Some(port)) => LoadBalancerCache::select_next_target_for_port_from(
             lb_snapshot,
             upstream_id,
-            current_host,
+            lb_hash_key,
+            port,
             &exclude,
             None,
-        )
+        ),
+        (None, None) => LoadBalancerCache::select_next_target_from(
+            lb_snapshot,
+            upstream_id,
+            lb_hash_key,
+            &exclude,
+            None,
+        ),
     }?;
     Some((next.host.clone(), next.port, next.dispatch_policy_port()))
 }

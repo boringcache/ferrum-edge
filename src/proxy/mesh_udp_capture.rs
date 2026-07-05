@@ -104,6 +104,11 @@ fn canonicalize_socket_addr(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
+#[cfg(target_os = "linux")]
+fn mesh_udp_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
+    ip.to_canonical().to_string()
+}
+
 /// Start the mesh UDP capture listener (Linux).
 ///
 /// Binds a transparent UDP socket on `cfg.addr`, enables per-datagram orig-dst
@@ -815,8 +820,8 @@ async fn run_udp_egress_session(
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
 ) {
-    use super::LoadBalancerConnectionGuard;
-    use crate::load_balancer::LoadBalancerCache;
+    use super::{LoadBalancerConnectionGuard, backend_dispatch};
+    use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
     use tracing::{debug, warn};
 
     // The admission epoch is reused here (codex r7 P2) so route resolution (done
@@ -828,20 +833,81 @@ async fn run_udp_egress_session(
     let proxy = entry.relay_proxy.as_ref();
 
     // ── Fail-closed egress gates (mirrors handle_mesh_tcp_egress) ──────────
-    let Some(selection) = LoadBalancerCache::select_target_from(
-        &epoch.load_balancer,
-        &entry.upstream_id,
-        &proxy.id,
-        None,
-    ) else {
-        warn!(
-            service = %entry.service_fqdn,
-            orig_dst = %key.orig_dst,
-            "Mesh UDP egress has no selectable workload target; ending session"
-        );
-        return;
+    // Engage the per-port LB lane (algorithm / locality) when all upstream
+    // targets share a single port — same pre-selection semantics as the HTTP
+    // dispatch path. Stream paths carry no HealthContext (issue #2018).
+    //
+    // All lb operations are done in a scoped block so the reference to
+    // `epoch.load_balancer` (the Arc inner snapshot) is released before
+    // `drop(epoch)` below (codex r7 P2: epoch is setup-only; drop early).
+    let (target, balancer) = {
+        let lb: &LoadBalancerCacheInner = &epoch.load_balancer;
+        // Engage the per-port lane only on a non-zero override port: the relay
+        // proxy's `backend_port` is a placeholder, so the HTTP path's fallback
+        // must not pin a mixed-port upstream (see tcp_proxy::resolve_backend_target).
+        let override_port =
+            LoadBalancerCache::initial_dispatch_port_override_from(lb, &entry.upstream_id);
+        let port_lane = (override_port != 0
+            && backend_dispatch::has_effective_port_override(
+                proxy,
+                lb,
+                &entry.upstream_id,
+                override_port,
+            )
+            && match mesh_stream_port_lane_supported(proxy, override_port) {
+                Ok(supported) => supported,
+                Err(message) => {
+                    warn!(
+                        service = %entry.service_fqdn,
+                        port = override_port,
+                        orig_dst = %key.orig_dst,
+                        %message,
+                        "Mesh UDP egress per-port LB policy is unsupported; ending session"
+                    );
+                    return;
+                }
+            })
+        .then_some(override_port);
+        if let Some(port) = port_lane {
+            let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+                lb,
+                &entry.upstream_id,
+                Some(port),
+                None,
+            );
+            if !matches!(strategy, crate::load_balancer::HashOnStrategy::Ip) {
+                warn!(
+                    service = %entry.service_fqdn,
+                    port,
+                    orig_dst = %key.orig_dst,
+                    "Mesh UDP egress per-port consistent hashing supports only source-IP hash keys; ending session"
+                );
+                return;
+            }
+        }
+        let lb_hash_key = mesh_udp_lb_hash_key_for_client_ip(key.client.ip());
+        let selection = if let Some(port) = port_lane {
+            LoadBalancerCache::select_target_for_port_from(
+                lb,
+                &entry.upstream_id,
+                &lb_hash_key,
+                port,
+                None,
+            )
+        } else {
+            LoadBalancerCache::select_target_from(lb, &entry.upstream_id, &lb_hash_key, None)
+        };
+        let Some(selection) = selection else {
+            warn!(
+                service = %entry.service_fqdn,
+                orig_dst = %key.orig_dst,
+                "Mesh UDP egress has no selectable workload target; ending session"
+            );
+            return;
+        };
+        let balancer = lb.balancers().get(&entry.upstream_id).cloned();
+        (selection.target, balancer)
     };
-    let target = selection.target;
 
     // Least-connection accounting parity with the raw-TCP / HTTP relay paths
     // (mirrors handle_mesh_tcp_egress): acquire the guard immediately after
@@ -849,11 +915,7 @@ async fn run_udp_egress_session(
     // active-connection counts include long-lived UDP sessions. Dropped on any
     // early return below and at session teardown, so least-connections LB sees a
     // UDP session start/stop exactly once.
-    let balancer = epoch
-        .load_balancer
-        .balancers()
-        .get(&entry.upstream_id)
-        .cloned();
+
     // Setup-only snapshot: release the epoch now so a long-lived UDP session does
     // not pin an old config generation in memory (codex r7 P2).
     drop(epoch);
@@ -1268,6 +1330,40 @@ fn spawn_capture_session_cleanup(
     });
 }
 
+#[cfg(target_os = "linux")]
+fn stream_port_override_affects_selection(proxy: &crate::config::types::Proxy, port: u16) -> bool {
+    let Some(override_config) = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&port))
+    else {
+        return false;
+    };
+    override_config.algorithm.is_some()
+        || override_config.hash_on.is_some()
+        || override_config.locality_lb_setting.is_some()
+}
+
+#[cfg(target_os = "linux")]
+fn mesh_stream_port_lane_supported(
+    proxy: &crate::config::types::Proxy,
+    port: u16,
+) -> Result<bool, &'static str> {
+    let Some(override_config) = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&port))
+    else {
+        return Ok(false);
+    };
+    match override_config.algorithm {
+        Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency) => {
+            Err("per-port LEAST_LATENCY requires stream latency accounting")
+        }
+        _ => Ok(stream_port_override_affects_selection(proxy, port)),
+    }
+}
+
 /// Non-Linux stub. `IP_TRANSPARENT` and recvmsg cmsg orig-dst recovery are
 /// Linux-only; mesh UDP capture is unsupported elsewhere, so the listener logs
 /// and returns immediately (the flag is default-off, so this is never reached
@@ -1349,6 +1445,79 @@ mod tests {
             client: client.parse().unwrap(),
             orig_dst: dst.parse().unwrap(),
         }
+    }
+
+    fn proxy_with_override(
+        override_config: crate::config::types::ResolvedPortOverride,
+    ) -> crate::config::types::Proxy {
+        let mut proxy: crate::config::types::Proxy = serde_yaml::from_str(
+            r#"
+id: mesh-udp-relay
+backend_scheme: udp
+backend_host: placeholder.local
+backend_port: 0
+listen_port: 15011
+"#,
+        )
+        .expect("proxy fixture should deserialize");
+        proxy.dispatch_port_overrides =
+            Some(std::collections::HashMap::from([(53, override_config)]));
+        proxy
+    }
+
+    #[test]
+    fn mesh_udp_stream_port_override_affects_selection_only_for_lb_fields() {
+        let timeout_only = proxy_with_override(crate::config::types::ResolvedPortOverride {
+            connect_timeout_ms: Some(250),
+            ..Default::default()
+        });
+        assert!(!stream_port_override_affects_selection(&timeout_only, 53));
+
+        let passive_only = proxy_with_override(crate::config::types::ResolvedPortOverride {
+            passive_health_check: Some(crate::config::types::PassiveHealthCheck::default()),
+            ..Default::default()
+        });
+        assert!(!stream_port_override_affects_selection(&passive_only, 53));
+
+        let locality = proxy_with_override(crate::config::types::ResolvedPortOverride {
+            locality_lb_setting: Some(crate::config::types::UpstreamLocalityLbSetting::default()),
+            ..Default::default()
+        });
+        assert!(stream_port_override_affects_selection(&locality, 53));
+
+        let algorithm = proxy_with_override(crate::config::types::ResolvedPortOverride {
+            algorithm: Some(crate::config::types::LoadBalancerAlgorithm::ConsistentHashing),
+            ..Default::default()
+        });
+        assert!(stream_port_override_affects_selection(&algorithm, 53));
+    }
+
+    #[test]
+    fn mesh_udp_stream_port_lane_rejects_least_latency() {
+        let least_latency = proxy_with_override(crate::config::types::ResolvedPortOverride {
+            algorithm: Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency),
+            ..Default::default()
+        });
+
+        assert!(stream_port_override_affects_selection(&least_latency, 53));
+        assert!(mesh_stream_port_lane_supported(&least_latency, 53).is_err());
+    }
+
+    #[test]
+    fn mesh_udp_lb_hash_key_canonicalizes_ipv4_mapped_clients() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        let mapped = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x020a));
+        let plain = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+
+        assert_eq!(
+            mesh_udp_lb_hash_key_for_client_ip(mapped),
+            mesh_udp_lb_hash_key_for_client_ip(plain)
+        );
+        assert_eq!(mesh_udp_lb_hash_key_for_client_ip(plain), "192.0.2.10");
+
+        let ipv6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 10));
+        assert_eq!(mesh_udp_lb_hash_key_for_client_ip(ipv6), "2001:db8::a");
     }
 
     #[test]

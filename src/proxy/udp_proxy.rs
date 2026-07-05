@@ -33,6 +33,7 @@ use crate::plugins::{
     StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
     UdpMetadataSink,
 };
+use crate::proxy::backend_dispatch::has_effective_port_override;
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 
@@ -1919,8 +1920,9 @@ async fn process_new_session_datagram(
     let mut preselected_backend_target = None;
     if let Some(enforcement) = mesh_enforcement_snapshot.as_ref() {
         use crate::modes::mesh::outbound_enforcement::{Decision, PROTOCOL_UDP, PROTOCOL_UDP_DTLS};
+        let lb_hash_key = udp_lb_hash_key_for_client_ip(client_addr.ip());
         let (backend_host, backend_port) =
-            resolve_backend_target(&view.proxy, &epoch.load_balancer)?;
+            resolve_backend_target(&view.proxy, &epoch.load_balancer, &lb_hash_key)?;
         preselected_backend_target = Some((backend_host.clone(), backend_port));
         let protocol_label = if matches!(view.proxy.effective_scheme(), BackendScheme::Dtls) {
             PROTOCOL_UDP_DTLS
@@ -2745,7 +2747,9 @@ async fn handle_dtls_client_inner(
     let idle_timeout = Duration::from_secs(proxy.udp_idle_timeout_seconds.max(1));
 
     // Resolve backend target
-    let (backend_host, backend_port) = resolve_backend_target(&proxy, &epoch.load_balancer)?;
+    let lb_hash_key = udp_lb_hash_key_for_client_ip(client_addr.ip());
+    let (backend_host, backend_port) =
+        resolve_backend_target(&proxy, &epoch.load_balancer, &lb_hash_key)?;
     // Populate backend target as soon as it's known — even if DNS or connect fails.
     backend_info.backend_target = format!("{}:{}", backend_host, backend_port);
 
@@ -3237,8 +3241,13 @@ async fn create_session(
         }
     }
 
-    let (backend_host, backend_port) =
-        resolve_or_reuse_backend_target(preselected_backend_target, &proxy, &epoch.load_balancer)?;
+    let lb_hash_key = udp_lb_hash_key_for_client_ip(client_addr.ip());
+    let (backend_host, backend_port) = resolve_or_reuse_backend_target(
+        preselected_backend_target,
+        &proxy,
+        &epoch.load_balancer,
+        &lb_hash_key,
+    )?;
 
     // Circuit breaker check — reject before creating backend socket if open.
     // When admitted, capture whether this is a half-open probe so downstream
@@ -4087,34 +4096,135 @@ async fn create_session(
 /// the client-side `RecvError` instead of the correct backend-side
 /// `BackendError`). Mirrors the TCP resolver in
 /// [`crate::proxy::tcp_proxy::resolve_backend_target`].
+///
+/// Per-port DestinationRule LB/locality policy engages only when
+/// `initial_dispatch_port_override` is non-zero (all targets on one port);
+/// the HTTP path's `backend_port` fallback is deliberately not used (a
+/// placeholder port must never pin a mixed-port upstream). Stream paths
+/// carry no `HealthContext` (issue #2018).
 fn resolve_backend_target(
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
+    lb_hash_key: &str,
 ) -> Result<(String, u16), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
-        let selection =
-            LoadBalancerCache::select_target_from(lb_snapshot, upstream_id, &proxy.id, None)
-                .ok_or_else(|| -> anyhow::Error {
-                    StreamSetupError::new(
-                        StreamSetupKind::NoHealthyTargets,
-                        format!("for upstream {upstream_id}"),
-                    )
-                    .into()
-                })?;
+        // Engage the per-port LB lane only when every upstream target shares a
+        // single dispatch port (non-zero `initial_dispatch_port_override`). The
+        // HTTP path's `backend_port` fallback is deliberately not used: for a
+        // stream proxy referencing an upstream, `backend_port` is a placeholder,
+        // and a coincidental match with one overridden port of a mixed-port
+        // upstream would silently pin selection to that port's targets.
+        let override_port =
+            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
+        let port_lane = if override_port != 0
+            && has_effective_port_override(proxy, lb_snapshot, upstream_id, override_port)
+            && udp_port_lane_selection_supported(proxy, lb_snapshot, upstream_id, override_port)?
+        {
+            Some(override_port)
+        } else {
+            None
+        };
+
+        let selection = if let Some(port) = port_lane {
+            LoadBalancerCache::select_target_for_port_from(
+                lb_snapshot,
+                upstream_id,
+                lb_hash_key,
+                port,
+                None,
+            )
+        } else {
+            LoadBalancerCache::select_target_from(lb_snapshot, upstream_id, lb_hash_key, None)
+        }
+        .ok_or_else(|| -> anyhow::Error {
+            StreamSetupError::new(
+                StreamSetupKind::NoHealthyTargets,
+                format!("for upstream {upstream_id}"),
+            )
+            .into()
+        })?;
         Ok((selection.target.host.clone(), selection.target.port))
     } else {
         Ok((proxy.backend_host.clone(), proxy.backend_port))
     }
 }
 
+fn udp_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
+    ip.to_canonical().to_string()
+}
+
+fn udp_port_lane_selection_supported(
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    port: u16,
+) -> Result<bool, anyhow::Error> {
+    let Some(override_config) = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&port))
+    else {
+        return Ok(false);
+    };
+    let unsupported_algorithm = match override_config.algorithm {
+        Some(crate::config::types::LoadBalancerAlgorithm::LeastConnections) => Some("LEAST_CONN"),
+        Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency) => Some("LEAST_LATENCY"),
+        _ => None,
+    };
+    if let Some(algorithm) = unsupported_algorithm {
+        return Err(StreamSetupError::new(
+            StreamSetupKind::UnsupportedStreamPolicy,
+            format!(
+                "for UDP port {port}: per-port {algorithm} requires stream load-balancer accounting"
+            ),
+        )
+        .into());
+    }
+    let selection_affecting = stream_port_override_affects_selection(override_config);
+    if selection_affecting {
+        validate_stream_hash_on(lb_snapshot, upstream_id, port)?;
+    }
+    Ok(selection_affecting)
+}
+
+fn stream_port_override_affects_selection(
+    override_config: &crate::config::types::ResolvedPortOverride,
+) -> bool {
+    override_config.algorithm.is_some()
+        || override_config.hash_on.is_some()
+        || override_config.locality_lb_setting.is_some()
+}
+
+fn validate_stream_hash_on(
+    lb_snapshot: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    port: u16,
+) -> Result<(), anyhow::Error> {
+    let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+        lb_snapshot,
+        upstream_id,
+        Some(port),
+        None,
+    );
+    if matches!(strategy, crate::load_balancer::HashOnStrategy::Ip) {
+        return Ok(());
+    }
+    Err(StreamSetupError::new(
+        StreamSetupKind::UnsupportedStreamPolicy,
+        format!("for UDP port {port}: stream per-port consistent hashing supports only source-IP hash keys"),
+    )
+    .into())
+}
+
 fn resolve_or_reuse_backend_target(
     preselected: Option<(String, u16)>,
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
+    lb_hash_key: &str,
 ) -> Result<(String, u16), anyhow::Error> {
     match preselected {
         Some(target) => Ok(target),
-        None => resolve_backend_target(proxy, lb_snapshot),
+        None => resolve_backend_target(proxy, lb_snapshot, lb_hash_key),
     }
 }
 
@@ -4161,11 +4271,11 @@ fn epoch_millis_precise() -> u64 {
 mod tests {
     use super::{
         BackendDtlsConfigCache, BackendDtlsConfigCacheState, DtlsDisconnectContext,
-        STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED, UdpDisconnectContext, UdpSession,
-        build_dtls_stream_summary, build_udp_stream_summary, cached_backend_dtls_config,
-        dtls_disconnect_cause, dtls_disconnect_direction, emit_udp_stream_disconnect,
-        forward_client_datagram_to_backend, reserve_udp_session_slot,
-        resolve_or_reuse_backend_target, udp_session_shard_amount,
+        STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED, StreamSetupKind, UdpDisconnectContext,
+        UdpSession, build_dtls_stream_summary, build_udp_stream_summary,
+        cached_backend_dtls_config, dtls_disconnect_cause, dtls_disconnect_direction,
+        emit_udp_stream_disconnect, find_stream_setup_error, forward_client_datagram_to_backend,
+        reserve_udp_session_slot, resolve_or_reuse_backend_target, udp_session_shard_amount,
     };
     use crate::config::types::{BackendScheme, BackendTlsConfig, Proxy};
     use crate::load_balancer::LoadBalancerCache;
@@ -4917,11 +5027,253 @@ listen_port: 5300
             Some(("admitted.local".to_string(), 5354)),
             &proxy,
             &snapshot,
+            "127.0.0.1",
         )
         .unwrap();
 
         assert_eq!(host, "admitted.local");
         assert_eq!(port, 5354);
+    }
+
+    #[test]
+    fn resolve_udp_backend_target_hashes_port_lane_by_client_key() {
+        let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "proxies": [{
+                "id": "udp-proxy",
+                "backend_scheme": "udp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 5300,
+                "upstream_id": "dns",
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "dns",
+                "algorithm": "round_robin",
+                "targets": [
+                    { "host": "a.local", "port": 5353 },
+                    { "host": "b.local", "port": 5353 }
+                ],
+                "port_overrides": {
+                    "5353": { "algorithm": "consistent_hashing" }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let mut hosts = std::collections::HashSet::new();
+        for i in 1..=64 {
+            let key = format!("192.0.2.{i}");
+            let (host, port) =
+                super::resolve_backend_target(&proxy, &snapshot, &key).expect("target selected");
+            assert_eq!(port, 5353);
+            hosts.insert(host);
+        }
+
+        assert!(
+            hosts.contains("a.local") && hosts.contains("b.local"),
+            "per-port UDP consistent hashing must use the session key, not a constant proxy id: {hosts:?}"
+        );
+    }
+
+    #[test]
+    fn udp_lb_hash_key_canonicalizes_ipv4_mapped_clients() {
+        let mapped: std::net::IpAddr = "::ffff:192.0.2.10".parse().expect("mapped IPv4");
+        let plain: std::net::IpAddr = "192.0.2.10".parse().expect("plain IPv4");
+        let v6: std::net::IpAddr = "2001:db8::10".parse().expect("plain IPv6");
+
+        assert_eq!(
+            super::udp_lb_hash_key_for_client_ip(mapped),
+            super::udp_lb_hash_key_for_client_ip(plain),
+            "IPv4-mapped UDP clients must hash like their plain IPv4 form"
+        );
+        assert_eq!(super::udp_lb_hash_key_for_client_ip(v6), "2001:db8::10");
+    }
+
+    #[test]
+    fn resolve_udp_backend_target_rejects_port_lane_for_least_connections() {
+        let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "proxies": [{
+                "id": "udp-proxy",
+                "backend_scheme": "udp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 5300,
+                "upstream_id": "dns",
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "dns",
+                "algorithm": "round_robin",
+                "targets": [
+                    { "host": "a.local", "port": 5353 },
+                    { "host": "b.local", "port": 5353 }
+                ],
+                "port_overrides": {
+                    "5353": { "algorithm": "least_connections" }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let err = super::resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("per-port LEAST_CONN must be rejected explicitly");
+        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+        assert!(
+            setup.message.contains("per-port LEAST_CONN"),
+            "error should make the unsupported policy explicit: {}",
+            setup.message
+        );
+    }
+
+    #[test]
+    fn resolve_udp_backend_target_rejects_port_lane_for_least_latency() {
+        let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "proxies": [{
+                "id": "udp-proxy",
+                "backend_scheme": "udp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 5300,
+                "upstream_id": "dns",
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "dns",
+                "algorithm": "round_robin",
+                "targets": [
+                    { "host": "a.local", "port": 5353 },
+                    { "host": "b.local", "port": 5353 }
+                ],
+                "port_overrides": {
+                    "5353": { "algorithm": "least_latency" }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let err = super::resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("per-port LEAST_LATENCY must be rejected explicitly");
+        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+        assert!(
+            setup.message.contains("per-port LEAST_LATENCY"),
+            "error should make the unsupported policy explicit: {}",
+            setup.message
+        );
+    }
+
+    #[test]
+    fn resolve_udp_backend_target_rejects_port_lane_for_non_ip_hash_on() {
+        let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "proxies": [{
+                "id": "udp-proxy",
+                "backend_scheme": "udp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 5300,
+                "upstream_id": "dns",
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "dns",
+                "algorithm": "round_robin",
+                "targets": [
+                    { "host": "a.local", "port": 5353 },
+                    { "host": "b.local", "port": 5353 }
+                ],
+                "port_overrides": {
+                    "5353": {
+                        "algorithm": "consistent_hashing",
+                        "hash_on": "cookie:ferrum-affinity"
+                    }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let err = super::resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("stream hash_on cookie must be rejected explicitly");
+        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+        assert!(
+            setup.message.contains("source-IP hash keys"),
+            "error should make the unsupported hash key explicit: {}",
+            setup.message
+        );
+    }
+
+    #[test]
+    fn resolve_udp_backend_target_rejects_port_lane_for_inherited_non_ip_hash_on() {
+        let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "proxies": [{
+                "id": "udp-proxy",
+                "backend_scheme": "udp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 5300,
+                "upstream_id": "dns",
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "dns",
+                "algorithm": "round_robin",
+                "hash_on": "header:x-user-id",
+                "targets": [
+                    { "host": "a.local", "port": 5353 },
+                    { "host": "b.local", "port": 5353 }
+                ],
+                "port_overrides": {
+                    "5353": { "algorithm": "consistent_hashing" }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let err = super::resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("inherited stream hash_on header must be rejected explicitly");
+        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+        assert!(
+            setup.message.contains("source-IP hash keys"),
+            "error should make the inherited unsupported hash key explicit: {}",
+            setup.message
+        );
     }
 
     #[test]

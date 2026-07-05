@@ -1568,11 +1568,13 @@ struct LocalityDistributeGroup {
 struct PortLbState {
     target_indices: Vec<usize>,
     algorithm: LoadBalancerAlgorithm,
+    algorithm_overridden: bool,
     rr_counter: AtomicU64,
     wrr_state: std::sync::Mutex<Vec<i64>>,
     wrr_needs_stale_check: AtomicBool,
     hash_ring: Vec<(u64, usize)>,
     hash_on_strategy: HashOnStrategy,
+    hash_on_override_strategy: Option<HashOnStrategy>,
     /// Per-port projection of `UpstreamPortOverride.locality_lb_setting`.
     /// When `Some`, dispatch on this port consults the per-port locality
     /// preference before falling through to the upstream-level
@@ -1817,11 +1819,16 @@ impl LoadBalancer {
                     PortLbState {
                         target_indices,
                         algorithm: effective_algorithm,
+                        algorithm_overridden: override_config.algorithm.is_some(),
                         rr_counter: AtomicU64::new(0),
                         wrr_state: std::sync::Mutex::new(wrr_state),
                         wrr_needs_stale_check: AtomicBool::new(false),
                         hash_ring,
                         hash_on_strategy: HashOnStrategy::parse(effective_hash_on),
+                        hash_on_override_strategy: override_config
+                            .hash_on
+                            .as_deref()
+                            .map(|hash_on| HashOnStrategy::parse(Some(hash_on))),
                         locality_lb: port_locality_lb,
                     },
                 );
@@ -2996,6 +3003,7 @@ impl LoadBalancer {
             return self.select_port_subset_vec_fallback(
                 ctx_key,
                 port_state,
+                subset_name,
                 subset_target_indices,
                 health,
             );
@@ -3026,10 +3034,10 @@ impl LoadBalancer {
         self.select_with_bitset_using(
             ctx_key,
             &port_subset_healthy,
-            port_state.algorithm,
-            &port_state.rr_counter,
-            &port_state.wrr_state,
-            &port_state.hash_ring,
+            self.port_subset_algorithm(port_state, subset_name),
+            self.port_subset_rr_counter(port_state),
+            self.port_subset_wrr_state(port_state, subset_name),
+            self.port_subset_hash_ring(port_state, subset_name),
             port_locality,
         )
         .map(|target| TargetSelection {
@@ -3083,6 +3091,7 @@ impl LoadBalancer {
         &self,
         ctx_key: &str,
         port_state: &PortLbState,
+        subset_name: &str,
         subset_indices: &[usize],
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
@@ -3106,10 +3115,10 @@ impl LoadBalancer {
         self.select_from_candidates_vec_using(
             ctx_key,
             &candidates,
-            port_state.algorithm,
-            &port_state.rr_counter,
-            &port_state.wrr_state,
-            &port_state.hash_ring,
+            self.port_subset_algorithm(port_state, subset_name),
+            self.port_subset_rr_counter(port_state),
+            self.port_subset_wrr_state(port_state, subset_name),
+            self.port_subset_hash_ring(port_state, subset_name),
             port_locality,
         )
         .map(|target| TargetSelection {
@@ -3186,7 +3195,15 @@ impl LoadBalancer {
         if let Some(port) = port
             && let Some(state) = self.port_overrides.get(&port)
         {
-            return state.hash_on_strategy.clone();
+            if state.algorithm_overridden || subset_name.is_none() {
+                return state.hash_on_strategy.clone();
+            }
+            if let Some(subset_name) = subset_name
+                && self.subset_algorithm(subset_name) == LoadBalancerAlgorithm::ConsistentHashing
+                && let Some(strategy) = &state.hash_on_override_strategy
+            {
+                return strategy.clone();
+            }
         }
         if let Some(subset_name) = subset_name {
             return self.hash_on_strategy_for_subset(subset_name);
@@ -3195,10 +3212,12 @@ impl LoadBalancer {
     }
 
     /// Resolve the effective algorithm a selection for `(port_override, subset)`
-    /// would use, with the SAME precedence as the `select*` family: a per-port
-    /// override (when present) wins over a subset override, which wins over the
-    /// upstream-level algorithm. Used by `select_upstream_target` to decide
-    /// whether to attempt PASSTHROUGH orig-dst matching before dispatching.
+    /// would use, with the SAME precedence as the `select*` family: an explicit
+    /// per-port algorithm wins over a subset override, which wins over the
+    /// upstream-level algorithm. Port overrides that only carry non-algorithm
+    /// policy (for example locality) keep the subset algorithm while scoping the
+    /// candidate/locality lane to the port. Used by `select_upstream_target` to
+    /// decide whether to attempt PASSTHROUGH orig-dst matching before dispatching.
     #[inline]
     pub fn effective_algorithm(
         &self,
@@ -3207,12 +3226,61 @@ impl LoadBalancer {
     ) -> LoadBalancerAlgorithm {
         if let Some(p) = port
             && let Some(port_state) = self.port_overrides.get(&p)
+            && (port_state.algorithm_overridden || subset_name.is_none())
         {
             return port_state.algorithm;
         }
         match subset_name {
             Some(name) => self.subset_algorithm(name),
             None => self.algorithm,
+        }
+    }
+
+    #[inline]
+    fn port_subset_algorithm(
+        &self,
+        port_state: &PortLbState,
+        subset_name: &str,
+    ) -> LoadBalancerAlgorithm {
+        if port_state.algorithm_overridden {
+            port_state.algorithm
+        } else {
+            self.subset_algorithm(subset_name)
+        }
+    }
+
+    #[inline]
+    fn port_subset_rr_counter<'a>(&'a self, port_state: &'a PortLbState) -> &'a AtomicU64 {
+        if port_state.algorithm_overridden {
+            &port_state.rr_counter
+        } else {
+            &self.rr_counter
+        }
+    }
+
+    #[inline]
+    fn port_subset_wrr_state<'a>(
+        &'a self,
+        port_state: &'a PortLbState,
+        subset_name: &str,
+    ) -> &'a std::sync::Mutex<Vec<i64>> {
+        if port_state.algorithm_overridden {
+            &port_state.wrr_state
+        } else {
+            self.subset_wrr_state(subset_name)
+        }
+    }
+
+    #[inline]
+    fn port_subset_hash_ring<'a>(
+        &'a self,
+        port_state: &'a PortLbState,
+        subset_name: &str,
+    ) -> &'a [(u64, usize)] {
+        if port_state.algorithm_overridden {
+            &port_state.hash_ring
+        } else {
+            self.subset_hash_ring(subset_name)
         }
     }
 
@@ -3796,6 +3864,7 @@ impl LoadBalancer {
             return self.select_excluding_port_subset_vec_fallback(
                 ctx_key,
                 port_state,
+                subset_name,
                 subset_target_indices,
                 exclude_idx,
                 health,
@@ -3830,10 +3899,10 @@ impl LoadBalancer {
         self.select_with_bitset_using(
             ctx_key,
             &port_subset_healthy,
-            port_state.algorithm,
-            &port_state.rr_counter,
-            &port_state.wrr_state,
-            &port_state.hash_ring,
+            self.port_subset_algorithm(port_state, subset_name),
+            self.port_subset_rr_counter(port_state),
+            self.port_subset_wrr_state(port_state, subset_name),
+            self.port_subset_hash_ring(port_state, subset_name),
             port_locality,
         )
     }
@@ -3933,6 +4002,7 @@ impl LoadBalancer {
         &self,
         ctx_key: &str,
         port_state: &PortLbState,
+        subset_name: &str,
         subset_indices: &[usize],
         exclude_idx: Option<usize>,
         health: Option<&HealthContext<'_>>,
@@ -3965,10 +4035,10 @@ impl LoadBalancer {
         self.select_from_candidates_vec_using(
             ctx_key,
             &candidates,
-            port_state.algorithm,
-            &port_state.rr_counter,
-            &port_state.wrr_state,
-            &port_state.hash_ring,
+            self.port_subset_algorithm(port_state, subset_name),
+            self.port_subset_rr_counter(port_state),
+            self.port_subset_wrr_state(port_state, subset_name),
+            self.port_subset_hash_ring(port_state, subset_name),
             port_locality,
         )
     }
