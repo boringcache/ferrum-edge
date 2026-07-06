@@ -422,6 +422,59 @@ fn test_merge_targets_empty_static() {
     assert_eq!(merged[0].host, "discovered-1");
 }
 
+#[test]
+fn filter_discovered_targets_keeps_valid_cross_cluster_hbone_synthetic_host() {
+    let mut target = make_target("mesh-xc-hbone|west-gw.example.com|15443|10.9.0.1", 8080);
+    target.service_port_policy_key = Some(8080);
+    target.tags = HashMap::from([
+        (
+            ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG.to_string(),
+            "true".to_string(),
+        ),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG.to_string(),
+            "true".to_string(),
+        ),
+        (
+            ferrum_edge::proxy::hbone_pool::HBONE_DIAL_HOST_TAG.to_string(),
+            "west-gw.example.com".to_string(),
+        ),
+        (
+            ferrum_edge::proxy::hbone_pool::HBONE_AUTHORITY_HOST_TAG.to_string(),
+            "10.9.0.1".to_string(),
+        ),
+        (
+            ferrum_edge::proxy::hbone_pool::HBONE_PORT_TAG.to_string(),
+            "15443".to_string(),
+        ),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG.to_string(),
+            "api.ferrum.svc.cluster.local".to_string(),
+        ),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG.to_string(),
+            "west.local".to_string(),
+        ),
+    ]);
+
+    let filtered = ferrum_edge::service_discovery::filter_discovered_targets(
+        "up-mesh",
+        "mesh",
+        vec![target],
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    );
+
+    assert_eq!(
+        filtered.len(),
+        1,
+        "synthetic cross-cluster HBONE targets must survive production SD filtering"
+    );
+    assert_eq!(
+        filtered[0].host,
+        "mesh-xc-hbone|west-gw.example.com|15443|10.9.0.1"
+    );
+}
+
 // ── targets_equal ─────────────────────────────────────────────────────
 
 #[test]
@@ -2280,12 +2333,11 @@ async fn mesh_sd_sidecar_remote_workloads_on_non_first_port_skip_fail_closed() {
 }
 
 #[tokio::test]
-async fn mesh_sd_ambient_topology_keeps_remote_workloads_marked_remote() {
-    // Pre-existing Ambient SD behavior (the Experimental cross-cluster
-    // endpoint-discovery surface): remote workloads stay discoverable, marked
-    // with the `mesh.remote` provenance tag so strict local-first LB can key
-    // on it. Pinned here so the sidecar fail-closed skip cannot leak into the
-    // Ambient path.
+async fn mesh_sd_ambient_topology_keeps_direct_remote_fallback_without_gateway() {
+    // Flat-network compatibility for Ambient SD: when no east-west gateway is
+    // declared, remote workloads stay discoverable as direct pod-IP HBONE
+    // targets, marked with `mesh.remote` so strict local-first LB can key on
+    // provenance.
     let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
     let remote_id = "spiffe://cluster.local/ns/ferrum/sa/api-remote";
     let mut remote = mesh_workload(remote_id, "api", "10.9.0.1", 8080);
@@ -2314,4 +2366,401 @@ async fn mesh_sd_ambient_topology_keeps_remote_workloads_marked_remote() {
         targets[1].tags.get("mesh.remote").map(String::as_str),
         Some("true")
     );
+}
+
+#[tokio::test]
+async fn mesh_sd_ambient_keeps_direct_remote_fallback_when_catch_all_gateway_cannot_route() {
+    // A network catch-all gateway only suppresses direct remote fallback when it
+    // is an actual candidate for this service/trust-domain. A catch-all that
+    // claims a different SNI would be rejected by the shared selector, so
+    // retaining direct fallback preserves the flat-network compatibility valve.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let remote_id = "spiffe://west.local/ns/ferrum/sa/api";
+    let mut svc = mesh_service("api", api_id, 8080);
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(remote_id),
+    });
+    let mut multi_cluster = mesh_west_multi_cluster();
+    multi_cluster.east_west_gateways[0].network = None;
+    multi_cluster.east_west_gateways[0].sni_hosts =
+        vec!["other.ferrum.svc.cluster.local".to_string()];
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![
+            mesh_workload(api_id, "api", "10.0.0.1", 8080),
+            mesh_remote_west_workload(remote_id, 8080),
+        ],
+        multi_cluster: Some(multi_cluster),
+        ..MeshConfig::default()
+    };
+
+    let mut targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+        .discover()
+        .await
+        .expect("discover succeeds");
+    targets.sort_by(|a, b| a.host.cmp(&b.host));
+
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert!(!targets[0].tags.contains_key("mesh.remote"));
+    assert_eq!(targets[1].host, "10.9.0.1");
+    assert_eq!(
+        targets[1].tags.get("mesh.remote").map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        !targets[1].tags.contains_key("mesh.cross_cluster"),
+        "non-candidate catch-all must not force the gateway-routed shape"
+    );
+}
+
+#[tokio::test]
+async fn mesh_sd_ambient_keeps_unknown_network_direct_fallback_when_catch_all_cannot_route() {
+    // `network: None` east-west gateways are catch-alls, not exact declarations
+    // for workloads missing a network label. If the catch-all is not a candidate
+    // for this service/trust-domain, it must not suppress the flat-network
+    // direct fallback for an unknown-network remote workload.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let remote_id = "spiffe://west.local/ns/ferrum/sa/api";
+    let mut svc = mesh_service("api", api_id, 8080);
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(remote_id),
+    });
+    let mut remote = mesh_remote_west_workload(remote_id, 8080);
+    remote.network = None;
+    let mut multi_cluster = mesh_west_multi_cluster();
+    multi_cluster.east_west_gateways[0].network = None;
+    multi_cluster.east_west_gateways[0].sni_hosts =
+        vec!["other.ferrum.svc.cluster.local".to_string()];
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![mesh_workload(api_id, "api", "10.0.0.1", 8080), remote],
+        multi_cluster: Some(multi_cluster),
+        ..MeshConfig::default()
+    };
+
+    let mut targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+        .discover()
+        .await
+        .expect("discover succeeds");
+    targets.sort_by(|a, b| a.host.cmp(&b.host));
+
+    assert_eq!(
+        targets.len(),
+        2,
+        "non-candidate catch-all gateway must not suppress unknown-network direct fallback"
+    );
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert!(!targets[0].tags.contains_key("mesh.remote"));
+    assert_eq!(targets[1].host, "10.9.0.1");
+    assert_eq!(
+        targets[1].tags.get("mesh.remote").map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        !targets[1].tags.contains_key("mesh.cross_cluster"),
+        "unknown-network direct fallback must not be rewritten into a non-candidate gateway target"
+    );
+}
+
+#[tokio::test]
+async fn mesh_sd_ambient_exact_network_gateway_without_candidate_skips_remote_fail_closed() {
+    // An exact-network gateway declaration is authoritative for that remote
+    // network. If it cannot route this service/trust-domain, Ambient SD must
+    // fail closed rather than re-enable the direct pod-IP compatibility path.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let remote_id = "spiffe://west.local/ns/ferrum/sa/api";
+    let mut svc = mesh_service("api", api_id, 8080);
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(remote_id),
+    });
+    let mut multi_cluster = mesh_west_multi_cluster();
+    multi_cluster.east_west_gateways[0].sni_hosts =
+        vec!["other.ferrum.svc.cluster.local".to_string()];
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![
+            mesh_workload(api_id, "api", "10.0.0.1", 8080),
+            mesh_remote_west_workload(remote_id, 8080),
+        ],
+        multi_cluster: Some(multi_cluster),
+        ..MeshConfig::default()
+    };
+
+    let targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+        .discover()
+        .await
+        .expect("discover succeeds");
+
+    assert_eq!(
+        targets.len(),
+        1,
+        "exact-network non-candidate gateway must suppress direct remote fallback"
+    );
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert!(!targets[0].tags.contains_key("mesh.remote"));
+    assert!(
+        !targets.iter().any(|target| target.host == "10.9.0.1"),
+        "remote pod IP must not be emitted when its network has a declared gateway"
+    );
+}
+
+#[tokio::test]
+async fn mesh_sd_ambient_topology_bridges_remote_workloads_via_east_west_gateway() {
+    // When an east-west gateway is declared for the remote workload's network,
+    // Ambient SD must use the mesh-mode Ambient shape: one per-pod synthetic
+    // target whose dial override is the gateway, while the real pod address is
+    // preserved as the inner HBONE CONNECT authority. It must not also emit the
+    // old direct remote-pod target.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let remote_id = "spiffe://west.local/ns/ferrum/sa/api";
+    let mut svc = mesh_service("api", api_id, 8080);
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(remote_id),
+    });
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![
+            mesh_workload(api_id, "api", "10.0.0.1", 8080),
+            mesh_remote_west_workload(remote_id, 8080),
+        ],
+        multi_cluster: Some(mesh_west_multi_cluster()),
+        ..MeshConfig::default()
+    };
+
+    let targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+        .discover()
+        .await
+        .expect("discover succeeds");
+
+    assert_eq!(
+        targets.len(),
+        2,
+        "one local target plus one gateway-routed Ambient target"
+    );
+
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert_eq!(targets[0].port, 8080);
+    assert_eq!(
+        targets[0].tags.get("mesh.spiffe_id").map(String::as_str),
+        Some(api_id)
+    );
+    assert!(!targets[0].tags.contains_key("mesh.cross_cluster"));
+    assert!(!targets[0].tags.contains_key("mesh.remote"));
+
+    let gateway = &targets[1];
+    assert_ne!(
+        gateway.host, "10.9.0.1",
+        "remote pod IP must not be emitted as the dial identity when a gateway exists"
+    );
+    assert!(
+        gateway.host.contains("west-gw.example.com") && gateway.host.contains("10.9.0.1"),
+        "Ambient gateway target identity scopes the real pod by gateway endpoint, got {:?}",
+        gateway.host
+    );
+    assert_eq!(gateway.port, 8080, "target port remains the app port");
+    assert_eq!(gateway.service_port_policy_key, Some(8080));
+    assert_eq!(
+        gateway.locality.as_deref(),
+        Some("west-region/west-zone"),
+        "remote-tier locality is preserved"
+    );
+
+    let tags = &gateway.tags;
+    assert_eq!(tags.get("mesh.hbone").map(String::as_str), Some("true"));
+    assert_eq!(
+        tags.get("mesh.hbone_dial_host").map(String::as_str),
+        Some("west-gw.example.com"),
+        "dispatch dials the east-west gateway"
+    );
+    assert_eq!(
+        tags.get("mesh.hbone_port").map(String::as_str),
+        Some("15443"),
+        "dial port is the east-west gateway port"
+    );
+    assert_eq!(
+        tags.get("mesh.hbone_authority_host").map(String::as_str),
+        Some("10.9.0.1"),
+        "inner CONNECT authority keeps the real pod address"
+    );
+    assert_eq!(
+        tags.get("mesh.eastwest_sni").map(String::as_str),
+        Some("api.ferrum.svc.cluster.local")
+    );
+    assert_eq!(
+        tags.get("mesh.cross_cluster").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(tags.get("mesh.remote").map(String::as_str), Some("true"));
+    assert_eq!(
+        tags.get("mesh.trust_domain").map(String::as_str),
+        Some("west.local")
+    );
+    assert!(
+        !tags.contains_key("mesh.spiffe_id"),
+        "gateway-routed Ambient targets verify by remote trust domain, not a pinned pod SVID"
+    );
+}
+
+#[tokio::test]
+async fn mesh_sd_ambient_mixed_networks_bridge_gatewayed_and_keep_gatewayless_direct() {
+    // The exact mixed-network scenario from issue #2011, in ONE snapshot: a
+    // gateway is declared for network A (west) while network B (east) has no
+    // gateway and no catch-all applies. The west workload must bridge through
+    // its east-west gateway (synthetic identity + dial override) while the
+    // east workload keeps the direct pod-IP flat-network fallback — gateway
+    // authority is judged PER WORKLOAD NETWORK, never snapshot-wide.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let west_id = "spiffe://west.local/ns/ferrum/sa/api";
+    let east_id = "spiffe://east.local/ns/ferrum/sa/api";
+    let mut svc = mesh_service("api", api_id, 8080);
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(west_id),
+    });
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(east_id),
+    });
+    let mut east_remote = mesh_workload(east_id, "api", "10.8.0.1", 8080);
+    east_remote.remote_provenance = true;
+    east_remote.network = Some("east-network".to_string());
+    east_remote.trust_domain = TrustDomain::new("east.local").expect("trust domain");
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![
+            mesh_workload(api_id, "api", "10.0.0.1", 8080),
+            mesh_remote_west_workload(west_id, 8080),
+            east_remote,
+        ],
+        // Gateway declared for west-network ONLY: no east-network entry and no
+        // catch-all, so east keeps the flat-network compatibility valve.
+        multi_cluster: Some(mesh_west_multi_cluster()),
+        ..MeshConfig::default()
+    };
+
+    let mut targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+        .discover()
+        .await
+        .expect("discover succeeds");
+    targets.sort_by(|a, b| a.host.cmp(&b.host));
+
+    assert_eq!(
+        targets.len(),
+        3,
+        "one local target, one direct east fallback, one west gateway bridge"
+    );
+
+    // Local workload is unchanged.
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert!(!targets[0].tags.contains_key("mesh.remote"));
+    assert!(!targets[0].tags.contains_key("mesh.cross_cluster"));
+
+    // Gatewayless east-network workload keeps the direct pod-IP HBONE target.
+    let east = &targets[1];
+    assert_eq!(east.host, "10.8.0.1");
+    assert_eq!(
+        east.tags.get("mesh.remote").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        east.tags.get("mesh.hbone").map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        !east.tags.contains_key("mesh.cross_cluster"),
+        "no gateway is declared for east-network: the direct fallback must not \
+         be forced into the gateway-routed shape"
+    );
+    assert!(
+        !east.tags.contains_key("mesh.hbone_dial_host"),
+        "the direct fallback dials the pod address itself, never a gateway"
+    );
+
+    // West-network workload bridges through its declared east-west gateway.
+    let west = &targets[2];
+    assert!(
+        west.host.contains("west-gw.example.com") && west.host.contains("10.9.0.1"),
+        "west target must carry the gateway-scoped synthetic identity, got {:?}",
+        west.host
+    );
+    assert_eq!(
+        west.tags.get("mesh.hbone_dial_host").map(String::as_str),
+        Some("west-gw.example.com")
+    );
+    assert_eq!(
+        west.tags
+            .get("mesh.hbone_authority_host")
+            .map(String::as_str),
+        Some("10.9.0.1")
+    );
+    assert_eq!(
+        west.tags.get("mesh.cross_cluster").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        west.tags.get("mesh.remote").map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        !targets.iter().any(|target| target.host == "10.9.0.1"),
+        "the gateway-declared west workload must not also emit a direct pod-IP target"
+    );
+}
+
+#[tokio::test]
+async fn mesh_sd_ambient_gateway_declared_non_first_port_skips_remote_fail_closed() {
+    // A gateway-declared Ambient remote workload must not fall back to a direct
+    // remote pod dial when the selected port is not bridgeable. The east-west
+    // gateway routes the service FQDN SNI to the first declared service port
+    // only, so non-first remote targets are skipped fail-closed.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let remote_id = "spiffe://west.local/ns/ferrum/sa/api";
+    let mut svc = mesh_service_with_ports(
+        api_id,
+        vec![
+            http_service_port(80, "http"),
+            http_service_port(81, "admin"),
+        ],
+    );
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(remote_id),
+    });
+    let mut remote = mesh_remote_west_workload(remote_id, 80);
+    remote.ports = vec![
+        WorkloadPort {
+            port: 80,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        },
+        WorkloadPort {
+            port: 81,
+            protocol: AppProtocol::Http,
+            name: Some("admin".to_string()),
+        },
+    ];
+    let mut multi_cluster = mesh_west_multi_cluster();
+    multi_cluster.east_west_gateways[0].sni_hosts.clear(); // wildcard gateway
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![
+            mesh_workload_with_ports(api_id, "10.0.0.1", vec![80, 81]),
+            remote,
+        ],
+        multi_cluster: Some(multi_cluster),
+        ..MeshConfig::default()
+    };
+
+    let targets = mesh_sd_discoverer(mesh, Some(81), MeshSdTopology::Ambient)
+        .discover()
+        .await
+        .expect("discover succeeds");
+
+    assert_eq!(
+        targets.len(),
+        1,
+        "gateway-declared non-first remote target must not fall back to direct pod dial"
+    );
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert_eq!(targets[0].port, 81);
+    assert!(!targets[0].tags.contains_key("mesh.cross_cluster"));
+    assert!(!targets[0].tags.contains_key("mesh.remote"));
 }

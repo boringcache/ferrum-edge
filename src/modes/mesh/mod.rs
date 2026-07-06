@@ -5141,7 +5141,10 @@ fn cross_cluster_hbone_synthetic_host(
     gateway_port: u16,
     pod_addr: &str,
 ) -> String {
-    format!("mesh-xc-hbone|{gateway_host}|{gateway_port}|{pod_addr}")
+    format!(
+        "{}{gateway_host}|{gateway_port}|{pod_addr}",
+        crate::proxy::hbone_pool::HBONE_CROSS_CLUSTER_SYNTHETIC_HOST_PREFIX
+    )
 }
 
 /// Append AMBIENT (HBONE) cross-cluster east-west targets for `service` on
@@ -5233,6 +5236,36 @@ fn append_cross_cluster_ambient_hbone_targets(
         return;
     };
 
+    let all_remote_workloads =
+        matched_remote_service_workloads(service, workloads, Some(multi_cluster));
+    append_cross_cluster_ambient_hbone_targets_prematched(
+        targets,
+        &runtime.cluster_domain,
+        service,
+        service_port,
+        protocol,
+        &all_remote_workloads,
+        multi_cluster,
+    );
+}
+
+/// The pre-matched entry point of the Ambient/HBONE cross-cluster shared core
+/// (see [`append_cross_cluster_ambient_hbone_targets`], which documents the
+/// emitted target shape). `remote_workloads` must already be matched to
+/// `service` under the caller's matching semantics and classified remote
+/// against the same `multi_cluster`. The mesh-mode materializer calls the
+/// ref-based wrapper above; the gateway mesh-SD bridge calls this directly so
+/// it can preserve its service-name fallback matching while sharing the same
+/// reachability, gateway-selection, and collision rules.
+pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
+    targets: &mut Vec<UpstreamTarget>,
+    cluster_domain: &str,
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
+    protocol: AppProtocol,
+    remote_workloads: &[&crate::modes::mesh::config::Workload],
+    multi_cluster: &crate::modes::mesh::config::MultiClusterConfig,
+) {
     // FIRST-PORT ONLY: identical rationale to the Sidecar path — the east-west
     // gateway routes a service-FQDN SNI to only the service's FIRST declared port
     // (single-port-per-SNI; SNI carries no port). A later port would misroute
@@ -5242,9 +5275,7 @@ fn append_cross_cluster_ambient_hbone_targets(
         return;
     }
 
-    let all_remote_workloads =
-        matched_remote_service_workloads(service, workloads, Some(multi_cluster));
-    if all_remote_workloads.is_empty() {
+    if remote_workloads.is_empty() {
         return;
     }
 
@@ -5252,8 +5283,9 @@ fn append_cross_cluster_ambient_hbone_targets(
     // cluster's east-west materializer could itself back (≥1 address + resolvable
     // first-service-port targetPort), mirroring `build_east_west_service_targets`
     // — a workload the destination would drop must not produce a dead path here.
-    let remote_workloads: Vec<_> = all_remote_workloads
-        .into_iter()
+    let remote_workloads: Vec<_> = remote_workloads
+        .iter()
+        .copied()
         .filter(|workload| east_west_workload_is_reachable(service, workload))
         .collect();
     if remote_workloads.is_empty() {
@@ -5268,7 +5300,7 @@ fn append_cross_cluster_ambient_hbone_targets(
 
     // The SNI the remote east-west gateway passthrough routes on — the
     // destination service FQDN (matches `build_east_west_service_targets`).
-    let cluster_domain = runtime.cluster_domain.trim_matches('.');
+    let cluster_domain = cluster_domain.trim_matches('.');
     let service_fqdn = format!(
         "{}.{}.svc.{cluster_domain}",
         service.name, service.namespace
@@ -5577,6 +5609,49 @@ fn select_east_west_gateway_for_network<'a>(
         .east_west_gateways
         .iter()
         .find(|gateway| gateway.network.is_none() && is_candidate(gateway))
+}
+
+/// Whether an east-west gateway declaration makes cross-cluster routing
+/// AUTHORITATIVE for `network` — i.e. the gateway-routed shape must be
+/// attempted and mismatches must fail closed rather than bypass the gateway
+/// with a direct pod dial. True when EITHER holds:
+///
+/// 1. For a NAMED network, ANY gateway declared with `gateway.network == network`
+///    (exact) is authoritative even when it is NOT a candidate
+///    (SNI/trust-domain miss): the operator declared how this network is
+///    reached, so a non-routable destination fails closed instead of
+///    re-enabling a direct dial. `network == None` is not a named exact network;
+///    `network: None` gateways are catch-alls and are authoritative only when
+///    the selector accepts them as candidates; or
+/// 2. [`select_east_west_gateway_for_network`] selects a gateway — which, when
+///    the network has no exact declaration, is an APPLICABLE catch-all
+///    (`network: None` AND an SNI/trust-domain candidate). A NON-candidate
+///    catch-all is NOT authoritative: it could never route this destination,
+///    so it does not suppress the flat-network direct fallback.
+///
+/// The gateway mesh-SD bridge uses the NEGATION of this as the Ambient
+/// direct-pod flat-network fallback valve (issue #2011,
+/// `service_discovery::mesh`); keeping the predicate next to the selector
+/// guarantees the fallback rule and the selection precedence can never drift.
+pub(crate) fn east_west_gateway_governs_network(
+    multi_cluster: &crate::modes::mesh::config::MultiClusterConfig,
+    network: Option<&str>,
+    service_fqdn: &str,
+    expected_trust_domain: &crate::identity::spiffe::TrustDomain,
+) -> bool {
+    let selected_gateway = select_east_west_gateway_for_network(
+        multi_cluster,
+        network,
+        service_fqdn,
+        expected_trust_domain,
+    );
+    let exact_named_network_declared = network.is_some()
+        && multi_cluster
+            .east_west_gateways
+            .iter()
+            .any(|gateway| gateway.network.as_deref() == network);
+
+    selected_gateway.is_some() || exact_named_network_declared
 }
 
 /// An HTTP-family `/` proxy on the outbound capture listener whose `HttpPool`

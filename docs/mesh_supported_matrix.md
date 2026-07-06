@@ -168,7 +168,7 @@ ledger unless they change the support contract.
 |---|---|---|
 | Ambient gRPC over HBONE (inner tunnel protocol is HTTP/1.1 — no trailer path; fail-closed today) | [#2009](https://github.com/ferrum-edge/ferrum-edge/issues/2009) | `docs/mesh.md` protocol matrix gRPC row + note [5] |
 | Cross-cluster protocol parity: gRPC, WebSocket, multi-port (single-port-per-SNI), raw TCP/UDP (all fail-closed / not materialized today) | [#2010](https://github.com/ferrum-edge/ferrum-edge/issues/2010) | `docs/mesh.md` cross-cluster egress sections + matrix notes [2][3][5][7] |
-| Ambient SD east-west parity (gateway-routed remote targets on the SD bridge without regressing flat-network direct dials) | [#2011](https://github.com/ferrum-edge/ferrum-edge/issues/2011) | `docs/mesh.md` protocol matrix note [4] |
+| Port-level `connectionPool` merge semantics vs Istio complete-replacement (uniform follow-up across all applied knobs) | [#2012](https://github.com/ferrum-edge/ferrum-edge/issues/2012) | `docs/mesh.md` "Port-level `connectionPool` merge semantics" |
 | Ambient UDP capture producer (matrix rows are "transport half only") + the live UDP/raw-TCP source-capture e2e (`netns-capture-live`) | [#2013](https://github.com/ferrum-edge/ferrum-edge/issues/2013) | `docs/mesh.md` matrix UDP/DTLS rows + note [10], UDP TPROXY capture section |
 
 ## How a feature graduates
