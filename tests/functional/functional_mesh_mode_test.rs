@@ -7767,7 +7767,8 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         // ground truth here, so we detect that precise status-2 guard-inspect
         // signature in gateway A's captured output and XFAIL until the source
         // fix (#2084) lands. Any other install timeout remains a hard failure.
-        if gateway_a_output.contains(UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL)
+        if status == "still running"
+            && gateway_a_output.contains(UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL)
             && gateway_a_output.contains("guard (status 2)")
         {
             eprintln!(
