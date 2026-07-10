@@ -1053,7 +1053,7 @@ pub(crate) fn retry_response_decision_context(ctx: &RequestContext) -> RequestCo
     retry_ctx
 }
 
-fn plugins_may_release_response_body_under_retries(
+pub(crate) fn plugins_may_release_response_body_under_retries(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
 ) -> bool {

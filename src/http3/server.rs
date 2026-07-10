@@ -810,6 +810,18 @@ async fn handle_h3_connection(
     Ok(())
 }
 
+fn should_use_native_h3_plain_dispatch(
+    http_flavor: HttpFlavor,
+    forces_reqwest_dispatch: bool,
+    backend_supports_native_h3: bool,
+    retry_response_needs_header_refinement: bool,
+) -> bool {
+    http_flavor == HttpFlavor::Plain
+        && !forces_reqwest_dispatch
+        && backend_supports_native_h3
+        && !retry_response_needs_header_refinement
+}
+
 /// Handle a single HTTP/3 request stream.
 #[allow(clippy::too_many_arguments)]
 async fn handle_h3_request(
@@ -2036,8 +2048,19 @@ async fn handle_h3_request(
     let forces_reqwest_dispatch = plugins.iter().any(|p| p.forces_reqwest_dispatch(&ctx));
     let backend_supports_native_h3 =
         crate::proxy::supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
-    let use_native_h3_pool =
-        http_flavor == HttpFlavor::Plain && !forces_reqwest_dispatch && backend_supports_native_h3;
+    // The buffered native-H3 retry loop drains each response before plugin
+    // content-type refinement. Keep the narrow set of retry requests whose
+    // active plugins may release an inherently streaming response on the
+    // cross-protocol header-first path, where the shared retry-marked decision
+    // context can release MCP SSE without waiting for EOF.
+    let retry_response_needs_header_refinement =
+        has_retry && crate::proxy::plugins_may_release_response_body_under_retries(&plugins, &ctx);
+    let use_native_h3_pool = should_use_native_h3_plain_dispatch(
+        http_flavor,
+        forces_reqwest_dispatch,
+        backend_supports_native_h3,
+        retry_response_needs_header_refinement,
+    );
     let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
     let mut backend_admission_start: std::time::Instant;
@@ -8210,6 +8233,31 @@ fn record_request(state: &ProxyState, status: u16) {
             .fetch_add(1, Ordering::Relaxed);
     }
     crate::runtime_metrics::global_ref().record_http_status(status);
+}
+
+#[cfg(test)]
+mod native_h3_response_dispatch_tests {
+    use super::{HttpFlavor, should_use_native_h3_plain_dispatch};
+
+    #[test]
+    fn retry_header_refinement_uses_cross_protocol_dispatch() {
+        assert!(!should_use_native_h3_plain_dispatch(
+            HttpFlavor::Plain,
+            false,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn ordinary_h3_capable_plain_requests_keep_native_dispatch() {
+        assert!(should_use_native_h3_plain_dispatch(
+            HttpFlavor::Plain,
+            false,
+            true,
+            false,
+        ));
+    }
 }
 
 #[cfg(test)]
