@@ -1192,6 +1192,18 @@ async fn run_udp_egress_session(
                 return;
             }
         };
+        if cross_cluster
+            && !target
+                .tags
+                .contains_key(crate::proxy::hbone_pool::HBONE_AUTHORITY_HOST_TAG)
+        {
+            warn!(
+                service = %entry.service_fqdn,
+                target_host = %target.host,
+                "Cross-cluster UDP HBONE target is missing its real-pod CONNECT authority; refusing dial"
+            );
+            return;
+        }
         let (expected_peer, expected_trust_domain, sni_override) = if cross_cluster {
             let Some(sni) = crate::proxy::hbone_pool::target_hbone_eastwest_sni(&target) else {
                 warn!(service = %entry.service_fqdn, "Cross-cluster UDP HBONE target is missing its SNI override; refusing dial");

@@ -209,6 +209,18 @@ pub(crate) async fn handle_mesh_tcp_egress(
                 return;
             }
         };
+        if cross_cluster
+            && !target
+                .tags
+                .contains_key(hbone_pool::HBONE_AUTHORITY_HOST_TAG)
+        {
+            warn!(
+                service = %entry.service_fqdn,
+                target_host = %target.host,
+                "Cross-cluster raw-TCP HBONE target is missing its real-pod CONNECT authority; refusing dial"
+            );
+            return;
+        }
         let (expected_peer, expected_trust_domain, sni_override) = if cross_cluster {
             let Some(sni) = hbone_pool::target_hbone_eastwest_sni(&target) else {
                 warn!(service = %entry.service_fqdn, "Cross-cluster raw-TCP HBONE target is missing its SNI override; refusing dial");

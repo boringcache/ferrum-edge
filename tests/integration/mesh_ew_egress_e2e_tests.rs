@@ -311,6 +311,60 @@ fn east_west_gateway_materializes_raw_tcp_and_udp_per_port_sni_relays() {
     }
 }
 
+#[test]
+fn east_west_l4_port_sharing_http_number_keeps_explicit_alias() {
+    let workload = workload_for("mixed", DEFAULT_NAMESPACE, [("app", "mixed")], ["10.0.0.9"]);
+    let mut service = service_for("mixed", DEFAULT_NAMESPACE, &[&workload]);
+    service.ports = vec![
+        ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        },
+        ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Tcp,
+            name: Some("tcp".to_string()),
+            target_port: None,
+        },
+    ];
+    let prepared = prepare_gateway_config_for_mesh(
+        gateway_config_with_mesh(
+            Vec::new(),
+            Vec::new(),
+            mesh_config_with(vec![workload], vec![service], Vec::new()),
+        ),
+        &east_west_runtime(),
+    )
+    .expect("prepared");
+
+    assert!(prepared.proxies.iter().any(|proxy| {
+        proxy
+            .hosts
+            .iter()
+            .any(|host| host == "mixed.default.svc.cluster.local")
+    }));
+    assert!(prepared.proxies.iter().any(|proxy| {
+        proxy
+            .hosts
+            .iter()
+            .any(|host| host == "p8080.mixed.default.svc.cluster.local")
+    }));
+    assert!(
+        prepared
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.id == "__mesh-ew-upstream-default-mixed")
+    );
+    assert!(
+        prepared
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.id == "__mesh-ew-upstream-default-mixed.p8080")
+    );
+}
+
 /// codex #2040 Finding B (id collision): a MULTI-port service `foo` (ports 8080,
 /// 9090) and a DISTINCT single-port service literally named `foo-p8080` must NOT
 /// clobber each other in the materializer's id-keyed upsert map. The per-port id

@@ -345,10 +345,8 @@ fn sidecar_client_runtime() -> ferrum_edge::modes::mesh::MeshRuntimeConfig {
 fn sidecar_cross_cluster_target_for_tcp_service_port_uses_per_port_sni() {
     let runtime = sidecar_client_runtime();
 
-    // A TCP service port (7070). Local + remote workloads both expose it; the
-    // remote workload sits on net-b with a matching gateway, so WITHOUT the
-    // HTTP-family gate a cross-cluster target would be appended — proving the
-    // gate (not just an absence of remote endpoints).
+    // The TCP port deliberately shares :7070 with the service's sole HTTP port.
+    // HTTP keeps the base FQDN; L4 must still use p7070 and a distinct id.
     let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
     local.ports = vec![WorkloadPort {
         port: 7070,
@@ -368,12 +366,20 @@ fn sidecar_cross_cluster_target_for_tcp_service_port_uses_per_port_sni() {
         cluster_ips: vec!["10.96.0.50".to_string()],
         name: "svc-b".to_string(),
         namespace: "default".to_string(),
-        ports: vec![ServicePort {
-            port: 7070,
-            protocol: AppProtocol::Tcp,
-            name: Some("tcp".to_string()),
-            target_port: None,
-        }],
+        ports: vec![
+            ServicePort {
+                port: 7070,
+                protocol: AppProtocol::Http,
+                name: Some("http-same-number".to_string()),
+                target_port: None,
+            },
+            ServicePort {
+                port: 7070,
+                protocol: AppProtocol::Tcp,
+                name: Some("tcp".to_string()),
+                target_port: None,
+            },
+        ],
         workloads: vec![
             WorkloadRef {
                 spiffe_id: local.spiffe_id.clone(),

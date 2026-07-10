@@ -1943,7 +1943,14 @@ fn build_east_west_service_proxies_and_upstreams(
             // multi-port service); every port of a multi-port service carries its
             // own `.p<port>` id so the per-port proxies never collide (codex #2040
             // Finding B).
-            let id_port = if base_port == Some(service_port.port) {
+            let effective_protocol = service
+                .protocol_overrides
+                .get(&service_port.port)
+                .copied()
+                .unwrap_or(service_port.protocol);
+            let id_port = if is_http_family_mesh_protocol(effective_protocol)
+                && base_port == Some(service_port.port)
+            {
                 None
             } else {
                 Some(service_port.port)
@@ -2226,7 +2233,14 @@ pub(crate) fn cross_cluster_service_sni(
     let base = cross_cluster_service_base_fqdn(service, cluster_domain);
     // Bare base FQDN ONLY for a single-HTTP-port service (its sole port). Every
     // port of a multi-port service — lowest included — gets an explicit alias.
-    if cross_cluster_service_base_port(service) == Some(service_port.port) {
+    let effective_protocol = service
+        .protocol_overrides
+        .get(&service_port.port)
+        .copied()
+        .unwrap_or(service_port.protocol);
+    if is_http_family_mesh_protocol(effective_protocol)
+        && cross_cluster_service_base_port(service) == Some(service_port.port)
+    {
         base
     } else {
         format!("p{}.{base}", service_port.port)
