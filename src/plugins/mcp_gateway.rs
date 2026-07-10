@@ -36,14 +36,20 @@ const METADATA_RESPONSE_REWRITE_KEY: &str = "mcp.needs_response_rewrite";
 const METADATA_RESPONSE_REWRITE_METHOD_KEY: &str = "mcp.response_rewrite.method";
 const METADATA_RESPONSE_REWRITE_SERVER_KEY: &str = "mcp.response_rewrite.server_id";
 const METADATA_RESPONSE_REWRITE_SESSION_KEY: &str = "mcp.response_rewrite.session";
-const METADATA_RESPONSE_REWRITE_PUBLIC_VALUE_KEY: &str = "mcp.response_rewrite.public_value";
-const METADATA_RESPONSE_REWRITE_UPSTREAM_VALUE_KEY: &str = "mcp.response_rewrite.upstream_value";
+const METADATA_RESPONSE_REWRITE_CATALOG_VERSION_KEY: &str = "mcp.response_rewrite.catalog_version";
 const MAX_MCP_PAGINATION_PAGES: usize = 100;
 const DEFAULT_MAX_MCP_CATALOG_ITEMS_PER_LIST: usize = 10_000;
 const DEFAULT_MAX_MCP_CATALOG_BYTES_PER_LIST: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_UPSTREAM_JSON_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_UPSTREAM_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MCP_STREAMABLE_HTTP_ACCEPT: &str = "application/json, text/event-stream";
+const MCP_REWRITTEN_RESPONSE_VALIDATORS: &[&str] = &[
+    "etag",
+    "last-modified",
+    "content-digest",
+    "digest",
+    "content-md5",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum McpGatewayMode {
@@ -346,6 +352,7 @@ struct McpCatalog {
     version: u64,
     last_refreshed_at: Option<Instant>,
     resource_templates_refreshed_at: Option<Instant>,
+    resource_templates_last_attempted_at: Option<Instant>,
     last_refreshed_wall: DateTime<Utc>,
 }
 
@@ -359,6 +366,7 @@ impl Default for McpCatalog {
             version: 0,
             last_refreshed_at: None,
             resource_templates_refreshed_at: None,
+            resource_templates_last_attempted_at: None,
             last_refreshed_wall: Utc::now(),
         }
     }
@@ -744,13 +752,19 @@ impl McpGateway {
 
     fn mark_request_rewrite(
         ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
         method: &str,
         param: &str,
         public_value: &str,
         upstream_value: &str,
         server_id: &str,
         downstream_session_id: &str,
+        catalog_version: u64,
     ) {
+        // Routed JSON results must remain identity-encoded so the response
+        // transform can inspect them. A non-compliant upstream that still sends
+        // Content-Encoding is handled defensively on the response path.
+        remove_header(headers, "accept-encoding");
         ctx.metadata
             .insert(METADATA_REWRITE_KEY.to_string(), "true".to_string());
         ctx.metadata
@@ -782,12 +796,8 @@ impl McpGateway {
             hash_str(downstream_session_id),
         );
         ctx.metadata.insert(
-            METADATA_RESPONSE_REWRITE_PUBLIC_VALUE_KEY.to_string(),
-            public_value.to_string(),
-        );
-        ctx.metadata.insert(
-            METADATA_RESPONSE_REWRITE_UPSTREAM_VALUE_KEY.to_string(),
-            upstream_value.to_string(),
+            METADATA_RESPONSE_REWRITE_CATALOG_VERSION_KEY.to_string(),
+            catalog_version.to_string(),
         );
     }
 
@@ -1499,6 +1509,52 @@ impl McpGateway {
             .map_err(McpCatalogError::Refresh)
     }
 
+    async fn prepare_response_resource_bindings(
+        &self,
+        ctx: &RequestContext,
+        downstream_session_id: &str,
+    ) {
+        if !self.discovery.aggregate_resources {
+            return;
+        }
+        let Some(session) = self.downstream_session_clone(downstream_session_id) else {
+            return;
+        };
+        {
+            let catalog = session.catalog.read().await;
+            if catalog
+                .resource_templates_last_attempted_at
+                .is_some_and(|attempted| attempted.elapsed() < self.discovery.cache_ttl)
+            {
+                return;
+            }
+        }
+        let _guard = session.catalog_refresh_lock.lock().await;
+        {
+            let mut catalog = session.catalog.write().await;
+            if catalog
+                .resource_templates_last_attempted_at
+                .is_some_and(|attempted| attempted.elapsed() < self.discovery.cache_ttl)
+            {
+                return;
+            }
+            // Record the attempt before network I/O so concurrent tool/prompt
+            // calls do not stampede an upstream that does not implement
+            // resources/templates/list. Explicit template-list requests still
+            // use ensure_resource_templates and surface refresh failures.
+            catalog.resource_templates_last_attempted_at = Some(Instant::now());
+        }
+        if let Err(error) = self
+            .refresh_resource_templates(ctx, downstream_session_id, &session.catalog)
+            .await
+        {
+            warn!(
+                error = %error,
+                "MCP resource templates unavailable for response reverse mapping"
+            );
+        }
+    }
+
     async fn refresh_catalog(
         &self,
         ctx: &RequestContext,
@@ -1654,6 +1710,7 @@ impl McpGateway {
             catalog.version = catalog.version.saturating_add(1);
         }
         catalog.resource_templates_refreshed_at = Some(Instant::now());
+        catalog.resource_templates_last_attempted_at = catalog.resource_templates_refreshed_at;
         catalog.last_refreshed_wall = discovered_at;
         Ok(())
     }
@@ -2217,6 +2274,12 @@ impl McpGateway {
                 None,
             );
         };
+        self.prepare_response_resource_bindings(ctx, downstream_session_id)
+            .await;
+        let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+            return session_not_found_response();
+        };
+        let catalog_version = catalog_lock.read().await.version;
         if let Err(error) = self
             .ensure_upstream_initialized(downstream_session_id, &server.server_id, ctx)
             .await
@@ -2231,12 +2294,14 @@ impl McpGateway {
         self.set_route_to_server(ctx, headers, server, Some(downstream_session_id));
         Self::mark_request_rewrite(
             ctx,
+            headers,
             "tools/call",
             "name",
             &public_name,
             &entry.upstream_name,
             &entry.server_id,
             downstream_session_id,
+            catalog_version,
         );
         PluginResult::Continue
     }
@@ -2283,6 +2348,12 @@ impl McpGateway {
                 None,
             );
         };
+        self.prepare_response_resource_bindings(ctx, downstream_session_id)
+            .await;
+        let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+            return session_not_found_response();
+        };
+        let catalog_version = catalog_lock.read().await.version;
         if let Err(error) = self
             .ensure_upstream_initialized(downstream_session_id, &server.server_id, ctx)
             .await
@@ -2309,12 +2380,14 @@ impl McpGateway {
         self.set_route_to_server(ctx, headers, server, Some(downstream_session_id));
         Self::mark_request_rewrite(
             ctx,
+            headers,
             "prompts/get",
             "name",
             &public_name,
             &entry.upstream_name,
             &entry.server_id,
             downstream_session_id,
+            catalog_version,
         );
         PluginResult::Continue
     }
@@ -2352,14 +2425,17 @@ impl McpGateway {
                 return session_not_found_response();
             };
             let catalog = catalog_lock.read().await;
-            catalog
-                .resources
-                .get(&public_uri)
-                .map(|entry| (entry.server_id.clone(), entry.upstream_uri.clone()))
+            catalog.resources.get(&public_uri).map(|entry| {
+                (
+                    entry.server_id.clone(),
+                    entry.upstream_uri.clone(),
+                    catalog.version,
+                )
+            })
         } else {
             None
         };
-        let (server_id, upstream_uri) = match route {
+        let (server_id, upstream_uri, catalog_version) = match route {
             Some(route) => route,
             None => {
                 if let Err(error) = self
@@ -2376,7 +2452,9 @@ impl McpGateway {
                     return session_not_found_response();
                 };
                 let catalog = catalog_lock.read().await;
-                let Some(route) = resource_template_route(&catalog, &public_uri) else {
+                let Some((server_id, upstream_uri)) =
+                    resource_template_route(&catalog, &public_uri)
+                else {
                     if let Some(error) = catalog_error {
                         return catalog_error_response(
                             envelope.id.clone(),
@@ -2391,7 +2469,7 @@ impl McpGateway {
                         None,
                     );
                 };
-                route
+                (server_id, upstream_uri, catalog.version)
             }
         };
         let Some(server) = self.servers.get(&server_id) else {
@@ -2428,12 +2506,14 @@ impl McpGateway {
         self.set_route_to_server(ctx, headers, server, Some(downstream_session_id));
         Self::mark_request_rewrite(
             ctx,
+            headers,
             "resources/read",
             "uri",
             &public_uri,
             &upstream_uri,
             &server_id,
             downstream_session_id,
+            catalog_version,
         );
         PluginResult::Continue
     }
@@ -2919,18 +2999,47 @@ impl Plugin for McpGateway {
         serde_json::to_vec(&value).ok()
     }
 
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if !self.should_buffer_response_body(ctx) {
+            return PluginResult::Continue;
+        }
+        let content_type = header_value(response_headers, "content-type");
+        if content_type.is_some_and(|value| {
+            super::utils::body_transform::is_event_stream_content_type(value)
+                || !mcp_content_type_is_json(value)
+        }) || header_value(response_headers, "content-encoding")
+            .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
+        {
+            return PluginResult::Continue;
+        }
+        // The transform may change the selected representation. Remove origin
+        // validators/integrity hashes before the body phase so clients cannot
+        // validate public-URI bytes against the upstream-native body.
+        for header in MCP_REWRITTEN_RESPONSE_VALIDATORS {
+            remove_header(response_headers, header);
+        }
+        PluginResult::Continue
+    }
+
     async fn transform_response_body_with_context(
         &self,
         ctx: &mut RequestContext,
         body: &[u8],
         content_type: Option<&str>,
-        _response_headers: &HashMap<String, String>,
+        response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         if !self.should_buffer_response_body(ctx)
             || content_type.is_some_and(|value| {
                 super::utils::body_transform::is_event_stream_content_type(value)
             })
             || content_type.is_some_and(|value| !mcp_content_type_is_json(value))
+            || header_value(response_headers, "content-encoding")
+                .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
         {
             return None;
         }
@@ -2957,29 +3066,24 @@ impl Plugin for McpGateway {
         }
         let server_id = ctx.metadata.get(METADATA_RESPONSE_REWRITE_SERVER_KEY)?;
         let session_hash = ctx.metadata.get(METADATA_RESPONSE_REWRITE_SESSION_KEY)?;
+        let expected_catalog_version = ctx
+            .metadata
+            .get(METADATA_RESPONSE_REWRITE_CATALOG_VERSION_KEY)?
+            .parse::<u64>()
+            .ok()?;
         let catalog_lock = self
             .session_catalogs_by_hash
             .get(session_hash)
             .map(|catalog| Arc::clone(catalog.value()))?;
         let catalog = catalog_lock.read().await;
+        if catalog.version != expected_catalog_version {
+            return None;
+        }
         let mut value: Value = serde_json::from_slice(body).ok()?;
         let result = value.get_mut("result")?;
 
         let outcome = match method.as_str() {
-            "resources/read" => {
-                let public_value = ctx
-                    .metadata
-                    .get(METADATA_RESPONSE_REWRITE_PUBLIC_VALUE_KEY)?;
-                let upstream_value = ctx
-                    .metadata
-                    .get(METADATA_RESPONSE_REWRITE_UPSTREAM_VALUE_KEY)?;
-                rewrite_resource_read_result(
-                    result,
-                    &catalog,
-                    server_id,
-                    Some((upstream_value.as_str(), public_value.as_str())),
-                )
-            }
+            "resources/read" => rewrite_resource_read_result(result, &catalog, server_id),
             "tools/call" => rewrite_tool_call_result(result, &catalog, server_id),
             "prompts/get" => rewrite_prompt_get_result(result, &catalog, server_id),
             _ => ResponseRewriteOutcome::Unchanged,
@@ -3029,7 +3133,6 @@ fn rewrite_resource_read_result(
     result: &mut Value,
     catalog: &McpCatalog,
     server_id: &str,
-    direct_binding: Option<(&str, &str)>,
 ) -> ResponseRewriteOutcome {
     let Some(contents) = result.get_mut("contents").and_then(Value::as_array_mut) else {
         return ResponseRewriteOutcome::Unchanged;
@@ -3037,13 +3140,7 @@ fn rewrite_resource_read_result(
     contents
         .iter_mut()
         .fold(ResponseRewriteOutcome::Unchanged, |outcome, content| {
-            outcome.merge(rewrite_uri_field(
-                content,
-                "uri",
-                catalog,
-                server_id,
-                direct_binding,
-            ))
+            outcome.merge(rewrite_uri_field(content, "uri", catalog, server_id))
         })
 }
 
@@ -3061,7 +3158,7 @@ fn rewrite_tool_call_result(
     // fields rather than walking arbitrary structured tool output.
     if let Some(contents) = result.get_mut("contents").and_then(Value::as_array_mut) {
         for content in contents {
-            outcome = outcome.merge(rewrite_uri_field(content, "uri", catalog, server_id, None));
+            outcome = outcome.merge(rewrite_uri_field(content, "uri", catalog, server_id));
         }
     }
     outcome
@@ -3113,10 +3210,10 @@ fn rewrite_content_block(
         _ => 0,
     };
     match content_kind {
-        1 => rewrite_uri_field(content, "uri", catalog, server_id, None),
+        1 => rewrite_uri_field(content, "uri", catalog, server_id),
         2 => content
             .get_mut("resource")
-            .map(|resource| rewrite_uri_field(resource, "uri", catalog, server_id, None))
+            .map(|resource| rewrite_uri_field(resource, "uri", catalog, server_id))
             .unwrap_or(ResponseRewriteOutcome::Unchanged),
         _ => ResponseRewriteOutcome::Unchanged,
     }
@@ -3127,21 +3224,14 @@ fn rewrite_uri_field(
     field: &str,
     catalog: &McpCatalog,
     server_id: &str,
-    direct_binding: Option<(&str, &str)>,
 ) -> ResponseRewriteOutcome {
     let Some(uri) = value.get(field).and_then(Value::as_str) else {
         return ResponseRewriteOutcome::Unchanged;
     };
-    let public_uri = if let Some((upstream_uri, public_uri)) = direct_binding
-        && uri == upstream_uri
-    {
-        Some(public_uri.to_string())
-    } else {
-        match reverse_resource_uri(catalog, server_id, uri) {
-            ReverseResourceUri::Mapped(public_uri) => Some(public_uri),
-            ReverseResourceUri::Unchanged => None,
-            ReverseResourceUri::Ambiguous => return ResponseRewriteOutcome::Ambiguous,
-        }
+    let public_uri = match reverse_resource_uri(catalog, server_id, uri) {
+        ReverseResourceUri::Mapped(public_uri) => Some(public_uri),
+        ReverseResourceUri::Unchanged => None,
+        ReverseResourceUri::Ambiguous => return ResponseRewriteOutcome::Ambiguous,
     };
     let Some(public_uri) = public_uri else {
         return ResponseRewriteOutcome::Unchanged;

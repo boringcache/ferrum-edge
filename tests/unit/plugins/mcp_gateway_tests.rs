@@ -148,6 +148,13 @@ async fn start_mcp_catalog_server() -> MockServer {
                                 "mimeType": "text/markdown"
                             }
                         ],
+                        "resourceTemplates": [
+                            {
+                                "uriTemplate": "file:///project/{path}",
+                                "name": "Project file",
+                                "mimeType": "text/plain"
+                            }
+                        ],
                         "prompts": [
                             {
                                 "name": "code_review",
@@ -1202,12 +1209,9 @@ async fn aggregate_resource_read_routes_and_rewrites_template_generated_uri() {
 #[tokio::test]
 async fn aggregate_resource_read_response_echoes_public_uri() {
     let server = start_mcp_catalog_server().await;
-    let plugin = create_plugin(
-        "mcp_gateway",
-        &aggregate_config(&format!("{}/mcp", server.uri())),
-    )
-    .unwrap()
-    .unwrap();
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["observability"] = json!({ "emit_metadata": false });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
 
     let (mut list_ctx, mut list_headers) = mcp_ctx(json!({
@@ -1232,10 +1236,12 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
     });
     let (mut ctx, mut headers) = mcp_ctx(request_body.clone());
     headers.insert("mcp-session-id".to_string(), session_id);
+    headers.insert("accept-encoding".to_string(), "gzip".to_string());
     assert!(matches!(
         plugin.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
+    assert!(!headers.contains_key("accept-encoding"));
     let _ = plugin
         .transform_request_body_with_context(
             &mut ctx,
@@ -1245,6 +1251,12 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
         )
         .await
         .expect("resource read request should be rewritten");
+    assert!(
+        ctx.metadata
+            .values()
+            .all(|value| value != "file:///project/README.md"),
+        "internal response rewrite metadata must not retain upstream URIs"
+    );
 
     assert!(plugin.requires_response_body_buffering());
     assert!(plugin.should_buffer_response_body(&ctx));
@@ -1265,12 +1277,25 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
             }]
         }
     });
+    let mut response_headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("etag".to_string(), "\"upstream-body\"".to_string()),
+        ("content-digest".to_string(), "sha-256=:old:".to_string()),
+    ]);
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(!response_headers.contains_key("etag"));
+    assert!(!response_headers.contains_key("content-digest"));
     let rewritten = plugin
         .transform_response_body_with_context(
             &mut ctx,
             serde_json::to_vec(&upstream_response).unwrap().as_slice(),
             Some("application/json"),
-            &HashMap::new(),
+            &response_headers,
         )
         .await
         .expect("resource read response should be reverse-mapped");
@@ -1313,11 +1338,28 @@ async fn aggregate_tool_call_response_rewrites_embedded_resource_uris() {
         }
     });
     let (mut ctx, mut headers) = mcp_ctx(request_body.clone());
-    headers.insert("mcp-session-id".to_string(), session_id);
+    headers.insert("mcp-session-id".to_string(), session_id.clone());
     assert!(matches!(
         plugin.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
+
+    let (mut template_ctx, mut template_headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 13,
+        "method": "resources/templates/list",
+        "params": {}
+    }));
+    template_headers.insert("mcp-session-id".to_string(), session_id);
+    let (_, template_body, _) = reject_json(
+        plugin
+            .before_proxy(&mut template_ctx, &mut template_headers)
+            .await,
+    );
+    let public_template = template_body["result"]["resourceTemplates"][0]["uriTemplate"]
+        .as_str()
+        .unwrap();
+    let generated_public_uri = public_template.replace("{path}", "generated.txt");
     let _ = plugin
         .transform_request_body_with_context(
             &mut ctx,
@@ -1341,9 +1383,9 @@ async fn aggregate_tool_call_response_rewrites_embedded_resource_uris() {
                 {
                     "type": "resource",
                     "resource": {
-                        "uri": "file:///project/README.md",
-                        "mimeType": "text/markdown",
-                        "text": "read me"
+                        "uri": "file:///project/generated.txt",
+                        "mimeType": "text/plain",
+                        "text": "generated"
                     }
                 }
             ]
@@ -1362,7 +1404,7 @@ async fn aggregate_tool_call_response_rewrites_embedded_resource_uris() {
     assert_eq!(rewritten["result"]["content"][0]["uri"], public_uri);
     assert_eq!(
         rewritten["result"]["content"][1]["resource"]["uri"],
-        public_uri
+        generated_public_uri
     );
 }
 
