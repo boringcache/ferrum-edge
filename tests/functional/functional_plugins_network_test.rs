@@ -5,6 +5,8 @@
 //! These are gap-fill tests for the rate-limiting / mirror / compression /
 //! response-caching plugins; they exercise the integration between the
 //! plugin lifecycle and the backend dispatch path.
+//! Round-2 adds response-body transformation under truncation/trickle and
+//! verifies reset/stalled mirror targets remain isolated from the primary.
 //!
 //! Run with:
 //!
@@ -470,6 +472,224 @@ async fn compression_handles_mid_stream_backend_close_without_corrupting_output(
             // than corrupted data.
             eprintln!("test3: reqwest error (acceptable): {e}");
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn response_transformer_never_emits_corrupt_json_for_truncated_or_trickled_body() {
+    for behavior in ["close-mid-body", "trickle-body"] {
+        let reservation = reserve_port().await.expect("reserve port");
+        let backend_port = reservation.port;
+        let backend = match behavior {
+            "close-mid-body" => ScriptedHttp1Backend::builder(reservation.into_listener())
+                .step(HttpStep::CloseMidBody {
+                    status: 200,
+                    reason: "OK".into(),
+                    headers: vec![
+                        ("Content-Length".into(), "64".into()),
+                        ("Content-Type".into(), "application/json".into()),
+                    ],
+                    body_prefix: br#"{"status":"pending"#.to_vec(),
+                    reset: true,
+                })
+                .spawn()
+                .expect("spawn close-mid-body backend"),
+            "trickle-body" => ScriptedHttp1Backend::builder(reservation.into_listener())
+                .step(HttpStep::TrickleBody {
+                    status: 200,
+                    reason: "OK".into(),
+                    headers: vec![
+                        ("Content-Length".into(), "4".into()),
+                        ("Content-Type".into(), "application/json".into()),
+                        ("Connection".into(), "close".into()),
+                    ],
+                    // Four delayed digits form one valid JSON number. This
+                    // exercises repeated DATA arrival without requiring the
+                    // fixture to synthesize different chunks.
+                    chunk: b"1".to_vec(),
+                    pause: Duration::from_millis(75),
+                    count: 4,
+                })
+                .spawn()
+                .expect("spawn trickle backend"),
+            _ => unreachable!(),
+        };
+
+        let yaml = yaml_with_plugin(
+            backend_port,
+            "response-transformer-network",
+            "response_transformer",
+            json!({
+                "rules": [{
+                    "operation": "add",
+                    "target": "body",
+                    "key": "gateway",
+                    "value": "ferrum",
+                }],
+            }),
+        );
+        let harness = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(yaml)
+            .pool_warmup_enabled(false)
+            .spawn()
+            .await
+            .expect("spawn gateway");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(4))
+            .pool_max_idle_per_host(0)
+            .build()
+            .expect("client");
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            client
+                .get(harness.proxy_url(&format!("/api/{behavior}")))
+                .send(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{behavior} response exceeded the outer timeout"));
+
+        match outcome {
+            Err(_) if behavior == "close-mid-body" => {}
+            Err(error) => panic!("{behavior} unexpectedly failed before response: {error}"),
+            Ok(response) => {
+                let status = response.status();
+                let body = tokio::time::timeout(Duration::from_secs(4), response.bytes()).await;
+                match body {
+                    Err(_) => panic!("{behavior} body read exceeded the outer timeout"),
+                    Ok(Err(_)) if behavior == "close-mid-body" => {}
+                    Ok(Err(error)) => panic!("{behavior} body read failed: {error}"),
+                    Ok(Ok(bytes)) if status.is_server_error() => {
+                        assert_eq!(
+                            behavior, "close-mid-body",
+                            "only the truncated case may cleanly fail as 5xx"
+                        );
+                        assert!(
+                            !bytes.is_empty(),
+                            "clean 5xx must carry an explicit error body"
+                        );
+                    }
+                    Ok(Ok(bytes)) => {
+                        assert_eq!(status.as_u16(), 200, "behavior={behavior}");
+                        let parsed: serde_json::Value = serde_json::from_slice(&bytes)
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "{behavior} returned corrupt JSON after response_transformer: \
+                                     {error}; bytes={bytes:?}"
+                                )
+                            });
+                        if behavior == "trickle-body" {
+                            assert_eq!(
+                                parsed,
+                                json!(1111),
+                                "trickled scalar JSON must remain byte-semantically intact"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !backend.received_requests().await.is_empty(),
+            "{behavior} backend did not receive the gateway request"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn request_mirror_reset_or_stall_never_delays_primary_response() {
+    for behavior in ["reset", "stall"] {
+        let primary_reservation = reserve_port().await.expect("primary port");
+        let primary_port = primary_reservation.port;
+        let primary = ScriptedHttp1Backend::builder(primary_reservation.into_listener())
+            .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+            .step(HttpStep::RespondStatus {
+                status: 200,
+                reason: "OK".into(),
+            })
+            .step(HttpStep::RespondHeader {
+                name: "Content-Length".into(),
+                value: "2".into(),
+            })
+            .step(HttpStep::RespondHeader {
+                name: "Connection".into(),
+                value: "close".into(),
+            })
+            .step(HttpStep::RespondBodyChunk(b"ok".to_vec()))
+            .step(HttpStep::RespondBodyEnd)
+            .spawn()
+            .expect("spawn primary");
+
+        let mirror_reservation = reserve_port().await.expect("mirror port");
+        let mirror_port = mirror_reservation.port;
+        let mirror = match behavior {
+            "reset" => ScriptedHttp1Backend::builder(mirror_reservation.into_listener())
+                .step(HttpStep::CloseMidBody {
+                    status: 200,
+                    reason: "OK".into(),
+                    headers: vec![("Content-Length".into(), "32".into())],
+                    body_prefix: b"partial".to_vec(),
+                    reset: true,
+                })
+                .spawn()
+                .expect("spawn reset mirror"),
+            "stall" => ScriptedHttp1Backend::builder(mirror_reservation.into_listener())
+                .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+                .step(HttpStep::Sleep(Duration::from_secs(30)))
+                .spawn()
+                .expect("spawn stalled mirror"),
+            _ => unreachable!(),
+        };
+
+        let yaml = yaml_with_plugin(
+            primary_port,
+            "request-mirror-network",
+            "request_mirror",
+            json!({
+                "mirror_host": "127.0.0.1",
+                "mirror_port": mirror_port,
+                "mirror_protocol": "http",
+                "percentage": 100.0,
+            }),
+        );
+        let harness = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(yaml)
+            .pool_warmup_enabled(false)
+            .spawn()
+            .await
+            .expect("spawn gateway");
+        let client = harness.http_client().expect("client");
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.get(&harness.proxy_url(&format!("/api/mirror-{behavior}"))),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{behavior} mirror blocked the primary response"))
+        .expect("primary response");
+        assert_eq!(response.status.as_u16(), 200, "response={response:?}");
+        assert_eq!(response.body_text(), "ok");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{behavior} mirror delayed the fire-and-forget primary path"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !mirror.received_requests().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{behavior} mirror never received the copied request"));
+        assert_eq!(primary.received_requests().await.len(), 1);
     }
 }
 

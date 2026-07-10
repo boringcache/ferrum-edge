@@ -168,6 +168,7 @@ impl Request {
 pub struct ScriptedHttp1BackendBuilder {
     listener: TcpListener,
     steps: Vec<HttpStep>,
+    connection_scripts: Vec<Vec<HttpStep>>,
 }
 
 impl ScriptedHttp1BackendBuilder {
@@ -175,6 +176,7 @@ impl ScriptedHttp1BackendBuilder {
         Self {
             listener,
             steps: Vec::new(),
+            connection_scripts: Vec::new(),
         }
     }
 
@@ -188,12 +190,25 @@ impl ScriptedHttp1BackendBuilder {
         self
     }
 
+    /// Supply connection-indexed scripts. Connection 0 receives the first
+    /// script, connection 1 the second, and later connections repeat the
+    /// final script. This is useful for deterministic retry tests such as
+    /// `503 -> 200` without coordinating an out-of-band mutable flag.
+    ///
+    /// When non-empty, these scripts take precedence over [`Self::step`] /
+    /// [`Self::steps`].
+    pub fn connection_scripts(mut self, scripts: impl IntoIterator<Item = Vec<HttpStep>>) -> Self {
+        self.connection_scripts.extend(scripts);
+        self
+    }
+
     pub fn spawn(self) -> io::Result<ScriptedHttp1Backend> {
         let port = self.listener.local_addr()?.port();
         let state = Arc::new(Http1State::default());
         let state_task = state.clone();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         let steps = self.steps;
+        let connection_scripts = self.connection_scripts;
         let listener = self.listener;
         let handle = tokio::spawn(async move {
             loop {
@@ -202,9 +217,14 @@ impl ScriptedHttp1BackendBuilder {
                     _ = &mut shutdown_rx => return,
                     accept_result = listener.accept() => {
                         let Ok((stream, _addr)) = accept_result else { continue; };
-                        state_task.accepted.fetch_add(1, Ordering::SeqCst);
+                        let connection_index =
+                            state_task.accepted.fetch_add(1, Ordering::SeqCst) as usize;
                         let state_conn = state_task.clone();
-                        let script = steps.clone();
+                        let script = connection_scripts
+                            .get(connection_index)
+                            .or_else(|| connection_scripts.last())
+                            .cloned()
+                            .unwrap_or_else(|| steps.clone());
                         let track = state_conn.clone();
                         let jh = tokio::spawn(async move {
                             let state_err = state_conn.clone();
