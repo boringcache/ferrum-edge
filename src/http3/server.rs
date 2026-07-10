@@ -2214,6 +2214,8 @@ async fn handle_h3_request(
             .any(|plugin| plugin.forces_reqwest_dispatch(&ctx));
     let backend_supports_native_h3 =
         crate::proxy::supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
+    let retry_response_needs_header_refinement =
+        has_retry && crate::proxy::plugins_may_release_response_body_under_retries(&plugins, &ctx);
     let use_native_h3_pool =
         http_flavor == HttpFlavor::Plain && !forces_reqwest_dispatch && backend_supports_native_h3;
 
