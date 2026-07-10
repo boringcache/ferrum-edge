@@ -1456,8 +1456,19 @@ impl Plugin for AiTranscriptAudit {
 
         let mut staging = self.staging.remove(&record_id).map(|(_, value)| value);
         if !emit {
-            ctx.metadata
-                .insert(MD_SINK_STATUS.to_string(), "skipped".to_string());
+            // A fail-closed rejection (`on_sink_error`/`on_buffer_full: reject`)
+            // stamps `MD_SINK_STATUS = "rejected"` and returns a 503 in the
+            // admission phase; that verdict is terminal. A later not-emitting
+            // decision must not overwrite it, or the client-visible 503 would be
+            // logged as `skipped` and the fail-closed audit trail lost.
+            ctx.metadata.insert(
+                MD_SINK_STATUS.to_string(),
+                if request_rejected_for_sink {
+                    "rejected".to_string()
+                } else {
+                    "skipped".to_string()
+                },
+            );
             return;
         }
 

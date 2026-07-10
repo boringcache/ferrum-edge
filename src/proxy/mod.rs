@@ -12575,11 +12575,13 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // see the divergence note above.
     apply_after_proxy_hooks_to_rejection(plugins, ctx, *status, headers).await;
 
-    // Synthetic responses bypass the normal buffered backend-response path.
-    // Observe only after final-body validators, rejection replacement, and the
-    // synthetic path's deliberately-late response-header hooks. This path
-    // already performs plugin capability scans to decide whether body hooks
-    // apply, so the additional scan remains confined to synthetic short-circuits.
+    // Observe every client-visible rejection that flows through this finalizer —
+    // synthetic short-circuits, gRPC rejects, non-2xx rejects, empty-body rejects
+    // — only after final-body validators, rejection replacement, and the
+    // synthetic path's deliberately-late response-header hooks have run. The
+    // committed-hook capability scan runs unconditionally (no longer gated on
+    // whether body hooks applied) so exporters see the final response on all
+    // rejection shapes, not just synthetic paths that ran body hooks.
     if plugins
         .iter()
         .any(|plugin| plugin.requires_response_committed_hook())

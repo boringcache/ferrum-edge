@@ -3294,3 +3294,93 @@ async fn unsampled_buffered_precommit_stamps_deferred_sink_status() {
         Some("deferred")
     );
 }
+
+#[tokio::test]
+async fn fail_closed_rejected_then_unsampled_keeps_rejected_sink_status() {
+    // A terminal fail-closed rejection must survive a later not-emitting commit
+    // decision. Config: unsampled (rate 0) with `always_capture_on_error: false`
+    // but the default `always_capture_on_guardrail: true`, so `commit_may_emit`
+    // is true and the fail-closed admission runs, yet a plain error status does
+    // NOT force emit at commit. Once an unhealthy sink under `on_sink_error:
+    // reject` stamps `sink_status = "rejected"` and returns a 503, the observe-
+    // only committed hook (which decides `emit = false` here) must not clobber
+    // that terminal verdict with `"skipped"` — otherwise the client-visible 503
+    // is mislogged and the fail-closed audit trail is lost.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "sampling": { "rate": 0.0, "always_capture_on_error": false },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint.clone(),
+                    "batch_size": 1,
+                    "flush_interval_ms": 100,
+                    "max_retries": 0,
+                    "on_sink_error": "reject"
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let headers = json_headers();
+
+    // Emit one guardrail record (guardrail forces emit even with
+    // always_capture_on_error=false) so the collector 401 flips the sink
+    // unhealthy.
+    let mut error_ctx = make_ctx();
+    error_ctx.metadata.insert(
+        "ai_semantic_firewall_rejected".to_string(),
+        "true".to_string(),
+    );
+    plugin
+        .on_final_request_body_with_context(&mut error_ctx, &headers, ai_request_body())
+        .await;
+    plugin
+        .capture_final_response_body(&mut error_ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+
+    // Now drive an unsampled, no-guardrail candidate over the buffered committed
+    // path. The fail-closed admission rejects (503) and stamps "rejected"; the
+    // committed hook then runs with emit=false and must NOT overwrite it.
+    let mut saw_reject = false;
+    for _ in 0..100 {
+        let mut ctx = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        let result = plugin
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        if matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ) {
+            assert_eq!(
+                ctx.metadata
+                    .get("ai_transcript_audit.sink_status")
+                    .map(String::as_str),
+                Some("rejected"),
+                "a fail-closed rejection must not be downgraded to skipped by the \
+                 not-emitting committed decision"
+            );
+            saw_reject = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        saw_reject,
+        "the unhealthy sink under on_sink_error=reject must fail closed for this candidate"
+    );
+}
