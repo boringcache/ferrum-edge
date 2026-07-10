@@ -776,6 +776,23 @@ impl AiTranscriptAudit {
                 staged.tool_names = parsed.as_ref().map(extract_tool_names).unwrap_or_default();
             }
         }
+        // Re-detect `stream` on the FINAL backend-visible body: a
+        // `request_transformer` may have added OR removed `"stream": true`
+        // after `before_proxy` staged the candidate. `MD_STREAM_REQUEST` drives
+        // the later buffer-vs-stream response decision
+        // (`buffered_response_capture_wanted`), so — mirroring
+        // `ai_tool_governor` — the marker must track the final body in BOTH
+        // directions. Only clear on a parsed, provably non-streaming body; an
+        // unparseable body cannot rule out `stream: true`, so leave the marker
+        // as staged.
+        if let Some(json) = parsed.as_ref() {
+            if json.get("stream").and_then(Value::as_bool) == Some(true) {
+                ctx.metadata
+                    .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
+            } else {
+                ctx.metadata.remove(MD_STREAM_REQUEST);
+            }
+        }
         ctx.metadata
             .insert(MD_REQUEST_HASH.to_string(), request_hash);
     }
@@ -1047,9 +1064,12 @@ impl AiTranscriptAudit {
         // then streamed too, so its body is not buffered-captured — the log
         // fallback still records the request side, status, and error reason.
         // Forcing a buffer to catch that body would risk the failure above for
-        // the common SSE success case. The marker is refreshed by the final
-        // request-body hook after transforms and before this response policy is
-        // committed, so a transformer-added/removed `stream` value is reflected.
+        // the common SSE success case. The marker is refreshed from the final
+        // backend-visible body by `on_final_request_body_with_context`
+        // (via `refresh_staged_request` for an already-classified candidate, or
+        // `stage_candidate` otherwise) — after transforms and before this
+        // response policy is committed — in both directions, so a
+        // transformer-added or -removed `stream` value is reflected here.
         if flag(&ctx.metadata, MD_STREAM_REQUEST) {
             return false;
         }

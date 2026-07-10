@@ -115,6 +115,35 @@ async fn collect_flushed_logs(harness: &GatewayHarness) -> String {
     }
 }
 
+/// GET the backend capability registry and return the single entry (tests
+/// configure a single proxy so the registry holds exactly one). Returns
+/// `None` until the async warmup probe has classified the backend.
+async fn fetch_capability_entry(harness: &GatewayHarness) -> Option<Value> {
+    let body = harness.get_admin_json("/backend-capabilities").await.ok()?;
+    body["entries"].as_array()?.first().cloned()
+}
+
+/// Poll the capability registry until the backend is classified
+/// `plain_http.h2_tls == "supported"`, or the deadline expires. Direct-H2
+/// dispatch (`ResponseBody::StreamingH2`) only engages once the backend is
+/// proven h2-over-TLS capable; before that the request falls back to the
+/// reqwest arm, so tests that mean to exercise the direct-H2 inspector must
+/// gate on this first.
+async fn wait_for_h2_tls_supported(harness: &GatewayHarness, timeout: Duration) -> Option<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(entry) = fetch_capability_entry(harness).await {
+            if entry["plain_http"]["h2_tls"].as_str() == Some("supported") {
+                return Some(entry);
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Build a file-mode YAML that points a gRPC proxy at the given port over
 /// plain HTTP (h2c — the gateway's gRPC pool performs an h2c handshake
 /// when `backend_scheme: http`). Callers can merge additional overrides
@@ -1173,6 +1202,21 @@ async fn bodyless_direct_h2_sse_response_is_governed() {
         .await
         .expect("spawn gateway");
 
+    // Direct-H2 dispatch (`ResponseBody::StreamingH2`) only engages once the
+    // async warmup probe has classified the backend h2-over-TLS capable.
+    // Until then the request falls back to the reqwest arm, which governed SSE
+    // before this PR — so without this gate a regression that stopped wiring
+    // the inspector onto `StreamingH2` could still pass here. Prove the
+    // direct-H2 arm is reachable before firing the request.
+    let entry = wait_for_h2_tls_supported(&harness, Duration::from_secs(15))
+        .await
+        .expect("backend must be classified h2_tls=supported for the direct-H2 arm");
+    assert_eq!(
+        entry["plain_http"]["h2_tls"].as_str(),
+        Some("supported"),
+        "precondition: direct-H2 streaming arm requires h2_tls=supported; entry: {entry:#?}"
+    );
+
     let response = reqwest::Client::new()
         .get(harness.proxy_url("/events/live"))
         .send()
@@ -1194,7 +1238,7 @@ async fn bodyless_direct_h2_sse_response_is_governed() {
     );
     let logs = harness
         .wait_for_log_contains(
-            &|logs| logs.contains("ai_tool_governor.decision") && logs.contains("deny"),
+            &|logs: &str| logs.contains("ai_tool_governor.decision") && logs.contains("deny"),
             Duration::from_secs(5),
         )
         .await;

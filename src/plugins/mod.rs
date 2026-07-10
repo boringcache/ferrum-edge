@@ -1676,7 +1676,15 @@ impl Drop for CompletionNotifyingInspector {
 /// only on the opted-in path, and is removed again when every plugin factory
 /// declines the concrete response, so terminal hooks cannot mistake an
 /// uninspected stream for one with pending write-back state.
+///
+/// This self-contained variant (which runs its own `requires_response_stream_hooks`
+/// scan) is now used only by external test crates; every gateway hot path resolves
+/// the capability through the `PluginCache` and calls
+/// [`create_response_stream_inspector_for_enabled_plugins`] directly.
+/// `#[allow(dead_code)]` because the binary target recompiles the source without
+/// those test crates, so it sees no caller.
 #[doc(hidden)]
+#[allow(dead_code)] // used only by tests/, dead code in the bin target
 pub fn create_response_stream_inspector(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
