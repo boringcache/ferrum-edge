@@ -81,16 +81,17 @@ struct RouteHostScope {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InvalidBackendRefReason {
+enum BackendRefFaultReason {
     InvalidKind,
     BackendNotFound,
     RefNotPermitted,
+    NoServiceableBackend,
 }
 
 #[derive(Default)]
 struct RouteBackendResolution {
     backends: Vec<RouteBackend>,
-    invalid: Option<InvalidBackendRefReason>,
+    fault_reason: Option<BackendRefFaultReason>,
     invalid_weight: u32,
     valid_weight: u32,
 }
@@ -2113,18 +2114,17 @@ fn http_route_resources(
             let request_transform = gateway_request_header_modifier_rules(rule);
             let redirect = gateway_request_redirect_value(object, rule, default_redirect_port)?;
             let backend_resolution = route_backends(object, rule, acc)?;
-            let invalid_backend_fault = backend_resolution.invalid.map(|reason| {
-                invalid_backend_fault_value_with_percentage(
+            let backend_ref_fault = backend_resolution.fault_reason.map(|reason| {
+                backend_ref_fault_value_with_percentage(
                     reason,
-                    invalid_backend_percentage(
+                    backend_ref_fault_percentage(
                         backend_resolution.valid_weight,
                         backend_resolution.invalid_weight,
                     ),
                 )
             });
-            let has_route_actions = !request_transform.is_empty()
-                || redirect.is_some()
-                || invalid_backend_fault.is_some();
+            let has_route_actions =
+                !request_transform.is_empty() || redirect.is_some() || backend_ref_fault.is_some();
 
             let (
                 backend_host,
@@ -2270,7 +2270,7 @@ fn http_route_resources(
                             &entry_descriptors_for_path,
                             &request_transform,
                             redirect.as_ref(),
-                            invalid_backend_fault.as_ref(),
+                            backend_ref_fault.as_ref(),
                         );
                         let rules_have_request_transform =
                             dispatch_rules_carry_field(&rules, "request_transform");
@@ -2877,15 +2877,18 @@ fn gateway_match_path_prefix(match_entry: &Value) -> Option<&str> {
     path.get("value").and_then(Value::as_str)
 }
 
-fn invalid_backend_fault_value_with_percentage(
-    reason: InvalidBackendRefReason,
+fn backend_ref_fault_value_with_percentage(
+    reason: BackendRefFaultReason,
     percentage: f64,
 ) -> Value {
     let body = match reason {
-        InvalidBackendRefReason::InvalidKind => "Gateway API backendRef kind is unsupported",
-        InvalidBackendRefReason::BackendNotFound => "Gateway API backendRef Service was not found",
-        InvalidBackendRefReason::RefNotPermitted => {
+        BackendRefFaultReason::InvalidKind => "Gateway API backendRef kind is unsupported",
+        BackendRefFaultReason::BackendNotFound => "Gateway API backendRef Service was not found",
+        BackendRefFaultReason::RefNotPermitted => {
             "Gateway API backendRef is not permitted by ReferenceGrant"
+        }
+        BackendRefFaultReason::NoServiceableBackend => {
+            "Gateway API rule has no serviceable backendRefs"
         }
     };
     serde_json::json!({
@@ -2897,8 +2900,10 @@ fn invalid_backend_fault_value_with_percentage(
     })
 }
 
-fn invalid_backend_percentage(valid_weight: u32, invalid_weight: u32) -> f64 {
+fn backend_ref_fault_percentage(valid_weight: u32, invalid_weight: u32) -> f64 {
     let total = valid_weight.saturating_add(invalid_weight);
+    // An all-zero-weight HTTPRoute has no weighted traffic denominator, but
+    // every request matching the retained rule must still fail closed.
     if total == 0 || invalid_weight >= total {
         return 100.0;
     }
@@ -3038,7 +3043,7 @@ fn route_backends(
     acc: &mut K8sAccumulator,
 ) -> Result<RouteBackendResolution, K8sTranslateError> {
     let mut backend_groups = Vec::new();
-    let mut invalid = None;
+    let mut fault_reason = None;
     let mut invalid_weight = 0u32;
     let mut valid_weight = 0u32;
     let mut skipped_zero = 0usize;
@@ -3059,7 +3064,7 @@ fn route_backends(
             match checked_backend_namespace(object, backend_ref, acc, object.kind.as_str()) {
                 Ok(namespace) => namespace,
                 Err(error) if error_is_backend_ref_resolution(&error) => {
-                    invalid.get_or_insert(backend_ref_resolution_reason(&error));
+                    fault_reason.get_or_insert(backend_ref_resolution_reason(&error));
                     invalid_weight = invalid_weight.saturating_add(weight);
                     continue;
                 }
@@ -3077,7 +3082,7 @@ fn route_backends(
             && (!acc.service_exists(&backend_namespace, backend_name)
                 || !acc.service_port_exists(&backend_namespace, backend_name, backend_port))
         {
-            invalid.get_or_insert(InvalidBackendRefReason::BackendNotFound);
+            fault_reason.get_or_insert(BackendRefFaultReason::BackendNotFound);
             invalid_weight = invalid_weight.saturating_add(weight);
             continue;
         }
@@ -3115,11 +3120,19 @@ fn route_backends(
     }
     let backends = flatten_route_backend_groups(backend_groups);
     if skipped_zero > 0 {
-        if backends.is_empty() {
-            acc.warnings.push(format!(
-                "{} rule has only zero-weight backendRefs; emitted blackhole backend",
-                object.kind
-            ));
+        if has_only_zero_weight_backend_refs(rule) {
+            if object.kind == "HTTPRoute" {
+                fault_reason.get_or_insert(BackendRefFaultReason::NoServiceableBackend);
+                acc.warnings.push(
+                    "HTTPRoute rule has only zero-weight backendRefs; materializing HTTP 500 fail-closed route action"
+                        .to_string(),
+                );
+            } else {
+                acc.warnings.push(format!(
+                    "{} rule has only zero-weight backendRefs; emitted blackhole backend",
+                    object.kind
+                ));
+            }
         } else {
             acc.warnings.push(format!(
                 "{} skipped {} zero-weight backendRef(s)",
@@ -3127,7 +3140,7 @@ fn route_backends(
             ));
         }
     }
-    if invalid.is_some() {
+    if fault_reason.is_some_and(|reason| reason != BackendRefFaultReason::NoServiceableBackend) {
         acc.warnings.push(format!(
             "{} {}/{} has unresolved backendRef(s); materializing fail-closed route action",
             object.kind, object.metadata.namespace, object.metadata.name
@@ -3135,7 +3148,7 @@ fn route_backends(
     }
     Ok(RouteBackendResolution {
         backends,
-        invalid,
+        fault_reason,
         invalid_weight,
         valid_weight,
     })
@@ -3222,14 +3235,14 @@ fn error_is_backend_ref_resolution(error: &K8sTranslateError) -> bool {
     }
 }
 
-fn backend_ref_resolution_reason(error: &K8sTranslateError) -> InvalidBackendRefReason {
+fn backend_ref_resolution_reason(error: &K8sTranslateError) -> BackendRefFaultReason {
     match error {
         K8sTranslateError::InvalidResource { message, .. }
             if message.contains("only core Service") =>
         {
-            InvalidBackendRefReason::InvalidKind
+            BackendRefFaultReason::InvalidKind
         }
-        _ => InvalidBackendRefReason::RefNotPermitted,
+        _ => BackendRefFaultReason::RefNotPermitted,
     }
 }
 
@@ -5318,6 +5331,55 @@ mod tests {
     }
 
     #[test]
+    fn http_route_selectorless_service_resolves_named_target_port() {
+        let service = core_service(
+            "named-target",
+            serde_json::json!({
+                "clusterIP": "10.96.0.11",
+                "ports": [{
+                    "name": "http",
+                    "port": 8080,
+                    "targetPort": "app-http"
+                }]
+            }),
+        );
+        let endpoint_slice = {
+            let mut slice = endpoint_slice_for_service(
+                "named-target",
+                vec![serde_json::json!({
+                    "addresses": ["10.1.0.11"],
+                    "conditions": {"ready": true}
+                })],
+            );
+            slice.spec["ports"] = serde_json::json!([{
+                "name": "app-http",
+                "port": 3001
+            }]);
+            slice
+        };
+        let route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "rules": [{
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/named"}}],
+                    "backendRefs": [{"name": "named-target", "port": 8080}]
+                }]
+            }),
+        );
+
+        let result = translate_k8s_objects(
+            &[service, endpoint_slice, route],
+            options().with_pod_discovery_enabled(true),
+        )
+        .expect("named Service targetPort should resolve through EndpointSlice port names");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(result.config.proxies[0].backend_host, "10.1.0.11");
+        assert_eq!(result.config.proxies[0].backend_port, 3001);
+        assert!(result.config.upstreams.is_empty());
+    }
+
+    #[test]
     fn http_route_headless_service_uses_ready_endpoint_slice_targets() {
         let service = core_service(
             "headless",
@@ -6810,7 +6872,7 @@ mod tests {
     }
 
     #[test]
-    fn http_route_keeps_all_zero_weight_rule_as_blackhole() {
+    fn http_route_keeps_all_zero_weight_rule_as_500_fault() {
         let result = translate_k8s_objects(
             &[object(
                 "HTTPRoute",
@@ -6842,6 +6904,26 @@ mod tests {
         assert_eq!(admin_proxy.backend_host, ZERO_WEIGHT_BACKEND_HOST);
         assert_eq!(admin_proxy.backend_port, ZERO_WEIGHT_BACKEND_PORT);
         assert!(admin_proxy.upstream_id.is_none());
+        let dispatch = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.plugin_name == "mesh_route_dispatch"
+                    && plugin.proxy_id.as_deref() == Some(admin_proxy.id.as_str())
+            })
+            .expect("zero-weight-only route should carry mesh_route_dispatch");
+        let abort = &dispatch.config["rules"][0]["fault"]["abort"];
+        assert_eq!(abort["status_code"], 500);
+        assert_eq!(abort["percentage"], 100.0);
+        let body = abort["body"]
+            .as_str()
+            .expect("fault body should be a string");
+        let body: Value = serde_json::from_str(body).expect("fault body should be valid JSON");
+        assert_eq!(
+            body["error"].as_str(),
+            Some("Gateway API rule has no serviceable backendRefs")
+        );
         assert!(
             result
                 .warnings

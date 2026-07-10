@@ -147,6 +147,8 @@ response_body_mode = buffer?
 
 Response body buffering uses a **two-tier check** mirroring the request-body pattern:
 
+Custom plugin authors should also read [Streaming-safe response plugins](../CUSTOM_PLUGINS.md#streaming-safe-response-plugins) for complete-body buffering, incremental `ResponseStreamInspector` hooks, `Content-Type` relabel safety, and the current transport limitations.
+
 1. **Config-time upper bound** — `requires_response_body_buffering()` is pre-computed in `PluginCache` at config load time. O(1) HashMap lookup per request.
 2. **Per-request refinement** — `should_buffer_response_body(&RequestContext)` lets plugins skip buffering when the request context makes it irrelevant.
 

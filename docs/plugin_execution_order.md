@@ -316,7 +316,7 @@ Given all built-in plugins enabled, the execution order is:
 | 45 | `ai_semantic_cache` | 2980 | before_proxy, after_proxy, on_final_response_body |
 | 46 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, normalize_response_body, response_stream_inspector |
 | 47 | `mcp_gateway` | 2992 | before_proxy, after_proxy, transform_request_body, transform_response_body |
-| 48 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body |
+| 48 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body, response_stream_inspector |
 | 49 | `mesh_route_dispatch` | 2995 | before_proxy |
 | 50 | `request_transformer` | 3000 | before_proxy, transform_request_body |
 | 51 | `serverless_function` | 3025 | before_proxy |

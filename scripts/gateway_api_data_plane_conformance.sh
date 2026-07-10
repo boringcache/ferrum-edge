@@ -568,6 +568,21 @@ spec:
       backendRefs:
         - name: blackbox-empty
           port: 8080
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /zero-weight
+      backendRefs:
+        - name: blackbox-a
+          port: 8080
+          weight: 0
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /zero
+      backendRefs:
+        - name: blackbox-a
+          port: 8080
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -777,6 +792,14 @@ run_blackbox_tests() {
     return 1
   fi
   echo "invalid backendRef failed closed with HTTP ${invalid_status}" >> "$report"
+
+  local zero_weight_status
+  zero_weight_status="$(curl_status blackbox.example /zero-weight)"
+  if [ "$zero_weight_status" != "500" ]; then
+    echo "zero-weight-only rule returned ${zero_weight_status}, expected 500" >&2
+    return 1
+  fi
+  echo "zero-weight-only rule failed closed with HTTP ${zero_weight_status}" >> "$report"
 
   local down_status
   down_status="$(curl_status blackbox.example /down)"

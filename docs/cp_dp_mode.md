@@ -106,7 +106,25 @@ The `ConfigUpdate` proto message carries an `UpdateType` discriminator:
 
 `ConfigUpdate.trust_bundles_json` and `FullConfigResponse.trust_bundles_json` carry the serializable mesh `TrustBundleSet` used by gateway DPs for gateway-to-mesh SPIFFE TLS, or JSON `null` when the CP is explicitly clearing previously delivered trust material. The CP also emits `null` instead of "unchanged" when configured trust bundles fail semantic validation, so DPs revoke stale CP trust anchors rather than preserving them. The CP strips `GatewayConfig.trust_bundles` from DP-facing full snapshot JSON and uses only this side channel, preserving compatibility with older DPs whose config deserializer rejects unknown fields. An empty or missing side channel is treated as "unchanged" for mixed-version CP/DP rollouts. New DPs hot-swap this trust material into the gateway SVID slot when an SVID is loaded, restore startup file trust when the CP clears it, and also retain CP-delivered bundles separately when no local SVID is configured. Older DPs ignore the field.
 
-Gateway trust bundles are CP-level trust roots, not namespace-scoped resources. They are sent to every DP connected to that CP namespace; deployments that need tenant-isolated mesh trust roots should run separate CP/config-store instances. Built-in SQL and MongoDB config stores do not yet persist top-level `GatewayConfig.trust_bundles`, so their narrow trust-bundle poll reports `Unchanged` and preserves trust material supplied by the initial config load. Backends that add a dedicated trust-bundle storage shape must implement `load_gateway_trust_bundles()` with a narrow query or change detector rather than relying on full config reloads.
+#### Trust-bundle config-store capabilities
+
+This matrix covers persistence and change detection for the local, CP-authoritative top-level `GatewayConfig.trust_bundles` value. It does not describe the mesh federation runtime overlay discussed below.
+
+| Configuration source | Supplies `GatewayConfig.trust_bundles`? | Detects a runtime change? | Namespace-partitioned? |
+|---|---|---|---|
+| File (YAML/JSON) | Yes, through serde deserialization | Full file reload only (`SIGHUP` on Unix); no narrow trust-bundle poll | No |
+| PostgreSQL | No | No | No |
+| MySQL | No | No | No |
+| SQLite | No | No | No |
+| MongoDB | No | No | No |
+
+The built-in SQL and MongoDB stores persist gateway resources separately and have no storage shape or change detector for the top-level trust-bundle value. The former `GatewayTrustBundlePoll::Current` consumer was therefore unreachable and has been removed together with the unused database-backend poll hook. A future backend may reintroduce runtime updates only with dedicated persistence and a narrow query or change detector that can identify trust-bundle-only changes during ordinary incremental polling. It must return the authoritative current value, including an explicit clear, without performing a full gateway-config reload; validate before swapping; and broadcast the accepted value through `trust_bundles_json`. Namespace-aware distribution also requires a partitioned storage key and lookup rather than one CP-wide value.
+
+Trust bundles are currently CP-level and non-partitioned. A single-namespace CP can distribute its configured value to its DPs, but CPs in `Set` or `All` multi-namespace scope force the side channel to JSON `null` so trust roots cannot cross tenant boundaries. Tenant-isolated roots require separate CP and config-store instances. See the [CP namespace-tenancy protocol matrix](cp_namespace_tenancy.md#protocol-matrix) and the enforcement coverage in [`cp_multi_namespace_tests.rs`](../tests/integration/cp_multi_namespace_tests.rs).
+
+DP persistence is memory-only on every path: received bundles are stored in lock-free `ArcSwap` runtime state and are not written to disk or a database. A restarted DP must reconnect and fetch the value from its CP again.
+
+Federated remote-cluster roots have a separate runtime mechanism. The [mesh federation poller](../src/modes/mesh/federation.rs) fetches each configured federation endpoint at `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS` and overlays the validated result onto the `TrustBundleSet.federated` subset. That poller is independent of this local/CP-authoritative config-store matrix and its `trust_bundles_json` delivery path.
 
 DPs handle both types transparently: full snapshots replace the entire config; deltas are applied via `ProxyState::apply_incremental()` which patches the in-memory config and performs surgical cache updates.
 
