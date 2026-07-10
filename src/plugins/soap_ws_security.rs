@@ -25,14 +25,15 @@
 //!
 //! In addition to namespace-aware canonicalization, the X.509 path enforces
 //! that every signed `#id` Reference resolves to a
-//! UNIQUE XML id-bearing attribute across the whole envelope (see
-//! `count_wsu_id_occurrences`), rejecting any envelope carrying a duplicate id —
+//! UNIQUE decoded XML id-bearing attribute across the whole envelope (see
+//! `count_dom_id_occurrences`), rejecting any envelope carrying a duplicate id —
 //! the classic XSW vector where an attacker keeps the legitimately-signed
 //! element and injects a second element with the same id that the backend
 //! consumes. The duplicate scan includes WS-Security `wsu:Id` / prefixed `Id`,
 //! bare `Id`, and common alternative spellings (`xml:id`, `ID`, `id`) so
 //! backends with broader fragment-id rules fail closed instead of seeing a
-//! forwarded alternate referent. The SAML path retains its single-`<Assertion>`
+//! forwarded alternate referent. A raw-attribute scan remains as a second,
+//! independent guard. The SAML path retains its single-`<Assertion>`
 //! guard plus the Reference-URI-equals-assertion-id check. These structural
 //! checks remain defense-in-depth against a backend selecting a different
 //! same-local-name element than the gateway's namespace-aware resolver.
@@ -709,10 +710,7 @@ impl SoapWsSecurity {
     fn validate_x509_signature(&self, security_block: &str, envelope: &str) -> Result<(), String> {
         let document = Document::parse(envelope)
             .map_err(|e| format!("WS-Security: malformed SOAP XML: {}", e))?;
-        let security_node = document
-            .descendants()
-            .find(|node| node.has_tag_name("Security"))
-            .ok_or_else(|| "WS-Security: missing Security element".to_string())?;
+        let security_node = selected_security_node(&document, envelope, security_block)?;
         let sig_node = unique_child_element(security_node, "Signature", "WS-Security")?
             .ok_or_else(|| "WS-Security: missing Signature element".to_string())?;
         let signed_info_node = unique_child_element(sig_node, "SignedInfo", "WS-Security")?
@@ -875,6 +873,15 @@ impl SoapWsSecurity {
                         "WS-Security: referenced id '{}' is not unique in the envelope \
                          ({} occurrences) — possible XML signature wrapping",
                         ref_id, occurrences
+                    ));
+                }
+                let decoded_occurrences =
+                    count_dom_id_occurrences(security_node.document(), ref_id);
+                if decoded_occurrences != 1 {
+                    return Err(format!(
+                        "WS-Security: decoded referenced id '{}' is not unique in the envelope \
+                         ({} occurrences) — possible XML signature wrapping",
+                        ref_id, decoded_occurrences
                     ));
                 }
                 find_descendant_by_wsu_id(security_node, ref_id)
@@ -1047,8 +1054,11 @@ impl SoapWsSecurity {
         envelope: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<String>, String> {
-        let assertion = match find_element_block(security_block, "Assertion") {
-            Some(a) => a,
+        let document = Document::parse(envelope)
+            .map_err(|e| format!("WS-Security: malformed SAML SOAP XML: {}", e))?;
+        let security_node = selected_security_node(&document, envelope, security_block)?;
+        let assertion_node = match descendant_element(security_node, "Assertion") {
+            Some(assertion) => assertion,
             None => {
                 return if self.saml_enabled {
                     Err("WS-Security: missing SAML Assertion element".to_string())
@@ -1063,7 +1073,12 @@ impl SoapWsSecurity {
         // downstream consumers that walk all assertions could see an
         // identity we never verified. Cheap insurance — reject and let the
         // operator deal with malformed/multi-assertion messages explicitly.
-        if count_elements(envelope, "Assertion") > 1 {
+        if document
+            .descendants()
+            .filter(|node| node.has_tag_name("Assertion"))
+            .count()
+            > 1
+        {
             return Err(
                 "WS-Security: multiple SAML Assertion elements are not allowed".to_string(),
             );
@@ -1072,12 +1087,13 @@ impl SoapWsSecurity {
         // ── 1. Signature verification ─────────────────────────────────
         // Must run before any other check — every other field is
         // attacker-controlled until we know the IdP signed this assertion.
-        self.validate_saml_signature(envelope)?;
-        let assertion_without_signature = remove_envelope_signature(&assertion);
+        self.validate_saml_signature(assertion_node, envelope)?;
 
         // ── 2. Issuer trust ───────────────────────────────────────────
-        let issuer = find_element_text(&assertion_without_signature, "Issuer")
+        let issuer_node = unique_child_element(assertion_node, "Issuer", "WS-Security: SAML")?
             .ok_or_else(|| "WS-Security: SAML Assertion missing Issuer element".to_string())?;
+        let issuer = decoded_element_text(issuer_node)
+            .ok_or_else(|| "WS-Security: SAML Issuer is empty".to_string())?;
 
         if !self.saml_trusted_issuers.iter().any(|ti| ti == &issuer) {
             return Err(format!(
@@ -1087,11 +1103,13 @@ impl SoapWsSecurity {
         }
 
         // ── 3. Conditions: NotBefore / NotOnOrAfter / Audience ────────
-        if let Some(conditions) = find_element_block(&assertion_without_signature, "Conditions") {
+        if let Some(conditions) =
+            unique_child_element(assertion_node, "Conditions", "WS-Security: SAML")?
+        {
             let skew = chrono::Duration::seconds(self.saml_clock_skew_seconds as i64);
 
-            if let Some(not_before_str) = find_attribute(&conditions, "NotBefore") {
-                let not_before = parse_ws_datetime(&not_before_str).ok_or_else(|| {
+            if let Some(not_before_str) = conditions.attribute("NotBefore") {
+                let not_before = parse_ws_datetime(not_before_str).ok_or_else(|| {
                     format!("WS-Security: invalid SAML NotBefore '{}'", not_before_str)
                 })?;
                 if now + skew < not_before {
@@ -1099,8 +1117,8 @@ impl SoapWsSecurity {
                 }
             }
 
-            if let Some(not_on_or_after_str) = find_attribute(&conditions, "NotOnOrAfter") {
-                let not_on_or_after = parse_ws_datetime(&not_on_or_after_str).ok_or_else(|| {
+            if let Some(not_on_or_after_str) = conditions.attribute("NotOnOrAfter") {
+                let not_on_or_after = parse_ws_datetime(not_on_or_after_str).ok_or_else(|| {
                     format!(
                         "WS-Security: invalid SAML NotOnOrAfter '{}'",
                         not_on_or_after_str
@@ -1113,7 +1131,7 @@ impl SoapWsSecurity {
 
             if let Some(ref expected_audience) = self.saml_audience {
                 let Some(audience_restriction) =
-                    find_element_block(&conditions, "AudienceRestriction")
+                    descendant_element(conditions, "AudienceRestriction")
                 else {
                     return Err(
                         "WS-Security: SAML AudienceRestriction is required when audience is configured"
@@ -1121,10 +1139,13 @@ impl SoapWsSecurity {
                     );
                 };
 
-                let audience =
-                    find_element_text(&audience_restriction, "Audience").ok_or_else(|| {
-                        "WS-Security: AudienceRestriction missing Audience element".to_string()
-                    })?;
+                let audience_node =
+                    unique_child_element(audience_restriction, "Audience", "WS-Security: SAML")?
+                        .ok_or_else(|| {
+                            "WS-Security: AudienceRestriction missing Audience element".to_string()
+                        })?;
+                let audience = decoded_element_text(audience_node)
+                    .ok_or_else(|| "WS-Security: SAML Audience is empty".to_string())?;
 
                 if &audience != expected_audience {
                     return Err(format!(
@@ -1141,8 +1162,9 @@ impl SoapWsSecurity {
         }
 
         // ── 4. Extract Subject NameID for downstream identity use ─────
-        let name_id = find_element_block(&assertion_without_signature, "Subject")
-            .and_then(|subject| find_element_text(&subject, "NameID"));
+        let name_id = unique_child_element(assertion_node, "Subject", "WS-Security: SAML")?
+            .and_then(|subject| descendant_element(subject, "NameID"))
+            .and_then(decoded_element_text);
 
         debug!("soap_ws_security: SAML assertion validated successfully");
         Ok(name_id)
@@ -1160,13 +1182,11 @@ impl SoapWsSecurity {
     ///    matches a configured trusted IdP cert.
     /// 5. Verify `<SignatureValue>` over exclusive-canonicalized
     ///    `<SignedInfo>` using the matched cert's public key.
-    fn validate_saml_signature(&self, envelope: &str) -> Result<(), String> {
-        let document = Document::parse(envelope)
-            .map_err(|e| format!("WS-Security: malformed SAML SOAP XML: {}", e))?;
-        let assertion_node = document
-            .descendants()
-            .find(|node| node.has_tag_name("Assertion"))
-            .ok_or_else(|| "WS-Security: missing SAML Assertion element".to_string())?;
+    fn validate_saml_signature(
+        &self,
+        assertion_node: Node<'_, '_>,
+        envelope: &str,
+    ) -> Result<(), String> {
         let sig_node = unique_child_element(assertion_node, "Signature", "WS-Security: SAML")?
             .ok_or_else(|| "WS-Security: SAML Assertion missing Signature element".to_string())?;
         let signed_info_node = unique_child_element(sig_node, "SignedInfo", "WS-Security: SAML")?
@@ -1615,6 +1635,25 @@ fn node_source<'a>(xml: &'a str, node: Node<'_, '_>) -> Result<&'a str, String> 
         .ok_or_else(|| "WS-Security: XML parser returned an invalid source range".to_string())
 }
 
+fn selected_security_node<'a, 'input>(
+    document: &'a Document<'input>,
+    xml: &str,
+    selected_source: &str,
+) -> Result<Node<'a, 'input>, String> {
+    let header = document
+        .descendants()
+        .find(|node| node.has_tag_name("Header"))
+        .ok_or_else(|| "WS-Security: SOAP Header element could not be located".to_string())?;
+    header
+        .descendants()
+        .skip(1)
+        .filter(|node| node.has_tag_name("Security"))
+        .find(|node| node_source(xml, *node).is_ok_and(|source| source == selected_source))
+        .ok_or_else(|| {
+            "WS-Security: selected Security element could not be located in SOAP Header".to_string()
+        })
+}
+
 fn envelope_body_node<'a, 'input>(document: &'a Document<'input>) -> Option<Node<'a, 'input>> {
     document
         .descendants()
@@ -1634,6 +1673,21 @@ fn find_descendant_by_wsu_id<'a, 'input>(
                             && attribute.namespace() == Some(WSU_NAMESPACE_URI)))
             })
     })
+}
+
+fn count_dom_id_occurrences(document: &Document<'_>, id: &str) -> usize {
+    document
+        .descendants()
+        .filter(Node::is_element)
+        .flat_map(|node| node.attributes())
+        .filter(|attribute| {
+            attribute.value() == id && matches!(attribute.name(), "Id" | "ID" | "id")
+        })
+        .count()
+}
+
+fn decoded_element_text(node: Node<'_, '_>) -> Option<String> {
+    node.text().map(|text| text.trim().to_string())
 }
 
 fn parse_signed_info_canonicalization(
@@ -2045,20 +2099,6 @@ fn push_canonical_attribute_value(output: &mut String, value: &str) {
 /// Returns the full element including its content and closing tag.
 fn find_element_block(xml: &str, local_name: &str) -> Option<String> {
     find_element_block_from(xml, local_name, 0)
-}
-
-/// Count the number of (top-level-scan) occurrences of an element by local
-/// name. Walks the same cursor pattern as the Reference-digest loop so
-/// nested same-named elements aren't double-counted.
-fn count_elements(xml: &str, local_name: &str) -> usize {
-    let mut count = 0usize;
-    let mut search_from = 0;
-    while let Some((_, next_start)) = find_element_block_from_with_end(xml, local_name, search_from)
-    {
-        count += 1;
-        search_from = next_start.max(search_from + 1);
-    }
-    count
 }
 
 /// Find an element block by local name, starting from a given byte offset.
@@ -2766,6 +2806,7 @@ fn extract_saml_signing_cert(sig_block: &str) -> Result<Vec<u8>, String> {
 /// (then-empty) Signature placeholder excised, so the verifier has to remove
 /// it too. For SAML assertions there is exactly one Signature child, so
 /// taking the first `<Signature>` match is correct.
+#[cfg(test)]
 fn remove_envelope_signature(xml: &str) -> String {
     let Some((block, end)) = find_element_block_from_with_end(xml, "Signature", 0) else {
         return xml.to_string();

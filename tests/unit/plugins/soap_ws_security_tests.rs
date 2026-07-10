@@ -1417,6 +1417,33 @@ async fn test_saml_valid_signed_assertion_accepted() {
 }
 
 #[tokio::test]
+async fn test_saml_decodes_signed_authorization_fields_from_verified_dom() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let assertion = saml_fixtures::AssertionBuilder::new(
+        "_assertion-entities",
+        "https://idp.example.com&#x2f;metadata",
+        "alice&#x40;example.com",
+    )
+    .build();
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "signed entity-encoded SAML fields should pass, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata.get("soap_ws_saml_subject").map(String::as_str),
+        Some("alice@example.com")
+    );
+}
+
+#[tokio::test]
 async fn test_saml_missing_signature_rejects() {
     let bundle = saml_fixtures::IdpBundle::new();
     let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
@@ -2396,6 +2423,76 @@ mod x509_roundtrip {
             }
             other => panic!("expected Reject for duplicate wsu:Id, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn entity_encoded_id_and_raw_duplicate_are_rejected_as_wrapping() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+
+        let entity_encoded =
+            build_signed_soap_envelope(&cert).replace("wsu:Id=\"TS-1\"", "wsu:Id=\"TS&#x2D;1\"");
+        let wrapped = entity_encoded.replace(
+            "<soap:Body>",
+            "<soap:Body><Injected wsu:Id=\"TS-1\" \
+             xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\">attacker</Injected>",
+        );
+        let mut ctx = make_ctx_with_soap_body(&wrapped);
+        let mut headers = soap_headers();
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(is_reject(&result));
+        assert!(
+            reject_body(&result).contains("not unique"),
+            "decoded duplicate ID must fail the XSW guard: {}",
+            reject_body(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn x509_verification_is_scoped_to_selected_soap_header_security() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let mut config = x509_plugin_config(cert_file.path());
+        config["x509_signature"]["require_signed_timestamp"] = json!(false);
+        let plugin = SoapWsSecurity::new(&config).unwrap();
+
+        let valid = build_signed_soap_envelope(&cert);
+        let security_start = valid.find("<wsse:Security").expect("Security start");
+        let security_end = valid[security_start..]
+            .find("</wsse:Security>")
+            .map(|offset| security_start + offset + "</wsse:Security>".len())
+            .expect("Security end");
+        let signed_security = &valid[security_start..security_end];
+        let signature_start = signed_security
+            .find("<Signature ")
+            .expect("Signature start");
+        let signature_end = signed_security[signature_start..]
+            .find("</Signature>")
+            .map(|offset| signature_start + offset + "</Signature>".len())
+            .expect("Signature end");
+        let mut unsigned_security = signed_security.to_string();
+        unsigned_security.replace_range(signature_start..signature_end, "");
+        unsigned_security = unsigned_security.replace("wsu:Id=\"TS-1\"", "wsu:Id=\"TS-actual\"");
+        let header_unsigned = valid.replacen(signed_security, &unsigned_security, 1);
+        let body = header_unsigned.replacen(
+            "<soap:Header>",
+            &format!("{}<soap:Header>", signed_security),
+            1,
+        );
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(is_reject(&result));
+        assert!(
+            reject_body(&result).contains("missing Signature"),
+            "pre-header signed Security must not satisfy header verification: {}",
+            reject_body(&result)
+        );
     }
 
     #[tokio::test]
