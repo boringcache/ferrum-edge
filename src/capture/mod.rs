@@ -2344,17 +2344,17 @@ mod tests {
         // chain-existence guard (issue #2084) rather than the first `; then`.
         let a_active_probe =
             format!("-C OUTPUT -p udp -j {UDP_FAIL_CLOSED_CHAIN_A} 2>/dev/null; then\n");
-        let then_block = script
+        let active_branch = script
             .split_once(a_active_probe.as_str())
-            .and_then(|(_, rest)| rest.split_once("\nelse\n").map(|(block, _)| block))
+            .map(|(_, rest)| rest)
             .expect("alternating guard switch");
-        let build_replacement = then_block
+        let build_replacement = active_branch
             .find(&format!("-F {UDP_FAIL_CLOSED_CHAIN_B}"))
             .expect("replacement guard is populated");
-        let insert_replacement = then_block
+        let insert_replacement = active_branch
             .find(&format!("-I OUTPUT 1 -p udp -j {UDP_FAIL_CLOSED_CHAIN_B}"))
             .expect("replacement guard is activated");
-        let remove_previous = then_block
+        let remove_previous = active_branch
             .find(&format!("-D OUTPUT -p udp -j {UDP_FAIL_CLOSED_CHAIN_A}"))
             .expect("previous guard is removed");
         assert!(build_replacement < insert_replacement && insert_replacement < remove_previous);
@@ -3810,12 +3810,24 @@ iptables() {{
         // v6 table teardown guarded behind the ip6tables (mangle) probe...
         assert!(script.contains("command -v ip6tables") && script.contains("ip6tables -t mangle"));
         for chain in [UDP_FAIL_CLOSED_CHAIN_A, UDP_FAIL_CLOSED_CHAIN_B] {
+            let existence_probe = format!(
+                "if iptables -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -S {chain} >/dev/null 2>&1"
+            );
+            let jump_release = format!(
+                "while true; do\n    if iptables -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} \
+                 -C OUTPUT -p udp -j {chain}"
+            );
+            let existence_idx = script
+                .find(&existence_probe)
+                .unwrap_or_else(|| panic!("teardown must probe v4 guard chain {chain}: {script}"));
+            let release_idx = script.find(&jump_release).unwrap_or_else(|| {
+                panic!(
+                    "teardown must loop over every duplicate v4 guard jump for {chain}: {script}"
+                )
+            });
             assert!(
-                script.contains(&format!(
-                    "while true; do\n  if iptables -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} \
-                     -C OUTPUT -p udp -j {chain}"
-                )),
-                "teardown must loop over every duplicate v4 guard jump for {chain}: {script}"
+                existence_idx < release_idx,
+                "teardown must establish v4 guard-chain existence before probing its jump for {chain}: {script}"
             );
         }
         assert!(
