@@ -1403,6 +1403,7 @@ fn reverse_translate(
         // Empty only when the CP emitted no carrier (older Ferrum-shaped xDS
         // CP) or the slice genuinely has no workloads.
         workloads: recovered.workloads,
+        ambient_udp_source_workloads: recovered.ambient_udp_source_workloads,
         node_waypoint_assertors: recovered.node_waypoint_assertors,
         services,
         // Inbound-only un-narrowed local services recovered from the dedicated
@@ -1560,6 +1561,7 @@ struct RecoveredSliceCarriers {
     labels: Option<BTreeMap<String, String>>,
     labels_ambiguous: bool,
     workloads: Vec<crate::modes::mesh::config::Workload>,
+    ambient_udp_source_workloads: Vec<crate::modes::mesh::config::Workload>,
     node_waypoint_assertors: Vec<crate::identity::spiffe::SpiffeId>,
     mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
     virtual_service_cors_policies: Vec<crate::modes::mesh::config::MeshVirtualServiceCorsPolicy>,
@@ -1792,6 +1794,9 @@ fn apply_recovered_carrier(
             recovered.declared_ingress_http_ports = value
         }
         MeshSliceCarrier::Workloads(value) => recovered.workloads = value,
+        MeshSliceCarrier::AmbientUdpSourceWorkloads(value) => {
+            recovered.ambient_udp_source_workloads = value
+        }
         MeshSliceCarrier::NodeWaypointAssertors(value) => recovered.node_waypoint_assertors = value,
         MeshSliceCarrier::WorkloadLabels(value) => recovered.labels = Some(value),
         MeshSliceCarrier::LabelsAmbiguous(value) => recovered.labels_ambiguous = value,
@@ -4218,6 +4223,7 @@ mod tests {
             version: "v1".to_string(),
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
             workloads: vec![workload.clone()],
+            ambient_udp_source_workloads: vec![workload.clone()],
             node_waypoint_assertors: vec![
                 SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint")
                     .expect("node waypoint spiffe id"),
@@ -4380,6 +4386,10 @@ mod tests {
         assert_eq!(recovered.trust_bundles, native.trust_bundles);
         assert_eq!(recovered.proxy_configs, native.proxy_configs);
         assert_eq!(recovered.workloads, native.workloads);
+        assert_eq!(
+            recovered.ambient_udp_source_workloads,
+            native.ambient_udp_source_workloads
+        );
         assert_eq!(
             recovered.node_waypoint_assertors,
             native.node_waypoint_assertors

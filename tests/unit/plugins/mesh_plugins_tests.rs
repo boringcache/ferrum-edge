@@ -125,6 +125,26 @@ fn ambient_udp_request_context(peer: &str, baggage: Option<&str>) -> RequestCont
 }
 
 fn ambient_udp_source_scoping_slice() -> MeshSlice {
+    let workload = Workload {
+        spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/client").expect("spiffe"),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "api".to_string())]),
+            namespace: None,
+        },
+        service_name: "api".to_string(),
+        addresses: vec!["10.0.0.20".to_string()],
+        ports: Vec::new(),
+        trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+        namespace: "default".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("client".to_string()),
+        pod_uid: Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string()),
+        node_waypoint: None,
+        remote_provenance: false,
+    };
     MeshSlice {
         namespace: "default".to_string(),
         mesh_policies: vec![
@@ -140,27 +160,8 @@ fn ambient_udp_source_scoping_slice() -> MeshSlice {
             ),
             policy_with_scope("mesh-allow", PolicyScope::MeshWide, PolicyAction::Allow),
         ],
-        workloads: vec![Workload {
-            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/client")
-                .expect("spiffe"),
-            selector: WorkloadSelector {
-                labels: HashMap::from([("app".to_string(), "api".to_string())]),
-                namespace: None,
-            },
-            service_name: "api".to_string(),
-            addresses: vec!["10.0.0.20".to_string()],
-            ports: Vec::new(),
-            trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
-            namespace: "default".to_string(),
-            network: None,
-            cluster: None,
-            weight: None,
-            locality: None,
-            service_account: Some("client".to_string()),
-            pod_uid: Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string()),
-            node_waypoint: None,
-            remote_provenance: false,
-        }],
+        workloads: vec![workload.clone()],
+        ambient_udp_source_workloads: vec![workload],
         ..MeshSlice::default()
     }
 }
@@ -730,6 +731,22 @@ async fn mesh_authz_ambient_udp_rejects_principal_pod_mismatch_as_scope_evidence
         ctx.metadata
             .get("mesh_authz.ignored_udp_source_scope")
             .map(String::as_str),
+        Some("principal_pod_mismatch")
+    );
+
+    let metrics = WorkloadMetrics::new(&json!({})).expect("metrics config");
+    let mut headers = std::mem::take(&mut ctx.headers);
+    let metrics_result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(metrics_result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/ferrum-system/sa/ztunnel"),
+        "downstream telemetry must use the authenticated peer after authz rejects the evidence"
+    );
+    assert_eq!(
+        ctx.metadata.get("mesh.ignored_baggage").map(String::as_str),
         Some("principal_pod_mismatch")
     );
 }

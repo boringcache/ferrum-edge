@@ -64,6 +64,8 @@ use crate::plugins::{
     StreamConnectionContext, priority,
 };
 
+pub(crate) const IGNORED_UDP_SOURCE_SCOPE_METADATA: &str = "mesh_authz.ignored_udp_source_scope";
+
 pub struct MeshAuthz {
     slice: MeshSlice,
     /// Unfiltered policy superset used only for Ambient UDP CONNECTs carrying
@@ -964,7 +966,7 @@ fn ambient_udp_source_scope_index(
 ) -> HashMap<[u8; 16], crate::modes::mesh::runtime::PolicyScopeCache> {
     let mut scopes = HashMap::new();
     let mut ambiguous = HashSet::new();
-    for workload in &slice.workloads {
+    for workload in &slice.ambient_udp_source_workloads {
         let Some(raw_uid) = workload.pod_uid.as_deref() else {
             continue;
         };
@@ -1729,7 +1731,7 @@ impl Plugin for MeshAuthz {
                     Ok(scope) => scope,
                     Err(reason) => {
                         ctx.metadata.insert(
-                            "mesh_authz.ignored_udp_source_scope".to_string(),
+                            IGNORED_UDP_SOURCE_SCOPE_METADATA.to_string(),
                             reason.to_string(),
                         );
                         // The asserted principal and pod UID are one evidence

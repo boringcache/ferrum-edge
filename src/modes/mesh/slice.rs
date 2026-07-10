@@ -203,6 +203,12 @@ pub struct MeshSlice {
     pub version: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workloads: Vec<Workload>,
+    /// Workloads eligible to bind trusted Ambient UDP `source.pod_uid`
+    /// evidence. Kept separate from `workloads` because ServiceWaypoint narrows
+    /// that field to destination backends, while a source pod normally is not a
+    /// backend of the service whose waypoint terminates its HBONE datagram.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ambient_udp_source_workloads: Vec<Workload>,
     /// Exact NodeWaypoint SPIFFE IDs trusted to assert HBONE source workload
     /// identity for this slice. Unlike `workloads`, this inventory is derived
     /// from scope-authorized `Workload.node_waypoint` endpoints before
@@ -471,6 +477,7 @@ impl MeshSlice {
             // to) its local labels; omitting it would keep the stale precedence.
             && self.labels_ambiguous == other.labels_ambiguous
             && self.workloads == other.workloads
+            && self.ambient_udp_source_workloads == other.ambient_udp_source_workloads
             && self.node_waypoint_assertors == other.node_waypoint_assertors
             && self.services == other.services
             && self.local_inbound_services == other.local_inbound_services
@@ -772,21 +779,25 @@ impl MeshSlice {
         // plugin tolerates the resulting superset at construction — see
         // `validate_scope_filter_identity` — and its cold-path `retain` does the
         // precise per-proxy narrowing.)
+        let ambient_udp_source_workloads: Vec<Workload> = if request.ambient_udp_source_scoping {
+            workloads
+                .iter()
+                .filter(|workload| workload.pod_uid.is_some())
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let ambient_udp_policy_candidates: Vec<(String, BTreeMap<String, String>)> =
-            if request.ambient_udp_source_scoping {
-                workloads
-                    .iter()
-                    .filter(|workload| workload.pod_uid.is_some())
-                    .map(|workload| {
-                        (
-                            workload.namespace.clone(),
-                            labels_to_btree(&workload.selector.labels),
-                        )
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            ambient_udp_source_workloads
+                .iter()
+                .map(|workload| {
+                    (
+                        workload.namespace.clone(),
+                        labels_to_btree(&workload.selector.labels),
+                    )
+                })
+                .collect();
         let policy_candidate_labels: Vec<&BTreeMap<String, String>> = if request.labels.is_empty() {
             if candidate_label_sets.is_empty() {
                 vec![&effective_labels]
@@ -1227,6 +1238,7 @@ impl MeshSlice {
             labels_ambiguous,
             version,
             workloads,
+            ambient_udp_source_workloads,
             node_waypoint_assertors,
             services,
             local_inbound_services,
@@ -2991,19 +3003,25 @@ mod tests {
 
     #[test]
     fn ambient_udp_slice_keeps_cross_namespace_source_policy_candidates() {
-        let mut workload = make_workload(
+        let mut destination = make_workload(
             "default",
             "reviews",
             HashMap::from([("app".into(), "reviews".into())]),
         );
-        workload.pod_uid = Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".into());
-        let workload_id = workload.spiffe_id.clone();
+        destination.pod_uid = Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".into());
+        let destination_id = destination.spiffe_id.clone();
+        let mut source = make_workload(
+            "default",
+            "client",
+            HashMap::from([("app".into(), "client".into())]),
+        );
+        source.pod_uid = Some("16b2c3d4-9dad-11d1-80b4-00c04fd430c8".into());
         let mesh = MeshConfig {
-            workloads: vec![workload],
+            workloads: vec![destination, source],
             services: vec![make_service_with_workload_refs(
                 "default",
                 "reviews",
-                vec![workload_id],
+                vec![destination_id],
             )],
             mesh_policies: vec![make_policy(
                 "default-source-policy",
@@ -3036,6 +3054,15 @@ mod tests {
         );
 
         assert_eq!(slice.workloads.len(), 1);
+        assert_eq!(slice.workloads[0].service_name, "reviews");
+        assert_eq!(slice.ambient_udp_source_workloads.len(), 2);
+        assert!(
+            slice
+                .ambient_udp_source_workloads
+                .iter()
+                .any(|workload| workload.service_name == "client"),
+            "source scope inventory must survive destination-workload narrowing"
+        );
         assert_eq!(slice.mesh_policies.len(), 1);
         assert_eq!(slice.mesh_policies[0].name, "default-source-policy");
     }
@@ -3201,6 +3228,7 @@ mod tests {
             labels_ambiguous: false,
             version: "v1".into(),
             workloads: vec![make_workload("ns", "web", HashMap::new())],
+            ambient_udp_source_workloads: Vec::new(),
             node_waypoint_assertors: Vec::new(),
             services: vec![make_service("ns", "web")],
             local_inbound_services: Vec::new(),
@@ -3257,6 +3285,15 @@ mod tests {
         };
         let b = MeshSlice::default();
         assert!(!a.content_eq(&b));
+    }
+
+    #[test]
+    fn content_eq_detects_ambient_udp_source_workloads_change() {
+        let a = MeshSlice {
+            ambient_udp_source_workloads: vec![make_workload("ns", "client", HashMap::new())],
+            ..MeshSlice::default()
+        };
+        assert!(!a.content_eq(&MeshSlice::default()));
     }
 
     #[test]

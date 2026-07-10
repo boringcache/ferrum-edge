@@ -95,6 +95,9 @@ pub const FERRUM_ECDS_SIDECAR_INGRESS_DECLARED_PORTS_TYPE_URL: &str =
 /// Inner `type_url` for the per-pod workload / endpoint carrier.
 pub const FERRUM_ECDS_WORKLOADS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.WorkloadsCarrier";
+/// Inner `type_url` for the Ambient UDP source-evidence workload inventory.
+pub const FERRUM_ECDS_AMBIENT_UDP_SOURCE_WORKLOADS_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.AmbientUdpSourceWorkloadsCarrier";
 /// Inner `type_url` for the exact NodeWaypoint assertor SPIFFE inventory.
 pub const FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.NodeWaypointAssertorsCarrier";
@@ -169,6 +172,7 @@ pub enum MeshSliceCarrier {
     /// otherwise); see [`FERRUM_ECDS_SIDECAR_INGRESS_DECLARED_PORTS_TYPE_URL`].
     SidecarIngressDeclaredPorts(usize),
     Workloads(Vec<Workload>),
+    AmbientUdpSourceWorkloads(Vec<Workload>),
     NodeWaypointAssertors(Vec<SpiffeId>),
     WorkloadLabels(BTreeMap<String, String>),
     /// Marker: `WorkloadLabels` is an ambiguous shared-SPIFFE intersection, not
@@ -209,6 +213,9 @@ impl MeshSliceCarrier {
                 FERRUM_ECDS_SIDECAR_INGRESS_DECLARED_PORTS_TYPE_URL
             }
             MeshSliceCarrier::Workloads(_) => FERRUM_ECDS_WORKLOADS_TYPE_URL,
+            MeshSliceCarrier::AmbientUdpSourceWorkloads(_) => {
+                FERRUM_ECDS_AMBIENT_UDP_SOURCE_WORKLOADS_TYPE_URL
+            }
             MeshSliceCarrier::NodeWaypointAssertors(_) => {
                 FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL
             }
@@ -240,6 +247,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::SidecarIngressDeclared(_) => "sidecar-ingress-declared",
             MeshSliceCarrier::SidecarIngressDeclaredPorts(_) => "sidecar-ingress-declared-ports",
             MeshSliceCarrier::Workloads(_) => "workloads",
+            MeshSliceCarrier::AmbientUdpSourceWorkloads(_) => "ambient-udp-source-workloads",
             MeshSliceCarrier::NodeWaypointAssertors(_) => "node-waypoint-assertors",
             MeshSliceCarrier::WorkloadLabels(_) => "workload-labels",
             MeshSliceCarrier::LabelsAmbiguous(_) => "workload-labels-ambiguous",
@@ -268,6 +276,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::SidecarIngressDeclared(value) => encode(value),
             MeshSliceCarrier::SidecarIngressDeclaredPorts(value) => encode(value),
             MeshSliceCarrier::Workloads(value) => encode(value),
+            MeshSliceCarrier::AmbientUdpSourceWorkloads(value) => encode(value),
             MeshSliceCarrier::NodeWaypointAssertors(value) => encode(value),
             MeshSliceCarrier::WorkloadLabels(value) => encode(value),
             MeshSliceCarrier::LabelsAmbiguous(value) => encode(value),
@@ -317,6 +326,9 @@ impl MeshSliceCarrier {
                 MeshSliceCarrier::SidecarIngressDeclaredPorts(decode_json(value)?)
             }
             FERRUM_ECDS_WORKLOADS_TYPE_URL => MeshSliceCarrier::Workloads(decode_json(value)?),
+            FERRUM_ECDS_AMBIENT_UDP_SOURCE_WORKLOADS_TYPE_URL => {
+                MeshSliceCarrier::AmbientUdpSourceWorkloads(decode_json(value)?)
+            }
             FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL => {
                 MeshSliceCarrier::NodeWaypointAssertors(decode_json(value)?)
             }
@@ -384,6 +396,9 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
             Some("ferrum-mesh-carrier/sidecar-ingress-declared-ports")
         }
         FERRUM_ECDS_WORKLOADS_TYPE_URL => Some("ferrum-mesh-carrier/workloads"),
+        FERRUM_ECDS_AMBIENT_UDP_SOURCE_WORKLOADS_TYPE_URL => {
+            Some("ferrum-mesh-carrier/ambient-udp-source-workloads")
+        }
         FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL => {
             Some("ferrum-mesh-carrier/node-waypoint-assertors")
         }
@@ -477,6 +492,11 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
     if !slice.workloads.is_empty() {
         carriers.push(MeshSliceCarrier::Workloads(slice.workloads.clone()));
     }
+    if !slice.ambient_udp_source_workloads.is_empty() {
+        carriers.push(MeshSliceCarrier::AmbientUdpSourceWorkloads(
+            slice.ambient_udp_source_workloads.clone(),
+        ));
+    }
     if !slice.node_waypoint_assertors.is_empty() {
         carriers.push(MeshSliceCarrier::NodeWaypointAssertors(
             slice.node_waypoint_assertors.clone(),
@@ -567,6 +587,9 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
             slice.declared_ingress_http_ports = value
         }
         MeshSliceCarrier::Workloads(value) => slice.workloads = value,
+        MeshSliceCarrier::AmbientUdpSourceWorkloads(value) => {
+            slice.ambient_udp_source_workloads = value
+        }
         MeshSliceCarrier::NodeWaypointAssertors(value) => slice.node_waypoint_assertors = value,
         MeshSliceCarrier::WorkloadLabels(value) => slice.labels = value,
         MeshSliceCarrier::LabelsAmbiguous(value) => slice.labels_ambiguous = value,
@@ -689,6 +712,7 @@ mod tests {
             MeshSliceCarrier::SidecarIngressDeclared(true),
             MeshSliceCarrier::SidecarIngressDeclaredPorts(2),
             MeshSliceCarrier::Workloads(Vec::new()),
+            MeshSliceCarrier::AmbientUdpSourceWorkloads(Vec::new()),
             MeshSliceCarrier::NodeWaypointAssertors(vec![
                 SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint").unwrap(),
             ]),
@@ -782,6 +806,7 @@ mod tests {
             MeshSliceCarrier::SidecarIngressDeclared(true),
             MeshSliceCarrier::SidecarIngressDeclaredPorts(2),
             MeshSliceCarrier::Workloads(Vec::new()),
+            MeshSliceCarrier::AmbientUdpSourceWorkloads(Vec::new()),
             MeshSliceCarrier::NodeWaypointAssertors(vec![
                 SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint").unwrap(),
             ]),
