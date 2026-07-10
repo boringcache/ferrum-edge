@@ -324,7 +324,7 @@ impl Plugin for PriorityOverridePlugin {
     }
     async fn on_response_stream_terminated(
         &self,
-        ctx: &RequestContext,
+        ctx: &mut RequestContext,
         response_status: u16,
         outcome: &crate::proxy::deferred_log::BodyOutcome,
     ) {

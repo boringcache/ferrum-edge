@@ -2316,16 +2316,9 @@ where
     // for this H3-client → non-H3-backend response. Without this, an H3 client
     // hitting an HTTP/1/2 SSE backend would stream uninspected. Chain every
     // opted-in plugin, gated to the response status.
-    let response_inspector = if plugins.iter().any(|p| p.requires_response_stream_hooks()) {
-        let content_type = response_headers.get("content-type").map(String::as_str);
-        let inspectors: Vec<_> = plugins
-            .iter()
-            .filter_map(|p| p.response_stream_inspector(&*ctx, status, content_type))
-            .collect();
-        crate::plugins::chain_response_stream_inspectors(inspectors)
-    } else {
-        None
-    };
+    let content_type = response_headers.get("content-type").map(String::as_str);
+    let response_inspector =
+        crate::plugins::create_response_stream_inspector(plugins, ctx, status, content_type);
     // Strip Content-Length when inspecting — the inspector transforms the body, so
     // the backend's declared length no longer matches what we send.
     if response_inspector.is_some() {
