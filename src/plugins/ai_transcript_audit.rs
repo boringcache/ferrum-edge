@@ -628,6 +628,23 @@ impl AiTranscriptAudit {
         }
     }
 
+    fn stream_fail_closed_rejection(&self, ctx: &mut RequestContext) -> Option<PluginResult> {
+        if !flag(&ctx.metadata, MD_CANDIDATE) || !flag(&ctx.metadata, MD_STREAM_REQUEST) {
+            return None;
+        }
+        let sink_unhealthy_reject = self.on_sink_error == SinkErrorPolicy::Reject
+            && !self.sink_healthy.load(Ordering::Relaxed);
+        let buffer_full_reject = self.on_buffer_full == BufferFullPolicy::Reject
+            && self.logger.queue_depth() >= self.logger.buffer_capacity();
+        if sink_unhealthy_reject || buffer_full_reject {
+            ctx.metadata
+                .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
+            Some(reject_audit_unavailable())
+        } else {
+            None
+        }
+    }
+
     fn sweep_staging(&self) {
         if self.staging.len() < STAGING_SWEEP_THRESHOLD {
             return;
@@ -1155,6 +1172,9 @@ impl Plugin for AiTranscriptAudit {
         };
         self.stage_candidate(ctx, body.as_bytes());
         ctx.metadata.insert("request_body".to_string(), body);
+        if let Some(result) = self.stream_fail_closed_rejection(ctx) {
+            return result;
+        }
         PluginResult::Continue
     }
 
@@ -1196,6 +1216,9 @@ impl Plugin for AiTranscriptAudit {
             return PluginResult::Continue;
         }
         self.stage_candidate(ctx, body);
+        if let Some(result) = self.stream_fail_closed_rejection(ctx) {
+            return result;
+        }
         PluginResult::Continue
     }
 
@@ -1510,8 +1533,9 @@ impl Plugin for AiTranscriptAudit {
             return;
         }
 
-        // A response already being streamed cannot be rejected, so the
-        // fail-closed sink stance only applies to buffered responses.
+        // A response already being streamed cannot be rejected. Fail-closed
+        // stream requests are preflighted before backend dispatch; this
+        // termination hook only emits the completed audit record.
         let (excerpt, truncated, hash) = if downstream_terminated {
             (None, true, None)
         } else {

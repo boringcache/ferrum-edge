@@ -2857,6 +2857,74 @@ async fn non_retryable_sink_4xx_marks_sink_unhealthy_under_reject() {
 }
 
 #[tokio::test]
+async fn stream_true_request_rejects_when_sink_unhealthy_fail_closed() {
+    // A streaming response cannot be replaced after headers are committed, so
+    // fail-closed sink health must be enforced at request classification time
+    // for client-controlled `stream:true` AI requests.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let config = json!({
+        "sink": {
+            "type": "http",
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+            "on_sink_error": "reject"
+        }
+    });
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    let headers = json_headers();
+
+    let mut saw_unhealthy_reject = false;
+    for _ in 0..100 {
+        let mut ctx = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        let _ = plugin
+            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut stream_ctx = make_ctx();
+        let result = plugin
+            .on_final_request_body_with_context(
+                &mut stream_ctx,
+                &headers,
+                br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+            )
+            .await;
+        if matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ) {
+            assert_eq!(
+                stream_ctx
+                    .metadata
+                    .get("ai_transcript_audit.sink_status")
+                    .map(String::as_str),
+                Some("rejected")
+            );
+            saw_unhealthy_reject = true;
+            break;
+        }
+    }
+
+    assert!(
+        saw_unhealthy_reject,
+        "stream:true AI requests must fail closed once the sink is unhealthy"
+    );
+}
+
+#[tokio::test]
 async fn sink_2xx_after_4xx_restores_health() {
     // Recovery stays on the probe model: once the collector answers 2xx again,
     // the flushed probe records flip sink_healthy back and rejects stop.
