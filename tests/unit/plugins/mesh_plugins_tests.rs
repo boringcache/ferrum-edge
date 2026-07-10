@@ -618,6 +618,10 @@ async fn mesh_authz_ambient_udp_retains_identical_duplicate_pod_scopes() {
 #[tokio::test]
 async fn mesh_authz_ambient_udp_suppresses_conflicting_duplicate_pod_scopes() {
     let mut slice = ambient_udp_source_scoping_slice();
+    let mut stale_principal_deny = allow_client_policy(PolicyAction::Deny);
+    stale_principal_deny.name = "stale-principal-deny".to_string();
+    stale_principal_deny.scope = PolicyScope::MeshWide;
+    slice.mesh_policies.push(stale_principal_deny);
     let mut conflicting = slice.workloads[0].clone();
     conflicting.selector.labels = HashMap::from([("app".to_string(), "other".to_string())]);
     slice.workloads.push(conflicting);
@@ -637,7 +641,7 @@ async fn mesh_authz_ambient_udp_suppresses_conflicting_duplicate_pod_scopes() {
 
     assert!(
         matches!(result, PluginResult::Continue),
-        "conflicting pod evidence must fall back to mesh-wide-only evaluation, got {result:?}"
+        "conflicting pod evidence must use the gateway peer for mesh-wide evaluation, got {result:?}"
     );
     assert_eq!(
         ctx.metadata
@@ -697,8 +701,15 @@ async fn mesh_authz_ambient_udp_untrusted_stamp_cannot_activate_scoped_policy() 
 
 #[tokio::test]
 async fn mesh_authz_ambient_udp_rejects_principal_pod_mismatch_as_scope_evidence() {
+    let mut slice = ambient_udp_source_scoping_slice();
+    let mut stale_principal_deny = allow_client_policy(PolicyAction::Deny);
+    stale_principal_deny.name = "stale-principal-deny".to_string();
+    stale_principal_deny.scope = PolicyScope::MeshWide;
+    stale_principal_deny.rules[0].from[0].spiffe_id_pattern =
+        Some("spiffe://cluster.local/ns/default/sa/other".to_string());
+    slice.mesh_policies.push(stale_principal_deny);
     let plugin = MeshAuthz::new(&json!({
-        "mesh_slice": ambient_udp_source_scoping_slice(),
+        "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
     }))
     .expect("plugin config");
@@ -711,7 +722,10 @@ async fn mesh_authz_ambient_udp_rejects_principal_pod_mismatch_as_scope_evidence
 
     let result = plugin.authorize(&mut ctx).await;
 
-    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "mismatched evidence must discard the asserted principal before mesh-wide evaluation, got {result:?}"
+    );
     assert_eq!(
         ctx.metadata
             .get("mesh_authz.ignored_udp_source_scope")

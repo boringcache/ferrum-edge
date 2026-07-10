@@ -793,7 +793,15 @@ impl CpGrpcServer {
                 &policy.scope,
                 namespace,
                 &istio_root_namespace,
-            )
+            ) || (request.ambient_udp_source_scoping
+                && visible_namespaces.iter().any(|candidate_namespace| {
+                    Self::policy_scope_can_apply_to_namespace(
+                        &policy.namespace,
+                        &policy.scope,
+                        candidate_namespace,
+                        &istio_root_namespace,
+                    )
+                }))
         });
         mesh.peer_authentications.retain(|policy| {
             Self::peer_auth_can_apply_to_namespace(policy, namespace, &istio_root_namespace)
@@ -2390,6 +2398,14 @@ mod tests {
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
                 services: vec![service],
+                mesh_policies: vec![crate::modes::mesh::config::MeshPolicy {
+                    name: "default-source-policy".to_string(),
+                    namespace: "default".to_string(),
+                    scope: PolicyScope::Namespace {
+                        namespace: "default".to_string(),
+                    },
+                    rules: Vec::new(),
+                }],
                 waypoint_bindings: vec![MeshWaypointBinding {
                     name: "waypoint".to_string(),
                     namespace: "infra".to_string(),
@@ -2406,12 +2422,20 @@ mod tests {
         let request = MeshSliceRequest {
             namespace: "infra".to_string(),
             waypoint_name: Some("waypoint".to_string()),
+            ambient_udp_source_scoping: true,
             ..MeshSliceRequest::default()
         };
 
         let mesh_config = CpGrpcServer::filter_config_to_mesh_request_for_scope(
             &config,
             &request,
+            &CpScope::Single("infra".to_string()),
+        );
+        let mut request_without_udp_scoping = request.clone();
+        request_without_udp_scoping.ambient_udp_source_scoping = false;
+        let mesh_config_without_udp_scoping = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &config,
+            &request_without_udp_scoping,
             &CpScope::Single("infra".to_string()),
         );
         let strict_config = CpGrpcServer::filter_config_to_namespace(&config, "infra");
@@ -2425,6 +2449,16 @@ mod tests {
         assert_eq!(mesh.waypoint_bindings.len(), 1);
         assert_eq!(mesh.waypoint_bindings[0].services.len(), 1);
         assert_eq!(mesh.waypoint_bindings[0].services[0].namespace, "default");
+        assert_eq!(mesh.mesh_policies.len(), 1);
+        assert_eq!(mesh.mesh_policies[0].name, "default-source-policy");
+        assert!(
+            mesh_config_without_udp_scoping
+                .mesh
+                .expect("mesh request view should retain mesh")
+                .mesh_policies
+                .is_empty(),
+            "cross-namespace source policies require the explicit Ambient UDP scoping request"
+        );
         assert!(
             strict_config
                 .mesh

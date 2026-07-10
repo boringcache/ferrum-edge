@@ -1194,14 +1194,14 @@ impl MeshAuthz {
         ctx: &RequestContext,
         source_principal: Option<&SpiffeId>,
         port: Option<u16>,
-        source_ip: Option<std::net::IpAddr>,
-        remote_ip: Option<std::net::IpAddr>,
+        source_ips: (Option<std::net::IpAddr>, Option<std::net::IpAddr>),
         headers: &BTreeMap<String, String>,
     ) -> BTreeMap<String, MeshAuthzAttribute> {
         let mut attributes = BTreeMap::new();
         if !keys.any {
             return attributes;
         }
+        let (source_ip, remote_ip) = source_ips;
         if keys.source_principal
             && let Some(principal) = source_principal
         {
@@ -1722,16 +1722,33 @@ impl Plugin for MeshAuthz {
                 "true".to_string(),
             );
         }
-        let (source_principal, baggage_outcome) = self.resolve_source_principal(ctx);
-        // Capture the resolved authz principal up front so the
+        let (mut source_principal, baggage_outcome) = self.resolve_source_principal(ctx);
+        let ambient_udp_source_scope =
+            if ambient_udp_source_scope_request && baggage_outcome == BaggageOutcome::Honored {
+                match self.ambient_udp_source_scope(ctx, source_principal.as_ref()) {
+                    Ok(scope) => scope,
+                    Err(reason) => {
+                        ctx.metadata.insert(
+                            "mesh_authz.ignored_udp_source_scope".to_string(),
+                            reason.to_string(),
+                        );
+                        // The asserted principal and pod UID are one evidence
+                        // bundle. If the live slice cannot bind them exactly,
+                        // discard both before mesh-wide evaluation and fall
+                        // back to the authenticated attesting gateway SVID.
+                        source_principal = ctx.peer_spiffe_id.clone();
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        // Capture the final authz principal up front so the
         // /mesh/policy-denies/recent drilldown records the identity the rule
         // actually saw, including the HBONE baggage rewrite for trusted
-        // assertors. `source_principal` is moved into `MeshAuthzRequest`
-        // below, so we own a separate `String` here. For the synthesised
-        // deny paths (untrusted_assertor / trust_domain_mismatch /
-        // unauthenticated_baggage) `resolve_source_principal` already
-        // returns the peer cert identity (or `None`), so logging this value
-        // is consistent across all branches.
+        // assertors or the authenticated gateway fallback after invalid UDP
+        // pod evidence. `source_principal` is moved into `MeshAuthzRequest`
+        // below, so we own a separate `String` here.
         let source_for_log = source_principal.as_ref().map(|id| id.as_str().to_string());
         let trust_domain_mismatch = baggage_outcome == BaggageOutcome::TrustDomainMismatch;
         let untrusted_assertor = baggage_outcome == BaggageOutcome::UntrustedAssertor;
@@ -1802,25 +1819,9 @@ impl Plugin for MeshAuthz {
             ctx,
             source_principal.as_ref(),
             port,
-            source_ip,
-            remote_ip,
+            (source_ip, remote_ip),
             &headers,
         );
-        let ambient_udp_source_scope =
-            if ambient_udp_source_scope_request && baggage_outcome == BaggageOutcome::Honored {
-                match self.ambient_udp_source_scope(ctx, source_principal.as_ref()) {
-                    Ok(scope) => scope,
-                    Err(reason) => {
-                        ctx.metadata.insert(
-                            "mesh_authz.ignored_udp_source_scope".to_string(),
-                            reason.to_string(),
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
         let request = MeshAuthzRequest {
             source_principal,
             request_principal,
