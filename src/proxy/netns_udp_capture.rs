@@ -798,7 +798,7 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
                 pod_uids = ?registry_uids,
                 "Ambient UDP disabled cleanup registry changed"
             );
-            self.last_registry_uids = registry_uids;
+            self.last_registry_uids = registry_uids.clone();
         }
 
         let mut desired: HashMap<u64, (PodCaptureTarget, HashSet<String>)> = HashMap::new();
@@ -848,8 +848,12 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
         let desired_netns: HashSet<u64> = desired.keys().copied().collect();
         self.cleaned_netns
             .retain(|netns| desired_netns.contains(netns));
+        // A transient cgroup/PID lookup miss omits the netns from `desired` but
+        // must not erase an already-started readiness handshake. Retain it while
+        // any owning UID is still in the registry; otherwise a later successful
+        // lookup would see no marker and could clean rules without an ack.
         self.pending_ack_netns
-            .retain(|netns, _| desired_netns.contains(netns));
+            .retain(|_, pod_uids| pod_uids.iter().any(|uid| registry_uids.contains(uid)));
 
         // Retract every stale producer marker before deleting any rules. A
         // marker observed here may have left the node-agent's BPF ready bit
@@ -2231,6 +2235,14 @@ mod tests {
             cleaned.lock().unwrap().is_empty(),
             "rules must remain fail closed while the host-veth gate closure is unverified"
         );
+
+        mgr.backend.set_netns("/cg/a", None);
+        assert_eq!(mgr.cleanup_once().await, 0);
+        assert!(
+            mgr.pending_ack_netns.contains_key(&100),
+            "transient netns lookup misses must preserve the pending handshake"
+        );
+        mgr.backend.set_netns("/cg/a", Some(100));
 
         let ack_dir = registry_root.path().join(".udp-not-ready");
         std::fs::create_dir_all(&ack_dir).unwrap();

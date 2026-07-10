@@ -2806,6 +2806,21 @@ fn reap_orphaned_udp_not_ready_acks(
     dir: &std::path::Path,
     pod_states: &DashMap<String, PodAttachmentState>,
 ) {
+    // The proxy polls the registry every ~2s. Keep a much wider grace so a
+    // freshly-published pod-removal ack cannot be reaped before the producer
+    // observes the registry removal and consumes it.
+    reap_orphaned_udp_not_ready_acks_older_than(
+        dir,
+        pod_states,
+        std::time::Duration::from_secs(30),
+    );
+}
+
+fn reap_orphaned_udp_not_ready_acks_older_than(
+    dir: &std::path::Path,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    minimum_age: std::time::Duration,
+) {
     const MAX_REAP_PER_PASS: usize = 256;
     let ack_dir = dir.join(".udp-not-ready");
     let entries = match std::fs::read_dir(&ack_dir) {
@@ -2830,6 +2845,14 @@ fn reap_orphaned_udp_not_ready_acks(
             continue;
         };
         if pod_registry_uid_is_unsafe(&uid) || pod_states.contains_key(&uid) {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+            .is_ok_and(|age| age >= minimum_age);
+        if !old_enough {
             continue;
         }
         if let Err(error) = std::fs::remove_file(entry.path())
@@ -2873,7 +2896,62 @@ fn reconcile_udp_capture_readiness(
     ready_uids: &mut HashSet<String>,
 ) {
     if !config.capture_config.udp_capture_enabled {
-        ready_uids.clear();
+        // Disabled is an intentional pass-through posture, but the stale-rule
+        // cleanup manager still needs a freshly-derived acknowledgement before
+        // it removes rules left by an enabled predecessor. Re-apply the disabled
+        // pod-map flags once per live process generation; never trust an ack file
+        // persisted from an older process.
+        ready_uids.retain(|uid| pod_states.contains_key(uid));
+        for state in pod_states.iter() {
+            if !state.attached {
+                continue;
+            }
+            let uid = state.key();
+            let ack_exists = config
+                .node_waypoint_pod_registry_dir
+                .as_ref()
+                .is_some_and(|dir| dir.join(".udp-not-ready").join(uid).is_file());
+            if ready_uids.contains(uid) && ack_exists {
+                continue;
+            }
+            let state_key = pod_state_key(pod_states, uid);
+            if let Some(dir) = &config.node_waypoint_pod_registry_dir {
+                remove_udp_not_ready_ack(dir, uid);
+            }
+            let info = pod_map_info(config, false);
+            let v4_ok = state
+                .pod_ip
+                .is_none_or(|ip| backend.update_pod_ip(ip, &info).is_ok());
+            let v6_ok = state
+                .pod_ip6
+                .is_none_or(|ip| backend.update_pod_ip6(ip, &info).is_ok());
+            if v4_ok && v6_ok {
+                forget_pending_capture_failure(
+                    &state_key,
+                    CAPTURE_FAILURE_UDP_READINESS,
+                    CAPTURE_FAILURE_DETAIL_UDP_READINESS,
+                );
+                ready_uids.insert(uid.clone());
+                if let Some(dir) = &config.node_waypoint_pod_registry_dir {
+                    write_udp_not_ready_ack(dir, uid);
+                }
+            } else {
+                metrics.record_attach_error();
+                remember_pending_capture_failure(
+                    &state_key,
+                    CAPTURE_FAILURE_UDP_READINESS,
+                    CAPTURE_FAILURE_DETAIL_UDP_READINESS,
+                );
+                warn!(
+                    pod_uid = uid.as_str(),
+                    "Failed to verify disabled Ambient UDP pod-map posture; withholding cleanup acknowledgement and retrying"
+                );
+            }
+        }
+        if let Some(dir) = &config.node_waypoint_pod_registry_dir {
+            reap_orphaned_udp_not_ready_acks(dir, pod_states);
+        }
+        clear_partial_capture_state_if_recovered(pod_states, metrics);
         return;
     }
 
@@ -5716,8 +5794,9 @@ mod tests {
     fn reconcile_reaps_orphaned_udp_not_ready_acks() {
         // A pod that enrolled and then left the node leaves a `.udp-not-ready/<uid>`
         // ack that no reconcile revisits; without reaping these accumulate one inode
-        // per pod ever seen. The next readiness reconcile must drop acks whose UID is
-        // no longer tracked, while preserving acks for still-present pods.
+        // per pod ever seen. A fresh ack must survive the normal reconcile grace so
+        // the proxy's slower registry poll can consume it; the age-qualified sweep
+        // then drops departed UIDs while preserving still-present pods.
         let registry = tempfile::tempdir().unwrap();
         let mut capture_config = CaptureConfig::explicit(15006, 15001);
         capture_config.udp_capture_enabled = true;
@@ -5776,6 +5855,16 @@ mod tests {
         assert!(
             ack_dir.join("pod-live").exists(),
             "ack for a still-tracked pod must be preserved"
+        );
+        assert!(
+            ack_dir.join("pod-gone-1").exists() && ack_dir.join("pod-gone-2").exists(),
+            "fresh pod-removal acks must survive long enough for the proxy poll"
+        );
+
+        reap_orphaned_udp_not_ready_acks_older_than(
+            registry.path(),
+            &pod_states,
+            std::time::Duration::ZERO,
         );
         assert!(
             !ack_dir.join("pod-gone-1").exists(),
@@ -8555,6 +8644,69 @@ mod tests {
                 .join("pod-a")
                 .is_file()
         );
+    }
+
+    #[test]
+    fn disabled_udp_rederives_cleanup_ack_from_live_pod_map_state() {
+        let registry = tempfile::tempdir().unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 6);
+        let pod_states = DashMap::new();
+        pod_states.insert(
+            "pod-a".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-a".to_string(),
+                pod_name: "pod-a".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: Some(ip),
+                pod_ip6: None,
+                cgroup_path: Some("/cg/a".to_string()),
+                veth_iface: Some("veth-a".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
+            },
+        );
+        let mut backend = MockEbpfBackend::default();
+        backend
+            .update_pod_ip(ip, &PodInfo::for_capture(15001, true, true))
+            .unwrap();
+        let ack_dir = registry.path().join(".udp-not-ready");
+        std::fs::create_dir_all(&ack_dir).unwrap();
+        std::fs::write(ack_dir.join("pod-a"), b"stale").unwrap();
+        let mut verified_uids = HashSet::new();
+        let metrics = NodeAgentMetrics::default();
+
+        reconcile_udp_capture_readiness(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &mut verified_uids,
+        );
+
+        let info = &backend.pod_ips[&ip];
+        assert_eq!(
+            info.capture_flags
+                & (ferrum_ebpf_common::POD_CAPTURE_FLAG_UDP_ENABLED
+                    | ferrum_ebpf_common::POD_CAPTURE_FLAG_UDP_READY),
+            0,
+            "disabled posture must be applied to the live pod map before cleanup"
+        );
+        assert_eq!(std::fs::read(ack_dir.join("pod-a")).unwrap(), b"");
+        assert!(verified_uids.contains("pod-a"));
     }
 
     #[test]

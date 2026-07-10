@@ -34,6 +34,9 @@ const ETH_P_IP: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86DD;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
+const IPPROTO_FRAGMENT: u8 = 44;
+const IPPROTO_ESP: u8 = 50;
+const IPPROTO_AH: u8 = 51;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_ACK: u8 = 0x10;
 const DNS_PORT: u16 = 53;
@@ -121,7 +124,15 @@ fn guard_ipv6(ctx: &TcContext) -> Result<i32, i64> {
         ],
     };
     let next_header: u8 = ctx.load(ETH_HDR_LEN + 6).map_err(|_| -1i64)?;
-    if (next_header == IPPROTO_UDP || ipv6_extension_header(next_header))
+    // Resolve bounded IPv6 extension chains before applying the source-side
+    // UDP readiness gate. Treating any first extension header as UDP would
+    // black-hole valid TCP/ICMPv6 with Hop-by-Hop/Routing/Destination Options;
+    // a malformed or overlong chain still fails closed for a not-ready source.
+    let source_is_udp = match ipv6_transport_protocol(ctx, next_header) {
+        Ok(protocol) => protocol == IPPROTO_UDP,
+        Err(_) => true,
+    };
+    if source_is_udp
         && matches!(
             unsafe { FERRUM_POD_IPS6.get(&src_ip) },
             Some(info) if info.udp_capture_not_ready()
@@ -273,6 +284,48 @@ fn ipv6_extension_header(next_header: u8) -> bool {
         next_header,
         0 | 43 | 44 | 50 | 51 | 60 | 135 | 139 | 140 | 253 | 254
     )
+}
+
+/// Resolve the transport protocol behind a bounded IPv6 extension chain.
+///
+/// Six headers comfortably cover legitimate chains while keeping verifier
+/// state bounded. ESP is opaque and is returned as non-UDP; malformed,
+/// truncated, or still-extended chains return an error so the readiness caller
+/// can fail closed without misclassifying valid extension-header TCP.
+#[inline(always)]
+fn ipv6_transport_protocol(ctx: &TcContext, first_header: u8) -> Result<u8, i64> {
+    let mut protocol = first_header;
+    let mut offset = ETH_HDR_LEN + 40;
+    let mut parsed = 0u8;
+    while parsed < 6 {
+        match protocol {
+            // Hop-by-Hop, Routing, Destination Options, Mobility, HIP, Shim6,
+            // and the two experimental extension-header values share the
+            // 8-octet-unit Hdr Ext Len shape.
+            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
+                protocol = ctx.load(offset).map_err(|_| -1i64)?;
+                let extension_len: u8 = ctx.load(offset + 1).map_err(|_| -1i64)?;
+                offset += (extension_len as usize + 1) * 8;
+            }
+            IPPROTO_FRAGMENT => {
+                protocol = ctx.load(offset).map_err(|_| -1i64)?;
+                offset += 8;
+            }
+            IPPROTO_AH => {
+                protocol = ctx.load(offset).map_err(|_| -1i64)?;
+                let payload_len: u8 = ctx.load(offset + 1).map_err(|_| -1i64)?;
+                offset += (payload_len as usize + 2) * 4;
+            }
+            IPPROTO_ESP => return Ok(IPPROTO_ESP),
+            _ => return Ok(protocol),
+        }
+        parsed += 1;
+    }
+    if ipv6_extension_header(protocol) {
+        Err(-1i64)
+    } else {
+        Ok(protocol)
+    }
 }
 
 #[inline(always)]
