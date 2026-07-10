@@ -723,6 +723,7 @@ impl CpGrpcServer {
         filter_frontend_tls_sources_to_namespace(config, namespace);
     }
 
+    #[cfg(test)]
     pub(crate) fn filter_config_to_mesh_request_for_scope(
         config: &GatewayConfig,
         request: &MeshSliceRequest,
@@ -2508,7 +2509,11 @@ mod tests {
         let bearer_restricted = CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
             &config,
             &request,
-            &CpScope::Set(HashSet::from(["infra".to_string(), "clients".to_string()])),
+            &CpScope::Set(HashSet::from([
+                "infra".to_string(),
+                "clients".to_string(),
+                "default".to_string(),
+            ])),
             true,
         );
         let strict_config = CpGrpcServer::filter_config_to_namespace(&config, "infra");
