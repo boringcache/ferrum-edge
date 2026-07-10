@@ -728,10 +728,25 @@ impl CpGrpcServer {
         request: &MeshSliceRequest,
         scope: &CpScope,
     ) -> GatewayConfig {
+        Self::filter_config_to_mesh_request_for_scope_and_bearer(config, request, scope, false)
+    }
+
+    pub(crate) fn filter_config_to_mesh_request_for_scope_and_bearer(
+        config: &GatewayConfig,
+        request: &MeshSliceRequest,
+        scope: &CpScope,
+        restrict_ambient_udp_sources_to_request_namespace: bool,
+    ) -> GatewayConfig {
         let mut filtered = config.clone();
         Self::filter_non_mesh_config_to_namespace(&mut filtered, &request.namespace);
         if let Some(mesh) = filtered.mesh.as_mut() {
-            Self::filter_mesh_config_to_request(mesh, request, true, Some(scope));
+            Self::filter_mesh_config_to_request(
+                mesh,
+                request,
+                true,
+                Some(scope),
+                restrict_ambient_udp_sources_to_request_namespace,
+            );
         }
         if scope.requires_namespace_claim_by_default() {
             Self::clear_unpartitioned_trust_material(&mut filtered);
@@ -744,7 +759,7 @@ impl CpGrpcServer {
             namespace: namespace.to_string(),
             ..MeshSliceRequest::default()
         };
-        Self::filter_mesh_config_to_request(mesh, &request, false, None);
+        Self::filter_mesh_config_to_request(mesh, &request, false, None, false);
     }
 
     fn filter_mesh_config_to_request(
@@ -752,6 +767,7 @@ impl CpGrpcServer {
         request: &MeshSliceRequest,
         allow_cross_namespace_mesh_visibility: bool,
         scope: Option<&CpScope>,
+        restrict_ambient_udp_sources_to_request_namespace: bool,
     ) {
         let namespace = request.namespace.as_str();
         let mut visible_namespaces =
@@ -759,9 +775,11 @@ impl CpGrpcServer {
         Self::constrain_visible_namespaces_to_scope(&mut visible_namespaces, scope);
         // A ServiceWaypoint terminates traffic for destination-visible services,
         // but trusted Ambient UDP evidence can name a source pod from any
-        // namespace this CP is allowed to serve. Preserve only pod-addressable
-        // source workloads and their policy namespaces beyond the destination
-        // view; the slice builder performs the exact UID/SPIFFE/selector bind.
+        // namespace this CP is allowed to serve. An explicit bearer claim
+        // further pins this superset to the subscribed namespace. Preserve only
+        // pod-addressable source workloads and their policy namespaces beyond
+        // the destination view; the slice builder performs the exact
+        // UID/SPIFFE/selector bind.
         let ambient_udp_source_namespaces: BTreeSet<String> = if request.ambient_udp_source_scoping
         {
             mesh.workloads
@@ -769,6 +787,8 @@ impl CpGrpcServer {
                 .filter(|workload| {
                     workload.pod_uid.is_some()
                         && Self::namespace_allowed_by_scope(&workload.namespace, scope)
+                        && (!restrict_ambient_udp_sources_to_request_namespace
+                            || workload.namespace == request.namespace)
                 })
                 .map(|workload| workload.namespace.clone())
                 .collect()
@@ -2485,6 +2505,12 @@ mod tests {
             &request_without_udp_scoping,
             &CpScope::Single("infra".to_string()),
         );
+        let bearer_restricted = CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            &config,
+            &request,
+            &CpScope::Set(HashSet::from(["infra".to_string(), "clients".to_string()])),
+            true,
+        );
         let strict_config = CpGrpcServer::filter_config_to_namespace(&config, "infra");
 
         let mesh = mesh_config
@@ -2500,6 +2526,12 @@ mod tests {
         assert_eq!(mesh.workloads[0].namespace, "clients");
         assert_eq!(mesh.mesh_policies.len(), 1);
         assert_eq!(mesh.mesh_policies[0].name, "clients-source-policy");
+        let bearer_mesh = bearer_restricted
+            .mesh
+            .expect("bearer-restricted mesh view should remain");
+        assert!(bearer_mesh.workloads.is_empty());
+        assert!(bearer_mesh.mesh_policies.is_empty());
+        assert_eq!(bearer_mesh.services.len(), 1);
         assert!(
             mesh_config_without_udp_scoping
                 .mesh

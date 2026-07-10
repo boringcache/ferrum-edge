@@ -94,6 +94,10 @@ pub struct XdsAdsServer {
     workload_identities: Arc<DashMap<String, String>>,
     waypoint_names: Arc<DashMap<String, String>>,
     ambient_udp_source_scoping_nodes: Arc<DashMap<String, ()>>,
+    /// Per-stream bearer boundary. Network handlers set this on their cloned
+    /// server after JWT verification; an explicit `ns` claim restricts the
+    /// Ambient UDP source workload/policy superset to the subscribed namespace.
+    restrict_ambient_udp_sources_to_request_namespace: bool,
     /// Mirror of `EnvConfig.mesh_sidecar_enforced`. When `true`, the slice
     /// builder applies Istio `Sidecar` egress scope narrowing. Default
     /// `false` preserves existing CP behavior.
@@ -276,6 +280,7 @@ impl XdsAdsServer {
             workload_identities: Arc::new(DashMap::new()),
             waypoint_names: Arc::new(DashMap::new()),
             ambient_udp_source_scoping_nodes: Arc::new(DashMap::new()),
+            restrict_ambient_udp_sources_to_request_namespace: false,
             sidecar_enforced,
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
@@ -366,7 +371,12 @@ impl XdsAdsServer {
         .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run)
         .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing)
         .with_ambient_udp_source_scoping(ambient_udp_source_scoping);
-        CpGrpcServer::filter_config_to_mesh_request_for_scope(config, &request, &self.scope)
+        CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            config,
+            &request,
+            &self.scope,
+            self.restrict_ambient_udp_sources_to_request_namespace,
+        )
     }
 
     fn replace_stream_config_if_changed(
@@ -1620,7 +1630,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         );
 
         let mut requests = request.into_inner();
-        let server = self.clone();
+        let mut server = self.clone();
+        server.restrict_ambient_udp_sources_to_request_namespace = allowed.is_present();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
 
@@ -1905,7 +1916,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         );
 
         let mut requests = request.into_inner();
-        let server = self.clone();
+        let mut server = self.clone();
+        server.restrict_ambient_udp_sources_to_request_namespace = allowed.is_present();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
 
@@ -2391,11 +2403,11 @@ fn should_send_delta_response(
 mod tests {
     use super::*;
     use crate::config::db_loader::IncrementalResult;
-    use crate::identity::spiffe::SpiffeId;
+    use crate::identity::spiffe::{SpiffeId, TrustDomain};
     use crate::modes::mesh::config::{
         AppProtocol, MeshConfig, MeshPolicy, MeshService, MeshSidecar, MeshSidecarEgress,
         MeshWaypointBinding, MeshWaypointServiceRef, MtlsMode, PeerAuthentication, PolicyScope,
-        ServicePort,
+        ServicePort, Workload, WorkloadSelector,
     };
     use chrono::{TimeZone, Utc};
     use prost::Message;
@@ -3025,20 +3037,39 @@ mod tests {
     #[test]
     fn xds_prefilter_preserves_waypoint_udp_source_policies_when_metadata_enables_scoping() {
         let mut config = waypoint_gateway_config("reviews", 0);
-        config
-            .mesh
-            .as_mut()
-            .expect("mesh should exist")
-            .mesh_policies
-            .push(MeshPolicy {
-                name: "default-source-policy".to_string(),
-                namespace: "default".to_string(),
-                scope: PolicyScope::Namespace {
-                    namespace: "default".to_string(),
-                },
-                rules: Vec::new(),
-            });
+        let mesh = config.mesh.as_mut().expect("mesh should exist");
+        mesh.workloads.push(Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/clients/sa/client")
+                .expect("source SPIFFE ID"),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "client".to_string())]),
+                namespace: Some("clients".to_string()),
+            },
+            service_name: "client".to_string(),
+            addresses: vec!["10.2.0.11".to_string()],
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("cluster.local").expect("source trust domain"),
+            namespace: "clients".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("client".to_string()),
+            pod_uid: Some("16b2c3d4-9dad-11d1-80b4-00c04fd430c8".to_string()),
+            node_waypoint: None,
+            remote_provenance: false,
+        });
+        mesh.mesh_policies.push(MeshPolicy {
+            name: "clients-source-policy".to_string(),
+            namespace: "clients".to_string(),
+            scope: PolicyScope::Namespace {
+                namespace: "clients".to_string(),
+            },
+            rules: Vec::new(),
+        });
         let server = test_server(config.clone());
+        let mut bearer_restricted_server = test_server(config.clone());
+        bearer_restricted_server.restrict_ambient_udp_sources_to_request_namespace = true;
 
         let without_udp = server.filter_config_for_xds_request(
             &config,
@@ -3047,6 +3078,12 @@ mod tests {
             false,
         );
         let with_udp = server.filter_config_for_xds_request(
+            &config,
+            "infra",
+            Some("waypoint".to_string()),
+            true,
+        );
+        let bearer_restricted = bearer_restricted_server.filter_config_for_xds_request(
             &config,
             "infra",
             Some("waypoint".to_string()),
@@ -3069,6 +3106,9 @@ mod tests {
             1,
             "xDS prefilter must retain source policies before snapshot slicing"
         );
+        let restricted_mesh = bearer_restricted.mesh.expect("mesh should remain");
+        assert!(restricted_mesh.workloads.is_empty());
+        assert!(restricted_mesh.mesh_policies.is_empty());
     }
 
     #[test]
