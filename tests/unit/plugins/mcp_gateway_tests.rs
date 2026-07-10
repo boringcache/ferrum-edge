@@ -1290,6 +1290,20 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
         200,
         &HashMap::from([("content-encoding".to_string(), "gzip".to_string(),)]),
     ));
+    let oversized_headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        (
+            "content-length".to_string(),
+            (4 * 1024 * 1024 + 1).to_string(),
+        ),
+    ]);
+    assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &oversized_headers,));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &oversized_headers,
+    ));
     let upstream_response = json!({
         "jsonrpc": "2.0",
         "id": 10,
@@ -1325,6 +1339,89 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
     assert!(!response_headers.contains_key("content-digest"));
     let rewritten: Value = serde_json::from_slice(&rewritten).unwrap();
     assert_eq!(rewritten["result"]["contents"][0]["uri"], public_uri);
+}
+
+#[tokio::test]
+async fn aggregate_resource_read_preserves_requested_template_public_uri() {
+    let server = start_mcp_catalog_server().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (mut template_ctx, mut template_headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 31,
+        "method": "resources/templates/list",
+        "params": {}
+    }));
+    template_headers.insert("mcp-session-id".to_string(), session_id.clone());
+    let (_, template_body, _) = reject_json(
+        plugin
+            .before_proxy(&mut template_ctx, &mut template_headers)
+            .await,
+    );
+    let requested_public_uri = template_body["result"]["resourceTemplates"][0]["uriTemplate"]
+        .as_str()
+        .unwrap()
+        .replace("{path}", "README.md");
+
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": 32,
+        "method": "resources/read",
+        "params": { "uri": requested_public_uri }
+    });
+    let (mut ctx, mut headers) = mcp_ctx(request_body.clone());
+    headers.insert("mcp-session-id".to_string(), session_id);
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let rewritten_request = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            serde_json::to_vec(&request_body).unwrap().as_slice(),
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("template resource read should be rewritten");
+    let rewritten_request: Value = serde_json::from_slice(&rewritten_request).unwrap();
+    assert_eq!(
+        rewritten_request["params"]["uri"],
+        "file:///project/README.md"
+    );
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 32,
+        "result": {
+            "contents": [{
+                "uri": "file:///project/README.md",
+                "mimeType": "text/markdown",
+                "text": "read me"
+            }]
+        }
+    }))
+    .unwrap();
+    let rewritten_response = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &upstream_response,
+            Some("application/json"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("resource echo should retain the routed public URI");
+    let rewritten_response: Value = serde_json::from_slice(&rewritten_response).unwrap();
+    assert_eq!(
+        rewritten_response["result"]["contents"][0]["uri"],
+        requested_public_uri
+    );
 }
 
 #[tokio::test]
@@ -1679,6 +1776,110 @@ async fn aggregate_template_reverse_mapping_preserves_upstream_percent_escapes()
         .expect("percent-preserving public URI should route back upstream");
     let rewritten_read: Value = serde_json::from_slice(&rewritten_read).unwrap();
     assert_eq!(rewritten_read["params"]["uri"], "file:///a%2Fb");
+}
+
+#[tokio::test]
+async fn aggregate_resource_read_reuses_selected_server_template_cache() {
+    let primary = start_mcp_catalog_server().await;
+    let unrelated = start_mcp_catalog_server().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "resources/templates/list"}),
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&unrelated)
+        .await;
+
+    let mut config = aggregate_config(&format!("{}/mcp", primary.uri()));
+    config["servers"]["unrelated"] = json!({
+        "upstream_url": format!("{}/mcp", unrelated.uri()),
+        "namespace": "unrelated",
+        "enabled": true,
+        "expose_tools": true,
+        "expose_resources": true,
+        "expose_prompts": true
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let tool_request = json!({
+        "jsonrpc": "2.0",
+        "id": 33,
+        "method": "tools/call",
+        "params": {
+            "name": "github.create_pr",
+            "arguments": { "repo": "payments-api" }
+        }
+    });
+    let (mut tool_ctx, mut tool_headers) = mcp_ctx(tool_request.clone());
+    tool_headers.insert("mcp-session-id".to_string(), session_id.clone());
+    assert!(matches!(
+        plugin.before_proxy(&mut tool_ctx, &mut tool_headers).await,
+        PluginResult::Continue
+    ));
+    let _ = plugin
+        .transform_request_body_with_context(
+            &mut tool_ctx,
+            serde_json::to_vec(&tool_request).unwrap().as_slice(),
+            Some("application/json"),
+            &tool_headers,
+        )
+        .await
+        .expect("tool request should be rewritten");
+    let tool_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 33,
+        "result": {
+            "content": [{
+                "type": "resource_link",
+                "uri": "file:///project/generated.txt",
+                "name": "Generated"
+            }]
+        }
+    }))
+    .unwrap();
+    let rewritten_response = plugin
+        .transform_response_body_with_context(
+            &mut tool_ctx,
+            &tool_response,
+            Some("application/json"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("selected-server template should reverse-map the resource link");
+    let rewritten_response: Value = serde_json::from_slice(&rewritten_response).unwrap();
+    let public_uri = rewritten_response["result"]["content"][0]["uri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let read_request = json!({
+        "jsonrpc": "2.0",
+        "id": 34,
+        "method": "resources/read",
+        "params": { "uri": public_uri }
+    });
+    let (mut read_ctx, mut read_headers) = mcp_ctx(read_request);
+    read_headers.insert("mcp-session-id".to_string(), session_id);
+    assert!(matches!(
+        plugin.before_proxy(&mut read_ctx, &mut read_headers).await,
+        PluginResult::Continue
+    ));
+
+    let unrelated_requests = unrelated.received_requests().await.unwrap();
+    assert!(!unrelated_requests.iter().any(|request| {
+        request
+            .body_json::<Value>()
+            .ok()
+            .and_then(|body| {
+                body.get("method")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            == Some("resources/templates/list")
+    }));
 }
 
 #[tokio::test]

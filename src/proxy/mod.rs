@@ -1044,7 +1044,7 @@ pub(crate) fn should_stream_response_body(
     }
 }
 
-fn retry_response_decision_context(ctx: &RequestContext) -> RequestContext {
+pub(crate) fn retry_response_decision_context(ctx: &RequestContext) -> RequestContext {
     let mut retry_ctx = ctx.clone();
     retry_ctx.metadata.insert(
         RETRY_RESPONSE_BUFFERING_METADATA_KEY.to_string(),

@@ -348,6 +348,17 @@ struct ResourceTemplateCatalogEntry {
     uri_template_regex: Arc<Regex>,
 }
 
+struct RequestRewrite<'a> {
+    method: &'a str,
+    param: &'a str,
+    public_value: &'a str,
+    upstream_value: &'a str,
+    server_id: &'a str,
+    downstream_session_id: &'a str,
+    catalog_version: u64,
+    response_resource_rewrite_possible: bool,
+}
+
 #[derive(Clone)]
 struct McpCatalog {
     tools: HashMap<String, ToolCatalogEntry>,
@@ -758,30 +769,27 @@ impl McpGateway {
     fn mark_request_rewrite(
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
-        method: &str,
-        param: &str,
-        public_value: &str,
-        upstream_value: &str,
-        server_id: &str,
-        downstream_session_id: &str,
-        catalog_version: u64,
-        response_resource_rewrite_possible: bool,
+        rewrite: RequestRewrite<'_>,
     ) {
         ctx.metadata
             .insert(METADATA_REWRITE_KEY.to_string(), "true".to_string());
-        ctx.metadata
-            .insert(METADATA_REWRITE_METHOD_KEY.to_string(), method.to_string());
-        ctx.metadata
-            .insert(METADATA_REWRITE_PARAM_KEY.to_string(), param.to_string());
+        ctx.metadata.insert(
+            METADATA_REWRITE_METHOD_KEY.to_string(),
+            rewrite.method.to_string(),
+        );
+        ctx.metadata.insert(
+            METADATA_REWRITE_PARAM_KEY.to_string(),
+            rewrite.param.to_string(),
+        );
         ctx.metadata.insert(
             METADATA_REWRITE_PUBLIC_VALUE_KEY.to_string(),
-            public_value.to_string(),
+            rewrite.public_value.to_string(),
         );
         ctx.metadata.insert(
             METADATA_REWRITE_UPSTREAM_VALUE_KEY.to_string(),
-            upstream_value.to_string(),
+            rewrite.upstream_value.to_string(),
         );
-        if !response_resource_rewrite_possible {
+        if !rewrite.response_resource_rewrite_possible {
             return;
         }
 
@@ -795,20 +803,26 @@ impl McpGateway {
         );
         ctx.metadata.insert(
             METADATA_RESPONSE_REWRITE_METHOD_KEY.to_string(),
-            method.to_string(),
+            rewrite.method.to_string(),
         );
         ctx.metadata.insert(
             METADATA_RESPONSE_REWRITE_SERVER_KEY.to_string(),
-            server_id.to_string(),
+            rewrite.server_id.to_string(),
         );
         ctx.metadata.insert(
             METADATA_RESPONSE_REWRITE_SESSION_KEY.to_string(),
-            hash_str(downstream_session_id),
+            hash_str(rewrite.downstream_session_id),
         );
         ctx.metadata.insert(
             METADATA_RESPONSE_REWRITE_CATALOG_VERSION_KEY.to_string(),
-            catalog_version.to_string(),
+            rewrite.catalog_version.to_string(),
         );
+        if rewrite.method == "resources/read" {
+            ctx.mcp_response_resource_binding = Some((
+                rewrite.upstream_value.to_string(),
+                rewrite.public_value.to_string(),
+            ));
+        }
     }
 
     fn resource_response_rewrite_possible(&self, server_id: &str) -> bool {
@@ -817,6 +831,12 @@ impl McpGateway {
                 .servers
                 .get(server_id)
                 .is_some_and(|server| server.enabled && server.expose_resources)
+    }
+
+    fn response_exceeds_rewrite_limit(&self, response_headers: &HashMap<String, String>) -> bool {
+        header_value(response_headers, "content-length")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .is_some_and(|length| length > self.validation.max_upstream_response_bytes)
     }
 
     fn primary_server(&self) -> Option<&McpServerConfig> {
@@ -2388,14 +2408,16 @@ impl McpGateway {
         Self::mark_request_rewrite(
             ctx,
             headers,
-            "tools/call",
-            "name",
-            &public_name,
-            &entry.upstream_name,
-            &entry.server_id,
-            downstream_session_id,
-            catalog_version,
-            response_resource_rewrite_possible,
+            RequestRewrite {
+                method: "tools/call",
+                param: "name",
+                public_value: &public_name,
+                upstream_value: &entry.upstream_name,
+                server_id: &entry.server_id,
+                downstream_session_id,
+                catalog_version,
+                response_resource_rewrite_possible,
+            },
         );
         PluginResult::Continue
     }
@@ -2479,14 +2501,16 @@ impl McpGateway {
         Self::mark_request_rewrite(
             ctx,
             headers,
-            "prompts/get",
-            "name",
-            &public_name,
-            &entry.upstream_name,
-            &entry.server_id,
-            downstream_session_id,
-            catalog_version,
-            response_resource_rewrite_possible,
+            RequestRewrite {
+                method: "prompts/get",
+                param: "name",
+                public_value: &public_name,
+                upstream_value: &entry.upstream_name,
+                server_id: &entry.server_id,
+                downstream_session_id,
+                catalog_version,
+                response_resource_rewrite_possible,
+            },
         );
         PluginResult::Continue
     }
@@ -2534,7 +2558,22 @@ impl McpGateway {
         } else {
             None
         };
-        let (server_id, upstream_uri, catalog_version) = match route {
+        // Tool/prompt response preparation may have populated templates for
+        // just the selected server. Honor a URI returned from that cache before
+        // attempting an all-server refresh: an unrelated resource server that
+        // does not implement template discovery must not make the freshly
+        // returned URI unreadable.
+        let cached_template_route = if route.is_none() {
+            let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
+                return session_not_found_response();
+            };
+            let catalog = catalog_lock.read().await;
+            resource_template_route(&catalog, &public_uri)
+                .map(|(server_id, upstream_uri)| (server_id, upstream_uri, catalog.version))
+        } else {
+            None
+        };
+        let (server_id, upstream_uri, catalog_version) = match route.or(cached_template_route) {
             Some(route) => route,
             None => {
                 if let Err(error) = self
@@ -2606,14 +2645,17 @@ impl McpGateway {
         Self::mark_request_rewrite(
             ctx,
             headers,
-            "resources/read",
-            "uri",
-            &public_uri,
-            &upstream_uri,
-            &server_id,
-            downstream_session_id,
-            catalog_version,
-            self.resource_response_rewrite_possible(&server_id),
+            RequestRewrite {
+                method: "resources/read",
+                param: "uri",
+                public_value: &public_uri,
+                upstream_value: &upstream_uri,
+                server_id: &server_id,
+                downstream_session_id,
+                catalog_version,
+                response_resource_rewrite_possible: self
+                    .resource_response_rewrite_possible(&server_id),
+            },
         );
         PluginResult::Continue
     }
@@ -2699,9 +2741,9 @@ impl Plugin for McpGateway {
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
-            && header_value(response_headers, "content-type").is_some_and(|value| {
-                super::utils::body_transform::is_event_stream_content_type(value)
-            })
+            && (header_value(response_headers, "content-type")
+                .is_some_and(super::utils::body_transform::is_event_stream_content_type)
+                || self.response_exceeds_rewrite_limit(response_headers))
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -2711,14 +2753,15 @@ impl Plugin for McpGateway {
         _response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
-        if content_type
-            .is_some_and(|value| super::utils::body_transform::is_event_stream_content_type(value))
-        {
+        if content_type.is_some_and(super::utils::body_transform::is_event_stream_content_type) {
             return false;
         }
         if header_value(response_headers, "content-encoding")
             .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
         {
+            return false;
+        }
+        if self.response_exceeds_rewrite_limit(response_headers) {
             return false;
         }
         self.should_buffer_response_body(ctx) && content_type.is_none_or(mcp_content_type_is_json)
@@ -3177,7 +3220,14 @@ impl Plugin for McpGateway {
         let result = value.get_mut("result")?;
 
         let outcome = match method.as_str() {
-            "resources/read" => rewrite_resource_read_result(result, &catalog, server_id),
+            "resources/read" => rewrite_resource_read_result(
+                result,
+                &catalog,
+                server_id,
+                ctx.mcp_response_resource_binding
+                    .as_ref()
+                    .map(|(upstream, public)| (upstream.as_str(), public.as_str())),
+            ),
             "tools/call" => rewrite_tool_call_result(result, &catalog, server_id),
             "prompts/get" => rewrite_prompt_get_result(result, &catalog, server_id),
             _ => ResponseRewriteOutcome::Unchanged,
@@ -3247,6 +3297,7 @@ fn rewrite_resource_read_result(
     result: &mut Value,
     catalog: &McpCatalog,
     server_id: &str,
+    routed_binding: Option<(&str, &str)>,
 ) -> ResponseRewriteOutcome {
     let Some(contents) = result.get_mut("contents").and_then(Value::as_array_mut) else {
         return ResponseRewriteOutcome::Unchanged;
@@ -3254,7 +3305,15 @@ fn rewrite_resource_read_result(
     contents
         .iter_mut()
         .fold(ResponseRewriteOutcome::Unchanged, |outcome, content| {
-            outcome.merge(rewrite_uri_field(content, "uri", catalog, server_id))
+            let rewritten = match routed_binding {
+                Some((upstream_uri, public_uri))
+                    if content.get("uri").and_then(Value::as_str) == Some(upstream_uri) =>
+                {
+                    rewrite_uri_field_to(content, "uri", public_uri)
+                }
+                _ => rewrite_uri_field(content, "uri", catalog, server_id),
+            };
+            outcome.merge(rewritten)
         })
 }
 
@@ -3353,8 +3412,16 @@ fn rewrite_uri_field(
     if public_uri == uri {
         return ResponseRewriteOutcome::Unchanged;
     }
+    rewrite_uri_field_to(value, field, &public_uri)
+}
+
+fn rewrite_uri_field_to(
+    value: &mut Value,
+    field: &str,
+    public_uri: &str,
+) -> ResponseRewriteOutcome {
     if let Some(object) = value.as_object_mut() {
-        object.insert(field.to_string(), Value::String(public_uri));
+        object.insert(field.to_string(), Value::String(public_uri.to_string()));
         ResponseRewriteOutcome::Changed
     } else {
         ResponseRewriteOutcome::Unchanged

@@ -501,6 +501,11 @@ pub struct RequestContext {
     pub(crate) a2a_gateway_binding: Option<&'static str>,
     pub(crate) a2a_gateway_is_agent_card: bool,
     pub(crate) a2a_gateway_streaming: bool,
+    /// Exact upstream/public resource URI pair used to route an MCP
+    /// `resources/read` request. Kept out of public metadata so upstream URI
+    /// details cannot enter transaction logs, while the response hook can
+    /// preserve the public URI spelling the client actually requested.
+    pub(crate) mcp_response_resource_binding: Option<(String, String)>,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -751,6 +756,7 @@ impl RequestContext {
             a2a_gateway_binding: None,
             a2a_gateway_is_agent_card: false,
             a2a_gateway_streaming: false,
+            mcp_response_resource_binding: None,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_score: 0,
@@ -832,6 +838,7 @@ impl RequestContext {
             a2a_gateway_binding: self.a2a_gateway_binding,
             a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
             a2a_gateway_streaming: self.a2a_gateway_streaming,
+            mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_score: self.waf_score,

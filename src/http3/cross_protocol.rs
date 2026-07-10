@@ -2086,15 +2086,18 @@ where
     // Refine the pre-header buffer/stream decision now that the content-type is
     // known — same downgrade the H1/H2 path applies. `inspect` mode buffers by
     // default (so a JSON response is inspected via `on_response_body`); this
-    // downgrades only an `text/event-stream` response to the windowed streaming
-    // path. Retries must stay buffered for replay (pass `None`, which leaves the
-    // decision unchanged).
+    // downgrades only a response every active body plugin can release to the
+    // windowed streaming path. Retry-enabled requests use the same marked
+    // decision context as H1/H2, allowing inherently streaming responses such
+    // as MCP SSE to opt out conservatively after headers arrive.
     let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), method);
+    let retry_ctx = has_retry.then(|| crate::proxy::retry_response_decision_context(&*ctx));
+    let response_decision_ctx = retry_ctx.as_ref().unwrap_or(&*ctx);
     let should_buffer_response = !crate::proxy::refine_stream_response_for_content_type(
         !should_buffer_response,
         proxy,
         plugins,
-        if has_retry { None } else { Some(&*ctx) },
+        Some(response_decision_ctx),
         status,
         &response_headers,
     );
@@ -6799,6 +6802,40 @@ mod tests {
         assert!(
             src.contains("cross_protocol::dispatch_grpc_streaming("),
             "H3 server must dispatch streaming-safe gRPC through dispatch_grpc_streaming"
+        );
+    }
+
+    /// Retry-enabled H3-to-HTTP dispatch must pass the marked response decision
+    /// context used by the H1/H2 path. Passing `None` here pins an MCP SSE
+    /// response to buffering until EOF even though every active plugin permits
+    /// header-time release.
+    #[test]
+    fn h3_plain_retry_response_refinement_uses_retry_context() {
+        let src = include_str!("cross_protocol.rs");
+        let start = src
+            .find("async fn dispatch_plain<S>")
+            .expect("dispatch_plain not found");
+        let tail = &src[start..];
+        let end = tail
+            .find("\n#[allow(clippy::too_many_arguments)]\nasync fn dispatch_grpc<S>")
+            .expect("end of dispatch_plain not found");
+        let body = &tail[..end];
+
+        assert!(
+            body.contains("crate::proxy::retry_response_decision_context(&*ctx)"),
+            "retry-enabled H3 plain dispatch must construct the shared marked context"
+        );
+        assert!(
+            body.contains("let response_decision_ctx = retry_ctx.as_ref().unwrap_or(&*ctx)"),
+            "H3 plain dispatch must select the marked retry context after response headers"
+        );
+        assert!(
+            body.contains("Some(response_decision_ctx)"),
+            "H3 plain response refinement must receive the marked retry context"
+        );
+        assert!(
+            !body.contains("if has_retry { None } else { Some(&*ctx) }"),
+            "retry-enabled H3 plain dispatch must not suppress content-type refinement"
         );
     }
 }
