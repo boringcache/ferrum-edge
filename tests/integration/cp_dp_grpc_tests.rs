@@ -713,6 +713,7 @@ async fn test_mesh_subscribe_receives_initial_mesh_slice() {
         workload_spiffe_id: "spiffe://cluster.local/ns/ferrum/sa/api".to_string(),
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
         waypoint_name: String::new(),
+        ambient_udp_source_scoping: false,
     });
     let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
     let update = stream.message().await.unwrap().unwrap();
@@ -800,6 +801,7 @@ async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
         workload_spiffe_id: String::new(),
         labels: HashMap::new(),
         waypoint_name: "api-waypoint".to_string(),
+        ambient_udp_source_scoping: false,
     });
     let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
     let update = stream.message().await.unwrap().unwrap();
@@ -823,6 +825,7 @@ async fn test_native_mesh_client_installs_mesh_slice_from_cp() {
         workload_spiffe_id: Some("spiffe://cluster.local/ns/ferrum/sa/api".to_string()),
         waypoint_name: None,
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
+        ambient_udp_source_scoping: false,
         primary_retry_secs: 0,
     };
     let handle = tokio::spawn(start_native_mesh_client_with_shutdown(
@@ -1341,6 +1344,7 @@ async fn test_mesh_subscribe_rejects_token_with_wrong_issuer() {
         workload_spiffe_id: "spiffe://cluster.local/ns/ferrum/sa/api".to_string(),
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
         waypoint_name: String::new(),
+        ambient_udp_source_scoping: false,
     });
 
     let result = client.mesh_subscribe(request).await;
@@ -3503,6 +3507,7 @@ async fn test_cp_rejects_mesh_subscribe_with_mismatched_namespace() {
         workload_spiffe_id: "spiffe://cluster.local/ns/staging/sa/api".to_string(),
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
         waypoint_name: String::new(),
+        ambient_udp_source_scoping: false,
     });
 
     let result = client.mesh_subscribe(request).await;
