@@ -3188,13 +3188,32 @@ impl Plugin for McpGateway {
         content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        let original_metadata_stamped = ctx
+            .metadata
+            .contains_key(crate::proxy::ORIGINAL_RESPONSE_METADATA_STAMPED_KEY);
+        let origin_encoded = if original_metadata_stamped {
+            ctx.metadata
+                .contains_key(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY)
+        } else {
+            header_value(response_headers, "content-encoding")
+                .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
+        };
+        let original_content_length = if original_metadata_stamped {
+            ctx.metadata
+                .get(crate::proxy::ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY)
+                .and_then(|value| value.parse::<usize>().ok())
+        } else {
+            header_value(response_headers, "content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+        };
         if !self.should_buffer_response_body(ctx)
             || content_type.is_some_and(|value| {
                 super::utils::body_transform::is_event_stream_content_type(value)
             })
             || content_type.is_some_and(|value| !mcp_content_type_is_json(value))
-            || header_value(response_headers, "content-encoding")
-                .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
+            || origin_encoded
+            || original_content_length
+                .is_none_or(|length| length > self.validation.max_upstream_response_bytes)
         {
             return None;
         }

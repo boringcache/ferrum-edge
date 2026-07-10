@@ -107,6 +107,13 @@ fn reject_raw(result: PluginResult) -> (u16, String, HashMap<String, String>) {
     }
 }
 
+fn known_json_response_headers(body: &[u8]) -> HashMap<String, String> {
+    HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-length".to_string(), body.len().to_string()),
+    ])
+}
+
 async fn start_mcp_catalog_server() -> MockServer {
     start_mcp_catalog_server_with_template("file:///project/{path}").await
 }
@@ -1354,7 +1361,7 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
         200,
         &unknown_length_headers,
     ));
-    let upstream_response = json!({
+    let upstream_response = serde_json::to_vec(&json!({
         "jsonrpc": "2.0",
         "id": 10,
         "result": {
@@ -1364,9 +1371,14 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
                 "text": "read me"
             }]
         }
-    });
+    }))
+    .unwrap();
     let mut response_headers = HashMap::from([
         ("content-type".to_string(), "application/json".to_string()),
+        (
+            "content-length".to_string(),
+            upstream_response.len().to_string(),
+        ),
         ("etag".to_string(), "\"upstream-body\"".to_string()),
         ("content-digest".to_string(), "sha-256=:old:".to_string()),
     ]);
@@ -1375,10 +1387,41 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
         Some("\"upstream-body\"")
     );
     assert!(response_headers.contains_key("content-digest"));
+
+    // Another buffering policy must not let an unknown-length response bypass
+    // MCP's rewrite cap at transform time.
+    let mut unknown_length_response_headers = response_headers.clone();
+    unknown_length_response_headers.remove("content-length");
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                upstream_response.as_slice(),
+                Some("application/json"),
+                &unknown_length_response_headers,
+            )
+            .await
+            .is_none()
+    );
+
+    // Production response paths snapshot the origin headers before
+    // `compression.after_proxy` decorates them. Gateway-added encoding must not
+    // be mistaken for an encoded origin body, and the original known length
+    // remains the MCP cap input after compression removes Content-Length.
+    ctx.metadata.insert(
+        "ferrum:original_response_metadata_stamped".to_string(),
+        "true".to_string(),
+    );
+    ctx.metadata.insert(
+        "ferrum:original_response_content_length".to_string(),
+        upstream_response.len().to_string(),
+    );
+    response_headers.remove("content-length");
+    response_headers.insert("content-encoding".to_string(), "gzip".to_string());
     let rewritten = plugin
         .transform_response_body_with_context(
             &mut ctx,
-            serde_json::to_vec(&upstream_response).unwrap().as_slice(),
+            upstream_response.as_slice(),
             Some("application/json"),
             &response_headers,
         )
@@ -1463,7 +1506,7 @@ async fn aggregate_resource_read_preserves_requested_template_public_uri() {
             &mut ctx,
             &upstream_response,
             Some("application/json"),
-            &HashMap::new(),
+            &known_json_response_headers(&upstream_response),
         )
         .await
         .expect("resource echo should retain the routed public URI");
@@ -1523,6 +1566,10 @@ async fn aggregate_response_preserves_validators_when_no_uri_is_rewritten() {
         "result": { "content": [{ "type": "text", "text": "done" }] }
     }))
     .unwrap();
+    response_headers.insert(
+        "content-length".to_string(),
+        upstream_response.len().to_string(),
+    );
     assert!(
         plugin
             .transform_response_body_with_context(
@@ -1608,7 +1655,7 @@ async fn aggregate_tool_call_response_rewrites_embedded_resource_uris() {
         .await
         .expect("tool call request should be rewritten");
 
-    let upstream_response = json!({
+    let upstream_response = serde_json::to_vec(&json!({
         "jsonrpc": "2.0",
         "id": 12,
         "result": {
@@ -1628,13 +1675,14 @@ async fn aggregate_tool_call_response_rewrites_embedded_resource_uris() {
                 }
             ]
         }
-    });
+    }))
+    .unwrap();
     let rewritten = plugin
         .transform_response_body_with_context(
             &mut ctx,
-            serde_json::to_vec(&upstream_response).unwrap().as_slice(),
+            &upstream_response,
             Some("application/json"),
-            &HashMap::new(),
+            &known_json_response_headers(&upstream_response),
         )
         .await
         .expect("tool result resource URIs should be reverse-mapped");
@@ -1698,7 +1746,7 @@ async fn aggregate_tool_call_reverse_maps_native_mcp_template_uri() {
             &mut ctx,
             &upstream_response,
             Some("application/json"),
-            &HashMap::new(),
+            &known_json_response_headers(&upstream_response),
         )
         .await
         .expect("native MCP template URI should be reverse-mapped");
@@ -1799,7 +1847,7 @@ async fn aggregate_template_reverse_mapping_preserves_upstream_percent_escapes()
             &mut ctx,
             &upstream_response,
             Some("application/json"),
-            &HashMap::new(),
+            &known_json_response_headers(&upstream_response),
         )
         .await
         .expect("reserved template URI should be reverse-mapped");
@@ -1938,7 +1986,7 @@ async fn aggregate_resource_read_reuses_selected_server_template_cache() {
             &mut tool_ctx,
             &tool_response,
             Some("application/json"),
-            &HashMap::new(),
+            &known_json_response_headers(&tool_response),
         )
         .await
         .expect("selected-server template should reverse-map the resource link");

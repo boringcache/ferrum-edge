@@ -199,6 +199,22 @@ pub(crate) const NO_TRANSFORM_RESPONSE_METADATA_KEY: &str = "ferrum:no_transform
 /// the origin's strong validator.
 pub(crate) const STRONG_ETAG_RESPONSE_METADATA_KEY: &str = "ferrum:strong_etag_response";
 
+/// Marker proving that the original backend response metadata below was
+/// captured before any `after_proxy` hook mutated its headers.
+pub(crate) const ORIGINAL_RESPONSE_METADATA_STAMPED_KEY: &str =
+    "ferrum:original_response_metadata_stamped";
+
+/// Parsed `Content-Length` from the original backend response. Body transforms
+/// use this snapshot when a later gateway plugin (notably `compression`)
+/// removes the wire header before the buffered-body phase.
+pub(crate) const ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY: &str =
+    "ferrum:original_response_content_length";
+
+/// Marker that the original backend response carried a non-identity
+/// `Content-Encoding`. This distinguishes origin encoding from an encoding
+/// selected later by the gateway compression plugin.
+pub(crate) const ORIGIN_ENCODED_RESPONSE_METADATA_KEY: &str = "ferrum:origin_encoded_response";
+
 /// The ORIGINAL backend HTTP status, captured at the start of
 /// `run_after_proxy_hooks` before any `after_proxy` hook can reject the response
 /// and replace it with a rejection. Plugins whose `after_proxy` runs at a higher
@@ -265,6 +281,31 @@ pub(crate) fn stamp_original_response_metadata(
     response_status: u16,
     response_headers: &HashMap<String, String>,
 ) {
+    ctx.metadata.insert(
+        ORIGINAL_RESPONSE_METADATA_STAMPED_KEY.to_string(),
+        "true".to_string(),
+    );
+    ctx.metadata
+        .remove(ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY);
+    if let Some(content_length) = response_headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        ctx.metadata.insert(
+            ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY.to_string(),
+            content_length.to_string(),
+        );
+    }
+    ctx.metadata.remove(ORIGIN_ENCODED_RESPONSE_METADATA_KEY);
+    if response_headers
+        .get("content-encoding")
+        .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
+    {
+        ctx.metadata.insert(
+            ORIGIN_ENCODED_RESPONSE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
     if response_status == 206 || response_headers.contains_key("content-range") {
         ctx.metadata
             .insert(RANGE_RESPONSE_METADATA_KEY.to_string(), "true".to_string());
@@ -2253,6 +2294,9 @@ pub(crate) fn store_request_body_metadata(
 
 pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<String, String>) {
     metadata.remove("request_body");
+    metadata.remove(ORIGINAL_RESPONSE_METADATA_STAMPED_KEY);
+    metadata.remove(ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY);
+    metadata.remove(ORIGIN_ENCODED_RESPONSE_METADATA_KEY);
     // ai_tool_governor uses these request-scoped markers to select the
     // inspectable streaming path and seed approval correlation. They are
     // lifecycle bookkeeping, not observability metadata, and must never make
@@ -27941,6 +27985,18 @@ mod tests {
             "mcp.response_rewrite.session".to_string(),
             "internal-session-hash".to_string(),
         );
+        ctx.metadata.insert(
+            ORIGINAL_RESPONSE_METADATA_STAMPED_KEY.to_string(),
+            "true".to_string(),
+        );
+        ctx.metadata.insert(
+            ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY.to_string(),
+            "128".to_string(),
+        );
+        ctx.metadata.insert(
+            ORIGIN_ENCODED_RESPONSE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
 
         let metadata = clone_log_metadata(&ctx);
 
@@ -27949,6 +28005,9 @@ mod tests {
         assert!(!metadata.contains_key("waf.action"));
         assert!(!metadata.contains_key("mcp.needs_response_rewrite"));
         assert!(!metadata.contains_key("mcp.response_rewrite.session"));
+        assert!(!metadata.contains_key(ORIGINAL_RESPONSE_METADATA_STAMPED_KEY));
+        assert!(!metadata.contains_key(ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY));
+        assert!(!metadata.contains_key(ORIGIN_ENCODED_RESPONSE_METADATA_KEY));
 
         ctx.set_waf_metadata("waf.rule_hits", "FE-SQLI-001");
         ctx.metadata

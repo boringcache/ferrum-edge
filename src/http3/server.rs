@@ -5257,6 +5257,22 @@ async fn proxy_to_backend_h3_refined_response(
                     .backend_capabilities
                     .mark_h3_unsupported(proxy, upstream_target);
             }
+            let (reject_status, reject_body) = h3_backend_failure_status_body(&error);
+            if retry_config.is_some() {
+                // Nothing has been committed downstream yet. Preserve this
+                // failure as a buffered result so the native-H3 retry loop can
+                // apply retry_on_connect_failure / status policy and rotate the
+                // target. The final exhausted failure is emitted by the normal
+                // buffered response path.
+                return Ok(H3RefinedResponse::Buffered(H3BufferedDispatchResult {
+                    status: reject_status.as_u16(),
+                    body: reject_body.as_bytes().to_vec(),
+                    headers: HashMap::new(),
+                    trailers: None,
+                    error_class: Some(h3_error_class),
+                    request_on_wire,
+                }));
+            }
             // Do NOT propagate a send error here: this refined path already
             // started least-connections LB tracking before dispatch, so
             // returning `Err` would skip the caller's `record_backend_outcome`
@@ -5265,7 +5281,6 @@ async fn proxy_to_backend_h3_refined_response(
             // disconnect in the result so the caller still records the outcome
             // and releases the connection — mirrors the size-limit / after_proxy
             // reject paths in `stream_h3_open_response_to_client`.
-            let (reject_status, reject_body) = h3_backend_failure_status_body(&error);
             let reject_sent = send_h3_response(h3_stream, reject_status, reject_body)
                 .await
                 .is_ok();
@@ -8282,6 +8297,8 @@ mod native_h3_retry_refinement_tests {
         let refine = &refine_tail[..refine_end];
         assert!(refine.contains("retry_response_decision_context(&*ctx)"));
         assert!(refine.contains("if !response_is_retryable"));
+        assert!(refine.contains("if retry_config.is_some()"));
+        assert!(refine.contains("H3RefinedResponse::Buffered(H3BufferedDispatchResult"));
     }
 }
 

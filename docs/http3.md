@@ -65,7 +65,7 @@ The streaming request-body pool path retries a stale cached H3 connection only w
 
 Use this path when the backend is known to speak QUIC. When startup or background refresh has not classified the target as H3-capable, the gateway routes via the cross-protocol bridge instead — this prevents the common failure mode of pointing H3 frontend traffic at an HTTP/2-only backend and seeing opaque QUIC connect errors on live requests.
 
-Retry-enabled requests normally keep native-H3 responses buffered so status-based retries and body plugins run before downstream commitment. A response plugin may explicitly declare that an inherently streaming response can be released after headers under retries (for example, `mcp_gateway` for `text/event-stream`). The native H3 header-first path applies the shared retry-marked content-type decision before draining the body, while retryable statuses remain buffered for the retry loop.
+Retry-enabled requests normally keep native-H3 responses buffered so status-based retries and body plugins run before downstream commitment. A response plugin may explicitly declare that an inherently streaming response can be released after headers under retries (for example, `mcp_gateway` for `text/event-stream`). The native H3 header-first path applies the shared retry-marked content-type decision before draining the body, while retryable statuses and pre-header dispatch failures remain buffered for the retry loop.
 
 ### Stale capability recovery
 
