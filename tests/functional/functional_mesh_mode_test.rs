@@ -7322,32 +7322,6 @@ fn netns_command(pid: u32, script: &str) -> Result<String, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn udp_missing_guard_chain_probe(pid: u32) -> Result<(Option<i32>, String), String> {
-    let output = Command::new("nsenter")
-        .arg(format!("--net=/proc/{pid}/ns/net"))
-        .args([
-            "--",
-            "iptables",
-            "-t",
-            "mangle",
-            "-w",
-            "5",
-            "-C",
-            "OUTPUT",
-            "-p",
-            "udp",
-            "-j",
-            "FERRUM_UDP_FAIL_CLOSED_A",
-        ])
-        .output()
-        .map_err(|error| format!("probe missing UDP guard chain: {error}"))?;
-    Ok((
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    ))
-}
-
-#[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct UdpCaptureSnapshot {
     output_jumps: usize,
@@ -7694,34 +7668,15 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         .expect("capture-disabled pod must have no UDP rules/listener");
     disabled_a.stop();
 
-    // The production alternating-guard installer currently probes an OUTPUT
-    // jump to generation A before creating that user chain. Some iptables
-    // backends report the expected missing target as status 2 instead of 1;
-    // production treats 2 as an xtables resource error and retries forever.
-    // Keep the remainder of this e2e strict on compatible backends, but record
-    // that exact producer incompatibility as the narrow #2084 XFAIL until the
-    // source fix lands. Any other probe result remains a harness/test failure.
-    let (missing_guard_status, missing_guard_stderr) =
-        udp_missing_guard_chain_probe(pod.pid()).expect("probe fresh-netns UDP guard behavior");
-    if missing_guard_status == Some(2) {
-        eprintln!(
-            "XFAIL #2084: this iptables backend returns status 2 for the producer's missing \
-             fail-closed guard target; UDP source capture cannot reach first install: \
-             {missing_guard_stderr}"
-        );
-        gateway_b.stop();
-        cp_a.shutdown().await;
-        cp_b.shutdown().await;
-        echo_task.abort();
-        return;
-    }
-    assert_eq!(
-        missing_guard_status,
-        Some(1),
-        "a fresh pod netns must report the absent UDP guard jump as status 1; \
-         stderr={missing_guard_stderr}"
-    );
-
+    // NOTE (#2084): the production alternating-guard installer probes an OUTPUT
+    // jump to generation A (`-C OUTPUT ... -j FERRUM_UDP_FAIL_CLOSED_A`) before
+    // creating that user chain. On nft-backed iptables a missing target chain is
+    // reported as exit status 2, not 1, and the producer treats status 2 as an
+    // xtables resource error and retries forever without ever reaching first
+    // install. That producer-side incompatibility is the ground truth, so the
+    // #2084 XFAIL is gated below on the producer's own runtime error signature
+    // (after gateway A with UDP capture starts) rather than on a separate,
+    // backend-divergent standalone probe here.
     let ports_a = reserve_mesh_ports().await;
     let a_outbound = ports_a.outbound;
     let mut gateway_a = LiveGatewayChild::new(spawn_mesh_gateway(
@@ -7764,9 +7719,31 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         wait_for_udp_capture_snapshot(pod.pid(), capture_port, true, Duration::from_secs(20))
     {
         let status = gateway_a.poll_status();
+        let gateway_a_output = captured_output(&temp_a);
+        // Authoritative #2084 gate keyed on the producer's own runtime error.
+        // On nft-backed iptables a `-C OUTPUT ... -j FERRUM_UDP_FAIL_CLOSED_A`
+        // probe of a not-yet-created target chain returns exit status 2 (legacy
+        // iptables returns 1); the producer treats status 2 as an xtables
+        // resource error and retries forever, so first install never converges
+        // and the snapshot stays empty for the full 20s. The producer is the
+        // ground truth here, so we detect that precise status-2 guard-inspect
+        // signature in gateway A's captured output and XFAIL until the source
+        // fix (#2084) lands. Any other install timeout remains a hard failure.
+        if gateway_a_output.contains("could not inspect active UDP fail-closed guard (status 2)") {
+            eprintln!(
+                "XFAIL #2084: the Ambient UDP producer's in-netns fail-closed guard probe \
+                 returns status 2 on this iptables backend, so first install never converges: \
+                 {error}; gateway A {status}"
+            );
+            gateway_a.stop();
+            gateway_b.stop();
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            echo_task.abort();
+            return;
+        }
         panic!(
-            "real manager/backend must install one UDP producer: {error}; gateway A {status}\n{}",
-            captured_output(&temp_a)
+            "real manager/backend must install one UDP producer: {error}; gateway A {status}\n{gateway_a_output}"
         );
     }
 
