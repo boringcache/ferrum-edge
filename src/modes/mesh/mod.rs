@@ -19615,6 +19615,7 @@ mod tests {
             labels_ambiguous: false,
             version: "test".to_string(),
             workloads: Vec::new(),
+            ambient_udp_source_workloads: Vec::new(),
             node_waypoint_assertors: Vec::new(),
             services: Vec::new(),
             local_inbound_services: Vec::new(),
