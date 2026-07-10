@@ -12586,25 +12586,17 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         .iter()
         .any(|plugin| plugin.requires_response_committed_hook())
     {
-        if is_grpc_request {
-            let status_code = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
-            let normalized = normalize_reject_response(status_code, body, headers, true);
-            for plugin in plugins.iter() {
-                plugin
-                    .on_response_committed(
-                        ctx,
-                        normalized.http_status.as_u16(),
-                        &normalized.headers,
-                        &normalized.body,
-                    )
-                    .await;
-            }
-        } else {
-            for plugin in plugins.iter() {
-                plugin
-                    .on_response_committed(ctx, *status, headers, body)
-                    .await;
-            }
+        let status_code = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
+        let normalized = normalize_reject_response(status_code, body, headers, is_grpc_request);
+        for plugin in plugins.iter() {
+            plugin
+                .on_response_committed(
+                    ctx,
+                    normalized.http_status.as_u16(),
+                    &normalized.headers,
+                    &normalized.body,
+                )
+                .await;
         }
     }
 }
@@ -26577,6 +26569,8 @@ mod tests {
 
     struct RejectHeaderPlugin;
 
+    struct CommittedHeaderProbePlugin;
+
     struct CustomNoTransformHeaderPlugin;
 
     struct CustomStrongEtagHeaderPlugin;
@@ -26678,6 +26672,40 @@ mod tests {
                 response_headers.insert("x-after-reject".to_string(), "applied".to_string());
             }
             PluginResult::Continue
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for CommittedHeaderProbePlugin {
+        fn name(&self) -> &str {
+            "committed_header_probe"
+        }
+
+        fn requires_response_committed_hook(&self) -> bool {
+            true
+        }
+
+        async fn on_response_committed(
+            &self,
+            ctx: &mut RequestContext,
+            response_status: u16,
+            response_headers: &HashMap<String, String>,
+            body: &[u8],
+        ) {
+            ctx.metadata.insert(
+                "test:committed_status".to_string(),
+                response_status.to_string(),
+            );
+            if let Some(content_type) = response_headers.get("content-type") {
+                ctx.metadata.insert(
+                    "test:committed_content_type".to_string(),
+                    content_type.clone(),
+                );
+            }
+            ctx.metadata.insert(
+                "test:committed_body".to_string(),
+                String::from_utf8_lossy(body).into_owned(),
+            );
         }
     }
 
@@ -27069,6 +27097,42 @@ mod tests {
 
         assert_eq!(response.http_status, StatusCode::OK);
         assert_eq!(response.body, body);
+    }
+
+    #[tokio::test]
+    async fn non_grpc_reject_committed_hook_sees_default_content_type() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CommittedHeaderProbePlugin)];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        let body = br#"{"error":"blocked"}"#;
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 422,
+            body: bytes::Bytes::copy_from_slice(body),
+            headers: HashMap::new(),
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            ctx.metadata
+                .get("test:committed_content_type")
+                .map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("test:committed_status")
+                .map(String::as_str),
+            Some("422")
+        );
+        assert_eq!(
+            ctx.metadata.get("test:committed_body").map(String::as_str),
+            Some(r#"{"error":"blocked"}"#)
+        );
     }
 
     #[tokio::test]

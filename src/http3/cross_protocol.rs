@@ -2065,11 +2065,31 @@ where
             None,
             backend_admission_elapsed,
         );
-        let mut outcome = write_reject_with_headers(
-            stream,
-            StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        let reject_status =
+            StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let normalized = crate::proxy::normalize_reject_response(
+            reject_status,
             &reject.body,
             &reject.headers,
+            false,
+        );
+        if has_response_committed_hook {
+            for plugin in plugins {
+                plugin
+                    .on_response_committed(
+                        ctx,
+                        normalized.http_status.as_u16(),
+                        &normalized.headers,
+                        &normalized.body,
+                    )
+                    .await;
+            }
+        }
+        let mut outcome = write_reject_with_headers(
+            stream,
+            normalized.http_status,
+            &normalized.body,
+            &normalized.headers,
             backend_start,
             bytes_sent,
         )

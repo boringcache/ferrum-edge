@@ -51,7 +51,7 @@ use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction,
     ResponseStreamInspector, TransactionSummary,
 };
-use crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY;
+use crate::proxy::{REJECTION_RESPONSE_METADATA_KEY, SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY};
 
 /// Schema version stamped onto every emitted record.
 const RECORD_VERSION: u32 = 1;
@@ -655,6 +655,10 @@ impl AiTranscriptAudit {
         }
 
         if self.on_buffer_full == BufferFullPolicy::Reject && staging.commit_permit.is_none() {
+            // Keep the reservation across a content-type downgrade to the SSE
+            // streaming path. Sampled/override stream records are not complete
+            // until `on_response_stream_terminated`; releasing here would make
+            // `on_buffer_full: reject` best-effort after the response committed.
             let Some(permit) = self.logger.try_reserve() else {
                 ctx.metadata
                     .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
@@ -1213,6 +1217,13 @@ impl Plugin for AiTranscriptAudit {
         ctx.metadata.insert("request_body".to_string(), body);
         if flag(&ctx.metadata, MD_STREAM_REQUEST) {
             PluginResult::Continue
+        } else if ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY) {
+            // `apply_after_proxy_hooks_to_rejection` is replaying header hooks
+            // over an already-fixed response and ignores replacement rejects.
+            // Admission ran in `before_proxy` (or the normal backend
+            // `after_proxy` pass); do not stamp a new rejected verdict whose
+            // 503 cannot replace the response at this point.
+            PluginResult::Continue
         } else {
             self.ensure_commit_admission(ctx)
         }
@@ -1336,7 +1347,7 @@ impl Plugin for AiTranscriptAudit {
     async fn on_final_response_body(
         &self,
         ctx: &mut RequestContext,
-        response_status: u16,
+        _response_status: u16,
         response_headers: &HashMap<String, String>,
         _body: &[u8],
     ) -> PluginResult {
@@ -1379,12 +1390,6 @@ impl Plugin for AiTranscriptAudit {
             .get(&record_id)
             .map(|staging| staging.sample_hit)
             .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
-        let (emit, _reason) = self.emit_decision(
-            sample_hit,
-            guardrail_fired(&ctx.metadata),
-            response_status >= 400,
-        );
-
         // The transaction-log `sampled` flag carries the sampling ROLL (matching
         // the exported record's `sampled` field), not the emit decision —
         // `sink_status` already conveys whether a record was emitted.
@@ -1396,14 +1401,6 @@ impl Plugin for AiTranscriptAudit {
             if !matches!(admission, PluginResult::Continue) {
                 return admission;
             }
-        }
-
-        if !emit {
-            // A later validator can still turn this response into an error and
-            // make it eligible for `always_capture_on_error`.
-            ctx.metadata
-                .insert(MD_SINK_STATUS.to_string(), "deferred".to_string());
-            return PluginResult::Continue;
         }
 
         // Keep rejection-capable sink admission here, before the response is

@@ -3374,6 +3374,31 @@ async fn fail_closed_rejected_then_unsampled_keeps_rejected_sink_status() {
                 "a fail-closed rejection must not be downgraded to skipped by the \
                  not-emitting committed decision"
             );
+
+            // Replaying `after_proxy` over an already-fixed rejection cannot
+            // replace that response: proxy core intentionally ignores Reject
+            // results in this scoped pass. The audit hook must therefore skip a
+            // fresh fail-closed admission instead of stamping `rejected` for a
+            // 503 the client will not receive.
+            let mut replay_ctx = make_ctx();
+            plugin
+                .on_final_request_body_with_context(&mut replay_ctx, &headers, ai_request_body())
+                .await;
+            replay_ctx
+                .metadata
+                .insert("ferrum:rejection_response".to_string(), "true".to_string());
+            let replay_result = plugin
+                .after_proxy(&mut replay_ctx, 403, &mut HashMap::new())
+                .await;
+            assert!(matches!(replay_result, PluginResult::Continue));
+            assert_ne!(
+                replay_ctx
+                    .metadata
+                    .get("ai_transcript_audit.sink_status")
+                    .map(String::as_str),
+                Some("rejected"),
+                "reject-path after_proxy replay must not claim an ignored fail-closed 503"
+            );
             saw_reject = true;
             break;
         }
