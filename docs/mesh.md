@@ -1994,7 +1994,13 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   Cleanup removes every duplicate guard jump and strictly detaches any
   partial live-capture OUTPUT path before releasing the guard. The guarded-to-live
   switch propagates xtables resource errors and also probes stale IPv6 guard chains
-  independently of the current IPv6 setting. The
+  independently of the current IPv6 setting. First-install detection is portable
+  across iptables backends: the guard establishes chain existence with `-S` before
+  probing the OUTPUT jump, so a fresh pod netns (where the jump references a
+  not-yet-created chain and nft-backed iptables returns exit status 2 where legacy
+  returns 1) is classified as a first install instead of a genuine resource error —
+  while any other non-1 status on either probe still aborts the install and retains
+  the fail-closed cleanup owner. The
   pre-first-poll enrollment window remains tracked under #2013, and live source-capture
   plus bind-collision verification remains #2038. The producer tears down only its own
   rules on pod removal / config change / shutdown
