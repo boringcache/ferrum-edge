@@ -306,6 +306,85 @@ async fn request_mirror_fires_even_when_primary_502s() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn request_mirror_stall_never_delays_primary_response() {
+    let primary_res = reserve_port().await.expect("primary port");
+    let primary_port = primary_res.port;
+    let primary = ScriptedHttp1Backend::builder(primary_res.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "2".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Connection".into(),
+            value: "close".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"ok".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn primary");
+
+    let mirror_res = reserve_port().await.expect("mirror port");
+    let mirror_port = mirror_res.port;
+    let mirror = ScriptedHttp1Backend::builder(mirror_res.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn stalled mirror");
+
+    let yaml = yaml_with_plugin(
+        primary_port,
+        "request-mirror-stall",
+        "request_mirror",
+        json!({
+            "mirror_host": "127.0.0.1",
+            "mirror_port": mirror_port,
+            "mirror_protocol": "http",
+            "percentage": 100.0,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let client = harness.http_client().expect("client");
+    let started = Instant::now();
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.get(&harness.proxy_url("/api/mirror-stall")),
+    )
+    .await
+    .expect("stalled mirror blocked the primary response")
+    .expect("primary response");
+
+    assert_eq!(response.status.as_u16(), 200, "response={response:?}");
+    assert_eq!(response.body_text(), "ok");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "stalled mirror delayed the fire-and-forget primary path"
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !mirror.received_requests().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("stalled mirror never received the copied request");
+    assert_eq!(primary.received_requests().await.len(), 1);
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Test 3 — `compression` handles mid-stream backend close without
 // corrupting output.

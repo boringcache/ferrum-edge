@@ -3190,7 +3190,7 @@ config:
 
 ### `request_mirror`
 
-Duplicates live proxy traffic to a secondary destination for shadow testing, validation, or migration checks without affecting client responses. The mirror request is fire-and-forget — the gateway spawns an async task and proceeds with the real backend call immediately.
+Duplicates live proxy traffic to a secondary destination for shadow testing, validation, or migration checks without affecting client responses. The mirror request is fire-and-forget — the gateway spawns an async task and proceeds with the real backend call immediately. Mirror response collection and logging also run in a detached task, so a target that stalls, resets, or responds slowly cannot delay the primary response.
 
 **Priority:** 3075
 **Protocols:** HTTP, gRPC
