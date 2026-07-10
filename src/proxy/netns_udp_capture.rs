@@ -316,25 +316,6 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             .all(|uid| udp_ready_marker_path(&ack_dir, uid).is_some_and(|marker| marker.is_file()))
     }
 
-    // Takes `&mut self` rather than `&self` on purpose: the reconcile future is
-    // `tokio::spawn`ed, so any borrow of `self` held across the `.await` below must
-    // keep the future `Send`. `NetnsUdpCaptureManager` is `Send` (its producer
-    // handles carry `Send` `FnOnce`/`FnMut` closures) but not `Sync`, so a shared
-    // `&self` held across the await would demand `Self: Sync` and fail to compile.
-    // A `&mut self` borrow only requires `Self: Send`, which holds.
-    async fn await_udp_not_ready_ack(&mut self, pod_uids: &HashSet<String>) -> bool {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        loop {
-            if self.udp_not_ready_acknowledged(pod_uids) {
-                return true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
-
     /// Poll-and-reconcile until `shutdown` flips to `true`, then close every
     /// producer (which tears down its in-netns UDP rules).
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
@@ -453,6 +434,17 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             })
             .map(|(netns, _)| *netns)
             .collect();
+        // Detach every gone producer and clear its ready markers FIRST, so the
+        // node-agent's next reconcile observes all of them as not-ready and can
+        // publish their acks together. Only then poll for acks against a single
+        // shared deadline: a sequential per-netns `await_udp_not_ready_ack` would
+        // cost up to 1s × N under a node drain / mass scale-down, stalling the
+        // reconcile loop (no new producers open until this pass returns) — mirror
+        // `shutdown_all`'s one-deadline poll so a delayed node-agent degrades to
+        // ~1s total instead. The ordering the handshake needs is preserved: marker
+        // removal precedes the ack wait, and `handle.close(retain_guard)` still
+        // runs only after the ack decision for that netns.
+        let mut closing: Vec<(u64, ActiveUdpCapture)> = Vec::with_capacity(gone.len());
         for netns in gone {
             if let Some(active) = self.active.remove(&netns) {
                 if let Some(dir) = &self.ready_dir {
@@ -460,7 +452,20 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                         remove_udp_ready_marker(dir, uid);
                     }
                 }
-                let retain_guard = !self.await_udp_not_ready_ack(&active.pod_uids).await;
+                closing.push((netns, active));
+            }
+        }
+        if !closing.is_empty() {
+            let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            while closing
+                .iter()
+                .any(|(_, active)| !self.udp_not_ready_acknowledged(&active.pod_uids))
+                && tokio::time::Instant::now() < ack_deadline
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            for (netns, active) in closing {
+                let retain_guard = !self.udp_not_ready_acknowledged(&active.pod_uids);
                 if retain_guard {
                     warn!(
                         netns_inode = netns,
@@ -1780,6 +1785,53 @@ mod tests {
             *retained.lock().unwrap(),
             vec![100],
             "producer teardown must retain the in-netns guard without BPF-close acknowledgement"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_pod_removal_awaits_acks_against_one_shared_deadline() {
+        // Node drain / mass scale-down: N pods in N distinct netns all go away in a
+        // single reconcile pass and the node-agent never acks. A per-netns 1s ack
+        // wait would cost ~N seconds; the shared-deadline poll must bound the whole
+        // gone pass to ~1s of virtual time while still retaining every fail-closed
+        // guard. Paused time makes the assertion deterministic (sleeps auto-advance).
+        const N: u64 = 8;
+        let initial: Vec<PodCaptureTarget> = (0..N)
+            .map(|i| target(&format!("pod-{i}"), &format!("/cg/{i}")))
+            .collect();
+        let netns_pairs: Vec<(String, Option<u64>)> = (0..N)
+            .map(|i| (format!("/cg/{i}"), Some(100 + i)))
+            .collect();
+        let backend_map: Vec<(&str, Option<u64>)> = netns_pairs
+            .iter()
+            .map(|(cg, ns)| (cg.as_str(), *ns))
+            .collect();
+        let source = Arc::new(StaticSource(Mutex::new(initial)));
+        let backend = MockBackend::new(&backend_map);
+        let retained = backend.retained_guards.clone();
+        let ready_root = tempfile::tempdir().unwrap();
+        let ready_dir = ready_root.path().join(".udp-ready");
+        let mut mgr = manager(source.clone(), backend).with_ready_dir(Some(ready_dir));
+
+        assert_eq!(mgr.reconcile_once().await, N as usize);
+        // Every pod leaves at once; no `.udp-not-ready` acks are ever published.
+        source.0.lock().unwrap().clear();
+
+        let start = tokio::time::Instant::now();
+        assert_eq!(mgr.reconcile_once().await, 0);
+        let elapsed = start.elapsed();
+
+        // One shared ~1s deadline, not N × 1s.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "batch removal must bound the ack wait to one shared deadline, took {elapsed:?}"
+        );
+        let mut got = retained.lock().unwrap().clone();
+        got.sort_unstable();
+        let expected: Vec<u64> = (0..N).map(|i| 100 + i).collect();
+        assert_eq!(
+            got, expected,
+            "every unacknowledged producer must retain its fail-closed guard"
         );
     }
 

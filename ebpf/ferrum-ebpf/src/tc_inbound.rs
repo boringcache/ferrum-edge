@@ -59,15 +59,21 @@ fn try_tc_inbound(ctx: &TcContext) -> Result<i32, i64> {
 
 #[inline(always)]
 fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
-    let src_ip: u32 = ctx.load(ETH_HDR_LEN + 12).map_err(|_| -1i64)?;
+    // Load `protocol` first and keep the pod-source UDP not-ready SHOT check
+    // ahead of the `dst` early-return (pod→external UDP must stay droppable
+    // during the enrollment window). Defer the `src_ip` load into the UDP arm so
+    // the common non-pod-destined TCP packet early-returns after a single
+    // `dst_ip` load — as it did before the readiness guard was added — instead
+    // of paying an unconditional source-IP load on every classified packet.
     let protocol: u8 = ctx.load(ETH_HDR_LEN + 9).map_err(|_| -1i64)?;
-    if protocol == IPPROTO_UDP
-        && matches!(
+    if protocol == IPPROTO_UDP {
+        let src_ip: u32 = ctx.load(ETH_HDR_LEN + 12).map_err(|_| -1i64)?;
+        if matches!(
             unsafe { FERRUM_POD_IPS.get(&src_ip) },
             Some(info) if info.udp_capture_not_ready()
-        )
-    {
-        return Ok(TC_ACT_SHOT);
+        ) {
+            return Ok(TC_ACT_SHOT);
+        }
     }
 
     let dst_ip: u32 = ctx.load(ETH_HDR_LEN + 16).map_err(|_| -1i64)?;
@@ -75,6 +81,9 @@ fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
         return Ok(TC_ACT_OK);
     }
 
+    // Reaching here means the destination is enrolled; the source IP is needed
+    // for the node-source and authorization checks below on both protocols.
+    let src_ip: u32 = ctx.load(ETH_HDR_LEN + 12).map_err(|_| -1i64)?;
     let source_is_node = unsafe { FERRUM_NODE_IPS.get(&src_ip) }.is_some();
     match protocol {
         IPPROTO_TCP => {
