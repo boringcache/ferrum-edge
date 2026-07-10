@@ -1151,6 +1151,47 @@ fn multi_cluster_rejects_wildcard_sni_overlapping_exact_sni_same_network() {
     );
 }
 
+/// East-west gateway selection accepts both a service base FQDN and its generated
+/// `p<port>.<base>` alias for multi-port cross-cluster dials. A same-network,
+/// overlapping-trust-domain base gateway and alias gateway would therefore both
+/// be candidates for alias traffic, so validation rejects the ambiguous pair.
+#[test]
+fn multi_cluster_rejects_base_fqdn_and_per_port_alias_same_network() {
+    let td_b = TrustDomain::new("cluster-b.local").unwrap();
+    let mesh = MeshConfig {
+        multi_cluster: Some(MultiClusterConfig {
+            east_west_gateways: vec![
+                EastWestGateway {
+                    name: "ew-base".to_string(),
+                    namespace: "mesh-system".to_string(),
+                    host: "eastwest-b.example".to_string(),
+                    port: 15443,
+                    sni_hosts: vec!["reviews.default.svc.cluster.local".to_string()],
+                    trust_domain: Some(td_b.clone()),
+                    network: Some("net-b".to_string()),
+                },
+                EastWestGateway {
+                    name: "ew-alias".to_string(),
+                    namespace: "mesh-system".to_string(),
+                    host: "eastwest-b2.example".to_string(),
+                    port: 15443,
+                    sni_hosts: vec!["p9090.reviews.default.svc.cluster.local".to_string()],
+                    trust_domain: Some(td_b),
+                    network: Some("net-b".to_string()),
+                },
+            ],
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshConfig::default()
+    };
+
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|err| err.contains("sni_hosts overlap")),
+        "base FQDN and derived per-port alias on the same network+TD must be rejected, got: \n         {errors:?}"
+    );
+}
+
 /// A wildcard and exact SNI that DON'T overlap (different subdomains) on the same
 /// network + trust domain are NOT a collision.
 #[test]

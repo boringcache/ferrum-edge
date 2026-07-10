@@ -3700,9 +3700,10 @@ fn validate_multi_cluster(
     // aware host-overlap semantics the selector uses. Two gateways on the SAME
     // network whose trust domains OVERLAP (a TD-less gateway is a wildcard that
     // overlaps every trust domain; two specific TDs overlap only when EQUAL) AND
-    // whose `sni_hosts` OVERLAP under `hosts_overlap` (so
-    // `*.default.svc.cluster.local` vs `reviews.default.svc.cluster.local` is
-    // caught, not only literal string equality) can BOTH route the same
+    // whose `sni_hosts` OVERLAP under east-west alias-aware host semantics (so
+    // `*.default.svc.cluster.local` vs `reviews.default.svc.cluster.local`, and
+    // `reviews.default.svc.cluster.local` vs `p9090.reviews.default.svc.cluster.local`,
+    // are caught, not only literal string equality) can BOTH route the same
     // destination FQDN, and `select_east_west_gateway_for_network` would silently
     // pick whichever is first. On a CLIENT data plane these are remote gateways
     // across networks, so a DIFFERENT network is never a collision; on an
@@ -3744,17 +3745,50 @@ fn validate_multi_cluster(
                 .iter()
                 .map(|sni| sni.to_ascii_lowercase())
                 .collect();
-            if crate::config::types::hosts_overlap(&earlier_snis, &later_snis) {
+            if east_west_sni_hosts_overlap(&earlier_snis, &later_snis) {
                 errors.push(format!(
                     "EastWestGateway '{}': sni_hosts overlap EastWestGateway '{}' on the same \
                      network for an overlapping trust domain (both can route the same destination \
-                     FQDN; selection would silently pick one — disambiguate by sni_hosts, network, \
-                     or trust_domain)",
+                     FQDN or per-port SNI alias; selection would silently pick one — disambiguate \
+                     by sni_hosts, network, or trust_domain)",
                     later.name, earlier.name
                 ));
             }
         }
     }
+}
+
+/// East-west gateway selection treats a service base FQDN as also owning its
+/// generated `p<port>.<base-fqdn>` aliases. Validation must therefore reject not
+/// only raw host/wildcard overlaps, but also a configured base FQDN on one
+/// gateway and a configured per-port alias of that base FQDN on another gateway.
+fn east_west_sni_hosts_overlap(a: &[String], b: &[String]) -> bool {
+    if crate::config::types::hosts_overlap(a, b) {
+        return true;
+    }
+
+    let a_bases: Vec<String> = a
+        .iter()
+        .filter_map(|host| east_west_per_port_alias_base(host))
+        .collect();
+    if !a_bases.is_empty() && crate::config::types::hosts_overlap(&a_bases, b) {
+        return true;
+    }
+
+    let b_bases: Vec<String> = b
+        .iter()
+        .filter_map(|host| east_west_per_port_alias_base(host))
+        .collect();
+    !b_bases.is_empty() && crate::config::types::hosts_overlap(a, &b_bases)
+}
+
+fn east_west_per_port_alias_base(host: &str) -> Option<String> {
+    let (port_label, base) = host.split_once('.')?;
+    let port = port_label.strip_prefix('p')?;
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(base.to_string())
 }
 
 /// Lower-case in-place hostname normalisation for mesh entries — matches
