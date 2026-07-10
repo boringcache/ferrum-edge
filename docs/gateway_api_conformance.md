@@ -72,7 +72,7 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 | `HTTPRoute` hostname, path, method, header, and query matching | Yes | Translated into proxies plus ordered `mesh_route_dispatch` rules where predicate matching is needed |
 | `HTTPRoute` `RequestHeaderModifier` | Yes | Route-level set/add/remove header filters are projected into request-transform rules and verified by black-box backend echo |
 | `HTTPRoute` `RequestRedirect` | Yes | Redirect filters materialize action-only dispatch rules with status, hostname, scheme, port, and path replacement support |
-| `HTTPRoute` weighted `backendRefs` | Yes | Multiple non-zero backends create a weighted upstream; a rule whose backendRefs are **all** `weight: 0` fails closed through a blackhole backend (~502, a known divergence from the spec's 500) — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
+| `HTTPRoute` weighted `backendRefs` | Yes | Multiple non-zero backends create a weighted upstream; a rule whose backendRefs are **all** `weight: 0` remains traffic-capturing and returns HTTP 500 through a synthesized fault-abort — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
 | Cross-namespace `HTTPRoute.backendRefs` | Yes | Requires an exact `ReferenceGrant`; missing grants are rejected and unresolved |
 | Cross-namespace `parentRefs` | Yes | Allowed only when the referenced Gateway listener permits the route namespace |
 | Invalid backend references | Yes | Missing Services, unsupported backend target kinds, and unpermitted cross-namespace refs are reported as unresolved and materialize fail-closed HTTP 500 routes |
@@ -88,33 +88,30 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 These behaviors are exercised by the black-box lab (invalid and weighted refs)
 and specified field-by-field in [`docs/configuration.md`](configuration.md)
 (Kubernetes Mesh Integration — the authoritative field-level reference). They
-are summarized here because they are common conformance questions. Open
-residuals are tracked in
-[#2027](https://github.com/ferrum-edge/ferrum-edge/issues/2027) (single-cluster
-Gateway API backendRef residuals) — **not** in the cross-cluster/UDP mesh
-trackers (#2010, #2013).
+are summarized here because they are common conformance questions. These are
+single-cluster Gateway API behaviors, not cross-cluster or UDP mesh surfaces.
 
 - **Invalid / unresolved backendRef** (missing Service, unsupported backend
   kind, or an unpermitted cross-namespace ref) materializes a fail-closed route
   that returns **HTTP 500**, matching the Gateway API expectation. The
   black-box lab asserts the `/invalid` route returns `500`.
 - **Zero-weight-only rule** (every `backendRef` in a matched rule has
-  `weight: 0`) is *not* dropped — Ferrum emits a generated
-  `ferrum-zero-weight.invalid:65535` blackhole backend so the rule still
-  captures traffic instead of falling through to a broader later route. That
-  blackhole currently fails as a **backend/DNS-resolution failure (typically a
-  502)**, a **known divergence** from the spec's expected 500 for a rule with no
-  serviceable backends (tracked in #2027). Translator unit tests
-  (`http_route_keeps_all_zero_weight_rule_as_blackhole`) assert the generated
-  backend *shape*; the request-time status is not yet asserted in-tree.
-- **backendRef port is numeric-only.** A Gateway API `backendRef.port` must be a
-  number; naming a Service port from a `backendRef`
-  (`Service.spec.ports[].name`) is **not implemented** for Gateway API
-  translation (Istio `VirtualService` destinations *do* support `port.name`).
-  Once a numeric backendRef port has selected a Service port, that Service's
-  `targetPort` **may** be a named pod port — resolved against EndpointSlice port
-  names. That Service-`targetPort` resolution is currently unit-tested only for
-  numeric target ports on the Gateway API path (tracked in #2027).
+  `weight: 0`) is *not* dropped. Ferrum keeps the route materialized and applies
+  the same synthesized 100% fault-abort used for wholly invalid/unresolved
+  backendRefs, so matching traffic returns **HTTP 500** instead of falling
+  through to a broader later route. The translator test
+  (`http_route_keeps_all_zero_weight_rule_as_500_fault`) pins the route and
+  fault shape; the black-box lab asserts `/zero-weight` returns `500` even with
+  a later `/zero` backend route.
+- **backendRef port is numeric-only in the upstream CRD.** Gateway API v1.5
+  defines `HTTPBackendRef.port` as `PortNumber`: for a Kubernetes Service it is
+  the numeric Service port, not the target port. There is therefore no named
+  `backendRef.port` field for Ferrum to implement. Once that numeric port
+  selects `Service.spec.ports[]`, its `targetPort` may be a named pod port;
+  Ferrum resolves it against `EndpointSlice.ports[].name`. The translator test
+  (`http_route_selectorless_service_resolves_named_target_port`) covers this
+  Gateway API path. Istio `VirtualService` separately supports
+  `destination.port.name`, resolved against `Service.spec.ports[].name`.
 
 ## CI Evidence
 
@@ -126,7 +123,7 @@ The standalone `gateway-api-conformance.yml` workflow is the single owner that d
 - `GatewayClass`, `Gateway`, `HTTPRoute`, `GRPCRoute`, and `ReferenceGrant` resources for direct black-box checks.
 - The upstream Gateway API conformance suite pinned by `GATEWAY_API_VERSION`, defaulting to `v1.5.1`, running the complete `GATEWAY-HTTP` profile with explicit supported features `Gateway,ReferenceGrant,HTTPRoute`.
 
-Direct black-box checks cover hostname, path, method, headers, weighted backend selection, cross-namespace references, invalid references, backend failure, TLS, route updates, and route deletion. Diagnostics and the upstream standard conformance report are uploaded from `conformance-results/` as retained CI artifacts.
+Direct black-box checks cover hostname, path, method, headers, weighted backend selection, zero-weight-only HTTP 500 behavior, cross-namespace references, invalid references, backend failure, TLS, route updates, and route deletion. Diagnostics and the upstream standard conformance report are uploaded from `conformance-results/` as retained CI artifacts.
 
 The standalone Gateway API conformance workflow triggers on every PR, but a lightweight `changes` job gates the heavy lab job internally: it runs the conformance suite only when the PR diff touches routing, Kubernetes translation/status, CP/DP sync, data-plane startup, plugins, charts, the conformance script, or related CI files, and otherwise skips it. Artifacts are retained for 90 days so the standard upstream report can be reproduced from the workflow inputs and preserved as release evidence.
 
@@ -177,7 +174,7 @@ Each run uploads a `gateway-api-conformance-<version>` bundle from
 | --- | --- |
 | `gateway-api-conformance-test.json` | Streaming `go test -json` events for every upstream conformance test. |
 | `gateway-api-conformance-report.yaml` | Upstream `conformance.gateway.networking.k8s.io` report; `profiles[].coreTests` has pass/fail per test. |
-| `gateway-api-blackbox.md` | Results of the direct black-box traffic checks (host/method/header/modifier/cross-namespace/redirect/weighted/invalid-500/no-endpoints/update/delete/TLS). |
+| `gateway-api-blackbox.md` | Results of the direct black-box traffic checks (host/method/header/modifier/cross-namespace/redirect/weighted/invalid-500/zero-weight-500/no-endpoints/update/delete/TLS). |
 | `gateway-api-resources.yaml` | `kubectl get gatewayclasses,gateways,httproutes,grpcroutes,referencegrants -A -o yaml` snapshot. |
 | `kubernetes-workloads.txt`, `namespaces.txt`, `ferrum-*-deployment.txt`, `ferrum-pods.txt`, `ferrum-events.txt` | Cluster/workload diagnostics. |
 | `ferrum-control-plane.log`, `ferrum-control-plane-previous.log`, `ferrum-data-plane.log`, `blackbox-*.log` | Container logs. |
