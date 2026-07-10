@@ -7165,16 +7165,21 @@ impl LivePodNetns {
         };
         let script = format!(
             "set -e; command -v ip >/dev/null 2>&1 || exit 97; \
-             ip link set lo up || exit 98; {route} exec sleep 90"
+             ip link set lo up || exit 98; {route} exec sleep 300"
         );
         let mut child = Command::new("unshare")
             .args(["--net", "sh", "-c", &script])
             .spawn()
             .map_err(|error| format!("spawn unshare netns child: {error}"))?;
 
-        let host_netns_inode = std::fs::metadata("/proc/self/ns/net")
-            .map_err(|error| format!("read host netns identity: {error}"))?
-            .ino();
+        let host_netns_inode = match std::fs::metadata("/proc/self/ns/net") {
+            Ok(metadata) => metadata.ino(),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("read host netns identity: {error}"));
+            }
+        };
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             match child.try_wait() {
@@ -7211,23 +7216,38 @@ impl LivePodNetns {
         // Give the child shell a bounded moment to finish loopback/default-route
         // setup after `unshare(2)` changed the namespace identity.
         std::thread::sleep(Duration::from_millis(100));
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("poll configured netns child: {error}"))?
-        {
-            let _ = child.wait();
-            return Err(format!(
-                "netns child exited after unshare with code {:?}",
-                status.code()
-            ));
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = child.wait();
+                return Err(format!(
+                    "netns child exited after unshare with code {:?}",
+                    status.code()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("poll configured netns child: {error}"));
+            }
+            Ok(None) => {}
         }
 
-        let cgroup_dir = TempDir::new().map_err(|error| format!("temp cgroup dir: {error}"))?;
-        std::fs::write(
+        let cgroup_dir = match TempDir::new() {
+            Ok(dir) => dir,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("temp cgroup dir: {error}"));
+            }
+        };
+        if let Err(error) = std::fs::write(
             cgroup_dir.path().join("cgroup.procs"),
             format!("{}\n", child.id()),
-        )
-        .map_err(|error| format!("write synthetic cgroup.procs: {error}"))?;
+        ) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("write synthetic cgroup.procs: {error}"));
+        }
         Ok(Self { child, cgroup_dir })
     }
 
@@ -7521,6 +7541,7 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     if !live_source_capture_prerequisites() {
         return;
     }
+    ensure_gateway_built().expect("build gateway for live UDP source-capture test");
 
     const VIP: &str = "192.0.2.40";
     const UNROUTABLE_VIP: &str = "192.0.2.41";
@@ -7816,13 +7837,16 @@ impl LiveVethPod {
                 return Err(format!("host veth command {args:?} failed with {status}"));
             }
         }
-        netns_command(
+        if let Err(error) = netns_command(
             pod.pid(),
             &format!(
                 "set -e; ip addr add {pod_ip}/30 dev {pod_if}; \
                  ip link set {pod_if} up; ip route add default via {host_ip} dev {pod_if}"
             ),
-        )?;
+        ) {
+            let _ = Command::new("ip").args(["link", "del", &host_if]).status();
+            return Err(error);
+        }
         Ok(Self {
             pod,
             host_if,
@@ -7945,6 +7969,7 @@ async fn functional_mesh_live_source_capture_raw_tcp_mtls_round_trip() {
     if !live_source_capture_prerequisites() {
         return;
     }
+    ensure_gateway_built().expect("build gateway for live raw-TCP source-capture test");
 
     const VIP: &str = "192.0.2.50";
     let veth = match LiveVethPod::spawn() {
