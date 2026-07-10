@@ -1798,6 +1798,21 @@ impl Plugin for MeshAuthz {
             remote_ip,
             &headers,
         );
+        let ambient_udp_source_scope =
+            if ambient_udp_source_scope_request && baggage_outcome == BaggageOutcome::Honored {
+                match self.ambient_udp_source_scope(ctx, source_principal.as_ref()) {
+                    Ok(scope) => scope,
+                    Err(reason) => {
+                        ctx.metadata.insert(
+                            "mesh_authz.ignored_udp_source_scope".to_string(),
+                            reason.to_string(),
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
         let request = MeshAuthzRequest {
             source_principal,
             request_principal,
@@ -1826,23 +1841,9 @@ impl Plugin for MeshAuthz {
         let mut scope_missing = false;
         let mut node_waypoint_authorized_destination = None;
         let decision = if ambient_udp_source_scope_request {
-            let source_scope = if baggage_outcome == BaggageOutcome::Honored {
-                match self.ambient_udp_source_scope(ctx, source_principal.as_ref()) {
-                    Ok(scope) => scope,
-                    Err(reason) => {
-                        ctx.metadata.insert(
-                            "mesh_authz.ignored_udp_source_scope".to_string(),
-                            reason.to_string(),
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
             evaluate_mesh_authorization_policies(
                 self.ambient_udp_source_policies.iter().filter(|policy| {
-                    source_scope.map_or_else(
+                    ambient_udp_source_scope.map_or_else(
                         || matches!(policy.scope, PolicyScope::MeshWide),
                         |scope| scope.policy_applies(policy),
                     )

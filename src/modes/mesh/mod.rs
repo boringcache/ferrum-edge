@@ -641,7 +641,6 @@ impl MeshRuntimeConfig {
             waypoint_name: self.service_waypoint_name(),
             ambient_udp_source_scoping: self.topology == MeshTopology::Ambient,
             labels: self.workload_labels.clone(),
-            ambient_udp_source_scoping: self.topology == MeshTopology::Ambient,
             // Same `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` interval the xDS
             // client uses — the knob is protocol-agnostic failover/failback.
             primary_retry_secs: self.xds_primary_retry_secs,
@@ -656,6 +655,7 @@ impl MeshRuntimeConfig {
             namespace: self.namespace.clone(),
             workload_spiffe_id: self.workload_spiffe_id.clone(),
             waypoint_name: self.service_waypoint_name(),
+            ambient_udp_source_scoping: self.topology == MeshTopology::Ambient,
             stream_channel_capacity: self.xds_stream_channel_capacity,
             primary_retry_secs: self.xds_primary_retry_secs,
             connect_timeout_seconds: self.xds_connect_timeout_seconds,
