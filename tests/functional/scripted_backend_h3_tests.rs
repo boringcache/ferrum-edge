@@ -1433,8 +1433,7 @@ async fn transformer_added_stream_marker_reclassifies_h3_capable_dispatch() {
     );
     let _tcp_backend = ScriptedTlsBackend::builder(
         tcp_res.into_listener(),
-        TlsConfig::new(cert.clone(), key.clone())
-            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+        TlsConfig::new(cert.clone(), key.clone()).with_alpn(vec![b"http/1.1".to_vec()]),
     )
     .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
     .step(TcpStep::Write(response.into_bytes()))
