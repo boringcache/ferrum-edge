@@ -1217,13 +1217,6 @@ impl Plugin for AiTranscriptAudit {
         ctx.metadata.insert("request_body".to_string(), body);
         if flag(&ctx.metadata, MD_STREAM_REQUEST) {
             PluginResult::Continue
-        } else if ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY) {
-            // `apply_after_proxy_hooks_to_rejection` is replaying header hooks
-            // over an already-fixed response and ignores replacement rejects.
-            // Admission ran in `before_proxy` (or the normal backend
-            // `after_proxy` pass); do not stamp a new rejected verdict whose
-            // 503 cannot replace the response at this point.
-            PluginResult::Continue
         } else {
             self.ensure_commit_admission(ctx)
         }
@@ -1302,6 +1295,13 @@ impl Plugin for AiTranscriptAudit {
             ctx.metadata.insert("request_body".to_string(), body);
         }
         if flag(&ctx.metadata, MD_STREAM_REQUEST) {
+            PluginResult::Continue
+        } else if ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY) {
+            // `apply_after_proxy_hooks_to_rejection` is replaying header hooks
+            // over an already-fixed response and ignores replacement rejects.
+            // Admission ran in `before_proxy` (or the normal backend
+            // `after_proxy` pass); do not stamp a new rejected verdict whose
+            // 503 cannot replace the response at this point.
             PluginResult::Continue
         } else {
             self.ensure_commit_admission(ctx)
@@ -1623,8 +1623,9 @@ impl Plugin for AiTranscriptAudit {
             return;
         }
 
-        // A response already being streamed cannot be rejected, so the
-        // fail-closed sink stance only applies to buffered responses.
+        // A response already being streamed cannot run a new rejecting
+        // admission. A pre-commit reservation, when configured, remains in
+        // staging and is consumed by this enqueue instead.
         let mut staging = self.staging.remove(&record_id).map(|(_, value)| value);
         let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(
