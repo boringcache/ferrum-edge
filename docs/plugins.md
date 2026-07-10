@@ -3288,7 +3288,7 @@ config:
 
 ## AI / LLM Plugins
 
-Nine plugins purpose-built for AI/LLM API gateway use cases. Response-parsing AI plugins auto-detect common provider JSON structures, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock** where applicable.
+Ferrum includes purpose-built AI/LLM API gateway plugins. Response-parsing AI plugins auto-detect common provider JSON structures, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock** where applicable.
 
 ### Upgrade notes (breaking config validation changes)
 
@@ -3306,6 +3306,15 @@ Validation follows the same per-mode tolerance model as other file-dependent con
 - **File mode** — fatal at startup. The gateway refuses to start.
 - **Database mode** — warnings are logged, but the gateway keeps serving with the previous valid config.
 - **DP mode** — the config update from the CP is rejected and the DP continues with its previously applied config.
+
+### `ai_tool_governor`
+
+Deterministic allow, deny, argument-redaction, and approval policy for AI tool
+definitions and calls across buffered JSON, streaming SSE, MCP, and A2A
+surfaces. See the dedicated
+[`ai_tool_governor` configuration guide](plugins/ai_tool_governor.md) for the
+complete schema, fail-closed behavior, examples, observability contract, and
+documented lifecycle limitations.
 
 ### `ai_transcript_audit`
 
