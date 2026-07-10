@@ -451,6 +451,7 @@ async fn grpc_a2a_method_is_detected_without_request_buffering() {
         Some("true")
     );
     assert!(!plugin.should_buffer_response_body(&ctx));
+    assert!(!plugin.forces_reqwest_dispatch(&ctx));
 }
 
 #[tokio::test]

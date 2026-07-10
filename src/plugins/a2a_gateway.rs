@@ -792,6 +792,7 @@ impl Plugin for A2aGateway {
             && self.observability.emit_metadata
             && ctx.a2a_gateway_detected
             && ctx.a2a_gateway_streaming
+            && ctx.a2a_gateway_binding != Some("grpc")
     }
 
     fn response_stream_inspector(
