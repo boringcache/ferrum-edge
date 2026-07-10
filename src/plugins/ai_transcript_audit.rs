@@ -629,7 +629,14 @@ impl AiTranscriptAudit {
     }
 
     fn stream_fail_closed_rejection(&self, ctx: &mut RequestContext) -> Option<PluginResult> {
-        if !flag(&ctx.metadata, MD_CANDIDATE) || !flag(&ctx.metadata, MD_STREAM_REQUEST) {
+        // Match the stream-inspector emission gate. A config with streaming
+        // capture disabled deliberately does not audit streams, and sampled
+        // capture must not turn a sampling miss into a fail-closed rejection.
+        if self.capture.streaming == StreamingCapture::Off
+            || !flag(&ctx.metadata, MD_CANDIDATE)
+            || !flag(&ctx.metadata, MD_STREAM_REQUEST)
+            || !self.stream_tee_wanted(&ctx.metadata)
+        {
             return None;
         }
         let sink_unhealthy_reject = self.on_sink_error == SinkErrorPolicy::Reject
@@ -1172,9 +1179,6 @@ impl Plugin for AiTranscriptAudit {
         };
         self.stage_candidate(ctx, body.as_bytes());
         ctx.metadata.insert("request_body".to_string(), body);
-        if let Some(result) = self.stream_fail_closed_rejection(ctx) {
-            return result;
-        }
         PluginResult::Continue
     }
 
@@ -1203,7 +1207,9 @@ impl Plugin for AiTranscriptAudit {
         // backend-visible bytes.
         if let Some("true") = ctx.metadata.get(MD_CANDIDATE).map(String::as_str) {
             self.refresh_staged_request(ctx, body);
-            return PluginResult::Continue;
+            return self
+                .stream_fail_closed_rejection(ctx)
+                .unwrap_or(PluginResult::Continue);
         }
         // Fallback for paths where the body was not available before
         // `before_proxy` (e.g. non-UTF-8 metadata skip above).
@@ -1505,7 +1511,7 @@ impl Plugin for AiTranscriptAudit {
 
     async fn on_response_stream_terminated(
         &self,
-        ctx: &RequestContext,
+        ctx: &mut RequestContext,
         response_status: u16,
         outcome: &crate::proxy::deferred_log::BodyOutcome,
     ) {
@@ -1520,22 +1526,13 @@ impl Plugin for AiTranscriptAudit {
         };
         let downstream_terminated = slot.downstream_terminated.load(Ordering::Relaxed);
         let captured = slot.captured.lock().ok().and_then(|mut guard| guard.take());
-        let staging = self.staging.remove(&record_id).map(|(_, value)| value);
-
-        let sample_hit = staging
-            .as_ref()
+        let sample_hit = self
+            .staging
+            .get(&record_id)
             .map(|staging| staging.sample_hit)
             .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
         let errored = response_status >= 400 || !outcome.body_completed;
         let guardrail = guardrail_fired(&ctx.metadata) || downstream_terminated;
-        let (emit, reason) = self.emit_decision(sample_hit, guardrail, errored);
-        if !emit {
-            return;
-        }
-
-        // A response already being streamed cannot be rejected. Fail-closed
-        // stream requests are preflighted before backend dispatch; this
-        // termination hook only emits the completed audit record.
         let (excerpt, truncated, hash) = if downstream_terminated {
             (None, true, None)
         } else {
@@ -1548,6 +1545,24 @@ impl Plugin for AiTranscriptAudit {
                 None => (None, true, None), // abnormal end: on_end never ran
             }
         };
+        if let Some(response_hash) = hash.as_ref() {
+            ctx.metadata
+                .insert(MD_RESPONSE_HASH.to_string(), response_hash.clone());
+        }
+        let (emit, reason) = self.emit_decision(sample_hit, guardrail, errored);
+        if !emit {
+            // Match the buffered path: the response evidence is finalized, but
+            // no record was emitted at this hook. Keep staging for the immediate
+            // log fallback to consume and mark the sink status non-terminal.
+            ctx.metadata
+                .insert(MD_SINK_STATUS.to_string(), "deferred".to_string());
+            return;
+        }
+
+        // The final request-body hook preflights known fail-closed conditions.
+        // Once headers are committed this hook can only emit the record; a sink
+        // or queue failure that begins after preflight cannot retract the stream.
+        let staging = self.staging.remove(&record_id).map(|(_, value)| value);
         let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(
             &record_id,
@@ -1561,7 +1576,13 @@ impl Plugin for AiTranscriptAudit {
             reason,
             None,
         );
-        let _ = self.enqueue(record);
+        let status = match self.enqueue(record) {
+            SinkOutcome::Queued => "queued",
+            SinkOutcome::Dropped => "dropped",
+            SinkOutcome::Rejected => "rejected",
+        };
+        ctx.metadata
+            .insert(MD_SINK_STATUS.to_string(), status.to_string());
     }
 
     // ---- fallback emission ----

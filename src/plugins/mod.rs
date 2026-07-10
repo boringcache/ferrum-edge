@@ -3,9 +3,10 @@
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
 //! `before_proxy` → `transform_request_body` → `on_final_request_body` →
-//! `backend_admission` → `after_proxy` → `on_response_body` → `transform_response_body` →
-//! `on_final_response_body` → `on_response_stream_terminated` (streamed responses only)
-//! → `log` → `on_ws_frame`.
+//! `backend_admission` → `after_proxy` → `normalize_response_body` →
+//! `on_response_body` → `transform_response_body` → `on_final_response_body` →
+//! `on_response_stream_terminated` (streamed responses only) → `log` →
+//! `on_ws_frame`.
 //!
 //! `backend_admission` runs last on the request side — after request-body
 //! transforms and `on_final_request_body`, immediately before the backend
@@ -33,6 +34,7 @@ pub mod ai_semantic_cache;
 pub mod ai_semantic_firewall;
 pub mod ai_stream_router;
 pub mod ai_token_metrics;
+pub mod ai_tool_governor;
 pub mod ai_transcript_audit;
 pub mod api_chargeback;
 pub mod api_chargeback_sink;
@@ -472,6 +474,38 @@ pub struct RequestContext {
     /// final body hooks. Kept out of public metadata so per-instance state does
     /// not leak into transaction logs.
     pub(crate) openapi_validator_matches: HashMap<usize, (String, String)>,
+    /// Per-`ai_tool_governor`-instance internal correlation markers staged between
+    /// `on_response_body` / `transform_response_body` and the
+    /// `on_final_response_body` re-check. Kept out of public `metadata` so this
+    /// per-request bookkeeping — the governed-body hash and the per-call
+    /// identity multiset, both DERIVED FROM RAW TOOL ARGUMENTS — never reaches
+    /// transaction logs (an operator who disabled `observability.hash_arguments`
+    /// must not get an arg-derived hash logged via a correlation marker).
+    /// The outer key is a process-unique governor instance ID. Multiple
+    /// instances may coexist on one proxy and must never consume each other's
+    /// dedup state.
+    pub(crate) ai_tool_governor_response_hashes: HashMap<u64, String>,
+    /// Per-instance governed-call identity multisets (identity hash -> count),
+    /// the one-for-one skip ledgers final re-checks consume. Kept off
+    /// `metadata` for the same reason as the response hashes.
+    pub(crate) ai_tool_governor_call_hashes: HashMap<u64, HashMap<String, usize>>,
+    /// Per-instance governed-request-body hashes, staged in `before_proxy` for
+    /// the `on_final_request_body` re-check. Same leak class as the response
+    /// markers (a hash over the raw request body including tool-call arguments),
+    /// so they remain off `metadata` too.
+    pub(crate) ai_tool_governor_request_hashes: HashMap<u64, String>,
+    /// Process-unique id for an attached response-stream inspector chain.
+    /// Assigned only after at least one configured plugin opts into streaming
+    /// hooks for the response, and cleared again when every factory returns
+    /// `None`. Stateful plugins use it to correlate inspector-owned results
+    /// with [`Plugin::on_response_stream_terminated`] without putting internal
+    /// correlation keys in transaction metadata.
+    pub(crate) response_stream_id: Option<u64>,
+    /// Completion signal paired with `response_stream_id`. The detached H1/H2
+    /// inspector task may still be finishing an async decision after the
+    /// downstream body is dropped; terminal logging waits on this signal before
+    /// draining plugin write-back state.
+    response_stream_completion: Option<Arc<ResponseStreamCompletion>>,
     /// A2A gateway detection state staged between request and response hooks.
     /// Kept out of public metadata so Agent Card rewriting can work even when
     /// `observability.emit_metadata` is disabled.
@@ -479,6 +513,11 @@ pub struct RequestContext {
     pub(crate) a2a_gateway_binding: Option<&'static str>,
     pub(crate) a2a_gateway_is_agent_card: bool,
     pub(crate) a2a_gateway_streaming: bool,
+    /// Exact upstream/public resource URI pair used to route an MCP
+    /// `resources/read` request. Kept out of public metadata so upstream URI
+    /// details cannot enter transaction logs, while the response hook can
+    /// preserve the public URI spelling the client actually requested.
+    pub(crate) mcp_response_resource_binding: Option<(String, String)>,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -722,10 +761,16 @@ impl RequestContext {
             ai_semantic_cache_embedding: None,
             ai_semantic_cache_scope_key: None,
             openapi_validator_matches: HashMap::new(),
+            ai_tool_governor_response_hashes: HashMap::new(),
+            ai_tool_governor_call_hashes: HashMap::new(),
+            ai_tool_governor_request_hashes: HashMap::new(),
+            response_stream_id: None,
+            response_stream_completion: None,
             a2a_gateway_detected: false,
             a2a_gateway_binding: None,
             a2a_gateway_is_agent_card: false,
             a2a_gateway_streaming: false,
+            mcp_response_resource_binding: None,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_score: 0,
@@ -759,6 +804,14 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
         }
+    }
+
+    /// Correlation id for the concrete response-stream inspector chain, when
+    /// one attached to this request. Streaming plugins can key bounded shared
+    /// state by this id in `response_stream_inspector`, then remove and fold it
+    /// into `ctx.metadata` from `on_response_stream_terminated`.
+    pub fn response_stream_id(&self) -> Option<u64> {
+        self.response_stream_id
     }
 
     /// Build the lightweight compatibility context used by final request-body
@@ -800,10 +853,16 @@ impl RequestContext {
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
+            ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
+            ai_tool_governor_call_hashes: self.ai_tool_governor_call_hashes.clone(),
+            ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
+            response_stream_id: self.response_stream_id,
+            response_stream_completion: self.response_stream_completion.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,
             a2a_gateway_binding: self.a2a_gateway_binding,
             a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
             a2a_gateway_streaming: self.a2a_gateway_streaming,
+            mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_score: self.waf_score,
@@ -1311,17 +1370,10 @@ impl RequestContext {
     /// Returns `Some(meta)` if a mirror request was dispatched and completed
     /// before the timeout. The 5-second timeout is a safety net — the mirror
     /// task always completes within the proxy's `backend_read_timeout_ms`
-    /// (set via `reqwest::RequestBuilder::timeout`). Since this runs after
-    /// the response is sent to the client, the wait has zero impact on
-    /// client-facing latency.
+    /// (set via `reqwest::RequestBuilder::timeout`). Callers on a client-visible
+    /// response path must run this in a detached task.
     pub async fn collect_mirror_result(&self) -> Option<MirrorResponseMeta> {
-        let rx = self.mirror_result_rx.as_ref()?;
-        let mut rx_clone = rx.clone();
-        match tokio::time::timeout(std::time::Duration::from_secs(5), rx_clone.changed()).await {
-            Ok(Ok(())) => rx_clone.borrow().clone(),
-            // Timeout or sender dropped — return whatever is currently available
-            _ => rx.borrow().clone(),
-        }
+        collect_mirror_result(self.mirror_result_rx.clone()?).await
     }
 
     /// Return the stable authenticated identity for downstream policy and
@@ -1481,6 +1533,21 @@ pub enum ResponseStreamAction {
     Terminate(Option<bytes::Bytes>),
 }
 
+/// Semantic stage for a streaming-response inspector.
+///
+/// Protocol/provider adapters must run before policy inspectors regardless of
+/// the plugins' request-side priorities: a guardrail can only evaluate the
+/// representation the client will receive after provider-native framing has
+/// been normalized. Ordering remains stable inside each stage, so configured
+/// plugin priority and config order still control peers with the same role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ResponseStreamInspectorStage {
+    /// Convert provider/protocol-native bytes into the client-visible format.
+    Normalize,
+    /// Inspect, enforce, audit, or otherwise consume client-visible bytes.
+    Inspect,
+}
+
 /// A stateful, per-response inspector for a streaming (non-buffered) response
 /// body, created by [`Plugin::response_stream_inspector`]. It **owns** its
 /// window / accumulator state, so the same type works both inside the async H3
@@ -1489,6 +1556,13 @@ pub enum ResponseStreamAction {
 /// chunk-by-chunk and relays the returned [`ResponseStreamAction`] bytes.
 #[async_trait]
 pub trait ResponseStreamInspector: Send {
+    /// Stage used when composing multiple inspectors. Policy inspectors should
+    /// keep the default; protocol/provider adapters override with
+    /// [`ResponseStreamInspectorStage::Normalize`].
+    fn stage(&self) -> ResponseStreamInspectorStage {
+        ResponseStreamInspectorStage::Inspect
+    }
+
     /// Inspect the next decoded chunk of the response body.
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction;
 
@@ -1509,16 +1583,176 @@ pub trait ResponseStreamInspector: Send {
 /// `ai_semantic_firewall` with different rules) runs them ALL, not just the
 /// first — matching how every other response hook runs for every plugin.
 ///
-/// `None` if the list is empty; the single inspector unchanged if there is one;
-/// otherwise a [`ChainedResponseStreamInspector`].
+/// Normalizers are stably ordered before inspectors; configured plugin order is
+/// preserved within each stage. `None` if the list is empty; the single
+/// inspector unchanged if there is one; otherwise a
+/// [`ChainedResponseStreamInspector`].
 pub fn chain_response_stream_inspectors(
     mut inspectors: Vec<Box<dyn ResponseStreamInspector>>,
 ) -> Option<Box<dyn ResponseStreamInspector>> {
     match inspectors.len() {
         0 => None,
         1 => inspectors.pop(),
-        _ => Some(Box::new(ChainedResponseStreamInspector { inspectors })),
+        _ => {
+            inspectors.sort_by_key(|inspector| inspector.stage());
+            Some(Box::new(ChainedResponseStreamInspector { inspectors }))
+        }
     }
+}
+
+static NEXT_RESPONSE_STREAM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[derive(Debug)]
+struct ResponseStreamCompletion {
+    completed: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl ResponseStreamCompletion {
+    fn new() -> Self {
+        Self {
+            completed: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn complete(&self) {
+        if !self
+            .completed
+            .swap(true, std::sync::atomic::Ordering::Release)
+        {
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            if self.completed.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.completed.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct CompletionNotifyingInspector {
+    inner: Box<dyn ResponseStreamInspector>,
+    completion: Arc<ResponseStreamCompletion>,
+}
+
+#[async_trait]
+impl ResponseStreamInspector for CompletionNotifyingInspector {
+    fn stage(&self) -> ResponseStreamInspectorStage {
+        self.inner.stage()
+    }
+
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        self.inner.on_chunk(chunk).await
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        self.inner.on_end().await
+    }
+
+    fn on_downstream_terminated(&mut self) {
+        self.inner.on_downstream_terminated();
+    }
+}
+
+impl Drop for CompletionNotifyingInspector {
+    fn drop(&mut self) {
+        self.completion.complete();
+    }
+}
+
+/// Resolve and compose the inspectors for one streaming response.
+///
+/// The common path is allocation-free: when no plugin opts into response
+/// streaming hooks this returns immediately. The correlation id is assigned
+/// only on the opted-in path, and is removed again when every plugin factory
+/// declines the concrete response, so terminal hooks cannot mistake an
+/// uninspected stream for one with pending write-back state.
+#[doc(hidden)]
+pub fn create_response_stream_inspector(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: u16,
+    content_type: Option<&str>,
+) -> Option<Box<dyn ResponseStreamInspector>> {
+    if !plugins
+        .iter()
+        .any(|plugin| plugin.requires_response_stream_hooks())
+    {
+        return None;
+    }
+
+    ctx.response_stream_id =
+        Some(NEXT_RESPONSE_STREAM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let inspectors: Vec<_> = plugins
+        .iter()
+        .filter_map(|plugin| plugin.response_stream_inspector(ctx, response_status, content_type))
+        .collect();
+    let inspector = chain_response_stream_inspectors(inspectors);
+    if let Some(inspector) = inspector {
+        let completion = Arc::new(ResponseStreamCompletion::new());
+        ctx.response_stream_completion = Some(Arc::clone(&completion));
+        Some(Box::new(CompletionNotifyingInspector {
+            inner: inspector,
+            completion,
+        }))
+    } else {
+        ctx.response_stream_id = None;
+        ctx.response_stream_completion = None;
+        None
+    }
+}
+
+pub(crate) async fn wait_for_response_stream_inspector(ctx: &RequestContext) {
+    if let Some(completion) = &ctx.response_stream_completion {
+        completion.wait().await;
+    }
+}
+
+pub(crate) fn clear_response_stream_inspector_state(ctx: &mut RequestContext) {
+    ctx.response_stream_id = None;
+    ctx.response_stream_completion = None;
+}
+
+/// Run buffered provider/protocol normalizers before response-body policy
+/// inspection. Returns whether any plugin replaced the bytes.
+///
+/// This is shared by the H1/H2 and all buffered H3 bridge/native paths so a
+/// frontend protocol cannot change which representation guardrails inspect.
+pub async fn normalize_response_body_for_inspection(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Vec<u8>,
+) -> bool {
+    let content_type = response_headers.get("content-type").cloned();
+    let mut normalized = false;
+    for plugin in plugins {
+        if let Some(body) = plugin
+            .normalize_response_body_with_context(
+                ctx,
+                response_status,
+                response_body,
+                content_type.as_deref(),
+                response_headers,
+            )
+            .await
+        {
+            response_headers.insert("content-length".to_string(), body.len().to_string());
+            *response_body = body;
+            normalized = true;
+        }
+    }
+    normalized
 }
 
 /// Pipes each chunk through a chain of [`ResponseStreamInspector`]s: inspector
@@ -1985,7 +2219,21 @@ pub async fn log_with_mirror(
         plugin.log_with_mesh_key(summary, mesh_key.as_ref()).await;
     }
     crate::runtime_metrics::global_ref().record_transaction(summary);
-    if let Some(mirror_result) = ctx.collect_mirror_result().await {
+
+    // Mirror completion and mirror-summary logging are fully detached from the
+    // primary transaction. Buffered response paths call `log_with_mirror`
+    // before handing the response to hyper, so awaiting the mirror receiver
+    // here would make a stalled shadow target client-visible. Do not clone the
+    // summary or plugin list when this request was not mirrored.
+    let Some(mirror_result_rx) = ctx.mirror_result_rx.clone() else {
+        return;
+    };
+    let summary = summary.clone();
+    let plugins = plugins.to_vec();
+    tokio::spawn(async move {
+        let Some(mirror_result) = collect_mirror_result(mirror_result_rx).await else {
+            return;
+        };
         let mirror_summary = summary.as_mirror_entry(mirror_result);
         let mirror_mesh_key = if precompute_mesh_key {
             crate::plugins::mesh::prometheus_helpers::mesh_request_key(&mirror_summary)
@@ -1997,6 +2245,16 @@ pub async fn log_with_mirror(
                 .log_with_mesh_key(&mirror_summary, mirror_mesh_key.as_ref())
                 .await;
         }
+    });
+}
+
+async fn collect_mirror_result(
+    mut rx: tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>,
+) -> Option<MirrorResponseMeta> {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed()).await {
+        Ok(Ok(())) => rx.borrow().clone(),
+        // Timeout or sender dropped — return whatever is currently available.
+        _ => rx.borrow().clone(),
     }
 }
 
@@ -2170,7 +2428,7 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_transcript_audit (2924), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_transcript_audit (2924), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_federation (4060), ai_response_guard (4075), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365) |
@@ -2225,6 +2483,12 @@ pub mod priority {
     pub const OPENAPI_VALIDATOR: u16 = 2960;
     pub const AI_SEMANTIC_FIREWALL: u16 = 2968;
     pub const AI_REQUEST_GUARD: u16 = 2975;
+    /// `ai_tool_governor`: deterministic allow/deny/approval policy on AI tool /
+    /// function calls (names, arguments, JSON Schema, regex, identity, approval).
+    /// Runs after semantic/request admission but before `ai_semantic_cache` and
+    /// `ai_federation` so disallowed tool schemas are screened before caching or
+    /// federation routing.
+    pub const AI_TOOL_GOVERNOR: u16 = 2978;
     pub const AI_SEMANTIC_CACHE: u16 = 2980;
     /// `ai_stream_router`: claims streaming (`"stream": true`) OpenAI Chat
     /// Completions requests, rewrites `route_override_*` to the matched provider,
@@ -2665,6 +2929,36 @@ pub trait Plugin: Send + Sync {
         self.requires_response_body_buffering()
     }
 
+    /// Returns `true` when this active buffering plugin may release an
+    /// inherently streaming response after headers arrive even though retries
+    /// are configured.
+    ///
+    /// The proxy uses this pre-header signal to select a header-first streaming
+    /// transport for a retry attempt. After headers arrive, this plugin must
+    /// confirm the concrete response and every other active buffering plugin
+    /// must report that it does not need that content type. Keep the default
+    /// conservative: most response transforms and inspectors require a
+    /// replayable body while retries are in flight.
+    fn may_release_response_body_under_retries(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
+    /// Header-aware confirmation for
+    /// [`may_release_response_body_under_retries`].
+    ///
+    /// Called only after backend response headers arrive. Returning `true`
+    /// allows this response to stream and makes mid-body retry impossible; use
+    /// it only for inherently streaming representations whose retry decision is
+    /// complete from status and headers.
+    fn should_release_response_body_under_retries(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        false
+    }
+
     /// Returns `true` when a plugin that otherwise buffers this response can
     /// release it before the proxy applies the conservative content-type relabel
     /// guard.
@@ -2730,13 +3024,33 @@ pub trait Plugin: Send + Sync {
         self.should_buffer_response_body(ctx)
     }
 
+    /// Normalize a buffered provider/protocol-native response into the
+    /// client-visible representation before response guardrails inspect it.
+    ///
+    /// This is a distinct lifecycle phase from `transform_response_body`: use it
+    /// only for representation adapters whose output is the contract consumed by
+    /// downstream policy plugins (for example Anthropic SSE to OpenAI SSE).
+    /// Ordinary presentation transforms remain in `transform_response_body`,
+    /// after `on_response_body`. Return `Some(new_body)` to replace the body.
+    async fn normalize_response_body_with_context(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _body: &[u8],
+        _content_type: Option<&str>,
+        _response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Called after the full response body has been received from the backend.
     ///
     /// Only invoked when `requires_response_body_buffering()` returns `true` for
     /// at least one active plugin on the proxy. Plugins that need to inspect,
     /// validate, or cache the response body should override this method.
     ///
-    /// The body bytes are the raw backend response body (before any response
+    /// The body bytes are the normalized backend response body (after
+    /// `normalize_response_body_with_context`, before ordinary response
     /// transformation). The response_status and response_headers are the values
     /// after the `after_proxy` phase.
     ///
@@ -2868,6 +3182,20 @@ pub trait Plugin: Send + Sync {
             .await
     }
 
+    /// Called immediately after this plugin returns a transformed response
+    /// body, before the next body transform runs.
+    ///
+    /// Use this for response headers that are valid only for the original body
+    /// representation, such as upstream validators or integrity digests. The
+    /// hook is not called when the transform returns `None`, so unchanged
+    /// responses retain their original headers.
+    fn on_response_body_transformed(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_headers: &mut HashMap<String, String>,
+    ) {
+    }
+
     /// Called after all `transform_response_body` hooks on buffered responses.
     ///
     /// Use this hook when the plugin must inspect or act on the final
@@ -2889,13 +3217,15 @@ pub trait Plugin: Send + Sync {
     /// Unlike `on_response_body` / `on_final_response_body`, this hook does not
     /// receive body bytes and cannot replace the response. It exists for plugins
     /// that hold per-request state across streaming responses and need the same
-    /// terminal signal the proxy uses for deferred logging/accounting. This is
-    /// distinct from [`ResponseStreamInspector`] chunk inspection: it is a
-    /// state-cleanup notification and cannot inspect, forward, or truncate body
-    /// bytes.
+    /// terminal signal the proxy uses for deferred logging/accounting. The
+    /// mutable context is the write-back point for aggregate results captured by
+    /// an inspector: metadata written here is copied into the final
+    /// [`TransactionSummary`] before `log` runs. This is distinct from
+    /// [`ResponseStreamInspector`] chunk inspection: it cannot inspect, forward,
+    /// or truncate body bytes.
     async fn on_response_stream_terminated(
         &self,
-        _ctx: &RequestContext,
+        _ctx: &mut RequestContext,
         _response_status: u16,
         _outcome: &crate::proxy::deferred_log::BodyOutcome,
     ) {
@@ -3384,6 +3714,10 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.clone(),
         )?))),
+        "ai_tool_governor" => Ok(Some(Arc::new(ai_tool_governor::AiToolGovernor::new(
+            config,
+            http_client.clone(),
+        )?))),
         "ai_transcript_audit" => Ok(Some(Arc::new(ai_transcript_audit::AiTranscriptAudit::new(
             config,
             http_client.clone(),
@@ -3734,6 +4068,7 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     ),
     builtin_plugin("ai_semantic_firewall", PluginFailurePolicy::FailClosed),
     builtin_plugin("ai_response_guard", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ai_tool_governor", PluginFailurePolicy::FailClosed),
     builtin_plugin("ai_semantic_cache", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("ai_stream_router", PluginFailurePolicy::FailClosed),
     builtin_plugin("ai_federation", PluginFailurePolicy::KeepLastKnownGood),

@@ -1289,13 +1289,65 @@ async fn stream_inspector_without_body_drive_does_not_emit_pending_record() {
         .expect("inspector");
 
     plugin
-        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(0))
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(0))
         .await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let received = server.received_requests().await.unwrap_or_default();
     assert!(
         received.is_empty(),
         "an inspector that never handled body bytes must not leave an emit-ready pending stream"
+    );
+}
+
+#[tokio::test]
+async fn unsampled_completed_stream_writes_hash_before_deferring_emit() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "capture": { "streaming_response": true },
+                "sampling": { "rate": 0.0 }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let stream =
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"complete\"}}]}\n\ndata: [DONE]\n\n";
+    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_end().await;
+
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.response_hash")
+            .map(String::len),
+        Some(64)
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str),
+        Some("deferred")
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
     );
 }
 
@@ -1347,7 +1399,7 @@ async fn downstream_stream_cut_omits_pre_cut_capture_and_forces_guardrail_sample
     ));
 
     plugin
-        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(stream.len() as u64))
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -1358,6 +1410,16 @@ async fn downstream_stream_cut_omits_pre_cut_capture_and_forces_guardrail_sample
     );
     assert!(records[0].get("response_hash").is_none());
     assert_eq!(records[0]["response_body_truncated"], true);
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_transcript_audit.response_hash")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str),
+        Some("queued")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1430,7 +1492,7 @@ async fn stream_capture_tail_guard_prevents_boundary_leak() {
     let _ = inspector.on_chunk(stream.as_bytes()).await;
     let _ = inspector.on_end().await;
     plugin
-        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(stream.len() as u64))
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -1440,6 +1502,17 @@ async fn stream_capture_tail_guard_prevents_boundary_leak() {
         "raw SSN prefix leaked at the stream capture boundary: {excerpt}"
     );
     assert_eq!(records[0]["response_body_truncated"], true);
+    assert!(
+        ctx.metadata
+            .contains_key("ai_transcript_audit.response_hash"),
+        "stream-terminal hook must write the completed response hash"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str),
+        Some("queued")
+    );
 }
 
 #[tokio::test]
@@ -1474,7 +1547,7 @@ data: [DONE]
     let _ = inspector.on_chunk(stream).await;
     let _ = inspector.on_end().await;
     plugin
-        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(stream.len() as u64))
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -1740,7 +1813,7 @@ async fn sampled_error_sse_is_teed_and_captures_body() {
     let _ = chain.on_chunk(body).await;
     let _ = chain.on_end().await;
     plugin
-        .on_response_stream_terminated(&ctx, 500, &BodyOutcome::success(body.len() as u64))
+        .on_response_stream_terminated(&mut ctx, 500, &BodyOutcome::success(body.len() as u64))
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -1991,7 +2064,7 @@ async fn stream_end_without_on_end_omits_body() {
         .await;
     drop(inspector); // on_end never ran
     plugin
-        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(32))
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(32))
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -2493,7 +2566,7 @@ async fn stream_hash_is_incremental_keyed_hmac_over_teed_bytes() {
     let _ = inspector.on_end().await;
     plugin
         .on_response_stream_terminated(
-            &ctx,
+            &mut ctx,
             200,
             &BodyOutcome::success((chunk_a.len() + chunk_b.len()) as u64),
         )
@@ -2658,7 +2731,7 @@ async fn request_guardrail_after_staging_tees_unsampled_stream() {
     let _ = inspector.on_chunk(stream).await;
     let _ = inspector.on_end().await;
     plugin
-        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(stream.len() as u64))
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -2868,6 +2941,7 @@ async fn stream_true_request_rejects_when_sink_unhealthy_fail_closed() {
         .await;
     let endpoint = format!("{}/ingest", server.uri());
     let config = json!({
+        "capture": { "streaming_response": true },
         "sink": {
             "type": "http",
             "endpoint_url": endpoint,
@@ -2921,6 +2995,82 @@ async fn stream_true_request_rejects_when_sink_unhealthy_fail_closed() {
     assert!(
         saw_unhealthy_reject,
         "stream:true AI requests must fail closed once the sink is unhealthy"
+    );
+}
+
+#[tokio::test]
+async fn unsampled_stream_keeps_fail_open_sampling_semantics_when_sink_unhealthy() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let config = json!({
+        "capture": { "streaming_response": "sampled" },
+        "sampling": {
+            "rate": 0.0,
+            "always_capture_on_guardrail": true,
+            "always_capture_on_error": true
+        },
+        "sink": {
+            "type": "http",
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+            "on_sink_error": "reject"
+        }
+    });
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    let headers = json_headers();
+    let stream_body =
+        br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+
+    let mut saw_guardrail_reject = false;
+    for _ in 0..100 {
+        // An error override emits despite the losing sampling roll and drives
+        // the mock collector unhealthy.
+        let mut error_ctx = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut error_ctx, &headers, ai_request_body())
+            .await;
+        let _ = plugin
+            .on_final_response_body(&mut error_ctx, 500, &headers, br#"{"error":true}"#)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut unsampled_ctx = make_ctx();
+        let unsampled = plugin
+            .on_final_request_body_with_context(&mut unsampled_ctx, &headers, stream_body)
+            .await;
+        assert!(
+            matches!(unsampled, PluginResult::Continue),
+            "a sampling miss must not become fail-closed merely because the sink is unhealthy"
+        );
+
+        let mut guarded_ctx = make_ctx();
+        guarded_ctx
+            .metadata
+            .insert("ai_shield_redacted".to_string(), "true".to_string());
+        let guarded = plugin
+            .on_final_request_body_with_context(&mut guarded_ctx, &headers, stream_body)
+            .await;
+        if matches!(
+            guarded,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ) {
+            saw_guardrail_reject = true;
+            break;
+        }
+    }
+
+    assert!(
+        saw_guardrail_reject,
+        "a guardrail-selected stream must fail closed once the sink is unhealthy"
     );
 }
 
@@ -3017,7 +3167,7 @@ async fn sse_pii_split_across_deltas_is_redacted_in_reassembled_excerpt() {
     }
     let _ = inspector.on_end().await;
     plugin
-        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(total))
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(total))
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -3068,7 +3218,7 @@ async fn non_openai_sse_capture_keeps_per_frame_redacted_fallback() {
     let _ = inspector.on_chunk(chunk).await;
     let _ = inspector.on_end().await;
     plugin
-        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(chunk.len() as u64))
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(chunk.len() as u64))
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);

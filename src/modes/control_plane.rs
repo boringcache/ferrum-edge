@@ -30,7 +30,7 @@ use tracing::{debug, error, info, warn};
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
-use crate::config::db_backend::{self, DatabaseBackend, GatewayTrustBundlePoll, IncrementalResult};
+use crate::config::db_backend::{self, DatabaseBackend, IncrementalResult};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot as apply_incremental_to_config;
 use crate::config::types::GatewayConfig;
@@ -40,7 +40,6 @@ use crate::grpc::mesh_registry::{
     MESH_NODE_REGISTRY_REAPER_INTERVAL, mesh_node_registry_stale_ttl,
 };
 use crate::grpc::mesh_server::MeshGrpcServer;
-use crate::modes::mesh::config::TrustBundleSet as MeshTrustBundleSet;
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
 use crate::xds::XdsAdsServer;
@@ -405,11 +404,9 @@ async fn load_full_config_multi(
         combined.consumers.append(&mut next.consumers);
         combined.plugin_configs.append(&mut next.plugin_configs);
         combined.upstreams.append(&mut next.upstreams);
-        // Per-namespace trust bundles are loaded via the dedicated
-        // `load_gateway_trust_bundles` poll path; the combined snapshot
-        // keeps the first namespace's value for back-compat with the
-        // single-namespace CP. Multi-namespace trust-bundle distribution
-        // is a future-work item tracked separately.
+        // Top-level trust bundles are CP-level rather than namespace-scoped, so
+        // the combined snapshot keeps the first namespace's value. Multi-namespace
+        // trust-bundle distribution remains disabled until storage is partitioned.
     }
     Ok(combined)
 }
@@ -566,33 +563,6 @@ fn build_namespace_lookups(
         .map(|u| (u.id.clone(), u.namespace.clone()))
         .collect();
     (proxy_ns, consumer_ns, plugin_config_ns, upstream_ns)
-}
-
-fn sanitize_gateway_trust_bundles_from_source(
-    trust_bundles: Option<Box<MeshTrustBundleSet>>,
-    context: &str,
-) -> Option<Box<MeshTrustBundleSet>> {
-    if let Some(ref trust_bundles) = trust_bundles {
-        let errors = crate::modes::mesh::config::validate_mesh_config(
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            Some(trust_bundles),
-        );
-        if !errors.is_empty() {
-            error!(
-                "Clearing invalid gateway trust bundles from CP {}: {}",
-                context,
-                errors.join("; ")
-            );
-            return None;
-        }
-    }
-
-    trust_bundles
 }
 
 pub async fn run(
@@ -1269,7 +1239,6 @@ pub async fn run(
     });
     let db_url_for_reconnect = effective_url.clone();
     let replica_url_for_reconnect = effective_replica_url.clone();
-    let poll_namespace = env_config.namespace.clone();
     let poll_fallback_namespace = env_config.namespace.clone();
     let dp_registry_poll = dp_registry.clone();
     let poll_cert_expiry_warning_days = env_config.tls_cert_expiry_warning_days;
@@ -1291,8 +1260,6 @@ pub async fn run(
         let mut last_polled_namespaces = initial_polled_namespaces;
         let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
 
-        let initial_config = config_poll.load_full();
-        let mut last_gateway_trust_bundles = initial_config.trust_bundles.clone();
         let mut last_change_sequences = initial_change_sequences;
 
         loop {
@@ -1364,7 +1331,6 @@ pub async fn run(
                         match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
                             Ok((new_config, sequences)) => {
                                 // Treat pool swap as a new source snapshot.
-                                last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                 last_change_sequences = sequences;
                                 let new_config_arc = Arc::new(new_config.clone());
                                 config_poll.store(new_config_arc.clone());
@@ -1436,55 +1402,6 @@ pub async fn run(
                                 db_available_poll.store(true, Ordering::Relaxed);
                                 last_polled_namespaces = nslist.clone();
                                 if result.is_empty() {
-                                    let source_trust_bundles = match db_poll
-                                        .load_gateway_trust_bundles(&poll_namespace)
-                                        .await
-                                    {
-                                        Ok(GatewayTrustBundlePoll::Unchanged) => {
-                                            last_change_sequences = next_change_sequences;
-                                            continue;
-                                        }
-                                        Ok(GatewayTrustBundlePoll::Current(trust_bundles)) => {
-                                            sanitize_gateway_trust_bundles_from_source(
-                                                trust_bundles,
-                                                "empty incremental poll",
-                                            )
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to refresh gateway trust bundles after empty incremental poll; \
-                                                 leaving the sequence cursor unchanged so the next poll retries: {}",
-                                                e
-                                            );
-                                            continue;
-                                        }
-                                    };
-                                    if source_trust_bundles != last_gateway_trust_bundles {
-                                        let version = result.poll_timestamp.to_rfc3339();
-                                        let mut refreshed_config = (*config_poll.load_full()).clone();
-                                        refreshed_config.trust_bundles =
-                                            source_trust_bundles.clone();
-                                        refreshed_config.loaded_at = result.poll_timestamp;
-                                        config_poll.store(Arc::new(refreshed_config));
-                                        // Trust-bundle-only refreshes are
-                                        // gateway-wide (one row), but the
-                                        // broadcast is still per-namespace
-                                        // because each subscribed channel
-                                        // needs the empty-payload tick.
-                                        for ns in poll_broadcasts.namespaces() {
-                                            CpGrpcServer::broadcast_namespace_delta(
-                                                poll_broadcasts.as_ref(),
-                                                &ns,
-                                                &result,
-                                                &version,
-                                                &dp_registry_poll,
-                                                source_trust_bundles.as_deref(),
-                                                &poll_scope,
-                                            );
-                                        }
-                                        last_gateway_trust_bundles =
-                                            source_trust_bundles;
-                                    }
                                     last_change_sequences = next_change_sequences;
                                     continue;
                                 }
@@ -1555,30 +1472,6 @@ pub async fn run(
                                     continue;
                                 }
 
-                                let mut trust_bundles_changed = false;
-                                match db_poll.load_gateway_trust_bundles(&poll_namespace).await {
-                                    Ok(GatewayTrustBundlePoll::Unchanged) => {}
-                                    Ok(GatewayTrustBundlePoll::Current(trust_bundles)) => {
-                                        let source_trust_bundles =
-                                            sanitize_gateway_trust_bundles_from_source(
-                                            trust_bundles,
-                                            "incremental poll",
-                                        );
-                                        if source_trust_bundles != last_gateway_trust_bundles {
-                                            new_config.trust_bundles =
-                                                source_trust_bundles.clone();
-                                            trust_bundles_changed = true;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to refresh gateway trust bundles during incremental poll; \
-                                             applying resource delta with previous trust material: {}",
-                                            e
-                                        );
-                                    }
-                                }
-
                                 // Validation passed — broadcast the delta to DPs
                                 // and store the new config before advancing the cursor.
                                 // Apply to CP's own in-memory config before broadcasting so
@@ -1604,11 +1497,6 @@ pub async fn run(
                                 // partition (= identical to pre-T2-A
                                 // behavior). For `Set`/`All` each DP sees
                                 // only its own namespace's resources.
-                                let trust_bundles_for_broadcast = if trust_bundles_changed {
-                                    new_config.trust_bundles.as_deref()
-                                } else {
-                                    None
-                                };
                                 let partitions = partition_incremental_by_namespace(
                                     result.clone(),
                                     &current_proxy_ns,
@@ -1623,12 +1511,9 @@ pub async fn run(
                                         ns_delta,
                                         &version,
                                         &dp_registry_poll,
-                                        trust_bundles_for_broadcast,
+                                        None,
                                         &poll_scope,
                                     );
-                                }
-                                if trust_bundles_changed {
-                                    last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                 }
                                 MeshGrpcServer::broadcast_delta_with_registry(&mesh_update_tx, result, &version, &mesh_registry_poll);
 
@@ -1650,7 +1535,6 @@ pub async fn run(
                                         db_available_poll.store(true, Ordering::Relaxed);
                                         last_polled_namespaces = nslist.clone();
                                         last_change_sequences = sequences;
-                                        last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                         let new_config_arc = Arc::new(new_config.clone());
                                         config_poll.store(new_config_arc.clone());
                                         for ns in &nslist {
@@ -1675,7 +1559,6 @@ pub async fn run(
                                                         db_available_poll.store(true, Ordering::Relaxed);
                                                         last_polled_namespaces = nslist.clone();
                                                         last_change_sequences = sequences;
-                                                        last_gateway_trust_bundles = new_config.trust_bundles.clone();
                                                         let new_config_arc = Arc::new(new_config.clone());
                                                         config_poll.store(new_config_arc.clone());
                                                         for ns in &nslist {
