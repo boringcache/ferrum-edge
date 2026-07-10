@@ -7537,6 +7537,43 @@ fn live_source_capture_slice(
     }
 }
 
+/// The `#2084` XFAIL gate below keys on this literal, which the Ambient UDP
+/// producer emits from `IptablesPlan::udp_fail_closed_script` (see
+/// `src/capture/mod.rs`, the `-C OUTPUT` guard-inspect branch). It is a shared
+/// substring of the runtime line `<binary> could not inspect active UDP
+/// fail-closed guard (status <N>)`, so it matches regardless of the iptables
+/// backend's actual `<binary>`/status. If the source message ever drifts, the
+/// gate would silently stop matching and the live lane would go red with no
+/// explanation — so `udp_fail_closed_guard_probe_literal_matches_source` below
+/// reconstructs the guard script via the same pub constructor and fails loudly
+/// the moment this literal no longer appears in it.
+#[cfg(target_os = "linux")]
+const UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL: &str =
+    "could not inspect active UDP fail-closed guard (status ";
+
+/// Drift guard for `UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL`. Builds the fail-closed
+/// UDP guard script from the exact pub constructor the producer runs and asserts
+/// the XFAIL-gate literal is still present, so a source-side wording change
+/// breaks this fast unit-style check instead of the root-only live lane.
+#[cfg(target_os = "linux")]
+#[test]
+fn udp_fail_closed_guard_probe_literal_matches_source() {
+    let mut config = ferrum_edge::capture::CaptureConfig::explicit(15006, 15001);
+    config.mode = ferrum_edge::capture::CaptureMode::Iptables;
+    config.udp_capture_enabled = true;
+    config.ip6tables_mode = ferrum_edge::capture::Ip6TablesMode::Disabled;
+    let script = ferrum_edge::capture::IptablesPlan::udp_fail_closed_script(&config);
+    assert!(
+        !script.is_empty(),
+        "UDP fail-closed guard script must be non-empty for a UDP-capture config"
+    );
+    assert!(
+        script.contains(UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL),
+        "the UDP fail-closed guard-inspect literal drifted in src/capture/mod.rs; update \
+         UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL and the #2084 XFAIL gate together.\n--- script ---\n{script}"
+    );
+}
+
 /// Full Ambient producer path: the real `NetnsUdpCaptureManager` resolves a
 /// synthetic cgroup, the real backend installs production UDP-only TPROXY rules
 /// and binds capture/reply sockets inside the pod netns, and the captured flow
@@ -7729,7 +7766,9 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         // ground truth here, so we detect that precise status-2 guard-inspect
         // signature in gateway A's captured output and XFAIL until the source
         // fix (#2084) lands. Any other install timeout remains a hard failure.
-        if gateway_a_output.contains("could not inspect active UDP fail-closed guard (status 2)") {
+        if gateway_a_output.contains(UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL)
+            && gateway_a_output.contains("guard (status 2)")
+        {
             eprintln!(
                 "XFAIL #2084: the Ambient UDP producer's in-netns fail-closed guard probe \
                  returns status 2 on this iptables backend, so first install never converges: \
