@@ -610,6 +610,7 @@ where
                 plugins,
                 backend_admission_plugins,
                 requires_response_body_buffering,
+                has_response_committed_hook,
                 sticky_cookie_needed,
             )
             .await
@@ -639,6 +640,7 @@ where
                 plugins,
                 backend_admission_plugins,
                 requires_response_body_buffering,
+                has_response_committed_hook,
                 sticky_cookie_needed,
             )
             .await
@@ -1181,6 +1183,7 @@ async fn dispatch_plain<S>(
     plugins: &[Arc<dyn Plugin>],
     backend_admission_plugins: &[Arc<dyn Plugin>],
     requires_response_body_buffering: bool,
+    has_response_committed_hook: bool,
     sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
@@ -2946,6 +2949,7 @@ async fn dispatch_grpc<S>(
     plugins: &[Arc<dyn Plugin>],
     backend_admission_plugins: &[Arc<dyn Plugin>],
     requires_response_body_buffering: bool,
+    has_response_committed_hook: bool,
     sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
