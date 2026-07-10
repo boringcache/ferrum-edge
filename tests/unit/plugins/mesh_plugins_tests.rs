@@ -98,6 +98,73 @@ fn request_context(source: Option<&str>) -> RequestContext {
     ctx
 }
 
+fn ambient_udp_request_context(peer: &str, baggage: Option<&str>) -> RequestContext {
+    let mut ctx = request_context(Some(peer));
+    ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    ctx.metadata
+        .insert("hbone_datagram".to_string(), "udp".to_string());
+    if let Some(baggage) = baggage {
+        ctx.headers
+            .insert("baggage".to_string(), baggage.to_string());
+    }
+    ctx.matched_proxy = Some(Arc::new(
+        serde_json::from_value::<Proxy>(json!({
+            "id": "__mesh-inbound-hbone-relay",
+            "namespace": "default",
+            "hosts": [],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "10.0.0.20",
+            "backend_port": 53
+        }))
+        .expect("relay proxy"),
+    ));
+    ctx
+}
+
+fn ambient_udp_source_scoping_slice() -> MeshSlice {
+    MeshSlice {
+        namespace: "default".to_string(),
+        mesh_policies: vec![
+            policy_with_scope(
+                "api-deny",
+                PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
+                PolicyAction::Deny,
+            ),
+            policy_with_scope("mesh-allow", PolicyScope::MeshWide, PolicyAction::Allow),
+        ],
+        workloads: vec![Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/client")
+                .expect("spiffe"),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                namespace: None,
+            },
+            service_name: "api".to_string(),
+            addresses: vec!["10.0.0.20".to_string()],
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("client".to_string()),
+            pod_uid: Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string()),
+            node_waypoint: None,
+            remote_provenance: false,
+        }],
+        ..MeshSlice::default()
+    }
+}
+
 fn stream_context() -> StreamConnectionContext {
     StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
@@ -473,6 +540,113 @@ async fn mesh_authz_ignores_hbone_baggage_from_untrusted_assertor() {
             .get("mesh_authz.ignored_baggage.untrusted_assertor")
             .map(String::as_str),
         Some("true")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_ambient_udp_applies_scope_for_validated_source_pod() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": ambient_udp_source_scoping_slice(),
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(
+            "source.principal=spiffe://cluster.local/ns/default/sa/client,source.pod_uid=6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        ),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "selector-scoped DENY for the attributed pod must apply, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("api-deny")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_ambient_udp_absent_pod_evidence_falls_back_to_mesh_wide() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": ambient_udp_source_scoping_slice(),
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some("source.principal=spiffe://cluster.local/ns/default/sa/client"),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "missing pod evidence must preserve mesh-wide-only evaluation, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_ambient_udp_untrusted_stamp_cannot_activate_scoped_policy() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": ambient_udp_source_scoping_slice(),
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/default/sa/untrusted",
+        Some(
+            "source.principal=spiffe://cluster.local/ns/default/sa/client,source.pod_uid=6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        ),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "untrusted stamp must fall back to mesh-wide-only evaluation, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_baggage.untrusted_assertor")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_ambient_udp_rejects_principal_pod_mismatch_as_scope_evidence() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": ambient_udp_source_scoping_slice(),
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(
+            "source.principal=spiffe://cluster.local/ns/default/sa/other,source.pod_uid=6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        ),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_udp_source_scope")
+            .map(String::as_str),
+        Some("principal_pod_mismatch")
     );
 }
 

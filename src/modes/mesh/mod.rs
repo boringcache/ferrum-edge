@@ -639,7 +639,9 @@ impl MeshRuntimeConfig {
             namespace: self.namespace.clone(),
             workload_spiffe_id: self.workload_spiffe_id.clone(),
             waypoint_name: self.service_waypoint_name(),
+            ambient_udp_source_scoping: self.topology == MeshTopology::Ambient,
             labels: self.workload_labels.clone(),
+            ambient_udp_source_scoping: self.topology == MeshTopology::Ambient,
             // Same `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` interval the xDS
             // client uses — the knob is protocol-agnostic failover/failback.
             primary_retry_secs: self.xds_primary_retry_secs,
@@ -871,6 +873,7 @@ impl MeshRuntimeConfig {
             enforce_sidecar_egress: self.sidecar_enforced,
             sidecar_egress_dry_run: self.sidecar_enforced_dry_run,
             enforce_sidecar_identity_narrowing: self.sidecar_identity_narrowing,
+            ambient_udp_source_scoping: self.topology == MeshTopology::Ambient,
         }
     }
 
@@ -8212,6 +8215,7 @@ fn inject_mesh_global_plugins(
         "cluster_domain": runtime.cluster_domain,
         "trust_domain_aliases": trust_domain_aliases,
         "per_pod_policy_scoping": runtime.topology == MeshTopology::NodeWaypoint,
+        "ambient_udp_source_scoping": runtime.topology == MeshTopology::Ambient,
     });
     if runtime.topology == MeshTopology::NodeWaypoint {
         mesh_authz_config["cluster_domains"] =

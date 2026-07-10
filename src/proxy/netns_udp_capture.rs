@@ -166,9 +166,27 @@ pub trait NetnsUdpCleanupBackend: Send + Sync + 'static {
 /// One active pod-netns UDP producer, keyed in the manager by netns inode.
 struct ActiveUdpCapture {
     handle: OpenedUdpCapture,
+    /// Evidence fixed for this producer. A registry identity change (or a
+    /// shared-netns ambiguity) forces a close/reopen so sessions can never keep
+    /// stamping stale or arbitrarily-selected pod evidence.
+    source_identity: Option<crate::modes::mesh::hbone::UdpSourceIdentity>,
     /// Pod UIDs currently justifying this netns's producer. A netns is closed
     /// only when NONE of its pods still justify it.
     pod_uids: HashSet<String>,
+}
+
+fn consistent_source_identity_for_netns(
+    targets: &[PodCaptureTarget],
+    pod_uids: &HashSet<String>,
+) -> Option<crate::modes::mesh::hbone::UdpSourceIdentity> {
+    let mut identities = targets
+        .iter()
+        .filter(|target| pod_uids.contains(&target.pod_uid))
+        .map(|target| target.source_identity.as_ref());
+    let first = identities.next().flatten()?.clone();
+    identities
+        .all(|identity| identity == Some(&first))
+        .then_some(first)
 }
 
 /// One netns whose producer is not active but whose selected UDP egress is
@@ -424,18 +442,42 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
         // Open producers for newly-seen netns; for an existing netns, refresh pod
         // membership (a shared netns may gain/lose pods without a socket rebind).
         for (netns, pod_uids) in desired {
-            if let Some(active) = self.active.get_mut(&netns) {
-                active.pod_uids = pod_uids;
+            let source_identity = consistent_source_identity_for_netns(&targets, &pod_uids);
+            let identity_unchanged = self
+                .active
+                .get(&netns)
+                .is_some_and(|active| active.source_identity == source_identity);
+            if identity_unchanged {
+                if let Some(active) = self.active.get_mut(&netns) {
+                    active.pod_uids = pod_uids;
+                }
                 continue;
+            }
+            if let Some(active) = self.active.remove(&netns) {
+                if let Some(task) = active.handle.close() {
+                    if let Some(prior) = self.pending_teardowns.remove(&netns) {
+                        let _ = prior.await;
+                    }
+                    self.pending_teardowns.insert(netns, task);
+                }
+                info!(
+                    netns_inode = netns,
+                    "Restarting Ambient UDP capture producer after source identity changed"
+                );
             }
             if let Some(guarded) = self.guarded.get_mut(&netns) {
                 guarded.pod_uids = pod_uids.clone();
             }
             // New netns: open one producer. Any target in this netns can open it —
             // they share the namespace.
-            let Some(target) = targets.iter().find(|t| pod_uids.contains(&t.pod_uid)) else {
+            let Some(mut target) = targets
+                .iter()
+                .find(|t| pod_uids.contains(&t.pod_uid))
+                .cloned()
+            else {
                 continue;
             };
+            target.source_identity = source_identity.clone();
             // Before installing fresh rules in this netns, await a prior
             // producer's teardown (registry flap: closed then reopened for the
             // same pod netns). Take the handle OUT of the map first, then await
@@ -454,7 +496,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                      before reopen; proceeding to reinstall rules"
                 );
             }
-            match self.backend.open_udp_capture(target, netns) {
+            match self.backend.open_udp_capture(&target, netns) {
                 NetnsUdpOpenResult::Opened(handle) => {
                     // The successful backend transition removed all guard jumps.
                     // Disarm the older stable cleanup handle so it cannot later
@@ -468,8 +510,14 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                         capture_port = self.capture_port,
                         "Opened Ambient per-pod-netns UDP capture producer"
                     );
-                    self.active
-                        .insert(netns, ActiveUdpCapture { handle, pod_uids });
+                    self.active.insert(
+                        netns,
+                        ActiveUdpCapture {
+                            handle,
+                            source_identity,
+                            pod_uids,
+                        },
+                    );
                 }
                 NetnsUdpOpenResult::Guarded(handle) => {
                     match self.guarded.entry(netns) {
@@ -1185,6 +1233,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
             recvmmsg_batch_size: self.recvmmsg_batch_size,
             session_shard_amount: self.session_shard_amount,
             session_limiter: self.session_limiter.clone(),
+            source_identity: target.source_identity.clone().map(Arc::new),
             reply_socket_factory,
         };
 
@@ -1490,6 +1539,7 @@ mod tests {
                 .map(|t| PodCaptureTarget {
                     pod_uid: t.pod_uid.clone(),
                     cgroup_path: t.cgroup_path.clone(),
+                    source_identity: t.source_identity.clone(),
                     source_ips: t.source_ips,
                 })
                 .collect()
@@ -1500,8 +1550,25 @@ mod tests {
         PodCaptureTarget {
             pod_uid: uid.to_string(),
             cgroup_path: cgroup.to_string(),
+            source_identity: None,
             source_ips: Default::default(),
         }
+    }
+
+    #[test]
+    fn shared_netns_conflicting_source_evidence_is_suppressed() {
+        let uid_a = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        let uid_b = "6ba7b811-9dad-11d1-80b4-00c04fd430c8";
+        let principal =
+            crate::identity::SpiffeId::new("spiffe://cluster.local/ns/default/sa/client").unwrap();
+        let mut a = target(uid_a, "/cg/shared");
+        a.source_identity =
+            crate::modes::mesh::hbone::UdpSourceIdentity::new(principal.clone(), uid_a);
+        let mut b = target(uid_b, "/cg/shared");
+        b.source_identity = crate::modes::mesh::hbone::UdpSourceIdentity::new(principal, uid_b);
+        let uids = HashSet::from([uid_a.to_string(), uid_b.to_string()]);
+
+        assert!(consistent_source_identity_for_netns(&[a, b], &uids).is_none());
     }
 
     fn manager(

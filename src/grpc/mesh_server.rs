@@ -468,6 +468,8 @@ impl MeshConfigSync for MeshGrpcServer {
         .with_enforce_sidecar_egress(self.sidecar_enforced)
         .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run)
         .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing);
+        let slice_request =
+            slice_request.with_ambient_udp_source_scoping(inner.ambient_udp_source_scoping);
         // Register the receiver before loading the initial snapshot so a
         // concurrent CP broadcast is either captured by this stream or already
         // reflected in the loaded snapshot.

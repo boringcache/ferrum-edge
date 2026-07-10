@@ -92,6 +92,7 @@ pub struct XdsClientConfig {
     pub namespace: String,
     pub workload_spiffe_id: Option<String>,
     pub waypoint_name: Option<String>,
+    pub ambient_udp_source_scoping: bool,
     pub stream_channel_capacity: usize,
     pub primary_retry_secs: u64,
     /// Client connection timeout. `0` disables tonic's explicit connect timeout.
@@ -152,15 +153,17 @@ impl ClientSubscriptionState {
         cluster: &str,
         workload_spiffe_id: Option<&str>,
         waypoint_name: Option<&str>,
+        ambient_udp_source_scoping: bool,
     ) -> Vec<DiscoveryRequest> {
         // Carry the workload SPIFFE in `Node.metadata` so a Ferrum CP can
         // identify this workload even when `node_id` is a hostname (the common
         // default). The CP needs it to compute Sidecar-aware narrowing and the
         // un-narrowed local-inbound-service view; without it a restrictive
         // Sidecar would narrow the local service out of the ECDS carriers.
-        let node_metadata = crate::xds::carrier::encode_node_metadata_with_waypoint(
+        let node_metadata = crate::xds::carrier::encode_node_metadata_with_waypoint_and_udp_scope(
             workload_spiffe_id,
             waypoint_name,
+            ambient_udp_source_scoping,
         );
         INITIAL_TYPE_URL_ORDER
             .iter()
@@ -772,6 +775,7 @@ async fn run_ads_stream_with_auth(
         &config.cluster,
         config.workload_spiffe_id.as_deref(),
         config.waypoint_name.as_deref(),
+        config.ambient_udp_source_scoping,
     ) {
         tx.send(request)
             .await
@@ -1992,6 +1996,7 @@ mod tests {
             namespace: "default".to_string(),
             workload_spiffe_id: None,
             waypoint_name: None,
+            ambient_udp_source_scoping: false,
             stream_channel_capacity: 32,
             primary_retry_secs: 300,
             connect_timeout_seconds: 10,
@@ -2082,8 +2087,8 @@ mod tests {
 
     #[test]
     fn initial_requests_are_ordered_cds_first() {
-        let requests =
-            ClientSubscriptionState::new().build_initial_requests("node-a", "default", None, None);
+        let requests = ClientSubscriptionState::new()
+            .build_initial_requests("node-a", "default", None, None, false);
         let type_urls: Vec<&str> = requests
             .iter()
             .map(|request| request.type_url.as_str())
@@ -2120,14 +2125,15 @@ mod tests {
             "default",
             Some(spiffe),
             Some("waypoint"),
+            false,
         );
         let node = requests[0].node.as_ref().expect("node present");
         let metadata = crate::xds::carrier::decode_node_metadata(&node.metadata);
         assert_eq!(metadata.workload_spiffe_id.as_deref(), Some(spiffe));
         assert_eq!(metadata.waypoint_name.as_deref(), Some("waypoint"));
         // Without a workload SPIFFE, metadata stays empty (prior wire shape).
-        let none =
-            ClientSubscriptionState::new().build_initial_requests("host-1", "default", None, None);
+        let none = ClientSubscriptionState::new()
+            .build_initial_requests("host-1", "default", None, None, false);
         assert!(none[0].node.as_ref().unwrap().metadata.is_empty());
     }
 
@@ -2208,7 +2214,7 @@ mod tests {
         state.record_response(CDS_TYPE_URL, "v1", "n1");
         state.mark_acked(CDS_TYPE_URL);
 
-        let requests = state.build_initial_requests("node-a", "default", None, None);
+        let requests = state.build_initial_requests("node-a", "default", None, None, false);
         let cds = requests
             .iter()
             .find(|request| request.type_url == CDS_TYPE_URL)
@@ -2249,7 +2255,7 @@ mod tests {
         assert!(
             state
                 .subscriptions
-                .build_initial_requests("node-a", "default", None, None)
+                .build_initial_requests("node-a", "default", None, None, false)
                 .iter()
                 .all(|request| request.version_info.is_empty())
         );
@@ -3221,7 +3227,7 @@ mod tests {
         state.reset_for_new_stream();
         let initial = state
             .subscriptions
-            .build_initial_requests("node-a", "default", None, None);
+            .build_initial_requests("node-a", "default", None, None, false);
         let cds = initial
             .iter()
             .find(|r| r.type_url == CDS_TYPE_URL)

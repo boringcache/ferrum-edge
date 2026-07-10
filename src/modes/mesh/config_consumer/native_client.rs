@@ -27,6 +27,7 @@ pub struct NativeMeshClientConfig {
     pub workload_spiffe_id: Option<String>,
     pub waypoint_name: Option<String>,
     pub labels: HashMap<String, String>,
+    pub ambient_udp_source_scoping: bool,
     /// Shared CP-failover primary-retry interval
     /// (`FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS`). When > 0 and connected to a
     /// fallback CP after a first slice is installed, the client proactively
@@ -44,6 +45,7 @@ impl NativeMeshClientConfig {
             workload_spiffe_id: self.workload_spiffe_id.clone().unwrap_or_default(),
             labels: self.labels.clone(),
             waypoint_name: self.waypoint_name.clone().unwrap_or_default(),
+            ambient_udp_source_scoping: self.ambient_udp_source_scoping,
         }
     }
 }
@@ -392,6 +394,7 @@ mod tests {
             workload_spiffe_id: None,
             waypoint_name: None,
             labels: HashMap::new(),
+            ambient_udp_source_scoping: false,
             primary_retry_secs: 300,
         };
         assert_eq!(config.primary_retry_secs, 300);

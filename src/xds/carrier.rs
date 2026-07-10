@@ -602,6 +602,8 @@ pub struct XdsNodeMetadata {
     pub workload_spiffe_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waypoint_name: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ambient_udp_source_scoping: bool,
 }
 
 /// Encode `Node.metadata` bytes for an outgoing DP request. Returns empty when
@@ -614,6 +616,14 @@ pub fn encode_node_metadata_with_waypoint(
     workload_spiffe_id: Option<&str>,
     waypoint_name: Option<&str>,
 ) -> Vec<u8> {
+    encode_node_metadata_with_waypoint_and_udp_scope(workload_spiffe_id, waypoint_name, false)
+}
+
+pub fn encode_node_metadata_with_waypoint_and_udp_scope(
+    workload_spiffe_id: Option<&str>,
+    waypoint_name: Option<&str>,
+    ambient_udp_source_scoping: bool,
+) -> Vec<u8> {
     let metadata = XdsNodeMetadata {
         workload_spiffe_id: workload_spiffe_id
             .filter(|spiffe| !spiffe.is_empty())
@@ -621,8 +631,12 @@ pub fn encode_node_metadata_with_waypoint(
         waypoint_name: waypoint_name
             .filter(|name| !name.trim().is_empty())
             .map(ToString::to_string),
+        ambient_udp_source_scoping,
     };
-    if metadata.workload_spiffe_id.is_none() && metadata.waypoint_name.is_none() {
+    if metadata.workload_spiffe_id.is_none()
+        && metadata.waypoint_name.is_none()
+        && !metadata.ambient_udp_source_scoping
+    {
         Vec::new()
     } else {
         serde_json::to_vec(&metadata).unwrap_or_default()
@@ -743,6 +757,10 @@ mod tests {
         let metadata = decode_node_metadata(&bytes);
         assert_eq!(metadata.workload_spiffe_id.as_deref(), Some(spiffe));
         assert_eq!(metadata.waypoint_name.as_deref(), Some("waypoint"));
+        let udp_scope = decode_node_metadata(&encode_node_metadata_with_waypoint_and_udp_scope(
+            None, None, true,
+        ));
+        assert!(udp_scope.ambient_udp_source_scoping);
         // Absent / empty identity encodes to empty bytes (prior no-metadata
         // wire shape) and decodes to no identity.
         assert!(encode_node_metadata(None).is_empty());

@@ -2037,6 +2037,7 @@ async fn fetch_remote_slice_endpoints(
             workload_spiffe_id: String::new(),
             labels: HashMap::new(),
             waypoint_name: String::new(),
+            ambient_udp_source_scoping: false,
         });
         let mut stream = client
             .mesh_subscribe(request)

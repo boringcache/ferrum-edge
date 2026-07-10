@@ -23,11 +23,35 @@ pub const HBONE_PROTOCOL: &str = "hbone";
 /// exclusive; an OLD destination that predates Stage 4 sees an unrecognized
 /// marker and `is_hbone_connect` returns `false`, so it 404s (fail-closed skew).
 pub const UDP_PROTOCOL: &str = "udp";
+pub const HBONE_DATAGRAM_METADATA_KEY: &str = "hbone_datagram";
+
+/// Source workload evidence attached to an Ambient UDP capture manager. The
+/// manager is created per pod netns, so this value is fixed for every session
+/// it originates rather than inferred from individual datagrams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpSourceIdentity {
+    pub principal: SpiffeId,
+    pub pod_uid: String,
+}
+
+impl UdpSourceIdentity {
+    pub fn new(principal: SpiffeId, pod_uid: impl Into<String>) -> Option<Self> {
+        let pod_uid = pod_uid.into();
+        crate::modes::mesh::node_waypoint::parse_pod_uid(&pod_uid).ok()?;
+        Some(Self { principal, pod_uid })
+    }
+}
 
 /// Per-stream identity metadata carried by ambient HBONE requests.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HboneIdentity {
     pub source_principal: Option<SpiffeId>,
+    /// Kubernetes pod UID asserted alongside `source.principal` for Ambient
+    /// per-pod-netns UDP capture. The destination may use this only after the
+    /// normal trusted-assertor and trust-domain checks accept the principal.
+    /// Keeping the parsed value as UUID bytes makes malformed evidence
+    /// indistinguishable from absent evidence (mesh-wide fallback).
+    pub source_pod_uid: Option<[u8; 16]>,
     pub destination_principal: Option<SpiffeId>,
     pub baggage: BTreeMap<String, String>,
 }
@@ -71,9 +95,15 @@ impl HboneIdentity {
             ],
         )
         .and_then(parse_spiffe);
+        let source_pod_uid = first_baggage_value(
+            &baggage,
+            &["source.pod_uid", "source.pod.uid", "source_pod_uid"],
+        )
+        .and_then(|value| crate::modes::mesh::node_waypoint::parse_pod_uid(value).ok());
 
         Self {
             source_principal,
+            source_pod_uid,
             destination_principal,
             baggage,
         }
@@ -86,6 +116,18 @@ impl HboneIdentity {
 pub fn baggage_header_for_source(source: &SpiffeId) -> String {
     let encoded = utf8_percent_encode(source.as_str(), NON_ALPHANUMERIC).to_string();
     format!("source.principal={encoded}")
+}
+
+/// Build the trusted source-evidence baggage used by the Ambient per-pod-netns
+/// UDP producer. It extends the existing `source.principal` assertion with the
+/// exact Kubernetes pod UID that selected the capture manager. The destination
+/// still treats both values as untrusted until the authenticated peer passes
+/// the shared HBONE assertor/trust-domain gate and the live slice proves that
+/// this pod UID belongs to the asserted SPIFFE identity.
+pub fn baggage_header_for_udp_source(source: &UdpSourceIdentity) -> String {
+    let principal = utf8_percent_encode(source.principal.as_str(), NON_ALPHANUMERIC).to_string();
+    let pod_uid = utf8_percent_encode(&source.pod_uid, NON_ALPHANUMERIC).to_string();
+    format!("source.principal={principal},source.pod_uid={pod_uid}")
 }
 
 /// Detect an HBONE-*shaped* CONNECT stream from request parts.
@@ -560,6 +602,32 @@ mod tests {
             header.starts_with("source.principal=spiffe%3A%2F%2F"),
             "SPIFFE URI must be percent encoded for baggage transport"
         );
+    }
+
+    #[test]
+    fn udp_source_baggage_round_trips_principal_and_pod_uid() {
+        let source = UdpSourceIdentity::new(
+            SpiffeId::new("spiffe://cluster.local/ns/team-a/sa/client").unwrap(),
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        )
+        .expect("valid source evidence");
+        let identity = HboneIdentity::from_baggage_header(&baggage_header_for_udp_source(&source));
+
+        assert_eq!(identity.source_principal, Some(source.principal));
+        assert_eq!(
+            identity.source_pod_uid,
+            crate::modes::mesh::node_waypoint::parse_pod_uid(&source.pod_uid).ok()
+        );
+    }
+
+    #[test]
+    fn udp_source_baggage_rejects_malformed_pod_uid_without_dropping_principal() {
+        let identity = HboneIdentity::from_baggage_header(
+            "source.principal=spiffe://cluster.local/ns/team-a/sa/client,source.pod_uid=not-a-uid",
+        );
+
+        assert!(identity.source_principal.is_some());
+        assert!(identity.source_pod_uid.is_none());
     }
 
     #[test]

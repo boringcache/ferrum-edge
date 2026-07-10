@@ -1843,6 +1843,33 @@ fn cleanup_partial_pod_enrollment(
     cleanup_pre_enrollment_maps(backend, pod_states, metrics, pod_uid, state);
 }
 
+fn build_workload_spiffe_id(
+    namespace: &str,
+    service_account: &str,
+    trust_domain: &str,
+) -> Option<crate::identity::SpiffeId> {
+    let trust_domain = match crate::identity::spiffe::TrustDomain::new(trust_domain) {
+        Ok(td) => td,
+        Err(e) => {
+            warn!(trust_domain, error = %e, "Cannot derive workload identity: invalid trust domain");
+            return None;
+        }
+    };
+    let path = format!("ns/{namespace}/sa/{service_account}");
+    match crate::identity::spiffe::SpiffeId::from_parts(&trust_domain, &path) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            warn!(
+                namespace,
+                service_account,
+                error = %e,
+                "Cannot derive workload identity: invalid SPIFFE components"
+            );
+            None
+        }
+    }
+}
+
 /// Construct the `WorkloadIdentity` for a pod from its UID and the derived
 /// SPIFFE ID. Returns `None` when the pod UID is not a valid UUID or the
 /// SPIFFE components are unusable.
@@ -1859,26 +1886,7 @@ fn build_workload_identity(
             return None;
         }
     };
-    let trust_domain = match crate::identity::spiffe::TrustDomain::new(trust_domain) {
-        Ok(td) => td,
-        Err(e) => {
-            warn!(trust_domain, error = %e, "Cannot derive workload identity: invalid trust domain");
-            return None;
-        }
-    };
-    let path = format!("ns/{namespace}/sa/{service_account}");
-    let spiffe_id = match crate::identity::spiffe::SpiffeId::from_parts(&trust_domain, &path) {
-        Ok(id) => id,
-        Err(e) => {
-            warn!(
-                namespace,
-                service_account,
-                error = %e,
-                "Cannot derive workload identity: invalid SPIFFE components"
-            );
-            return None;
-        }
-    };
+    let spiffe_id = build_workload_spiffe_id(namespace, service_account, trust_domain)?;
     let hash = crate::modes::mesh::node_waypoint::workload_spiffe_hash(&spiffe_id);
     Some(crate::ebpf::WorkloadIdentity::new(uid_bytes, hash))
 }
@@ -2650,6 +2658,7 @@ fn publish_pod_registry(
     pod_uid: &str,
     cgroup_path: &str,
     pod_source_ips: PodSourceIps,
+    source_identity: Option<&crate::identity::SpiffeId>,
 ) {
     if pod_registry_uid_is_unsafe(pod_uid) {
         warn!(
@@ -2673,6 +2682,9 @@ fn publish_pod_registry(
     // the mesh proxy uses to override the loopback peer of in-netns capture
     // connections so authz/logs/IP-keyed plugins see the real pod IP.
     let mut contents = format!("{cgroup_path}\n");
+    if let Some(identity) = source_identity {
+        contents.push_str(&format!("spiffe_id={identity}\n"));
+    }
     if let Some(ip) = pod_source_ips.ipv4 {
         contents.push_str(&format!("ipv4={ip}\n"));
     }
@@ -2831,7 +2843,18 @@ fn handle_pod_added(
                     state.cgroup_path.as_deref(),
                 )
             {
-                publish_pod_registry(dir, pod_uid, cgroup, event.pod_source_ips);
+                let source_identity = build_workload_spiffe_id(
+                    namespace,
+                    event.service_account.unwrap_or("default"),
+                    &config.trust_domain,
+                );
+                publish_pod_registry(
+                    dir,
+                    pod_uid,
+                    cgroup,
+                    event.pod_source_ips,
+                    source_identity.as_ref(),
+                );
             }
             let current_pod_ip = state.pod_ip;
             let current_pod_ip6 = state.pod_ip6;
@@ -3148,7 +3171,18 @@ fn handle_pod_added(
             &config.node_waypoint_pod_registry_dir,
             cgroup_path.as_deref(),
         ) {
-            publish_pod_registry(dir, pod_uid, cgroup_path_value, event.pod_source_ips);
+            let source_identity = build_workload_spiffe_id(
+                namespace,
+                event.service_account.unwrap_or("default"),
+                &config.trust_domain,
+            );
+            publish_pod_registry(
+                dir,
+                pod_uid,
+                cgroup_path_value,
+                event.pod_source_ips,
+                source_identity.as_ref(),
+            );
         }
     }
 }
@@ -5942,13 +5976,13 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(registry.path().join(pod_uid)).unwrap(),
             format!(
-                "{}\nipv4=10.0.0.5\nipv6=fd00::5\n",
+                "{}\nspiffe_id=spiffe://cluster.local/ns/default/sa/default\nipv4=10.0.0.5\nipv6=fd00::5\n",
                 cgroup_root
                     .path()
                     .join(format!("kubepods/pod{pod_uid}"))
                     .display()
             ),
-            "NodeWaypoint registry must publish family-specific pod source IPs"
+            "capture registry must publish workload identity and family-specific pod source IPs"
         );
     }
 
@@ -6001,7 +6035,10 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(registry.path().join(pod_uid)).unwrap(),
-            format!("{}\nipv4=10.0.0.5\n", cgroup_path.display())
+            format!(
+                "{}\nspiffe_id=spiffe://cluster.local/ns/default/sa/default\nipv4=10.0.0.5\n",
+                cgroup_path.display()
+            )
         );
 
         handle_pod_added(
@@ -6017,7 +6054,10 @@ mod tests {
 
         assert_eq!(
             std::fs::read_to_string(registry.path().join(pod_uid)).unwrap(),
-            format!("{}\nipv4=10.0.0.5\nipv6=fd00::5\n", cgroup_path.display()),
+            format!(
+                "{}\nspiffe_id=spiffe://cluster.local/ns/default/sa/default\nipv4=10.0.0.5\nipv6=fd00::5\n",
+                cgroup_path.display()
+            ),
             "same-UID status.podIPs updates must refresh IPv6 source overrides"
         );
     }
@@ -7808,6 +7848,8 @@ mod tests {
         let registry = dir.path().join("node-waypoint-pods");
         // Directory does not exist yet — publish must create it.
         assert!(!registry.exists());
+        let source_identity =
+            crate::identity::SpiffeId::new("spiffe://cluster.local/ns/default/sa/api").unwrap();
 
         publish_pod_registry(
             &registry,
@@ -7817,14 +7859,16 @@ mod tests {
                 ipv4: Some(std::net::Ipv4Addr::new(10, 1, 2, 3)),
                 ipv6: Some("fd00::123".parse().unwrap()),
             },
+            Some(&source_identity),
         );
 
         let path = registry.join("pod-uid-1");
         assert!(path.exists(), "registry entry must be written");
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
-            contents, "/sys/fs/cgroup/kubepods/poduid1\nipv4=10.1.2.3\nipv6=fd00::123\n",
-            "registry entry carries the cgroup path and family-specific source pod IPs"
+            contents,
+            "/sys/fs/cgroup/kubepods/poduid1\nspiffe_id=spiffe://cluster.local/ns/default/sa/api\nipv4=10.1.2.3\nipv6=fd00::123\n",
+            "registry entry carries the workload identity and family-specific source pod IPs"
         );
     }
 
@@ -7853,7 +7897,13 @@ mod tests {
     fn remove_pod_registry_removes_entry_and_tolerates_absent() {
         let dir = tempfile::tempdir().unwrap();
         let registry = dir.path().join("node-waypoint-pods");
-        publish_pod_registry(&registry, "pod-uid-1", "/cg/path", PodSourceIps::default());
+        publish_pod_registry(
+            &registry,
+            "pod-uid-1",
+            "/cg/path",
+            PodSourceIps::default(),
+            None,
+        );
         let path = registry.join("pod-uid-1");
         assert!(path.exists());
 
@@ -7874,7 +7924,13 @@ mod tests {
         // None of these may write anything; an escaping UID must be refused
         // before any directory is created or file written.
         for unsafe_uid in ["", "../escape", "a/b", "a\\b", "..", "foo/../bar"] {
-            publish_pod_registry(&registry, unsafe_uid, "/cg/path", PodSourceIps::default());
+            publish_pod_registry(
+                &registry,
+                unsafe_uid,
+                "/cg/path",
+                PodSourceIps::default(),
+                None,
+            );
         }
 
         // The guard fires before `create_dir_all`, so nothing was created and

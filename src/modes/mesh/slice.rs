@@ -49,6 +49,10 @@ pub struct MeshSliceRequest {
     /// referenced by admitted services. Defaults to `false` for a one-release
     /// dry-run window.
     pub enforce_sidecar_identity_narrowing: bool,
+    /// Keep the namespace-visible AuthorizationPolicy candidate superset needed
+    /// for destination-side Ambient UDP per-pod source scoping. The consumer
+    /// re-filters it only after trusted pod evidence is validated.
+    pub ambient_udp_source_scoping: bool,
 }
 
 impl Default for MeshSliceRequest {
@@ -63,6 +67,7 @@ impl Default for MeshSliceRequest {
             enforce_sidecar_egress: false,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            ambient_udp_source_scoping: false,
         }
     }
 }
@@ -84,6 +89,7 @@ impl MeshSliceRequest {
             enforce_sidecar_egress: false,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            ambient_udp_source_scoping: false,
         }
     }
 
@@ -103,6 +109,7 @@ impl MeshSliceRequest {
             enforce_sidecar_egress: false,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            ambient_udp_source_scoping: false,
         }
     }
 
@@ -141,6 +148,11 @@ impl MeshSliceRequest {
     /// aliases during Sidecar egress matching.
     pub fn with_cluster_domain(mut self, cluster_domain: String) -> Self {
         self.cluster_domain = cluster_domain;
+        self
+    }
+
+    pub fn with_ambient_udp_source_scoping(mut self, enabled: bool) -> Self {
+        self.ambient_udp_source_scoping = enabled;
         self
     }
 
@@ -760,15 +772,28 @@ impl MeshSlice {
         // plugin tolerates the resulting superset at construction — see
         // `validate_scope_filter_identity` — and its cold-path `retain` does the
         // precise per-proxy narrowing.)
-        let policy_candidate_labels: Vec<&BTreeMap<String, String>> = if request.labels.is_empty() {
-            if candidate_label_sets.is_empty() {
-                vec![&effective_labels]
+        let ambient_udp_candidate_labels: Vec<BTreeMap<String, String>> =
+            if request.ambient_udp_source_scoping {
+                workloads
+                    .iter()
+                    .filter(|workload| workload.pod_uid.is_some())
+                    .map(|workload| labels_to_btree(&workload.selector.labels))
+                    .collect()
             } else {
-                candidate_label_sets.iter().collect()
-            }
-        } else {
-            vec![&effective_labels]
-        };
+                Vec::new()
+            };
+        let policy_candidate_labels: Vec<&BTreeMap<String, String>> =
+            if request.ambient_udp_source_scoping && !ambient_udp_candidate_labels.is_empty() {
+                ambient_udp_candidate_labels.iter().collect()
+            } else if request.labels.is_empty() {
+                if candidate_label_sets.is_empty() {
+                    vec![&effective_labels]
+                } else {
+                    candidate_label_sets.iter().collect()
+                }
+            } else {
+                vec![&effective_labels]
+            };
         // Resolve the effective applicable Sidecar egress scope for this
         // workload. The returned scope is used downstream to narrow `services`,
         // `service_entries`, and `destination_rules`. Returns `None` when no
@@ -3076,6 +3101,7 @@ mod tests {
             enforce_sidecar_egress: false,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            ambient_udp_source_scoping: false,
         }
     }
 
@@ -3093,6 +3119,7 @@ mod tests {
             enforce_sidecar_egress: false,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            ambient_udp_source_scoping: false,
         }
     }
 
@@ -4236,6 +4263,7 @@ mod tests {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             waypoint_name: None,
+            ambient_udp_source_scoping: false,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // The slice should inherit labels from the matched workload.
@@ -4293,6 +4321,7 @@ mod tests {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             waypoint_name: None,
+            ambient_udp_source_scoping: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -4374,6 +4403,7 @@ mod tests {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             waypoint_name: None,
+            ambient_udp_source_scoping: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -4446,6 +4476,7 @@ mod tests {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             waypoint_name: None,
+            ambient_udp_source_scoping: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -4491,6 +4522,7 @@ mod tests {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             waypoint_name: None,
+            ambient_udp_source_scoping: false,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // Explicit labels should be used, not the workload's labels.
@@ -4929,6 +4961,7 @@ mod tests {
                 sidecar_egress_dry_run: false,
                 enforce_sidecar_identity_narrowing: false,
                 waypoint_name: None,
+                ambient_udp_source_scoping: false,
             },
         );
 
@@ -5682,6 +5715,7 @@ mod tests {
             enforce_sidecar_egress: true,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            ambient_udp_source_scoping: false,
         }
     }
 
@@ -5699,6 +5733,7 @@ mod tests {
             enforce_sidecar_egress: true,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            ambient_udp_source_scoping: false,
         }
     }
 

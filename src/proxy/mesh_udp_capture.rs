@@ -338,6 +338,10 @@ pub(crate) struct MeshUdpCaptureRuntime {
     pub recvmmsg_batch_size: usize,
     pub session_shard_amount: usize,
     pub session_limiter: std::sync::Arc<MeshUdpSessionLimiter>,
+    /// Per-pod evidence fixed by the Ambient capture manager. `None` for the
+    /// Sidecar current-netns listener and for old/malformed registry entries;
+    /// those sessions retain the mesh-wide authorization posture.
+    pub source_identity: Option<std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>>,
     /// Builds each session's transparent reply socket in the SAME netns as the
     /// capture socket (current-netns for Sidecar, pod-netns for Ambient).
     pub reply_socket_factory: std::sync::Arc<dyn ReplySocketFactory>,
@@ -377,6 +381,7 @@ pub async fn start_mesh_udp_capture_listener(
             recvmmsg_batch_size,
             session_shard_amount,
             session_limiter: std::sync::Arc::new(MeshUdpSessionLimiter::new(max_sessions)),
+            source_identity: None,
             reply_socket_factory: std::sync::Arc::new(CurrentNetnsReplySocketFactory),
         },
         shutdown,
@@ -416,6 +421,7 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
         recvmmsg_batch_size,
         session_shard_amount,
         session_limiter,
+        source_identity,
         reply_socket_factory,
     } = runtime;
     let frontend_socket = Arc::new(frontend_socket);
@@ -509,6 +515,7 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
                                                 client,
                                                 orig_dst,
                                                 chunk,
+                                                source_identity.as_ref(),
                                                 &reply_socket_factory,
                                             );
                                         }
@@ -521,6 +528,7 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
                                             client,
                                             orig_dst,
                                             data,
+                                            source_identity.as_ref(),
                                             &reply_socket_factory,
                                         );
                                     }
@@ -663,6 +671,7 @@ fn handle_captured_datagram(
     client: SocketAddr,
     orig_dst: Option<SocketAddr>,
     data: &[u8],
+    source_identity: Option<&std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>>,
     reply_factory: &std::sync::Arc<dyn ReplySocketFactory>,
 ) -> bool {
     use tracing::debug;
@@ -747,6 +756,7 @@ fn handle_captured_datagram(
                 last_activity,
                 queued_bytes,
                 epoch,
+                source_identity.cloned(),
                 reply_factory.clone(),
             );
             true
@@ -953,6 +963,7 @@ fn spawn_udp_egress_session(
     last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
+    source_identity: Option<std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>>,
     reply_factory: std::sync::Arc<dyn ReplySocketFactory>,
 ) {
     tokio::spawn(async move {
@@ -964,6 +975,7 @@ fn spawn_udp_egress_session(
             last_activity,
             queued_bytes,
             epoch,
+            source_identity.as_deref(),
             &reply_factory,
         )
         .await;
@@ -1016,6 +1028,7 @@ async fn run_udp_egress_session(
     last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
+    source_identity: Option<&crate::modes::mesh::hbone::UdpSourceIdentity>,
     reply_factory: &std::sync::Arc<dyn ReplySocketFactory>,
 ) {
     use super::{LoadBalancerConnectionGuard, backend_dispatch};
@@ -1211,6 +1224,7 @@ async fn run_udp_egress_session(
                 target.port,
                 target.dispatch_policy_port(),
                 expected_peer.as_ref(),
+                source_identity,
             )
             .await
         {

@@ -66,6 +66,12 @@ use crate::plugins::{
 
 pub struct MeshAuthz {
     slice: MeshSlice,
+    /// Unfiltered policy superset used only for Ambient UDP CONNECTs carrying
+    /// validated per-pod evidence. Ordinary Ambient/Sidecar traffic continues
+    /// to use the construction-time workload filter in `slice.mesh_policies`.
+    ambient_udp_source_policies: Vec<MeshPolicy>,
+    ambient_udp_source_scopes: HashMap<[u8; 16], crate::modes::mesh::runtime::PolicyScopeCache>,
+    ambient_udp_source_scoping: bool,
     destination_policy_scopes_by_upstream:
         HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
     destination_policy_scopes_by_backend:
@@ -85,6 +91,7 @@ pub struct MeshAuthz {
     destination_route_upstreams_requiring_scope: HashSet<String>,
     has_route_upstream_metadata: bool,
     has_header_rules: bool,
+    ambient_udp_has_header_rules: bool,
     /// Additional SPIFFE trust domains accepted as equivalent to the peer
     /// cert's trust domain when authorising HBONE baggage `source.principal`.
     /// Default empty: strict same-trust-domain match.
@@ -117,6 +124,7 @@ pub struct MeshAuthz {
     /// conditions pays nothing and the common cases (a handful of keys)
     /// avoid building the full attribute namespace per request.
     condition_keys: ConditionAttributeKeys,
+    ambient_udp_condition_keys: ConditionAttributeKeys,
 }
 
 /// Which Istio `when:` attribute keys the loaded policies actually reference.
@@ -951,6 +959,47 @@ impl TrustedAssertor {
 /// override this list to add their names.
 const DEFAULT_TRUSTED_HBONE_ASSERTOR_SA_NAMES: &[&str] = &["ztunnel", "waypoint"];
 
+fn ambient_udp_source_scope_index(
+    slice: &MeshSlice,
+) -> HashMap<[u8; 16], crate::modes::mesh::runtime::PolicyScopeCache> {
+    let mut scopes = HashMap::new();
+    let mut ambiguous = HashSet::new();
+    for workload in &slice.workloads {
+        let Some(raw_uid) = workload.pod_uid.as_deref() else {
+            continue;
+        };
+        let Ok(uid) = crate::modes::mesh::node_waypoint::parse_pod_uid(raw_uid) else {
+            continue;
+        };
+        if ambiguous.contains(&uid) || scopes.contains_key(&uid) {
+            scopes.remove(&uid);
+            ambiguous.insert(uid);
+            continue;
+        }
+        scopes.insert(
+            uid,
+            crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload),
+        );
+    }
+    scopes
+}
+
+fn normalize_authz_policies(policies: &mut [MeshPolicy]) {
+    for policy in policies {
+        normalize_mesh_policy_header_names(policy);
+        for rule in &mut policy.rules {
+            for request in &mut rule.to {
+                for host in &mut request.hosts {
+                    *host = normalize_request_match_host_pattern(host);
+                }
+                for host in &mut request.not_hosts {
+                    *host = normalize_request_match_host_pattern(host);
+                }
+            }
+        }
+    }
+}
+
 impl MeshAuthz {
     pub fn new(config: &Value) -> Result<Self, String> {
         // Whether the policies arrived via a `mesh_slice` (the slice-apply path
@@ -1021,6 +1070,20 @@ impl MeshAuthz {
             .get("per_pod_policy_scoping")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let ambient_udp_source_scoping = config
+            .get("ambient_udp_source_scoping")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut ambient_udp_source_policies = if ambient_udp_source_scoping {
+            slice.mesh_policies.clone()
+        } else {
+            Vec::new()
+        };
+        let ambient_udp_source_scopes = if ambient_udp_source_scoping {
+            ambient_udp_source_scope_index(&slice)
+        } else {
+            HashMap::new()
+        };
 
         if !per_pod_policy_scoping {
             validate_scope_filter_identity(&slice, from_slice)?;
@@ -1038,21 +1101,14 @@ impl MeshAuthz {
             });
         }
 
-        for policy in &mut slice.mesh_policies {
-            normalize_mesh_policy_header_names(policy);
-            for rule in &mut policy.rules {
-                for request in &mut rule.to {
-                    for host in &mut request.hosts {
-                        *host = normalize_request_match_host_pattern(host);
-                    }
-                    for host in &mut request.not_hosts {
-                        *host = normalize_request_match_host_pattern(host);
-                    }
-                }
-            }
-        }
+        normalize_authz_policies(&mut slice.mesh_policies);
+        normalize_authz_policies(&mut ambient_udp_source_policies);
         let has_header_rules = mesh_policies_have_header_rules(&slice.mesh_policies);
         let condition_keys = ConditionAttributeKeys::from_policies(&slice.mesh_policies);
+        let ambient_udp_has_header_rules =
+            mesh_policies_have_header_rules(&ambient_udp_source_policies);
+        let ambient_udp_condition_keys =
+            ConditionAttributeKeys::from_policies(&ambient_udp_source_policies);
         // Whether any namespace/selector-scoped (non-mesh-wide) policy is loaded.
         // The stream path fails closed on a missing per-pod scope only when such
         // policies exist; otherwise mesh-wide-only evaluation is complete.
@@ -1083,6 +1139,9 @@ impl MeshAuthz {
         };
         Ok(Self {
             slice,
+            ambient_udp_source_policies,
+            ambient_udp_source_scopes,
+            ambient_udp_source_scoping,
             destination_policy_scopes_by_upstream: destination_policy_scope_index.by_upstream,
             destination_policy_scopes_by_backend: destination_policy_scope_index.by_backend,
             destination_policy_scopes_by_namespaced_backend: destination_policy_scope_index
@@ -1100,11 +1159,13 @@ impl MeshAuthz {
                 .route_upstreams_requiring_scope,
             has_route_upstream_metadata,
             has_header_rules,
+            ambient_udp_has_header_rules,
             trust_domain_aliases,
             trusted_hbone_assertors,
             per_pod_policy_scoping,
             has_scoped_policies,
             condition_keys,
+            ambient_udp_condition_keys,
         })
     }
 
@@ -1121,6 +1182,7 @@ impl MeshAuthz {
     /// rules exist; conditions on `request.headers[...]` reuse that map.
     fn build_http_condition_attributes(
         &self,
+        keys: &ConditionAttributeKeys,
         ctx: &RequestContext,
         source_principal: Option<&SpiffeId>,
         port: Option<u16>,
@@ -1129,7 +1191,6 @@ impl MeshAuthz {
         headers: &BTreeMap<String, String>,
     ) -> BTreeMap<String, MeshAuthzAttribute> {
         let mut attributes = BTreeMap::new();
-        let keys = &self.condition_keys;
         if !keys.any {
             return attributes;
         }
@@ -1634,6 +1695,15 @@ impl Plugin for MeshAuthz {
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
+        let ambient_udp_source_scope_request = self.ambient_udp_source_scoping
+            && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+            && ctx
+                .metadata
+                .get(crate::modes::mesh::hbone::HBONE_DATAGRAM_METADATA_KEY)
+                .is_some_and(|value| value == "udp")
+            && ctx.matched_proxy.as_ref().is_some_and(|proxy| {
+                proxy.id == crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID
+            });
         let unauthenticated_hbone_baggage = is_hbone_request(ctx)
             && has_baggage_header_from_request(ctx)
             && !is_authenticated_hbone_request(ctx);
@@ -1675,7 +1745,12 @@ impl Plugin for MeshAuthz {
             .raw_header_get("host")
             .or_else(|| ctx.raw_header_get(":authority"))
             .map(str::to_string);
-        let headers = if self.has_header_rules {
+        let has_header_rules = if ambient_udp_source_scope_request {
+            self.ambient_udp_has_header_rules
+        } else {
+            self.has_header_rules
+        };
+        let headers = if has_header_rules {
             ctx.materialize_headers();
             if host.is_none() {
                 host = ctx.headers.get("host").cloned();
@@ -1709,7 +1784,13 @@ impl Plugin for MeshAuthz {
         // the keys some loaded policy references (`condition_keys`). Without
         // this, condition-gated DENY rules never fired and condition-gated
         // ALLOW rules never matched — a fail-open hole this closes.
+        let condition_keys = if ambient_udp_source_scope_request {
+            &self.ambient_udp_condition_keys
+        } else {
+            &self.condition_keys
+        };
         let attributes = self.build_http_condition_attributes(
+            condition_keys,
             ctx,
             source_principal.as_ref(),
             port,
@@ -1744,7 +1825,31 @@ impl Plugin for MeshAuthz {
         // services, destination_rules, etc. the authz engine never reads).
         let mut scope_missing = false;
         let mut node_waypoint_authorized_destination = None;
-        let decision = if self.per_pod_policy_scoping {
+        let decision = if ambient_udp_source_scope_request {
+            let source_scope = if baggage_outcome == BaggageOutcome::Honored {
+                match self.ambient_udp_source_scope(ctx, source_principal.as_ref()) {
+                    Ok(scope) => scope,
+                    Err(reason) => {
+                        ctx.metadata.insert(
+                            "mesh_authz.ignored_udp_source_scope".to_string(),
+                            reason.to_string(),
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            evaluate_mesh_authorization_policies(
+                self.ambient_udp_source_policies.iter().filter(|policy| {
+                    source_scope.map_or_else(
+                        || matches!(policy.scope, PolicyScope::MeshWide),
+                        |scope| scope.policy_applies(policy),
+                    )
+                }),
+                &request,
+            )
+        } else if self.per_pod_policy_scoping {
             if self.has_scoped_policies {
                 ctx.metadata.insert(
                     NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA.to_string(),
@@ -2001,6 +2106,27 @@ impl Plugin for MeshAuthz {
 }
 
 impl MeshAuthz {
+    fn ambient_udp_source_scope(
+        &self,
+        ctx: &RequestContext,
+        source_principal: Option<&SpiffeId>,
+    ) -> Result<Option<&crate::modes::mesh::runtime::PolicyScopeCache>, &'static str> {
+        let identity = HboneIdentity::from_baggage_values(
+            ctx.raw_header_values(BAGGAGE_HEADER)
+                .chain(ctx.headers.get(BAGGAGE_HEADER).map(String::as_str)),
+        );
+        let Some(pod_uid) = identity.source_pod_uid else {
+            return Ok(None);
+        };
+        let Some(scope) = self.ambient_udp_source_scopes.get(&pod_uid) else {
+            return Err("pod_not_in_slice");
+        };
+        if source_principal != Some(&scope.spiffe_id) {
+            return Err("principal_pod_mismatch");
+        }
+        Ok(Some(scope))
+    }
+
     /// Resolve the SPIFFE identity used for authz, applying the HBONE baggage
     /// trust-assertor and trust-domain checks.
     ///

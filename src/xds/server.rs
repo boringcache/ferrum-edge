@@ -93,6 +93,7 @@ pub struct XdsAdsServer {
     /// Cleared when the node's last stream ends.
     workload_identities: Arc<DashMap<String, String>>,
     waypoint_names: Arc<DashMap<String, String>>,
+    ambient_udp_source_scoping_nodes: Arc<DashMap<String, ()>>,
     /// Mirror of `EnvConfig.mesh_sidecar_enforced`. When `true`, the slice
     /// builder applies Istio `Sidecar` egress scope narrowing. Default
     /// `false` preserves existing CP behavior.
@@ -176,6 +177,7 @@ struct XdsStreamGuard {
     active_streams: Arc<XdsStreamRegistry>,
     workload_identities: Arc<DashMap<String, String>>,
     waypoint_names: Arc<DashMap<String, String>>,
+    ambient_udp_source_scoping_nodes: Arc<DashMap<String, ()>>,
 }
 
 impl XdsStreamGuard {
@@ -185,6 +187,7 @@ impl XdsStreamGuard {
         active_streams: Arc<XdsStreamRegistry>,
         workload_identities: Arc<DashMap<String, String>>,
         waypoint_names: Arc<DashMap<String, String>>,
+        ambient_udp_source_scoping_nodes: Arc<DashMap<String, ()>>,
     ) -> Self {
         Self {
             node_id: None,
@@ -193,6 +196,7 @@ impl XdsStreamGuard {
             active_streams,
             workload_identities,
             waypoint_names,
+            ambient_udp_source_scoping_nodes,
         }
     }
 
@@ -216,6 +220,7 @@ impl XdsStreamGuard {
             self.nonce_tracker.remove_node(&node_id);
             self.workload_identities.remove(&node_id);
             self.waypoint_names.remove(&node_id);
+            self.ambient_udp_source_scoping_nodes.remove(&node_id);
         }
     }
 }
@@ -270,6 +275,7 @@ impl XdsAdsServer {
             active_streams: Arc::new(XdsStreamRegistry::new(DEFAULT_XDS_MAX_STREAMS_PER_NODE)),
             workload_identities: Arc::new(DashMap::new()),
             waypoint_names: Arc::new(DashMap::new()),
+            ambient_udp_source_scoping_nodes: Arc::new(DashMap::new()),
             sidecar_enforced,
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
@@ -472,7 +478,11 @@ impl XdsAdsServer {
             .with_cluster_domain(self.cluster_domain.clone())
             .with_enforce_sidecar_egress(self.sidecar_enforced)
             .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run)
-            .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing);
+            .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing)
+            .with_ambient_udp_source_scoping(
+                self.ambient_udp_source_scoping_nodes
+                    .contains_key(metadata_key),
+            );
         let mut config = config.clone();
         config.normalize_fields();
         config.normalize_mesh_fields();
@@ -550,10 +560,19 @@ impl XdsAdsServer {
             state_key,
             metadata.waypoint_name,
         );
-        if identity_changed || waypoint_changed {
+        let udp_scope_changed = if metadata.ambient_udp_source_scoping {
+            self.ambient_udp_source_scoping_nodes
+                .insert(state_key.to_string(), ())
+                .is_none()
+        } else {
+            self.ambient_udp_source_scoping_nodes
+                .remove(state_key)
+                .is_some()
+        };
+        if identity_changed || waypoint_changed || udp_scope_changed {
             self.invalidate_snapshot_for_config_update(state_key);
         }
-        identity_changed || waypoint_changed
+        identity_changed || waypoint_changed || udp_scope_changed
     }
 
     fn reconcile_optional_string_state(
@@ -582,6 +601,7 @@ impl XdsAdsServer {
             self.active_streams.clone(),
             self.workload_identities.clone(),
             self.waypoint_names.clone(),
+            self.ambient_udp_source_scoping_nodes.clone(),
         )
     }
 
@@ -2673,6 +2693,7 @@ mod tests {
             active_streams.clone(),
             Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
         );
         first
             .set_node_id("node-a")
@@ -2682,6 +2703,7 @@ mod tests {
             snapshot_cache.clone(),
             nonce_tracker.clone(),
             active_streams.clone(),
+            Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),
         );
@@ -2705,6 +2727,7 @@ mod tests {
             snapshot_cache,
             nonce_tracker,
             active_streams.clone(),
+            Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),
         );
@@ -2936,6 +2959,7 @@ mod tests {
             crate::xds::carrier::XdsNodeMetadata {
                 workload_spiffe_id: None,
                 waypoint_name: Some("waypoint".to_string()),
+                ambient_udp_source_scoping: false,
             },
         ));
         assert!(server.waypoint_names.get(&tenant_key).is_some());
@@ -2978,6 +3002,7 @@ mod tests {
             crate::xds::carrier::XdsNodeMetadata {
                 workload_spiffe_id: None,
                 waypoint_name: Some("waypoint".to_string()),
+                ambient_udp_source_scoping: false,
             },
         );
         let snapshot =
