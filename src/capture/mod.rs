@@ -2241,7 +2241,7 @@ fn udp_fail_closed_release_for(binary: &str) -> Vec<String> {
 fn udp_strict_output_jump_release_for(binary: &str, chain: &str) -> String {
     let jump = format!("-p udp -j {chain}");
     format!(
-        "while true; do\n  if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C OUTPUT {jump} 2>/dev/null; then\n    {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -D OUTPUT {jump}\n  else\n    status=$?\n    if [ \"$status\" -eq 1 ]; then\n      break\n    fi\n    echo \"{binary} could not check OUTPUT jump {chain} (status $status)\" >&2\n    exit \"$status\"\n  fi\ndone"
+        "if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -S {chain} >/dev/null 2>&1; then\n  while true; do\n    if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C OUTPUT {jump} 2>/dev/null; then\n      {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -D OUTPUT {jump}\n    else\n      status=$?\n      if [ \"$status\" -eq 1 ]; then\n        break\n      fi\n      echo \"{binary} could not check OUTPUT jump {chain} (status $status)\" >&2\n      exit \"$status\"\n    fi\n  done\nelse\n  status=$?\n  if [ \"$status\" -ne 1 ]; then\n    echo \"{binary} could not inspect UDP fail-closed guard chain {chain} before release (status $status)\" >&2\n    exit \"$status\"\n  fi\nfi"
     )
 }
 
@@ -2424,6 +2424,64 @@ mod tests {
         );
     }
 
+    /// Model nft-backed iptables, where `-C OUTPUT ... -j <missing-chain>`
+    /// returns status 2. A fresh netns must install and activate guard A without
+    /// ever issuing that non-portable jump probe for absent guard B.
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn udp_fail_closed_script_executes_first_install_with_nft_missing_chain_status() {
+        use std::process::Command;
+
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.udp_capture_enabled = true;
+        config.ip6tables_mode = Ip6TablesMode::Disabled;
+        let script = IptablesPlan::udp_fail_closed_script(&config);
+        let harness = format!(
+            r#"
+a_exists=0
+b_exists=0
+a_active=0
+b_active=0
+iptables() {{
+  case "$*" in
+    *"-S {UDP_FAIL_CLOSED_CHAIN_A}"*) [ "$a_exists" -eq 1 ] ;;
+    *"-S {UDP_FAIL_CLOSED_CHAIN_B}"*) [ "$b_exists" -eq 1 ] ;;
+    *"-C OUTPUT -p udp -j {UDP_FAIL_CLOSED_CHAIN_A}"*)
+      [ "$a_exists" -eq 1 ] || return 2
+      [ "$a_active" -eq 1 ]
+      ;;
+    *"-C OUTPUT -p udp -j {UDP_FAIL_CLOSED_CHAIN_B}"*)
+      [ "$b_exists" -eq 1 ] || return 2
+      [ "$b_active" -eq 1 ]
+      ;;
+    *"-N {UDP_FAIL_CLOSED_CHAIN_A}"*) a_exists=1 ;;
+    *"-N {UDP_FAIL_CLOSED_CHAIN_B}"*) b_exists=1 ;;
+    *"-I OUTPUT 1 -p udp -j {UDP_FAIL_CLOSED_CHAIN_A}"*) a_active=1 ;;
+    *"-I OUTPUT 1 -p udp -j {UDP_FAIL_CLOSED_CHAIN_B}"*) b_active=1 ;;
+    *"-D OUTPUT -p udp -j {UDP_FAIL_CLOSED_CHAIN_A}"*) a_active=0 ;;
+    *"-D OUTPUT -p udp -j {UDP_FAIL_CLOSED_CHAIN_B}"*) b_active=0 ;;
+    *) return 0 ;;
+  esac
+}}
+{script}
+[ "$a_exists" -eq 1 ] && [ "$a_active" -eq 1 ] && [ "$b_active" -eq 0 ]
+"#
+        );
+
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(harness)
+            .output()
+            .expect("execute generated fail-closed script with nft-modeling shim");
+        assert!(
+            output.status.success(),
+            "fresh-netns first install must succeed when missing-chain jump probes return status 2: status={:?}\nstdout={}\nstderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// Fail-closed must be preserved for genuine xtables resource errors on BOTH
     /// the existence probe and the jump probe: any non-1 status aborts the install
     /// with the binary's own exit code (so `set -e` propagates it and the producer
@@ -2436,13 +2494,13 @@ mod tests {
 
         let script = IptablesPlan::udp_fail_closed_script(&config);
 
-        // Exactly two strict `status -ne 1 -> exit` handlers: one for the
-        // existence probe, one for the jump probe. Status 1 alone (absent
-        // chain/jump) is the only tolerated not-installed signal.
+        // The outer existence and active-jump probes plus each strict release
+        // chain-existence probe preserve the same status contract: status 1
+        // alone means absent, while every other non-zero status aborts.
         assert_eq!(
             script.matches("if [ \"$status\" -ne 1 ]; then").count(),
-            2,
-            "both the chain-existence and jump probes must fail closed on non-1 status:\n{script}"
+            6,
+            "all chain-existence probes must fail closed on non-1 status:\n{script}"
         );
         assert!(
             script.contains("could not inspect UDP fail-closed guard chain"),
@@ -2452,16 +2510,12 @@ mod tests {
             script.contains("could not inspect active UDP fail-closed guard"),
             "jump probe still reports and re-raises a genuine resource error:\n{script}"
         );
-        // Both handlers re-raise the binary's own status so `set -e` aborts the
-        // whole install and the producer keeps the fail-closed cleanup owner. The
-        // two probe handlers re-raise directly; the strict jump-release loops
-        // (`udp_strict_output_jump_release_for`) also re-raise their own status.
-        // The active-guard swap runs release_b + release_a (2), and the
-        // install/replace-B path runs release_b once and appears twice (inner +
-        // outer else), for 2 handler + 4 release = 6 total.
+        // The two outer handlers and both error paths in each of the four
+        // expanded strict-release blocks re-raise the binary's status, so
+        // `set -e` aborts and the producer keeps the fail-closed cleanup owner.
         assert_eq!(
             script.matches("exit \"$status\"").count(),
-            6,
+            10,
             "every strict probe re-raises the xtables status to fail closed:\n{script}"
         );
     }
