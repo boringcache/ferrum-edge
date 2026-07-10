@@ -1458,6 +1458,21 @@ impl AiToolGovernor {
         );
     }
 
+    fn write_uninspectable_metadata_into(
+        engine: &GovernorEngine,
+        metadata: &mut HashMap<String, String>,
+    ) {
+        if !engine.observability.emit_metadata {
+            return;
+        }
+        metadata.insert("ai_tool_governor.enabled".to_string(), "true".to_string());
+        metadata.insert(
+            "ai_tool_governor.mode".to_string(),
+            engine.mode.as_str().to_string(),
+        );
+        set_decision_metadata(metadata, "deny");
+    }
+
     fn merge_stream_metadata(
         target: &mut HashMap<String, String>,
         source: &HashMap<String, String>,
@@ -1529,15 +1544,7 @@ impl AiToolGovernor {
         surface: &str,
         reason: &str,
     ) -> PluginResult {
-        if self.engine.observability.emit_metadata {
-            let m = &mut ctx.metadata;
-            m.insert("ai_tool_governor.enabled".to_string(), "true".to_string());
-            m.insert(
-                "ai_tool_governor.mode".to_string(),
-                self.engine.mode.as_str().to_string(),
-            );
-            set_decision_metadata(m, "deny");
-        }
+        Self::write_uninspectable_metadata_into(&self.engine, &mut ctx.metadata);
         PluginResult::Reject {
             status_code: UNINSPECTABLE_STATUS,
             body: format!(
@@ -3488,6 +3495,21 @@ impl ToolCallStreamInspector {
         }
     }
 
+    fn record_uninspectable_metadata(&self) {
+        let Some(slot) = &self.stream_metadata else {
+            return;
+        };
+        match slot.lock() {
+            Ok(mut metadata) => {
+                AiToolGovernor::write_uninspectable_metadata_into(&self.engine, &mut metadata);
+            }
+            Err(poisoned) => {
+                let mut metadata = poisoned.into_inner();
+                AiToolGovernor::write_uninspectable_metadata_into(&self.engine, &mut metadata);
+            }
+        }
+    }
+
     /// Evaluate the accumulated tool calls at a completion boundary. On
     /// release, appends the held raw bytes to `out` and resets batch state.
     async fn finalize(&mut self, out: &mut Vec<u8>) -> Finalize {
@@ -3504,6 +3526,7 @@ impl ToolCallStreamInspector {
         // `build_calls()` silently drops unnamed calls.
         if self.accumulator.has_ungovernable_call() {
             if self.engine.mode == Mode::Enforce {
+                self.record_uninspectable_metadata();
                 self.held.clear();
                 return Finalize::Blocked;
             }
@@ -3575,6 +3598,7 @@ impl ToolCallStreamInspector {
                 "held stream exceeded cap"
             );
             if self.engine.mode == Mode::Enforce {
+                self.record_uninspectable_metadata();
                 self.carry.clear();
                 return self.terminate(Vec::new());
             }
@@ -3597,6 +3621,7 @@ impl ToolCallStreamInspector {
             "streaming tool-call hold exceeded cap"
         );
         if self.engine.mode == Mode::Enforce {
+            self.record_uninspectable_metadata();
             self.held.clear();
             self.carry.clear();
             return self.terminate(out);
@@ -3623,6 +3648,7 @@ impl ToolCallStreamInspector {
         let (calls, ungovernable) = extract_response_tool_calls(&json);
         if ungovernable {
             if self.engine.mode == Mode::Enforce {
+                self.record_uninspectable_metadata();
                 warn!(
                     target: "ai_tool_governor",
                     "JSON-shaped stream contains an ungovernable tool call; cutting stream"
@@ -3786,6 +3812,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                 // Enforce fails closed; dry-run releases the held bytes
                 // unchanged.
                 if self.engine.mode == Mode::Enforce {
+                    self.record_uninspectable_metadata();
                     warn!(
                         target: "ai_tool_governor",
                         held_bytes = self.carry.len(),
@@ -3811,6 +3838,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
             StreamBodyShape::Unknown => {
                 if std::str::from_utf8(&self.carry).is_err() {
                     if self.engine.mode == Mode::Enforce {
+                        self.record_uninspectable_metadata();
                         warn!(
                             target: "ai_tool_governor",
                             held_bytes = self.carry.len(),

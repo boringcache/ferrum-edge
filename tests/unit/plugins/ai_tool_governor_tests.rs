@@ -3300,16 +3300,28 @@ const SSE_UNNAMED_TOOL_FRAMES: &str = concat!(
 /// governed; enforce mode cuts the stream rather than forwarding them.
 #[tokio::test]
 async fn streaming_unnamed_tool_frames_fail_closed_in_enforce() {
-    let plugin = make(streaming_config(json!({}), "deny"));
-    let ctx = create_test_context();
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-        .expect("inspector");
+    let plugin = Arc::new(make(streaming_config(json!({}), "deny")));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
     let (_out, terminated) =
         drive_stream(&mut inspector, &[SSE_UNNAMED_TOOL_FRAMES.as_bytes()]).await;
     assert!(
         terminated,
         "ungovernable tool-call frames must cut the stream in enforce mode"
+    );
+    drop(inspector);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(0))
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("deny"),
+        "the fail-closed stream cut must be visible in transaction metadata"
     );
 }
 
