@@ -1964,106 +1964,6 @@ async fn handle_h3_request(
         && (maybe_requires_response_body_buffering || stream_hooks_enabled);
     let mut request_body_prepared = false;
     let mut prepared_raw_request_body_bytes: Option<u64> = None;
-    if reevaluate_response_policy_after_request_body {
-        let body_was_prebuffered = prebuffered_body_data.is_some();
-        let mut body_data = prebuffered_body_data.take().unwrap_or_default();
-        if !body_was_prebuffered {
-            while let Some(chunk) = stream.recv_data().await? {
-                let bytes = chunk.chunk();
-                if content_length_limit > 0 && body_data.len() + bytes.len() > content_length_limit
-                {
-                    record_request(&state, 413);
-                    send_h3_error_flavor_aware(
-                        &mut stream,
-                        http_flavor,
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        r#"{"error":"Request body exceeds maximum size"}"#,
-                        crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-                        "Request body exceeds maximum size",
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                body_data.extend_from_slice(bytes);
-            }
-        }
-        prepared_raw_request_body_bytes = Some(body_data.len() as u64);
-
-        let mut hook_headers = proxy_headers.clone();
-        hook_headers
-            .entry(":method".to_string())
-            .or_insert_with(|| method.clone());
-        let transformed = crate::proxy::apply_request_body_plugins_with_context(
-            &plugins,
-            Some(&mut ctx),
-            &hook_headers,
-            body_data,
-        )
-        .await;
-        match crate::proxy::run_final_request_body_hooks(
-            &plugins,
-            Some(&mut ctx),
-            &hook_headers,
-            &transformed,
-        )
-        .await
-        {
-            PluginResult::Continue => {
-                prebuffered_body_data = Some(transformed);
-                request_body_prepared = true;
-            }
-            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-                let Some(reject) = plugin_result_into_reject_parts(reject) else {
-                    record_request(&state, 500);
-                    send_h3_reject_flavor_aware(
-                        &mut stream,
-                        http_flavor,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
-                        &HashMap::new(),
-                    )
-                    .await?;
-                    return Ok(());
-                };
-                let mut headers = reject.headers;
-                apply_after_proxy_hooks_to_rejection(
-                    &plugins,
-                    &mut ctx,
-                    reject.status_code,
-                    &mut headers,
-                )
-                .await;
-                let http_status =
-                    StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_REQUEST);
-                let log_status_code = h3_reject_log_status_and_metadata(
-                    &mut ctx,
-                    http_flavor,
-                    http_status,
-                    &reject.body,
-                    &headers,
-                );
-                record_request(&state, log_status_code);
-                log_rejected_request(
-                    &plugins,
-                    &ctx,
-                    log_status_code,
-                    start_time,
-                    "on_final_request_body",
-                    plugin_execution_ns,
-                )
-                .await;
-                send_h3_reject_flavor_aware(
-                    &mut stream,
-                    http_flavor,
-                    http_status,
-                    &reject.body,
-                    &headers,
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-    }
 
     // --- Upstream target selection and circuit breaker ---
     // DestinationRule-derived HTTP connectionPool/TLS knobs are projected below
@@ -2116,38 +2016,6 @@ async fn handle_h3_request(
     // proxy on H3 only.
     ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
 
-    // Determine streaming vs buffered mode — same logic as the H1/H2 paths.
-    // Stream by default; buffer when plugins / response_body_mode need body
-    // access or when the current request has effective retries (needs replay).
-    // This must run AFTER the selected-target retry cap above so
-    // DestinationRule `maxRetries: 0` disables retry-dependent buffering and
-    // native-H3 suppression for the selected port.
-    let has_retry = match http_flavor {
-        HttpFlavor::Plain => {
-            crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method)
-        }
-        HttpFlavor::Grpc => crate::retry::can_retry_connection_failures(proxy.retry.as_ref()),
-        HttpFlavor::WebSocket => false,
-    };
-    let should_stream_response = crate::proxy::should_stream_response_body(
-        &proxy,
-        &plugins,
-        &ctx,
-        maybe_requires_response_body_buffering,
-    );
-    let needs_request_buffering = has_retry || plugin_needs_request_buffering;
-    let needs_response_buffering = has_retry || !should_stream_response;
-    // Keep the reqwest pin as a transport optimization, evaluated from the
-    // finalized request context. Inspector correctness no longer depends on it:
-    // native-H3 and cross-protocol streams both drive the same inspector chain.
-    let forces_reqwest_dispatch = stream_hooks_enabled
-        && plugins
-            .iter()
-            .any(|plugin| plugin.forces_reqwest_dispatch(&ctx));
-    let backend_supports_native_h3 =
-        crate::proxy::supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
-    let use_native_h3_pool =
-        http_flavor == HttpFlavor::Plain && !forces_reqwest_dispatch && backend_supports_native_h3;
     let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
     let mut backend_admission_start: std::time::Instant;
@@ -2178,6 +2046,167 @@ async fn handle_h3_request(
                 return Ok(());
             }
         };
+
+    // Preserve fail-fast breaker behavior: only drain/transform an H3 request
+    // body after the selected target's breaker admits it. Every local failure
+    // below releases a HALF_OPEN probe before writing the client response.
+    let preparation_backend_host = upstream_target
+        .as_deref()
+        .map(|target| target.host.as_str())
+        .unwrap_or(proxy.backend_host.as_str());
+    let preparation_blocked_by_egress_policy =
+        crate::proxy::denied_literal_backend_or_dns_override(
+            preparation_backend_host,
+            &proxy,
+            &state.env_config.backend_allow_ips,
+        )
+        .is_some();
+    if reevaluate_response_policy_after_request_body && !preparation_blocked_by_egress_policy {
+        let body_was_prebuffered = prebuffered_body_data.is_some();
+        let mut body_data = prebuffered_body_data.take().unwrap_or_default();
+        if !body_was_prebuffered {
+            while let Some(chunk) = stream.recv_data().await.inspect_err(|_error| {
+                release_h3_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
+            })? {
+                let bytes = chunk.chunk();
+                if content_length_limit > 0 && body_data.len() + bytes.len() > content_length_limit
+                {
+                    release_h3_circuit_breaker_probe_on_admission_reject(
+                        &state,
+                        &proxy,
+                        cb_target_key.as_deref(),
+                        cb_is_half_open_probe,
+                    );
+                    record_request(&state, 413);
+                    send_h3_error_flavor_aware(
+                        &mut stream,
+                        http_flavor,
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        r#"{"error":"Request body exceeds maximum size"}"#,
+                        crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                        "Request body exceeds maximum size",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                body_data.extend_from_slice(bytes);
+            }
+        }
+        prepared_raw_request_body_bytes = Some(body_data.len() as u64);
+
+        let mut hook_headers = proxy_headers.clone();
+        hook_headers
+            .entry(":method".to_string())
+            .or_insert_with(|| method.clone());
+        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            &plugins,
+            Some(&mut ctx),
+            &hook_headers,
+            body_data,
+        )
+        .await;
+        match crate::proxy::run_final_request_body_hooks(
+            &plugins,
+            Some(&mut ctx),
+            &hook_headers,
+            &transformed,
+        )
+        .await
+        {
+            PluginResult::Continue => {
+                prebuffered_body_data = Some(transformed);
+                request_body_prepared = true;
+            }
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                release_h3_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
+                let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                    record_request(&state, 500);
+                    send_h3_reject_flavor_aware(
+                        &mut stream,
+                        http_flavor,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        b"Internal Server Error",
+                        &HashMap::new(),
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                let mut headers = reject.headers;
+                apply_after_proxy_hooks_to_rejection(
+                    &plugins,
+                    &mut ctx,
+                    reject.status_code,
+                    &mut headers,
+                )
+                .await;
+                let http_status =
+                    StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_REQUEST);
+                let log_status_code = h3_reject_log_status_and_metadata(
+                    &mut ctx,
+                    http_flavor,
+                    http_status,
+                    &reject.body,
+                    &headers,
+                );
+                record_request(&state, log_status_code);
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    log_status_code,
+                    start_time,
+                    "on_final_request_body",
+                    plugin_execution_ns,
+                )
+                .await;
+                send_h3_reject_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    http_status,
+                    &reject.body,
+                    &headers,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
+
+    // Determine streaming vs buffered mode from the finalized request context.
+    // This remains after selected-target retry capping and now also after the
+    // fail-fast breaker admission above.
+    let has_retry = match http_flavor {
+        HttpFlavor::Plain => {
+            crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method)
+        }
+        HttpFlavor::Grpc => crate::retry::can_retry_connection_failures(proxy.retry.as_ref()),
+        HttpFlavor::WebSocket => false,
+    };
+    let should_stream_response = crate::proxy::should_stream_response_body(
+        &proxy,
+        &plugins,
+        &ctx,
+        maybe_requires_response_body_buffering,
+    );
+    let needs_request_buffering = has_retry || plugin_needs_request_buffering;
+    let needs_response_buffering = has_retry || !should_stream_response;
+    let forces_reqwest_dispatch = stream_hooks_enabled
+        && plugins
+            .iter()
+            .any(|plugin| plugin.forces_reqwest_dispatch(&ctx));
+    let backend_supports_native_h3 =
+        crate::proxy::supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
+    let use_native_h3_pool =
+        http_flavor == HttpFlavor::Plain && !forces_reqwest_dispatch && backend_supports_native_h3;
 
     let backend_url = build_h3_backend_url_for_flavor(
         &proxy,

@@ -2680,16 +2680,20 @@ pub(crate) async fn run_response_inspection(
 /// dispatch, and connection guards; this task owns it until backend EOF, policy
 /// termination, error, or downstream cancellation. DATA frames are held until
 /// the inspector releases them, while sanitized trailer frames pass through
-/// unchanged on a clean stream.
+/// unchanged on a clean stream. The configured response-size cap is applied to
+/// released inspector output as well as to bytes consumed by the source body,
+/// so expansion and terminal events cannot bypass the operator limit.
 pub(crate) async fn run_proxy_body_response_inspection(
     mut body: ProxyBody,
     mut inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
     tx: tokio::sync::mpsc::Sender<Result<Frame<Bytes>, BoxError>>,
+    max_response_body_size_bytes: usize,
 ) {
     use crate::plugins::ResponseStreamAction;
     use http_body_util::BodyExt;
 
     let mut trailing_frame: Option<Frame<Bytes>> = None;
+    let mut emitted_bytes: usize = 0;
     loop {
         let frame = tokio::select! {
             biased;
@@ -2701,14 +2705,39 @@ pub(crate) async fn run_proxy_body_response_inspection(
             Ok(frame) => match frame.into_data() {
                 Ok(bytes) => match inspector.on_chunk(&bytes).await {
                     ResponseStreamAction::Forward(out) => {
-                        if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
-                            return;
+                        if !out.is_empty() {
+                            if max_response_body_size_bytes > 0
+                                && emitted_bytes.saturating_add(out.len())
+                                    > max_response_body_size_bytes
+                            {
+                                let _ = tx
+                                    .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                                        "response body exceeds maximum size",
+                                    ) as BoxError))
+                                    .await;
+                                return;
+                            }
+                            emitted_bytes = emitted_bytes.saturating_add(out.len());
+                            if tx.send(Ok(Frame::data(out))).await.is_err() {
+                                return;
+                            }
                         }
                     }
                     ResponseStreamAction::Terminate(final_bytes) => {
                         if let Some(bytes) = final_bytes
                             && !bytes.is_empty()
                         {
+                            if max_response_body_size_bytes > 0
+                                && emitted_bytes.saturating_add(bytes.len())
+                                    > max_response_body_size_bytes
+                            {
+                                let _ = tx
+                                    .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                                        "response body exceeds maximum size",
+                                    ) as BoxError))
+                                    .await;
+                                return;
+                            }
                             let _ = tx.send(Ok(Frame::data(bytes))).await;
                         }
                         return;
@@ -2732,6 +2761,16 @@ pub(crate) async fn run_proxy_body_response_inspection(
     match inspector.on_end().await {
         ResponseStreamAction::Forward(out) => {
             if !out.is_empty() {
+                if max_response_body_size_bytes > 0
+                    && emitted_bytes.saturating_add(out.len()) > max_response_body_size_bytes
+                {
+                    let _ = tx
+                        .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                            "response body exceeds maximum size",
+                        ) as BoxError))
+                        .await;
+                    return;
+                }
                 if tx.send(Ok(Frame::data(out))).await.is_err() {
                     return;
                 }
@@ -2744,6 +2783,16 @@ pub(crate) async fn run_proxy_body_response_inspection(
             if let Some(bytes) = final_bytes
                 && !bytes.is_empty()
             {
+                if max_response_body_size_bytes > 0
+                    && emitted_bytes.saturating_add(bytes.len()) > max_response_body_size_bytes
+                {
+                    let _ = tx
+                        .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                            "response body exceeds maximum size",
+                        ) as BoxError))
+                        .await;
+                    return;
+                }
                 let _ = tx.send(Ok(Frame::data(bytes))).await;
             }
         }

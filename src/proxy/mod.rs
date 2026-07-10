@@ -14501,7 +14501,17 @@ async fn handle_proxy_request_inner(
     // admitted the request. This preserves the open-breaker behavior (no slow
     // upload drain or body-plugin I/O before the immediate 503) while still
     // updating response buffering and transport preference before dispatch.
-    if reevaluate_response_policy_after_request_body {
+    let preparation_backend_host = upstream_target
+        .as_deref()
+        .map(|target| target.host.as_str())
+        .unwrap_or(proxy.backend_host.as_str());
+    let preparation_blocked_by_egress_policy = denied_literal_backend_or_dns_override(
+        preparation_backend_host,
+        &proxy,
+        &state.env_config.backend_allow_ips,
+    )
+    .is_some();
+    if reevaluate_response_policy_after_request_body && !preparation_blocked_by_egress_policy {
         let hook_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
@@ -18523,7 +18533,10 @@ async fn handle_proxy_request_inner(
             let mut body = if let Some(inspector) = response_inspector {
                 let (tx, rx) = tokio::sync::mpsc::channel(16);
                 tokio::spawn(crate::proxy::body::run_proxy_body_response_inspection(
-                    body, inspector, tx,
+                    body,
+                    inspector,
+                    tx,
+                    state.max_response_body_size_bytes,
                 ));
                 crate::proxy::body::inspected_streaming_body(rx)
             } else {
@@ -18651,7 +18664,10 @@ async fn handle_proxy_request_inner(
             let mut body = if let Some(inspector) = response_inspector {
                 let (tx, rx) = tokio::sync::mpsc::channel(16);
                 tokio::spawn(crate::proxy::body::run_proxy_body_response_inspection(
-                    body, inspector, tx,
+                    body,
+                    inspector,
+                    tx,
+                    state.max_response_body_size_bytes,
                 ));
                 crate::proxy::body::inspected_streaming_body(rx)
             } else {
