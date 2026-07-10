@@ -799,14 +799,8 @@ async fn request_mirror_reset_never_delays_primary_response() {
     assert_misbehaving_mirror_does_not_delay_primary("reset").await;
 }
 
-// Disabled pending #2078: a stalled mirror currently holds the primary client
-// response open until `collect_mirror_result()` reaches its 5-second logging
-// timeout, violating the documented fire-and-forget contract. Functional CI
-// deliberately runs all `#[ignore]` tests, so `cfg(any())` keeps this known-bug
-// regression out of the shard until #2078 is fixed; remove the cfg gate then.
-#[cfg(any())]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "gateway bug #2078"]
+#[ignore]
 async fn request_mirror_stall_never_delays_primary_response() {
     assert_misbehaving_mirror_does_not_delay_primary("stall").await;
 }
