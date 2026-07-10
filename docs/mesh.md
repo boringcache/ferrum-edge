@@ -1992,8 +1992,12 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   switch propagates xtables resource errors and also probes stale IPv6 guard chains
   independently of the current IPv6 setting. The
   pre-first-poll enrollment window remains tracked under #2013. The privileged
-  `netns-capture-live` gate now verifies the real manager/backend source producer,
-  including its transparent bind, full HBONE round trip, and return-source spoofing.
+  `netns-capture-live` gate verifies the real manager/backend source producer,
+  including its transparent bind, full HBONE round trip, and return-source spoofing,
+  when the runner's iptables backend reports a missing first-install guard jump with
+  status 1. Backends that report the absent guard target as status 2 are narrowly
+  XFAIL-gated under [#2084](https://github.com/ferrum-edge/ferrum-edge/issues/2084);
+  every other prerequisite, startup, capture, relay, and cleanup failure remains fatal.
   The producer tears down only its own
   rules on pod removal / config change / shutdown
   (graceful shutdown AWAITS the per-netns teardown). When Ambient UDP capture is
@@ -2013,8 +2017,10 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   per-pod. Ambient producers share one node-wide session limiter, so
   `FERRUM_UDP_MAX_SESSIONS` is not multiplied by pod count. The reconcile /
   rule-generation / registry logic remains unit-tested, and the full Ambient live
-  source-capture e2e is enforced by `functional_mesh_live_source_capture_udp_manager_hbone_round_trip`
-  in `netns-capture-live`: fresh pod netns → production manager/backend TPROXY rules
+  source-capture e2e is enforced (subject only to the #2084 missing-guard-chain
+  iptables-backend XFAIL above) by
+  `functional_mesh_live_source_capture_udp_manager_hbone_round_trip` in
+  `netns-capture-live`: fresh pod netns → production manager/backend TPROXY rules
   and capture socket → recovered original destination → HBONE datagram tunnel →
   destination echo → transparent reply sourced from the original VIP:port. The same
   gate proves no-route fail-closed behavior, capture-disabled absence, reconcile
