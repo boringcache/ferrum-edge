@@ -5209,10 +5209,9 @@ impl ProxyState {
                     // (slice-declared sidecars speak mesh-mTLS by construction),
                     // so enrolling them would dial a non-existent `:15008` HBONE
                     // listener and record a spurious unsupported verdict. Also
-                    // skip any cross-cluster east-west target (HTTP-family-only by
-                    // construction, so it should never land on a raw-TCP upstream
-                    // — defensive: it dials the gateway `:15443`, never a
-                    // probeable `:15008`, and dispatch bypasses the registry).
+                    // skip cross-cluster east-west targets: they dial the
+                    // operator gateway `:15443`, never a probeable workload
+                    // `:15008`, and L4 dispatch bypasses the registry.
                     if !crate::proxy::hbone_pool::target_hbone_enabled(target)
                         || crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
                     {
@@ -5255,8 +5254,8 @@ impl ProxyState {
             for target in &upstream.targets {
                 // Ambient `mesh.hbone` per-workload targets only; Sidecar
                 // `mesh.mtls` (no probe) and cross-cluster east-west targets
-                // (HTTP-family-only, gateway-dialed, registry-bypassed) are
-                // excluded — same rationale as the VIP pass above.
+                // (gateway-dialed, registry-bypassed) are excluded — same
+                // rationale as the VIP pass above.
                 if !crate::proxy::hbone_pool::target_hbone_enabled(target)
                     || crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
                 {
@@ -5303,8 +5302,8 @@ impl ProxyState {
                 for target in &upstream.targets {
                     // Ambient `mesh.hbone` UDP targets only; Sidecar `mesh.mtls`
                     // (no probe) and cross-cluster east-west targets
-                    // (HTTP-family-only, gateway-dialed, registry-bypassed) are
-                    // excluded — same rationale as the raw-TCP passes above.
+                    // (gateway-dialed, registry-bypassed) are excluded — same
+                    // rationale as the raw-TCP passes above.
                     if !crate::proxy::hbone_pool::target_hbone_enabled(target)
                         || crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
                     {
