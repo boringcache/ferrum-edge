@@ -14560,6 +14560,7 @@ async fn handle_proxy_request_inner(
 
     let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet> = None;
+    let mut preacquired_backend_admission = PreacquiredBackendAdmission::default();
 
     // Circuit breaker check — per-target when upstream is configured, per-proxy otherwise
     // `cb_admission_open_epoch` is re-captured on retry-target rotation (the gRPC
@@ -14606,15 +14607,55 @@ async fn handle_proxy_request_inner(
         .as_deref()
         .map(|target| target.host.as_str())
         .unwrap_or(proxy.backend_host.as_str());
-    let preparation_blocked_by_dispatch_policy = denied_literal_backend_or_dns_override(
-        preparation_backend_host,
-        &proxy,
-        &state.env_config.backend_allow_ips,
-    )
-    .is_some()
+    let preparation_requires_direct_h2_for_sni = reevaluate_response_policy_after_request_body
+        && resolve_backend_connection_proxy_for_target(&proxy, upstream_target.as_deref())
+            .resolved_tls
+            .sni
+            .is_some();
+    let preparation_blocked_by_dispatch_policy = preparation_requires_direct_h2_for_sni
+        || denied_literal_backend_or_dns_override(
+            preparation_backend_host,
+            &proxy,
+            &state.env_config.backend_allow_ips,
+        )
+        .is_some()
         || backend_dispatch::direct_http_mesh_transport_refusal(upstream_target.as_deref())
             .is_some();
     if reevaluate_response_policy_after_request_body && !preparation_blocked_by_dispatch_policy {
+        if !backend_admission_plugins.is_empty() {
+            let admission_proxy =
+                resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref());
+            let permits = match backend_dispatch::run_backend_admission_plugins(
+                backend_admission_plugins.as_ref(),
+                &ctx,
+                admission_proxy.as_ref(),
+                upstream_target.as_deref(),
+                ProxyProtocol::Http,
+            ) {
+                Ok(permits) => permits,
+                Err(rejection) => {
+                    release_circuit_breaker_probe_on_admission_reject(
+                        &state,
+                        &proxy,
+                        cb_target_key.as_deref(),
+                        cb_is_half_open_probe,
+                    );
+                    return Ok(handle_backend_admission_rejection(
+                        rejection,
+                        &plugins,
+                        &mut ctx,
+                        &state,
+                        start_time,
+                        plugin_execution_ns,
+                        Some(&original_request_path),
+                        is_grpc_request,
+                        grpc_web_response_content_type,
+                    )
+                    .await);
+                }
+            };
+            preacquired_backend_admission = PreacquiredBackendAdmission::acquired(permits);
+        }
         let hook_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
@@ -14669,21 +14710,33 @@ async fn handle_proxy_request_inner(
             ClientRequestBody::Buffered(body) => {
                 ctx.bytes_sent_observed
                     .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                let mut body_hook_ctx = needs_final_request_body_context
+                    .then(|| ctx.clone_for_final_request_body_hooks());
                 let transformed = apply_request_body_plugins_with_context(
                     &plugins,
-                    Some(&mut ctx),
+                    body_hook_ctx.as_mut(),
                     &hook_headers,
                     body,
                 )
                 .await;
-                match run_final_request_body_hooks(
+                let final_body_result = run_final_request_body_hooks(
                     &plugins,
-                    Some(&mut ctx),
+                    body_hook_ctx.as_mut(),
                     &hook_headers,
                     &transformed,
                 )
-                .await
-                {
+                .await;
+                if let Some(body_hook_ctx) = body_hook_ctx {
+                    let request_body = ctx.metadata.remove("request_body");
+                    ctx.metadata = body_hook_ctx.metadata;
+                    if let Some(body) = request_body {
+                        ctx.metadata.insert("request_body".to_string(), body);
+                    }
+                    ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+                    ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
+                    ctx.waf_score = body_hook_ctx.waf_score;
+                }
+                match final_body_result {
                     PluginResult::Continue => {
                         request_body_prepared = true;
                         ClientRequestBody::Buffered(transformed)
@@ -17346,6 +17399,7 @@ async fn handle_proxy_request_inner(
             upstream_target.as_deref(),
             &plugins,
             backend_admission_plugins.as_ref(),
+            std::mem::take(&mut preacquired_backend_admission),
             body_hook_ctx.as_mut(),
             &ctx,
             should_stream,
@@ -17683,6 +17737,7 @@ async fn handle_proxy_request_inner(
             upstream_target.as_deref(),
             &plugins,
             backend_admission_plugins.as_ref(),
+            std::mem::take(&mut preacquired_backend_admission),
             body_hook_ctx.as_mut(),
             &ctx,
             should_stream,
@@ -19836,6 +19891,56 @@ enum BackendDispatchResult {
     AdmissionRejected(backend_dispatch::BackendAdmissionRejection),
 }
 
+/// Backend-admission result acquired before request-body finalization.
+///
+/// The explicit `was_run` bit distinguishes "admission ran and no plugin
+/// returned a permit" from "admission has not run yet". This lets the narrow
+/// post-transform response-policy path preserve fail-fast admission without
+/// invoking admission plugins twice on accepted requests.
+#[derive(Default)]
+pub(crate) struct PreacquiredBackendAdmission {
+    was_run: bool,
+    permits: Option<BackendAdmissionPermitSet>,
+}
+
+impl PreacquiredBackendAdmission {
+    pub(crate) fn acquired(permits: Option<BackendAdmissionPermitSet>) -> Self {
+        Self {
+            was_run: true,
+            permits,
+        }
+    }
+
+    pub(crate) fn take_if_acquired(&mut self) -> Option<Option<BackendAdmissionPermitSet>> {
+        self.was_run.then(|| {
+            self.was_run = false;
+            self.permits.take()
+        })
+    }
+
+    fn take_or_run(
+        &mut self,
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        ctx: &RequestContext,
+        proxy: &Proxy,
+        upstream_target: Option<&UpstreamTarget>,
+        protocol: ProxyProtocol,
+    ) -> Result<Option<BackendAdmissionPermitSet>, backend_dispatch::BackendAdmissionRejection>
+    {
+        if let Some(permits) = self.take_if_acquired() {
+            Ok(permits)
+        } else {
+            backend_dispatch::run_backend_admission_plugins(
+                plugins,
+                ctx,
+                proxy,
+                upstream_target,
+                protocol,
+            )
+        }
+    }
+}
+
 fn backend_dispatch_response(
     response: retry::BackendResponse,
     retained_body: Option<Bytes>,
@@ -20069,6 +20174,7 @@ async fn proxy_to_backend(
     upstream_target: Option<&UpstreamTarget>,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     backend_admission_plugins: &[Arc<dyn crate::plugins::Plugin>],
+    mut preacquired_backend_admission: PreacquiredBackendAdmission,
     mut ctx: Option<&mut RequestContext>,
     // Real, read-only request context for the response-side buffering decision.
     // Distinct from `ctx` above, which is the request-body-hook clone and is
@@ -20093,10 +20199,11 @@ async fn proxy_to_backend(
     // has completed.
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
     inbound_version: hyper::Version,
-    // Out-parameter: set to the instant the backend admission permit is
-    // acquired (immediately before the backend dial / send), so the caller's
-    // adaptive-concurrency sample measures only the backend interaction and not
-    // the request-body collection / final-body-hook time that precedes it.
+    // Out-parameter: reset immediately before the backend dial / send, after
+    // admission permits are available. A narrow response-policy reevaluation
+    // path may preacquire admission before body finalization to preserve
+    // fail-fast rejection; its client-upload/body-hook time must still stay out
+    // of the backend latency sample.
     // Left at its incoming value (the caller's `backend_start`) on paths that
     // never reach admission, so the fallback is the pre-fix behavior.
     backend_admission_started_at: &mut Instant,
@@ -20181,7 +20288,7 @@ async fn proxy_to_backend(
         {
             return reject;
         }
-        backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+        backend_admission_permits = match preacquired_backend_admission.take_or_run(
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -20267,7 +20374,7 @@ async fn proxy_to_backend(
         {
             return reject;
         }
-        backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+        backend_admission_permits = match preacquired_backend_admission.take_or_run(
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -20336,7 +20443,7 @@ async fn proxy_to_backend(
         {
             return reject;
         }
-        backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+        backend_admission_permits = match preacquired_backend_admission.take_or_run(
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -20462,7 +20569,7 @@ async fn proxy_to_backend(
             // limited requests intentionally do not enter this block: they must
             // stay on the reqwest path so local 413 checks and deferred backend
             // admission happen before any backend interaction.
-            let mut h2_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+            let mut h2_admission_permits = match preacquired_backend_admission.take_or_run(
                 backend_admission_plugins,
                 request_ctx,
                 proxy,
@@ -21074,7 +21181,7 @@ async fn proxy_to_backend(
         }
     };
 
-    backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+    backend_admission_permits = match preacquired_backend_admission.take_or_run(
         backend_admission_plugins,
         request_ctx,
         proxy,
@@ -21084,8 +21191,10 @@ async fn proxy_to_backend(
         Ok(permits) => permits,
         Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
     };
-    // Admission is acquired here, after request-body collection and final-body
-    // hooks, so the adaptive sample measures only the backend interaction.
+    // Ordinary requests acquire admission here after request-body collection
+    // and final-body hooks. The narrow post-transform policy path consumes its
+    // preacquired result here instead; either way, reset the timer now so the
+    // adaptive sample measures only the backend interaction.
     *backend_admission_started_at = Instant::now();
 
     // Send
@@ -28669,6 +28778,7 @@ mod tests {
                 None,
                 plugins,
                 &[],
+                PreacquiredBackendAdmission::default(),
                 None,  // body-hook ctx (absent for response-only configs)
                 &ctx,  // real read-only request context
                 false, // stream_response: WAF requested buffering pre-flight
@@ -28781,12 +28891,14 @@ mod tests {
             None,
             &plugins,
             &[],
+            PreacquiredBackendAdmission::default(),
             None,
             &ctx,
             false,
             false,
             true,
             true,
+            false,
             "127.0.0.1",
             "127.0.0.1",
             false,
