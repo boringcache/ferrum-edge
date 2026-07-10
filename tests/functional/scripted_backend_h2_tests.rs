@@ -140,10 +140,10 @@ async fn fetch_capability_entry(harness: &GatewayHarness) -> Option<Value> {
 async fn wait_for_h2_tls_supported(harness: &GatewayHarness, timeout: Duration) -> Option<Value> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(entry) = fetch_capability_entry(harness).await {
-            if entry["plain_http"]["h2_tls"].as_str() == Some("supported") {
-                return Some(entry);
-            }
+        if let Some(entry) = fetch_capability_entry(harness).await
+            && entry["plain_http"]["h2_tls"].as_str() == Some("supported")
+        {
+            return Some(entry);
         }
         if Instant::now() >= deadline {
             return None;
@@ -1586,7 +1586,22 @@ async fn bodyless_direct_h2_sse_response_is_governed() {
         "stream-terminal metadata must be written before summary logging: {logs}"
     );
     assert!(backend.received_stream_count() >= 1);
-    backend.assert_no_step_errors().await;
+    let step_errors = backend.step_errors().await;
+    let unexpected_step_errors: Vec<_> = step_errors
+        .iter()
+        // Capability warmup may open a speculative H2 connection and drop it
+        // before sending the client preface. The governed response and received
+        // GET above prove the real direct-H2 connection completed; do not treat
+        // that independent probe disconnect as a script failure.
+        .filter(|error| {
+            !error.starts_with("h2 handshake failed: connection error detected: unspecific protocol error detected")
+        })
+        .collect();
+    assert!(
+        unexpected_step_errors.is_empty(),
+        "{} unexpected script step error(s): {unexpected_step_errors:?}",
+        unexpected_step_errors.len()
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────

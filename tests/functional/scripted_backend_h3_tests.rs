@@ -1688,6 +1688,138 @@ async fn transformer_added_stream_marker_reclassifies_h3_capable_dispatch() {
     );
 }
 
+// A bodyless request has no request-body marker that could prefer reqwest. Once
+// capability warmup proves the backend H3-capable, its SSE response must still
+// run through the native-H3 `StreamingH3` inspector arm. The Content-Length
+// assertion also covers the split between the preserved backend length (used
+// for graceful-close classification) and the stripped client-visible header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn bodyless_native_h3_sse_response_is_governed() {
+    const DENIED_SSE: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"rm_rf\",\"arguments\":\"{\\\"path\\\":\\\"/etc\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    let ca = TestCa::new("h3-bodyless-governor").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    // Keep the TCP side available to the concurrent H2 capability probe. The
+    // functional request must still land on the QUIC backend, asserted below.
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls probe backend");
+
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-type", "text/event-stream".to_string()),
+            ("content-length", DENIED_SSE.len().to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from_static(
+            DENIED_SSE.as_bytes(),
+        )))
+        .spawn()
+        .expect("spawn h3 backend");
+
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "native-h3-governor",
+            "listen_path": "/events",
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "backend_tls_verify_server_cert": false,
+            "plugins": [{"plugin_config_id": "governor"}]
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "governor",
+            "proxy_id": "native-h3-governor",
+            "plugin_name": "ai_tool_governor",
+            "scope": "proxy",
+            "enabled": true,
+            "config": {
+                "mode": "enforce",
+                "tools": {"rm_rf": {"action": "deny"}},
+                "default_action": "allow",
+                "inspect": {
+                    "response_tool_calls": false,
+                    "streaming_response_tool_calls": true
+                }
+            }
+        }]
+    });
+    let harness = GatewayHarness::builder()
+        .file_config(serde_yaml::to_string(&config).expect("yaml"))
+        .pool_warmup_enabled(true)
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("capability entry")
+        .expect("registry populated");
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "precondition: native-H3 streaming arm requires h3=supported; entry: {entry:#?}"
+    );
+
+    let response = reqwest::Client::builder()
+        .http1_only()
+        .build()
+        .expect("client")
+        .get(harness.proxy_url("/events/live"))
+        .send()
+        .await
+        .expect("bodyless request");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        response.headers().get("content-length").is_none(),
+        "an attached inspector may cut or transform the body"
+    );
+    let body = response.text().await.expect("response body");
+    assert!(
+        body.contains("ai_tool_governor_tool_blocked"),
+        "governor must terminate the native-H3 stream: {body}"
+    );
+    assert!(
+        !body.contains("/etc"),
+        "held denied tool-call frames must not leak: {body}"
+    );
+
+    let received = h3_backend.received_requests().await;
+    assert!(
+        received
+            .iter()
+            .any(|request| request.method == "GET" && request.path == "/live"),
+        "bodyless GET must reach the native H3 backend; received: {received:#?}"
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Test 12 — STREAMING H3 response path recovers a graceful QUIC close that
 // arrives AFTER a complete Content-Length body.

@@ -782,15 +782,16 @@ impl AiTranscriptAudit {
         // the later buffer-vs-stream response decision
         // (`buffered_response_capture_wanted`), so — mirroring
         // `ai_tool_governor` — the marker must track the final body in BOTH
-        // directions. Only clear on a parsed, provably non-streaming body; an
-        // unparseable body cannot rule out `stream: true`, so leave the marker
-        // as staged.
-        if let Some(json) = parsed.as_ref() {
-            if json.get("stream").and_then(Value::as_bool) == Some(true) {
+        // directions. An unparseable body cannot rule out `stream: true`, so
+        // conservatively mark it streaming; only a parsed, provably
+        // non-streaming body clears the marker.
+        match parsed.as_ref() {
+            Some(json) if json.get("stream").and_then(Value::as_bool) != Some(true) => {
+                ctx.metadata.remove(MD_STREAM_REQUEST);
+            }
+            Some(_) | None => {
                 ctx.metadata
                     .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
-            } else {
-                ctx.metadata.remove(MD_STREAM_REQUEST);
             }
         }
         ctx.metadata

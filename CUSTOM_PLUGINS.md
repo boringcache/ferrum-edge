@@ -263,7 +263,7 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn may_modify_response_content_type(&self, &ctx, backend_content_type) -> bool` | `false` | Set when `after_proxy` may relabel the backend `Content-Type`; this prevents an unsafe buffer-to-stream downgrade. The answer must match the current request and backend type exactly. |
 | `fn requires_response_stream_hooks(&self) -> bool` | `false` | Config-time opt-in for streaming response inspection. |
 | `fn response_stream_inspector(&self, &ctx, status, content_type) -> Option<Box<dyn ResponseStreamInspector>>` | `None` | Create state owned by one eligible streaming response, or return `None` for passthrough. |
-| `fn forces_reqwest_dispatch(&self, &ctx) -> bool` | `false` | Per-request native-H3 dispatch override for requests whose response inspector must run. See the current transport limitation below. |
+| `fn forces_reqwest_dispatch(&self, &ctx) -> bool` | `false` | Optional per-request native-H3 dispatch override when reqwest is operationally preferable; inspectors do not require it for transport coverage. |
 | `fn applies_after_proxy_on_reject(&self) -> bool` | `false` | Set to `true` if your plugin's `after_proxy` should also run on gateway-generated rejection responses (e.g., CORS headers on error responses). |
 | `fn requires_ws_frame_hooks(&self) -> bool` | `false` | Set to `true` if your plugin implements `on_ws_frame()`. Pre-computed per proxy for zero overhead when unused. |
 | `fn warmup_hostnames(&self) -> Vec<String>` | `[]` | Hostnames your plugin connects to (for DNS pre-warming at startup). |

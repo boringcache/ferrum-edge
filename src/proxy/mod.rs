@@ -14606,13 +14606,15 @@ async fn handle_proxy_request_inner(
         .as_deref()
         .map(|target| target.host.as_str())
         .unwrap_or(proxy.backend_host.as_str());
-    let preparation_blocked_by_egress_policy = denied_literal_backend_or_dns_override(
+    let preparation_blocked_by_dispatch_policy = denied_literal_backend_or_dns_override(
         preparation_backend_host,
         &proxy,
         &state.env_config.backend_allow_ips,
     )
-    .is_some();
-    if reevaluate_response_policy_after_request_body && !preparation_blocked_by_egress_policy {
+    .is_some()
+        || backend_dispatch::direct_http_mesh_transport_refusal(upstream_target.as_deref())
+            .is_some();
+    if reevaluate_response_policy_after_request_body && !preparation_blocked_by_dispatch_policy {
         let hook_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
@@ -14713,13 +14715,14 @@ async fn handle_proxy_request_inner(
                         )
                         .await;
                         apply_grpc_reject_metadata(&mut ctx, &normalized);
-                        log_rejected_request(
+                        log_rejected_request_with_path(
                             &plugins,
                             &ctx,
                             normalized.http_status.as_u16(),
                             start_time,
                             "on_final_request_body",
                             plugin_execution_ns,
+                            Some(&original_request_path),
                         )
                         .await;
                         record_request(&state, normalized.http_status.as_u16());
@@ -18647,16 +18650,16 @@ async fn handle_proxy_request_inner(
                     inspector,
                     tx,
                     state.max_response_body_size_bytes,
+                    lb_connection_guard,
                 ));
                 crate::proxy::body::inspected_streaming_body(rx)
             } else {
-                body
+                body.with_lb_connection_guard(lb_connection_guard)
             };
-            // Keep lifecycle/accounting on the client-visible inspected body.
-            // A policy Terminate is a clean EOF (matching reqwest), while a
-            // backend error forwarded by the bridge and a real downstream drop
-            // still reach the existing deferred classifiers.
-            body = body.with_lb_connection_guard(lb_connection_guard);
+            // Deferred admission/dispatch outcomes stay on the client-visible
+            // body. The least-connections guard moves into the inspection task
+            // on a hit so a client cancel cannot under-count a provider-blocked
+            // inspector that still owns the backend stream.
             if let Some(permits) = backend_admission_permits.take() {
                 body = body.with_deferred_backend_admission_outcome(
                     permits,
@@ -18778,14 +18781,13 @@ async fn handle_proxy_request_inner(
                     inspector,
                     tx,
                     state.max_response_body_size_bytes,
+                    lb_connection_guard,
                 ));
                 crate::proxy::body::inspected_streaming_body(rx)
             } else {
-                body
+                body.with_lb_connection_guard(lb_connection_guard)
             };
-            body = body
-                .with_success_on_drop_after_response_bytes(success_on_drop_after_bytes)
-                .with_lb_connection_guard(lb_connection_guard);
+            body = body.with_success_on_drop_after_response_bytes(success_on_drop_after_bytes);
             if let Some(permits) = backend_admission_permits.take() {
                 body = body.with_deferred_backend_admission_outcome(
                     permits,

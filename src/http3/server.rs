@@ -41,7 +41,8 @@ use crate::proxy::headers::{
 use crate::proxy::{
     ProxyState, apply_after_proxy_hooks_to_rejection, apply_plugin_rejection_response,
     apply_reject_after_proxy_and_synthetic_body_hooks, log_rejected_request,
-    plugin_result_into_reject_parts, run_after_proxy_hooks, run_authentication_phase,
+    log_rejected_request_with_path, plugin_result_into_reject_parts, run_after_proxy_hooks,
+    run_authentication_phase,
 };
 use crate::tls::{CrlList, TlsPolicy};
 
@@ -2054,14 +2055,18 @@ async fn handle_h3_request(
         .as_deref()
         .map(|target| target.host.as_str())
         .unwrap_or(proxy.backend_host.as_str());
-    let preparation_blocked_by_egress_policy =
+    let preparation_blocked_by_dispatch_policy =
         crate::proxy::denied_literal_backend_or_dns_override(
             preparation_backend_host,
             &proxy,
             &state.env_config.backend_allow_ips,
         )
-        .is_some();
-    if reevaluate_response_policy_after_request_body && !preparation_blocked_by_egress_policy {
+        .is_some()
+            || crate::proxy::backend_dispatch::direct_http_mesh_transport_refusal(
+                upstream_target.as_deref(),
+            )
+            .is_some();
+    if reevaluate_response_policy_after_request_body && !preparation_blocked_by_dispatch_policy {
         let body_was_prebuffered = prebuffered_body_data.is_some();
         let mut body_data = prebuffered_body_data.take().unwrap_or_default();
         if !body_was_prebuffered {
@@ -2097,7 +2102,10 @@ async fn handle_h3_request(
                 body_data.extend_from_slice(bytes);
             }
         }
-        prepared_raw_request_body_bytes = Some(body_data.len() as u64);
+        let raw_request_body_bytes = body_data.len() as u64;
+        prepared_raw_request_body_bytes = Some(raw_request_body_bytes);
+        ctx.bytes_sent_observed
+            .fetch_max(raw_request_body_bytes, std::sync::atomic::Ordering::Release);
 
         let mut hook_headers = proxy_headers.clone();
         hook_headers
@@ -2159,13 +2167,14 @@ async fn handle_h3_request(
                     &headers,
                 );
                 record_request(&state, log_status_code);
-                log_rejected_request(
+                log_rejected_request_with_path(
                     &plugins,
                     &ctx,
                     log_status_code,
                     start_time,
                     "on_final_request_body",
                     plugin_execution_ns,
+                    Some(&original_request_path),
                 )
                 .await;
                 send_h3_reject_flavor_aware(

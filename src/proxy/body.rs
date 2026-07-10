@@ -2676,18 +2676,20 @@ pub(crate) async fn run_response_inspection(
 ///
 /// This is the transport-independent counterpart of [`run_response_inspection`]
 /// for direct HTTP/2 and native HTTP/3 backend responses. The source body keeps
-/// its protocol-specific timeout, size-limit, trailer filtering, admission,
-/// dispatch, and connection guards; this task owns it until backend EOF, policy
-/// termination, error, or downstream cancellation. DATA frames are held until
-/// the inspector releases them, while sanitized trailer frames pass through
-/// unchanged on a clean stream. The configured response-size cap is applied to
-/// released inspector output as well as to bytes consumed by the source body,
-/// so expansion and terminal events cannot bypass the operator limit.
+/// its protocol-specific timeout and trailer filtering (plus source-side size
+/// limiting where that transport builder requires it); this task owns it and
+/// the least-connections guard until backend EOF, policy termination, error, or
+/// downstream cancellation. Deferred admission and dispatch outcomes remain on
+/// the client-visible outer body. DATA frames are held until the inspector
+/// releases them, while sanitized trailer frames pass through unchanged on a
+/// clean stream. This driver independently caps released inspector output, so
+/// expansion and terminal events cannot bypass the operator limit.
 pub(crate) async fn run_proxy_body_response_inspection(
     mut body: ProxyBody,
     mut inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
     tx: tokio::sync::mpsc::Sender<Result<Frame<Bytes>, BoxError>>,
     max_response_body_size_bytes: usize,
+    _lb_connection_guard: super::LoadBalancerConnectionGuard,
 ) {
     use crate::plugins::ResponseStreamAction;
     use http_body_util::BodyExt;
