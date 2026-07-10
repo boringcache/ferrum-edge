@@ -653,23 +653,39 @@ async fn mesh_authz_ambient_udp_suppresses_conflicting_duplicate_pod_scopes() {
 }
 
 #[tokio::test]
-async fn mesh_authz_ambient_udp_absent_pod_evidence_falls_back_to_mesh_wide() {
+async fn mesh_authz_ambient_udp_missing_or_invalid_pod_evidence_uses_gateway_principal() {
+    let mut slice = ambient_udp_source_scoping_slice();
+    let mut stale_principal_deny = allow_client_policy(PolicyAction::Deny);
+    stale_principal_deny.name = "stale-principal-deny".to_string();
+    stale_principal_deny.scope = PolicyScope::MeshWide;
+    slice.mesh_policies.push(stale_principal_deny);
     let plugin = MeshAuthz::new(&json!({
-        "mesh_slice": ambient_udp_source_scoping_slice(),
+        "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
     }))
     .expect("plugin config");
-    let mut ctx = ambient_udp_request_context(
-        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
-        Some("source.principal=spiffe://cluster.local/ns/default/sa/client"),
-    );
+    for baggage in [
+        "source.principal=spiffe://cluster.local/ns/default/sa/client",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client,source.pod_uid=not-a-uid",
+    ] {
+        let mut ctx = ambient_udp_request_context(
+            "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+            Some(baggage),
+        );
 
-    let result = plugin.authorize(&mut ctx).await;
+        let result = plugin.authorize(&mut ctx).await;
 
-    assert!(
-        matches!(result, PluginResult::Continue),
-        "missing pod evidence must preserve mesh-wide-only evaluation, got {result:?}"
-    );
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "unbound pod evidence must use the gateway peer for mesh-wide evaluation, got {result:?}"
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mesh_authz.ignored_udp_source_scope")
+                .map(String::as_str),
+            Some("missing_or_invalid_pod_uid")
+        );
+    }
 }
 
 #[tokio::test]

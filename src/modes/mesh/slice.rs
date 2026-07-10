@@ -780,7 +780,7 @@ impl MeshSlice {
         // `validate_scope_filter_identity` — and its cold-path `retain` does the
         // precise per-proxy narrowing.)
         let ambient_udp_source_workloads: Vec<Workload> = if request.ambient_udp_source_scoping {
-            workloads
+            mesh.workloads
                 .iter()
                 .filter(|workload| workload.pod_uid.is_some())
                 .cloned()
@@ -3011,7 +3011,7 @@ mod tests {
         destination.pod_uid = Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".into());
         let destination_id = destination.spiffe_id.clone();
         let mut source = make_workload(
-            "default",
+            "clients",
             "client",
             HashMap::from([("app".into(), "client".into())]),
         );
@@ -3024,10 +3024,10 @@ mod tests {
                 vec![destination_id],
             )],
             mesh_policies: vec![make_policy(
-                "default-source-policy",
-                "default",
+                "clients-source-policy",
+                "clients",
                 PolicyScope::Namespace {
-                    namespace: "default".into(),
+                    namespace: "clients".into(),
                 },
             )],
             waypoint_bindings: vec![MeshWaypointBinding {
@@ -3064,7 +3064,7 @@ mod tests {
             "source scope inventory must survive destination-workload narrowing"
         );
         assert_eq!(slice.mesh_policies.len(), 1);
-        assert_eq!(slice.mesh_policies[0].name, "default-source-policy");
+        assert_eq!(slice.mesh_policies[0].name, "clients-source-policy");
     }
 
     fn make_policy(name: &str, namespace: &str, scope: PolicyScope) -> MeshPolicy {

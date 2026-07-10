@@ -558,7 +558,10 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                     }
                     NetnsUdpGuardResult::Unverified(handle) => {
                         match self.guarded.entry(netns) {
-                            std::collections::hash_map::Entry::Occupied(_) => handle.disarm(),
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                entry.get_mut().pod_uids = pod_uids.clone();
+                                handle.disarm();
+                            }
                             std::collections::hash_map::Entry::Vacant(entry) => {
                                 entry.insert(GuardedUdpCapture {
                                     handle,
@@ -2037,6 +2040,48 @@ mod tests {
             mgr.active
                 .get(&100)
                 .is_some_and(|active| active.source_identity.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn unverified_guard_retry_refreshes_shared_netns_membership() {
+        let uid_a = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        let uid_b = "16b2c3d4-9dad-11d1-80b4-00c04fd430c8";
+        let attributed = |uid: &str, principal: &str| {
+            let mut capture_target = target(uid, "/cg/a");
+            capture_target.source_identity = crate::modes::mesh::hbone::UdpSourceIdentity::new(
+                crate::identity::SpiffeId::new(principal).unwrap(),
+                uid,
+            );
+            capture_target
+        };
+        let source = Arc::new(StaticSource(Mutex::new(vec![attributed(
+            uid_a,
+            "spiffe://cluster.local/ns/default/sa/old-client",
+        )])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let mut mgr = manager(source.clone(), backend);
+
+        mgr.reconcile_once().await;
+        mgr.backend.set_unverified_guard_prepare(100, true);
+        *source.0.lock().unwrap() = vec![attributed(
+            uid_a,
+            "spiffe://cluster.local/ns/default/sa/new-client",
+        )];
+        mgr.reconcile_once().await;
+
+        *source.0.lock().unwrap() = vec![
+            attributed(uid_a, "spiffe://cluster.local/ns/default/sa/new-client"),
+            attributed(uid_b, "spiffe://cluster.local/ns/default/sa/sidecar"),
+        ];
+        mgr.reconcile_once().await;
+
+        assert_eq!(
+            mgr.guarded
+                .get(&100)
+                .map(|guarded| guarded.pod_uids.clone()),
+            Some(HashSet::from([uid_a.to_string(), uid_b.to_string()])),
+            "the retained cleanup handle must track the current shared-netns membership"
         );
     }
 

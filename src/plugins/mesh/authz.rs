@@ -2128,7 +2128,7 @@ impl MeshAuthz {
                 .chain(ctx.headers.get(BAGGAGE_HEADER).map(String::as_str)),
         );
         let Some(pod_uid) = identity.source_pod_uid else {
-            return Ok(None);
+            return Err("missing_or_invalid_pod_uid");
         };
         let Some(scope) = self.ambient_udp_source_scopes.get(&pod_uid) else {
             return Err("pod_not_in_slice");

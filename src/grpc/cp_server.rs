@@ -757,6 +757,24 @@ impl CpGrpcServer {
         let mut visible_namespaces =
             Self::mesh_visible_namespaces(mesh, request, allow_cross_namespace_mesh_visibility);
         Self::constrain_visible_namespaces_to_scope(&mut visible_namespaces, scope);
+        // A ServiceWaypoint terminates traffic for destination-visible services,
+        // but trusted Ambient UDP evidence can name a source pod from any
+        // namespace this CP is allowed to serve. Preserve only pod-addressable
+        // source workloads and their policy namespaces beyond the destination
+        // view; the slice builder performs the exact UID/SPIFFE/selector bind.
+        let ambient_udp_source_namespaces: BTreeSet<String> = if request.ambient_udp_source_scoping
+        {
+            mesh.workloads
+                .iter()
+                .filter(|workload| {
+                    workload.pod_uid.is_some()
+                        && Self::namespace_allowed_by_scope(&workload.namespace, scope)
+                })
+                .map(|workload| workload.namespace.clone())
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
         let istio_root_namespace = mesh.istio_root_namespace.clone();
 
         // Raw authoritative configs never carry this runtime-only field. When
@@ -772,8 +790,11 @@ impl CpGrpcServer {
                 scope,
             );
         }
-        mesh.workloads
-            .retain(|workload| visible_namespaces.contains(&workload.namespace));
+        mesh.workloads.retain(|workload| {
+            visible_namespaces.contains(&workload.namespace)
+                || (workload.pod_uid.is_some()
+                    && ambient_udp_source_namespaces.contains(&workload.namespace))
+        });
         let workload_ids: HashSet<_> = mesh
             .workloads
             .iter()
@@ -794,14 +815,16 @@ impl CpGrpcServer {
                 namespace,
                 &istio_root_namespace,
             ) || (request.ambient_udp_source_scoping
-                && visible_namespaces.iter().any(|candidate_namespace| {
-                    Self::policy_scope_can_apply_to_namespace(
-                        &policy.namespace,
-                        &policy.scope,
-                        candidate_namespace,
-                        &istio_root_namespace,
-                    )
-                }))
+                && ambient_udp_source_namespaces
+                    .iter()
+                    .any(|candidate_namespace| {
+                        Self::policy_scope_can_apply_to_namespace(
+                            &policy.namespace,
+                            &policy.scope,
+                            candidate_namespace,
+                            &istio_root_namespace,
+                        )
+                    }))
         });
         mesh.peer_authentications.retain(|policy| {
             Self::peer_auth_can_apply_to_namespace(policy, namespace, &istio_root_namespace)
@@ -2378,8 +2401,10 @@ mod tests {
 
     #[test]
     fn mesh_request_filter_preserves_waypoint_bound_cross_namespace_services() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
         use crate::modes::mesh::config::{
             AppProtocol, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
+            Workload,
         };
 
         let service = MeshService {
@@ -2395,14 +2420,36 @@ mod tests {
             protocol_overrides: Default::default(),
             cluster_ips: Vec::new(),
         };
+        let source_workload = Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/clients/sa/client")
+                .expect("source SPIFFE ID"),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "client".to_string())]),
+                namespace: Some("clients".to_string()),
+            },
+            service_name: "client".to_string(),
+            addresses: vec!["10.2.0.11".to_string()],
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("cluster.local").expect("source trust domain"),
+            namespace: "clients".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("client".to_string()),
+            pod_uid: Some("16b2c3d4-9dad-11d1-80b4-00c04fd430c8".to_string()),
+            node_waypoint: None,
+            remote_provenance: false,
+        };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
+                workloads: vec![source_workload],
                 services: vec![service],
                 mesh_policies: vec![crate::modes::mesh::config::MeshPolicy {
-                    name: "default-source-policy".to_string(),
-                    namespace: "default".to_string(),
+                    name: "clients-source-policy".to_string(),
+                    namespace: "clients".to_string(),
                     scope: PolicyScope::Namespace {
-                        namespace: "default".to_string(),
+                        namespace: "clients".to_string(),
                     },
                     rules: Vec::new(),
                 }],
@@ -2449,8 +2496,10 @@ mod tests {
         assert_eq!(mesh.waypoint_bindings.len(), 1);
         assert_eq!(mesh.waypoint_bindings[0].services.len(), 1);
         assert_eq!(mesh.waypoint_bindings[0].services[0].namespace, "default");
+        assert_eq!(mesh.workloads.len(), 1);
+        assert_eq!(mesh.workloads[0].namespace, "clients");
         assert_eq!(mesh.mesh_policies.len(), 1);
-        assert_eq!(mesh.mesh_policies[0].name, "default-source-policy");
+        assert_eq!(mesh.mesh_policies[0].name, "clients-source-policy");
         assert!(
             mesh_config_without_udp_scoping
                 .mesh

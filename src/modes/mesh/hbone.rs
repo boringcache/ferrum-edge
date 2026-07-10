@@ -50,7 +50,8 @@ pub struct HboneIdentity {
     /// per-pod-netns UDP capture. The destination may use this only after the
     /// normal trusted-assertor and trust-domain checks accept the principal.
     /// Keeping the parsed value as UUID bytes makes malformed evidence
-    /// indistinguishable from absent evidence (mesh-wide fallback).
+    /// indistinguishable from absent evidence; authorization callers decide
+    /// whether that absence is a fail-closed evidence rejection.
     pub source_pod_uid: Option<[u8; 16]>,
     pub destination_principal: Option<SpiffeId>,
     pub baggage: BTreeMap<String, String>,
