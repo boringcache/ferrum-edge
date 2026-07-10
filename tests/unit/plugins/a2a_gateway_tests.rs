@@ -1362,6 +1362,8 @@ async fn streaming_jsonrpc_inspector_forwards_incomplete_event_without_holding()
         panic!("observe-only A2A inspector must never terminate a stream");
     };
     assert_eq!(forwarded.as_ref(), partial);
+    let end = inspector.on_end().await;
+    assert!(matches!(end, ResponseStreamAction::Forward(ref bytes) if bytes.is_empty()));
 
     assert!(
         plugin
