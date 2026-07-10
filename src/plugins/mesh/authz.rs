@@ -971,15 +971,23 @@ fn ambient_udp_source_scope_index(
         let Ok(uid) = crate::modes::mesh::node_waypoint::parse_pod_uid(raw_uid) else {
             continue;
         };
-        if ambiguous.contains(&uid) || scopes.contains_key(&uid) {
-            scopes.remove(&uid);
-            ambiguous.insert(uid);
+        if ambiguous.contains(&uid) {
             continue;
         }
-        scopes.insert(
-            uid,
-            crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload),
-        );
+        let candidate = crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload);
+        match scopes.entry(uid) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) if entry.get() == &candidate => {
+                // Kubernetes may project one pod through multiple Services.
+                // Identical attestations are one scope, not an ambiguity.
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                entry.remove();
+                ambiguous.insert(uid);
+            }
+        }
     }
     scopes
 }

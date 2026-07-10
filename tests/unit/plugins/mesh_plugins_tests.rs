@@ -578,6 +578,76 @@ async fn mesh_authz_ambient_udp_applies_scope_for_validated_source_pod() {
 }
 
 #[tokio::test]
+async fn mesh_authz_ambient_udp_retains_identical_duplicate_pod_scopes() {
+    let mut slice = ambient_udp_source_scoping_slice();
+    let mut second_service = slice.workloads[0].clone();
+    second_service.service_name = "api-alias".to_string();
+    slice.workloads.push(second_service);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(
+            "source.principal=spiffe://cluster.local/ns/default/sa/client,source.pod_uid=6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        ),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "one pod projected through multiple Services must retain its scoped policy, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("api-deny")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_ambient_udp_suppresses_conflicting_duplicate_pod_scopes() {
+    let mut slice = ambient_udp_source_scoping_slice();
+    let mut conflicting = slice.workloads[0].clone();
+    conflicting.selector.labels = HashMap::from([("app".to_string(), "other".to_string())]);
+    slice.workloads.push(conflicting);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(
+            "source.principal=spiffe://cluster.local/ns/default/sa/client,source.pod_uid=6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        ),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "conflicting pod evidence must fall back to mesh-wide-only evaluation, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_udp_source_scope")
+            .map(String::as_str),
+        Some("pod_not_in_slice")
+    );
+}
+
+#[tokio::test]
 async fn mesh_authz_ambient_udp_absent_pod_evidence_falls_back_to_mesh_wide() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": ambient_udp_source_scoping_slice(),
