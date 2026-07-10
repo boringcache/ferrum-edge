@@ -36,7 +36,7 @@ Every H3 request goes through the same plugin lifecycle as H1/H2 (route match �
 
 | Dispatch input | Request flavor | Backend path |
 |---|---|---|
-| `HttpsPool` + target classified as `h3` | `Plain` | **Native H3 pool** (quinn/h3 → QUIC upstream), except retry requests whose response plugin may require header-time streaming release |
+| `HttpsPool` + target classified as `h3` | `Plain` | **Native H3 pool** (quinn/h3 → QUIC upstream) |
 | `HttpsPool` + target not classified as `h3` | `Plain` | Cross-protocol bridge → reqwest / direct H2 as needed |
 | `HttpsPool` + target classified as `h3` | `Grpc` | **Native H3 pool** (`dispatch_grpc_native_h3` → QUIC upstream) when the body can stream (no retry / body-plugin buffering, no reqwest-forcing plugin) — the only path that reaches an **H3-only** gRPC backend |
 | `HttpsPool` + target not classified as `h3` (or buffering forced) | `Grpc` | Cross-protocol bridge → `GrpcConnectionPool` (HTTP/2 + trailers) |
@@ -65,7 +65,7 @@ The streaming request-body pool path retries a stale cached H3 connection only w
 
 Use this path when the backend is known to speak QUIC. When startup or background refresh has not classified the target as H3-capable, the gateway routes via the cross-protocol bridge instead — this prevents the common failure mode of pointing H3 frontend traffic at an HTTP/2-only backend and seeing opaque QUIC connect errors on live requests.
 
-Retry-enabled requests normally keep native-H3 responses buffered so status-based retries and body plugins run before downstream commitment. A response plugin may explicitly declare that an inherently streaming response can be released after headers under retries (for example, `mcp_gateway` for `text/event-stream`). Those requests use the cross-protocol header-first bridge so the shared retry-marked content-type decision can release the stream without waiting for EOF; ordinary retry traffic remains on native H3.
+Retry-enabled requests normally keep native-H3 responses buffered so status-based retries and body plugins run before downstream commitment. A response plugin may explicitly declare that an inherently streaming response can be released after headers under retries (for example, `mcp_gateway` for `text/event-stream`). The native H3 header-first path applies the shared retry-marked content-type decision before draining the body, while retryable statuses remain buffered for the retry loop.
 
 ### Stale capability recovery
 

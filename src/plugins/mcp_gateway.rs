@@ -48,6 +48,26 @@ const MCP_TEMPLATE_RESOURCE_URI_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'_')
     .remove(b'~');
+const MCP_RESERVED_TEMPLATE_RESOURCE_URI_ENCODE_SET: &AsciiSet =
+    &MCP_TEMPLATE_RESOURCE_URI_ENCODE_SET
+        .remove(b':')
+        .remove(b'/')
+        .remove(b'?')
+        .remove(b'#')
+        .remove(b'[')
+        .remove(b']')
+        .remove(b'@')
+        .remove(b'!')
+        .remove(b'$')
+        .remove(b'&')
+        .remove(b'\'')
+        .remove(b'(')
+        .remove(b')')
+        .remove(b'*')
+        .remove(b'+')
+        .remove(b',')
+        .remove(b';')
+        .remove(b'=');
 const MCP_REWRITTEN_RESPONSE_VALIDATORS: &[&str] = &[
     "etag",
     "last-modified",
@@ -833,10 +853,15 @@ impl McpGateway {
                 .is_some_and(|server| server.enabled && server.expose_resources)
     }
 
-    fn response_exceeds_rewrite_limit(&self, response_headers: &HashMap<String, String>) -> bool {
+    fn response_length_allows_rewrite(&self, response_headers: &HashMap<String, String>) -> bool {
         header_value(response_headers, "content-length")
             .and_then(|value| value.trim().parse::<usize>().ok())
-            .is_some_and(|length| length > self.validation.max_upstream_response_bytes)
+            .is_some_and(|length| length <= self.validation.max_upstream_response_bytes)
+    }
+
+    fn response_encoding_allows_rewrite(response_headers: &HashMap<String, String>) -> bool {
+        header_value(response_headers, "content-encoding")
+            .is_none_or(|encoding| encoding.eq_ignore_ascii_case("identity"))
     }
 
     fn primary_server(&self) -> Option<&McpServerConfig> {
@@ -2741,9 +2766,10 @@ impl Plugin for McpGateway {
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
-            && (header_value(response_headers, "content-type")
-                .is_some_and(super::utils::body_transform::is_event_stream_content_type)
-                || self.response_exceeds_rewrite_limit(response_headers))
+            && !(header_value(response_headers, "content-type")
+                .is_none_or(mcp_content_type_is_json)
+                && Self::response_encoding_allows_rewrite(response_headers)
+                && self.response_length_allows_rewrite(response_headers))
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -2753,18 +2779,10 @@ impl Plugin for McpGateway {
         _response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
-        if content_type.is_some_and(super::utils::body_transform::is_event_stream_content_type) {
-            return false;
-        }
-        if header_value(response_headers, "content-encoding")
-            .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
-        {
-            return false;
-        }
-        if self.response_exceeds_rewrite_limit(response_headers) {
-            return false;
-        }
-        self.should_buffer_response_body(ctx) && content_type.is_none_or(mcp_content_type_is_json)
+        self.should_buffer_response_body(ctx)
+            && content_type.is_none_or(mcp_content_type_is_json)
+            && Self::response_encoding_allows_rewrite(response_headers)
+            && self.response_length_allows_rewrite(response_headers)
     }
 
     fn needs_final_request_body_context(&self) -> bool {
@@ -3211,9 +3229,14 @@ impl Plugin for McpGateway {
         let catalog_lock = self
             .session_catalogs_by_hash
             .get(session_hash)
-            .map(|catalog| Arc::clone(catalog.value()))?;
-        let catalog = catalog_lock.read().await;
-        let catalog_version_matches = catalog.version == expected_catalog_version;
+            .map(|catalog| Arc::clone(catalog.value()));
+        let catalog = match &catalog_lock {
+            Some(catalog) => Some(catalog.read().await),
+            None => None,
+        };
+        let catalog_version_matches = catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.version == expected_catalog_version);
         if !catalog_version_matches
             && (method != "resources/read" || ctx.mcp_response_resource_binding.is_none())
         {
@@ -3225,15 +3248,15 @@ impl Plugin for McpGateway {
         let outcome = match method.as_str() {
             "resources/read" => rewrite_resource_read_result(
                 result,
-                &catalog,
+                catalog.as_deref(),
                 server_id,
                 ctx.mcp_response_resource_binding
                     .as_ref()
                     .map(|(upstream, public)| (upstream.as_str(), public.as_str())),
                 catalog_version_matches,
             ),
-            "tools/call" => rewrite_tool_call_result(result, &catalog, server_id),
-            "prompts/get" => rewrite_prompt_get_result(result, &catalog, server_id),
+            "tools/call" => rewrite_tool_call_result(result, catalog.as_deref()?, server_id),
+            "prompts/get" => rewrite_prompt_get_result(result, catalog.as_deref()?, server_id),
             _ => ResponseRewriteOutcome::Unchanged,
         };
         if outcome != ResponseRewriteOutcome::Changed {
@@ -3299,7 +3322,7 @@ impl ResponseRewriteOutcome {
 
 fn rewrite_resource_read_result(
     result: &mut Value,
-    catalog: &McpCatalog,
+    catalog: Option<&McpCatalog>,
     server_id: &str,
     routed_binding: Option<(&str, &str)>,
     allow_catalog_fallback: bool,
@@ -3316,9 +3339,9 @@ fn rewrite_resource_read_result(
                 {
                     rewrite_uri_field_to(content, "uri", public_uri)
                 }
-                _ if allow_catalog_fallback => {
-                    rewrite_uri_field(content, "uri", catalog, server_id)
-                }
+                _ if allow_catalog_fallback => catalog
+                    .map(|catalog| rewrite_uri_field(content, "uri", catalog, server_id))
+                    .unwrap_or(ResponseRewriteOutcome::Unchanged),
                 _ => ResponseRewriteOutcome::Unchanged,
             };
             outcome.merge(rewritten)
@@ -3514,17 +3537,13 @@ fn expand_public_resource_template(
             .is_some_and(|operator| b"+#./;?&".contains(operator))
         {
             // The public URI suffix is percent-decoded once by
-            // `public_resource_uri_parts`. Escape an upstream percent byte so
-            // existing percent escapes survive that decode unchanged while
-            // reserved characters allowed by the URI-template operator remain
-            // literal.
-            let mut remainder = expansion;
-            while let Some(percent) = remainder.find('%') {
-                public_uri.push_str(&remainder[..percent]);
-                public_uri.push_str("%25");
-                remainder = &remainder[percent + 1..];
-            }
-            public_uri.push_str(remainder);
+            // `public_resource_uri_parts`. Keep RFC 3986 reserved/unreserved
+            // bytes literal, encode invalid URI bytes, and encode `%` as `%25`
+            // so existing upstream escapes survive that single decode.
+            public_uri.push_str(
+                &utf8_percent_encode(expansion, MCP_RESERVED_TEMPLATE_RESOURCE_URI_ENCODE_SET)
+                    .to_string(),
+            );
         } else {
             public_uri.push_str(
                 &utf8_percent_encode(expansion, MCP_TEMPLATE_RESOURCE_URI_ENCODE_SET).to_string(),

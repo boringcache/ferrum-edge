@@ -1271,13 +1271,25 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
         "method": "resources/templates/list",
         "params": {}
     }));
-    refresh_headers.insert("mcp-session-id".to_string(), session_id);
+    refresh_headers.insert("mcp-session-id".to_string(), session_id.clone());
     let (refresh_status, _, _) = reject_json(
         plugin
             .before_proxy(&mut refresh_ctx, &mut refresh_headers)
             .await,
     );
     assert_eq!(refresh_status, 200);
+
+    // Removing the session also removes its shared catalog, but must not
+    // invalidate the exact binding already carried by this in-flight request.
+    let (mut delete_ctx, mut delete_headers) = mcp_ctx(json!({}));
+    delete_ctx.method = "DELETE".to_string();
+    delete_headers.insert("mcp-session-id".to_string(), session_id);
+    let (delete_status, _, _) = reject_json(
+        plugin
+            .before_proxy(&mut delete_ctx, &mut delete_headers)
+            .await,
+    );
+    assert_eq!(delete_status, 200);
 
     assert!(plugin.requires_response_body_buffering());
     assert!(plugin.should_buffer_response_body(&ctx));
@@ -1293,7 +1305,19 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
     assert!(!plugin.should_release_response_body_under_retries(
         &ctx,
         200,
-        &HashMap::from([("content-type".to_string(), "application/json".to_string(),)]),
+        &HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("content-length".to_string(), "128".to_string()),
+        ]),
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("content-length".to_string(), "128".to_string()),
+        ]),
     ));
     assert!(!plugin.should_buffer_response_body_for_content_type(
         &ctx,
@@ -1320,6 +1344,15 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
         Some("application/json"),
         200,
         &oversized_headers,
+    ));
+    let unknown_length_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &unknown_length_headers,));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &unknown_length_headers,
     ));
     let upstream_response = json!({
         "jsonrpc": "2.0",
@@ -1746,11 +1779,18 @@ async fn aggregate_template_reverse_mapping_preserves_upstream_percent_escapes()
         "jsonrpc": "2.0",
         "id": 20,
         "result": {
-            "content": [{
-                "type": "resource_link",
-                "uri": "file:///a%2Fb",
-                "name": "Encoded path"
-            }]
+            "content": [
+                {
+                    "type": "resource_link",
+                    "uri": "file:///a%2Fb",
+                    "name": "Encoded path"
+                },
+                {
+                    "type": "resource_link",
+                    "uri": "file:///reports/Q1 draft.md",
+                    "name": "Report draft"
+                }
+            ]
         }
     }))
     .unwrap();
@@ -1769,6 +1809,14 @@ async fn aggregate_template_reverse_mapping_preserves_upstream_percent_escapes()
         .unwrap()
         .to_string();
     assert_eq!(public_uri, "mcp://github/file%3A%2F%2F%2Fa%252Fb");
+    let spaced_public_uri = rewritten["result"]["content"][1]["uri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        spaced_public_uri,
+        "mcp://github/file%3A%2F%2F%2Freports%2FQ1%20draft.md"
+    );
 
     let read_body = json!({
         "jsonrpc": "2.0",
@@ -1777,7 +1825,7 @@ async fn aggregate_template_reverse_mapping_preserves_upstream_percent_escapes()
         "params": { "uri": public_uri }
     });
     let (mut read_ctx, mut read_headers) = mcp_ctx(read_body.clone());
-    read_headers.insert("mcp-session-id".to_string(), session_id);
+    read_headers.insert("mcp-session-id".to_string(), session_id.clone());
     assert!(matches!(
         plugin.before_proxy(&mut read_ctx, &mut read_headers).await,
         PluginResult::Continue
@@ -1793,6 +1841,35 @@ async fn aggregate_template_reverse_mapping_preserves_upstream_percent_escapes()
         .expect("percent-preserving public URI should route back upstream");
     let rewritten_read: Value = serde_json::from_slice(&rewritten_read).unwrap();
     assert_eq!(rewritten_read["params"]["uri"], "file:///a%2Fb");
+
+    let spaced_read_body = json!({
+        "jsonrpc": "2.0",
+        "id": 22,
+        "method": "resources/read",
+        "params": { "uri": spaced_public_uri }
+    });
+    let (mut spaced_read_ctx, mut spaced_read_headers) = mcp_ctx(spaced_read_body.clone());
+    spaced_read_headers.insert("mcp-session-id".to_string(), session_id);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut spaced_read_ctx, &mut spaced_read_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    let rewritten_spaced_read = plugin
+        .transform_request_body_with_context(
+            &mut spaced_read_ctx,
+            serde_json::to_vec(&spaced_read_body).unwrap().as_slice(),
+            Some("application/json"),
+            &spaced_read_headers,
+        )
+        .await
+        .expect("space-encoding public URI should route back upstream");
+    let rewritten_spaced_read: Value = serde_json::from_slice(&rewritten_spaced_read).unwrap();
+    assert_eq!(
+        rewritten_spaced_read["params"]["uri"],
+        "file:///reports/Q1 draft.md"
+    );
 }
 
 #[tokio::test]
