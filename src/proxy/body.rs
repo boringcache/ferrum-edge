@@ -2672,6 +2672,84 @@ pub(crate) async fn run_response_inspection(
     }
 }
 
+/// Drive a response-stream inspector over an already constructed proxy body.
+///
+/// This is the transport-independent counterpart of [`run_response_inspection`]
+/// for direct HTTP/2 and native HTTP/3 backend responses. The source body keeps
+/// its protocol-specific timeout, size-limit, trailer filtering, admission,
+/// dispatch, and connection guards; this task owns it until backend EOF, policy
+/// termination, error, or downstream cancellation. DATA frames are held until
+/// the inspector releases them, while sanitized trailer frames pass through
+/// unchanged on a clean stream.
+pub(crate) async fn run_proxy_body_response_inspection(
+    mut body: ProxyBody,
+    mut inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
+    tx: tokio::sync::mpsc::Sender<Result<Frame<Bytes>, BoxError>>,
+) {
+    use crate::plugins::ResponseStreamAction;
+    use http_body_util::BodyExt;
+
+    let mut trailing_frame: Option<Frame<Bytes>> = None;
+    loop {
+        let frame = tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            next = body.frame() => next,
+        };
+        let Some(frame) = frame else { break };
+        match frame {
+            Ok(frame) => match frame.into_data() {
+                Ok(bytes) => match inspector.on_chunk(&bytes).await {
+                    ResponseStreamAction::Forward(out) => {
+                        if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
+                            return;
+                        }
+                    }
+                    ResponseStreamAction::Terminate(final_bytes) => {
+                        if let Some(bytes) = final_bytes
+                            && !bytes.is_empty()
+                        {
+                            let _ = tx.send(Ok(Frame::data(bytes))).await;
+                        }
+                        return;
+                    }
+                },
+                Err(frame) => {
+                    // A trailing frame must stay behind bytes the inspector is
+                    // still holding for `on_end()`. Sending trailers now and a
+                    // final released DATA frame afterward would violate HTTP
+                    // frame ordering. Policy termination deliberately drops it.
+                    trailing_frame = Some(frame);
+                }
+            },
+            Err(error) => {
+                let _ = tx.send(Err(error)).await;
+                return;
+            }
+        }
+    }
+
+    match inspector.on_end().await {
+        ResponseStreamAction::Forward(out) => {
+            if !out.is_empty() {
+                if tx.send(Ok(Frame::data(out))).await.is_err() {
+                    return;
+                }
+            }
+            if let Some(frame) = trailing_frame {
+                let _ = tx.send(Ok(frame)).await;
+            }
+        }
+        ResponseStreamAction::Terminate(final_bytes) => {
+            if let Some(bytes) = final_bytes
+                && !bytes.is_empty()
+            {
+                let _ = tx.send(Ok(Frame::data(bytes))).await;
+            }
+        }
+    }
+}
+
 /// HTTP/2 streaming body wrapped in a [`StripHopByHopTrailers`] filter so
 /// hop-by-hop names (RFC 9110 §7.6.1, response-direction set) cannot leak
 /// downstream via TRAILERS frames. Used for the gRPC streaming response path

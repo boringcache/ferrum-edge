@@ -1788,9 +1788,9 @@ impl Plugin for AiSemanticFirewall {
     fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
         // Only when THIS request was marked for windowed inspection — so an
         // inspect-mode proxy does not push its ordinary (non-streamed, never
-        // inspected) requests off the native-H3 backend path. The windowed
-        // inspector is wired only on the reqwest streaming response path, so a
-        // marked request must dispatch via reqwest to be inspectable.
+        // inspected) requests off the native-H3 backend path. Every streaming
+        // response arm is inspectable; this pin keeps the established reqwest
+        // path as the preferred transport for already-marked requests.
         self.enabled && self.streaming_config.is_some() && windowed_streaming_marker_set(ctx)
     }
 

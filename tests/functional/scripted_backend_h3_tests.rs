@@ -1407,6 +1407,144 @@ async fn h1_frontend_to_native_h3_backend_uses_frontend_forwarding_metadata() {
     );
 }
 
+// A request transformer can introduce `stream: true` only in the final request
+// body. Dispatch preference and response buffering must be re-evaluated from
+// that finalized context before an H3-capable backend transport is committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn transformer_added_stream_marker_reclassifies_h3_capable_dispatch() {
+    const DENIED_SSE: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"rm_rf\",\"arguments\":\"{\\\"path\\\":\\\"/etc\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    let ca = TestCa::new("h3-post-transform-dispatch").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        DENIED_SSE.len(),
+        DENIED_SSE
+    );
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(response.into_bytes()))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls backend");
+
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-type", "text/event-stream".to_string()),
+            ("content-length", DENIED_SSE.len().to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from_static(
+            DENIED_SSE.as_bytes(),
+        )))
+        .spawn()
+        .expect("spawn h3 backend");
+
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "post-transform-h3",
+            "listen_path": "/ai",
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "backend_tls_verify_server_cert": false,
+            "plugins": [
+                {"plugin_config_id": "transformer"},
+                {"plugin_config_id": "governor"}
+            ]
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "transformer",
+                "proxy_id": "post-transform-h3",
+                "plugin_name": "request_transformer",
+                "scope": "proxy",
+                "enabled": true,
+                "config": {"rules": [{
+                    "operation": "add",
+                    "target": "body",
+                    "key": "stream",
+                    "value": true
+                }]}
+            },
+            {
+                "id": "governor",
+                "proxy_id": "post-transform-h3",
+                "plugin_name": "ai_tool_governor",
+                "scope": "proxy",
+                "enabled": true,
+                "config": {
+                    "mode": "enforce",
+                    "tools": {"rm_rf": {"action": "deny"}},
+                    "default_action": "allow",
+                    "inspect": {
+                        "response_tool_calls": false,
+                        "streaming_response_tool_calls": true
+                    }
+                }
+            }
+        ]
+    });
+    let harness = GatewayHarness::builder()
+        .file_config(serde_yaml::to_string(&config).expect("yaml"))
+        .pool_warmup_enabled(true)
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("capability entry")
+        .expect("registry populated");
+    assert_eq!(entry["plain_http"]["h3"].as_str(), Some("supported"));
+
+    let response = reqwest::Client::builder()
+        .http1_only()
+        .build()
+        .expect("client")
+        .post(harness.proxy_url("/ai/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"test","messages":[]}"#)
+        .send()
+        .await
+        .expect("request through gateway");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(response.headers().get("content-length").is_none());
+    let body = response.text().await.expect("response body");
+    assert!(
+        body.contains("ai_tool_governor_tool_blocked"),
+        "transformed streaming request must be governed: {body}"
+    );
+    assert!(!body.contains("/etc"), "held frames leaked: {body}");
+
+    let received = h3_backend.received_requests().await;
+    assert!(
+        !received.iter().any(|request| request.method == "POST"),
+        "post-transform reqwest preference was frozen before final-body hooks: {received:#?}"
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Test 12 — STREAMING H3 response path recovers a graceful QUIC close that
 // arrives AFTER a complete Content-Length body.

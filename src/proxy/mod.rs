@@ -14369,6 +14369,123 @@ async fn handle_proxy_request_inner(
         &ctx.headers,
         &state.mesh_egress_strip_baggage_keys,
     );
+    let stream_hooks_enabled = plugin_cache_view.requires_response_stream_hooks();
+    let maybe_requires_response_body_buffering =
+        plugin_cache_view.requires_response_body_buffering();
+
+    // Request-body transforms can change the per-request response policy (most
+    // notably `stream: true`). When either response buffering or streaming
+    // inspection is configured, finalize the already-required buffered request
+    // body before selecting a backend transport. The two PluginCache flags keep
+    // the ordinary no-body-policy path unchanged: no extra scan, clone, collect,
+    // or hook pass.
+    let reevaluate_response_policy_after_request_body = !is_grpc_request
+        && requires_request_body_buffering
+        && (maybe_requires_response_body_buffering || stream_hooks_enabled);
+    let mut request_body_prepared = false;
+    if reevaluate_response_policy_after_request_body {
+        // Body transforms/final hooks need a stable outbound-header view while
+        // mutating the real context. This clone exists only on the opted-in body
+        // policy path; the common path keeps borrowing `ctx.headers` directly.
+        let hook_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
+        client_request_body = match client_request_body {
+            ClientRequestBody::Streaming(request) => {
+                match buffer_request_body_for_before_proxy(
+                    *request,
+                    &method,
+                    &hook_headers,
+                    state.max_request_body_size_bytes,
+                )
+                .await
+                {
+                    Ok(body) => body,
+                    Err(RequestBodyBufferError::TooLarge) => {
+                        record_request(&state, 413);
+                        return Ok(build_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            r#"{"error":"Request body exceeds maximum size"}"#,
+                        ));
+                    }
+                    Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
+                        error!(
+                            proxy_id = %proxy.id,
+                            path = %ctx.path,
+                            error_kind = "client_disconnect",
+                            error = %error_message,
+                            "Client disconnected while finalizing request body before dispatch"
+                        );
+                        record_request(&state, 499);
+                        return Ok(build_response(
+                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                            r#"{"error":"Client disconnected"}"#,
+                        ));
+                    }
+                }
+            }
+            buffered => buffered,
+        };
+
+        client_request_body = match client_request_body {
+            ClientRequestBody::Buffered(body) => {
+                ctx.bytes_sent_observed
+                    .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                let transformed = apply_request_body_plugins_with_context(
+                    &plugins,
+                    Some(&mut ctx),
+                    &hook_headers,
+                    body,
+                )
+                .await;
+                match run_final_request_body_hooks(
+                    &plugins,
+                    Some(&mut ctx),
+                    &hook_headers,
+                    &transformed,
+                )
+                .await
+                {
+                    PluginResult::Continue => {
+                        request_body_prepared = true;
+                        ClientRequestBody::Buffered(transformed)
+                    }
+                    reject @ PluginResult::Reject { .. }
+                    | reject @ PluginResult::RejectBinary { .. } => {
+                        let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                            record_request(&state, 500);
+                            return Ok(build_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                r#"{"error":"Internal error"}"#,
+                            ));
+                        };
+                        let status = StatusCode::from_u16(reject.status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let normalized = finalize_reject_response_with_after_proxy_hooks(
+                            &plugins,
+                            &mut ctx,
+                            status,
+                            &reject.body,
+                            reject.headers,
+                            is_grpc_request,
+                        )
+                        .await;
+                        apply_grpc_reject_metadata(&mut ctx, &normalized);
+                        log_rejected_request(
+                            &plugins,
+                            &ctx,
+                            normalized.http_status.as_u16(),
+                            start_time,
+                            "on_final_request_body",
+                            plugin_execution_ns,
+                        )
+                        .await;
+                        record_request(&state, normalized.http_status.as_u16());
+                        return Ok(build_response_from_normalized_reject(normalized));
+                    }
+                }
+            }
+            bodyless => bodyless,
+        };
+    }
     // Pre-computed at config reload (see `PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT`)
     // so the proxy hot path does not re-scan the plugin list per request.
     let needs_final_request_body_context = requires_request_body_buffering
@@ -16839,7 +16956,7 @@ async fn handle_proxy_request_inner(
         &proxy,
         &plugins,
         &ctx,
-        plugin_cache_view.requires_response_body_buffering(),
+        maybe_requires_response_body_buffering,
     );
 
     // Determine if we can stream the request body to the backend without
@@ -16848,18 +16965,14 @@ async fn handle_proxy_request_inner(
     // failures.
     let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method);
     let stream_request_body = !has_retry && !requires_request_body_buffering;
-    // A response-stream inspector (e.g. ai_semantic_firewall `inspect`) is wired
-    // only on the reqwest streaming path, so a request that WILL be inspected must
-    // be dispatched via reqwest — otherwise a native-H3 backend would return
-    // `ResponseBody::StreamingH3` and bypass inspection. This is gated per request
-    // (a plugin returns `true` only for the specific requests it inspects, via
-    // `ctx` markers) so an inspect-mode proxy does NOT push its ordinary,
-    // never-inspected requests off the native-H3 fast path. (Direct-H2/HBONE are
-    // already excluded for these requests because `inspect`/`buffer` force
-    // request-body buffering, which disables those pools; native H3 does not gate
-    // on that, so it is excluded explicitly here.)
-    let requires_response_stream_inspection =
-        plugins.iter().any(|p| p.forces_reqwest_dispatch(&ctx));
+    // The reqwest pin is now an optimization rather than the correctness
+    // boundary: every streaming response arm can drive inspectors. Evaluate it
+    // from the finalized context so a body transform that adds/removes
+    // `stream: true` is reflected before the native-H3 decision commits.
+    let requires_response_stream_inspection = stream_hooks_enabled
+        && plugins
+            .iter()
+            .any(|plugin| plugin.forces_reqwest_dispatch(&ctx));
     let request_client_ip = ctx.client_ip.clone();
     let request_xff_append_ip = socket_ip.clone();
     let retry_config = if has_retry {
@@ -17101,6 +17214,7 @@ async fn handle_proxy_request_inner(
             requires_request_body_buffering,
             stream_request_body,
             has_retry,
+            request_body_prepared,
             &request_client_ip,
             &request_xff_append_ip,
             is_tls,
@@ -17433,6 +17547,7 @@ async fn handle_proxy_request_inner(
             requires_request_body_buffering,
             stream_request_body,
             false, // no retry — don't retain body
+            request_body_prepared,
             &request_client_ip,
             &request_xff_append_ip,
             is_tls,
@@ -17957,9 +18072,9 @@ async fn handle_proxy_request_inner(
     // logger. The resolver stamps a private stream id only when an inspector
     // actually attaches; the terminal hook uses that id to drain plugin-owned
     // aggregate state into transaction metadata.
-    let response_inspector = if matches!(response_body, ResponseBody::Streaming { .. }) {
+    let response_inspector = if body_will_stream && stream_hooks_enabled {
         let content_type = response_headers.get("content-type").map(String::as_str);
-        crate::plugins::create_response_stream_inspector(
+        crate::plugins::create_response_stream_inspector_for_enabled_plugins(
             &plugins,
             &mut ctx,
             response_status,
@@ -18374,7 +18489,20 @@ async fn handle_proxy_request_inner(
                     h2_total_deadline,
                 )
             };
-            let mut body = body.with_lb_connection_guard(lb_connection_guard);
+            let mut body = if let Some(inspector) = response_inspector {
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                tokio::spawn(crate::proxy::body::run_proxy_body_response_inspection(
+                    body, inspector, tx,
+                ));
+                crate::proxy::body::inspected_streaming_body(rx)
+            } else {
+                body
+            };
+            // Keep lifecycle/accounting on the client-visible inspected body.
+            // A policy Terminate is a clean EOF (matching reqwest), while a
+            // backend error forwarded by the bridge and a real downstream drop
+            // still reach the existing deferred classifiers.
+            body = body.with_lb_connection_guard(lb_connection_guard);
             if let Some(permits) = backend_admission_permits.take() {
                 body = body.with_deferred_backend_admission_outcome(
                     permits,
@@ -18488,7 +18616,16 @@ async fn handle_proxy_request_inner(
                     proxy.backend_read_timeout_ms,
                 )
             };
-            let mut body = body
+            let mut body = if let Some(inspector) = response_inspector {
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                tokio::spawn(crate::proxy::body::run_proxy_body_response_inspection(
+                    body, inspector, tx,
+                ));
+                crate::proxy::body::inspected_streaming_body(rx)
+            } else {
+                body
+            };
+            body = body
                 .with_success_on_drop_after_response_bytes(success_on_drop_after_bytes)
                 .with_lb_connection_guard(lb_connection_guard);
             if let Some(permits) = backend_admission_permits.take() {
@@ -19764,6 +19901,7 @@ async fn proxy_to_backend(
     requires_request_body_buffering: bool,
     stream_request_body: bool,
     retain_request_body: bool,
+    request_body_prepared: bool,
     client_ip: &str,
     xff_append_ip: &str,
     is_tls: bool,
@@ -20048,6 +20186,7 @@ async fn proxy_to_backend(
             inbound_version,
             stream_request_body,
             retain_request_body,
+            request_body_prepared,
             stream_response,
             ctx_bytes_sent_observed,
         )
@@ -20495,24 +20634,29 @@ async fn proxy_to_backend(
                     body_bytes.len() as u64,
                     std::sync::atomic::Ordering::Release,
                 );
-                let body_bytes = apply_request_body_plugins_with_context(
-                    plugins,
-                    ctx.as_deref_mut(),
-                    headers,
-                    body_bytes,
-                )
-                .await;
-                match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
-                    PluginResult::Continue => {}
-                    reject @ PluginResult::Reject { .. }
-                    | reject @ PluginResult::RejectBinary { .. } => {
-                        return backend_dispatch_response(
-                            reject_result_to_backend_response(reject, resolved_ip.clone()),
-                            None,
-                            None,
-                        );
+                let body_bytes = if request_body_prepared {
+                    body_bytes
+                } else {
+                    let body_bytes = apply_request_body_plugins_with_context(
+                        plugins,
+                        ctx.as_deref_mut(),
+                        headers,
+                        body_bytes,
+                    )
+                    .await;
+                    match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
+                        PluginResult::Continue => {}
+                        reject @ PluginResult::Reject { .. }
+                        | reject @ PluginResult::RejectBinary { .. } => {
+                            return backend_dispatch_response(
+                                reject_result_to_backend_response(reject, resolved_ip.clone()),
+                                None,
+                                None,
+                            );
+                        }
                     }
-                }
+                    body_bytes
+                };
                 if !body_bytes.is_empty() {
                     // `Bytes::from(Vec<u8>)` is zero-cost (transfers ownership of
                     // the Vec without copying). The optional clone below is then
@@ -24180,6 +24324,7 @@ async fn proxy_to_backend_http3(
     inbound_version: hyper::Version,
     stream_request_body: bool,
     retain_request_body: bool,
+    request_body_prepared: bool,
     stream_response: bool,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> (retry::BackendResponse, Option<Bytes>) {
@@ -24550,18 +24695,27 @@ async fn proxy_to_backend_http3(
 
     ctx_bytes_sent_observed.fetch_max(request_body.len() as u64, Ordering::Release);
 
-    let request_body =
-        apply_request_body_plugins_with_context(plugins, ctx.as_deref_mut(), headers, request_body)
-            .await;
-    match run_final_request_body_hooks(plugins, ctx, headers, &request_body).await {
-        PluginResult::Continue => {}
-        reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-            return (
-                reject_result_to_backend_response(reject, resolved_ip.clone()),
-                None,
-            );
+    let request_body = if request_body_prepared {
+        request_body
+    } else {
+        let request_body = apply_request_body_plugins_with_context(
+            plugins,
+            ctx.as_deref_mut(),
+            headers,
+            request_body,
+        )
+        .await;
+        match run_final_request_body_hooks(plugins, ctx, headers, &request_body).await {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                return (
+                    reject_result_to_backend_response(reject, resolved_ip.clone()),
+                    None,
+                );
+            }
         }
-    }
+        request_body
+    };
 
     let request_content_length = if !request_body.is_empty() {
         Some(request_body.len().to_string())
@@ -28244,6 +28398,7 @@ mod tests {
                 false, // requires_request_body_buffering
                 true,  // stream_request_body
                 false, // retain_request_body (non-retry -> downgrade active)
+                false, // request_body_prepared
                 "127.0.0.1",
                 "127.0.0.1",
                 false, // is_tls

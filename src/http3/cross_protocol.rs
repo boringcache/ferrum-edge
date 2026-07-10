@@ -181,6 +181,11 @@ where
     pub cb_is_half_open_probe: bool,
     pub flavor: HttpFlavor,
     pub prebuffered_body: Option<Vec<u8>>,
+    /// The request body was already transformed and passed through final-body
+    /// hooks before transport selection in the H3 frontend.
+    pub request_body_prepared: bool,
+    /// Original client-visible byte count when `request_body_prepared` is true.
+    pub raw_prebuffered_body_bytes: Option<u64>,
     pub client_ip: &'a str,
     /// Immediate QUIC peer address — appended to X-Forwarded-For so the H3
     /// bridge matches the H1/H2 peer-append semantics (`build_xff_value`).
@@ -189,6 +194,7 @@ where
     pub plugins: &'a [Arc<dyn Plugin>],
     pub backend_admission_plugins: &'a [Arc<dyn Plugin>],
     pub requires_response_body_buffering: bool,
+    pub requires_response_stream_hooks: bool,
     pub sticky_cookie_needed: bool,
 }
 
@@ -507,19 +513,24 @@ where
         cb_is_half_open_probe,
         flavor,
         prebuffered_body,
+        request_body_prepared,
+        raw_prebuffered_body_bytes,
         client_ip,
         xff_append_ip,
         ctx,
         plugins,
         backend_admission_plugins,
         requires_response_body_buffering,
+        requires_response_stream_hooks,
         sticky_cookie_needed,
     } = request;
     let backend_start = Instant::now();
-    let raw_prebuffered_body_bytes = prebuffered_body
-        .as_ref()
-        .map(|body| body.len() as u64)
-        .unwrap_or(0);
+    let raw_prebuffered_body_bytes = raw_prebuffered_body_bytes.unwrap_or_else(|| {
+        prebuffered_body
+            .as_ref()
+            .map(|body| body.len() as u64)
+            .unwrap_or(0)
+    });
 
     // If an earlier plugin phase pre-buffered the request body, run the
     // post-before_proxy body-transform + body-validation hooks on it
@@ -528,7 +539,7 @@ where
     // or plugins that don't opt in are zero-cost — see
     // `apply_request_body_plugins`.
     let prebuffered_body = match prebuffered_body {
-        Some(body) if !plugins.is_empty() => {
+        Some(body) if !request_body_prepared && !plugins.is_empty() => {
             // Use the context-aware variant so body transforms that depend on
             // `before_proxy` decisions in `ctx.metadata` (e.g.
             // `ai_stream_router`'s provider-specific translation) and
@@ -607,6 +618,7 @@ where
                 plugins,
                 backend_admission_plugins,
                 requires_response_body_buffering,
+                requires_response_stream_hooks,
                 sticky_cookie_needed,
             )
             .await
@@ -1178,6 +1190,7 @@ async fn dispatch_plain<S>(
     plugins: &[Arc<dyn Plugin>],
     backend_admission_plugins: &[Arc<dyn Plugin>],
     requires_response_body_buffering: bool,
+    requires_response_stream_hooks: bool,
     sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
@@ -2316,9 +2329,17 @@ where
     // for this H3-client → non-H3-backend response. Without this, an H3 client
     // hitting an HTTP/1/2 SSE backend would stream uninspected. Chain every
     // opted-in plugin, gated to the response status.
-    let content_type = response_headers.get("content-type").map(String::as_str);
-    let response_inspector =
-        crate::plugins::create_response_stream_inspector(plugins, ctx, status, content_type);
+    let response_inspector = if requires_response_stream_hooks {
+        let content_type = response_headers.get("content-type").map(String::as_str);
+        crate::plugins::create_response_stream_inspector_for_enabled_plugins(
+            plugins,
+            ctx,
+            status,
+            content_type,
+        )
+    } else {
+        None
+    };
     // Strip Content-Length when inspecting — the inspector transforms the body, so
     // the backend's declared length no longer matches what we send.
     if response_inspector.is_some() {

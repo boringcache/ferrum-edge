@@ -1690,6 +1690,26 @@ pub fn create_response_stream_inspector(
         return None;
     }
 
+    create_response_stream_inspector_for_enabled_plugins(
+        plugins,
+        ctx,
+        response_status,
+        content_type,
+    )
+}
+
+/// Resolve inspectors after the caller has checked the PluginCache's
+/// precomputed response-stream-hooks capability.
+///
+/// Unlike [`create_response_stream_inspector`], this skips the redundant
+/// per-response capability scan. Request hot paths must use this entry point
+/// behind `PluginCacheRequestView::requires_response_stream_hooks()`.
+pub(crate) fn create_response_stream_inspector_for_enabled_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: u16,
+    content_type: Option<&str>,
+) -> Option<Box<dyn ResponseStreamInspector>> {
     ctx.response_stream_id =
         Some(NEXT_RESPONSE_STREAM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let inspectors: Vec<_> = plugins
@@ -3302,13 +3322,13 @@ pub trait Plugin: Send + Sync {
         None
     }
 
-    /// Returns `true` if THIS request's response must come back on the reqwest
-    /// streaming path rather than a native-H3 (or other advanced) backend
-    /// transport — e.g. because a response-stream inspector will run and is only
-    /// wired on the reqwest path. Evaluated per request just before backend
-    /// dispatch (after `before_proxy`), so a plugin can scope it to the requests
-    /// it actually inspects (via `ctx` markers) instead of forcing every request
-    /// on the proxy off the fast path. Zero overhead when `false` (default).
+    /// Returns `true` if THIS request should prefer the reqwest streaming path
+    /// over a native backend transport. Every streaming dispatch arm drives
+    /// response inspectors, so this is an optimization (for example to avoid a
+    /// transport-specific bridge), not the inspection correctness boundary.
+    /// Evaluated from the finalized request context immediately before backend
+    /// dispatch, so body-transform markers are visible. Zero overhead when no
+    /// response-stream plugin is configured or this returns `false` (default).
     fn forces_reqwest_dispatch(&self, _ctx: &RequestContext) -> bool {
         false
     }

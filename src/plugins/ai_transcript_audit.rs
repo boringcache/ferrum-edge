@@ -1047,28 +1047,18 @@ impl AiTranscriptAudit {
         // then streamed too, so its body is not buffered-captured — the log
         // fallback still records the request side, status, and error reason.
         // Forcing a buffer to catch that body would risk the failure above for
-        // the common SSE success case. The marker is derived from the
-        // pre-transform body because this decision is made before request-body
-        // transforms run; a later transformer that rewrites `stream` cannot be
-        // reflected here (same ordering limit as the AI-candidate
-        // classification; proxy-core follow-up: issue #2055).
+        // the common SSE success case. The marker is refreshed by the final
+        // request-body hook after transforms and before this response policy is
+        // committed, so a transformer-added/removed `stream` value is reflected.
         if flag(&ctx.metadata, MD_STREAM_REQUEST) {
             return false;
         }
         match ctx.metadata.get(MD_CANDIDATE).map(String::as_str) {
             Some("true") => true,
-            // `before_proxy` classified the pre-transform body as non-AI. This
-            // decision is locked in before `on_final_request_body_with_context`
-            // could re-stage a candidate that a later request-body transformer
-            // (ordered after priority 2924) turned into an AI payload, so such a
-            // request's *buffered* response body is not captured. That is a
-            // deliberate tradeoff: buffering every JSON POST response instead
-            // would re-introduce the over-buffering of ordinary non-AI traffic a
-            // prior review flagged. The stream marker has the same pre-transform
-            // limit: only bodies that classified as AI at staging time are
-            // marked for stream inspection (proxy-core follow-up: issue #2055).
-            // The transaction is still audited request-side via the `log`
-            // fallback.
+            // The final transformed body was classified as non-AI. Do not
+            // buffer every JSON POST response: that would over-buffer ordinary
+            // non-AI traffic. The transaction is still audited request-side via
+            // the `log` fallback.
             Some("false") => false,
             _ => {
                 ctx.method == "POST"
@@ -1110,10 +1100,11 @@ impl Plugin for AiTranscriptAudit {
     /// - `before_proxy` terminators (`ai_federation`, `ai_semantic_cache`
     ///   hits) consume it and short-circuit — their transactions must still
     ///   be audited via the response/log hooks;
-    /// - the proxy's response stream-vs-buffer decision runs (it reads
-    ///   `ai_transcript_audit.candidate` via `should_buffer_response_body`);
-    /// - `forces_reqwest_dispatch` is evaluated ahead of backend dispatch (it
-    ///   reads the stream marker written during staging).
+    /// - the proxy's post-transform response stream-vs-buffer decision runs (it
+    ///   reads `ai_transcript_audit.candidate` via
+    ///   `should_buffer_response_body`);
+    /// - the final `forces_reqwest_dispatch` preference is evaluated (it reads
+    ///   the stream marker written during staging).
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.active
     }

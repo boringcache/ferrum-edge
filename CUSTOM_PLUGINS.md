@@ -599,12 +599,12 @@ impl Plugin for MySseInspector {
     }
 
     fn forces_reqwest_dispatch(&self, _ctx: &RequestContext) -> bool {
-        true // Prevents native H3 only; direct H2 remains subject to #2055.
+        true // Optional transport preference; inspection does not depend on it.
     }
 }
 ```
 
-On today's standard HTTP handler, the example also requires `pool_enable_http2: false` on a plain-HTTPS proxy to exclude the direct-H2 arm and guarantee reqwest dispatch. That setting is not a universal workaround for gRPC or mesh H2 transports, and a backend TLS SNI override may require direct H2. Until #2055 is resolved, test every backend transport the plugin can select; constrain enforcing routes to supported dispatch or provide a buffered fallback where inspectors are not wired. In production, also narrow `forces_reqwest_dispatch()` with a request marker when only some requests can be inspected, rather than moving all traffic off native H3.
+The proxy drives inspectors on reqwest, direct HTTP/2, and native HTTP/3 response arms. Use `forces_reqwest_dispatch()` only as a scoped transport preference when reqwest is operationally desirable for a request; it is not required for inspector coverage.
 
 The `ResponseStreamInspector` action contract is:
 
@@ -612,9 +612,7 @@ The `ResponseStreamInspector` action contract is:
 - `on_end(&mut self)` is the clean end-of-stream flush for a trailing partial window. Its default returns an empty `Forward`.
 - Response headers are already committed before either hook runs. `Terminate` can only truncate the in-flight response; it cannot change the HTTP status, replace headers, or retract previously forwarded bytes.
 
-There is one current transport limitation to design around:
-
-- In the standard HTTP proxy handler, inspectors currently attach only to the reqwest `ResponseBody::Streaming` arm, not the direct `StreamingH2` or `StreamingH3` arms ([#2055](https://github.com/ferrum-edge/ferrum-edge/issues/2055)). `forces_reqwest_dispatch()` prevents native-H3 selection for requests where it returns `true`; make that decision per request when possible. It does not itself exclude every direct-H2/HBONE case, so do not assume universal transport coverage until #2055 is resolved. The dedicated H3 frontend native and cross-protocol loops do drive inspectors, which is why the inspector must be portable across H1/H2 and H3 drivers.
+Inspectors must remain portable across the detached H1/H2 driver and the native H3 event loop. They cannot borrow request context, must keep accumulators bounded, and must treat `on_downstream_terminated()` as the signal that a later inspector cut bytes they had already observed.
 
 ### `Content-Type` relabeling trap
 
