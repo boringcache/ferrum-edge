@@ -328,6 +328,12 @@ fn east_west_l4_port_sharing_http_number_keeps_explicit_alias() {
             name: Some("tcp".to_string()),
             target_port: None,
         },
+        ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Udp,
+            name: Some("udp".to_string()),
+            target_port: None,
+        },
     ];
     let prepared = prepare_gateway_config_for_mesh(
         gateway_config_with_mesh(
@@ -345,12 +351,17 @@ fn east_west_l4_port_sharing_http_number_keeps_explicit_alias() {
             .iter()
             .any(|host| host == "mixed.default.svc.cluster.local")
     }));
-    assert!(prepared.proxies.iter().any(|proxy| {
-        proxy
-            .hosts
-            .iter()
-            .any(|host| host == "p8080.mixed.default.svc.cluster.local")
-    }));
+    for alias in [
+        "p8080-tcp.mixed.default.svc.cluster.local",
+        "p8080-udp.mixed.default.svc.cluster.local",
+    ] {
+        assert!(
+            prepared
+                .proxies
+                .iter()
+                .any(|proxy| proxy.hosts.iter().any(|host| host == alias))
+        );
+    }
     assert!(
         prepared
             .upstreams
@@ -361,7 +372,13 @@ fn east_west_l4_port_sharing_http_number_keeps_explicit_alias() {
         prepared
             .upstreams
             .iter()
-            .any(|upstream| upstream.id == "__mesh-ew-upstream-default-mixed.p8080")
+            .any(|upstream| upstream.id == "__mesh-ew-upstream-default-mixed.p8080-tcp")
+    );
+    assert!(
+        prepared
+            .upstreams
+            .iter()
+            .any(|upstream| upstream.id == "__mesh-ew-upstream-default-mixed.p8080-udp")
     );
 }
 

@@ -1935,26 +1935,15 @@ fn build_east_west_service_proxies_and_upstreams(
         // client + destination agree per EXPLICIT numeric port and cannot
         // cross-wire under cross-cluster port skew (codex #2040 Finding A);
         // `cross_cluster_service_sni` is the shared source of that SNI. L4 ports
-        // are inherently per-port and therefore always use `p<port>.<fqdn>`.
-        let base_port = cross_cluster_service_base_port(service);
+        // are inherently per-port and use `p<port>.<fqdn>` (or the
+        // protocol-suffixed form when TCP and UDP share a number).
         for service_port in &service.ports {
             // `None` (⇒ port-less legacy id) ONLY for a single-port service's sole
             // port (`cross_cluster_service_base_port` returns `None` for a
             // multi-port service); every port of a multi-port service carries its
             // own `.p<port>` id so the per-port proxies never collide (codex #2040
             // Finding B).
-            let effective_protocol = service
-                .protocol_overrides
-                .get(&service_port.port)
-                .copied()
-                .unwrap_or(service_port.protocol);
-            let id_port = if is_http_family_mesh_protocol(effective_protocol)
-                && base_port == Some(service_port.port)
-            {
-                None
-            } else {
-                Some(service_port.port)
-            };
+            let id_suffix = cross_cluster_service_sni_label(service, service_port);
             // Build upstream targets for THIS service port.
             let targets = build_east_west_service_targets(
                 service,
@@ -2012,8 +2001,11 @@ fn build_east_west_service_proxies_and_upstreams(
                 continue;
             }
 
-            let upstream_id =
-                mesh_east_west_service_upstream_id(&service.namespace, &service.name, id_port);
+            let upstream_id = mesh_east_west_service_upstream_id(
+                &service.namespace,
+                &service.name,
+                id_suffix.as_deref(),
+            );
 
             let upstream = Upstream {
                 id: upstream_id.clone(),
@@ -2047,8 +2039,11 @@ fn build_east_west_service_proxies_and_upstreams(
             };
             upstreams.push(upstream);
 
-            let proxy_id =
-                mesh_east_west_service_proxy_id(&service.namespace, &service.name, id_port);
+            let proxy_id = mesh_east_west_service_proxy_id(
+                &service.namespace,
+                &service.name,
+                id_suffix.as_deref(),
+            );
             let proxy = east_west_service_proxy(
                 &proxy_id,
                 &sni_hostname,
@@ -2194,6 +2189,51 @@ pub(crate) fn cross_cluster_service_base_port(
     }
 }
 
+/// DNS label (and internal id suffix) for a service port's east-west alias.
+/// `None` is the HTTP-only bare-base compatibility case. L4 normally uses
+/// `p<port>`; when TCP-family and UDP share the same numeric service port, the
+/// transport discriminator is required because their targetPorts may differ.
+fn cross_cluster_service_sni_label(
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
+) -> Option<String> {
+    let effective_protocol = service
+        .protocol_overrides
+        .get(&service_port.port)
+        .copied()
+        .unwrap_or(service_port.protocol);
+    if is_http_family_mesh_protocol(effective_protocol)
+        && cross_cluster_service_base_port(service) == Some(service_port.port)
+    {
+        return None;
+    }
+
+    let l4_same_number = service
+        .ports
+        .iter()
+        .filter(|candidate| {
+            candidate.port == service_port.port
+                && !is_http_family_mesh_protocol(
+                    service
+                        .protocol_overrides
+                        .get(&candidate.port)
+                        .copied()
+                        .unwrap_or(candidate.protocol),
+                )
+        })
+        .count();
+    if l4_same_number > 1 {
+        let transport = if is_udp_mesh_protocol(effective_protocol) {
+            "udp"
+        } else {
+            "tcp"
+        };
+        Some(format!("p{}-{transport}", service_port.port))
+    } else {
+        Some(format!("p{}", service_port.port))
+    }
+}
+
 /// The cross-cluster east-west SNI a `(service, service_port)` routes on
 /// (multi-port scheme, issue #2010 phase 3; codex #2040 Finding A).
 ///
@@ -2205,9 +2245,9 @@ pub(crate) fn cross_cluster_service_base_port(
 ///   lowest — on an explicit per-port alias `p<service_port>.<base_fqdn>` (e.g.
 ///   `p8080.reviews...`, `p9090.reviews...`). The bare base FQDN routes to NO
 ///   port for a multi-port service.
-/// - A **raw-TCP or UDP** port always routes on `p<service_port>.<base_fqdn>`.
-///   L4 capture is inherently per-port and never consumes the HTTP-only bare
-///   base-port compatibility case.
+/// - A **raw-TCP or UDP** port routes on `p<service_port>.<base_fqdn>`; when
+///   TCP and UDP share the number, `-tcp` / `-udp` disambiguates their aliases.
+///   L4 capture never consumes the HTTP-only bare-base compatibility case.
 ///
 /// Aliasing every port of a multi-port service (rather than routing the lowest
 /// port on the bare base) is what makes the scheme fail CLOSED under
@@ -2233,18 +2273,8 @@ pub(crate) fn cross_cluster_service_sni(
     let base = cross_cluster_service_base_fqdn(service, cluster_domain);
     // Bare base FQDN ONLY for a single-HTTP-port service (its sole port). Every
     // port of a multi-port service — lowest included — gets an explicit alias.
-    let effective_protocol = service
-        .protocol_overrides
-        .get(&service_port.port)
-        .copied()
-        .unwrap_or(service_port.protocol);
-    if is_http_family_mesh_protocol(effective_protocol)
-        && cross_cluster_service_base_port(service) == Some(service_port.port)
-    {
-        base
-    } else {
-        format!("p{}.{base}", service_port.port)
-    }
+    cross_cluster_service_sni_label(service, service_port)
+        .map_or(base.clone(), |label| format!("{label}.{base}"))
 }
 
 /// Build upstream targets from workloads that belong to the given service, for
@@ -2394,11 +2424,12 @@ fn sanitize_mesh_id_component(component: &str) -> String {
     component.replace(['/', '.'], "-")
 }
 
-/// East-west per-service proxy id. `service_port` is `None` for a SINGLE-HTTP-port
+/// East-west per-service proxy id. `sni_label` is `None` for a SINGLE-HTTP-port
 /// service — which keeps the historic port-LESS `__mesh-ew-svc-<ns>-<name>` id so
 /// that service is byte-identical to the pre-multi-port shape — and `Some(port)`
 /// for EVERY port of a MULTI-port service (multi-port east-west, issue #2010
-/// phase 3; no bare base id is emitted for a multi-port service, matching the
+/// phase 3; L4 labels may additionally carry a `-tcp` / `-udp` discriminator
+/// when both transports share one number. No bare base id is emitted for a multi-port service, matching the
 /// SNI scheme where every port of a multi-port service takes an explicit
 /// `p<port>.<fqdn>` alias).
 ///
@@ -2412,32 +2443,28 @@ fn sanitize_mesh_id_component(component: &str) -> String {
 /// sanitized (`/`,`.` → `-`) BEFORE the `.p<port>` marker is appended so a
 /// malformed component can never forge the structural separator, while the
 /// intentional marker dot is preserved (never collapsed).
-fn mesh_east_west_service_proxy_id(
-    namespace: &str,
-    name: &str,
-    service_port: Option<u16>,
-) -> String {
+fn mesh_east_west_service_proxy_id(namespace: &str, name: &str, sni_label: Option<&str>) -> String {
     let namespace = sanitize_mesh_id_component(namespace);
     let name = sanitize_mesh_id_component(name);
-    match service_port {
+    match sni_label {
         None => format!("__mesh-ew-svc-{namespace}-{name}"),
-        Some(port) => format!("__mesh-ew-svc-{namespace}-{name}.p{port}"),
+        Some(label) => format!("__mesh-ew-svc-{namespace}-{name}.{label}"),
     }
 }
 
-/// East-west per-service upstream id; `service_port` semantics and the
+/// East-west per-service upstream id; `sni_label` semantics and the
 /// collision-free `.p<port>` marker mirror [`mesh_east_west_service_proxy_id`]
 /// (single-port ⇒ port-less legacy id; multi-port ⇒ explicit per-port id).
 fn mesh_east_west_service_upstream_id(
     namespace: &str,
     name: &str,
-    service_port: Option<u16>,
+    sni_label: Option<&str>,
 ) -> String {
     let namespace = sanitize_mesh_id_component(namespace);
     let name = sanitize_mesh_id_component(name);
-    match service_port {
+    match sni_label {
         None => format!("__mesh-ew-upstream-{namespace}-{name}"),
-        Some(port) => format!("__mesh-ew-upstream-{namespace}-{name}.p{port}"),
+        Some(label) => format!("__mesh-ew-upstream-{namespace}-{name}.{label}"),
     }
 }
 

@@ -2403,12 +2403,20 @@ fn cross_cluster_udp_materializes_per_port_targets_for_both_captured_topologies(
             cluster_ips: vec!["10.96.0.53".to_string()],
             name: "svc-b".to_string(),
             namespace: "default".to_string(),
-            ports: vec![ServicePort {
-                port: 5353,
-                protocol: AppProtocol::Udp,
-                name: Some("dns".to_string()),
-                target_port: None,
-            }],
+            ports: vec![
+                ServicePort {
+                    port: 5353,
+                    protocol: AppProtocol::Tcp,
+                    name: Some("dns-tcp".to_string()),
+                    target_port: None,
+                },
+                ServicePort {
+                    port: 5353,
+                    protocol: AppProtocol::Udp,
+                    name: Some("dns-udp".to_string()),
+                    target_port: None,
+                },
+            ],
             workloads: vec![
                 WorkloadRef {
                     spiffe_id: local.spiffe_id.clone(),
@@ -2432,9 +2440,22 @@ fn cross_cluster_udp_materializes_per_port_targets_for_both_captured_topologies(
         assert_eq!(cross.len(), 1, "{topology:?}");
         assert_eq!(
             cross[0].tags.get(MESH_EASTWEST_SNI_TAG).map(String::as_str),
-            Some("p5353.svc-b.default.svc.cluster.local")
+            Some("p5353-udp.svc-b.default.svc.cluster.local")
         );
         assert_eq!(cross[0].port, 5353);
         assert!(!cross[0].tags.contains_key("mesh.spiffe_id"));
+        let tcp_cross = upstreams
+            .get("__mesh-out-tcp-upstream-default-svc-b-5353")
+            .expect("TCP per-port upstream")
+            .iter()
+            .find(|target| target.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
+            .expect("cross-cluster TCP target");
+        assert_eq!(
+            tcp_cross
+                .tags
+                .get(MESH_EASTWEST_SNI_TAG)
+                .map(String::as_str),
+            Some("p5353-tcp.svc-b.default.svc.cluster.local")
+        );
     }
 }
