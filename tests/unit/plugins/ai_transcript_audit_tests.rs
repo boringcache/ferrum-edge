@@ -1321,7 +1321,7 @@ async fn error_sse_response_is_teed_when_error_capture_enabled() {
 async fn sse_downgrade_releases_precommit_buffer_reservation() {
     let plugin = AiTranscriptAudit::new(
         &json!({
-            "capture": { "streaming_response": true },
+            "capture": { "response": true, "streaming_response": false },
             "sink": {
                 "type": "http",
                 "endpoint_url": "https://audit.example.com/x",
@@ -1334,6 +1334,10 @@ async fn sse_downgrade_releases_precommit_buffer_reservation() {
         loopback_http_client(),
     )
     .unwrap();
+    assert!(
+        plugin.requires_response_stream_hooks(),
+        "fail-closed buffered capture must observe a content-type downgrade to release its slot"
+    );
     let headers = json_headers();
 
     let mut first = make_ctx();
@@ -1349,8 +1353,8 @@ async fn sse_downgrade_releases_precommit_buffer_reservation() {
     assert!(
         plugin
             .response_stream_inspector(&first, 200, Some("text/event-stream"))
-            .is_some(),
-        "the unexpected SSE response must select the streaming inspector"
+            .is_none(),
+        "stream capture is disabled; the hook only releases buffered admission"
     );
 
     let mut second = make_ctx();

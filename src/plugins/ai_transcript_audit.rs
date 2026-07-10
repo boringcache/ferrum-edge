@@ -1508,6 +1508,7 @@ impl Plugin for AiTranscriptAudit {
 
     fn requires_response_stream_hooks(&self) -> bool {
         self.capture.streaming != StreamingCapture::Off
+            || (self.capture.response && self.on_buffer_full == BufferFullPolicy::Reject)
     }
 
     fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
@@ -1522,12 +1523,24 @@ impl Plugin for AiTranscriptAudit {
         response_status: u16,
         content_type: Option<&str>,
     ) -> Option<Box<dyn ResponseStreamInspector>> {
+        if !content_type.is_some_and(is_event_stream) {
+            return None;
+        }
+        let record_id = ctx.metadata.get(MD_RECORD_ID)?.clone();
+
+        // The response is now known to use the streaming path. It cannot be
+        // rejected after its headers commit, so release any slot reserved by
+        // the conservative pre-header buffering decision. Stream-terminal
+        // enqueue remains best-effort, matching the documented fail-closed
+        // contract for buffered responses only. This runs even when streaming
+        // capture is off or a sampled-mode tee loses its roll.
+        if let Some(mut staging) = self.staging.get_mut(&record_id) {
+            staging.commit_permit.take();
+        }
+
         if self.capture.streaming == StreamingCapture::Off
             || !flag(&ctx.metadata, &self.stream_marker_key())
         {
-            return None;
-        }
-        if !content_type.is_some_and(is_event_stream) {
             return None;
         }
         // In `sampled` mode the marker alone is not enough: only tee streams
@@ -1536,7 +1549,6 @@ impl Plugin for AiTranscriptAudit {
         if !self.stream_tee_wanted(&ctx.metadata) {
             return None;
         }
-        let record_id = ctx.metadata.get(MD_RECORD_ID)?.clone();
         let sample_hit = self.staged_sample_hit(&ctx.metadata);
         // 2xx SSE is the normal capture path. A non-2xx SSE is teed too when the
         // record will emit anyway — either `always_capture_on_error` is set, or
@@ -1549,15 +1561,6 @@ impl Plugin for AiTranscriptAudit {
             || (response_status >= 400 && (self.sampling.always_on_error || sample_hit));
         if !status_eligible {
             return None;
-        }
-
-        // The response is now known to use the streaming path. It cannot be
-        // rejected after its headers commit, so release any slot reserved by
-        // the conservative pre-header buffering decision. Stream-terminal
-        // enqueue remains best-effort, matching the documented fail-closed
-        // contract for buffered responses only.
-        if let Some(mut staging) = self.staging.get_mut(&record_id) {
-            staging.commit_permit.take();
         }
 
         let slot = Arc::new(StreamSlot {
