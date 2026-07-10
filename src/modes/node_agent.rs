@@ -4139,16 +4139,18 @@ pub fn handle_pod_removed(
 
     let removed = pod_states.remove(pod_uid);
     let Some((_, state)) = removed else {
-        if let Some(dir) = &config.node_waypoint_pod_registry_dir {
-            write_udp_not_ready_ack(dir, pod_uid);
-        }
+        // No tracked state means there is no verified BPF cleanup result to
+        // acknowledge. Withhold the UDP close ack so a surviving producer keeps
+        // its in-netns guard fail closed.
         clear_partial_capture_state_if_recovered(pod_states, metrics);
         return;
     };
 
+    let mut udp_gate_cleanup_succeeded = true;
     if state.attached {
         if let Err(e) = backend.detach_pod(pod_uid) {
             warn!(pod_uid, error = %e, "Failed to detach BPF programs");
+            udp_gate_cleanup_succeeded = false;
         }
         cleanup_node_probe_ports(backend, pod_states, metrics, pod_uid, &state);
         if let Some(ip) = state.pod_ip {
@@ -4186,9 +4188,23 @@ pub fn handle_pod_removed(
         }
         metrics.pods_unenrolled.fetch_add(1, Ordering::Relaxed);
         info!(pod_uid, pod_name = %state.pod_name, "Pod unenrolled from eBPF capture");
+        udp_gate_cleanup_succeeded &= !PENDING_CAPTURE_FAILURES.iter().any(|entry| {
+            parse_pending_capture_failure_key(entry.key()).is_some_and(|failure| {
+                failure.state_key == state_key && failure.operation == CAPTURE_FAILURE_POD_IP_REMOVE
+            })
+        });
     }
-    if let Some(dir) = &config.node_waypoint_pod_registry_dir {
-        write_udp_not_ready_ack(dir, pod_uid);
+    if config.capture_config.udp_capture_enabled {
+        if udp_gate_cleanup_succeeded {
+            if let Some(dir) = &config.node_waypoint_pod_registry_dir {
+                write_udp_not_ready_ack(dir, pod_uid);
+            }
+        } else {
+            warn!(
+                pod_uid,
+                "Withholding Ambient UDP not-ready acknowledgement because BPF gate cleanup is incomplete"
+            );
+        }
     }
     clear_partial_capture_state_if_recovered(pod_states, metrics);
 }
@@ -5603,6 +5619,68 @@ mod tests {
                 .exists(),
             "restart teardown must withhold the UDP not-ready ack (fail closed)"
         );
+    }
+
+    #[test]
+    fn pod_removal_withholds_udp_not_ready_ack_when_bpf_gate_cleanup_fails() {
+        let registry = tempfile::tempdir().unwrap();
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.udp_capture_enabled = true;
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 11);
+        let pod_states = DashMap::new();
+        pod_states.insert(
+            "pod-udp".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-udp".to_string(),
+                pod_name: "pod-udp".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: Some(ip),
+                pod_ip6: None,
+                cgroup_path: Some("/cg/udp".to_string()),
+                veth_iface: Some("veth-udp".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
+            },
+        );
+        let state_key = pod_state_key(&pod_states, "pod-udp");
+        let mut backend = MockEbpfBackend {
+            fail_remove_pod_ip: true,
+            ..MockEbpfBackend::default()
+        };
+        backend
+            .update_pod_ip(ip, &PodInfo::for_capture(15001, true, true))
+            .unwrap();
+        let metrics = NodeAgentMetrics::default();
+
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-udp");
+
+        assert!(
+            !registry
+                .path()
+                .join(".udp-not-ready")
+                .join("pod-udp")
+                .exists(),
+            "failed BPF gate cleanup must not authorize producer teardown"
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
+        );
+        forget_pending_capture_failures_for_pod(&state_key);
     }
 
     #[test]

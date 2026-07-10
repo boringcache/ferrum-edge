@@ -280,8 +280,9 @@ producer retry, and marker/map updates are idempotent. Therefore the polling
 interval can delay UDP readiness, but it cannot create a plaintext bypass
 window. On producer stop, readiness is removed first and the producer waits for
 `<registry_dir>/.udp-not-ready/<pod_uid>`, which the node-agent writes only after
-the BPF ready bit is cleared (or the pod is unenrolled). A failed BPF update
-keeps capture degraded and withholds that acknowledgement; after a bounded wait
+the BPF ready bit is cleared or pod unenrollment has verifiably removed the BPF
+gate. A failed map removal or classifier detach keeps capture degraded and
+withholds that acknowledgement; after a bounded wait
 the producer retains its in-netns fail-closed guard while releasing the producer
 tasks/netns handle instead of tearing down into plaintext. The live
 bind-collision/source-capture verification remains part of #2038.

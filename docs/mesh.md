@@ -2007,11 +2007,17 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   shutdown. Its stop signal is also threaded into every per-session tunnel task;
   producer close removes the session senders, waits up to two seconds for those
   tasks, then aborts any stragglers before the pod-netns reply factory and stable
-  netns handle are released. Graceful shutdown AWAITS the per-netns teardown.
+  netns handle are released. Per-producer loops observe only the manager's stop
+  signal, so global shutdown cannot race ahead of the manager's marker retraction
+  and retain-guard decision. Graceful shutdown AWAITS the per-netns teardown.
   When Ambient UDP capture is disabled, mesh startup still runs a best-effort
   cleanup manager over the registry
   so stale pod-netns `FERRUM_MESH_UDP_*` rules from a prior enabled crash/kill are
-  removed instead of black-holing workload UDP. Startup is **fail-closed**: an
+  removed instead of black-holing workload UDP. If it observes a stale
+  `.udp-ready` marker, cleanup retracts every marker first and waits for the
+  node-agent's closed-gate acknowledgement against one shared deadline; without
+  that acknowledgement it preserves the stale rules fail-closed and retries
+  instead of reopening plaintext. Startup is **fail-closed**: an
   invalid capture config, a runtime image missing `sh`/`ip`/`iptables`, or a required
   IPv6 `ip6tables` mangle table failure aborts mesh startup rather than silently
   retrying with nothing captured. The producer **disables the proxy-UID owner-match
