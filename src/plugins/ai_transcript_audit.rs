@@ -1515,18 +1515,15 @@ impl Plugin for AiTranscriptAudit {
         &self,
         ctx: &RequestContext,
         _response_status: u16,
-        content_type: Option<&str>,
+        _content_type: Option<&str>,
     ) {
-        if !content_type.is_some_and(is_event_stream) {
-            return;
-        }
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID) else {
             return;
         };
         // A streamed response cannot be rejected after its headers commit.
         // Release capacity reserved by the conservative pre-header buffering
-        // decision on every transport, including direct H2/H3 and responses
-        // for which no chunk inspector attaches.
+        // decision for every content type and transport, including direct
+        // H2/H3 responses for which no chunk inspector attaches.
         if let Some(mut staging) = self.staging.get_mut(record_id) {
             staging.commit_permit.take();
         }

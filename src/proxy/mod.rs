@@ -16497,11 +16497,29 @@ async fn handle_proxy_request_inner(
                                         &plugins, &mut ctx, reject, false,
                                     )
                                     .await;
-                                response_status = normalized.http_status.as_u16();
-                                response_headers = normalized.headers;
+                                if let (Some(grpc_web_ct), Some(grpc_status)) =
+                                    (grpc_web_response_content_type, normalized.grpc_status)
+                                {
+                                    let message = normalized
+                                        .grpc_message
+                                        .as_deref()
+                                        .unwrap_or_else(|| grpc_status_reason(grpc_status));
+                                    let translated =
+                                        crate::plugins::grpc_web::error_response_for_content_type(
+                                            grpc_web_ct,
+                                            grpc_status,
+                                            message,
+                                        );
+                                    response_status = 200;
+                                    response_headers = translated.headers;
+                                    response_body = translated.body;
+                                } else {
+                                    response_status = normalized.http_status.as_u16();
+                                    response_headers = normalized.headers;
+                                    response_body = normalized.body;
+                                }
                                 plugin_response_headers = response_headers.clone();
                                 response_trailers.clear();
-                                response_body = normalized.body;
                                 break;
                             }
                         }

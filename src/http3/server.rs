@@ -4677,6 +4677,27 @@ async fn run_h3_backend_admission_or_send_reject(
                 &rejection.body,
                 &headers,
             );
+            if plugins
+                .iter()
+                .any(|plugin| plugin.requires_response_committed_hook())
+            {
+                let normalized = crate::proxy::normalize_reject_response(
+                    http_status,
+                    &rejection.body,
+                    &headers,
+                    matches!(flavor, HttpFlavor::Grpc),
+                );
+                for plugin in plugins {
+                    plugin
+                        .on_response_committed(
+                            ctx,
+                            normalized.http_status.as_u16(),
+                            &normalized.headers,
+                            &normalized.body,
+                        )
+                        .await;
+                }
+            }
             record_request(state, log_status_code);
             log_rejected_request(
                 plugins,

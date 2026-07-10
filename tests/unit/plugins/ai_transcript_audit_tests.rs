@@ -1318,7 +1318,7 @@ async fn error_sse_response_is_teed_when_error_capture_enabled() {
 }
 
 #[tokio::test]
-async fn sse_downgrade_releases_precommit_buffer_reservation() {
+async fn streaming_selection_releases_precommit_buffer_reservation() {
     let plugin = AiTranscriptAudit::new(
         &json!({
             "capture": { "response": true, "streaming_response": false },
@@ -1350,13 +1350,7 @@ async fn sse_downgrade_releases_precommit_buffer_reservation() {
         plugin.before_proxy(&mut first, &mut first_headers).await,
         PluginResult::Continue
     ));
-    plugin.on_response_stream_selected(&first, 200, Some("text/event-stream"));
-    assert!(
-        plugin
-            .response_stream_inspector(&first, 200, Some("text/event-stream"))
-            .is_none(),
-        "stream capture is disabled; the hook only releases buffered admission"
-    );
+    plugin.on_response_stream_selected(&first, 200, Some("text/plain"));
 
     let mut second = make_ctx();
     second.metadata.insert(
