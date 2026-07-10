@@ -581,9 +581,9 @@ async fn mesh_authz_ambient_udp_applies_scope_for_validated_source_pod() {
 #[tokio::test]
 async fn mesh_authz_ambient_udp_retains_identical_duplicate_pod_scopes() {
     let mut slice = ambient_udp_source_scoping_slice();
-    let mut second_service = slice.workloads[0].clone();
-    second_service.service_name = "api-alias".to_string();
-    slice.workloads.push(second_service);
+    let mut second_projection = slice.ambient_udp_source_workloads[0].clone();
+    second_projection.service_name = "api-alias".to_string();
+    slice.ambient_udp_source_workloads.push(second_projection);
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
@@ -623,9 +623,9 @@ async fn mesh_authz_ambient_udp_suppresses_conflicting_duplicate_pod_scopes() {
     stale_principal_deny.name = "stale-principal-deny".to_string();
     stale_principal_deny.scope = PolicyScope::MeshWide;
     slice.mesh_policies.push(stale_principal_deny);
-    let mut conflicting = slice.workloads[0].clone();
+    let mut conflicting = slice.ambient_udp_source_workloads[0].clone();
     conflicting.selector.labels = HashMap::from([("app".to_string(), "other".to_string())]);
-    slice.workloads.push(conflicting);
+    slice.ambient_udp_source_workloads.push(conflicting);
     let plugin = MeshAuthz::new(&json!({
         "mesh_slice": slice,
         "ambient_udp_source_scoping": true,
