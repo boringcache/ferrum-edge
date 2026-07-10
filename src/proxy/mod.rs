@@ -14383,116 +14383,11 @@ async fn handle_proxy_request_inner(
         && requires_request_body_buffering
         && (maybe_requires_response_body_buffering || stream_hooks_enabled);
     let mut request_body_prepared = false;
-    if reevaluate_response_policy_after_request_body {
-        // Body transforms/final hooks need a stable outbound-header view while
-        // mutating the real context. This clone exists only on the opted-in body
-        // policy path; the common path keeps borrowing `ctx.headers` directly.
-        let hook_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
-        client_request_body = match client_request_body {
-            ClientRequestBody::Streaming(request) => {
-                match buffer_request_body_for_before_proxy(
-                    *request,
-                    &method,
-                    &hook_headers,
-                    state.max_request_body_size_bytes,
-                )
-                .await
-                {
-                    Ok(body) => body,
-                    Err(RequestBodyBufferError::TooLarge) => {
-                        record_request(&state, 413);
-                        return Ok(build_response(
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            r#"{"error":"Request body exceeds maximum size"}"#,
-                        ));
-                    }
-                    Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
-                        error!(
-                            proxy_id = %proxy.id,
-                            path = %ctx.path,
-                            error_kind = "client_disconnect",
-                            error = %error_message,
-                            "Client disconnected while finalizing request body before dispatch"
-                        );
-                        record_request(&state, 499);
-                        return Ok(build_response(
-                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
-                            r#"{"error":"Client disconnected"}"#,
-                        ));
-                    }
-                }
-            }
-            buffered => buffered,
-        };
-
-        client_request_body = match client_request_body {
-            ClientRequestBody::Buffered(body) => {
-                ctx.bytes_sent_observed
-                    .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
-                let transformed = apply_request_body_plugins_with_context(
-                    &plugins,
-                    Some(&mut ctx),
-                    &hook_headers,
-                    body,
-                )
-                .await;
-                match run_final_request_body_hooks(
-                    &plugins,
-                    Some(&mut ctx),
-                    &hook_headers,
-                    &transformed,
-                )
-                .await
-                {
-                    PluginResult::Continue => {
-                        request_body_prepared = true;
-                        ClientRequestBody::Buffered(transformed)
-                    }
-                    reject @ PluginResult::Reject { .. }
-                    | reject @ PluginResult::RejectBinary { .. } => {
-                        let Some(reject) = plugin_result_into_reject_parts(reject) else {
-                            record_request(&state, 500);
-                            return Ok(build_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                r#"{"error":"Internal error"}"#,
-                            ));
-                        };
-                        let status = StatusCode::from_u16(reject.status_code)
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                        let normalized = finalize_reject_response_with_after_proxy_hooks(
-                            &plugins,
-                            &mut ctx,
-                            status,
-                            &reject.body,
-                            reject.headers,
-                            is_grpc_request,
-                        )
-                        .await;
-                        apply_grpc_reject_metadata(&mut ctx, &normalized);
-                        log_rejected_request(
-                            &plugins,
-                            &ctx,
-                            normalized.http_status.as_u16(),
-                            start_time,
-                            "on_final_request_body",
-                            plugin_execution_ns,
-                        )
-                        .await;
-                        record_request(&state, normalized.http_status.as_u16());
-                        return Ok(build_response_from_normalized_reject(normalized));
-                    }
-                }
-            }
-            bodyless => bodyless,
-        };
-    }
     // Pre-computed at config reload (see `PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT`)
     // so the proxy hot path does not re-scan the plugin list per request.
     let needs_final_request_body_context = requires_request_body_buffering
         && capabilities
             .has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
-    let proxy_headers: &HashMap<String, String> =
-        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
     let effective_query_string = query_string_after_plugin_strips(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
@@ -14539,7 +14434,7 @@ async fn handle_proxy_request_inner(
         &state,
         &epoch,
         &ctx.client_ip,
-        proxy_headers,
+        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
         ctx.orig_dst,
     );
     let lb_hash_key = selection.lb_hash_key;
@@ -14601,6 +14496,131 @@ async fn handle_proxy_request_inner(
                 return Ok(build_response_from_normalized_reject(reject));
             }
         };
+
+    // Finalize the body only after fail-fast routing and breaker gates have
+    // admitted the request. This preserves the open-breaker behavior (no slow
+    // upload drain or body-plugin I/O before the immediate 503) while still
+    // updating response buffering and transport preference before dispatch.
+    if reevaluate_response_policy_after_request_body {
+        let hook_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
+        client_request_body = match client_request_body {
+            ClientRequestBody::Streaming(request) => {
+                match buffer_request_body_for_before_proxy(
+                    *request,
+                    &method,
+                    &hook_headers,
+                    state.max_request_body_size_bytes,
+                )
+                .await
+                {
+                    Ok(body) => body,
+                    Err(RequestBodyBufferError::TooLarge) => {
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            cb_is_half_open_probe,
+                        );
+                        record_request(&state, 413);
+                        return Ok(build_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            r#"{"error":"Request body exceeds maximum size"}"#,
+                        ));
+                    }
+                    Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            cb_is_half_open_probe,
+                        );
+                        error!(
+                            proxy_id = %proxy.id,
+                            path = %ctx.path,
+                            error_kind = "client_disconnect",
+                            error = %error_message,
+                            "Client disconnected while finalizing request body before dispatch"
+                        );
+                        record_request(&state, 499);
+                        return Ok(build_response(
+                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                            r#"{"error":"Client disconnected"}"#,
+                        ));
+                    }
+                }
+            }
+            buffered => buffered,
+        };
+
+        client_request_body = match client_request_body {
+            ClientRequestBody::Buffered(body) => {
+                ctx.bytes_sent_observed
+                    .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                let transformed = apply_request_body_plugins_with_context(
+                    &plugins,
+                    Some(&mut ctx),
+                    &hook_headers,
+                    body,
+                )
+                .await;
+                match run_final_request_body_hooks(
+                    &plugins,
+                    Some(&mut ctx),
+                    &hook_headers,
+                    &transformed,
+                )
+                .await
+                {
+                    PluginResult::Continue => {
+                        request_body_prepared = true;
+                        ClientRequestBody::Buffered(transformed)
+                    }
+                    reject @ PluginResult::Reject { .. }
+                    | reject @ PluginResult::RejectBinary { .. } => {
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            cb_is_half_open_probe,
+                        );
+                        let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                            record_request(&state, 500);
+                            return Ok(build_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                r#"{"error":"Internal error"}"#,
+                            ));
+                        };
+                        let status = StatusCode::from_u16(reject.status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let normalized = finalize_reject_response_with_after_proxy_hooks(
+                            &plugins,
+                            &mut ctx,
+                            status,
+                            &reject.body,
+                            reject.headers,
+                            is_grpc_request,
+                        )
+                        .await;
+                        apply_grpc_reject_metadata(&mut ctx, &normalized);
+                        log_rejected_request(
+                            &plugins,
+                            &ctx,
+                            normalized.http_status.as_u16(),
+                            start_time,
+                            "on_final_request_body",
+                            plugin_execution_ns,
+                        )
+                        .await;
+                        record_request(&state, normalized.http_status.as_u16());
+                        return Ok(build_response_from_normalized_reject(normalized));
+                    }
+                }
+            }
+            bodyless => bodyless,
+        };
+    }
+    let proxy_headers: &HashMap<String, String> =
+        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
     // Check if this is a WebSocket upgrade request. WebSocket is a runtime
     // flavor in the new scheme-decoupled model — any HTTP-family proxy
@@ -18068,6 +18088,17 @@ async fn handle_proxy_request_inner(
             | ResponseBody::StreamingH2(_)
             | ResponseBody::StreamingH3(_)
     );
+    // Native H3 needs the backend's declared length to distinguish a complete
+    // body followed by a graceful QUIC close from truncation. Preserve it
+    // before an attached inspector strips the client-visible Content-Length.
+    let streaming_h3_backend_content_length =
+        matches!(&response_body, ResponseBody::StreamingH3(_))
+            .then(|| {
+                response_headers
+                    .get("content-length")
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .flatten();
     // Resolve the inspector before cloning the context into the deferred
     // logger. The resolver stamps a private stream id only when an inspector
     // actually attaches; the terminal hook uses that id to drain plugin-owned
@@ -18571,11 +18602,12 @@ async fn handle_proxy_request_inner(
             body
         }
         ResponseBody::StreamingH3(h3_resp) => {
-            let cl = response_headers
+            let client_content_length = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
             let success_on_drop_after_bytes =
-                h3_success_on_drop_after_response_bytes(inbound_version, cl);
+                h3_success_on_drop_after_response_bytes(inbound_version, client_content_length);
+            let backend_content_length = streaming_h3_backend_content_length;
             // Method + status thread into `H3FrameSource` so its graceful-close
             // recovery gate uses the same `is_response_body_complete` predicate
             // as the buffered path (HEAD/204/304 no-body responses included).
@@ -18589,7 +18621,7 @@ async fn handle_proxy_request_inner(
                     h3_resp.recv_stream,
                     h3_method,
                     response_status,
-                    cl,
+                    backend_content_length,
                     proxy.backend_read_timeout_ms,
                 )
             } else if state.max_response_body_size_bytes > 0 {
@@ -18598,7 +18630,7 @@ async fn handle_proxy_request_inner(
                     state.max_response_body_size_bytes,
                     h3_method,
                     response_status,
-                    cl,
+                    backend_content_length,
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
@@ -18609,7 +18641,7 @@ async fn handle_proxy_request_inner(
                     h3_resp.recv_stream,
                     h3_method,
                     response_status,
-                    cl,
+                    backend_content_length,
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
