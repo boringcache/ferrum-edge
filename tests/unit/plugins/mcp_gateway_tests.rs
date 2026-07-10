@@ -1815,7 +1815,7 @@ async fn aggregate_template_reverse_mapping_preserves_upstream_percent_escapes()
         .to_string();
     assert_eq!(
         spaced_public_uri,
-        "mcp://github/file%3A%2F%2F%2Freports%2FQ1%20draft.md"
+        "mcp://github/file%3A%2F%2F%2Freports/Q1%20draft.md"
     );
 
     let read_body = json!({
