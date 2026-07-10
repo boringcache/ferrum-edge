@@ -123,6 +123,54 @@ async fn mock_sink() -> MockServer {
     server
 }
 
+#[async_trait]
+trait AuditBufferedResponseTestExt {
+    async fn capture_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        status: u16,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult;
+}
+
+#[async_trait]
+impl AuditBufferedResponseTestExt for AiTranscriptAudit {
+    async fn capture_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        status: u16,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        let result = self
+            .on_final_response_body(ctx, status, headers, body)
+            .await;
+        match &result {
+            PluginResult::Continue => {
+                self.on_response_committed(ctx, status, headers, body).await;
+            }
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => {
+                self.on_response_committed(ctx, *status_code, headers, body.as_bytes())
+                    .await;
+            }
+            PluginResult::RejectBinary {
+                status_code,
+                body,
+                headers,
+            } => {
+                self.on_response_committed(ctx, *status_code, headers, body)
+                    .await;
+            }
+        }
+        result
+    }
+}
+
 /// Drive request + response capture for `body`/`resp_body`, return emitted records.
 async fn capture_roundtrip(config_overrides: Value, resp_body: &[u8]) -> Vec<Value> {
     let server = mock_sink().await;
@@ -138,7 +186,7 @@ async fn capture_roundtrip(config_overrides: Value, resp_body: &[u8]) -> Vec<Val
         .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
         .await;
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, resp_body)
+        .capture_final_response_body(&mut ctx, 200, &headers, resp_body)
         .await;
     wait_for_records(&server).await
 }
@@ -158,6 +206,7 @@ async fn name_priority_and_protocols() {
     assert_eq!(plugin.priority(), priority::AI_TRANSCRIPT_AUDIT);
     assert_eq!(plugin.priority(), 2924);
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    assert!(plugin.requires_response_committed_hook());
     // Registration matches the observability sink family (http/tcp/udp_logging,
     // prometheus_metrics): a construction failure omits the plugin rather than
     // rejecting startup/reload. Runtime fail-closed capture is the explicit
@@ -496,7 +545,7 @@ async fn request_capture_redacts_decoded_json_string_escapes() {
         )
         .await;
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -539,7 +588,7 @@ async fn request_capture_redacts_json_keys_and_numeric_scalars() {
         )
         .await;
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -580,7 +629,7 @@ async fn request_capture_applies_custom_redactor_to_serialized_json_payload() {
         )
         .await;
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -630,7 +679,7 @@ async fn non_json_buffered_response_does_not_export_body_or_hash() {
         .await;
     let response_headers = content_type_headers("text/html");
     plugin
-        .on_final_response_body(
+        .capture_final_response_body(
             &mut ctx,
             200,
             &response_headers,
@@ -674,7 +723,7 @@ data: [DONE]
 
 "#;
     plugin
-        .on_final_response_body(&mut ctx, 200, &response_headers, body)
+        .capture_final_response_body(&mut ctx, 200, &response_headers, body)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -751,7 +800,7 @@ async fn sampling_rate_zero_skips_by_default() {
         .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
         .await;
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     // Give any (erroneous) async send a chance to arrive.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -786,7 +835,7 @@ async fn sampling_rate_zero_still_captures_on_guardrail() {
     ctx.metadata
         .insert("ai_response_guard_detected".to_string(), "true".to_string());
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(
@@ -816,7 +865,7 @@ async fn sampling_rate_zero_captures_non_empty_guardrail_metadata() {
         "ssn,email".to_string(),
     );
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -843,7 +892,7 @@ async fn sampling_rate_zero_captures_reject_guardrail_markers() {
             .await;
         ctx.metadata.insert(key.to_string(), value.to_string());
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
             .await;
         let records = wait_for_records(&server).await;
         assert_eq!(records.len(), 1, "expected guardrail capture for {key}");
@@ -870,7 +919,7 @@ async fn sampling_rate_zero_captures_scoped_semantic_firewall_metadata() {
         "warn".to_string(),
     );
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -892,7 +941,7 @@ async fn error_status_capture_reason_is_error() {
         .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
         .await;
     plugin
-        .on_final_response_body(&mut ctx, 500, &headers, br#"{"error":"boom"}"#)
+        .capture_final_response_body(&mut ctx, 500, &headers, br#"{"error":"boom"}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -1060,7 +1109,7 @@ async fn final_body_hook_refreshes_staged_capture_after_transforms() {
     );
 
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -1104,7 +1153,7 @@ async fn backend_path_after_proxy_does_not_revert_final_request_capture_from_sta
         .after_proxy(&mut ctx, 200, &mut response_headers)
         .await;
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -1141,7 +1190,7 @@ async fn synthetic_response_refreshes_live_request_metadata_before_emitting() {
 
     let headers = json_headers();
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -1451,7 +1500,7 @@ async fn redaction_runs_before_truncation_at_capture_boundary() {
         .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
         .await;
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -1664,7 +1713,7 @@ async fn sink_recovers_after_transient_outage_with_reject_policy() {
             .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
             .await;
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
             .await
     }
 
@@ -1729,7 +1778,7 @@ async fn harvests_guardrail_and_token_metadata() {
         "allow".to_string(),
     );
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -1766,7 +1815,7 @@ async fn records_per_minute_limit_drops_excess() {
             .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
             .await;
         let result = plugin
-            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
             .await;
         assert!(matches!(result, PluginResult::Continue));
     }
@@ -1859,7 +1908,7 @@ data: [DONE]
 
 "#;
     plugin
-        .on_final_response_body(&mut ctx, 200, &response_headers, body)
+        .capture_final_response_body(&mut ctx, 200, &response_headers, body)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -1887,7 +1936,7 @@ async fn buffered_json_response_not_captured_when_response_capture_disabled() {
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
     let result = plugin
-        .on_final_response_body(&mut ctx, 200, &json_headers(), br#"{"choices":[]}"#)
+        .capture_final_response_body(&mut ctx, 200, &json_headers(), br#"{"choices":[]}"#)
         .await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(
@@ -1922,7 +1971,7 @@ async fn custom_sink_headers_are_sent_with_env_expansion() {
         .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
         .await;
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -1996,7 +2045,7 @@ async fn privacy_client_ip_and_redacted_response_headers_captured() {
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
     plugin
-        .on_final_response_body(&mut ctx, 200, &response_headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &response_headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -2024,7 +2073,7 @@ async fn tool_names_extracted_from_tools_and_functions() {
         .on_final_request_body_with_context(&mut ctx, &headers, body)
         .await;
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -2088,7 +2137,7 @@ async fn framed_grpc_response_does_not_export_body() {
         .await;
     let response_headers = content_type_headers("application/grpc");
     plugin
-        .on_final_response_body(&mut ctx, 200, &response_headers, b"\x00\x00\x00\x00\x02hi")
+        .capture_final_response_body(&mut ctx, 200, &response_headers, b"\x00\x00\x00\x00\x02hi")
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -2132,14 +2181,14 @@ async fn log_fallback_emits_from_summary_envelope() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn unsampled_response_later_turned_error_is_captured_via_log() {
-    // rate 0, backend 2xx: `on_final_response_body` does not emit but must KEEP
-    // the staging entry, so a later validator that turns the response into a 5xx
-    // is still captured by `always_capture_on_error` via the log fallback.
+async fn sampled_validator_rejected_response_emits_committed_status_and_body() {
+    // rate 1, backend 2xx: the sampled audit record is deferred. A later
+    // validator replaces the response, and the committed hook must export that
+    // client-visible rejection rather than the backend success.
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
     let plugin = AiTranscriptAudit::new(
-        &config_with_sink(&endpoint, json!({ "sampling": { "rate": 0.0 } })),
+        &config_with_sink(&endpoint, json!({ "sampling": { "rate": 1.0 } })),
         loopback_http_client(),
     )
     .unwrap();
@@ -2148,22 +2197,24 @@ async fn unsampled_response_later_turned_error_is_captured_via_log() {
     plugin
         .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
         .await;
-    // Unsampled 2xx at the audit hook: not emitted, staging retained.
+    // Sampled backend 2xx at the audit hook: not emitted until commit.
     let result = plugin
         .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     assert!(matches!(result, PluginResult::Continue));
-    // A later final-response validator rejected the response: the summary is 5xx.
-    let mut summary = create_test_transaction_summary();
-    summary.response_status_code = 500;
-    summary.metadata = ctx.metadata.clone();
-    plugin.log(&summary).await;
+    let rejection_body = br#"{"error":"response schema validation failed"}"#;
+    plugin
+        .on_response_committed(&mut ctx, 422, &headers, rejection_body)
+        .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["status_code"], 500);
+    assert_eq!(records[0]["status_code"], 422);
+    assert_eq!(
+        records[0]["response_body"],
+        "{\"error\":\"response schema validation failed\"}"
+    );
     assert_eq!(records[0]["capture_reason"], "error");
-    // The sampling roll was false; only the error override forced the capture.
-    assert_eq!(records[0]["sampled"], false);
+    assert_eq!(records[0]["sampled"], true);
 }
 
 #[tokio::test]
@@ -2189,7 +2240,7 @@ async fn provider_prefers_ai_provider_over_federation_name() {
     ctx.metadata
         .insert("ai_provider".to_string(), "anthropic".to_string());
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -2218,7 +2269,7 @@ async fn sampled_field_reflects_roll_not_emit_on_guardrail_capture() {
     ctx.metadata
         .insert("ai_shield_rejected".to_string(), "true".to_string());
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -2320,7 +2371,7 @@ async fn fail_closed_record_carries_503_status() {
             .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
             .await;
         let _ = plugin
-            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let received = server.received_requests().await.unwrap_or_default();
@@ -2603,7 +2654,7 @@ async fn request_derived_model_and_tool_names_are_redacted() {
             .on_final_request_body_with_context(&mut ctx, &headers, body)
             .await;
         plugin
-            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
             .await;
         let records = wait_for_records(&server).await;
         assert_eq!(records.len(), 1, "overrides: {overrides}");
@@ -2638,7 +2689,7 @@ async fn request_derived_model_and_tool_names_are_redacted() {
         .on_final_request_body_with_context(&mut ctx, &headers, body)
         .await;
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
@@ -2669,7 +2720,7 @@ async fn transaction_log_sampled_flag_carries_roll_not_emit() {
     ctx.metadata
         .insert("ai_shield_rejected".to_string(), "true".to_string());
     plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
     assert_eq!(
         ctx.metadata
@@ -2903,7 +2954,7 @@ async fn non_retryable_sink_4xx_marks_sink_unhealthy_under_reject() {
             .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
             .await;
         let result = plugin
-            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
             .await;
         if matches!(
             result,
@@ -2964,7 +3015,7 @@ async fn sink_2xx_after_4xx_restores_health() {
             .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
             .await;
         let result = plugin
-            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
             .await;
         match result {
             PluginResult::Reject { .. } => saw_reject = true,
@@ -3151,11 +3202,10 @@ async fn sampled_flag_is_written_at_staging_for_streamed_and_request_only() {
 }
 
 #[tokio::test]
-async fn unsampled_buffered_retention_stamps_deferred_sink_status() {
+async fn unsampled_buffered_precommit_stamps_deferred_sink_status() {
     // rate 0, buffered 2xx, no overrides: staging is retained for a possible
-    // later-validator error emission via the log fallback, so the stamped
-    // sink_status must be the non-terminal `deferred`, not a terminal
-    // `skipped` that would lie if the fallback later emits.
+    // later-validator error emission at commit, so the pre-commit sink_status
+    // must remain the non-terminal `deferred`.
     let plugin = AiTranscriptAudit::new(
         &config_with_sink(
             "https://audit.example.com/x",

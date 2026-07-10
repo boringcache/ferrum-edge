@@ -322,6 +322,20 @@ impl Plugin for PriorityOverridePlugin {
             .on_final_response_body(ctx, response_status, response_headers, body)
             .await
     }
+    fn requires_response_committed_hook(&self) -> bool {
+        self.inner.requires_response_committed_hook()
+    }
+    async fn on_response_committed(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+    ) {
+        self.inner
+            .on_response_committed(ctx, response_status, response_headers, body)
+            .await;
+    }
     async fn on_response_stream_terminated(
         &self,
         ctx: &mut RequestContext,
@@ -524,20 +538,21 @@ fn same_proxy_group_plugin_config(left: &PluginConfig, right: &PluginConfig) -> 
 /// Bitflags for per-protocol plugin capability checks. Avoids per-request
 /// `plugins.iter().any(|p| p.some_flag())` scans on the hot path.
 #[derive(Clone, Copy, Default)]
-pub struct PluginCapabilities(u8);
+pub struct PluginCapabilities(u16);
 
 impl PluginCapabilities {
-    pub const HAS_AUTH_PLUGINS: u8 = 1 << 0;
-    pub const MODIFIES_REQUEST_HEADERS: u8 = 1 << 1;
-    pub const MODIFIES_REQUEST_BODY: u8 = 1 << 2;
-    pub const HAS_BODY_BEFORE_BEFORE_PROXY: u8 = 1 << 3;
-    pub const NEEDS_REQUEST_BODY_BYTES: u8 = 1 << 4;
-    pub const HAS_BODY_BEFORE_AUTHENTICATE: u8 = 1 << 5;
-    pub const NEEDS_DECODED_QUERY_PARAMS: u8 = 1 << 6;
-    pub const NEEDS_FINAL_REQUEST_BODY_CONTEXT: u8 = 1 << 7;
+    pub const HAS_AUTH_PLUGINS: u16 = 1 << 0;
+    pub const MODIFIES_REQUEST_HEADERS: u16 = 1 << 1;
+    pub const MODIFIES_REQUEST_BODY: u16 = 1 << 2;
+    pub const HAS_BODY_BEFORE_BEFORE_PROXY: u16 = 1 << 3;
+    pub const NEEDS_REQUEST_BODY_BYTES: u16 = 1 << 4;
+    pub const HAS_BODY_BEFORE_AUTHENTICATE: u16 = 1 << 5;
+    pub const NEEDS_DECODED_QUERY_PARAMS: u16 = 1 << 6;
+    pub const NEEDS_FINAL_REQUEST_BODY_CONTEXT: u16 = 1 << 7;
+    pub const HAS_RESPONSE_COMMITTED_HOOK: u16 = 1 << 8;
 
     #[inline(always)]
-    pub fn has(self, flag: u8) -> bool {
+    pub fn has(self, flag: u16) -> bool {
         self.0 & flag != 0
     }
 }
@@ -558,7 +573,7 @@ pub struct PluginPhaseData {
 
 /// Build `PluginPhaseData` from a protocol-filtered plugin list.
 fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
-    let mut caps = 0u8;
+    let mut caps = 0u16;
     let mut auth = Vec::new();
     let mut authorize = Vec::new();
     let mut backend_admission = Vec::new();
@@ -593,6 +608,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.needs_final_request_body_context() {
             caps |= PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT;
+        }
+        if p.requires_response_committed_hook() {
+            caps |= PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK;
         }
     }
     PluginPhaseData {

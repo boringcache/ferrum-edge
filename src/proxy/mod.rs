@@ -20,9 +20,10 @@
 //! 9. **Plugin: on_response_body** — raw backend body inspection before transforms:
 //!    AI token metrics, AI rate limiter
 //! 10. **Plugin: transform_response_body** — body rewrites (e.g., response_transformer)
-//! 11. **Plugin: on_final_response_body** — final client-visible body validation/storage:
+//! 11. **Plugin: on_final_response_body** — buffered body validation/storage:
 //!     body validation, response size limiting, response caching
-//! 12. **Plugin: log** — stdout/HTTP logging, Prometheus, OpenTelemetry
+//! 12. **Plugin: on_response_committed** — observe-only final buffered status/body export
+//! 13. **Plugin: log** — stdout/HTTP logging, Prometheus, OpenTelemetry
 //!
 //! Key design principles:
 //! - **Lock-free reads**: All config access uses `ArcSwap::load()` — no mutexes on the hot path
@@ -12535,9 +12536,9 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     body: &mut Vec<u8>,
     is_grpc_request: bool,
 ) {
-    if !plugins.is_empty()
-        && should_apply_synthetic_response_body_hooks(*status, is_grpc_request, body, plugins, ctx)
-    {
+    let applied_synthetic_body_hooks = !plugins.is_empty()
+        && should_apply_synthetic_response_body_hooks(*status, is_grpc_request, body, plugins, ctx);
+    if applied_synthetic_body_hooks {
         // KNOWN ORDERING DIVERGENCE (accepted, documented trade-off):
         //
         // On the synthetic short-circuit path the response-BODY hooks
@@ -12574,6 +12575,23 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // emitted onto whatever the client actually receives. Runs LAST by design —
     // see the divergence note above.
     apply_after_proxy_hooks_to_rejection(plugins, ctx, *status, headers).await;
+
+    // Synthetic responses bypass the normal buffered backend-response path.
+    // Observe only after final-body validators, rejection replacement, and the
+    // synthetic path's deliberately-late response-header hooks. This path
+    // already performs plugin capability scans to decide whether body hooks
+    // apply, so the additional scan remains confined to synthetic short-circuits.
+    if applied_synthetic_body_hooks
+        && plugins
+            .iter()
+            .any(|plugin| plugin.requires_response_committed_hook())
+    {
+        for plugin in plugins.iter() {
+            plugin
+                .on_response_committed(ctx, *status, headers, body)
+                .await;
+        }
+    }
 }
 
 pub(crate) struct AfterProxyReject {
@@ -16428,6 +16446,21 @@ async fn handle_proxy_request_inner(
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
 
+                if capabilities.has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
+                    let phase_start = Instant::now();
+                    for plugin in plugins.iter() {
+                        plugin
+                            .on_response_committed(
+                                &mut ctx,
+                                response_status,
+                                &plugin_response_headers,
+                                &response_body,
+                            )
+                            .await;
+                    }
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                }
+
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
                 let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
                 let plugin_external_io_ms =
@@ -17913,6 +17946,21 @@ async fn handle_proxy_request_inner(
             )
             .await;
             response_body = ResponseBody::Buffered(body);
+        }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
+    // Observe the response only after final-body rejection replacement. The
+    // precomputed capability bit keeps this phase to one predictable branch
+    // when no exporter is configured.
+    if capabilities.has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
+        && let ResponseBody::Buffered(ref data) = response_body
+    {
+        let phase_start = Instant::now();
+        for plugin in plugins.iter() {
+            plugin
+                .on_response_committed(&mut ctx, response_status, &response_headers, data)
+                .await;
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }

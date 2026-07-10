@@ -5,6 +5,7 @@
 //! `before_proxy` → `transform_request_body` → `on_final_request_body` →
 //! `backend_admission` → `after_proxy` → `normalize_response_body` →
 //! `on_response_body` → `transform_response_body` → `on_final_response_body` →
+//! `on_response_committed` (buffered responses only) →
 //! `on_response_stream_terminated` (streamed responses only) → `log` →
 //! `on_ws_frame`.
 //!
@@ -3141,6 +3142,31 @@ pub trait Plugin: Send + Sync {
         _body: &[u8],
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Returns `true` when this plugin needs the observe-only committed response
+    /// hook for buffered responses.
+    ///
+    /// The plugin cache precomputes this capability so requests pay only a bit
+    /// test when no exporter needs the hook.
+    fn requires_response_committed_hook(&self) -> bool {
+        false
+    }
+
+    /// Observes the final client-visible buffered response after every
+    /// `on_final_response_body` hook and any resulting rejection replacement.
+    ///
+    /// This hook cannot mutate or reject the response. Exporters should keep
+    /// fail-closed admission checks in an earlier rejecting hook, then construct
+    /// and enqueue records here so status and body describe what the client will
+    /// receive.
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
     }
 
     /// Called exactly once when a streamed, non-buffered response body reaches a

@@ -48,6 +48,9 @@ transform_response_body()       ── can transform response body (buffered onl
 on_final_response_body()        ── can reject (post-transform validation)
   │
   ▼
+on_response_committed()         ── observe-only final buffered status/body
+  │
+  ▼
 log()                           ── fire-and-forget
   │
   ▼
@@ -225,6 +228,7 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `on_response_body(&mut ctx, status, &headers, &body)` | Post-backend (buffered) | Yes | Inspect buffered response body, extract metrics |
 | `transform_response_body(&body, content_type, &headers)` | Post-backend (buffered) | No | Rewrite response body before sending to client |
 | `on_final_response_body(&mut ctx, status, &headers, &body)` | Post-backend (post-transform) | Yes | Validate the final response body after all transforms |
+| `on_response_committed(&mut ctx, status, &headers, &body)` | Post-backend (buffered commit) | No | Export the final client-visible buffered response after validators and rejection replacement; opt in with `requires_response_committed_hook()` |
 | `response_stream_inspector(&ctx, status, content_type)` | Post-backend (streaming) | No (can truncate) | Create one stateful, per-response body inspector |
 | `on_response_stream_terminated(&mut ctx, status, outcome)` | Post-backend (streaming terminal) | No | Clean up/account for streaming state and write aggregate transaction metadata before logging; does not receive body bytes |
 | `log(&summary)` | Logging | No | Send transaction data to external systems |
@@ -527,6 +531,13 @@ async fn transform_response_body(
     None // Some(new_body) replaces it
 }
 ```
+
+Exporters that must observe the response after all rejecting validators should
+also return `true` from `requires_response_committed_hook()` and emit from
+`on_response_committed()`. That hook receives the final buffered status,
+headers, and body, but returns `()` and therefore cannot mutate or reject the
+response. Keep any fail-closed sink-health admission in an earlier rejecting
+hook; keep sampling, redaction, and record shaping inside the exporter.
 
 ### Inspect while streaming
 

@@ -1079,6 +1079,17 @@ impl AiTranscriptAudit {
             }
         }
     }
+
+    fn buffered_response_capture_enabled(
+        &self,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.capture.response
+            || (self.capture.streaming != StreamingCapture::Off
+                && response_headers
+                    .get("content-type")
+                    .is_some_and(|content_type| is_event_stream(content_type)))
+    }
 }
 
 #[async_trait]
@@ -1275,7 +1286,7 @@ impl Plugin for AiTranscriptAudit {
         ctx: &mut RequestContext,
         response_status: u16,
         response_headers: &HashMap<String, String>,
-        body: &[u8],
+        _body: &[u8],
     ) -> PluginResult {
         // `capture.response` gates buffered *JSON* responses. A buffered SSE body
         // can still reach this hook when streaming capture is enabled but the
@@ -1284,11 +1295,7 @@ impl Plugin for AiTranscriptAudit {
         // path left to attach the response transcript. Honor the streaming
         // policy (`response_body_capture_allowed` already permits SSE) even when
         // buffered JSON capture is off.
-        let buffered_sse_capture = self.capture.streaming != StreamingCapture::Off
-            && response_headers
-                .get("content-type")
-                .is_some_and(|content_type| is_event_stream(content_type));
-        if !self.capture.response && !buffered_sse_capture {
+        if !self.buffered_response_capture_enabled(response_headers) {
             return PluginResult::Continue;
         }
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
@@ -1313,10 +1320,73 @@ impl Plugin for AiTranscriptAudit {
             ctx.metadata.insert("request_body".to_string(), body);
         }
 
-        let captures_response_body = response_body_capture_allowed(self.capture, response_headers);
-        let response_hash = captures_response_body.then(|| self.redactor.keyed_hash_hex(body));
+        // Peek (do not consume) the staging entry for the fail-closed gate. The
+        // observe-only committed hook consumes it after every validator has run.
+        let sample_hit = self
+            .staging
+            .get(&record_id)
+            .map(|staging| staging.sample_hit)
+            .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
+        let (emit, _reason) = self.emit_decision(
+            sample_hit,
+            guardrail_fired(&ctx.metadata),
+            response_status >= 400,
+        );
 
-        // Peek (do not consume) the staging entry to make the emit decision.
+        // The transaction-log `sampled` flag carries the sampling ROLL (matching
+        // the exported record's `sampled` field), not the emit decision —
+        // `sink_status` already conveys whether a record was emitted.
+        ctx.metadata
+            .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
+
+        if !emit {
+            // A later validator can still turn this response into an error and
+            // make it eligible for `always_capture_on_error`.
+            ctx.metadata
+                .insert(MD_SINK_STATUS.to_string(), "deferred".to_string());
+            return PluginResult::Continue;
+        }
+
+        // Keep rejection-capable sink admission here, before the response is
+        // committed. Record construction and enqueue happen later with the
+        // final status/body. The committed 503 record remains a recovery probe:
+        // a successful flush flips sink health back to true.
+        let sink_unhealthy_reject = self.on_sink_error == SinkErrorPolicy::Reject
+            && !self.sink_healthy.load(Ordering::Relaxed);
+        let queue_full_reject = self.on_buffer_full == BufferFullPolicy::Reject
+            && self.logger.queue_depth() >= self.logger.buffer_capacity();
+        if sink_unhealthy_reject || queue_full_reject {
+            ctx.metadata
+                .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
+            return reject_audit_unavailable();
+        }
+        ctx.metadata
+            .insert(MD_SINK_STATUS.to_string(), "deferred".to_string());
+        PluginResult::Continue
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        self.capture.response || self.capture.streaming != StreamingCapture::Off
+    }
+
+    async fn on_response_committed(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) {
+        if !self.buffered_response_capture_enabled(response_headers) {
+            return;
+        }
+        let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
+            return;
+        };
+        if !flag(&ctx.metadata, MD_CANDIDATE) {
+            self.staging.remove(&record_id);
+            return;
+        }
+
         let sample_hit = self
             .staging
             .get(&record_id)
@@ -1327,67 +1397,28 @@ impl Plugin for AiTranscriptAudit {
             guardrail_fired(&ctx.metadata),
             response_status >= 400,
         );
+        ctx.metadata
+            .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
 
+        let staging = self.staging.remove(&record_id).map(|(_, value)| value);
+        if !emit {
+            ctx.metadata
+                .insert(MD_SINK_STATUS.to_string(), "skipped".to_string());
+            return;
+        }
+
+        let captures_response_body = response_body_capture_allowed(self.capture, response_headers);
+        let response_hash = captures_response_body.then(|| self.redactor.keyed_hash_hex(body));
         if let Some(response_hash) = response_hash.as_ref() {
             ctx.metadata
                 .insert(MD_RESPONSE_HASH.to_string(), response_hash.clone());
         }
-        // The transaction-log `sampled` flag carries the sampling ROLL (matching
-        // the exported record's `sampled` field), not the emit decision —
-        // `sink_status` already conveys whether a record was emitted.
-        ctx.metadata
-            .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
-
-        if !emit {
-            // Leave the staging entry in place. A later same-phase validator
-            // (`body_validator` 2950, `openapi_validator` 2960) can still turn
-            // this response into a 4xx/5xx after us; the `log` fallback then
-            // re-evaluates `always_capture_on_error` against the final
-            // client-visible status and is the only path that can emit that
-            // plugin-generated error. Discarding staging here would drop it.
-            // The stamped status is deliberately non-terminal: `log()` runs
-            // after the summary metadata was captured and cannot rewrite it,
-            // so a terminal "skipped" would lie whenever the fallback later
-            // emits. `deferred` = no record was emitted at response time, but
-            // one may still be emitted via the log fallback — correlate by
-            // `record_id` against the collector.
-            ctx.metadata
-                .insert(MD_SINK_STATUS.to_string(), "deferred".to_string());
-            return PluginResult::Continue;
-        }
-        // A response hook is emitting now, so consume the staging entry to keep
-        // the `log` fallback from emitting a duplicate. Accepted limitation: a
-        // later same-phase validator (2950/2960) that replaces the response
-        // AFTER this emit leaves the exported record with the backend
-        // status/body; the transaction log carries the client-visible status
-        // plus `record_id` for correlation. No hook exists that has the final
-        // status, the body, and fail-closed rejection at once — proxy-core
-        // follow-up: issue #2056.
-        let staging = self.staging.remove(&record_id).map(|(_, value)| value);
         let (response_excerpt, response_truncated) = if captures_response_body {
             self.shape_body(body, self.limits.max_response_bytes)
         } else {
             (None, false)
         };
-        // Fail-closed stance while the sink is unhealthy: the client request
-        // is rejected, but the record is still built and enqueued below. The
-        // background flush of those queued records is the recovery probe — a
-        // successful batch send flips `sink_healthy` back to true. Without
-        // this, one transient sink outage would reject audited traffic
-        // forever (nothing would ever enqueue, so nothing could ever flush).
-        let sink_unhealthy_reject = self.on_sink_error == SinkErrorPolicy::Reject
-            && !self.sink_healthy.load(Ordering::Relaxed);
-
-        // When we are about to fail closed, the client-visible outcome is the 503
-        // from `reject_audit_unavailable()`, not the backend status — stamp that
-        // on the record so the collector does not read a fail-closed outage as a
-        // successful 2xx transaction.
-        let record_status = if sink_unhealthy_reject {
-            503
-        } else {
-            response_status
-        };
-        let envelope = self.envelope_from_ctx(ctx, record_status);
+        let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(
             &record_id,
             envelope,
@@ -1405,14 +1436,8 @@ impl Plugin for AiTranscriptAudit {
             SinkOutcome::Dropped => "dropped",
             SinkOutcome::Rejected => "rejected",
         };
-        if sink_unhealthy_reject || status == "rejected" {
-            ctx.metadata
-                .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
-            return reject_audit_unavailable();
-        }
         ctx.metadata
             .insert(MD_SINK_STATUS.to_string(), status.to_string());
-        PluginResult::Continue
     }
 
     // ---- streaming (SSE) response capture ----
