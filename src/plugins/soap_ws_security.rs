@@ -2085,8 +2085,9 @@ fn canonicalize_node(
 }
 
 fn add_required_prefix<'a>(prefixes: &mut Vec<(&'a str, bool)>, prefix: &'a str, required: bool) {
-    if let Some((_, existing_required)) =
-        prefixes.iter_mut().find(|(existing, _)| existing == prefix)
+    if let Some((_, existing_required)) = prefixes
+        .iter_mut()
+        .find(|(existing, _)| *existing == prefix)
     {
         *existing_required |= required;
     } else {
