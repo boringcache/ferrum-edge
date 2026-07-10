@@ -7645,6 +7645,7 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
             waypoint_name: None,
             env_overrides: vec![
                 ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                ("FERRUM_LOG_LEVEL", "debug".to_string()),
                 ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
                 ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
                 ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
@@ -7868,7 +7869,21 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     wait_for_udp_capture_snapshot(pod.pid(), capture_port, false, Duration::from_secs(12))
         .expect("pod deletion must remove UDP rules/listener");
 
+    // Closing A ends the CONNECT stream. B's relay-completion log is emitted
+    // only by `handle_hbone_udp_request` after it accepted the UDP-marked HBONE
+    // CONNECT and relayed the framed datagrams, so this proves the round trip did
+    // not pass through a direct/plaintext dial from A to the loopback echo.
     gateway_a.stop();
+    assert!(
+        wait_for_captured_output(
+            &temp_b,
+            "HBONE UDP tunnel relay completed",
+            Duration::from_secs(5),
+        )
+        .await,
+        "gateway B did not confirm the UDP HBONE relay\n{}",
+        captured_output(&temp_b)
+    );
     gateway_b.stop();
     cp_a.shutdown().await;
     cp_b.shutdown().await;
@@ -8003,6 +8018,20 @@ async fn wait_for_tcp_port_in_netns(pid: u32, port: u16, timeout: Duration) -> b
         })
         .unwrap_or(false);
         if connected {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_captured_output(temp: &TempDir, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if captured_output(temp).contains(needle) {
             return true;
         }
         if Instant::now() >= deadline {
@@ -8175,6 +8204,20 @@ async fn functional_mesh_live_source_capture_raw_tcp_mtls_round_trip() {
     capture_config.ip6tables_mode = ferrum_edge::capture::Ip6TablesMode::Disabled;
     let setup_script = ferrum_edge::capture::IptablesPlan::for_config(&capture_config).script();
     netns_command(veth.pod.pid(), &setup_script).expect("install production TCP REDIRECT rules");
+
+    // Gateway A runs as uid 1337 inside the pod netns. Deny that uid direct
+    // access to the echo port while leaving B's mesh-mTLS listener reachable.
+    // A plaintext/direct-target regression therefore cannot reach the backend;
+    // the round trip can succeed only through B's CONNECT relay (which runs in
+    // the host netns and dials the echo as the destination gateway).
+    netns_command(
+        veth.pod.pid(),
+        &format!(
+            "iptables -w 5 -t filter -I OUTPUT 1 -p tcp --dport {echo_port} \
+             -m owner --uid-owner 1337 -j REJECT"
+        ),
+    )
+    .expect("isolate raw-TCP echo from gateway A direct dials");
 
     let destination: SocketAddr = format!("{VIP}:{echo_port}").parse().expect("TCP VIP");
     let (reply, peer) = tcp_round_trip_from_netns(
