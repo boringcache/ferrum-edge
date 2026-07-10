@@ -1981,8 +1981,9 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   chain would capture and drop the HBONE relay's own delivery to the local app
   (`handle_hbone_udp_request` → local `UdpSocket`) AND the source pod's return-path
   reply to the client — black-holing the relayed UDP both ways. It rides the per-pod
-  registry the node-agent publishes (now also published for Ambient when UDP capture
-  is enabled). Before touching stale state or binding the unprivileged capture port,
+  registry the node-agent publishes (also published for Ambient while UDP is
+  disabled so stale-rule cleanup can still resolve current pod netns). Before
+  touching stale state or binding the unprivileged capture port,
   it installs a dedicated fail-closed OUTPUT guard that mirrors the exact configured
   outbound capture scope. The guard uses alternating chains so guarded retries build
   and activate a replacement before removing the prior guard; a workload that

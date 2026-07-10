@@ -286,10 +286,12 @@ impl NodeAgentConfig {
             capture_config.include_cidrs.push("::/0".to_string());
         }
         // Publish the per-pod registry (uid → cgroup) when EITHER the NodeWaypoint
-        // TCP in-netns capture path needs it (the historical consumer) OR an
-        // Ambient UDP capture producer will consume it (`FERRUM_MESH_CAPTURE_UDP_
-        // ENABLED`, #2013): Ambient's mesh proxy runs the `NetnsUdpCaptureManager`
-        // over this same registry to open per-pod-netns UDP capture. The registry
+        // TCP in-netns capture path needs it (the historical consumer) OR the
+        // topology is Ambient. Ambient's mesh proxy consumes the same registry
+        // for both the enabled `NetnsUdpCaptureManager` producer and the disabled
+        // `NetnsUdpCleanupManager`; suppressing publication when UDP is disabled
+        // would make an enabled-to-disabled rollout unable to visit pod netns and
+        // reap stale rules from the prior producer (#2013, codex). The registry
         // is a generic per-pod map; publishing it does NOT change eBPF/redirect
         // behavior — that stays gated on `node_waypoint_in_netns` via the capture
         // contract, so a plain Ambient (LocalPod) deployment gets the registry for
@@ -308,13 +310,13 @@ impl NodeAgentConfig {
         // `.udp-ready/<uid>`.
         let mesh_topology =
             resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").unwrap_or_else(|| "sidecar".to_string());
-        let ambient_udp_producer = capture_config.udp_capture_enabled
-            && mesh_topology.trim().eq_ignore_ascii_case("ambient");
+        let ambient_topology = mesh_topology.trim().eq_ignore_ascii_case("ambient");
+        let ambient_udp_producer = capture_config.udp_capture_enabled && ambient_topology;
         // The node-agent readiness guard is meaningful only when the Ambient
         // mesh runtime starts `NetnsUdpCaptureManager`. Other topologies keep
         // their documented unsupported/pass-through posture.
         capture_config.udp_capture_enabled = ambient_udp_producer;
-        let should_publish_registry = node_waypoint_in_netns || ambient_udp_producer;
+        let should_publish_registry = node_waypoint_in_netns || ambient_topology;
         let node_waypoint_pod_registry_dir = if should_publish_registry {
             Some(std::path::PathBuf::from(
                 &env_config.mesh_node_waypoint_pod_registry_dir,
@@ -4951,6 +4953,33 @@ mod tests {
                         .iter()
                         .any(|cidr| cidr == "::/0"),
                     "the UDP producer must not force the NodeWaypoint ::/0 include"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_config_keeps_ambient_registry_for_disabled_udp_cleanup() {
+        let local_pod = EnvConfig {
+            node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
+            ..EnvConfig::default()
+        };
+        with_env_vars(
+            &[
+                ("FERRUM_NODE_AGENT_NODE_NAME", "node-udp-cleanup"),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "false"),
+                ("FERRUM_MESH_TOPOLOGY", "ambient"),
+            ],
+            || {
+                let config = NodeAgentConfig::from_env_config(&local_pod)
+                    .expect("node-agent config should parse");
+                assert!(
+                    !config.capture_config.udp_capture_enabled,
+                    "disabled cleanup must not arm the UDP readiness guard"
+                );
+                assert!(
+                    config.node_waypoint_pod_registry_dir.is_some(),
+                    "Ambient must keep publishing pod netns for disabled stale-rule cleanup"
                 );
             },
         );

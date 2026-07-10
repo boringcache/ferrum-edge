@@ -237,12 +237,15 @@ override or the pod-loopback peer.
 
 ### Also consumed by the Ambient UDP capture producer (#2013)
 
-The **same** registry is published for **Ambient** deployments when UDP capture
-is enabled (`FERRUM_MESH_CAPTURE_UDP_ENABLED=true`): the node-agent publish gate
-is `should_publish_registry = node_waypoint_in_netns || ambient_udp_producer`.
-The UDP term additionally requires `FERRUM_MESH_TOPOLOGY=ambient`; setting the
-shared UDP flag on a topology that starts no per-pod producer does not arm a BPF
-guard that could never become ready.
+The **same** registry is published for every **Ambient** deployment. The enabled
+producer consumes it when `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`; when UDP is
+disabled, the stale-rule cleanup manager still needs current pod netns entries
+to repair an enabled-to-disabled rollout. The node-agent publish gate is
+`should_publish_registry = node_waypoint_in_netns || ambient_topology`, while
+the BPF UDP readiness guard remains separately gated on both the UDP flag and
+`FERRUM_MESH_TOPOLOGY=ambient`. Setting the shared UDP flag on a topology that
+starts no per-pod producer therefore does not arm a guard that could never
+become ready.
 The UDP term is deliberately **not** anded with `outbound_capture_enabled`: the
 Ambient UDP producer binds its own `FERRUM_MESH_CAPTURE_UDP_PORT` inside each
 pod netns and never uses the TCP `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` listener, so
@@ -252,8 +255,8 @@ empty directory while pod UDP egress bypasses capture. Publishing for the
 Ambient-UDP case does **not** flip the NodeWaypoint ipv6-outbound-deny /
 connect4-deferral posture (that stays gated on `node_waypoint_in_netns`) — it
 only makes the per-pod `uid → cgroup` registry available so the Ambient mesh
-proxy's `NetnsUdpCaptureManager` (`src/proxy/netns_udp_capture.rs`) can discover
-enrolled pods. For each pod the producer enters the pod netns
+proxy's producer or disabled cleanup manager (`src/proxy/netns_udp_capture.rs`)
+can discover enrolled pods. For each pod the producer enters the pod netns
 (`setns(CLONE_NEWNET)` on a dedicated thread), installs a dedicated fail-closed
 OUTPUT guard, then binds the transparent capture socket and installs the UDP
 TPROXY rules while that guard remains active. The guard mirrors the operator's
