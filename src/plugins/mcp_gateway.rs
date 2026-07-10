@@ -3523,15 +3523,11 @@ fn reverse_resource_uri(
         return ReverseResourceUri::Mapped(public_uri);
     }
 
-    // Check for an already-public URI only after exact and template upstream
-    // bindings: an upstream may use a native `mcp://` URI whose authority
-    // happens to equal this gateway's server id, and it must still be
-    // namespaced when a configured template matches it.
-    if public_resource_uri_parts(upstream_uri)
-        .is_some_and(|(public_server_id, _)| public_server_id == server_id)
-    {
-        return ReverseResourceUri::Unchanged;
-    }
+    // No exact resource or template binding matched. This includes native
+    // `mcp://` URIs whose authority happens to equal this gateway's server id:
+    // exact/template matching runs first (so a configured template still
+    // namespaces them), and anything left over has no upstream binding to
+    // reverse-map, so it must pass through unchanged.
     ReverseResourceUri::Unchanged
 }
 
