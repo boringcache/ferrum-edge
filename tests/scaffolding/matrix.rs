@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn grpc_status_assertion_accepts_inactive_request_stream_with_formatted_error() {
-        let mut headers = HeaderMap::new();
+        let mut headers = http::HeaderMap::new();
         headers.insert("grpc-status", "14".parse().unwrap());
         let response = MatrixResponse::Grpc(GrpcResponse {
             http_status: 200,
