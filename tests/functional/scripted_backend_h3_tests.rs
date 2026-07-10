@@ -2096,12 +2096,14 @@ async fn h3_mid_body_reset_and_goaway_surface_protocol_error_family() {
             "{name} was falsely classified as a connection reset instead of a stream protocol error; logs:\n{logs}"
         );
 
-        let downgraded = wait_for_h3_class(&harness, "unsupported", Duration::from_secs(5))
+        let capability = fetch_capability_entry(&harness)
             .await
-            .expect("capability lookup");
-        assert!(
-            downgraded.is_some(),
-            "{name} protocol failure must apply the documented next-request H3 downgrade"
+            .expect("capability lookup")
+            .expect("capability entry");
+        assert_eq!(
+            capability["plain_http"]["h3"].as_str(),
+            Some("supported"),
+            "{name} is a post-headers stream fault and must not falsely downgrade the backend's H3 capability; capability={capability:#?}"
         );
         let requests = h3_backend.received_requests().await;
         assert!(

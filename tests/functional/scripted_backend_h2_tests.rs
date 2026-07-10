@@ -529,11 +529,6 @@ async fn h2_pool_opens_fresh_connection_after_prior_stream_reset() {
                     ("content-type", "application/grpc".into()),
                 ]),
                 H2Step::SendRstStream { error_code: 7 },
-                // Keep the reset connection alive. If the gateway poisons the
-                // pool correctly, request two opens connection index 1; if it
-                // wrongly reuses this H2 connection, no script step services
-                // that stream and the bounded client fails.
-                H2Step::Sleep(Duration::from_secs(2)),
             ],
             vec![
                 H2Step::ExpectHeaders(MatchHeaders::any()),
@@ -579,6 +574,12 @@ async fn h2_pool_opens_fresh_connection_after_prior_stream_reset() {
             || first.trailers.is_none(),
         "first RPC must expose the scripted reset; response={first:?}"
     );
+
+    // The connection-index-0 script terminates after its RST_STREAM and the
+    // fixture gives the H2 driver a bounded 100ms flush tail. Wait beyond that
+    // tail so request two deterministically exercises stale-pool replacement,
+    // not a request-write-vs-connection-close race.
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let second = tokio::time::timeout(
         Duration::from_secs(4),
