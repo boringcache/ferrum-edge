@@ -3550,19 +3550,6 @@ where
                 }
             }
 
-            if has_response_committed_hook {
-                for plugin in plugins.iter() {
-                    plugin
-                        .on_response_committed(
-                            ctx,
-                            response_status,
-                            &plugin_response_headers,
-                            &response_body,
-                        )
-                        .await;
-                }
-            }
-
             // Reconcile hook edits/removals from the merged view back into the
             // wire trailers, then assemble the initial HEADERS frame from the
             // view. H3 always uses the split wire shape — real initial headers
@@ -3626,6 +3613,19 @@ where
                 })
             {
                 response_trailers.clear();
+            }
+
+            if has_response_committed_hook {
+                for plugin in plugins.iter() {
+                    plugin
+                        .on_response_committed(
+                            ctx,
+                            response_status,
+                            &response_headers,
+                            &response_body,
+                        )
+                        .await;
+                }
             }
 
             if let Err(error) =

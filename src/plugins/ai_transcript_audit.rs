@@ -641,7 +641,7 @@ impl AiTranscriptAudit {
     /// immutable. The permit is stored with the bounded request staging and is
     /// consumed only after validators determine the final status/body.
     fn ensure_commit_admission(&self, ctx: &mut RequestContext) -> PluginResult {
-        if !self.capture.response {
+        if !self.requires_response_committed_hook() {
             return PluginResult::Continue;
         }
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
@@ -1391,6 +1391,13 @@ impl Plugin for AiTranscriptAudit {
         ctx.metadata
             .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
 
+        if self.commit_may_emit(sample_hit) {
+            let admission = self.ensure_commit_admission(ctx);
+            if !matches!(admission, PluginResult::Continue) {
+                return admission;
+            }
+        }
+
         if !emit {
             // A later validator can still turn this response into an error and
             // make it eligible for `always_capture_on_error`.
@@ -1403,12 +1410,6 @@ impl Plugin for AiTranscriptAudit {
         // committed. Record construction and enqueue happen later with the
         // final status/body. The committed 503 record remains a recovery probe:
         // a successful flush flips sink health back to true.
-        if self.commit_may_emit(sample_hit) {
-            let admission = self.ensure_commit_admission(ctx);
-            if !matches!(admission, PluginResult::Continue) {
-                return admission;
-            }
-        }
         ctx.metadata
             .insert(MD_SINK_STATUS.to_string(), "deferred".to_string());
         PluginResult::Continue

@@ -12584,10 +12584,25 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         .iter()
         .any(|plugin| plugin.requires_response_committed_hook())
     {
-        for plugin in plugins.iter() {
-            plugin
-                .on_response_committed(ctx, *status, headers, body)
-                .await;
+        if is_grpc_request {
+            let status_code = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let normalized = normalize_reject_response(status_code, body, headers, true);
+            for plugin in plugins.iter() {
+                plugin
+                    .on_response_committed(
+                        ctx,
+                        normalized.http_status.as_u16(),
+                        &normalized.headers,
+                        &normalized.body,
+                    )
+                    .await;
+            }
+        } else {
+            for plugin in plugins.iter() {
+                plugin
+                    .on_response_committed(ctx, *status, headers, body)
+                    .await;
+            }
         }
     }
 }
@@ -16444,79 +16459,6 @@ async fn handle_proxy_request_inner(
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
 
-                if capabilities.has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
-                    let phase_start = Instant::now();
-                    for plugin in plugins.iter() {
-                        plugin
-                            .on_response_committed(
-                                &mut ctx,
-                                response_status,
-                                &plugin_response_headers,
-                                &response_body,
-                            )
-                            .await;
-                    }
-                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                }
-
-                let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-                let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
-                let plugin_external_io_ms =
-                    ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-                let gateway_processing_ms = total_ms - backend_total_ms;
-                let gateway_overhead_ms =
-                    (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
-
-                // Log phase
-                if !plugins.is_empty() {
-                    // Resolve backend IP from DNS cache for gRPC tx log
-                    let grpc_resolved_ip = state
-                        .dns_cache
-                        .resolve(
-                            &proxy.backend_host,
-                            proxy.dns_override.as_deref(),
-                            proxy.dns_cache_ttl_seconds,
-                        )
-                        .await
-                        .ok()
-                        .map(|ip| ip.to_string());
-
-                    // gRPC buffered-success path — `response_body` holds the
-                    // full gRPC response frame (protobuf + trailers). Its
-                    // length is the bytes that will flow to the client.
-                    let bytes_sent = ctx
-                        .bytes_sent_observed
-                        .load(std::sync::atomic::Ordering::Acquire);
-                    let bytes_received = response_body.len() as u64;
-                    let summary = TransactionSummary {
-                        namespace: proxy.namespace.clone(),
-                        timestamp_received: ctx.timestamp_received.to_rfc3339(),
-                        client_ip: ctx.client_ip.clone(),
-                        consumer_username: ctx.effective_identity().map(str::to_owned),
-                        auth_method: ctx.auth_method,
-                        http_method: method,
-                        request_path: original_request_path.clone(),
-                        proxy_id: Some(proxy.id.clone()),
-                        proxy_name: proxy.name.clone(),
-                        backend_target: Some(strip_query_params(&grpc_backend_url).to_string()),
-                        backend_resolved_ip: grpc_resolved_ip,
-                        response_status_code: response_status,
-                        latency_total_ms: total_ms,
-                        latency_gateway_processing_ms: gateway_processing_ms,
-                        latency_backend_ttfb_ms: backend_total_ms,
-                        latency_backend_total_ms: backend_total_ms,
-                        latency_plugin_execution_ms: plugin_execution_ms,
-                        latency_plugin_external_io_ms: plugin_external_io_ms,
-                        latency_gateway_overhead_ms: gateway_overhead_ms,
-                        request_user_agent: ctx.headers.get("user-agent").cloned(),
-                        bytes_sent,
-                        bytes_received,
-                        metadata: clone_log_metadata(&ctx),
-                        ..TransactionSummary::default()
-                    };
-                    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
-                }
-
                 // Capture the backend's original trailer `set-cookie` (issue
                 // #1638) before reconciliation overwrites it, so the re-homing
                 // step below can distinguish a hook-contributed value from the
@@ -16641,6 +16583,74 @@ async fn handle_proxy_request_inner(
                             })
                             .or_insert(cookie_val);
                     }
+                }
+
+                if capabilities.has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
+                    let phase_start = Instant::now();
+                    for plugin in plugins.iter() {
+                        plugin
+                            .on_response_committed(
+                                &mut ctx,
+                                response_status,
+                                &response_headers,
+                                &response_body,
+                            )
+                            .await;
+                    }
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                }
+
+                let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+                let plugin_external_io_ms =
+                    ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+                let gateway_processing_ms = total_ms - backend_total_ms;
+                let gateway_overhead_ms =
+                    (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
+
+                // Log only after committed exporters write their final metadata.
+                if !plugins.is_empty() {
+                    let grpc_resolved_ip = state
+                        .dns_cache
+                        .resolve(
+                            &proxy.backend_host,
+                            proxy.dns_override.as_deref(),
+                            proxy.dns_cache_ttl_seconds,
+                        )
+                        .await
+                        .ok()
+                        .map(|ip| ip.to_string());
+                    let bytes_sent = ctx
+                        .bytes_sent_observed
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    let bytes_received = response_body.len() as u64;
+                    let summary = TransactionSummary {
+                        namespace: proxy.namespace.clone(),
+                        timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                        client_ip: ctx.client_ip.clone(),
+                        consumer_username: ctx.effective_identity().map(str::to_owned),
+                        auth_method: ctx.auth_method,
+                        http_method: method,
+                        request_path: original_request_path.clone(),
+                        proxy_id: Some(proxy.id.clone()),
+                        proxy_name: proxy.name.clone(),
+                        backend_target: Some(strip_query_params(&grpc_backend_url).to_string()),
+                        backend_resolved_ip: grpc_resolved_ip,
+                        response_status_code: response_status,
+                        latency_total_ms: total_ms,
+                        latency_gateway_processing_ms: gateway_processing_ms,
+                        latency_backend_ttfb_ms: backend_total_ms,
+                        latency_backend_total_ms: backend_total_ms,
+                        latency_plugin_execution_ms: plugin_execution_ms,
+                        latency_plugin_external_io_ms: plugin_external_io_ms,
+                        latency_gateway_overhead_ms: gateway_overhead_ms,
+                        request_user_agent: ctx.headers.get("user-agent").cloned(),
+                        bytes_sent,
+                        bytes_received,
+                        metadata: clone_log_metadata(&ctx),
+                        ..TransactionSummary::default()
+                    };
+                    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
 
                 record_request(&state, response_status);
