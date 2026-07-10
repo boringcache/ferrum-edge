@@ -34,6 +34,7 @@ pub mod ai_semantic_cache;
 pub mod ai_semantic_firewall;
 pub mod ai_stream_router;
 pub mod ai_token_metrics;
+pub mod ai_tool_governor;
 pub mod ai_transcript_audit;
 pub mod api_chargeback;
 pub mod api_chargeback_sink;
@@ -473,6 +474,26 @@ pub struct RequestContext {
     /// final body hooks. Kept out of public metadata so per-instance state does
     /// not leak into transaction logs.
     pub(crate) openapi_validator_matches: HashMap<usize, (String, String)>,
+    /// Per-`ai_tool_governor`-instance internal correlation markers staged between
+    /// `on_response_body` / `transform_response_body` and the
+    /// `on_final_response_body` re-check. Kept out of public `metadata` so this
+    /// per-request bookkeeping — the governed-body hash and the per-call
+    /// identity multiset, both DERIVED FROM RAW TOOL ARGUMENTS — never reaches
+    /// transaction logs (an operator who disabled `observability.hash_arguments`
+    /// must not get an arg-derived hash logged via a correlation marker).
+    /// The outer key is a process-unique governor instance ID. Multiple
+    /// instances may coexist on one proxy and must never consume each other's
+    /// dedup state.
+    pub(crate) ai_tool_governor_response_hashes: HashMap<u64, String>,
+    /// Per-instance governed-call identity multisets (identity hash -> count),
+    /// the one-for-one skip ledgers final re-checks consume. Kept off
+    /// `metadata` for the same reason as the response hashes.
+    pub(crate) ai_tool_governor_call_hashes: HashMap<u64, HashMap<String, usize>>,
+    /// Per-instance governed-request-body hashes, staged in `before_proxy` for
+    /// the `on_final_request_body` re-check. Same leak class as the response
+    /// markers (a hash over the raw request body including tool-call arguments),
+    /// so they remain off `metadata` too.
+    pub(crate) ai_tool_governor_request_hashes: HashMap<u64, String>,
     /// A2A gateway detection state staged between request and response hooks.
     /// Kept out of public metadata so Agent Card rewriting can work even when
     /// `observability.emit_metadata` is disabled.
@@ -723,6 +744,9 @@ impl RequestContext {
             ai_semantic_cache_embedding: None,
             ai_semantic_cache_scope_key: None,
             openapi_validator_matches: HashMap::new(),
+            ai_tool_governor_response_hashes: HashMap::new(),
+            ai_tool_governor_call_hashes: HashMap::new(),
+            ai_tool_governor_request_hashes: HashMap::new(),
             a2a_gateway_detected: false,
             a2a_gateway_binding: None,
             a2a_gateway_is_agent_card: false,
@@ -801,6 +825,9 @@ impl RequestContext {
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
+            ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
+            ai_tool_governor_call_hashes: self.ai_tool_governor_call_hashes.clone(),
+            ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,
             a2a_gateway_binding: self.a2a_gateway_binding,
             a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
@@ -2231,7 +2258,7 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_transcript_audit (2924), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_transcript_audit (2924), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_federation (4060), ai_response_guard (4075), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365) |
@@ -2286,6 +2313,12 @@ pub mod priority {
     pub const OPENAPI_VALIDATOR: u16 = 2960;
     pub const AI_SEMANTIC_FIREWALL: u16 = 2968;
     pub const AI_REQUEST_GUARD: u16 = 2975;
+    /// `ai_tool_governor`: deterministic allow/deny/approval policy on AI tool /
+    /// function calls (names, arguments, JSON Schema, regex, identity, approval).
+    /// Runs after semantic/request admission but before `ai_semantic_cache` and
+    /// `ai_federation` so disallowed tool schemas are screened before caching or
+    /// federation routing.
+    pub const AI_TOOL_GOVERNOR: u16 = 2978;
     pub const AI_SEMANTIC_CACHE: u16 = 2980;
     /// `ai_stream_router`: claims streaming (`"stream": true`) OpenAI Chat
     /// Completions requests, rewrites `route_override_*` to the matched provider,
@@ -3465,6 +3498,10 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.clone(),
         )?))),
+        "ai_tool_governor" => Ok(Some(Arc::new(ai_tool_governor::AiToolGovernor::new(
+            config,
+            http_client.clone(),
+        )?))),
         "ai_transcript_audit" => Ok(Some(Arc::new(ai_transcript_audit::AiTranscriptAudit::new(
             config,
             http_client.clone(),
@@ -3815,6 +3852,7 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     ),
     builtin_plugin("ai_semantic_firewall", PluginFailurePolicy::FailClosed),
     builtin_plugin("ai_response_guard", PluginFailurePolicy::FailClosed),
+    builtin_plugin("ai_tool_governor", PluginFailurePolicy::FailClosed),
     builtin_plugin("ai_semantic_cache", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("ai_stream_router", PluginFailurePolicy::FailClosed),
     builtin_plugin("ai_federation", PluginFailurePolicy::KeepLastKnownGood),

@@ -229,6 +229,7 @@ async fn test_all_plugins_available() {
         "ai_response_guard",
         "ai_semantic_cache",
         "ai_semantic_firewall",
+        "ai_tool_governor",
         "ai_transcript_audit",
         "geo_restriction",
         "request_deduplication",
@@ -413,6 +414,9 @@ async fn test_plugin_creation_all_plugins() {
                     "endpoint": "http://127.0.0.1:9/v1/embeddings",
                     "request_timeout_ms": 100
                 }
+            }),
+            "ai_tool_governor" => json!({
+                "tools": { "github.create_pr": { "action": "allow" } }
             }),
             // ai_transcript_audit requires an HTTP sink endpoint.
             "ai_transcript_audit" => json!({

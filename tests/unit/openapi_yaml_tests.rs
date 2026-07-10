@@ -74,6 +74,119 @@ fn access_control_schema_matches_runtime_validation() {
     }
 }
 
+#[test]
+fn ai_tool_governor_schema_matches_runtime_invariants() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let mut schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/AiToolGovernorConfig"
+    });
+    schema
+        .as_object_mut()
+        .expect("schema should be object")
+        .insert("components".to_string(), spec["components"].clone());
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("AiToolGovernorConfig schema compiles");
+
+    for config in [
+        json!({
+            "enabled": false,
+            "mode": "ignored-invalid-mode",
+            "default_action": "ignored-invalid-action",
+            "tools": {"": {"action": "ignored-invalid-action"}},
+            "inspect": "ignored-invalid-inspection",
+            "approval": "ignored-invalid-approval"
+        }),
+        json!({"default_action": "deny", "tools": {}}),
+        json!({"tools": {"search": {"action": "allow"}}}),
+        json!({
+            "tools": {
+                "search": {
+                    "action": "redact_args",
+                    "required_args": ["query"],
+                    "blocked_arg_patterns": [{"name": "secret", "regex": "secret"}]
+                }
+            }
+        }),
+        json!({
+            "default_action": "allow",
+            "tools": {"deploy": {"action": "require_approval"}},
+            "inspect": {"request_tool_definitions": true, "response_tool_calls": false}
+        }),
+        json!({
+            "mode": "dry_run",
+            "tools": {"deploy": {"action": "require_approval"}}
+        }),
+        json!({
+            "tools": {"deploy": {"action": "require_approval"}},
+            "approval": {"endpoint_url": "https://approval.example/decide"}
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "config should be valid: {config}"
+        );
+    }
+
+    for config in [
+        json!({
+            "tools": {"search": {"action": "allow"}},
+            "inspect": {
+                "request_tool_definitions": false,
+                "response_tool_calls": false,
+                "streaming_response_tool_calls": false,
+                "mcp_tool_calls": false,
+                "a2a_methods": false
+            }
+        }),
+        json!({"default_action": "allow"}),
+        json!({"default_action": "allow", "tools": {}}),
+        json!({"tools": {"": {"action": "deny"}}}),
+        json!({"tools": {"search": {"action": "redact_args"}}}),
+        json!({
+            "tools": {"search": {"action": "redact_args", "blocked_arg_patterns": []}}
+        }),
+        json!({
+            "tools": {
+                "search": {
+                    "action": "redact_args",
+                    "blocked_arg_patterns": [{"name": "", "regex": "secret"}]
+                }
+            }
+        }),
+        json!({
+            "tools": {
+                "search": {
+                    "action": "redact_args",
+                    "blocked_arg_patterns": [{"name": "secret", "regex": ""}]
+                }
+            }
+        }),
+        json!({"tools": {"deploy": {"action": "require_approval"}}}),
+        json!({"default_action": "require_approval", "tools": {}}),
+        json!({"tools": {"search": {"action": "allow", "required_args": [""]}}}),
+        json!({
+            "tools": {"deploy": {"action": "require_approval"}},
+            "approval": {"endpoint_url": ""}
+        }),
+        json!({
+            "tools": {"deploy": {"action": "require_approval"}},
+            "approval": {"endpoint_url": "ftp://approval.example/decide"}
+        }),
+        json!({
+            "tools": {"deploy": {"action": "require_approval"}},
+            "approval": {"endpoint_url": "https:///decide"}
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_err(),
+            "config should be invalid: {config}"
+        );
+    }
+}
+
 fn plugin_config_schema_mapping(spec: &serde_json::Value) -> BTreeMap<String, String> {
     let all_of = spec
         .pointer("/components/schemas/PluginConfig/allOf")
