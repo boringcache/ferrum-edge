@@ -494,6 +494,18 @@ pub struct RequestContext {
     /// markers (a hash over the raw request body including tool-call arguments),
     /// so they remain off `metadata` too.
     pub(crate) ai_tool_governor_request_hashes: HashMap<u64, String>,
+    /// Process-unique id for an attached response-stream inspector chain.
+    /// Assigned only after at least one configured plugin opts into streaming
+    /// hooks for the response, and cleared again when every factory returns
+    /// `None`. Stateful plugins use it to correlate inspector-owned results
+    /// with [`Plugin::on_response_stream_terminated`] without putting internal
+    /// correlation keys in transaction metadata.
+    pub(crate) response_stream_id: Option<u64>,
+    /// Completion signal paired with `response_stream_id`. The detached H1/H2
+    /// inspector task may still be finishing an async decision after the
+    /// downstream body is dropped; terminal logging waits on this signal before
+    /// draining plugin write-back state.
+    response_stream_completion: Option<Arc<ResponseStreamCompletion>>,
     /// A2A gateway detection state staged between request and response hooks.
     /// Kept out of public metadata so Agent Card rewriting can work even when
     /// `observability.emit_metadata` is disabled.
@@ -747,6 +759,8 @@ impl RequestContext {
             ai_tool_governor_response_hashes: HashMap::new(),
             ai_tool_governor_call_hashes: HashMap::new(),
             ai_tool_governor_request_hashes: HashMap::new(),
+            response_stream_id: None,
+            response_stream_completion: None,
             a2a_gateway_detected: false,
             a2a_gateway_binding: None,
             a2a_gateway_is_agent_card: false,
@@ -784,6 +798,14 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
         }
+    }
+
+    /// Correlation id for the concrete response-stream inspector chain, when
+    /// one attached to this request. Streaming plugins can key bounded shared
+    /// state by this id in `response_stream_inspector`, then remove and fold it
+    /// into `ctx.metadata` from `on_response_stream_terminated`.
+    pub fn response_stream_id(&self) -> Option<u64> {
+        self.response_stream_id
     }
 
     /// Build the lightweight compatibility context used by final request-body
@@ -828,6 +850,8 @@ impl RequestContext {
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
             ai_tool_governor_call_hashes: self.ai_tool_governor_call_hashes.clone(),
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
+            response_stream_id: self.response_stream_id,
+            response_stream_completion: self.response_stream_completion.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,
             a2a_gateway_binding: self.a2a_gateway_binding,
             a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
@@ -1574,6 +1598,128 @@ pub fn chain_response_stream_inspectors(
             Some(Box::new(ChainedResponseStreamInspector { inspectors }))
         }
     }
+}
+
+static NEXT_RESPONSE_STREAM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[derive(Debug)]
+struct ResponseStreamCompletion {
+    completed: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl ResponseStreamCompletion {
+    fn new() -> Self {
+        Self {
+            completed: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn complete(&self) {
+        if !self
+            .completed
+            .swap(true, std::sync::atomic::Ordering::Release)
+        {
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            if self.completed.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.completed.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct CompletionNotifyingInspector {
+    inner: Box<dyn ResponseStreamInspector>,
+    completion: Arc<ResponseStreamCompletion>,
+}
+
+#[async_trait]
+impl ResponseStreamInspector for CompletionNotifyingInspector {
+    fn stage(&self) -> ResponseStreamInspectorStage {
+        self.inner.stage()
+    }
+
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        self.inner.on_chunk(chunk).await
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        self.inner.on_end().await
+    }
+
+    fn on_downstream_terminated(&mut self) {
+        self.inner.on_downstream_terminated();
+    }
+}
+
+impl Drop for CompletionNotifyingInspector {
+    fn drop(&mut self) {
+        self.completion.complete();
+    }
+}
+
+/// Resolve and compose the inspectors for one streaming response.
+///
+/// The common path is allocation-free: when no plugin opts into response
+/// streaming hooks this returns immediately. The correlation id is assigned
+/// only on the opted-in path, and is removed again when every plugin factory
+/// declines the concrete response, so terminal hooks cannot mistake an
+/// uninspected stream for one with pending write-back state.
+#[doc(hidden)]
+pub fn create_response_stream_inspector(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: u16,
+    content_type: Option<&str>,
+) -> Option<Box<dyn ResponseStreamInspector>> {
+    if !plugins
+        .iter()
+        .any(|plugin| plugin.requires_response_stream_hooks())
+    {
+        return None;
+    }
+
+    ctx.response_stream_id =
+        Some(NEXT_RESPONSE_STREAM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let inspectors: Vec<_> = plugins
+        .iter()
+        .filter_map(|plugin| plugin.response_stream_inspector(ctx, response_status, content_type))
+        .collect();
+    let inspector = chain_response_stream_inspectors(inspectors);
+    if let Some(inspector) = inspector {
+        let completion = Arc::new(ResponseStreamCompletion::new());
+        ctx.response_stream_completion = Some(Arc::clone(&completion));
+        Some(Box::new(CompletionNotifyingInspector {
+            inner: inspector,
+            completion,
+        }))
+    } else {
+        ctx.response_stream_id = None;
+        ctx.response_stream_completion = None;
+        None
+    }
+}
+
+pub(crate) async fn wait_for_response_stream_inspector(ctx: &RequestContext) {
+    if let Some(completion) = &ctx.response_stream_completion {
+        completion.wait().await;
+    }
+}
+
+pub(crate) fn clear_response_stream_inspector_state(ctx: &mut RequestContext) {
+    ctx.response_stream_id = None;
+    ctx.response_stream_completion = None;
 }
 
 /// Run buffered provider/protocol normalizers before response-body policy
@@ -3003,13 +3149,15 @@ pub trait Plugin: Send + Sync {
     /// Unlike `on_response_body` / `on_final_response_body`, this hook does not
     /// receive body bytes and cannot replace the response. It exists for plugins
     /// that hold per-request state across streaming responses and need the same
-    /// terminal signal the proxy uses for deferred logging/accounting. This is
-    /// distinct from [`ResponseStreamInspector`] chunk inspection: it is a
-    /// state-cleanup notification and cannot inspect, forward, or truncate body
-    /// bytes.
+    /// terminal signal the proxy uses for deferred logging/accounting. The
+    /// mutable context is the write-back point for aggregate results captured by
+    /// an inspector: metadata written here is copied into the final
+    /// [`TransactionSummary`] before `log` runs. This is distinct from
+    /// [`ResponseStreamInspector`] chunk inspection: it cannot inspect, forward,
+    /// or truncate body bytes.
     async fn on_response_stream_terminated(
         &self,
-        _ctx: &RequestContext,
+        _ctx: &mut RequestContext,
         _response_status: u16,
         _outcome: &crate::proxy::deferred_log::BodyOutcome,
     ) {

@@ -788,8 +788,9 @@ impl HboneConnectionPool {
     /// connection caching a per-connection `hbone`-vs-`udp` verdict by its first
     /// marker), and a captured UDP flow is already a distinct session with its own
     /// lifetime. SVID rotation is automatic (each session dials with the current
-    /// SVID). The dial PINS `expected_peer`; a missing gateway SVID fails closed
-    /// before the dial. Distinct from [`Self::get_tunnel`], which hardcodes the
+    /// SVID). In-cluster dials pin `expected_peer`; cross-cluster dials use the
+    /// supplied trust-domain scope and SNI override. A missing gateway SVID fails
+    /// closed before the dial. Distinct from [`Self::get_tunnel`], which hardcodes the
     /// `hbone` marker on the pooled byte-stream path.
     //
     // Callers: the mesh UDP capture egress datapath (Linux-only, `IP_TRANSPARENT`)
@@ -805,6 +806,8 @@ impl HboneConnectionPool {
         app_port: u16,
         app_policy_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
+        expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
+        sni_override: Option<&str>,
         asserted_source: Option<&UdpSourceIdentity>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
         let (source_identity, _fingerprint) = self.current_svid_identity_cached()?;
@@ -833,10 +836,8 @@ impl HboneConnectionPool {
             dial_host,
             hbone_port,
             expected_peer,
-            // Datagram-over-HBONE is in-cluster only here; no trust-domain scope
-            // / SNI override (cross-cluster UDP is not in scope).
-            None,
-            None,
+            expected_trust_domain,
+            sni_override,
             &pool_config,
             keepalive_override,
             Some(connect_timeout),
@@ -898,6 +899,8 @@ impl HboneConnectionPool {
                 app_port,
                 app_policy_port,
                 expected_peer,
+                None,
+                None,
                 None,
             )
             .await?;
