@@ -722,7 +722,6 @@ impl SoapWsSecurity {
         let signed_info_node = unique_child_element(sig_node, "SignedInfo", "WS-Security")?
             .ok_or_else(|| "WS-Security: Signature missing SignedInfo element".to_string())?;
         let sig_block = node_source(envelope, sig_node)?;
-        let signed_info = node_source(envelope, signed_info_node)?;
 
         // Determine signature algorithm
         let sig_method = unique_child_element(signed_info_node, "SignatureMethod", "WS-Security")?
@@ -756,7 +755,7 @@ impl SoapWsSecurity {
 
         // Check that Timestamp is signed (if required)
         if self.require_signed_timestamp {
-            self.verify_timestamp_is_signed(&signed_info, security_block)?;
+            self.verify_timestamp_is_signed(signed_info_node, security_node)?;
         }
 
         // Extract SignatureValue
@@ -973,42 +972,33 @@ impl SoapWsSecurity {
 
     fn verify_timestamp_is_signed(
         &self,
-        signed_info: &str,
-        security_block: &str,
+        signed_info: Node<'_, '_>,
+        security_node: Node<'_, '_>,
     ) -> Result<(), String> {
-        // Find the wsu:Id of the Timestamp element
-        let ts_block = match find_element_block(security_block, "Timestamp") {
-            Some(b) => b,
+        let timestamp = match descendant_element(security_node, "Timestamp") {
+            Some(timestamp) => timestamp,
             None => return Ok(()), // No timestamp to sign — timestamp validation handles this
         };
+        let ts_id = timestamp
+            .attributes()
+            .find(|attribute| {
+                attribute.name() == "Id"
+                    && (attribute.namespace().is_none()
+                        || attribute.namespace() == Some(WSU_NAMESPACE_URI))
+            })
+            .map(|attribute| attribute.value())
+            .ok_or_else(|| {
+                "WS-Security: Timestamp has no wsu:Id — cannot verify it is signed".to_string()
+            })?;
 
-        let ts_start = security_block
-            .find(&ts_block)
-            .ok_or_else(|| "WS-Security: Timestamp block could not be located".to_string())?;
-        let ts_id = match find_wsu_id_in_xml(security_block, ts_start) {
-            Some(id) => id,
-            None => {
-                return Err(
-                    "WS-Security: Timestamp has no wsu:Id — cannot verify it is signed".to_string(),
-                );
-            }
-        };
-
-        // Iterate each <Reference> and compare its parsed URI attribute
-        // against `#<timestamp-id>`. A naive substring check on `signed_info`
-        // would accept prefix matches (e.g. `URI="#TS-1abc"` for `TS-1`) and
-        // would also miss valid signatures that use whitespace around `=`
-        // (`URI = "#TS-1"`) or single quotes. Parsing each Reference's URI
-        // via `find_attribute` handles all of these uniformly.
+        // DOM attribute values are entity-decoded, matching Reference
+        // resolution and canonicalization semantics.
         let expected = format!("#{}", ts_id);
-        let mut search_from = 0;
-        while let Some((ref_block, next_start)) =
-            find_element_block_from_with_end(signed_info, "Reference", search_from)
+        for reference in signed_info
+            .children()
+            .filter(|node| node.has_tag_name("Reference"))
         {
-            search_from = next_start.max(search_from + 1);
-            if let Some(uri) = find_attribute(&ref_block, "URI")
-                && uri == expected
-            {
+            if reference.attribute("URI") == Some(expected.as_str()) {
                 return Ok(());
             }
         }
@@ -2400,36 +2390,10 @@ pub(crate) fn find_element_by_wsu_id_in_range(
     None
 }
 
-/// Extract the standards-resolvable WS-Security Utility id attribute from an
-/// element. Bare `Id` is accepted for compatibility; prefixed `*:Id` attributes
-/// are accepted only when that prefix is bound to the WSU namespace URI.
-fn find_wsu_id_in_xml(xml: &str, tag_start: usize) -> Option<String> {
-    let tag_end_rel = find_start_tag_end(xml, tag_start)?;
-    let tag = xml.get(tag_start + 1..tag_start + tag_end_rel)?;
-    let namespaces = namespace_bindings_for_tag(xml, tag_start)?;
-    find_resolvable_wsu_id_value_in_tag(tag, &namespaces)
-}
-
 fn tag_has_resolvable_wsu_id(tag: &str, id: &str, namespaces: &HashMap<String, String>) -> bool {
     scan_tag_attributes(tag, |name, value| {
         is_resolvable_wsu_id_attribute_name(name, namespaces) && value == id
     })
-}
-
-fn find_resolvable_wsu_id_value_in_tag(
-    tag: &str,
-    namespaces: &HashMap<String, String>,
-) -> Option<String> {
-    let mut found = None;
-    scan_tag_attributes(tag, |name, value| {
-        if is_resolvable_wsu_id_attribute_name(name, namespaces) {
-            found = Some(value.to_string());
-            true
-        } else {
-            false
-        }
-    });
-    found
 }
 
 fn is_resolvable_wsu_id_attribute_name(name: &str, namespaces: &HashMap<String, String>) -> bool {
@@ -2450,17 +2414,6 @@ fn is_resolvable_wsu_id_attribute_name(name: &str, namespaces: &HashMap<String, 
 struct NamespaceFrame {
     element_name: String,
     previous_bindings: Vec<(String, Option<String>)>,
-}
-
-fn namespace_bindings_for_tag(
-    xml: &str,
-    target_tag_start: usize,
-) -> Option<HashMap<String, String>> {
-    let (mut namespaces, _) = namespace_state_before_tag(xml, target_tag_start)?;
-    let tag_end_rel = find_start_tag_end(xml, target_tag_start)?;
-    let tag = xml.get(target_tag_start + 1..target_tag_start + tag_end_rel)?;
-    apply_namespace_declarations(tag, &mut namespaces);
-    Some(namespaces)
 }
 
 fn namespace_state_before_tag(
@@ -2521,15 +2474,6 @@ fn extract_full_tag_name_from_tag(tag: &str) -> Option<&str> {
     } else {
         Some(&trimmed[..end])
     }
-}
-
-fn apply_namespace_declarations(tag: &str, namespaces: &mut HashMap<String, String>) {
-    scan_tag_attributes(tag, |name, value| {
-        if let Some(prefix) = name.strip_prefix("xmlns:") {
-            namespaces.insert(prefix.to_string(), value.to_string());
-        }
-        false
-    });
 }
 
 fn apply_namespace_declarations_with_history(

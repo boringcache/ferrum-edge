@@ -2491,6 +2491,24 @@ mod x509_roundtrip {
     }
 
     #[tokio::test]
+    async fn entity_encoded_timestamp_id_is_recognized_as_signed() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+        let body =
+            build_signed_soap_envelope(&cert).replace("wsu:Id=\"TS-1\"", "wsu:Id=\"TS&#x2D;1\"");
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "entity-equivalent timestamp ID should remain signed, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn entity_encoded_id_and_raw_duplicate_are_rejected_as_wrapping() {
         let cert = mint_rsa_cert();
         let cert_file = write_pem_to_tempfile(&cert.cert_pem);
