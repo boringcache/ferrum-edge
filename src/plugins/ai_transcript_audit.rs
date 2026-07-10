@@ -655,10 +655,6 @@ impl AiTranscriptAudit {
         }
 
         if self.on_buffer_full == BufferFullPolicy::Reject && staging.commit_permit.is_none() {
-            // Keep the reservation across a content-type downgrade to the SSE
-            // streaming path. Sampled/override stream records are not complete
-            // until `on_response_stream_terminated`; releasing here would make
-            // `on_buffer_full: reject` best-effort after the response committed.
             let Some(permit) = self.logger.try_reserve() else {
                 ctx.metadata
                     .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
@@ -1555,6 +1551,15 @@ impl Plugin for AiTranscriptAudit {
             return None;
         }
 
+        // The response is now known to use the streaming path. It cannot be
+        // rejected after its headers commit, so release any slot reserved by
+        // the conservative pre-header buffering decision. Stream-terminal
+        // enqueue remains best-effort, matching the documented fail-closed
+        // contract for buffered responses only.
+        if let Some(mut staging) = self.staging.get_mut(&record_id) {
+            staging.commit_permit.take();
+        }
+
         let slot = Arc::new(StreamSlot {
             captured: Mutex::new(None),
             downstream_terminated: AtomicBool::new(false),
@@ -1624,8 +1629,7 @@ impl Plugin for AiTranscriptAudit {
         }
 
         // A response already being streamed cannot run a new rejecting
-        // admission. A pre-commit reservation, when configured, remains in
-        // staging and is consumed by this enqueue instead.
+        // admission, so stream-terminal enqueue is best-effort.
         let mut staging = self.staging.remove(&record_id).map(|(_, value)| value);
         let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(

@@ -1318,6 +1318,54 @@ async fn error_sse_response_is_teed_when_error_capture_enabled() {
 }
 
 #[tokio::test]
+async fn sse_downgrade_releases_precommit_buffer_reservation() {
+    let plugin = AiTranscriptAudit::new(
+        &json!({
+            "capture": { "streaming_response": true },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/x",
+                "batch_size": 1,
+                "flush_interval_ms": 100,
+                "buffer_capacity": 1,
+                "on_buffer_full": "reject"
+            }
+        }),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let headers = json_headers();
+
+    let mut first = make_ctx();
+    first.metadata.insert(
+        "request_body".to_string(),
+        std::str::from_utf8(ai_request_body()).unwrap().to_string(),
+    );
+    let mut first_headers = headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut first, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        plugin
+            .response_stream_inspector(&first, 200, Some("text/event-stream"))
+            .is_some(),
+        "the unexpected SSE response must select the streaming inspector"
+    );
+
+    let mut second = make_ctx();
+    second.metadata.insert(
+        "request_body".to_string(),
+        std::str::from_utf8(ai_request_body()).unwrap().to_string(),
+    );
+    let mut second_headers = headers;
+    assert!(matches!(
+        plugin.before_proxy(&mut second, &mut second_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
 async fn stream_inspector_without_body_drive_does_not_emit_pending_record() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
