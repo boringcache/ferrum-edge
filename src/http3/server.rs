@@ -2551,6 +2551,21 @@ async fn handle_h3_request(
             .load(std::sync::atomic::Ordering::Relaxed) as f64
             / 1_000_000.0;
         let gateway_processing_ms = total_ms - outcome.backend_total_ms;
+        if outcome.response_streamed {
+            let stream_outcome = BodyOutcome {
+                body_completed: outcome.body_completed,
+                body_error_class: outcome.body_error_class,
+                bytes_streamed: outcome.bytes_streamed,
+                client_disconnected: outcome.client_disconnected,
+            };
+            run_response_stream_termination_hooks(
+                &plugins,
+                &mut ctx,
+                outcome.response_status,
+                &stream_outcome,
+            )
+            .await;
+        }
         let summary = TransactionSummary {
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -2588,21 +2603,6 @@ async fn handle_h3_request(
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
         };
-        if outcome.response_streamed {
-            let stream_outcome = BodyOutcome {
-                body_completed: outcome.body_completed,
-                body_error_class: outcome.body_error_class,
-                bytes_streamed: outcome.bytes_streamed,
-                client_disconnected: outcome.client_disconnected,
-            };
-            run_response_stream_termination_hooks(
-                &plugins,
-                &ctx,
-                summary.response_status_code,
-                &stream_outcome,
-            )
-            .await;
-        }
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
 
         return Ok(());
@@ -3077,18 +3077,13 @@ async fn handle_h3_request(
         // can be stripped — the inspector transforms the body, so the backend's
         // length no longer applies and would make a cut look like a truncated body.
         // Gated once per response; the common case (no opt-in) skips it entirely.
-        let mut response_inspector = if plugins.iter().any(|p| p.requires_response_stream_hooks()) {
-            let content_type = response_headers.get("content-type").map(String::as_str);
-            // Chain EVERY opted-in plugin (not just the first), gated to the
-            // response status so error bodies are not inspected.
-            let inspectors: Vec<_> = plugins
-                .iter()
-                .filter_map(|p| p.response_stream_inspector(&ctx, response_status, content_type))
-                .collect();
-            crate::plugins::chain_response_stream_inspectors(inspectors)
-        } else {
-            None
-        };
+        let content_type = response_headers.get("content-type").map(String::as_str);
+        let mut response_inspector = crate::plugins::create_response_stream_inspector(
+            &plugins,
+            &mut ctx,
+            response_status,
+            content_type,
+        );
         // Capture the backend's declared length BEFORE stripping it for the
         // client — the graceful-close recovery below still needs it to tell a
         // complete body from a truncated one (an inspected response strips
@@ -3480,6 +3475,18 @@ async fn handle_h3_request(
         let gateway_processing_ms = total_ms - backend_total_ms;
         let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
 
+        // Native H3 drives the inspector in this task rather than a detached
+        // body task. Drop it explicitly so the shared completion signal is set
+        // before terminal hooks wait and drain metadata.
+        drop(response_inspector);
+        let stream_outcome = BodyOutcome {
+            body_completed,
+            body_error_class,
+            bytes_streamed,
+            client_disconnected,
+        };
+        run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
+            .await;
         let summary = TransactionSummary {
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -3518,19 +3525,6 @@ async fn handle_h3_request(
             metadata: crate::proxy::clone_log_metadata(&ctx),
         };
 
-        let stream_outcome = BodyOutcome {
-            body_completed,
-            body_error_class,
-            bytes_streamed,
-            client_disconnected,
-        };
-        run_response_stream_termination_hooks(
-            &plugins,
-            &ctx,
-            summary.response_status_code,
-            &stream_outcome,
-        )
-        .await;
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
         record_request(&state, response_status);
         return Ok(());
@@ -3960,6 +3954,14 @@ async fn handle_h3_request(
         let gateway_processing_ms = total_ms - backend_total_ms;
         let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
 
+        let stream_outcome = BodyOutcome {
+            body_completed: h3_stream_result.body_completed,
+            body_error_class: h3_stream_result.body_error_class,
+            bytes_streamed: h3_stream_result.bytes_streamed,
+            client_disconnected: h3_stream_result.client_disconnected,
+        };
+        run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
+            .await;
         let summary = TransactionSummary {
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -3995,19 +3997,6 @@ async fn handle_h3_request(
             metadata: crate::proxy::clone_log_metadata(&ctx),
         };
 
-        let stream_outcome = BodyOutcome {
-            body_completed: h3_stream_result.body_completed,
-            body_error_class: h3_stream_result.body_error_class,
-            bytes_streamed: h3_stream_result.bytes_streamed,
-            client_disconnected: h3_stream_result.client_disconnected,
-        };
-        run_response_stream_termination_hooks(
-            &plugins,
-            &ctx,
-            summary.response_status_code,
-            &stream_outcome,
-        )
-        .await;
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
 
         record_request(&state, response_status);

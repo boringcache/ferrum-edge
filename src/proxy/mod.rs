@@ -5209,10 +5209,9 @@ impl ProxyState {
                     // (slice-declared sidecars speak mesh-mTLS by construction),
                     // so enrolling them would dial a non-existent `:15008` HBONE
                     // listener and record a spurious unsupported verdict. Also
-                    // skip any cross-cluster east-west target (HTTP-family-only by
-                    // construction, so it should never land on a raw-TCP upstream
-                    // — defensive: it dials the gateway `:15443`, never a
-                    // probeable `:15008`, and dispatch bypasses the registry).
+                    // skip cross-cluster east-west targets: they dial the
+                    // operator gateway `:15443`, never a probeable workload
+                    // `:15008`, and L4 dispatch bypasses the registry.
                     if !crate::proxy::hbone_pool::target_hbone_enabled(target)
                         || crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
                     {
@@ -5255,8 +5254,8 @@ impl ProxyState {
             for target in &upstream.targets {
                 // Ambient `mesh.hbone` per-workload targets only; Sidecar
                 // `mesh.mtls` (no probe) and cross-cluster east-west targets
-                // (HTTP-family-only, gateway-dialed, registry-bypassed) are
-                // excluded — same rationale as the VIP pass above.
+                // (gateway-dialed, registry-bypassed) are excluded — same
+                // rationale as the VIP pass above.
                 if !crate::proxy::hbone_pool::target_hbone_enabled(target)
                     || crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
                 {
@@ -5303,8 +5302,8 @@ impl ProxyState {
                 for target in &upstream.targets {
                     // Ambient `mesh.hbone` UDP targets only; Sidecar `mesh.mtls`
                     // (no probe) and cross-cluster east-west targets
-                    // (HTTP-family-only, gateway-dialed, registry-bypassed) are
-                    // excluded — same rationale as the raw-TCP passes above.
+                    // (gateway-dialed, registry-bypassed) are excluded — same
+                    // rationale as the raw-TCP passes above.
                     if !crate::proxy::hbone_pool::target_hbone_enabled(target)
                         || crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
                     {
@@ -15965,7 +15964,7 @@ async fn handle_proxy_request_inner(
                         Some(crate::proxy::deferred_log::DeferredTransactionLogger::new_with_start_time(
                             summary,
                             Arc::clone(&plugins),
-                            Arc::new(ctx.clone()),
+                            ctx.clone(),
                             start_time,
                         ))
                     }
@@ -17953,6 +17952,24 @@ async fn handle_proxy_request_inner(
             | ResponseBody::StreamingH2(_)
             | ResponseBody::StreamingH3(_)
     );
+    // Resolve the inspector before cloning the context into the deferred
+    // logger. The resolver stamps a private stream id only when an inspector
+    // actually attaches; the terminal hook uses that id to drain plugin-owned
+    // aggregate state into transaction metadata.
+    let response_inspector = if matches!(response_body, ResponseBody::Streaming { .. }) {
+        let content_type = response_headers.get("content-type").map(String::as_str);
+        crate::plugins::create_response_stream_inspector(
+            &plugins,
+            &mut ctx,
+            response_status,
+            content_type,
+        )
+    } else {
+        None
+    };
+    if response_inspector.is_some() {
+        response_headers.remove("content-length");
+    }
     let needs_transaction_summary =
         !plugins.is_empty() || body_will_stream || backend_error_class.is_some();
     let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
@@ -18010,7 +18027,7 @@ async fn handle_proxy_request_inner(
                     crate::proxy::deferred_log::DeferredTransactionLogger::new_with_start_time(
                         summary,
                         Arc::clone(&plugins),
-                        Arc::new(ctx.clone()),
+                        ctx.clone(),
                         start_time,
                     ),
                 )
@@ -18052,33 +18069,6 @@ async fn handle_proxy_request_inner(
     }
 
     record_request(&state, response_status);
-
-    // Streaming response inspection (e.g. ai_semantic_firewall `inspect` mode):
-    // resolve the per-response inspector BEFORE the headers are applied so we can
-    // strip Content-Length when present — the inspector transforms the body
-    // (releases windows, may cut), so the backend's length no longer matches what
-    // we send, and leaving it would make a mid-stream cut look like a truncated
-    // body to the client. Gated to streaming responses with an opted-in plugin;
-    // the common case skips it. Consumed by the `ResponseBody::Streaming` arm.
-    let response_inspector = if matches!(response_body, ResponseBody::Streaming { .. })
-        && plugins.iter().any(|p| p.requires_response_stream_hooks())
-    {
-        let content_type = response_headers.get("content-type").map(String::as_str);
-        // Chain EVERY opted-in plugin (not just the first), gated to the response
-        // status so error bodies are not inspected.
-        let inspectors: Vec<_> = plugins
-            .iter()
-            .filter_map(|plugin| {
-                plugin.response_stream_inspector(&ctx, response_status, content_type)
-            })
-            .collect();
-        crate::plugins::chain_response_stream_inspectors(inspectors)
-    } else {
-        None
-    };
-    if response_inspector.is_some() {
-        response_headers.remove("content-length");
-    }
 
     // Build final response
     let mut resp_builder = Response::builder()
