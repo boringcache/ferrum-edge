@@ -675,9 +675,7 @@ impl AiTranscriptAudit {
         let sink_unhealthy_reject = self.on_sink_error == SinkErrorPolicy::Reject
             && !self.sink_healthy.load(Ordering::Relaxed);
         let buffer_full_reject = if self.on_buffer_full == BufferFullPolicy::Reject {
-            let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
-                return None;
-            };
+            let record_id = ctx.metadata.get(MD_RECORD_ID).cloned()?;
             if self.stream_reservations.contains_key(&record_id) {
                 false
             } else if let Some(permit) = self.logger.try_reserve() {
