@@ -2055,15 +2055,27 @@ async fn handle_h3_request(
         ) {
             Ok(result) => result,
             Err(()) => {
-                record_request(&state, 503);
+                let mut status_code = 503;
+                let mut body =
+                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#
+                        .to_vec();
                 let mut rej_headers = HashMap::new();
-                apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, 503, &mut rej_headers)
-                    .await;
+                apply_after_proxy_hooks_to_rejection(
+                    &plugins,
+                    &mut ctx,
+                    &mut status_code,
+                    &mut body,
+                    &mut rej_headers,
+                )
+                .await;
+                let status = StatusCode::from_u16(status_code)
+                    .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+                record_request(&state, status.as_u16());
                 send_h3_reject_flavor_aware(
                     &mut stream,
                     http_flavor,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                    status,
+                    &body,
                     &rej_headers,
                 )
                 .await?;
@@ -3669,21 +3681,24 @@ async fn handle_h3_request(
                 .await?;
                 return Ok(());
             };
+            let mut status_code = reject.status_code;
+            let mut body = reject.body;
             let mut headers = reject.headers;
             apply_after_proxy_hooks_to_rejection(
                 &plugins,
                 &mut ctx,
-                reject.status_code,
+                &mut status_code,
+                &mut body,
                 &mut headers,
             )
             .await;
             let http_status =
-                StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::PAYLOAD_TOO_LARGE);
+                StatusCode::from_u16(status_code).unwrap_or(StatusCode::PAYLOAD_TOO_LARGE);
             let log_status_code = h3_reject_log_status_and_metadata(
                 &mut ctx,
                 http_flavor,
                 http_status,
-                &reject.body,
+                &body,
                 &headers,
             );
             record_request(&state, log_status_code);
@@ -3700,7 +3715,7 @@ async fn handle_h3_request(
                 &mut stream,
                 http_flavor,
                 http_status,
-                &reject.body,
+                &body,
                 &headers,
             )
             .await?;
@@ -4664,16 +4679,24 @@ async fn run_h3_backend_admission_or_send_reject(
                 cb_target_key,
                 cb_is_half_open_probe,
             );
+            let mut status_code = rejection.status_code;
+            let mut body = rejection.body;
             let mut headers = rejection.headers;
-            apply_after_proxy_hooks_to_rejection(plugins, ctx, rejection.status_code, &mut headers)
-                .await;
-            let http_status = StatusCode::from_u16(rejection.status_code)
+            apply_after_proxy_hooks_to_rejection(
+                plugins,
+                ctx,
+                &mut status_code,
+                &mut body,
+                &mut headers,
+            )
+            .await;
+            let http_status = StatusCode::from_u16(status_code)
                 .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
             let log_status_code = h3_reject_log_status_and_metadata(
                 ctx,
                 flavor,
                 http_status,
-                &rejection.body,
+                &body,
                 &headers,
             );
             record_request(state, log_status_code);
@@ -4686,8 +4709,7 @@ async fn run_h3_backend_admission_or_send_reject(
                 plugin_execution_ns,
             )
             .await;
-            send_h3_reject_flavor_aware(stream, flavor, http_status, &rejection.body, &headers)
-                .await?;
+            send_h3_reject_flavor_aware(stream, flavor, http_status, &body, &headers).await?;
             Ok(Err(()))
         }
     }

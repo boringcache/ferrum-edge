@@ -478,16 +478,18 @@ async fn send_h3_backend_admission_rejection<S>(
 ) where
     S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
 {
+    let mut status_code = rejection.status_code;
+    let mut body = rejection.body;
     let mut headers = rejection.headers;
     crate::proxy::apply_after_proxy_hooks_to_rejection(
         plugins,
         ctx,
-        rejection.status_code,
+        &mut status_code,
+        &mut body,
         &mut headers,
     )
     .await;
-    let status =
-        StatusCode::from_u16(rejection.status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+    let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
     crate::proxy::log_rejected_request_with_path(
         plugins,
         ctx,
@@ -499,7 +501,7 @@ async fn send_h3_backend_admission_rejection<S>(
     )
     .await;
     crate::proxy::record_request(state, status.as_u16());
-    send_h3_reject_body(stream, status, &rejection.body, &headers).await;
+    send_h3_reject_body(stream, status, &body, &headers).await;
 }
 
 pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(

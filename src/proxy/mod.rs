@@ -12355,22 +12355,25 @@ pub(crate) async fn log_rejected_request_with_path(
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
 }
 
+/// Run rejection-aware `after_proxy` hooks over a response that has not yet
+/// been committed. An explicitly opted-in fail-closed hook may replace all
+/// three response parts in place; taking mutable status/body/header arguments
+/// keeps every protocol caller from accidentally discarding that replacement.
 pub(crate) async fn apply_after_proxy_hooks_to_rejection(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
-    status_code: u16,
+    status_code: &mut u16,
+    response_body: &mut Vec<u8>,
     response_headers: &mut HashMap<String, String>,
-) -> Option<(u16, Vec<u8>)> {
+) {
     let previous_marker = ctx.metadata.insert(
         REJECTION_RESPONSE_METADATA_KEY.to_string(),
         "true".to_string(),
     );
 
-    let mut effective_status = status_code;
-    let mut replacement = None;
     for plugin in plugins.iter().filter(|p| p.applies_after_proxy_on_reject()) {
         match plugin
-            .after_proxy(ctx, effective_status, response_headers)
+            .after_proxy(ctx, *status_code, response_headers)
             .await
         {
             reject @ PluginResult::Reject { .. }
@@ -12384,16 +12387,17 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
                 };
                 let reject_status = parts.status_code;
                 if plugin.may_replace_rejection_response() {
-                    effective_status = parts.status_code;
+                    let replaced_status = *status_code;
+                    *status_code = parts.status_code;
+                    *response_body = parts.body;
                     response_headers.clear();
                     response_headers
                         .insert("content-type".to_string(), "application/json".to_string());
                     response_headers.extend(parts.headers);
-                    replacement = Some((effective_status, parts.body));
                     warn!(
                         rejecting_plugin = plugin.name(),
-                        replacement_status = effective_status,
-                        replaced_status = status_code,
+                        replacement_status = *status_code,
+                        replaced_status,
                         "after_proxy plugin replaced an uncommitted rejection response"
                     );
                     continue;
@@ -12408,7 +12412,7 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
                 warn!(
                     rejecting_plugin = plugin.name(),
                     attempted_reject_status = reject_status,
-                    committed_status = status_code,
+                    committed_status = *status_code,
                     "after_proxy plugin returned Reject during rejection handling; \
                      ignoring (plugin did not opt in to replacement)"
                 );
@@ -12423,7 +12427,6 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
     } else {
         ctx.metadata.remove(REJECTION_RESPONSE_METADATA_KEY);
     }
-    replacement
 }
 
 /// Rebuild `response_status` / `response_headers` for a plugin rejection
@@ -12463,13 +12466,16 @@ pub(crate) async fn apply_plugin_rejection_response(
     response_headers: &mut HashMap<String, String>,
     reject: RejectedResponseParts,
 ) -> Vec<u8> {
-    let body = rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
-    if let Some((replacement_status, replacement_body)) =
-        apply_after_proxy_hooks_to_rejection(plugins, ctx, *response_status, response_headers).await
-    {
-        *response_status = replacement_status;
-        return replacement_body;
-    }
+    let mut body =
+        rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
+    apply_after_proxy_hooks_to_rejection(
+        plugins,
+        ctx,
+        response_status,
+        &mut body,
+        response_headers,
+    )
+    .await;
     body
 }
 
@@ -12701,12 +12707,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // one-shot response state (rotated session cookie, route overrides) is
     // emitted onto whatever the client actually receives. Runs LAST by design —
     // see the divergence note above.
-    if let Some((replacement_status, replacement_body)) =
-        apply_after_proxy_hooks_to_rejection(plugins, ctx, *status, headers).await
-    {
-        *status = replacement_status;
-        *body = replacement_body;
-    }
+    apply_after_proxy_hooks_to_rejection(plugins, ctx, status, body, headers).await;
 }
 
 pub(crate) struct AfterProxyReject {
@@ -12781,8 +12782,8 @@ pub(crate) async fn run_after_proxy_hooks(
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let RejectedResponseParts {
-                    status_code,
-                    body,
+                    mut status_code,
+                    mut body,
                     mut headers,
                 } = plugin_result_into_reject_parts(reject)
                     .expect("reject result should convert to rejection parts");
@@ -12794,10 +12795,14 @@ pub(crate) async fn run_after_proxy_hooks(
                 ctx.metadata
                     .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
                 ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
-                let replacement =
-                    apply_after_proxy_hooks_to_rejection(plugins, ctx, status_code, &mut headers)
-                        .await;
-                let (status_code, body) = replacement.unwrap_or((status_code, body));
+                apply_after_proxy_hooks_to_rejection(
+                    plugins,
+                    ctx,
+                    &mut status_code,
+                    &mut body,
+                    &mut headers,
+                )
+                .await;
                 return Some(AfterProxyReject {
                     status_code,
                     body,
