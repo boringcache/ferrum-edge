@@ -314,7 +314,7 @@ Given all built-in plugins enabled, the execution order is:
 | 43 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
 | 44 | `ai_semantic_cache` | 2980 | before_proxy, after_proxy, on_final_response_body |
 | 45 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, normalize_response_body, response_stream_inspector |
-| 46 | `mcp_gateway` | 2992 | before_proxy, transform_request_body |
+| 46 | `mcp_gateway` | 2992 | before_proxy, transform_request_body, transform_response_body |
 | 47 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body |
 | 48 | `mesh_route_dispatch` | 2995 | before_proxy |
 | 49 | `request_transformer` | 3000 | before_proxy, transform_request_body |
@@ -594,7 +594,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `ai_request_guard` | ✓ | ✓ | | | | Validates JSON request bodies |
 | `ai_stream_router` | ✓ | | | | | Claims `stream: true` OpenAI Chat Completions, route-overrides to a provider, normalizes provider SSE to OpenAI SSE |
 | `ai_federation` | ✓ | ✓ | | | | Routes to AI providers, normalizes responses |
-| `mcp_gateway` | ✓ | ✓ | | | | Parses MCP JSON-RPC, emits `mcp.*` metadata, and routes namespaced MCP tools/resources/prompts |
+| `mcp_gateway` | ✓ | ✓ | | | | Parses MCP JSON-RPC, emits `mcp.*` metadata, routes namespaced MCP tools/resources/prompts, and reverse-maps routed JSON results |
 | `a2a_gateway` | ✓ | ✓ | | | | Detects A2A HTTP/REST/gRPC methods, rewrites HTTP Agent Cards, applies method policy, and emits `a2a.*` metadata |
 | `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing |
 | `ai_token_metrics` | ✓ | ✓ | | | | Parses JSON response bodies for token usage |
