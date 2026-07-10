@@ -1239,7 +1239,7 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
         "params": { "uri": public_uri }
     });
     let (mut ctx, mut headers) = mcp_ctx(request_body.clone());
-    headers.insert("mcp-session-id".to_string(), session_id);
+    headers.insert("mcp-session-id".to_string(), session_id.clone());
     headers.insert("accept-encoding".to_string(), "gzip".to_string());
     assert!(matches!(
         plugin.before_proxy(&mut ctx, &mut headers).await,
@@ -1261,6 +1261,23 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
             .all(|value| value != "file:///project/README.md"),
         "internal response rewrite metadata must not retain upstream URIs"
     );
+
+    // A concurrent template refresh changes the shared catalog version while
+    // this read is in flight. The exact private request binding remains valid
+    // and must still rewrite the upstream echo to the requested public URI.
+    let (mut refresh_ctx, mut refresh_headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 101,
+        "method": "resources/templates/list",
+        "params": {}
+    }));
+    refresh_headers.insert("mcp-session-id".to_string(), session_id);
+    let (refresh_status, _, _) = reject_json(
+        plugin
+            .before_proxy(&mut refresh_ctx, &mut refresh_headers)
+            .await,
+    );
+    assert_eq!(refresh_status, 200);
 
     assert!(plugin.requires_response_body_buffering());
     assert!(plugin.should_buffer_response_body(&ctx));

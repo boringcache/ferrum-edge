@@ -3213,7 +3213,10 @@ impl Plugin for McpGateway {
             .get(session_hash)
             .map(|catalog| Arc::clone(catalog.value()))?;
         let catalog = catalog_lock.read().await;
-        if catalog.version != expected_catalog_version {
+        let catalog_version_matches = catalog.version == expected_catalog_version;
+        if !catalog_version_matches
+            && (method != "resources/read" || ctx.mcp_response_resource_binding.is_none())
+        {
             return None;
         }
         let mut value: Value = serde_json::from_slice(body).ok()?;
@@ -3227,6 +3230,7 @@ impl Plugin for McpGateway {
                 ctx.mcp_response_resource_binding
                     .as_ref()
                     .map(|(upstream, public)| (upstream.as_str(), public.as_str())),
+                catalog_version_matches,
             ),
             "tools/call" => rewrite_tool_call_result(result, &catalog, server_id),
             "prompts/get" => rewrite_prompt_get_result(result, &catalog, server_id),
@@ -3298,6 +3302,7 @@ fn rewrite_resource_read_result(
     catalog: &McpCatalog,
     server_id: &str,
     routed_binding: Option<(&str, &str)>,
+    allow_catalog_fallback: bool,
 ) -> ResponseRewriteOutcome {
     let Some(contents) = result.get_mut("contents").and_then(Value::as_array_mut) else {
         return ResponseRewriteOutcome::Unchanged;
@@ -3311,7 +3316,10 @@ fn rewrite_resource_read_result(
                 {
                     rewrite_uri_field_to(content, "uri", public_uri)
                 }
-                _ => rewrite_uri_field(content, "uri", catalog, server_id),
+                _ if allow_catalog_fallback => {
+                    rewrite_uri_field(content, "uri", catalog, server_id)
+                }
+                _ => ResponseRewriteOutcome::Unchanged,
             };
             outcome.merge(rewritten)
         })
