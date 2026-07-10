@@ -12851,7 +12851,7 @@ pub(crate) async fn normalize_grpc_plugin_rejection_with_after_proxy_hooks(
     invoke_response_committed: bool,
 ) -> NormalizedRejectResponse {
     let status = StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
-    let normalized = finalize_reject_response_with_after_proxy_hooks(
+    let normalized = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
         plugins,
         ctx,
         status,
@@ -12940,6 +12940,26 @@ async fn finalize_reject_response_with_after_proxy_hooks(
     ctx: &mut RequestContext,
     status: StatusCode,
     body: &[u8],
+    headers: HashMap<String, String>,
+    is_grpc_request: bool,
+) -> NormalizedRejectResponse {
+    finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+        plugins,
+        ctx,
+        status,
+        body,
+        headers,
+        is_grpc_request,
+        true,
+    )
+    .await
+}
+
+async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status: StatusCode,
+    body: &[u8],
     mut headers: HashMap<String, String>,
     is_grpc_request: bool,
     invoke_response_committed: bool,
@@ -12985,7 +13005,7 @@ async fn handle_backend_admission_rejection(
     is_grpc_request: bool,
     grpc_web_error_content_type: Option<&str>,
 ) -> Response<ProxyBody> {
-    let reject = finalize_reject_response_with_after_proxy_hooks(
+    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
         plugins,
         ctx,
         StatusCode::from_u16(rejection.status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
@@ -14031,7 +14051,6 @@ async fn handle_proxy_request_inner(
                         &plugin_reject.body,
                         plugin_reject.headers,
                         is_grpc_request,
-                        true,
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
@@ -14144,7 +14163,6 @@ async fn handle_proxy_request_inner(
                 &body,
                 headers,
                 is_grpc_request,
-                true,
             )
             .await;
             apply_grpc_reject_metadata(&mut ctx, &reject);
@@ -14183,7 +14201,6 @@ async fn handle_proxy_request_inner(
                         &plugin_reject.body,
                         plugin_reject.headers,
                         is_grpc_request,
-                        true,
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
@@ -14302,7 +14319,6 @@ async fn handle_proxy_request_inner(
                         &plugin_reject.body,
                         plugin_reject.headers,
                         is_grpc_request,
-                        true,
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
@@ -14346,7 +14362,6 @@ async fn handle_proxy_request_inner(
                         &plugin_reject.body,
                         plugin_reject.headers,
                         is_grpc_request,
-                        true,
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
@@ -14530,7 +14545,6 @@ async fn handle_proxy_request_inner(
                     br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
                     HashMap::new(),
                     is_grpc_request,
-                    true,
                 )
                 .await;
                 apply_grpc_reject_metadata(&mut ctx, &reject);
@@ -27126,7 +27140,6 @@ mod tests {
             &reject.body,
             reject.headers,
             false,
-            true,
         )
         .await
     }
