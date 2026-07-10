@@ -3785,7 +3785,13 @@ fn east_west_sni_hosts_overlap(a: &[String], b: &[String]) -> bool {
 fn east_west_per_port_alias_base(host: &str) -> Option<String> {
     let (port_label, base) = host.split_once('.')?;
     let port = port_label.strip_prefix('p')?;
-    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+    // `cross_cluster_service_sni` renders a non-zero u16 without leading
+    // zeroes. Recognize only that canonical generated namespace so an ordinary
+    // hostname such as `p65536.example` is not reinterpreted as an alias.
+    let Ok(port_number) = port.parse::<u16>() else {
+        return None;
+    };
+    if base.is_empty() || port.starts_with('0') || port_number == 0 {
         return None;
     }
     Some(base.to_string())
