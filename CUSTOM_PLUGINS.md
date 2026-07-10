@@ -462,6 +462,8 @@ Response plugins have two different body-access models:
 
 **Which do I pick?** If correctness requires the complete body, or you must transform it or reject it with a new HTTP status, buffer it. If you can decide from bounded windows and forwarding must remain incremental, use a stream inspector. Do not set `requires_response_body_buffering()` merely to observe an SSE stream: doing so removes its streaming behavior and can collect an unbounded body until the response-size limit produces a 502.
 
+A stream inspector runs only when the response remains on a streaming path. Non-SSE responses with a known `Content-Length` at or below `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES` (64 KiB by default) may be eagerly buffered before an inspector is created. If a plugin must cover those responses too, implement the corresponding buffered hook as a fallback or configure the cutoff to `0`. SSE is always exempt from this adaptive small-response buffering.
+
 See the [response-body streaming guide](docs/response_body_streaming.md) for the gateway's buffering decision flow and protocol-specific behavior.
 
 ### Buffer the complete response
@@ -556,14 +558,14 @@ impl ResponseStreamInspector for SseInspector {
         }
 
         let keep = BLOCKED.len().saturating_sub(1).min(scan.len());
-        self.tail.clear();
-        self.tail.extend_from_slice(&scan[scan.len() - keep..]);
-        ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk))
+        let held_tail = scan.split_off(scan.len() - keep);
+        self.tail = held_tail;
+        // Release only bytes that cannot begin a future cross-chunk match.
+        ResponseStreamAction::Forward(Bytes::from(scan))
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
-        self.tail.clear();
-        ResponseStreamAction::Forward(Bytes::new())
+        ResponseStreamAction::Forward(Bytes::from(std::mem::take(&mut self.tail)))
     }
 }
 
@@ -595,10 +597,12 @@ impl Plugin for MySseInspector {
     }
 
     fn forces_reqwest_dispatch(&self, _ctx: &RequestContext) -> bool {
-        true // Narrow this with a request marker when only some requests can be inspected.
+        true // Prevents native H3 only; direct H2 remains subject to #2055.
     }
 }
 ```
+
+On today's standard HTTP handler, the example also requires `pool_enable_http2: false` on a plain-HTTPS proxy to exclude the direct-H2 arm and guarantee reqwest dispatch. That setting is not a universal workaround for gRPC or mesh H2 transports, and a backend TLS SNI override may require direct H2. Until #2055 is resolved, test every backend transport the plugin can select; constrain enforcing routes to supported dispatch or provide a buffered fallback where inspectors are not wired. In production, also narrow `forces_reqwest_dispatch()` with a request marker when only some requests can be inspected, rather than moving all traffic off native H3.
 
 The `ResponseStreamInspector` action contract is:
 
