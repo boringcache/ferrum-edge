@@ -12375,14 +12375,15 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
         {
             reject @ PluginResult::Reject { .. }
             | reject @ PluginResult::RejectBinary { .. } => {
-                let reject_status = match &reject {
-                    PluginResult::Reject { status_code, .. }
-                    | PluginResult::RejectBinary { status_code, .. } => *status_code,
-                    PluginResult::Continue => unreachable!(),
+                let Some(parts) = plugin_result_into_reject_parts(reject) else {
+                    warn!(
+                        rejecting_plugin = plugin.name(),
+                        "after_proxy rejection could not be normalized"
+                    );
+                    continue;
                 };
+                let reject_status = parts.status_code;
                 if plugin.may_replace_rejection_response() {
-                    let parts = plugin_result_into_reject_parts(reject)
-                        .expect("reject result should convert to rejection parts");
                     effective_status = parts.status_code;
                     response_headers.clear();
                     response_headers
