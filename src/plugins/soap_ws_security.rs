@@ -2433,7 +2433,7 @@ fn namespace_state_before_tag(
 fn extract_full_tag_name_from_tag(tag: &str) -> Option<&str> {
     let trimmed = tag.trim_start();
     let end = trimmed
-        .find([' ', '/', '\t', '\n', '\r'])
+        .find([' ', '>', '/', '\t', '\n', '\r'])
         .unwrap_or(trimmed.len());
     if end == 0 {
         None
