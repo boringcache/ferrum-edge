@@ -127,6 +127,13 @@ pub struct MeshAuthz {
     /// avoid building the full attribute namespace per request.
     condition_keys: ConditionAttributeKeys,
     ambient_udp_condition_keys: ConditionAttributeKeys,
+    /// Monotonic-ms of the last emitted `principal_pod_mismatch` warning, or
+    /// `0` before the first. Gates a rate-limited operator warning when the
+    /// node-agent-derived HBONE source SPIFFE fails to byte-match the CP-derived
+    /// slice `Workload.spiffe_id` for the same pod UID, so per-pod Ambient UDP
+    /// scoping silently degrades to mesh-wide. Lock-free (`&self` hot path);
+    /// see [`Self::warn_udp_principal_pod_mismatch`].
+    udp_principal_pod_mismatch_warn_last_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Which Istio `when:` attribute keys the loaded policies actually reference.
@@ -1176,7 +1183,51 @@ impl MeshAuthz {
             has_scoped_policies,
             condition_keys,
             ambient_udp_condition_keys,
+            udp_principal_pod_mismatch_warn_last_ms: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Emit a rate-limited (one per ~30s) structured warning when an Ambient
+    /// UDP CONNECT's asserted `source.pod_uid` is present in the slice scope
+    /// index but the honored `source.principal` does not byte-match the CP's
+    /// `Workload.spiffe_id` for that pod. This is the observable signal for the
+    /// otherwise-silent cross-component derivation divergence between the
+    /// node-agent's published SPIFFE (`spiffe://<trust_domain>/ns/<ns>/sa/<sa>`,
+    /// `node_agent.rs`) and the CP-derived slice identity: when they diverge,
+    /// per-pod scoping fails closed to mesh-wide with no other trace. The
+    /// fail-closed fallback itself is unchanged; this only makes it visible.
+    fn warn_udp_principal_pod_mismatch(&self, asserted: Option<&str>, expected: &str) {
+        use std::sync::atomic::Ordering;
+        // ~30s window: divergence is a configuration/derivation fault, not a
+        // per-request condition, so one line per window per proxy is enough to
+        // surface it without pegging the log pipeline under a UDP flood.
+        const WINDOW_MS: u64 = 30_000;
+        let now = crate::socket_opts::monotonic_now_ms();
+        let last = self
+            .udp_principal_pod_mismatch_warn_last_ms
+            .load(Ordering::Relaxed);
+        // Emit on the first event (`last == 0`) or after a full window. A single
+        // CAS claims the window; losers stay silent. `saturating_sub` guards a
+        // coarse clock that does not advance between calls.
+        if last != 0 && now.saturating_sub(last) < WINDOW_MS {
+            return;
+        }
+        if self
+            .udp_principal_pod_mismatch_warn_last_ms
+            .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        tracing::warn!(
+            asserted_source_principal = asserted.unwrap_or("<none>"),
+            expected_slice_spiffe_id = %expected,
+            "mesh_authz: Ambient UDP source pod UID matched the slice but its asserted \
+             source.principal does not byte-match the CP-derived Workload.spiffe_id; per-pod \
+             UDP policy scoping is degrading to mesh-wide for this workload. Verify the \
+             node-agent FERRUM_MESH_TRUST_DOMAIN and service-account SPIFFE derivation match \
+             the control plane's Workload identity"
+        );
     }
 
     /// Build the Istio `when:` attribute map for an HTTP-family request,
@@ -2134,6 +2185,15 @@ impl MeshAuthz {
             return Err("pod_not_in_slice");
         };
         if source_principal != Some(&scope.spiffe_id) {
+            // The pod UID is in the slice but the asserted principal does not
+            // byte-match the CP's Workload.spiffe_id — the cross-component
+            // derivation divergence described on `warn_udp_principal_pod_mismatch`.
+            // Surface it (rate-limited) so operators see why per-pod scoping is
+            // not applying; the fail-closed mesh-wide fallback is unchanged.
+            self.warn_udp_principal_pod_mismatch(
+                source_principal.map(SpiffeId::as_str),
+                scope.spiffe_id.as_str(),
+            );
             return Err("principal_pod_mismatch");
         }
         Ok(Some(scope))
