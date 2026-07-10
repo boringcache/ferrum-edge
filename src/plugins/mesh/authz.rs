@@ -1903,13 +1903,60 @@ impl Plugin for MeshAuthz {
         let mut scope_missing = false;
         let mut node_waypoint_authorized_destination = None;
         let decision = if ambient_udp_source_scope_request {
+            // Ambient UDP inbound relay. Evaluate the UNION of:
+            //
+            //   1. the DESTINATION-scoped policies that normal (non-UDP) inbound
+            //      HBONE evaluates for this relay — `self.slice.mesh_policies`,
+            //      already retained at construction (line ~1116) to those whose
+            //      scope applies to this proxy's workload identity
+            //      (`slice.namespace`/`slice.labels`). This is exactly the set the
+            //      fall-through `else` (`evaluate_mesh_authorization(&self.slice,
+            //      ..)`) uses, so a namespace/selector DENY (e.g. DENY-all in the
+            //      service namespace) or ALLOW protecting the destination workload
+            //      still runs for `udp` CONNECTs. There is no separate
+            //      destination-scope liveness gate to miss here: for Ambient /
+            //      ServiceWaypoint topology `per_pod_policy_scoping` is off, so the
+            //      destination filter is baked into `self.slice.mesh_policies`, not
+            //      resolved per request. Failing closed on it would be stricter
+            //      than the normal inbound path, so we stay at parity.
+            //
+            //   2. the SOURCE-scoped policies applicable to the asserted source-pod
+            //      scope from `ambient_udp_source_policies` (the pre-retain full
+            //      clone), or mesh-wide-only when the source evidence is
+            //      absent/invalid. Absent/invalid source evidence therefore still
+            //      fails closed to mesh-wide + destination policies (never broader
+            //      than before this change).
+            //
+            // Both sets feed ONE `evaluate_mesh_authorization_policies` iterator so
+            // the deny-first / "if any ALLOW is applicable at least one must match"
+            // aggregation is computed once across the combined set. Combining two
+            // separate decisions would break that aggregation (a destination-only
+            // ALLOW plus a source-only ALLOW must not each independently deny).
+            //
+            // Dedup by policy identity without a per-request allocation: because
+            // `ambient_udp_source_policies` is the pre-retain clone and
+            // `self.slice.mesh_policies` is exactly `{p : destination-applicable}`,
+            // any source-arm policy that ALSO applies to the destination scope is
+            // already in arm 1, so the source arm skips destination-applicable
+            // policies (`!policy_scope_applies_to_workload(.., slice.namespace,
+            // slice.labels)`). Predicate-only; the hot path never clones the slice
+            // or builds a set.
+            let source_scope = ambient_udp_source_scope;
             evaluate_mesh_authorization_policies(
-                self.ambient_udp_source_policies.iter().filter(|policy| {
-                    ambient_udp_source_scope.map_or_else(
-                        || matches!(policy.scope, PolicyScope::MeshWide),
-                        |scope| scope.policy_applies(policy),
-                    )
-                }),
+                self.slice.mesh_policies.iter().chain(
+                    self.ambient_udp_source_policies.iter().filter(|policy| {
+                        let source_applies = source_scope.map_or_else(
+                            || matches!(policy.scope, PolicyScope::MeshWide),
+                            |scope| scope.policy_applies(policy),
+                        );
+                        source_applies
+                            && !policy_scope_applies_to_workload(
+                                policy,
+                                &self.slice.namespace,
+                                &self.slice.labels,
+                            )
+                    }),
+                ),
                 &request,
             )
         } else if self.per_pod_policy_scoping {

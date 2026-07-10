@@ -767,6 +767,285 @@ async fn mesh_authz_ambient_udp_rejects_principal_pod_mismatch_as_scope_evidence
     );
 }
 
+/// A cross-namespace Ambient UDP slice: the terminating relay's destination
+/// namespace (`slice.namespace`) is `svc-ns`, while the validated source pod
+/// lives in `client-ns`. This isolates the two policy arms of the UDP
+/// authorization union — a `Namespace{svc-ns}` policy is DESTINATION-scoped only
+/// and a `Namespace{client-ns}` policy is SOURCE-scoped only — so a test can
+/// prove each arm is evaluated independently.
+fn ambient_udp_cross_namespace_slice(policies: Vec<MeshPolicy>) -> MeshSlice {
+    let client = Workload {
+        spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/client-ns/sa/client").expect("spiffe"),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "client".to_string())]),
+            namespace: None,
+        },
+        service_name: "client".to_string(),
+        addresses: vec!["10.0.1.20".to_string()],
+        ports: Vec::new(),
+        trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+        namespace: "client-ns".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("client".to_string()),
+        pod_uid: Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string()),
+        node_waypoint: None,
+        remote_provenance: false,
+    };
+    MeshSlice {
+        // Destination workload identity the relay terminates for. The
+        // construction-time retain filters `mesh_policies` to those applicable
+        // to THIS namespace/labels, exactly as normal (non-UDP) inbound HBONE
+        // evaluates.
+        namespace: "svc-ns".to_string(),
+        mesh_policies: policies,
+        workloads: vec![client.clone()],
+        ambient_udp_source_workloads: vec![client],
+        ..MeshSlice::default()
+    }
+}
+
+const AMBIENT_UDP_CLIENT_BAGGAGE: &str = "source.principal=spiffe://cluster.local/ns/client-ns/sa/client,\
+     source.pod_uid=6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+
+/// A `from.principal`-keyed ALLOW that only matches the given SPIFFE id, with an
+/// arbitrary policy scope. Used to build applicable-but-unmatched vs. matched
+/// ALLOW policies for the union aggregation test.
+fn principal_scoped_policy(
+    name: &str,
+    scope: PolicyScope,
+    principal: &str,
+    action: PolicyAction,
+) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: "default".to_string(),
+        scope,
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some(principal.to_string()),
+                namespace_pattern: None,
+                trust_domain: Some(TrustDomain::new("cluster.local").expect("trust domain")),
+                trust_domain_pattern: None,
+            }],
+            to: Vec::new(),
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action,
+        }],
+    }
+}
+
+/// (a) A DESTINATION-namespace DENY-all must block a `udp` CONNECT even when the
+/// validated source pod's own namespace-scoped ALLOW would otherwise permit it.
+/// Before the union fix the branch evaluated ONLY source-scoped policies, so the
+/// destination DENY (scoped to a different namespace than the source pod) was
+/// filtered out and the request fell through to the source ALLOW.
+#[tokio::test]
+async fn mesh_authz_ambient_udp_destination_namespace_deny_blocks_source_allowed_connect() {
+    let slice = ambient_udp_cross_namespace_slice(vec![
+        // Destination-only: applies to svc-ns (the slice namespace), not client-ns.
+        policy_with_scope(
+            "dest-deny-all",
+            PolicyScope::Namespace {
+                namespace: "svc-ns".to_string(),
+            },
+            PolicyAction::Deny,
+        ),
+        // Source-only: applies to the client pod's namespace, not svc-ns.
+        policy_with_scope(
+            "client-allow",
+            PolicyScope::Namespace {
+                namespace: "client-ns".to_string(),
+            },
+            PolicyAction::Allow,
+        ),
+    ]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "destination-namespace DENY-all must run for a udp CONNECT, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("dest-deny-all")
+    );
+}
+
+/// (b) A SOURCE-scoped DENY still blocks after the union: bringing destination
+/// policies in must not weaken the source-scoped enforcement this PR added.
+#[tokio::test]
+async fn mesh_authz_ambient_udp_source_scoped_deny_still_blocks_after_union() {
+    let slice = ambient_udp_cross_namespace_slice(vec![
+        // Destination-only ALLOW-all (matches everything for the destination).
+        policy_with_scope(
+            "dest-allow-all",
+            PolicyScope::Namespace {
+                namespace: "svc-ns".to_string(),
+            },
+            PolicyAction::Allow,
+        ),
+        // Source-only DENY-all keyed to the client pod's namespace.
+        policy_with_scope(
+            "client-deny",
+            PolicyScope::Namespace {
+                namespace: "client-ns".to_string(),
+            },
+            PolicyAction::Deny,
+        ),
+    ]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "source-scoped DENY must still deny under the union, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("client-deny")
+    );
+}
+
+/// (c) ALLOW aggregation across the union follows Istio "if any applicable ALLOW
+/// exists, at least one must match" semantics computed over the COMBINED set —
+/// not two independent decisions. A destination-scoped ALLOW that is applicable
+/// but does not match (`from.principal` = someone else) sets `saw_allow`, and a
+/// source-scoped ALLOW that DOES match the client satisfies it, so the request is
+/// allowed. A broken two-decision combination would let the destination arm alone
+/// resolve to implicit-deny and reject.
+#[tokio::test]
+async fn mesh_authz_ambient_udp_allow_aggregation_spans_union() {
+    let slice = ambient_udp_cross_namespace_slice(vec![
+        // Destination-scoped ALLOW that is applicable (svc-ns) but never matches
+        // this client principal — on its own it would implicit-deny.
+        principal_scoped_policy(
+            "dest-allow-other",
+            PolicyScope::Namespace {
+                namespace: "svc-ns".to_string(),
+            },
+            "spiffe://cluster.local/ns/svc-ns/sa/other",
+            PolicyAction::Allow,
+        ),
+        // Source-scoped ALLOW that matches the client principal.
+        principal_scoped_policy(
+            "client-allow",
+            PolicyScope::Namespace {
+                namespace: "client-ns".to_string(),
+            },
+            "spiffe://cluster.local/ns/client-ns/sa/client",
+            PolicyAction::Allow,
+        ),
+    ]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a matching source ALLOW must satisfy the union's ALLOW aggregation, got {result:?}"
+    );
+}
+
+/// (d) Absent source evidence must still fail closed to mesh-wide + DESTINATION
+/// policies. A destination-namespace DENY must run even when no source pod scope
+/// can be resolved (no `source.pod_uid` in baggage), instead of silently allowing.
+#[tokio::test]
+async fn mesh_authz_ambient_udp_absent_source_evidence_still_applies_destination_deny() {
+    let slice = ambient_udp_cross_namespace_slice(vec![policy_with_scope(
+        "dest-deny-all",
+        PolicyScope::Namespace {
+            namespace: "svc-ns".to_string(),
+        },
+        PolicyAction::Deny,
+    )]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    // Principal present but no pod_uid → source scope unresolved, evidence falls
+    // back to the authenticated gateway peer for mesh-wide-only source scoping.
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some("source.principal=spiffe://cluster.local/ns/client-ns/sa/client"),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "destination DENY must run even with absent source pod evidence, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("dest-deny-all")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_udp_source_scope")
+            .map(String::as_str),
+        Some("missing_or_invalid_pod_uid")
+    );
+}
+
 #[tokio::test]
 async fn mesh_authz_default_trusts_waypoint_service_account() {
     // The default trusted_hbone_assertors list includes both ztunnel and
