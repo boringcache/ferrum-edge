@@ -7386,9 +7386,8 @@ fn wait_for_udp_capture_snapshot(
     timeout: Duration,
 ) -> Result<UdpCaptureSnapshot, String> {
     let deadline = Instant::now() + timeout;
-    let mut last = None;
     loop {
-        match udp_capture_snapshot(pid, capture_port) {
+        let observation = match udp_capture_snapshot(pid, capture_port) {
             Ok(snapshot) => {
                 let ready = if active {
                     snapshot.output_jumps == 1
@@ -7404,15 +7403,15 @@ fn wait_for_udp_capture_snapshot(
                 if ready {
                     return Ok(snapshot);
                 }
-                last = Some(format!("{snapshot:?}"));
+                format!("{snapshot:?}")
             }
-            Err(error) => last = Some(error),
-        }
+            Err(error) => error,
+        };
         if Instant::now() >= deadline {
             return Err(format!(
                 "UDP capture state did not become {} within {timeout:?}; last={}",
                 if active { "active" } else { "absent" },
-                last.unwrap_or_else(|| "no observation".to_string())
+                observation
             ));
         }
         std::thread::sleep(Duration::from_millis(100));
