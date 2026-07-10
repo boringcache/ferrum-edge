@@ -1999,8 +1999,11 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   publication, so the host-veth tc classifier drops pod-originated UDP until the
   producer publishes `.udp-ready/<pod_uid>` after the guarded-to-live transition.
   Re-enrollment removes stale readiness first, and both marker and BPF transitions
-  reconcile idempotently. Live source-capture plus bind-collision verification remains
-  #2038. The producer tears down only its own rules on pod removal / config change /
+  reconcile idempotently. Producer stop removes readiness and waits for the
+  node-agent's `.udp-not-ready/<pod_uid>` acknowledgement that the BPF gate closed;
+  if the acknowledgement is unavailable, stop retains the in-netns DROP guard
+  instead of reopening plaintext. Live source-capture plus bind-collision
+  verification remains #2038. The producer tears down only its own rules on pod removal / config change /
   shutdown. Its stop signal is also threaded into every per-session tunnel task;
   producer close removes the session senders, waits up to two seconds for those
   tasks, then aborts any stragglers before the pod-netns reply factory and stable

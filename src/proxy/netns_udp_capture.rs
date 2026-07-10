@@ -49,9 +49,12 @@ use super::netns_capture::{PodCaptureSource, PodCaptureTarget};
 /// task then tears down that netns's UDP TPROXY rules once the loop exits.
 pub struct OpenedUdpCapture {
     stop: watch::Sender<bool>,
+    /// Production teardown mode: `true` retains the in-netns fail-closed guard
+    /// when the node-agent could not acknowledge that its BPF gate closed.
+    retain_guard: Option<watch::Sender<bool>>,
     /// Test-only close hook so a mock backend can record teardown. Production
     /// leaves this `None` — real teardown runs in the supervising task after `stop`.
-    on_close: Option<Box<dyn FnOnce() + Send>>,
+    on_close: Option<Box<dyn FnOnce(bool) + Send>>,
     /// The production backend's supervising task (capture loop → in-netns rule
     /// teardown). On graceful shutdown the manager awaits it (bounded) so the
     /// TPROXY/routing rules are actually removed from the pod netns before the
@@ -61,18 +64,24 @@ pub struct OpenedUdpCapture {
 
 impl OpenedUdpCapture {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn new(stop: watch::Sender<bool>, task: tokio::task::JoinHandle<()>) -> Self {
+    pub(crate) fn new(
+        stop: watch::Sender<bool>,
+        retain_guard: watch::Sender<bool>,
+        task: tokio::task::JoinHandle<()>,
+    ) -> Self {
         Self {
             stop,
+            retain_guard: Some(retain_guard),
             on_close: None,
             task: Some(task),
         }
     }
 
     #[cfg(test)]
-    fn with_on_close(stop: watch::Sender<bool>, on_close: Box<dyn FnOnce() + Send>) -> Self {
+    fn with_on_close(stop: watch::Sender<bool>, on_close: Box<dyn FnOnce(bool) + Send>) -> Self {
         Self {
             stop,
+            retain_guard: None,
             on_close: Some(on_close),
             task: None,
         }
@@ -83,10 +92,13 @@ impl OpenedUdpCapture {
     /// hook only. Dropping the returned handle does NOT abort the task — teardown
     /// still runs in the background (used on pod removal); the shutdown path awaits
     /// it instead.
-    fn close(mut self) -> Option<tokio::task::JoinHandle<()>> {
+    fn close(mut self, retain_guard: bool) -> Option<tokio::task::JoinHandle<()>> {
+        if let Some(tx) = &self.retain_guard {
+            let _ = tx.send(retain_guard);
+        }
         let _ = self.stop.send(true);
         if let Some(cb) = self.on_close.take() {
-            cb();
+            cb(retain_guard);
         }
         self.task.take()
     }
@@ -291,6 +303,32 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
         self
     }
 
+    fn udp_not_ready_acknowledged(&self, pod_uids: &HashSet<String>) -> bool {
+        let Some(ready_dir) = &self.ready_dir else {
+            return true;
+        };
+        let Some(registry_dir) = ready_dir.parent() else {
+            return false;
+        };
+        let ack_dir = registry_dir.join(".udp-not-ready");
+        pod_uids
+            .iter()
+            .all(|uid| udp_ready_marker_path(&ack_dir, uid).is_some_and(|marker| marker.is_file()))
+    }
+
+    async fn await_udp_not_ready_ack(&self, pod_uids: &HashSet<String>) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if self.udp_not_ready_acknowledged(pod_uids) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// Poll-and-reconcile until `shutdown` flips to `true`, then close every
     /// producer (which tears down its in-netns UDP rules).
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
@@ -416,6 +454,13 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                         remove_udp_ready_marker(dir, uid);
                     }
                 }
+                let retain_guard = !self.await_udp_not_ready_ack(&active.pod_uids).await;
+                if retain_guard {
+                    warn!(
+                        netns_inode = netns,
+                        "Ambient UDP producer stop was not acknowledged by the node-agent; retaining fail-closed in-netns guard"
+                    );
+                }
                 // Close the producer (signal its loop to stop). Rather than drop
                 // the supervising task's handle fire-and-forget, RETAIN it keyed
                 // by netns so the open pass can await this teardown to completion
@@ -424,7 +469,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                 // netns) must not let this old teardown fire AFTER the new install
                 // and delete the fresh chains (codex fail-open race). The handle
                 // is `None` for the test mock (no supervising task).
-                if let Some(task) = active.handle.close() {
+                if let Some(task) = active.handle.close(retain_guard) {
                     // Defensive: an unlikely pre-existing pending teardown for the
                     // same netns is awaited first, so handles cannot accumulate.
                     if let Some(prior) = self.pending_teardowns.remove(&netns) {
@@ -614,13 +659,25 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                 }
             });
         }
-        for (_, active) in self.active.drain() {
+        let active_captures: Vec<_> = self.active.drain().collect();
+        for (_, active) in &active_captures {
             if let Some(dir) = &self.ready_dir {
                 for uid in &active.pod_uids {
                     remove_udp_ready_marker(dir, uid);
                 }
             }
-            if let Some(handle) = active.handle.close() {
+        }
+        let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while active_captures
+            .iter()
+            .any(|(_, active)| !self.udp_not_ready_acknowledged(&active.pod_uids))
+            && tokio::time::Instant::now() < ack_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        for (_, active) in active_captures {
+            let retain_guard = !self.udp_not_ready_acknowledged(&active.pod_uids);
+            if let Some(handle) = active.handle.close(retain_guard) {
                 tasks.spawn(async move {
                     let _ = handle.await;
                 });
@@ -1014,6 +1071,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         let teardown_script = IptablesPlan::udp_teardown_script(include_v6);
         let capture_teardown_script = IptablesPlan::udp_capture_rules_teardown_script(include_v6);
         let fail_closed_script = IptablesPlan::udp_fail_closed_script(&self.capture_config);
+        let fail_closed_on_stop = fail_closed_script.clone();
         let fail_closed_teardown_script = IptablesPlan::udp_fail_closed_teardown_script();
         let capture_output_release_script = IptablesPlan::udp_capture_output_release_script();
 
@@ -1279,6 +1337,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         };
 
         let (stop_tx, stop_rx) = watch::channel(false);
+        let (retain_guard_tx, retain_guard_rx) = watch::channel(false);
         let global_shutdown = self.global_shutdown.clone();
         let pod_uid = target.pod_uid.clone();
         info!(
@@ -1307,13 +1366,30 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
             // netns's UDP rules. `setns` + `sh -c` are blocking, so run them off
             // the runtime. Best-effort: an already-gone pod netns is expected.
             let _ = tokio::task::spawn_blocking(move || {
-                teardown();
-                debug!(pod_uid = %pod_uid, "Ambient UDP producer: per-pod-netns UDP rules torn down");
+                if *retain_guard_rx.borrow() {
+                    let netns_for_guard = netns.clone();
+                    let guarded = super::netns_capture::run_in_netns(
+                        netns_for_guard.as_ref(),
+                        move || run_shell_script(&fail_closed_on_stop),
+                    );
+                    if guarded.is_ok() {
+                        teardown_capture_rules();
+                    } else if let Err(error) = guarded {
+                        warn!(
+                            pod_uid = %pod_uid,
+                            %error,
+                            "Ambient UDP producer could not retain fail-closed guard; preserving socketless capture rules"
+                        );
+                    }
+                } else {
+                    teardown();
+                }
+                debug!(pod_uid = %pod_uid, retain_guard = *retain_guard_rx.borrow(), "Ambient UDP producer: per-pod-netns UDP stop cleanup completed");
             })
             .await;
         });
 
-        NetnsUdpOpenResult::Opened(OpenedUdpCapture::new(stop_tx, task))
+        NetnsUdpOpenResult::Opened(OpenedUdpCapture::new(stop_tx, retain_guard_tx, task))
     }
 }
 
@@ -1392,6 +1468,7 @@ mod tests {
         open_netns_by_cgroup: Mutex<HashMap<String, Option<u64>>>,
         opened: Arc<Mutex<Vec<u64>>>,
         closed: Arc<Mutex<Vec<u64>>>,
+        retained_guards: Arc<Mutex<Vec<u64>>>,
         /// Ordered open/teardown log across all netns, used by the reopen-race
         /// regression test to prove a prior teardown completes before reinstall.
         events: Arc<Mutex<Vec<Event>>>,
@@ -1416,6 +1493,7 @@ mod tests {
                 open_netns_by_cgroup: Mutex::new(HashMap::new()),
                 opened: Arc::new(Mutex::new(Vec::new())),
                 closed: Arc::new(Mutex::new(Vec::new())),
+                retained_guards: Arc::new(Mutex::new(Vec::new())),
                 events: Arc::new(Mutex::new(Vec::new())),
                 fail_open: Mutex::new(HashSet::new()),
                 fail_guard_cleanup_once: Arc::new(Mutex::new(HashSet::new())),
@@ -1513,6 +1591,7 @@ mod tests {
             self.events.lock().unwrap().push(Event::Opened(netns));
             let (stop_tx, mut stop_rx) = watch::channel(false);
             let closed = self.closed.clone();
+            let retained_guards = self.retained_guards.clone();
             let events = self.events.clone();
             if self.slow_teardown {
                 // Real supervising task, like production: wait for the stop
@@ -1525,11 +1604,15 @@ mod tests {
                     closed.lock().unwrap().push(netns);
                     events.lock().unwrap().push(Event::TornDown(netns));
                 });
-                NetnsUdpOpenResult::Opened(OpenedUdpCapture::new(stop_tx, task))
+                let (retain_guard_tx, _) = watch::channel(false);
+                NetnsUdpOpenResult::Opened(OpenedUdpCapture::new(stop_tx, retain_guard_tx, task))
             } else {
                 NetnsUdpOpenResult::Opened(OpenedUdpCapture::with_on_close(
                     stop_tx,
-                    Box::new(move || {
+                    Box::new(move |retain_guard| {
+                        if retain_guard {
+                            retained_guards.lock().unwrap().push(netns);
+                        }
                         closed.lock().unwrap().push(netns);
                         events.lock().unwrap().push(Event::TornDown(netns));
                     }),
@@ -1608,6 +1691,22 @@ mod tests {
         NetnsUdpCleanupManager::new(source, backend, Duration::from_secs(2))
     }
 
+    #[test]
+    fn close_propagates_fail_closed_guard_retention() {
+        let retained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = retained.clone();
+        let (stop_tx, _) = watch::channel(false);
+        let handle = OpenedUdpCapture::with_on_close(
+            stop_tx,
+            Box::new(move |retain_guard| {
+                observed.store(retain_guard, std::sync::atomic::Ordering::Release);
+            }),
+        );
+
+        assert!(handle.close(true).is_none());
+        assert!(retained.load(std::sync::atomic::Ordering::Acquire));
+    }
+
     #[tokio::test]
     async fn opens_one_producer_per_netns_and_dedupes_shared_netns() {
         // Two pods in ONE netns (shared) + one pod in another → 2 producers.
@@ -1648,11 +1747,33 @@ mod tests {
         assert_eq!(mgr.reconcile_once().await, 1, "reconcile stays idempotent");
         assert!(ready_dir.join("pod-a").is_file());
 
+        let ack_dir = ready_root.path().join(".udp-not-ready");
+        std::fs::create_dir_all(&ack_dir).unwrap();
+        std::fs::write(ack_dir.join("pod-a"), b"").unwrap();
         source.0.lock().unwrap().clear();
         assert_eq!(mgr.reconcile_once().await, 0);
         assert!(
             !ready_dir.join("pod-a").exists(),
             "readiness closes before producer teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_node_agent_ack_retains_fail_closed_guard_on_stop() {
+        let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let retained = backend.retained_guards.clone();
+        let ready_root = tempfile::tempdir().unwrap();
+        let ready_dir = ready_root.path().join(".udp-ready");
+        let mut mgr = manager(source.clone(), backend).with_ready_dir(Some(ready_dir));
+
+        assert_eq!(mgr.reconcile_once().await, 1);
+        source.0.lock().unwrap().clear();
+        assert_eq!(mgr.reconcile_once().await, 0);
+        assert_eq!(
+            *retained.lock().unwrap(),
+            vec![100],
+            "producer teardown must retain the in-netns guard without BPF-close acknowledgement"
         );
     }
 

@@ -63,9 +63,11 @@ const CAPTURE_FAILURE_POD_IP_UPDATE: &str = "pod_ip_update";
 const CAPTURE_FAILURE_POD_IP_REMOVE: &str = "pod_ip_remove";
 const CAPTURE_FAILURE_NODE_PROBE_PORT_UPDATE: &str = "node_probe_port_update";
 const CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE: &str = "node_probe_port_remove";
+const CAPTURE_FAILURE_UDP_READINESS: &str = "udp_readiness";
 const CAPTURE_FAILURE_DETAIL_POD_IP: &str = "pod_ip";
 const CAPTURE_FAILURE_DETAIL_POD_IP6: &str = "pod_ip6";
 const CAPTURE_FAILURE_DETAIL_NODE_PROBE_PORTS: &str = "node_probe_ports";
+const CAPTURE_FAILURE_DETAIL_UDP_READINESS: &str = "udp_readiness";
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -292,8 +294,8 @@ impl NodeAgentConfig {
         // behavior — that stays gated on `node_waypoint_in_netns` via the capture
         // contract, so a plain Ambient (LocalPod) deployment gets the registry for
         // the UDP producer WITHOUT the NodeWaypoint ipv6-deny / connect4-deferral
-        // posture. The UDP gate is `udp_capture_enabled` ALONE (NOT anded with
-        // `outbound_capture_enabled`): the Ambient UDP producer binds its own
+        // posture. The UDP gate is `udp_capture_enabled && topology == ambient`,
+        // but is NOT anded with `outbound_capture_enabled`: the producer binds its own
         // `FERRUM_MESH_CAPTURE_UDP_PORT` inside each pod netns and does not use the
         // TCP `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` listener at all, so a port-0
         // outbound listener (which clears `outbound_capture_enabled` for the TCP
@@ -304,7 +306,15 @@ impl NodeAgentConfig {
         // before publishing this entry. The host-veth tc guard drops pod UDP until
         // the producer installs its guard/socket/rules and publishes
         // `.udp-ready/<uid>`.
-        let should_publish_registry = node_waypoint_in_netns || capture_config.udp_capture_enabled;
+        let mesh_topology =
+            resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").unwrap_or_else(|| "sidecar".to_string());
+        let ambient_udp_producer = capture_config.udp_capture_enabled
+            && mesh_topology.trim().eq_ignore_ascii_case("ambient");
+        // The node-agent readiness guard is meaningful only when the Ambient
+        // mesh runtime starts `NetnsUdpCaptureManager`. Other topologies keep
+        // their documented unsupported/pass-through posture.
+        capture_config.udp_capture_enabled = ambient_udp_producer;
+        let should_publish_registry = node_waypoint_in_netns || ambient_udp_producer;
         let node_waypoint_pod_registry_dir = if should_publish_registry {
             Some(std::path::PathBuf::from(
                 &env_config.mesh_node_waypoint_pod_registry_dir,
@@ -955,6 +965,7 @@ async fn run_with_backend(
                     backend.as_mut(),
                     &pod_states,
                     config,
+                    metrics.as_ref(),
                     &mut udp_ready_uids,
                 );
             }
@@ -2732,7 +2743,13 @@ fn remove_pod_ready_marker(dir: &std::path::Path, pod_uid: &str) {
     if pod_registry_uid_is_unsafe(pod_uid) {
         return;
     }
-    for marker_dir in [".ready", ".ready4", ".ready6", ".udp-ready"] {
+    for marker_dir in [
+        ".ready",
+        ".ready4",
+        ".ready6",
+        ".udp-ready",
+        ".udp-not-ready",
+    ] {
         let path = dir.join(marker_dir).join(pod_uid);
         if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -2744,6 +2761,31 @@ fn remove_pod_ready_marker(dir: &std::path::Path, pod_uid: &str) {
                 "Failed to remove node-waypoint readiness marker"
             );
         }
+    }
+}
+
+fn write_udp_not_ready_ack(dir: &std::path::Path, pod_uid: &str) {
+    if pod_registry_uid_is_unsafe(pod_uid) {
+        return;
+    }
+    let ack_dir = dir.join(".udp-not-ready");
+    if let Err(error) = std::fs::create_dir_all(&ack_dir) {
+        warn!(pod_uid, %error, "Failed to create Ambient UDP not-ready acknowledgement dir");
+        return;
+    }
+    if let Err(error) = std::fs::write(ack_dir.join(pod_uid), b"") {
+        warn!(pod_uid, %error, "Failed to publish Ambient UDP not-ready acknowledgement");
+    }
+}
+
+fn remove_udp_not_ready_ack(dir: &std::path::Path, pod_uid: &str) {
+    if pod_registry_uid_is_unsafe(pod_uid) {
+        return;
+    }
+    if let Err(error) = std::fs::remove_file(dir.join(".udp-not-ready").join(pod_uid))
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(pod_uid, %error, "Failed to remove Ambient UDP not-ready acknowledgement");
     }
 }
 
@@ -2770,6 +2812,7 @@ fn reconcile_udp_capture_readiness(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
     config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
     ready_uids: &mut HashSet<String>,
 ) {
     if !config.capture_config.udp_capture_enabled {
@@ -2784,8 +2827,20 @@ fn reconcile_udp_capture_readiness(
         }
         let uid = state.key();
         let ready = udp_ready_marker_exists(config, uid);
-        if ready_uids.contains(uid) == ready {
+        let not_ready_ack_exists = config
+            .node_waypoint_pod_registry_dir
+            .as_ref()
+            .is_some_and(|dir| dir.join(".udp-not-ready").join(uid).is_file());
+        if ready_uids.contains(uid) == ready && (ready || not_ready_ack_exists) {
             continue;
+        }
+        if ready {
+            // Invalidate the closed-state acknowledgement BEFORE either family
+            // can be opened. A partial v4/v6 update must never leave a stale ack
+            // that would authorize producer teardown while one family is ready.
+            if let Some(dir) = &config.node_waypoint_pod_registry_dir {
+                remove_udp_not_ready_ack(dir, uid);
+            }
         }
         let info = pod_map_info(config, ready);
         let v4_ok = state
@@ -2795,10 +2850,21 @@ fn reconcile_udp_capture_readiness(
             .pod_ip6
             .is_none_or(|ip| backend.update_pod_ip6(ip, &info).is_ok());
         if v4_ok && v6_ok {
+            forget_pending_capture_failure(
+                uid,
+                CAPTURE_FAILURE_UDP_READINESS,
+                CAPTURE_FAILURE_DETAIL_UDP_READINESS,
+            );
             if ready {
                 ready_uids.insert(uid.clone());
+                if let Some(dir) = &config.node_waypoint_pod_registry_dir {
+                    remove_udp_not_ready_ack(dir, uid);
+                }
             } else {
                 ready_uids.remove(uid);
+                if let Some(dir) = &config.node_waypoint_pod_registry_dir {
+                    write_udp_not_ready_ack(dir, uid);
+                }
             }
             debug!(
                 pod_uid = uid.as_str(),
@@ -2806,6 +2872,12 @@ fn reconcile_udp_capture_readiness(
                 "Reconciled Ambient UDP producer readiness guard"
             );
         } else {
+            metrics.record_attach_error();
+            remember_pending_capture_failure(
+                uid,
+                CAPTURE_FAILURE_UDP_READINESS,
+                CAPTURE_FAILURE_DETAIL_UDP_READINESS,
+            );
             warn!(
                 pod_uid = uid.as_str(),
                 udp_ready = ready,
@@ -2813,6 +2885,7 @@ fn reconcile_udp_capture_readiness(
             );
         }
     }
+    clear_partial_capture_state_if_recovered(pod_states, metrics);
 }
 
 fn handle_pod_added(
@@ -3079,6 +3152,38 @@ fn handle_pod_added(
             }
         }
         if attach_ok {
+            // Seed the source-IP lifecycle flags BEFORE attaching tc. Once the
+            // classifier is live its lookup therefore cannot miss and allow a
+            // pre-producer UDP datagram through.
+            if config.capture_config.udp_capture_enabled {
+                let info = pod_map_info(config, false);
+                if let Some(ip) = pod_ip
+                    && let Err(e) = backend.update_pod_ip(ip, &info)
+                {
+                    warn!(pod_uid, %ip, error = %e, "Failed to arm UDP enrollment guard");
+                    metrics.record_attach_error();
+                    cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
+                    remember_failed_pod_enrollment(
+                        &state_key,
+                        attempt_signature,
+                        enrollment_snapshot.clone(),
+                    );
+                    return;
+                }
+                if let Some(ip) = pod_ip6
+                    && let Err(e) = backend.update_pod_ip6(ip, &info)
+                {
+                    warn!(pod_uid, %ip, error = %e, "Failed to arm IPv6 UDP enrollment guard");
+                    metrics.record_attach_error();
+                    cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
+                    remember_failed_pod_enrollment(
+                        &state_key,
+                        attempt_signature,
+                        enrollment_snapshot.clone(),
+                    );
+                    return;
+                }
+            }
             let Some(ref iface) = veth_iface else {
                 warn!(
                     pod_uid,
@@ -3948,6 +4053,11 @@ pub fn handle_pod_removed(
         CAPTURE_FAILURE_POD_IP_UPDATE,
         CAPTURE_FAILURE_DETAIL_POD_IP6,
     );
+    forget_pending_capture_failure(
+        &state_key,
+        CAPTURE_FAILURE_UDP_READINESS,
+        CAPTURE_FAILURE_DETAIL_UDP_READINESS,
+    );
     forget_pending_node_probe_port_update_failures_for_state(&state_key);
     // Drop this pod's per-pod registry entry (if publishing is enabled) so the
     // mesh proxy's in-netns capture listeners stop discovering a torn-down pod.
@@ -3963,6 +4073,9 @@ pub fn handle_pod_removed(
 
     let removed = pod_states.remove(pod_uid);
     let Some((_, state)) = removed else {
+        if let Some(dir) = &config.node_waypoint_pod_registry_dir {
+            write_udp_not_ready_ack(dir, pod_uid);
+        }
         clear_partial_capture_state_if_recovered(pod_states, metrics);
         return;
     };
@@ -4007,6 +4120,9 @@ pub fn handle_pod_removed(
         }
         metrics.pods_unenrolled.fetch_add(1, Ordering::Relaxed);
         info!(pod_uid, pod_name = %state.pod_name, "Pod unenrolled from eBPF capture");
+    }
+    if let Some(dir) = &config.node_waypoint_pod_registry_dir {
+        write_udp_not_ready_ack(dir, pod_uid);
     }
     clear_partial_capture_state_if_recovered(pod_states, metrics);
 }
@@ -4570,6 +4686,11 @@ fn cleanup_all_pods(
     if let Err(e) = backend.cleanup_all() {
         warn!(error = %e, "Failed to cleanup BPF state during shutdown");
     }
+    if let Some(dir) = &config.node_waypoint_pod_registry_dir {
+        for entry in pod_states.iter() {
+            write_udp_not_ready_ack(dir, &entry.value().pod_uid);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4719,6 +4840,7 @@ mod tests {
             &[
                 ("FERRUM_NODE_AGENT_NODE_NAME", "node-udp"),
                 ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+                ("FERRUM_MESH_TOPOLOGY", "ambient"),
             ],
             || {
                 let config = NodeAgentConfig::from_env_config(&local_pod)
@@ -4761,6 +4883,7 @@ mod tests {
             &[
                 ("FERRUM_NODE_AGENT_NODE_NAME", "node-udp-no-tcp"),
                 ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+                ("FERRUM_MESH_TOPOLOGY", "ambient"),
                 ("FERRUM_MESH_OUTBOUND_LISTEN_ADDR", "127.0.0.1:0"),
             ],
             || {
@@ -4776,6 +4899,27 @@ mod tests {
                      disabled (port 0) — the producer is independent of the TCP \
                      listener (#2013)"
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_config_does_not_arm_udp_guard_without_ambient_producer() {
+        let local_pod = EnvConfig {
+            node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
+            ..EnvConfig::default()
+        };
+        with_env_vars(
+            &[
+                ("FERRUM_NODE_AGENT_NODE_NAME", "node-sidecar-udp"),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+                ("FERRUM_MESH_TOPOLOGY", "sidecar"),
+            ],
+            || {
+                let config = NodeAgentConfig::from_env_config(&local_pod)
+                    .expect("node-agent config should parse");
+                assert!(!config.capture_config.udp_capture_enabled);
+                assert!(config.node_waypoint_pod_registry_dir.is_none());
             },
         );
     }
@@ -7996,8 +8140,15 @@ mod tests {
             .update_pod_ip(ip, &pod_map_info(&config, false))
             .unwrap();
         let mut ready_uids = HashSet::new();
+        let metrics = NodeAgentMetrics::default();
 
-        reconcile_udp_capture_readiness(&mut backend, &pod_states, &config, &mut ready_uids);
+        reconcile_udp_capture_readiness(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &mut ready_uids,
+        );
         assert!(
             backend.pod_ips[&ip].capture_flags & ferrum_ebpf_common::POD_CAPTURE_FLAG_UDP_READY
                 == 0,
@@ -8007,7 +8158,13 @@ mod tests {
         let ready_dir = registry.path().join(".udp-ready");
         std::fs::create_dir_all(&ready_dir).unwrap();
         std::fs::write(ready_dir.join("pod-a"), b"").unwrap();
-        reconcile_udp_capture_readiness(&mut backend, &pod_states, &config, &mut ready_uids);
+        reconcile_udp_capture_readiness(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &mut ready_uids,
+        );
         assert!(
             backend.pod_ips[&ip].capture_flags & ferrum_ebpf_common::POD_CAPTURE_FLAG_UDP_READY
                 != 0,
@@ -8015,18 +8172,59 @@ mod tests {
         );
 
         let stable = backend.pod_ips[&ip].clone();
-        reconcile_udp_capture_readiness(&mut backend, &pod_states, &config, &mut ready_uids);
+        reconcile_udp_capture_readiness(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &mut ready_uids,
+        );
         assert_eq!(
             backend.pod_ips[&ip], stable,
             "ready reconcile is idempotent"
         );
 
         std::fs::remove_file(ready_dir.join("pod-a")).unwrap();
-        reconcile_udp_capture_readiness(&mut backend, &pod_states, &config, &mut ready_uids);
+        backend.fail_update_pod_ip = true;
+        reconcile_udp_capture_readiness(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &mut ready_uids,
+        );
+        assert!(
+            !registry
+                .path()
+                .join(".udp-not-ready")
+                .join("pod-a")
+                .exists(),
+            "failed BPF closure must not acknowledge producer teardown"
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
+        );
+
+        backend.fail_update_pod_ip = false;
+        reconcile_udp_capture_readiness(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &mut ready_uids,
+        );
         assert!(
             backend.pod_ips[&ip].capture_flags & ferrum_ebpf_common::POD_CAPTURE_FLAG_UDP_READY
                 == 0,
             "marker removal must close the BPF gate again"
+        );
+        assert!(
+            registry
+                .path()
+                .join(".udp-not-ready")
+                .join("pod-a")
+                .is_file()
         );
     }
 

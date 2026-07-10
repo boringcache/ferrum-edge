@@ -239,7 +239,10 @@ override or the pod-loopback peer.
 
 The **same** registry is published for **Ambient** deployments when UDP capture
 is enabled (`FERRUM_MESH_CAPTURE_UDP_ENABLED=true`): the node-agent publish gate
-is `should_publish_registry = node_waypoint_in_netns || udp_capture_enabled`.
+is `should_publish_registry = node_waypoint_in_netns || ambient_udp_producer`.
+The UDP term additionally requires `FERRUM_MESH_TOPOLOGY=ambient`; setting the
+shared UDP flag on a topology that starts no per-pod producer does not arm a BPF
+guard that could never become ready.
 The UDP term is deliberately **not** anded with `outbound_capture_enabled`: the
 Ambient UDP producer binds its own `FERRUM_MESH_CAPTURE_UDP_PORT` inside each
 pod netns and never uses the TCP `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` listener, so
@@ -275,8 +278,13 @@ socket, and complete TPROXY ruleset are live, it publishes
 opens the BPF gate. A stale marker is removed before re-enrollment or a guarded
 producer retry, and marker/map updates are idempotent. Therefore the polling
 interval can delay UDP readiness, but it cannot create a plaintext bypass
-window. The live bind-collision/source-capture verification remains part of
-#2038.
+window. On producer stop, readiness is removed first and the producer waits for
+`<registry_dir>/.udp-not-ready/<pod_uid>`, which the node-agent writes only after
+the BPF ready bit is cleared (or the pod is unenrolled). A failed BPF update
+keeps capture degraded and withholds that acknowledgement; after a bounded wait
+the producer retains its in-netns fail-closed guard while releasing the producer
+tasks/netns handle instead of tearing down into plaintext. The live
+bind-collision/source-capture verification remains part of #2038.
 
 The Ambient UDP producer needs the same host access the NodeWaypoint in-netns
 listener needs — the read-only host cgroup mount + host `/proc` to resolve pod
