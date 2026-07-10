@@ -1363,17 +1363,10 @@ impl RequestContext {
     /// Returns `Some(meta)` if a mirror request was dispatched and completed
     /// before the timeout. The 5-second timeout is a safety net — the mirror
     /// task always completes within the proxy's `backend_read_timeout_ms`
-    /// (set via `reqwest::RequestBuilder::timeout`). Since this runs after
-    /// the response is sent to the client, the wait has zero impact on
-    /// client-facing latency.
+    /// (set via `reqwest::RequestBuilder::timeout`). Callers on a client-visible
+    /// response path must run this in a detached task.
     pub async fn collect_mirror_result(&self) -> Option<MirrorResponseMeta> {
-        let rx = self.mirror_result_rx.as_ref()?;
-        let mut rx_clone = rx.clone();
-        match tokio::time::timeout(std::time::Duration::from_secs(5), rx_clone.changed()).await {
-            Ok(Ok(())) => rx_clone.borrow().clone(),
-            // Timeout or sender dropped — return whatever is currently available
-            _ => rx.borrow().clone(),
-        }
+        collect_mirror_result(self.mirror_result_rx.clone()?).await
     }
 
     /// Return the stable authenticated identity for downstream policy and
@@ -2219,7 +2212,21 @@ pub async fn log_with_mirror(
         plugin.log_with_mesh_key(summary, mesh_key.as_ref()).await;
     }
     crate::runtime_metrics::global_ref().record_transaction(summary);
-    if let Some(mirror_result) = ctx.collect_mirror_result().await {
+
+    // Mirror completion and mirror-summary logging are fully detached from the
+    // primary transaction. Buffered response paths call `log_with_mirror`
+    // before handing the response to hyper, so awaiting the mirror receiver
+    // here would make a stalled shadow target client-visible. Do not clone the
+    // summary or plugin list when this request was not mirrored.
+    let Some(mirror_result_rx) = ctx.mirror_result_rx.clone() else {
+        return;
+    };
+    let summary = summary.clone();
+    let plugins = plugins.to_vec();
+    tokio::spawn(async move {
+        let Some(mirror_result) = collect_mirror_result(mirror_result_rx).await else {
+            return;
+        };
         let mirror_summary = summary.as_mirror_entry(mirror_result);
         let mirror_mesh_key = if precompute_mesh_key {
             crate::plugins::mesh::prometheus_helpers::mesh_request_key(&mirror_summary)
@@ -2231,6 +2238,16 @@ pub async fn log_with_mirror(
                 .log_with_mesh_key(&mirror_summary, mirror_mesh_key.as_ref())
                 .await;
         }
+    });
+}
+
+async fn collect_mirror_result(
+    mut rx: tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>,
+) -> Option<MirrorResponseMeta> {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed()).await {
+        Ok(Ok(())) => rx.borrow().clone(),
+        // Timeout or sender dropped — return whatever is currently available.
+        _ => rx.borrow().clone(),
     }
 }
 
