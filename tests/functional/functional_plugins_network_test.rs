@@ -310,7 +310,7 @@ async fn request_mirror_fires_even_when_primary_502s() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
-async fn request_mirror_stall_never_delays_primary_response() {
+async fn request_mirror_stall_scripted_backend_never_delays_primary() {
     let primary_res = reserve_port().await.expect("primary port");
     let primary_port = primary_res.port;
     let primary = ScriptedHttp1Backend::builder(primary_res.into_listener())
