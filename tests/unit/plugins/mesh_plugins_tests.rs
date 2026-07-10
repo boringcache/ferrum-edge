@@ -807,6 +807,74 @@ fn ambient_udp_cross_namespace_slice(policies: Vec<MeshPolicy>) -> MeshSlice {
     }
 }
 
+fn ambient_udp_service_waypoint_slice(policies: Vec<MeshPolicy>) -> MeshSlice {
+    let source = Workload {
+        spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/client-ns/sa/client")
+            .expect("source spiffe"),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "client".to_string())]),
+            namespace: None,
+        },
+        service_name: "client".to_string(),
+        addresses: vec!["10.0.1.20".to_string()],
+        ports: Vec::new(),
+        trust_domain: TrustDomain::new("cluster.local").expect("source trust domain"),
+        namespace: "client-ns".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("client".to_string()),
+        pod_uid: Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string()),
+        node_waypoint: None,
+        remote_provenance: false,
+    };
+    let destination = Workload {
+        spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/svc-ns/sa/reviews")
+            .expect("destination spiffe"),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+            namespace: None,
+        },
+        service_name: "reviews".to_string(),
+        addresses: vec!["10.0.2.30".to_string()],
+        ports: Vec::new(),
+        trust_domain: TrustDomain::new("cluster.local").expect("destination trust domain"),
+        namespace: "svc-ns".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("reviews".to_string()),
+        pod_uid: Some("7ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string()),
+        node_waypoint: None,
+        remote_provenance: false,
+    };
+    MeshSlice {
+        namespace: "waypoint-ns".to_string(),
+        waypoint_name: Some("reviews-waypoint".to_string()),
+        mesh_policies: policies,
+        workloads: vec![destination.clone()],
+        ambient_udp_source_workloads: vec![source],
+        services: vec![MeshService {
+            name: "reviews".to_string(),
+            namespace: "svc-ns".to_string(),
+            ports: vec![ServicePort {
+                port: 53,
+                protocol: AppProtocol::Udp,
+                name: Some("dns".to_string()),
+                target_port: None,
+            }],
+            workloads: vec![WorkloadRef {
+                spiffe_id: destination.spiffe_id,
+            }],
+            protocol_overrides: HashMap::new(),
+            cluster_ips: Vec::new(),
+        }],
+        ..MeshSlice::default()
+    }
+}
+
 const AMBIENT_UDP_CLIENT_BAGGAGE: &str = "source.principal=spiffe://cluster.local/ns/client-ns/sa/client,\
      source.pod_uid=6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 
@@ -893,6 +961,106 @@ async fn mesh_authz_ambient_udp_destination_namespace_deny_blocks_source_allowed
             .get("mesh_authz.deny_policy")
             .map(String::as_str),
         Some("dest-deny-all")
+    );
+}
+
+/// ServiceWaypoint's slice namespace is the waypoint's own namespace, not the
+/// namespace of the Service it protects. Destination policy resolution must use
+/// the CONNECT authority/backend workload scope or a service-namespace DENY is
+/// lost after the construction-time waypoint-identity retain.
+#[tokio::test]
+async fn mesh_authz_service_waypoint_udp_resolves_destination_service_scope() {
+    let slice = ambient_udp_service_waypoint_slice(vec![
+        policy_with_scope(
+            "dest-deny-all",
+            PolicyScope::Namespace {
+                namespace: "svc-ns".to_string(),
+            },
+            PolicyAction::Deny,
+        ),
+        policy_with_scope(
+            "client-allow",
+            PolicyScope::Namespace {
+                namespace: "client-ns".to_string(),
+            },
+            PolicyAction::Allow,
+        ),
+    ]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+    );
+    ctx.matched_proxy = Some(Arc::new(
+        serde_json::from_value::<Proxy>(json!({
+            "id": "__mesh-inbound-hbone-relay",
+            "namespace": "",
+            "hosts": [],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "10.0.2.30",
+            "backend_port": 53
+        }))
+        .expect("service-waypoint relay proxy"),
+    ));
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "destination Service DENY must run at a cross-namespace waypoint, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("dest-deny-all")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_service_waypoint_udp_missing_destination_scope_fails_closed() {
+    let slice = ambient_udp_service_waypoint_slice(vec![policy_with_scope(
+        "client-allow",
+        PolicyScope::Namespace {
+            namespace: "client-ns".to_string(),
+        },
+        PolicyAction::Allow,
+    )]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("destination_scope_missing")
     );
 }
 

@@ -787,7 +787,7 @@ impl CpGrpcServer {
                 .iter()
                 .filter(|workload| {
                     workload.pod_uid.is_some()
-                        && Self::namespace_allowed_by_scope(&workload.namespace, scope)
+                        && Self::ambient_udp_source_namespace_allowed(&workload.namespace, scope)
                         && (!restrict_ambient_udp_sources_to_request_namespace
                             || workload.namespace == request.namespace)
                 })
@@ -816,6 +816,21 @@ impl CpGrpcServer {
                 || (workload.pod_uid.is_some()
                     && ambient_udp_source_namespaces.contains(&workload.namespace))
         });
+        if request.ambient_udp_source_scoping {
+            // Destination-visible ServiceWaypoint workloads must remain in the
+            // ordinary workload view for routing and destination-policy scope,
+            // even when their namespace is outside the CP-authorized SOURCE
+            // evidence boundary. `MeshSlice` derives its separate Ambient UDP
+            // source inventory from `pod_uid.is_some()`, so clear only that
+            // source-attestation key on destination-only records. This avoids
+            // reintroducing a cross-namespace source pod through the common
+            // workload carrier without dropping the destination workload.
+            for workload in &mut mesh.workloads {
+                if !ambient_udp_source_namespaces.contains(&workload.namespace) {
+                    workload.pod_uid = None;
+                }
+            }
+        }
         let workload_ids: HashSet<_> = mesh
             .workloads
             .iter()
@@ -835,17 +850,26 @@ impl CpGrpcServer {
                 &policy.scope,
                 namespace,
                 &istio_root_namespace,
-            ) || (request.ambient_udp_source_scoping
-                && ambient_udp_source_namespaces
-                    .iter()
-                    .any(|candidate_namespace| {
-                        Self::policy_scope_can_apply_to_namespace(
-                            &policy.namespace,
-                            &policy.scope,
-                            candidate_namespace,
-                            &istio_root_namespace,
-                        )
-                    }))
+            ) || (request.waypoint_name.is_some()
+                && visible_namespaces.iter().any(|destination_namespace| {
+                    Self::policy_scope_can_apply_to_namespace(
+                        &policy.namespace,
+                        &policy.scope,
+                        destination_namespace,
+                        &istio_root_namespace,
+                    )
+                }))
+                || (request.ambient_udp_source_scoping
+                    && ambient_udp_source_namespaces
+                        .iter()
+                        .any(|candidate_namespace| {
+                            Self::policy_scope_can_apply_to_namespace(
+                                &policy.namespace,
+                                &policy.scope,
+                                candidate_namespace,
+                                &istio_root_namespace,
+                            )
+                        }))
         });
         mesh.peer_authentications.retain(|policy| {
             Self::peer_auth_can_apply_to_namespace(policy, namespace, &istio_root_namespace)
@@ -1078,6 +1102,21 @@ impl CpGrpcServer {
         match scope {
             Some(CpScope::Set(scope_namespaces)) => scope_namespaces.contains(namespace),
             _ => true,
+        }
+    }
+
+    fn ambient_udp_source_namespace_allowed(namespace: &str, scope: Option<&CpScope>) -> bool {
+        match scope {
+            // `Single` historically permits cross-namespace destination
+            // visibility for a ServiceWaypoint binding, so the general scope
+            // helper above intentionally treats it as unrestricted. Ambient
+            // UDP SOURCE evidence is different: the single-namespace CP is an
+            // authorization boundary, and a no-claim token must never receive
+            // pod identities/policies from namespaces other than its validated
+            // subscription namespace.
+            Some(CpScope::Single(scope_namespace)) => namespace == scope_namespace,
+            Some(CpScope::Set(scope_namespaces)) => scope_namespaces.contains(namespace),
+            Some(CpScope::All) | None => true,
         }
     }
 
@@ -2425,9 +2464,11 @@ mod tests {
         use crate::identity::spiffe::{SpiffeId, TrustDomain};
         use crate::modes::mesh::config::{
             AppProtocol, MeshService, MeshWaypointBinding, MeshWaypointServiceRef, ServicePort,
-            Workload,
+            Workload, WorkloadRef,
         };
 
+        let destination_spiffe = SpiffeId::new("spiffe://cluster.local/ns/default/sa/reviews")
+            .expect("destination SPIFFE ID");
         let service = MeshService {
             name: "reviews".to_string(),
             namespace: "default".to_string(),
@@ -2437,7 +2478,9 @@ mod tests {
                 name: Some("http".to_string()),
                 target_port: None,
             }],
-            workloads: Vec::new(),
+            workloads: vec![WorkloadRef {
+                spiffe_id: destination_spiffe.clone(),
+            }],
             protocol_overrides: Default::default(),
             cluster_ips: Vec::new(),
         };
@@ -2462,18 +2505,48 @@ mod tests {
             node_waypoint: None,
             remote_provenance: false,
         };
+        let destination_workload = Workload {
+            spiffe_id: destination_spiffe,
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+                namespace: Some("default".to_string()),
+            },
+            service_name: "reviews".to_string(),
+            addresses: vec!["10.2.0.12".to_string()],
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("cluster.local").expect("destination trust domain"),
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("reviews".to_string()),
+            pod_uid: Some("26b2c3d4-9dad-11d1-80b4-00c04fd430c8".to_string()),
+            node_waypoint: None,
+            remote_provenance: false,
+        };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
-                workloads: vec![source_workload],
+                workloads: vec![source_workload, destination_workload],
                 services: vec![service],
-                mesh_policies: vec![crate::modes::mesh::config::MeshPolicy {
-                    name: "clients-source-policy".to_string(),
-                    namespace: "clients".to_string(),
-                    scope: PolicyScope::Namespace {
+                mesh_policies: vec![
+                    crate::modes::mesh::config::MeshPolicy {
+                        name: "clients-source-policy".to_string(),
                         namespace: "clients".to_string(),
+                        scope: PolicyScope::Namespace {
+                            namespace: "clients".to_string(),
+                        },
+                        rules: Vec::new(),
                     },
-                    rules: Vec::new(),
-                }],
+                    crate::modes::mesh::config::MeshPolicy {
+                        name: "reviews-destination-policy".to_string(),
+                        namespace: "default".to_string(),
+                        scope: PolicyScope::Namespace {
+                            namespace: "default".to_string(),
+                        },
+                        rules: Vec::new(),
+                    },
+                ],
                 waypoint_bindings: vec![MeshWaypointBinding {
                     name: "waypoint".to_string(),
                     namespace: "infra".to_string(),
@@ -2494,7 +2567,9 @@ mod tests {
             ..MeshSliceRequest::default()
         };
 
-        let mesh_config = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+        let mesh_config =
+            CpGrpcServer::filter_config_to_mesh_request_for_scope(&config, &request, &CpScope::All);
+        let single_scope_config = CpGrpcServer::filter_config_to_mesh_request_for_scope(
             &config,
             &request,
             &CpScope::Single("infra".to_string()),
@@ -2527,23 +2602,55 @@ mod tests {
         assert_eq!(mesh.waypoint_bindings.len(), 1);
         assert_eq!(mesh.waypoint_bindings[0].services.len(), 1);
         assert_eq!(mesh.waypoint_bindings[0].services[0].namespace, "default");
-        assert_eq!(mesh.workloads.len(), 1);
-        assert_eq!(mesh.workloads[0].namespace, "clients");
-        assert_eq!(mesh.mesh_policies.len(), 1);
-        assert_eq!(mesh.mesh_policies[0].name, "clients-source-policy");
+        assert_eq!(mesh.workloads.len(), 2);
+        assert!(
+            mesh.workloads
+                .iter()
+                .any(|workload| workload.namespace == "clients" && workload.pod_uid.is_some())
+        );
+        assert_eq!(mesh.mesh_policies.len(), 2);
+        assert!(
+            mesh.mesh_policies
+                .iter()
+                .any(|policy| policy.name == "clients-source-policy")
+        );
+        assert!(
+            mesh.mesh_policies
+                .iter()
+                .any(|policy| policy.name == "reviews-destination-policy")
+        );
+        let single_scope_mesh = single_scope_config
+            .mesh
+            .expect("single-scope mesh view should remain");
+        assert_eq!(single_scope_mesh.services.len(), 1);
+        assert_eq!(single_scope_mesh.workloads.len(), 1);
+        assert_eq!(single_scope_mesh.workloads[0].namespace, "default");
+        assert!(single_scope_mesh.workloads[0].pod_uid.is_none());
+        assert_eq!(single_scope_mesh.mesh_policies.len(), 1);
+        assert_eq!(
+            single_scope_mesh.mesh_policies[0].name,
+            "reviews-destination-policy"
+        );
         let bearer_mesh = bearer_restricted
             .mesh
             .expect("bearer-restricted mesh view should remain");
-        assert!(bearer_mesh.workloads.is_empty());
-        assert!(bearer_mesh.mesh_policies.is_empty());
+        assert_eq!(bearer_mesh.workloads.len(), 1);
+        assert_eq!(bearer_mesh.workloads[0].namespace, "default");
+        assert!(bearer_mesh.workloads[0].pod_uid.is_none());
+        assert_eq!(bearer_mesh.mesh_policies.len(), 1);
+        assert_eq!(
+            bearer_mesh.mesh_policies[0].name,
+            "reviews-destination-policy"
+        );
         assert_eq!(bearer_mesh.services.len(), 1);
         assert!(
             mesh_config_without_udp_scoping
                 .mesh
                 .expect("mesh request view should retain mesh")
                 .mesh_policies
-                .is_empty(),
-            "cross-namespace source policies require the explicit Ambient UDP scoping request"
+                .iter()
+                .all(|policy| policy.name != "clients-source-policy"),
+            "cross-namespace source policies require the explicit Ambient UDP scoping request; destination policies remain visible"
         );
         assert!(
             strict_config

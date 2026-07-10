@@ -2016,7 +2016,11 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   normal inbound HBONE enforces for the destination workload) and the per-pod
   **source** namespace/selector scope, applying the latter only after the normal
   trusted-assertor + trust-domain checks and an exact live pod-UID↔SPIFFE binding
-  check. Absent, malformed, stale, mismatched, or untrusted evidence discards the
+  check. A ServiceWaypoint resolves the destination scope from the CONNECT authority's
+  bound Service workload rather than the waypoint namespace and rejects the CONNECT if
+  that destination scope is missing. A default single-namespace CP never exports
+  Ambient UDP source evidence outside its configured namespace. Absent, malformed,
+  stale, mismatched, or untrusted evidence discards the
   source stamp and falls back to mesh-wide source scoping (still unioned with the
   destination policy set, never broader). NodeWaypoint UDP/DTLS remains
   unchanged and does not gain per-pod scoping. Ambient producers share one node-wide session limiter, so

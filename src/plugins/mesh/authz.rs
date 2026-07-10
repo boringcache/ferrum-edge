@@ -74,6 +74,11 @@ pub struct MeshAuthz {
     ambient_udp_source_policies: Vec<MeshPolicy>,
     ambient_udp_source_scopes: HashMap<[u8; 16], crate::modes::mesh::runtime::PolicyScopeCache>,
     ambient_udp_source_scoping: bool,
+    /// ServiceWaypoint UDP relays terminate for workloads outside the
+    /// waypoint's own namespace. Their destination policy scope must therefore
+    /// be resolved from the CONNECT authority/backend, not from
+    /// `slice.namespace` (the waypoint namespace).
+    ambient_udp_destination_scope_required: bool,
     destination_policy_scopes_by_upstream:
         HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
     destination_policy_scopes_by_backend:
@@ -1144,21 +1149,30 @@ impl MeshAuthz {
                         .iter()
                         .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny))
             });
+        let ambient_udp_destination_scope_required =
+            ambient_udp_source_scoping && slice.waypoint_name.is_some();
         let mut has_route_upstream_metadata = false;
-        let destination_policy_scope_index = if per_pod_policy_scoping {
-            let cluster_domains = normalized_cluster_domains(config);
-            let (route_metadata_present, route_upstreams) =
-                parse_node_waypoint_route_upstreams(config)?;
-            has_route_upstream_metadata = route_metadata_present;
-            destination_policy_scope_index(&slice, &cluster_domains, &route_upstreams)
-        } else {
-            DestinationPolicyScopeIndex::default()
-        };
+        let destination_policy_scope_index =
+            if per_pod_policy_scoping || ambient_udp_destination_scope_required {
+                let cluster_domains = normalized_cluster_domains(config);
+                let route_upstreams = if per_pod_policy_scoping {
+                    let (route_metadata_present, route_upstreams) =
+                        parse_node_waypoint_route_upstreams(config)?;
+                    has_route_upstream_metadata = route_metadata_present;
+                    route_upstreams
+                } else {
+                    Vec::new()
+                };
+                destination_policy_scope_index(&slice, &cluster_domains, &route_upstreams)
+            } else {
+                DestinationPolicyScopeIndex::default()
+            };
         Ok(Self {
             slice,
             ambient_udp_source_policies,
             ambient_udp_source_scopes,
             ambient_udp_source_scoping,
+            ambient_udp_destination_scope_required,
             destination_policy_scopes_by_upstream: destination_policy_scope_index.by_upstream,
             destination_policy_scopes_by_backend: destination_policy_scope_index.by_backend,
             destination_policy_scopes_by_namespaced_backend: destination_policy_scope_index
@@ -1905,20 +1919,16 @@ impl Plugin for MeshAuthz {
         let decision = if ambient_udp_source_scope_request {
             // Ambient UDP inbound relay. Evaluate the UNION of:
             //
-            //   1. the DESTINATION-scoped policies that normal (non-UDP) inbound
-            //      HBONE evaluates for this relay — `self.slice.mesh_policies`,
-            //      already retained at construction (line ~1116) to those whose
-            //      scope applies to this proxy's workload identity
-            //      (`slice.namespace`/`slice.labels`). This is exactly the set the
-            //      fall-through `else` (`evaluate_mesh_authorization(&self.slice,
-            //      ..)`) uses, so a namespace/selector DENY (e.g. DENY-all in the
-            //      service namespace) or ALLOW protecting the destination workload
-            //      still runs for `udp` CONNECTs. There is no separate
-            //      destination-scope liveness gate to miss here: for Ambient /
-            //      ServiceWaypoint topology `per_pod_policy_scoping` is off, so the
-            //      destination filter is baked into `self.slice.mesh_policies`, not
-            //      resolved per request. Failing closed on it would be stricter
-            //      than the normal inbound path, so we stay at parity.
+            //   1. DESTINATION-scoped policies. Plain Ambient uses
+            //      `self.slice.mesh_policies`, retained at construction to the
+            //      destination workload identity just like non-UDP inbound HBONE.
+            //      ServiceWaypoint is different: `slice.namespace` is the
+            //      WAYPOINT namespace, while the protected Service/backends may be
+            //      elsewhere. For it, resolve the synthesized relay's exact
+            //      CONNECT-authority backend through the precomputed destination
+            //      scope index and test the full policy superset against those
+            //      backing-workload scopes. Missing destination evidence fails
+            //      closed; it never falls back to waypoint-namespace filtering.
             //
             //   2. the SOURCE-scoped policies applicable to the asserted source-pod
             //      scope from `ambient_udp_source_policies` (the pre-retain full
@@ -1933,32 +1943,67 @@ impl Plugin for MeshAuthz {
             // separate decisions would break that aggregation (a destination-only
             // ALLOW plus a source-only ALLOW must not each independently deny).
             //
-            // Dedup by policy identity without a per-request allocation: because
-            // `ambient_udp_source_policies` is the pre-retain clone and
-            // `self.slice.mesh_policies` is exactly `{p : destination-applicable}`,
-            // any source-arm policy that ALSO applies to the destination scope is
-            // already in arm 1, so the source arm skips destination-applicable
-            // policies (`!policy_scope_applies_to_workload(.., slice.namespace,
-            // slice.labels)`). Predicate-only; the hot path never clones the slice
-            // or builds a set.
+            // Dedup is predicate-only and allocation-free. Plain Ambient chains
+            // the retained destination set with source-only entries from the full
+            // superset. ServiceWaypoint filters the full superset once with
+            // `destination_applies || source_applies`, so a policy applying to
+            // both arms is yielded only once.
             let source_scope = ambient_udp_source_scope;
-            evaluate_mesh_authorization_policies(
-                self.slice.mesh_policies.iter().chain(
+            if self.ambient_udp_destination_scope_required {
+                let destination_scopes = ctx
+                    .matched_proxy
+                    .as_ref()
+                    .and_then(|proxy| self.destination_scope_match_for_proxy(proxy))
+                    .map(|matched| matched.scopes);
+                let Some(destination_scopes) = destination_scopes else {
+                    ctx.metadata.insert(
+                        "mesh_authz.destination_scope_missing".to_string(),
+                        "true".to_string(),
+                    );
+                    ctx.metadata.insert(
+                        "mesh_authz.deny_policy".to_string(),
+                        "destination_scope_missing".to_string(),
+                    );
+                    self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
+                    return PluginResult::Reject {
+                        status_code: 403,
+                        body: r#"{"error":"Mesh authorization denied: missing destination policy scope"}"#
+                            .into(),
+                        headers: HashMap::new(),
+                    };
+                };
+                evaluate_mesh_authorization_policies(
                     self.ambient_udp_source_policies.iter().filter(|policy| {
+                        let destination_applies = destination_scopes
+                            .iter()
+                            .any(|scope| scope.policy_applies(policy));
                         let source_applies = source_scope.map_or_else(
                             || matches!(policy.scope, PolicyScope::MeshWide),
                             |scope| scope.policy_applies(policy),
                         );
-                        source_applies
-                            && !policy_scope_applies_to_workload(
-                                policy,
-                                &self.slice.namespace,
-                                &self.slice.labels,
-                            )
+                        destination_applies || source_applies
                     }),
-                ),
-                &request,
-            )
+                    &request,
+                )
+            } else {
+                evaluate_mesh_authorization_policies(
+                    self.slice.mesh_policies.iter().chain(
+                        self.ambient_udp_source_policies.iter().filter(|policy| {
+                            let source_applies = source_scope.map_or_else(
+                                || matches!(policy.scope, PolicyScope::MeshWide),
+                                |scope| scope.policy_applies(policy),
+                            );
+                            source_applies
+                                && !policy_scope_applies_to_workload(
+                                    policy,
+                                    &self.slice.namespace,
+                                    &self.slice.labels,
+                                )
+                        }),
+                    ),
+                    &request,
+                )
+            }
         } else if self.per_pod_policy_scoping {
             if self.has_scoped_policies {
                 ctx.metadata.insert(
