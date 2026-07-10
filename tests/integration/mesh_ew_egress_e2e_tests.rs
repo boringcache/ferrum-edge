@@ -19,7 +19,7 @@
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{
     AppProtocol, EastWestGateway, MultiClusterConfig, Resolution, ServiceEntry,
-    ServiceEntryLocation, ServicePort,
+    ServiceEntryLocation, ServicePort, WorkloadPort,
 };
 use ferrum_edge::modes::mesh::prepare_gateway_config_for_mesh;
 use ferrum_edge::modes::mesh::{MeshTopology, runtime::MeshRuntimeState};
@@ -247,6 +247,68 @@ fn east_west_gateway_materializes_per_port_proxies_for_multiport_service() {
             .map(|p| (&p.id, &p.hosts))
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn east_west_gateway_materializes_raw_tcp_and_udp_per_port_sni_relays() {
+    let mut workload = workload_for(
+        "l4-service",
+        DEFAULT_NAMESPACE,
+        [("app", "l4-service")],
+        ["10.0.0.8"],
+    );
+    workload.ports = vec![
+        WorkloadPort {
+            port: 7070,
+            protocol: AppProtocol::Tcp,
+            name: Some("tcp".to_string()),
+        },
+        WorkloadPort {
+            port: 5353,
+            protocol: AppProtocol::Udp,
+            name: Some("udp".to_string()),
+        },
+    ];
+    let mut service = service_for("l4-service", DEFAULT_NAMESPACE, &[&workload]);
+    service.ports = vec![
+        ServicePort {
+            port: 7070,
+            protocol: AppProtocol::Tcp,
+            name: Some("tcp".to_string()),
+            target_port: None,
+        },
+        ServicePort {
+            port: 5353,
+            protocol: AppProtocol::Udp,
+            name: Some("udp".to_string()),
+            target_port: None,
+        },
+    ];
+    let config = gateway_config_with_mesh(
+        Vec::new(),
+        Vec::new(),
+        mesh_config_with(vec![workload], vec![service], Vec::new()),
+    );
+    let prepared = prepare_gateway_config_for_mesh(config, &east_west_runtime()).expect("prepared");
+
+    for (alias, port) in [
+        ("p7070.l4-service.default.svc.cluster.local", 7070),
+        ("p5353.l4-service.default.svc.cluster.local", 5353),
+    ] {
+        let proxy = prepared
+            .proxies
+            .iter()
+            .find(|proxy| proxy.hosts.iter().any(|host| host == alias))
+            .expect("L4 alias proxy");
+        assert!(proxy.passthrough);
+        assert_eq!(proxy.listen_port, Some(15443));
+        let upstream = prepared
+            .upstreams
+            .iter()
+            .find(|upstream| Some(&upstream.id) == proxy.upstream_id.as_ref())
+            .expect("L4 alias upstream");
+        assert!(upstream.targets.iter().all(|target| target.port == port));
+    }
 }
 
 /// codex #2040 Finding B (id collision): a MULTI-port service `foo` (ports 8080,
