@@ -331,30 +331,38 @@ impl A2aSseStreamInspector {
         match (self.task_id.as_deref(), self.context_id.as_deref()) {
             (Some(task_id), Some(context_id)) => tracing::info!(
                 target: "a2a_gateway",
-                "a2a.stream_events" = self.stream_events,
-                "a2a.task_id" = task_id,
-                "a2a.context_id" = context_id,
-                "a2a.task_state" = task_state,
+                {
+                    "a2a.stream_events" = self.stream_events,
+                    "a2a.task_id" = task_id,
+                    "a2a.context_id" = context_id,
+                    "a2a.task_state" = task_state
+                },
                 "observed A2A SSE response metadata"
             ),
             (Some(task_id), None) => tracing::info!(
                 target: "a2a_gateway",
-                "a2a.stream_events" = self.stream_events,
-                "a2a.task_id" = task_id,
-                "a2a.task_state" = task_state,
+                {
+                    "a2a.stream_events" = self.stream_events,
+                    "a2a.task_id" = task_id,
+                    "a2a.task_state" = task_state
+                },
                 "observed A2A SSE response metadata"
             ),
             (None, Some(context_id)) => tracing::info!(
                 target: "a2a_gateway",
-                "a2a.stream_events" = self.stream_events,
-                "a2a.context_id" = context_id,
-                "a2a.task_state" = task_state,
+                {
+                    "a2a.stream_events" = self.stream_events,
+                    "a2a.context_id" = context_id,
+                    "a2a.task_state" = task_state
+                },
                 "observed A2A SSE response metadata"
             ),
             (None, None) => tracing::info!(
                 target: "a2a_gateway",
-                "a2a.stream_events" = self.stream_events,
-                "a2a.task_state" = task_state,
+                {
+                    "a2a.stream_events" = self.stream_events,
+                    "a2a.task_state" = task_state
+                },
                 "observed A2A SSE response metadata"
             ),
         }
