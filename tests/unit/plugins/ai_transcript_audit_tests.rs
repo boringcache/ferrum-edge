@@ -2930,10 +2930,11 @@ async fn non_retryable_sink_4xx_marks_sink_unhealthy_under_reject() {
 }
 
 #[tokio::test]
-async fn stream_true_request_rejects_when_sink_unhealthy_fail_closed() {
+async fn stream_capture_preflights_sink_health_before_dispatch_or_short_circuit() {
     // A streaming response cannot be replaced after headers are committed, so
-    // fail-closed sink health must be enforced at request classification time
-    // for client-controlled `stream:true` AI requests.
+    // fail-closed sink health must be enforced while the AI request can still
+    // be rejected, including candidates whose provider chooses SSE without a
+    // client-controlled `stream:true` field.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(401))
@@ -2957,44 +2958,57 @@ async fn stream_true_request_rejects_when_sink_unhealthy_fail_closed() {
     let mut saw_unhealthy_reject = false;
     for _ in 0..100 {
         let mut ctx = make_ctx();
-        plugin
+        let preflight = plugin
             .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
             .await;
-        let _ = plugin
-            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
-            .await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let mut stream_ctx = make_ctx();
-        let result = plugin
-            .on_final_request_body_with_context(
-                &mut stream_ctx,
-                &headers,
-                br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
-            )
-            .await;
         if matches!(
-            result,
+            preflight,
             PluginResult::Reject {
                 status_code: 503,
                 ..
             }
         ) {
             assert_eq!(
-                stream_ctx
-                    .metadata
+                ctx.metadata
                     .get("ai_transcript_audit.sink_status")
                     .map(String::as_str),
                 Some("rejected")
             );
+
+            // `before_proxy` must enforce the same preflight before a later
+            // cache/federation plugin can short-circuit the request.
+            let mut short_circuit_ctx = make_ctx();
+            short_circuit_ctx.metadata.insert(
+                "request_body".to_string(),
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#
+                    .to_string(),
+            );
+            let mut short_circuit_headers = json_headers();
+            let before_proxy = plugin
+                .before_proxy(&mut short_circuit_ctx, &mut short_circuit_headers)
+                .await;
+            assert!(
+                matches!(
+                    before_proxy,
+                    PluginResult::Reject {
+                        status_code: 503,
+                        ..
+                    }
+                ),
+                "staged stream candidates must fail closed before downstream short-circuits"
+            );
             saw_unhealthy_reject = true;
             break;
         }
+        let _ = plugin
+            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     assert!(
         saw_unhealthy_reject,
-        "stream:true AI requests must fail closed once the sink is unhealthy"
+        "stream-capture candidates must fail closed once the sink is unhealthy"
     );
 }
 

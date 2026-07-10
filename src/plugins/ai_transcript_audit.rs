@@ -629,13 +629,16 @@ impl AiTranscriptAudit {
     }
 
     fn stream_fail_closed_rejection(&self, ctx: &mut RequestContext) -> Option<PluginResult> {
-        // Match the stream-inspector emission gate. A config with streaming
-        // capture disabled deliberately does not audit streams, and sampled
-        // capture must not turn a sampling miss into a fail-closed rejection.
+        // Preflight only records already known to emit on a successful stream:
+        // sampling winners plus known request-side guardrail overrides. `On`
+        // tees every stream but still honors `sampling.rate` at emission time,
+        // so `stream_tee_wanted` would be too broad here. Error/response-side
+        // overrides are not knowable before backend dispatch.
         if self.capture.streaming == StreamingCapture::Off
             || !flag(&ctx.metadata, MD_CANDIDATE)
-            || !flag(&ctx.metadata, MD_STREAM_REQUEST)
-            || !self.stream_tee_wanted(&ctx.metadata)
+            || !flag(&ctx.metadata, &self.stream_marker_key())
+            || !(self.staged_sample_hit(&ctx.metadata)
+                || (self.sampling.always_on_guardrail && guardrail_fired(&ctx.metadata)))
         {
             return None;
         }
@@ -1179,6 +1182,9 @@ impl Plugin for AiTranscriptAudit {
         };
         self.stage_candidate(ctx, body.as_bytes());
         ctx.metadata.insert("request_body".to_string(), body);
+        if let Some(result) = self.stream_fail_closed_rejection(ctx) {
+            return result;
+        }
         PluginResult::Continue
     }
 
