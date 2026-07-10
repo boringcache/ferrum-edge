@@ -7135,6 +7135,15 @@ impl LiveGatewayChild {
             kill_child(&mut child);
         }
     }
+
+    fn poll_status(&mut self) -> String {
+        match self.0.as_mut().map(Child::try_wait) {
+            Some(Ok(Some(status))) => format!("exited with {status}"),
+            Some(Ok(None)) => "still running".to_string(),
+            Some(Err(error)) => format!("status check failed: {error}"),
+            None => "already stopped".to_string(),
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -7697,8 +7706,15 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         "UDP source gateway A did not start\n{}",
         captured_output(&temp_a)
     );
-    wait_for_udp_capture_snapshot(pod.pid(), capture_port, true, Duration::from_secs(12))
-        .expect("real manager/backend must install one UDP producer");
+    if let Err(error) =
+        wait_for_udp_capture_snapshot(pod.pid(), capture_port, true, Duration::from_secs(20))
+    {
+        let status = gateway_a.poll_status();
+        panic!(
+            "real manager/backend must install one UDP producer: {error}; gateway A {status}\n{}",
+            captured_output(&temp_a)
+        );
+    }
 
     // Let at least two additional 2s reconcile passes run, then prove neither
     // the manager nor the idempotent scripts duplicated listeners/rules/routes.
