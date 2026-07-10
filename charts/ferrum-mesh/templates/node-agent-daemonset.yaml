@@ -63,8 +63,9 @@
 {{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED" -}}
 {{- $ambientUdpCaptureEnabled = has (lower (trim (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED")))) (list "true" "1") -}}
 {{- end -}}
+{{- $ambientUdpLifecycle := eq $ambientTopology "ambient" -}}
 {{- $ambientUdpProducer := and (eq $ambientTopology "ambient") $ambientUdpCaptureEnabled -}}
-{{- $nodeAgentPublishesRegistry := or $nodeWaypointRegistryEnabled $ambientUdpProducer -}}
+{{- $nodeAgentPublishesRegistry := or $nodeWaypointRegistryEnabled $ambientUdpLifecycle -}}
 {{- $nodeAgentManagedEnv := list
   "FERRUM_MODE"
   "FERRUM_MESH_CAPTURE_MODE"
@@ -208,15 +209,17 @@ spec:
             - name: FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR
               value: {{ .Values.nodeAgent.podRegistryDir | quote }}
             {{- end }}
-            {{- if $ambientUdpProducer }}
-            {{- /* Propagate the Ambient UDP producer flag (#2013) so the
-                   node-agent publishes the per-pod registry and arms the
-                   producer-readiness BPF guard. The topology discriminator keeps
-                   that guard disabled where no Ambient producer can answer. */}}
-            - name: FERRUM_MESH_CAPTURE_UDP_ENABLED
-              value: "true"
+            {{- if $ambientUdpLifecycle }}
+            {{- /* Propagate Ambient topology even while UDP is disabled so the
+                   node-agent keeps publishing the registry and re-derives
+                   disabled-cleanup acknowledgements. The capture flag remains
+                   producer-only, so disabled cleanup never arms readiness. */}}
             - name: FERRUM_MESH_TOPOLOGY
               value: "ambient"
+            {{- end }}
+            {{- if $ambientUdpProducer }}
+            - name: FERRUM_MESH_CAPTURE_UDP_ENABLED
+              value: "true"
             {{- end }}
             {{- if .Values.nodeAgent.admin.enabled }}
             - name: FERRUM_NODE_AGENT_ADMIN_ENABLED

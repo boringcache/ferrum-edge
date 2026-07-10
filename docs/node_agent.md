@@ -204,9 +204,10 @@ maps:
 |---|---|---|
 | Pod registry dir | `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR` (default `/run/ferrum/node-waypoint-pods`) | One file per enrolled pod. File **name** = pod UID; file **contents** = line 1 pod cgroup path, then optional `ipv4=<pod-ip>` / `ipv6=<pod-ip>` lines from Kubernetes `status.podIPs`. |
 
-Helm sets `nodeAgent.podRegistryDir` to that default and, when
-`nodeAgent.proxyMode=node_waypoint`, mounts it as the same writable hostPath in
-both the node-agent and ambient DaemonSets. If operators override the path,
+Helm sets `nodeAgent.podRegistryDir` to that default and mounts it as the same
+writable hostPath in both DaemonSets for NodeWaypoint or an Ambient eBPF
+node-agent, including the UDP-disabled stale-rule cleanup posture. If operators
+override the path,
 both processes must see the same host directory; a container-local directory
 lets both pods report Ready while no in-netns capture listener is attached for
 workloads. The chart rejects incomplete NodeWaypoint topologies at render time:

@@ -962,7 +962,7 @@ async fn run_with_backend(
                     metrics.as_ref(),
                 );
             }
-            _ = udp_readiness_interval.tick(), if config.capture_config.udp_capture_enabled => {
+            _ = udp_readiness_interval.tick(), if udp_readiness_reconcile_enabled(config) => {
                 reconcile_udp_capture_readiness(
                     backend.as_mut(),
                     &pod_states,
@@ -2883,6 +2883,12 @@ fn pod_map_info(config: &NodeAgentConfig, udp_ready: bool) -> PodInfo {
         config.capture_config.udp_capture_enabled,
         udp_ready,
     )
+}
+
+fn udp_readiness_reconcile_enabled(config: &NodeAgentConfig) -> bool {
+    config.capture_config.udp_capture_enabled
+        || (config.node_waypoint_pod_registry_dir.is_some()
+            && config.capture_contract.proxy_mode == NodeAgentProxyMode::LocalPod)
 }
 
 /// Open or close the host-veth enrollment guard from producer readiness
@@ -5059,6 +5065,10 @@ mod tests {
                     config.node_waypoint_pod_registry_dir.is_some(),
                     "Ambient must keep publishing pod netns for disabled stale-rule cleanup"
                 );
+                assert!(
+                    udp_readiness_reconcile_enabled(&config),
+                    "disabled Ambient cleanup must keep live ack reconciliation scheduled"
+                );
             },
         );
     }
@@ -5118,6 +5128,7 @@ mod tests {
                     .expect("node-agent config should parse");
                 assert!(!config.capture_config.udp_capture_enabled);
                 assert!(config.node_waypoint_pod_registry_dir.is_none());
+                assert!(!udp_readiness_reconcile_enabled(&config));
             },
         );
     }
