@@ -1,5 +1,6 @@
 use ferrum_edge::_test_support::{
-    soap_count_wsu_id_occurrences_for_test, soap_find_element_by_wsu_id_for_test,
+    soap_count_wsu_id_occurrences_for_test, soap_exclusive_canonicalize_element_for_test,
+    soap_find_element_by_wsu_id_for_test,
 };
 use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
 use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
@@ -443,6 +444,21 @@ fn find_element_by_wsu_id_rejects_prefix_after_namespace_scope_ends() {
 
     assert!(resolved.starts_with("<Signed"));
     assert!(resolved.contains("signed body bytes"));
+}
+
+#[test]
+fn exclusive_c14n_reemits_inherited_namespaces_and_orders_attributes() {
+    let xml = r#"<outer xmlns="urn:default" xmlns:p="urn:payload" xmlns:keep="urn:inclusive">
+        <p:Payload z="last" p:qualified="third" a="first"><Child/><p:Empty/></p:Payload>
+    </outer>"#;
+
+    let canonical = soap_exclusive_canonicalize_element_for_test(xml, "Payload", "keep #default")
+        .expect("fixture must canonicalize");
+
+    assert_eq!(
+        canonical,
+        "<p:Payload xmlns=\"urn:default\" xmlns:keep=\"urn:inclusive\" xmlns:p=\"urn:payload\" a=\"first\" z=\"last\" p:qualified=\"third\"><Child></Child><p:Empty></p:Empty></p:Payload>"
+    );
 }
 
 #[test]
@@ -926,10 +942,10 @@ async fn test_nonce_replay_detected() {
 //   1. Locates `<Signature>` inside the assertion.
 //   2. Confirms the signing cert (from `KeyInfo/X509Data/X509Certificate`)
 //      matches one of `saml.trusted_signing_certs` by SHA-256 fingerprint.
-//   3. Verifies each `<Reference>` digest against the assertion with its own
-//      `<Signature>` element excised (enveloped-signature transform).
-//   4. Verifies `<SignatureValue>` over the `<SignedInfo>` bytes using the
-//      cert's public key.
+//   3. Applies the declared enveloped-signature and exclusive-c14n transforms
+//      before verifying each `<Reference>` digest.
+//   4. Verifies `<SignatureValue>` over exclusive-canonicalized `<SignedInfo>`
+//      using the cert's public key.
 //   5. THEN checks Issuer / NotBefore / NotOnOrAfter / Audience.
 //
 // Tests below construct SAML assertions and sign them with a bundled test
@@ -1244,19 +1260,25 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 "<Assertion ID=\"{}\"><Issuer>{}</Issuer>{}</Assertion>",
                 self.assertion_id, self.issuer, signed_body_after_issuer
             );
+            let canonical_assertion = super::soap_exclusive_canonicalize_element_for_test(
+                &assertion_no_sig,
+                "Assertion",
+                "",
+            )
+            .expect("test assertion must canonicalize");
 
             let (digest_method_uri, asserted_digest) = if self.use_sha1_digest {
                 (
                     "http://www.w3.org/2000/09/xmldsig#sha1",
                     ring::digest::digest(
                         &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
-                        assertion_no_sig.as_bytes(),
+                        canonical_assertion.as_bytes(),
                     ),
                 )
             } else {
                 (
                     "http://www.w3.org/2001/04/xmlenc#sha256",
-                    ring::digest::digest(&ring::digest::SHA256, assertion_no_sig.as_bytes()),
+                    ring::digest::digest(&ring::digest::SHA256, canonical_assertion.as_bytes()),
                 )
             };
             let digest_b64 = B64.encode(asserted_digest.as_ref());
@@ -1268,12 +1290,19 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
 <CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>\
 <SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>\
 <Reference URI=\"#{}\">\
+<Transforms>\
+<Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>\
+<Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>\
+</Transforms>\
 <DigestMethod Algorithm=\"{}\"/>\
 <DigestValue>{}</DigestValue>\
 </Reference>\
 </SignedInfo>",
                 self.assertion_id, digest_method_uri, digest_b64
             );
+            let canonical_signed_info =
+                super::soap_exclusive_canonicalize_element_for_test(&signed_info, "SignedInfo", "")
+                    .expect("test SignedInfo must canonicalize");
 
             // Pick the signing key + matching cert.
             let (key_pkcs8_b64, cert_pem) = if self.sign_with_untrusted_key {
@@ -1291,7 +1320,7 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 .sign(
                     &RSA_PKCS1_SHA256,
                     &rng,
-                    signed_info.as_bytes(),
+                    canonical_signed_info.as_bytes(),
                     &mut sig_bytes,
                 )
                 .expect("test signing must succeed");
@@ -2107,9 +2136,10 @@ mod x509_roundtrip {
 
     /// Construct a SOAP envelope whose `<wsse:Security>` block contains a
     /// `<Timestamp wsu:Id="TS-1">` and a `<Signature>` covering that Timestamp.
-    /// The `<SignedInfo>` byte sequence in the returned envelope is exactly
-    /// what `validate_x509_signature` extracts via `find_element_block`, so
-    /// the signature computed here will match what the verifier checks.
+    /// The signed bytes are exclusive-canonicalized rather than copied from
+    /// the wire. Namespace declarations are intentionally inherited and then
+    /// re-emitted by c14n, making this a regression fixture for the old
+    /// wire-byte verifier.
     fn build_signed_soap_envelope(cert: &TestRsaCert) -> String {
         build_signed_soap_envelope_with_timestamp_prefix(cert, "wsu")
     }
@@ -2131,33 +2161,47 @@ mod x509_roundtrip {
             expires = expires,
         );
 
-        // verify_reference_digests hashes the raw bytes of the referenced
-        // element as extracted from the envelope (no XML C14N in this impl),
-        // so we hash the exact `timestamp_xml` string we'll embed below.
-        let ts_digest = ring::digest::digest(&ring::digest::SHA256, timestamp_xml.as_bytes());
+        let timestamp_context = format!(
+            r#"<root xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:{prefix}="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">{timestamp}</root>"#,
+            prefix = timestamp_prefix,
+            timestamp = timestamp_xml,
+        );
+        let canonical_timestamp =
+            soap_exclusive_canonicalize_element_for_test(&timestamp_context, "Timestamp", "soap")
+                .expect("test Timestamp must canonicalize");
+        assert_ne!(
+            canonical_timestamp, timestamp_xml,
+            "fixture must differ from wire bytes to regress raw-byte verification"
+        );
+        let ts_digest = ring::digest::digest(&ring::digest::SHA256, canonical_timestamp.as_bytes());
         let ts_digest_b64 = B64.encode(ts_digest.as_ref());
 
-        // Build SignedInfo as the EXACT bytes that will appear in the envelope.
-        // This is what `find_element_block(security_block, "SignedInfo")`
-        // returns and what we pass into `ring::RsaKeyPair::sign`.
-        // Raw-string delimiter must be `##` because the URL fragments
-        // `xml-exc-c14n#`, `xmldsig-more#`, and `xmlenc#` contain `#`
-        // and a single-`#` raw literal would terminate at the first
-        // `"#` (e.g. inside `xml-exc-c14n#"/>`), which is what tripped
-        // the parser before the fix.
         let signed_info = format!(
-            r##"<SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#TS-1"><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>{}</DigestValue></Reference></SignedInfo>"##,
+            r##"<SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"><ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="soap"/></CanonicalizationMethod><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#TS-1"><Transforms><Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"><ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="soap"/></Transform></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>{}</DigestValue></Reference></SignedInfo>"##,
             ts_digest_b64
         );
+        let signed_info_context = format!(
+            r#"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">{signed_info}</Signature>"#,
+        );
+        let canonical_signed_info = soap_exclusive_canonicalize_element_for_test(
+            &signed_info_context,
+            "SignedInfo",
+            "soap",
+        )
+        .expect("test SignedInfo must canonicalize");
+        assert_ne!(
+            canonical_signed_info, signed_info,
+            "fixture must sign canonical form rather than wire bytes"
+        );
 
-        // Sign the SignedInfo bytes with RSA-PKCS1-v1_5 over SHA-256.
+        // Sign the exclusive-canonicalized SignedInfo with RSA-PKCS1-v1_5.
         let rng = SystemRandom::new();
         let mut signature = vec![0u8; cert.signing_key.public().modulus_len()];
         cert.signing_key
             .sign(
                 &RSA_PKCS1_SHA256,
                 &rng,
-                signed_info.as_bytes(),
+                canonical_signed_info.as_bytes(),
                 &mut signature,
             )
             .expect("ring RSA sign");
@@ -2215,6 +2259,51 @@ mod x509_roundtrip {
             matches!(result, PluginResult::Continue),
             "expected Continue with valid RSA signature, got {:?}",
             result,
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_signed_info_canonicalization_is_rejected() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+        let body = build_signed_soap_envelope(&cert).replacen(
+            "http://www.w3.org/2001/10/xml-exc-c14n#",
+            "urn:unsupported:canonicalization",
+            1,
+        );
+
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(is_reject(&result));
+        assert!(
+            reject_body(&result).contains("unsupported CanonicalizationMethod"),
+            "unexpected rejection: {}",
+            reject_body(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_reference_transform_is_rejected() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+        let body = build_signed_soap_envelope(&cert).replace(
+            "<Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\">",
+            "<Transform Algorithm=\"urn:unsupported:transform\">",
+        );
+
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(is_reject(&result));
+        assert!(
+            reject_body(&result).contains("unsupported Transform algorithm"),
+            "unexpected rejection: {}",
+            reject_body(&result)
         );
     }
 

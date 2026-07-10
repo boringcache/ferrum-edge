@@ -127,6 +127,18 @@ pub mod _test_support {
         crate::plugins::soap_ws_security::find_element_by_wsu_id_in_range(xml, 0, xml.len(), id)
     }
 
+    pub fn soap_exclusive_canonicalize_element_for_test(
+        xml: &str,
+        local_name: &str,
+        prefix_list: &str,
+    ) -> Result<String, String> {
+        crate::plugins::soap_ws_security::exclusive_canonicalize_element_for_test(
+            xml,
+            local_name,
+            prefix_list,
+        )
+    }
+
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
     pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
         crate::proxy::tcp_proxy::classify_stream_error(error)

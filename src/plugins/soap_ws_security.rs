@@ -11,24 +11,20 @@
 //! Runs in `before_proxy` with request body buffering. Priority 1500 places
 //! it in the AuthN band after HMAC auth.
 //!
-//! ## XMLDSIG limitation (shared by X.509 and SAML signature paths)
+//! ## XMLDSIG canonicalization (shared by X.509 and SAML signature paths)
 //!
 //! Both the WS-Security X.509 signature path and the SAML assertion signature
-//! path verify `<SignatureValue>` against the **wire bytes** of `<SignedInfo>`
-//! (and digest each Reference against the wire bytes of the referenced
-//! element, with the SAML enveloped-signature transform applied for the
-//! assertion). They do NOT yet apply Exclusive XML Canonicalization
-//! (`xml-exc-c14n#`) before hashing. Signers that canonicalize before signing
-//! AND whose canonical output happens to match the wire bytes will verify
-//! cleanly; signers whose intermediates re-serialize, reorder attributes, or
-//! re-emit namespace declarations may fail verification. Operators
-//! integrating with IdPs that mandate strict c14n should validate end-to-end
-//! before depending on these paths.
+//! path apply Exclusive XML Canonicalization (`xml-exc-c14n#`) to
+//! `<SignedInfo>` and to each referenced node before cryptographic verification.
+//! `InclusiveNamespaces PrefixList` parameters are honored. Only the
+//! enveloped-signature and exclusive-c14n Reference transforms are supported;
+//! unknown algorithms and transform chains are rejected rather than falling
+//! back to wire-byte hashing.
 //!
 //! ## XML Signature Wrapping (XSW) mitigation
 //!
-//! Because verification is substring-based rather than DOM + exclusive-c14n,
-//! the X.509 path enforces that every signed `#id` Reference resolves to a
+//! In addition to namespace-aware canonicalization, the X.509 path enforces
+//! that every signed `#id` Reference resolves to a
 //! UNIQUE XML id-bearing attribute across the whole envelope (see
 //! `count_wsu_id_occurrences`), rejecting any envelope carrying a duplicate id —
 //! the classic XSW vector where an attacker keeps the legitimately-signed
@@ -37,10 +33,9 @@
 //! bare `Id`, and common alternative spellings (`xml:id`, `ID`, `id`) so
 //! backends with broader fragment-id rules fail closed instead of seeing a
 //! forwarded alternate referent. The SAML path retains its single-`<Assertion>`
-//! guard plus the Reference-URI-equals-assertion-id check. A residual risk
-//! remains for a backend that selects a *different* same-local-name element than
-//! the gateway digested; reducing the forwarded body to only the signed subtree
-//! (or full DOM + exclusive-c14n) is the long-term fix.
+//! guard plus the Reference-URI-equals-assertion-id check. These structural
+//! checks remain defense-in-depth against a backend selecting a different
+//! same-local-name element than the gateway's namespace-aware resolver.
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -48,6 +43,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use ring::digest;
 use ring::signature as ring_sig;
+use roxmltree::{Document, Node, NodeId};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -68,6 +64,8 @@ const XMLDSIG_RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha
 const XMLDSIG_RSA_SHA1: &str = "http://www.w3.org/2000/09/xmldsig#rsa-sha1";
 const XMLDSIG_SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
 const XMLDSIG_SHA1: &str = "http://www.w3.org/2000/09/xmldsig#sha1";
+const XMLDSIG_ENVELOPED_SIGNATURE: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
+const XML_EXCLUSIVE_C14N: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 const WSU_NAMESPACE_URI: &str =
     "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd";
 
@@ -708,29 +706,28 @@ impl SoapWsSecurity {
 
     // ── X.509 signature verification ────────────────────────────────────
 
-    fn validate_x509_signature(
-        &self,
-        security_block: &str,
-        soap_body: &str,
-        envelope: &str,
-    ) -> Result<(), String> {
-        // Extract the Signature element
-        let sig_block = find_element_block(security_block, "Signature")
+    fn validate_x509_signature(&self, security_block: &str, envelope: &str) -> Result<(), String> {
+        let document = Document::parse(envelope)
+            .map_err(|e| format!("WS-Security: malformed SOAP XML: {}", e))?;
+        let security_node = document
+            .descendants()
+            .find(|node| node.has_tag_name("Security"))
+            .ok_or_else(|| "WS-Security: missing Security element".to_string())?;
+        let sig_node = unique_child_element(security_node, "Signature", "WS-Security")?
             .ok_or_else(|| "WS-Security: missing Signature element".to_string())?;
-
-        // Extract SignedInfo (the data that was signed)
-        let signed_info = find_element_block(&sig_block, "SignedInfo")
+        let signed_info_node = unique_child_element(sig_node, "SignedInfo", "WS-Security")?
             .ok_or_else(|| "WS-Security: Signature missing SignedInfo element".to_string())?;
+        let sig_block = node_source(envelope, sig_node)?;
+        let signed_info = node_source(envelope, signed_info_node)?;
 
         // Determine signature algorithm
-        let sig_method_block = find_element_block(&signed_info, "SignatureMethod")
+        let sig_method = unique_child_element(signed_info_node, "SignatureMethod", "WS-Security")?
             .ok_or_else(|| "WS-Security: SignedInfo missing SignatureMethod".to_string())?;
-        let sig_algorithm_uri =
-            find_attribute(&sig_method_block, "Algorithm").ok_or_else(|| {
-                "WS-Security: SignatureMethod missing Algorithm attribute".to_string()
-            })?;
+        let sig_algorithm_uri = sig_method.attribute("Algorithm").ok_or_else(|| {
+            "WS-Security: SignatureMethod missing Algorithm attribute".to_string()
+        })?;
 
-        let sig_algorithm = match sig_algorithm_uri.as_str() {
+        let sig_algorithm = match sig_algorithm_uri {
             XMLDSIG_RSA_SHA256 => SignatureAlgorithm::RsaSha256,
             XMLDSIG_RSA_SHA1 => SignatureAlgorithm::RsaSha1,
             other => {
@@ -748,8 +745,10 @@ impl SoapWsSecurity {
             ));
         }
 
+        let canonicalization = parse_signed_info_canonicalization(signed_info_node, "WS-Security")?;
+
         // Verify Reference digests
-        self.verify_reference_digests(&signed_info, security_block, soap_body, envelope)?;
+        self.verify_reference_digests(signed_info_node, security_node, sig_node, envelope)?;
 
         // Check that Timestamp is signed (if required)
         if self.require_signed_timestamp {
@@ -757,15 +756,18 @@ impl SoapWsSecurity {
         }
 
         // Extract SignatureValue
-        let sig_value_b64 = find_element_text(&sig_block, "SignatureValue")
+        let sig_value_node = unique_child_element(sig_node, "SignatureValue", "WS-Security")?
             .ok_or_else(|| "WS-Security: Signature missing SignatureValue".to_string())?;
+        let sig_value_b64 = sig_value_node
+            .text()
+            .ok_or_else(|| "WS-Security: SignatureValue is empty".to_string())?;
 
         let sig_bytes = BASE64
             .decode(sig_value_b64.replace(char::is_whitespace, "").as_bytes())
             .map_err(|e| format!("WS-Security: invalid SignatureValue base64: {}", e))?;
 
         // Extract the certificate (BinarySecurityToken or inline KeyInfo)
-        let cert_der = self.extract_signing_cert(security_block, &sig_block)?;
+        let cert_der = self.extract_signing_cert(security_block, sig_block)?;
 
         // Verify the cert is trusted
         let cert_fingerprint = digest::digest(&digest::SHA256, &cert_der).as_ref().to_vec();
@@ -782,8 +784,15 @@ impl SoapWsSecurity {
             }
         };
 
-        // Verify the signature over SignedInfo
-        let signed_info_bytes = signed_info.as_bytes();
+        // Verify the signature over the canonicalized SignedInfo node. Parsing
+        // the full envelope preserves namespace declarations inherited from
+        // Signature/Security/Envelope that are absent from the wire substring.
+        let signed_info_bytes = exclusive_canonicalize(
+            envelope,
+            signed_info_node,
+            &canonicalization.inclusive_prefixes,
+            None,
+        )?;
 
         let verify_algorithm: &dyn ring_sig::VerificationAlgorithm = match sig_algorithm {
             SignatureAlgorithm::RsaSha256 => &ring_sig::RSA_PKCS1_2048_8192_SHA256,
@@ -793,7 +802,7 @@ impl SoapWsSecurity {
         let public_key = ring_sig::UnparsedPublicKey::new(verify_algorithm, public_key_der);
 
         public_key
-            .verify(signed_info_bytes, &sig_bytes)
+            .verify(&signed_info_bytes, &sig_bytes)
             .map_err(|_| "WS-Security: signature verification failed".to_string())?;
 
         debug!("soap_ws_security: X.509 signature verified successfully");
@@ -802,19 +811,15 @@ impl SoapWsSecurity {
 
     fn verify_reference_digests(
         &self,
-        signed_info: &str,
-        security_block: &str,
-        soap_body: &str,
+        signed_info: Node<'_, '_>,
+        security_node: Node<'_, '_>,
+        signature_node: Node<'_, '_>,
         envelope: &str,
     ) -> Result<(), String> {
-        // Find all Reference elements in SignedInfo. We must use the variant
-        // that returns the end offset so we can advance past each match —
-        // advancing by 1 byte (or by `ref_block.len().min(1)`, the previous
-        // bug) just re-finds the same Reference and loops forever.
-        let mut search_from = 0;
         let mut reference_count = 0;
-        while let Some((ref_block, next_start)) =
-            find_element_block_from_with_end(signed_info, "Reference", search_from)
+        for reference in signed_info
+            .children()
+            .filter(|node| node.has_tag_name("Reference"))
         {
             reference_count += 1;
             // Bound attacker-controlled work: each Reference triggers a
@@ -830,32 +835,32 @@ impl SoapWsSecurity {
                     MAX_SIGNED_REFERENCES
                 ));
             }
-            // Defensive: ensure the cursor advances even for pathological
-            // inputs (e.g. zero-length match). Without this, a malformed
-            // element could still loop indefinitely.
-            search_from = next_start.max(search_from + 1);
-
-            let uri = find_attribute(&ref_block, "URI").unwrap_or_default();
-
+            let uri = reference
+                .attribute("URI")
+                .ok_or_else(|| "WS-Security: Reference missing URI attribute".to_string())?;
             // Determine the digest algorithm
-            let digest_method = find_element_block(&ref_block, "DigestMethod")
+            let digest_method = unique_child_element(reference, "DigestMethod", "WS-Security")?
                 .ok_or_else(|| "WS-Security: Reference missing DigestMethod".to_string())?;
-            let digest_alg_uri = find_attribute(&digest_method, "Algorithm")
+            let digest_alg_uri = digest_method
+                .attribute("Algorithm")
                 .ok_or_else(|| "WS-Security: DigestMethod missing Algorithm".to_string())?;
 
             // Extract expected digest
-            let expected_b64 = find_element_text(&ref_block, "DigestValue")
+            let digest_value = unique_child_element(reference, "DigestValue", "WS-Security")?
                 .ok_or_else(|| "WS-Security: Reference missing DigestValue".to_string())?;
+            let expected_b64 = digest_value
+                .text()
+                .ok_or_else(|| "WS-Security: DigestValue is empty".to_string())?;
 
             let expected_bytes = BASE64
                 .decode(expected_b64.replace(char::is_whitespace, "").as_bytes())
                 .map_err(|e| format!("WS-Security: invalid DigestValue base64: {}", e))?;
 
             // Find the referenced element
-            let referenced_content = if uri.is_empty() {
-                // Entire document
-                soap_body.to_string()
-            } else if let Some(ref_id) = uri.strip_prefix('#') {
+            let referenced_node = if let Some(ref_id) = uri.strip_prefix('#') {
+                if ref_id.is_empty() {
+                    return Err("WS-Security: empty fragment Reference URI is unsupported".into());
+                }
                 // XML Signature Wrapping defense: a signed reference must
                 // resolve to exactly ONE element in the whole envelope.
                 // WS-Security / XMLDSIG ids are document-unique, so a duplicate
@@ -872,25 +877,10 @@ impl SoapWsSecurity {
                         ref_id, occurrences
                     ));
                 }
-                let security_range = envelope
-                    .find(security_block)
-                    .map(|start| (start, start + security_block.len()));
-                let body_range = if soap_body.is_empty() {
-                    None
-                } else {
-                    envelope
-                        .find(soap_body)
-                        .map(|start| (start, start + soap_body.len()))
-                };
-
-                security_range
-                    .and_then(|(start, end)| {
-                        find_element_by_wsu_id_in_range(envelope, start, end, ref_id)
-                    })
+                find_descendant_by_wsu_id(security_node, ref_id)
                     .or_else(|| {
-                        body_range.and_then(|(start, end)| {
-                            find_element_by_wsu_id_in_range(envelope, start, end, ref_id)
-                        })
+                        envelope_body_node(security_node.document())
+                            .and_then(|body| find_descendant_by_wsu_id(body, ref_id))
                     })
                     .ok_or_else(|| {
                         format!("WS-Security: referenced element '{}' not found", ref_id)
@@ -899,13 +889,24 @@ impl SoapWsSecurity {
                 return Err(format!("WS-Security: unsupported Reference URI '{}'", uri));
             };
 
+            let transforms = parse_reference_transforms(reference, "WS-Security")?;
+            let excluded_signature = transforms
+                .enveloped_signature
+                .then_some(signature_node.id());
+            let referenced_content = exclusive_canonicalize(
+                envelope,
+                referenced_node,
+                &transforms.inclusive_prefixes,
+                excluded_signature,
+            )?;
+
             // Compute and compare digest. The allowed_digest_algorithms list
             // is checked independently of the signature algorithm list — an
             // operator who wants rsa-sha256 signatures over sha1 digests
             // (rare but valid per XMLDSIG) configures both knobs explicitly,
             // and the default (sha256 only) refuses sha1 digests regardless
             // of which signature algorithm is in use.
-            let computed = match digest_alg_uri.as_str() {
+            let computed = match digest_alg_uri {
                 XMLDSIG_SHA256 => {
                     if !self
                         .allowed_digest_algorithms
@@ -916,7 +917,7 @@ impl SoapWsSecurity {
                             digest_alg_uri
                         ));
                     }
-                    digest::digest(&digest::SHA256, referenced_content.as_bytes())
+                    digest::digest(&digest::SHA256, &referenced_content)
                 }
                 XMLDSIG_SHA1 => {
                     if !self
@@ -928,10 +929,7 @@ impl SoapWsSecurity {
                             digest_alg_uri
                         ));
                     }
-                    digest::digest(
-                        &digest::SHA1_FOR_LEGACY_USE_ONLY,
-                        referenced_content.as_bytes(),
-                    )
+                    digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &referenced_content)
                 }
                 other => {
                     return Err(format!(
@@ -1074,7 +1072,7 @@ impl SoapWsSecurity {
         // ── 1. Signature verification ─────────────────────────────────
         // Must run before any other check — every other field is
         // attacker-controlled until we know the IdP signed this assertion.
-        self.validate_saml_signature(&assertion)?;
+        self.validate_saml_signature(envelope)?;
         let assertion_without_signature = remove_envelope_signature(&assertion);
 
         // ── 2. Issuer trust ───────────────────────────────────────────
@@ -1155,30 +1153,39 @@ impl SoapWsSecurity {
     /// Steps:
     /// 1. Locate `<Signature>` inside the assertion.
     /// 2. Resolve the signing algorithm and confirm it is in the allow list.
-    /// 3. Verify each `<Reference>` digest. The SAML enveloped-signature
-    ///    transform is applied — the assertion's Signature element is excised
-    ///    from the referenced content before hashing.
+    /// 3. Verify each `<Reference>` digest after applying its declared
+    ///    enveloped-signature / exclusive-c14n transform chain.
     /// 4. Extract the signing cert from `KeyInfo/X509Data/X509Certificate`
     ///    (or `BinarySecurityToken`) and confirm its SHA-256 fingerprint
     ///    matches a configured trusted IdP cert.
-    /// 5. Verify `<SignatureValue>` over the `<SignedInfo>` bytes using the
-    ///    matched cert's public key.
-    fn validate_saml_signature(&self, assertion: &str) -> Result<(), String> {
-        let sig_block = find_element_block(assertion, "Signature")
+    /// 5. Verify `<SignatureValue>` over exclusive-canonicalized
+    ///    `<SignedInfo>` using the matched cert's public key.
+    fn validate_saml_signature(&self, envelope: &str) -> Result<(), String> {
+        let document = Document::parse(envelope)
+            .map_err(|e| format!("WS-Security: malformed SAML SOAP XML: {}", e))?;
+        let assertion_node = document
+            .descendants()
+            .find(|node| node.has_tag_name("Assertion"))
+            .ok_or_else(|| "WS-Security: missing SAML Assertion element".to_string())?;
+        let sig_node = unique_child_element(assertion_node, "Signature", "WS-Security: SAML")?
             .ok_or_else(|| "WS-Security: SAML Assertion missing Signature element".to_string())?;
-
-        let signed_info = find_element_block(&sig_block, "SignedInfo")
-            .ok_or_else(|| "WS-Security: SAML Signature missing SignedInfo element".to_string())?;
+        let signed_info_node = unique_child_element(sig_node, "SignedInfo", "WS-Security: SAML")?
+            .ok_or_else(|| {
+            "WS-Security: SAML Signature missing SignedInfo element".to_string()
+        })?;
+        let sig_block = node_source(envelope, sig_node)?;
 
         // ── Resolve signature algorithm ───────────────────────────────
-        let sig_method_block = find_element_block(&signed_info, "SignatureMethod")
-            .ok_or_else(|| "WS-Security: SAML SignedInfo missing SignatureMethod".to_string())?;
-        let sig_algorithm_uri =
-            find_attribute(&sig_method_block, "Algorithm").ok_or_else(|| {
-                "WS-Security: SAML SignatureMethod missing Algorithm attribute".to_string()
-            })?;
+        let sig_method =
+            unique_child_element(signed_info_node, "SignatureMethod", "WS-Security: SAML")?
+                .ok_or_else(|| {
+                    "WS-Security: SAML SignedInfo missing SignatureMethod".to_string()
+                })?;
+        let sig_algorithm_uri = sig_method.attribute("Algorithm").ok_or_else(|| {
+            "WS-Security: SAML SignatureMethod missing Algorithm attribute".to_string()
+        })?;
 
-        let sig_algorithm = match sig_algorithm_uri.as_str() {
+        let sig_algorithm = match sig_algorithm_uri {
             XMLDSIG_RSA_SHA256 => SignatureAlgorithm::RsaSha256,
             XMLDSIG_RSA_SHA1 => SignatureAlgorithm::RsaSha1,
             other => {
@@ -1199,18 +1206,24 @@ impl SoapWsSecurity {
             ));
         }
 
+        let canonicalization =
+            parse_signed_info_canonicalization(signed_info_node, "WS-Security: SAML")?;
+
         // ── Verify Reference digest(s) ────────────────────────────────
-        self.verify_saml_reference_digests(&signed_info, assertion)?;
+        self.verify_saml_reference_digests(signed_info_node, assertion_node, sig_node, envelope)?;
 
         // ── Extract SignatureValue ────────────────────────────────────
-        let sig_value_b64 = find_element_text(&sig_block, "SignatureValue")
+        let sig_value_node = unique_child_element(sig_node, "SignatureValue", "WS-Security: SAML")?
             .ok_or_else(|| "WS-Security: SAML Signature missing SignatureValue".to_string())?;
+        let sig_value_b64 = sig_value_node
+            .text()
+            .ok_or_else(|| "WS-Security: SAML SignatureValue is empty".to_string())?;
         let sig_bytes = BASE64
             .decode(sig_value_b64.replace(char::is_whitespace, "").as_bytes())
             .map_err(|e| format!("WS-Security: SAML invalid SignatureValue base64: {}", e))?;
 
         // ── Resolve signing cert and confirm it is trusted ────────────
-        let cert_der = extract_saml_signing_cert(&sig_block)?;
+        let cert_der = extract_saml_signing_cert(sig_block)?;
         let cert_fingerprint = digest::digest(&digest::SHA256, &cert_der).as_ref().to_vec();
 
         let trusted = self
@@ -1225,7 +1238,7 @@ impl SoapWsSecurity {
             }
         };
 
-        // ── Verify the signature over SignedInfo ──────────────────────
+        // ── Verify the signature over canonicalized SignedInfo ────────
         let verify_algorithm: &dyn ring_sig::VerificationAlgorithm = match sig_algorithm {
             SignatureAlgorithm::RsaSha256 => &ring_sig::RSA_PKCS1_2048_8192_SHA256,
             SignatureAlgorithm::RsaSha1 => &ring_sig::RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY,
@@ -1233,8 +1246,15 @@ impl SoapWsSecurity {
 
         let public_key = ring_sig::UnparsedPublicKey::new(verify_algorithm, public_key_der);
 
+        let canonical_signed_info = exclusive_canonicalize(
+            envelope,
+            signed_info_node,
+            &canonicalization.inclusive_prefixes,
+            None,
+        )?;
+
         public_key
-            .verify(signed_info.as_bytes(), &sig_bytes)
+            .verify(&canonical_signed_info, &sig_bytes)
             .map_err(|_| "WS-Security: SAML signature verification failed".to_string())?;
 
         debug!("soap_ws_security: SAML assertion signature verified");
@@ -1245,31 +1265,29 @@ impl SoapWsSecurity {
     ///
     /// At least one Reference must be present, and at least one Reference
     /// must target the enclosing assertion via `URI="#<assertion-ID>"`. The
-    /// enveloped-signature transform is applied for the assertion-targeted
-    /// Reference: the assertion's own `<Signature>` element is removed before
-    /// digesting. Other References (e.g. SAML 2.0 SubjectConfirmationData)
+    /// declared transform chain is applied for the assertion-targeted
+    /// Reference. Other References (e.g. SAML 2.0 SubjectConfirmationData)
     /// are NOT supported here — they would require resolving arbitrary IDs
     /// inside the assertion and applying additional transforms, which is
     /// outside the scope of the current pragmatic implementation.
     fn verify_saml_reference_digests(
         &self,
-        signed_info: &str,
-        assertion: &str,
+        signed_info: Node<'_, '_>,
+        assertion: Node<'_, '_>,
+        signature: Node<'_, '_>,
+        envelope: &str,
     ) -> Result<(), String> {
-        let assertion_id = find_attribute(assertion, "ID")
-            .or_else(|| find_attribute(assertion, "AssertionID"))
+        let assertion_id = assertion
+            .attribute("ID")
+            .or_else(|| assertion.attribute("AssertionID"))
             .ok_or_else(|| "WS-Security: SAML Assertion missing ID attribute".to_string())?;
         let expected_uri = format!("#{}", assertion_id);
-
-        // Pre-compute the enveloped-signature transform once.
-        let assertion_without_signature = remove_envelope_signature(assertion);
-
-        let mut search_from = 0;
         let mut reference_count = 0;
         let mut covered_assertion = false;
 
-        while let Some((ref_block, next_start)) =
-            find_element_block_from_with_end(signed_info, "Reference", search_from)
+        for reference in signed_info
+            .children()
+            .filter(|node| node.has_tag_name("Reference"))
         {
             reference_count += 1;
             if reference_count > MAX_SIGNED_REFERENCES {
@@ -1278,9 +1296,9 @@ impl SoapWsSecurity {
                     MAX_SIGNED_REFERENCES
                 ));
             }
-            search_from = next_start.max(search_from + 1);
-
-            let uri = find_attribute(&ref_block, "URI").unwrap_or_default();
+            let uri = reference
+                .attribute("URI")
+                .ok_or_else(|| "WS-Security: SAML Reference missing URI attribute".to_string())?;
 
             // Only Reference URIs that target this assertion are accepted —
             // an attacker who can choose the Reference URI would otherwise
@@ -1292,19 +1310,33 @@ impl SoapWsSecurity {
                 ));
             }
 
-            let digest_method = find_element_block(&ref_block, "DigestMethod")
-                .ok_or_else(|| "WS-Security: SAML Reference missing DigestMethod".to_string())?;
-            let digest_alg_uri = find_attribute(&digest_method, "Algorithm").ok_or_else(|| {
+            let digest_method =
+                unique_child_element(reference, "DigestMethod", "WS-Security: SAML")?.ok_or_else(
+                    || "WS-Security: SAML Reference missing DigestMethod".to_string(),
+                )?;
+            let digest_alg_uri = digest_method.attribute("Algorithm").ok_or_else(|| {
                 "WS-Security: SAML DigestMethod missing Algorithm attribute".to_string()
             })?;
 
-            let expected_b64 = find_element_text(&ref_block, "DigestValue")
+            let digest_value = unique_child_element(reference, "DigestValue", "WS-Security: SAML")?
                 .ok_or_else(|| "WS-Security: SAML Reference missing DigestValue".to_string())?;
+            let expected_b64 = digest_value
+                .text()
+                .ok_or_else(|| "WS-Security: SAML DigestValue is empty".to_string())?;
             let expected_bytes = BASE64
                 .decode(expected_b64.replace(char::is_whitespace, "").as_bytes())
                 .map_err(|e| format!("WS-Security: SAML invalid DigestValue base64: {}", e))?;
 
-            let computed = match digest_alg_uri.as_str() {
+            let transforms = parse_reference_transforms(reference, "WS-Security: SAML")?;
+            let excluded_signature = transforms.enveloped_signature.then_some(signature.id());
+            let canonical_assertion = exclusive_canonicalize(
+                envelope,
+                assertion,
+                &transforms.inclusive_prefixes,
+                excluded_signature,
+            )?;
+
+            let computed = match digest_alg_uri {
                 XMLDSIG_SHA256 => {
                     if !self
                         .saml_allowed_digest_algorithms
@@ -1315,7 +1347,7 @@ impl SoapWsSecurity {
                             digest_alg_uri
                         ));
                     }
-                    digest::digest(&digest::SHA256, assertion_without_signature.as_bytes())
+                    digest::digest(&digest::SHA256, &canonical_assertion)
                 }
                 XMLDSIG_SHA1 => {
                     if !self
@@ -1327,10 +1359,7 @@ impl SoapWsSecurity {
                             digest_alg_uri
                         ));
                     }
-                    digest::digest(
-                        &digest::SHA1_FOR_LEGACY_USE_ONLY,
-                        assertion_without_signature.as_bytes(),
-                    )
+                    digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &canonical_assertion)
                 }
                 other => {
                     return Err(format!(
@@ -1448,7 +1477,6 @@ impl Plugin for SoapWsSecurity {
 
         // Extract the SOAP Header and Body
         let soap_header = find_element_block(envelope, "Header");
-        let soap_body = find_element_block(envelope, "Body").unwrap_or_default();
 
         // Find the WS-Security header
         let security_block = soap_header
@@ -1507,7 +1535,7 @@ impl Plugin for SoapWsSecurity {
 
         // Validate X.509 signature
         if self.x509_enabled
-            && let Err(e) = self.validate_x509_signature(&security_block, &soap_body, envelope)
+            && let Err(e) = self.validate_x509_signature(&security_block, envelope)
         {
             warn!("soap_ws_security: X.509 signature validation failed: {}", e);
             return PluginResult::Reject {
@@ -1539,6 +1567,472 @@ impl Plugin for SoapWsSecurity {
         }
 
         PluginResult::Continue
+    }
+}
+
+// ── XML Exclusive Canonicalization helpers ─────────────────────────────────
+
+struct CanonicalizationSpec {
+    inclusive_prefixes: Vec<String>,
+}
+
+struct ReferenceTransforms {
+    enveloped_signature: bool,
+    inclusive_prefixes: Vec<String>,
+}
+
+fn descendant_element<'a, 'input>(
+    parent: Node<'a, 'input>,
+    local_name: &str,
+) -> Option<Node<'a, 'input>> {
+    parent
+        .descendants()
+        .skip(1)
+        .find(|node| node.has_tag_name(local_name))
+}
+
+fn unique_child_element<'a, 'input>(
+    parent: Node<'a, 'input>,
+    local_name: &str,
+    context: &str,
+) -> Result<Option<Node<'a, 'input>>, String> {
+    let mut matches = parent
+        .children()
+        .filter(|node| node.has_tag_name(local_name));
+    let first = matches.next();
+    if matches.next().is_some() {
+        return Err(format!(
+            "{}: multiple {} elements are not allowed",
+            context, local_name
+        ));
+    }
+    Ok(first)
+}
+
+fn node_source<'a>(xml: &'a str, node: Node<'_, '_>) -> Result<&'a str, String> {
+    let range = node.range();
+    xml.get(range)
+        .ok_or_else(|| "WS-Security: XML parser returned an invalid source range".to_string())
+}
+
+fn envelope_body_node<'a, 'input>(document: &'a Document<'input>) -> Option<Node<'a, 'input>> {
+    document
+        .descendants()
+        .find(|node| node.has_tag_name("Body"))
+}
+
+fn find_descendant_by_wsu_id<'a, 'input>(
+    parent: Node<'a, 'input>,
+    id: &str,
+) -> Option<Node<'a, 'input>> {
+    parent.descendants().find(|node| {
+        node.is_element()
+            && node.attributes().any(|attribute| {
+                attribute.value() == id
+                    && ((attribute.name() == "Id" && attribute.namespace().is_none())
+                        || (attribute.name() == "Id"
+                            && attribute.namespace() == Some(WSU_NAMESPACE_URI)))
+            })
+    })
+}
+
+fn parse_signed_info_canonicalization(
+    signed_info: Node<'_, '_>,
+    context: &str,
+) -> Result<CanonicalizationSpec, String> {
+    let method = unique_child_element(signed_info, "CanonicalizationMethod", context)?
+        .ok_or_else(|| format!("{}: SignedInfo missing CanonicalizationMethod", context))?;
+    let algorithm = method.attribute("Algorithm").ok_or_else(|| {
+        format!(
+            "{}: CanonicalizationMethod missing Algorithm attribute",
+            context
+        )
+    })?;
+    if algorithm != XML_EXCLUSIVE_C14N {
+        return Err(format!(
+            "{}: unsupported CanonicalizationMethod algorithm '{}'",
+            context, algorithm
+        ));
+    }
+
+    Ok(CanonicalizationSpec {
+        inclusive_prefixes: parse_inclusive_namespaces(method, context)?,
+    })
+}
+
+fn parse_reference_transforms(
+    reference: Node<'_, '_>,
+    context: &str,
+) -> Result<ReferenceTransforms, String> {
+    let transforms = unique_child_element(reference, "Transforms", context)?.ok_or_else(|| {
+        format!(
+            "{}: Reference missing required exclusive-c14n Transform",
+            context
+        )
+    })?;
+
+    for child in transforms.children().filter(Node::is_element) {
+        if !child.has_tag_name("Transform") {
+            return Err(format!(
+                "{}: unsupported element '{}' inside Transforms",
+                context,
+                child.tag_name().name()
+            ));
+        }
+    }
+
+    let mut enveloped_signature = false;
+    let mut inclusive_prefixes = None;
+    let mut transform_count = 0usize;
+    for transform in transforms
+        .children()
+        .filter(|node| node.has_tag_name("Transform"))
+    {
+        transform_count += 1;
+        if transform_count > 2 {
+            return Err(format!(
+                "{}: unsupported Reference transform chain length",
+                context
+            ));
+        }
+        let algorithm = transform
+            .attribute("Algorithm")
+            .ok_or_else(|| format!("{}: Transform missing Algorithm attribute", context))?;
+        match algorithm {
+            XMLDSIG_ENVELOPED_SIGNATURE => {
+                if enveloped_signature {
+                    return Err(format!(
+                        "{}: duplicate enveloped-signature Transform",
+                        context
+                    ));
+                }
+                if inclusive_prefixes.is_some() {
+                    return Err(format!(
+                        "{}: enveloped-signature Transform cannot follow canonicalization",
+                        context
+                    ));
+                }
+                if transform.children().any(|node| node.is_element()) {
+                    return Err(format!(
+                        "{}: enveloped-signature Transform parameters are unsupported",
+                        context
+                    ));
+                }
+                enveloped_signature = true;
+            }
+            XML_EXCLUSIVE_C14N => {
+                if inclusive_prefixes.is_some() {
+                    return Err(format!("{}: duplicate exclusive-c14n Transform", context));
+                }
+                inclusive_prefixes = Some(parse_inclusive_namespaces(transform, context)?);
+            }
+            other => {
+                return Err(format!(
+                    "{}: unsupported Transform algorithm '{}'",
+                    context, other
+                ));
+            }
+        }
+    }
+
+    let inclusive_prefixes = inclusive_prefixes.ok_or_else(|| {
+        format!(
+            "{}: Reference transform chain does not include exclusive c14n",
+            context
+        )
+    })?;
+
+    Ok(ReferenceTransforms {
+        enveloped_signature,
+        inclusive_prefixes,
+    })
+}
+
+fn parse_inclusive_namespaces(
+    algorithm_node: Node<'_, '_>,
+    context: &str,
+) -> Result<Vec<String>, String> {
+    let mut parameter = None;
+    for child in algorithm_node.children().filter(Node::is_element) {
+        if child.tag_name().name() != "InclusiveNamespaces"
+            || child.tag_name().namespace() != Some(XML_EXCLUSIVE_C14N)
+        {
+            return Err(format!(
+                "{}: unsupported canonicalization parameter '{}'",
+                context,
+                child.tag_name().name()
+            ));
+        }
+        if parameter.replace(child).is_some() {
+            return Err(format!(
+                "{}: multiple InclusiveNamespaces parameters are not allowed",
+                context
+            ));
+        }
+    }
+
+    let Some(parameter) = parameter else {
+        return Ok(Vec::new());
+    };
+    let prefix_list = parameter
+        .attribute("PrefixList")
+        .ok_or_else(|| format!("{}: InclusiveNamespaces missing PrefixList", context))?;
+    let mut prefixes = Vec::new();
+    for token in prefix_list.split_whitespace() {
+        let prefix = if token == "#default" { "" } else { token };
+        if token == "xmlns" || token.contains(':') || token.starts_with('#') && token != "#default"
+        {
+            return Err(format!(
+                "{}: invalid InclusiveNamespaces prefix '{}'",
+                context, token
+            ));
+        }
+        if !prefixes.iter().any(|existing| existing == prefix) {
+            prefixes.push(prefix.to_string());
+        }
+    }
+    Ok(prefixes)
+}
+
+fn exclusive_canonicalize(
+    xml: &str,
+    root: Node<'_, '_>,
+    inclusive_prefixes: &[String],
+    excluded_node: Option<NodeId>,
+) -> Result<Vec<u8>, String> {
+    if !root.is_element() {
+        return Err("WS-Security: exclusive c14n requires an element node".to_string());
+    }
+
+    let mut output = String::with_capacity(root.range().len());
+    let mut rendered_namespaces = HashMap::new();
+    rendered_namespaces.insert(
+        "xml".to_string(),
+        "http://www.w3.org/XML/1998/namespace".to_string(),
+    );
+    canonicalize_node(
+        xml,
+        root,
+        inclusive_prefixes,
+        excluded_node,
+        &mut rendered_namespaces,
+        &mut output,
+    )?;
+    Ok(output.into_bytes())
+}
+
+pub(crate) fn exclusive_canonicalize_element_for_test(
+    xml: &str,
+    local_name: &str,
+    prefix_list: &str,
+) -> Result<String, String> {
+    let document = Document::parse(xml)
+        .map_err(|e| format!("WS-Security: malformed XML test fixture: {}", e))?;
+    let root = document
+        .descendants()
+        .find(|node| node.has_tag_name(local_name))
+        .ok_or_else(|| format!("WS-Security: test fixture missing {}", local_name))?;
+    let prefixes = prefix_list
+        .split_whitespace()
+        .map(|prefix| {
+            if prefix == "#default" {
+                String::new()
+            } else {
+                prefix.to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+    let canonical = exclusive_canonicalize(xml, root, &prefixes, None)?;
+    String::from_utf8(canonical).map_err(|_| "WS-Security: canonical XML was not UTF-8".to_string())
+}
+
+fn canonicalize_node(
+    xml: &str,
+    node: Node<'_, '_>,
+    inclusive_prefixes: &[String],
+    excluded_node: Option<NodeId>,
+    rendered_namespaces: &mut HashMap<String, String>,
+    output: &mut String,
+) -> Result<(), String> {
+    if excluded_node == Some(node.id()) {
+        return Ok(());
+    }
+
+    if node.is_text() {
+        if let Some(text) = node.text() {
+            push_canonical_text(output, text);
+        }
+        return Ok(());
+    }
+    if node.is_comment() {
+        return Ok(());
+    }
+    if let Some(pi) = node.pi() {
+        output.push_str("<?");
+        output.push_str(pi.target);
+        if let Some(value) = pi.value {
+            output.push(' ');
+            output.push_str(value);
+        }
+        output.push_str("?>");
+        return Ok(());
+    }
+    if !node.is_element() {
+        return Ok(());
+    }
+
+    let qname = element_qname(xml, node)?;
+    output.push('<');
+    output.push_str(qname);
+
+    let mut required_prefixes: Vec<(String, bool)> = inclusive_prefixes
+        .iter()
+        .cloned()
+        .map(|prefix| (prefix, false))
+        .collect();
+    let element_prefix = qname
+        .split_once(':')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or("");
+    add_required_prefix(&mut required_prefixes, element_prefix, true);
+
+    let mut attributes = Vec::new();
+    for attribute in node.attributes() {
+        let qname_range = attribute.range_qname();
+        let attribute_qname = xml.get(qname_range).ok_or_else(|| {
+            "WS-Security: XML parser returned an invalid attribute range".to_string()
+        })?;
+        if let Some((prefix, _)) = attribute_qname.split_once(':') {
+            add_required_prefix(&mut required_prefixes, prefix, true);
+        }
+        attributes.push((
+            attribute.namespace().unwrap_or(""),
+            attribute.name(),
+            attribute_qname,
+            attribute.value(),
+        ));
+    }
+
+    let mut namespace_declarations = Vec::new();
+    for (prefix, required) in required_prefixes {
+        if prefix == "xml" {
+            continue;
+        }
+        let namespace_uri = if prefix.is_empty() {
+            node.lookup_namespace_uri(None).unwrap_or("")
+        } else if let Some(uri) = node.lookup_namespace_uri(Some(&prefix)) {
+            uri
+        } else if required {
+            return Err(format!(
+                "WS-Security: visibly used namespace prefix '{}' is not bound",
+                prefix
+            ));
+        } else {
+            continue;
+        };
+
+        let already_rendered = rendered_namespaces
+            .get(&prefix)
+            .map(String::as_str)
+            .unwrap_or("");
+        if namespace_uri != already_rendered {
+            namespace_declarations.push((prefix, namespace_uri.to_string()));
+        }
+    }
+    namespace_declarations.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut namespace_history = Vec::new();
+    for (prefix, uri) in namespace_declarations {
+        namespace_history.push((prefix.clone(), rendered_namespaces.get(&prefix).cloned()));
+        rendered_namespaces.insert(prefix.clone(), uri.clone());
+        output.push_str(" xmlns");
+        if !prefix.is_empty() {
+            output.push(':');
+            output.push_str(&prefix);
+        }
+        output.push_str("=\"");
+        push_canonical_attribute_value(output, &uri);
+        output.push('"');
+    }
+
+    attributes.sort_by(|left, right| left.0.cmp(right.0).then_with(|| left.1.cmp(right.1)));
+    for (_, _, qname, value) in attributes {
+        output.push(' ');
+        output.push_str(qname);
+        output.push_str("=\"");
+        push_canonical_attribute_value(output, value);
+        output.push('"');
+    }
+    output.push('>');
+
+    for child in node.children() {
+        canonicalize_node(
+            xml,
+            child,
+            inclusive_prefixes,
+            excluded_node,
+            rendered_namespaces,
+            output,
+        )?;
+    }
+
+    output.push_str("</");
+    output.push_str(qname);
+    output.push('>');
+
+    for (prefix, previous) in namespace_history.into_iter().rev() {
+        if let Some(uri) = previous {
+            rendered_namespaces.insert(prefix, uri);
+        } else {
+            rendered_namespaces.remove(&prefix);
+        }
+    }
+    Ok(())
+}
+
+fn add_required_prefix(prefixes: &mut Vec<(String, bool)>, prefix: &str, required: bool) {
+    if let Some((_, existing_required)) =
+        prefixes.iter_mut().find(|(existing, _)| existing == prefix)
+    {
+        *existing_required |= required;
+    } else {
+        prefixes.push((prefix.to_string(), required));
+    }
+}
+
+fn element_qname<'a>(xml: &'a str, node: Node<'_, '_>) -> Result<&'a str, String> {
+    let range = node.range();
+    let source = xml
+        .get(range.start..range.end)
+        .ok_or_else(|| "WS-Security: XML parser returned an invalid element range".to_string())?;
+    let name = extract_full_tag_name_from_tag(source.strip_prefix('<').unwrap_or(source))
+        .ok_or_else(|| "WS-Security: canonicalized element has no qualified name".to_string())?;
+    Ok(name)
+}
+
+fn push_canonical_text(output: &mut String, text: &str) {
+    for character in text.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '\r' => output.push_str("&#xD;"),
+            other => output.push(other),
+        }
+    }
+}
+
+fn push_canonical_attribute_value(output: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '"' => output.push_str("&quot;"),
+            '\t' => output.push_str("&#x9;"),
+            '\n' => output.push_str("&#xA;"),
+            '\r' => output.push_str("&#xD;"),
+            other => output.push(other),
+        }
     }
 }
 
@@ -2527,18 +3021,28 @@ mod tests {
         }))
         .expect("timestamp-only config should construct");
         let timestamp = r#"<wsu:Timestamp xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" wsu:Id="TS-1"></wsu:Timestamp>"#;
-        let digest = digest::digest(&digest::SHA256, timestamp.as_bytes());
+        let canonical_timestamp =
+            exclusive_canonicalize_element_for_test(timestamp, "Timestamp", "")
+                .expect("timestamp should canonicalize");
+        let digest = digest::digest(&digest::SHA256, canonical_timestamp.as_bytes());
         let digest_b64 = BASE64.encode(digest.as_ref());
         let reference = format!(
-            r##"<Reference URI="#TS-1"><DigestMethod Algorithm="{}"/><DigestValue>{}</DigestValue></Reference>"##,
-            XMLDSIG_SHA256, digest_b64
+            r##"<Reference URI="#TS-1"><Transforms><Transform Algorithm="{}"/></Transforms><DigestMethod Algorithm="{}"/><DigestValue>{}</DigestValue></Reference>"##,
+            XML_EXCLUSIVE_C14N, XMLDSIG_SHA256, digest_b64
         );
         let references =
             std::iter::repeat_n(reference.as_str(), MAX_SIGNED_REFERENCES + 1).collect::<String>();
-        let signed_info = format!("<SignedInfo>{}</SignedInfo>", references);
+        let envelope = format!(
+            "<Envelope><Security>{}<Signature><SignedInfo>{}</SignedInfo></Signature></Security><Body></Body></Envelope>",
+            timestamp, references
+        );
+        let document = Document::parse(&envelope).expect("test envelope should parse");
+        let security = descendant_element(document.root(), "Security").expect("Security");
+        let signature = descendant_element(security, "Signature").expect("Signature");
+        let signed_info = descendant_element(signature, "SignedInfo").expect("SignedInfo");
 
         let err = plugin
-            .verify_reference_digests(&signed_info, timestamp, "", timestamp)
+            .verify_reference_digests(signed_info, security, signature, &envelope)
             .expect_err("reference cap must reject");
 
         assert!(err.contains("too many Signature References"), "got: {err}");
@@ -2552,18 +3056,32 @@ mod tests {
         .expect("timestamp-only config should construct");
         let assertion = r#"<Assertion ID="assertion-1"><Issuer>https://idp.example.com</Issuer><Signature></Signature><Subject><NameID>alice@example.com</NameID></Subject></Assertion>"#;
         let assertion_without_signature = remove_envelope_signature(assertion);
-        let digest = digest::digest(&digest::SHA256, assertion_without_signature.as_bytes());
+        let canonical_assertion =
+            exclusive_canonicalize_element_for_test(&assertion_without_signature, "Assertion", "")
+                .expect("assertion should canonicalize");
+        let digest = digest::digest(&digest::SHA256, canonical_assertion.as_bytes());
         let digest_b64 = BASE64.encode(digest.as_ref());
         let reference = format!(
-            r##"<Reference URI="#assertion-1"><DigestMethod Algorithm="{}"/><DigestValue>{}</DigestValue></Reference>"##,
-            XMLDSIG_SHA256, digest_b64
+            r##"<Reference URI="#assertion-1"><Transforms><Transform Algorithm="{}"/><Transform Algorithm="{}"/></Transforms><DigestMethod Algorithm="{}"/><DigestValue>{}</DigestValue></Reference>"##,
+            XMLDSIG_ENVELOPED_SIGNATURE, XML_EXCLUSIVE_C14N, XMLDSIG_SHA256, digest_b64
         );
         let references =
             std::iter::repeat_n(reference.as_str(), MAX_SIGNED_REFERENCES + 1).collect::<String>();
-        let signed_info = format!("<SignedInfo>{}</SignedInfo>", references);
+        let envelope = assertion.replacen(
+            "<Signature></Signature>",
+            &format!(
+                "<Signature><SignedInfo>{}</SignedInfo></Signature>",
+                references
+            ),
+            1,
+        );
+        let document = Document::parse(&envelope).expect("test assertion should parse");
+        let assertion = descendant_element(document.root(), "Assertion").expect("Assertion");
+        let signature = descendant_element(assertion, "Signature").expect("Signature");
+        let signed_info = descendant_element(signature, "SignedInfo").expect("SignedInfo");
 
         let err = plugin
-            .verify_saml_reference_digests(&signed_info, assertion)
+            .verify_saml_reference_digests(signed_info, assertion, signature, &envelope)
             .expect_err("SAML reference cap must reject");
 
         assert!(

@@ -1639,7 +1639,7 @@ Validates WS-Security headers in SOAP XML envelopes. Supports UsernameToken auth
 
 The plugin buffers request bodies with SOAP content types (`text/xml`, `application/soap+xml`, `application/xml`) and parses the `wsse:Security` header from the SOAP envelope. Non-SOAP requests pass through untouched.
 
-> **XMLDSIG canonicalization caveat.** Both the WS-Security X.509 signature path and the SAML assertion signature path verify `<SignatureValue>` against the **wire bytes** of `<SignedInfo>` (and digest each Reference against the wire bytes of the referenced element, with the SAML enveloped-signature transform applied for the assertion). They do not yet apply Exclusive XML Canonicalization (`xml-exc-c14n#`). Signers whose canonical output matches the wire bytes verify cleanly; signers whose intermediates re-serialize, reorder attributes, or re-emit namespace declarations may fail. Operators integrating with strict XMLDSIG IdPs / WS-Security signers should validate end-to-end before depending on these paths.
+> **XMLDSIG canonicalization support.** Both the WS-Security X.509 and SAML signature paths apply Exclusive XML Canonicalization (`xml-exc-c14n#`) to `<SignedInfo>` and referenced elements, including `InclusiveNamespaces PrefixList`. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n. Unsupported canonicalization or transform algorithms fail closed; inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported.
 
 **Priority:** 1500
 
