@@ -2957,25 +2957,50 @@ async fn stream_capture_preflights_sink_health_before_dispatch_or_short_circuit(
 
     let mut saw_unhealthy_reject = false;
     for _ in 0..100 {
-        let mut ctx = make_ctx();
-        let preflight = plugin
-            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        // Stage one candidate while the sink may still be healthy, then drive
+        // a separate record through the collector. `after_proxy` must catch the
+        // health transition before the staged response commits.
+        let mut precommit_ctx = make_ctx();
+        let staged = plugin
+            .on_final_request_body_with_context(
+                &mut precommit_ctx,
+                &headers,
+                ai_request_body(),
+            )
+            .await;
+        if matches!(staged, PluginResult::Continue) {
+            let mut driver_ctx = make_ctx();
+            let driver_staged = plugin
+                .on_final_request_body_with_context(&mut driver_ctx, &headers, ai_request_body())
+                .await;
+            if matches!(driver_staged, PluginResult::Continue) {
+                let _ = plugin
+                    .on_final_response_body(&mut driver_ctx, 200, &headers, br#"{"ok":true}"#)
+                    .await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let mut response_headers = headers.clone();
+        let precommit = plugin
+            .after_proxy(&mut precommit_ctx, 200, &mut response_headers)
             .await;
         if matches!(
-            preflight,
+            precommit,
             PluginResult::Reject {
                 status_code: 503,
                 ..
             }
         ) {
             assert_eq!(
-                ctx.metadata
+                precommit_ctx
+                    .metadata
                     .get("ai_transcript_audit.sink_status")
                     .map(String::as_str),
                 Some("rejected")
             );
 
-            // `before_proxy` must enforce the same preflight before a later
+            // `before_proxy` enforces the same check before a later
             // cache/federation plugin can short-circuit the request.
             let mut short_circuit_ctx = make_ctx();
             short_circuit_ctx.metadata.insert(
@@ -3000,10 +3025,6 @@ async fn stream_capture_preflights_sink_health_before_dispatch_or_short_circuit(
             saw_unhealthy_reject = true;
             break;
         }
-        let _ = plugin
-            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
-            .await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     assert!(

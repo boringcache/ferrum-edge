@@ -1256,17 +1256,21 @@ impl Plugin for AiTranscriptAudit {
         _response_status: u16,
         _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.active
-            || flag(&ctx.metadata, MD_FINAL_REQ_SEEN)
-            || !flag(&ctx.metadata, MD_CANDIDATE)
-        {
+        if !self.active || !flag(&ctx.metadata, MD_CANDIDATE) {
             return PluginResult::Continue;
         }
-        if let Some(body) = ctx.metadata.remove("request_body") {
+        if !flag(&ctx.metadata, MD_FINAL_REQ_SEEN)
+            && let Some(body) = ctx.metadata.remove("request_body")
+        {
             self.refresh_staged_request(ctx, body.as_bytes());
             ctx.metadata.insert("request_body".to_string(), body);
         }
-        PluginResult::Continue
+        // This is the last pre-commit checkpoint for both backend responses and
+        // downstream before_proxy short-circuits. Recheck so a sink failure that
+        // began during backend work, or a guardrail override published after our
+        // staging hook, cannot commit a selected stream unaudited.
+        self.stream_fail_closed_rejection(ctx)
+            .unwrap_or(PluginResult::Continue)
     }
 
     // ---- buffered response capture ----
