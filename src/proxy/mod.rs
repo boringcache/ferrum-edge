@@ -12534,6 +12534,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     headers: &mut HashMap<String, String>,
     body: &mut Vec<u8>,
     is_grpc_request: bool,
+    invoke_response_committed: bool,
 ) {
     let applied_synthetic_body_hooks = !plugins.is_empty()
         && should_apply_synthetic_response_body_hooks(*status, is_grpc_request, body, plugins, ctx);
@@ -12582,9 +12583,10 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // committed-hook capability scan runs unconditionally (no longer gated on
     // whether body hooks applied) so exporters see the final response on all
     // rejection shapes, not just synthetic paths that ran body hooks.
-    if plugins
-        .iter()
-        .any(|plugin| plugin.requires_response_committed_hook())
+    if invoke_response_committed
+        && plugins
+            .iter()
+            .any(|plugin| plugin.requires_response_committed_hook())
     {
         let status_code = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
         let normalized = normalize_reject_response(status_code, body, headers, is_grpc_request);
@@ -12846,6 +12848,7 @@ pub(crate) async fn normalize_grpc_plugin_rejection_with_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     reject: RejectedResponseParts,
+    invoke_response_committed: bool,
 ) -> NormalizedRejectResponse {
     let status = StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
     let normalized = finalize_reject_response_with_after_proxy_hooks(
@@ -12855,6 +12858,7 @@ pub(crate) async fn normalize_grpc_plugin_rejection_with_after_proxy_hooks(
         &reject.body,
         reject.headers,
         true,
+        invoke_response_committed,
     )
     .await;
     apply_grpc_reject_metadata(ctx, &normalized);
@@ -12915,6 +12919,14 @@ fn build_grpc_web_error_response(
         status,
         message,
     );
+    build_grpc_web_error_response_from_parts(response, status, message)
+}
+
+fn build_grpc_web_error_response_from_parts(
+    response: crate::plugins::grpc_web::GrpcWebErrorResponse,
+    status: u32,
+    message: &str,
+) -> Response<ProxyBody> {
     let builder =
         headers_mod::apply_response_headers(Response::builder().status(200), &response.headers);
 
@@ -12930,6 +12942,7 @@ async fn finalize_reject_response_with_after_proxy_hooks(
     body: &[u8],
     mut headers: HashMap<String, String>,
     is_grpc_request: bool,
+    invoke_response_committed: bool,
 ) -> NormalizedRejectResponse {
     let mut response_status = status.as_u16();
     let mut response_body = body.to_vec();
@@ -12941,6 +12954,7 @@ async fn finalize_reject_response_with_after_proxy_hooks(
         &mut headers,
         &mut response_body,
         is_grpc_request,
+        invoke_response_committed,
     )
     .await;
     // Attribute the reject-path `after_proxy` + synthetic response-body hook time
@@ -12978,18 +12992,40 @@ async fn handle_backend_admission_rejection(
         &rejection.body,
         rejection.headers,
         is_grpc_request,
+        grpc_web_error_content_type.is_none(),
     )
     .await;
     apply_grpc_reject_metadata(ctx, &reject);
-    let grpc_web_response = grpc_web_error_content_type.and_then(|content_type| {
-        reject.grpc_status.map(|grpc_status| {
-            let message = reject
-                .grpc_message
-                .as_deref()
-                .unwrap_or_else(|| grpc_status_reason(grpc_status));
-            build_grpc_web_error_response(content_type, grpc_status, message)
-        })
-    });
+    let grpc_web_response = if let (Some(content_type), Some(grpc_status)) =
+        (grpc_web_error_content_type, reject.grpc_status)
+    {
+        let message = reject
+            .grpc_message
+            .as_deref()
+            .unwrap_or_else(|| grpc_status_reason(grpc_status));
+        let translated = crate::plugins::grpc_web::error_response_for_content_type(
+            content_type,
+            grpc_status,
+            message,
+        );
+        if plugins
+            .iter()
+            .any(|plugin| plugin.requires_response_committed_hook())
+        {
+            for plugin in plugins {
+                plugin
+                    .on_response_committed(ctx, 200, &translated.headers, &translated.body)
+                    .await;
+            }
+        }
+        Some(build_grpc_web_error_response_from_parts(
+            translated,
+            grpc_status,
+            message,
+        ))
+    } else {
+        None
+    };
     log_rejected_request_with_path(
         plugins,
         ctx,
@@ -13995,6 +14031,7 @@ async fn handle_proxy_request_inner(
                         &plugin_reject.body,
                         plugin_reject.headers,
                         is_grpc_request,
+                        true,
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
@@ -14107,6 +14144,7 @@ async fn handle_proxy_request_inner(
                 &body,
                 headers,
                 is_grpc_request,
+                true,
             )
             .await;
             apply_grpc_reject_metadata(&mut ctx, &reject);
@@ -14145,6 +14183,7 @@ async fn handle_proxy_request_inner(
                         &plugin_reject.body,
                         plugin_reject.headers,
                         is_grpc_request,
+                        true,
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
@@ -14263,6 +14302,7 @@ async fn handle_proxy_request_inner(
                         &plugin_reject.body,
                         plugin_reject.headers,
                         is_grpc_request,
+                        true,
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
@@ -14306,6 +14346,7 @@ async fn handle_proxy_request_inner(
                         &plugin_reject.body,
                         plugin_reject.headers,
                         is_grpc_request,
+                        true,
                     )
                     .await;
                     apply_grpc_reject_metadata(&mut ctx, &reject);
@@ -14489,6 +14530,7 @@ async fn handle_proxy_request_inner(
                     br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
                     HashMap::new(),
                     is_grpc_request,
+                    true,
                 )
                 .await;
                 apply_grpc_reject_metadata(&mut ctx, &reject);
@@ -14968,7 +15010,7 @@ async fn handle_proxy_request_inner(
                         ));
                     };
                     let normalized = normalize_grpc_plugin_rejection_with_after_proxy_hooks(
-                        &plugins, &mut ctx, reject,
+                        &plugins, &mut ctx, reject, true,
                     )
                     .await;
                     record_request(&state, normalized.http_status.as_u16());
@@ -16358,7 +16400,7 @@ async fn handle_proxy_request_inner(
                                 );
                                 let normalized =
                                     normalize_grpc_plugin_rejection_with_after_proxy_hooks(
-                                        &plugins, &mut ctx, reject,
+                                        &plugins, &mut ctx, reject, false,
                                     )
                                     .await;
                                 response_status = normalized.http_status.as_u16();
@@ -16438,7 +16480,7 @@ async fn handle_proxy_request_inner(
                                 );
                                 let normalized =
                                     normalize_grpc_plugin_rejection_with_after_proxy_hooks(
-                                        &plugins, &mut ctx, reject,
+                                        &plugins, &mut ctx, reject, false,
                                     )
                                     .await;
                                 response_status = normalized.http_status.as_u16();
@@ -17952,6 +17994,36 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
+    // Inject the sticky-session cookie before committed exporters observe the
+    // final header view. This remains after every rejection/body replacement so
+    // the cookie lands on the same response that will be sent downstream.
+    if sticky_cookie_needed
+        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
+    {
+        let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
+            &proxy,
+            &epoch.load_balancer,
+            upstream_id,
+            target,
+        );
+        if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
+            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
+            let default_cc = crate::config::types::HashOnCookieConfig::default();
+            let cookie_config = upstream
+                .as_ref()
+                .and_then(|u| u.hash_on_cookie_config.as_ref())
+                .unwrap_or(&default_cc);
+            let cookie_val = build_sticky_cookie_header(cookie_name, target, cookie_config);
+            response_headers
+                .entry("set-cookie".to_string())
+                .and_modify(|v| {
+                    v.push('\n');
+                    v.push_str(&cookie_val);
+                })
+                .or_insert(cookie_val);
+        }
+    }
+
     // Observe the response only after final-body rejection replacement. The
     // precomputed capability bit keeps this phase to one predictable branch
     // when no exporter is configured.
@@ -18016,6 +18088,15 @@ async fn handle_proxy_request_inner(
             content_type,
         )
     } else {
+        if body_will_stream {
+            let content_type = response_headers.get("content-type").map(String::as_str);
+            crate::plugins::notify_response_stream_selected(
+                &plugins,
+                &ctx,
+                response_status,
+                content_type,
+            );
+        }
         None
     };
     if response_inspector.is_some() {
@@ -18089,35 +18170,6 @@ async fn handle_proxy_request_inner(
         } else {
             None
         };
-
-    // Inject sticky session cookie when cookie-based consistent hashing selected a new session
-    if sticky_cookie_needed
-        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
-    {
-        let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
-            &proxy,
-            &epoch.load_balancer,
-            upstream_id,
-            target,
-        );
-        if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
-            let default_cc = crate::config::types::HashOnCookieConfig::default();
-            let cookie_config = upstream
-                .as_ref()
-                .and_then(|u| u.hash_on_cookie_config.as_ref())
-                .unwrap_or(&default_cc);
-            let cookie_val = build_sticky_cookie_header(cookie_name, target, cookie_config);
-            // Append to existing set-cookie or create new entry (newline-separated)
-            response_headers
-                .entry("set-cookie".to_string())
-                .and_modify(|v| {
-                    v.push('\n');
-                    v.push_str(&cookie_val);
-                })
-                .or_insert(cookie_val);
-        }
-    }
 
     record_request(&state, response_status);
 
@@ -27074,6 +27126,7 @@ mod tests {
             &reject.body,
             reject.headers,
             false,
+            true,
         )
         .await
     }
@@ -27786,9 +27839,10 @@ mod tests {
             headers: HashMap::new(),
         };
 
-        let normalized =
-            normalize_grpc_plugin_rejection_with_after_proxy_hooks(&plugins, &mut ctx, reject)
-                .await;
+        let normalized = normalize_grpc_plugin_rejection_with_after_proxy_hooks(
+            &plugins, &mut ctx, reject, true,
+        )
+        .await;
 
         assert_eq!(normalized.http_status, StatusCode::OK);
         assert_eq!(

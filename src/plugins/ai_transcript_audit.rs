@@ -1511,6 +1511,27 @@ impl Plugin for AiTranscriptAudit {
             || (self.capture.response && self.on_buffer_full == BufferFullPolicy::Reject)
     }
 
+    fn on_response_stream_selected(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        content_type: Option<&str>,
+    ) {
+        if !content_type.is_some_and(is_event_stream) {
+            return;
+        }
+        let Some(record_id) = ctx.metadata.get(MD_RECORD_ID) else {
+            return;
+        };
+        // A streamed response cannot be rejected after its headers commit.
+        // Release capacity reserved by the conservative pre-header buffering
+        // decision on every transport, including direct H2/H3 and responses
+        // for which no chunk inspector attaches.
+        if let Some(mut staging) = self.staging.get_mut(record_id) {
+            staging.commit_permit.take();
+        }
+    }
+
     fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
         self.capture.streaming != StreamingCapture::Off
             && flag(&ctx.metadata, &self.stream_marker_key())
@@ -1527,17 +1548,6 @@ impl Plugin for AiTranscriptAudit {
             return None;
         }
         let record_id = ctx.metadata.get(MD_RECORD_ID)?.clone();
-
-        // The response is now known to use the streaming path. It cannot be
-        // rejected after its headers commit, so release any slot reserved by
-        // the conservative pre-header buffering decision. Stream-terminal
-        // enqueue remains best-effort, matching the documented fail-closed
-        // contract for buffered responses only. This runs even when streaming
-        // capture is off or a sampled-mode tee loses its roll.
-        if let Some(mut staging) = self.staging.get_mut(&record_id) {
-            staging.commit_permit.take();
-        }
-
         if self.capture.streaming == StreamingCapture::Off
             || !flag(&ctx.metadata, &self.stream_marker_key())
         {

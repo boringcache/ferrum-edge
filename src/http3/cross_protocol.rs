@@ -574,6 +574,7 @@ where
                         plugins,
                         ctx,
                         reject,
+                        has_response_committed_hook,
                         backend_start,
                         raw_prebuffered_body_bytes,
                     )
@@ -3395,6 +3396,7 @@ where
                         body: Bytes::from(reject.body),
                         headers: reject.headers,
                     },
+                    has_response_committed_hook,
                     backend_start,
                     bytes_sent,
                 )
@@ -5058,6 +5060,7 @@ async fn write_final_body_reject<S>(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     reject: PluginResult,
+    has_response_committed_hook: bool,
     backend_start: Instant,
     bytes_sent: u64,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
@@ -5095,16 +5098,35 @@ where
         &mut headers,
     )
     .await;
+    let normalized = crate::proxy::normalize_reject_response(
+        http_status,
+        &parts.body,
+        &headers,
+        matches!(flavor, HttpFlavor::Grpc),
+    );
     if matches!(flavor, HttpFlavor::Grpc) {
-        let normalized = normalize_h3_grpc_reject(http_status, &parts.body, &headers);
         apply_h3_grpc_reject_metadata(ctx, &normalized);
+    }
+    if has_response_committed_hook {
+        for plugin in plugins {
+            plugin
+                .on_response_committed(
+                    ctx,
+                    normalized.http_status.as_u16(),
+                    &normalized.headers,
+                    &normalized.body,
+                )
+                .await;
+        }
+    }
+    if matches!(flavor, HttpFlavor::Grpc) {
         write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await
     } else {
         write_reject_with_headers(
             stream,
-            http_status,
-            &parts.body,
-            &headers,
+            normalized.http_status,
+            &normalized.body,
+            &normalized.headers,
             backend_start,
             bytes_sent,
         )

@@ -1350,6 +1350,7 @@ async fn sse_downgrade_releases_precommit_buffer_reservation() {
         plugin.before_proxy(&mut first, &mut first_headers).await,
         PluginResult::Continue
     ));
+    plugin.on_response_stream_selected(&first, 200, Some("text/event-stream"));
     assert!(
         plugin
             .response_stream_inspector(&first, 200, Some("text/event-stream"))

@@ -1387,6 +1387,7 @@ async fn handle_h3_request(
                     &mut headers,
                     &mut reject_body,
                     matches!(http_flavor, HttpFlavor::Grpc),
+                    true,
                 )
                 .await;
                 plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -1512,6 +1513,7 @@ async fn handle_h3_request(
             &mut headers,
             &mut reject_body,
             matches!(http_flavor, HttpFlavor::Grpc),
+            true,
         )
         .await;
         plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
@@ -1587,6 +1589,7 @@ async fn handle_h3_request(
                         &mut headers,
                         &mut reject_body,
                         matches!(http_flavor, HttpFlavor::Grpc),
+                        true,
                     )
                     .await;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -1715,6 +1718,7 @@ async fn handle_h3_request(
                         &mut headers,
                         &mut reject_body,
                         matches!(http_flavor, HttpFlavor::Grpc),
+                        true,
                     )
                     .await;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -1794,6 +1798,7 @@ async fn handle_h3_request(
                         &mut headers,
                         &mut reject_body,
                         matches!(http_flavor, HttpFlavor::Grpc),
+                        true,
                     )
                     .await;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -4496,6 +4501,10 @@ async fn handle_h3_request(
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
 
+        response_headers
+            .entry("content-type".to_string())
+            .or_insert_with(|| "application/json".to_string());
+
         if capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
             let phase_start = std::time::Instant::now();
             for plugin in plugins.iter() {
@@ -4560,12 +4569,8 @@ async fn handle_h3_request(
 
         // Build and send buffered response
         let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let mut resp_builder =
+        let resp_builder =
             apply_response_headers(Response::builder().status(status), &response_headers);
-
-        if !response_headers.contains_key("content-type") {
-            resp_builder = resp_builder.header("content-type", "application/json");
-        }
 
         let resp = resp_builder
             .body(())

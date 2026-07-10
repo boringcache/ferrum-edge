@@ -1691,6 +1691,8 @@ pub fn create_response_stream_inspector(
         return None;
     }
 
+    notify_response_stream_selected(plugins, ctx, response_status, content_type);
+
     ctx.response_stream_id =
         Some(NEXT_RESPONSE_STREAM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let inspectors: Vec<_> = plugins
@@ -1709,6 +1711,23 @@ pub fn create_response_stream_inspector(
         ctx.response_stream_id = None;
         ctx.response_stream_completion = None;
         None
+    }
+}
+
+/// Notify opted-in plugins that the final response will use a streaming body,
+/// even when the concrete transport cannot attach a chunk inspector.
+#[doc(hidden)]
+pub fn notify_response_stream_selected(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    response_status: u16,
+    content_type: Option<&str>,
+) {
+    for plugin in plugins
+        .iter()
+        .filter(|plugin| plugin.requires_response_stream_hooks())
+    {
+        plugin.on_response_stream_selected(ctx, response_status, content_type);
     }
 }
 
@@ -3303,6 +3322,18 @@ pub trait Plugin: Send + Sync {
     /// stream window-by-window does **not** buffer the whole body.
     fn requires_response_stream_hooks(&self) -> bool {
         false
+    }
+
+    /// Called once after the final response headers select a streaming body,
+    /// before those headers are committed. Unlike
+    /// [`Self::response_stream_inspector`], this notification also runs for
+    /// direct H2/H3 transports that cannot attach a chunk inspector.
+    fn on_response_stream_selected(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _content_type: Option<&str>,
+    ) {
     }
 
     /// Create a stateful [`ResponseStreamInspector`] for a streaming (non-buffered)
