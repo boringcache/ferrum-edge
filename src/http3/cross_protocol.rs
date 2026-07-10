@@ -2191,6 +2191,7 @@ where
                     response_headers
                         .insert("content-length".to_string(), transformed.len().to_string());
                     response_body = transformed;
+                    plugin.on_response_body_transformed(ctx, &mut response_headers);
                 }
             }
 
@@ -3503,6 +3504,7 @@ where
                     plugin_response_headers
                         .insert("content-length".to_string(), transformed.len().to_string());
                     response_body = transformed;
+                    plugin.on_response_body_transformed(ctx, &mut plugin_response_headers);
                 }
             }
             for plugin in plugins.iter() {

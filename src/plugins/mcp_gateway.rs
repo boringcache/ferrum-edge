@@ -765,11 +765,8 @@ impl McpGateway {
         server_id: &str,
         downstream_session_id: &str,
         catalog_version: u64,
+        response_resource_rewrite_possible: bool,
     ) {
-        // Routed JSON results must remain identity-encoded so the response
-        // transform can inspect them. A non-compliant upstream that still sends
-        // Content-Encoding is handled defensively on the response path.
-        remove_header(headers, "accept-encoding");
         ctx.metadata
             .insert(METADATA_REWRITE_KEY.to_string(), "true".to_string());
         ctx.metadata
@@ -784,6 +781,14 @@ impl McpGateway {
             METADATA_REWRITE_UPSTREAM_VALUE_KEY.to_string(),
             upstream_value.to_string(),
         );
+        if !response_resource_rewrite_possible {
+            return;
+        }
+
+        // Routed JSON results must remain identity-encoded so the response
+        // transform can inspect them. A non-compliant upstream that still sends
+        // Content-Encoding is handled defensively on the response path.
+        remove_header(headers, "accept-encoding");
         ctx.metadata.insert(
             METADATA_RESPONSE_REWRITE_KEY.to_string(),
             "true".to_string(),
@@ -804,6 +809,14 @@ impl McpGateway {
             METADATA_RESPONSE_REWRITE_CATALOG_VERSION_KEY.to_string(),
             catalog_version.to_string(),
         );
+    }
+
+    fn resource_response_rewrite_possible(&self, server_id: &str) -> bool {
+        self.discovery.aggregate_resources
+            && self
+                .servers
+                .get(server_id)
+                .is_some_and(|server| server.enabled && server.expose_resources)
     }
 
     fn primary_server(&self) -> Option<&McpServerConfig> {
@@ -1520,7 +1533,7 @@ impl McpGateway {
         downstream_session_id: &str,
         server_id: &str,
     ) {
-        if !self.discovery.aggregate_resources {
+        if !self.resource_response_rewrite_possible(server_id) {
             return;
         }
         let Some(session) = self.downstream_session_clone(downstream_session_id) else {
@@ -2350,8 +2363,12 @@ impl McpGateway {
                 None,
             );
         };
-        self.prepare_response_resource_bindings(ctx, downstream_session_id, &server.server_id)
-            .await;
+        let response_resource_rewrite_possible =
+            self.resource_response_rewrite_possible(&server.server_id);
+        if response_resource_rewrite_possible {
+            self.prepare_response_resource_bindings(ctx, downstream_session_id, &server.server_id)
+                .await;
+        }
         let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
             return session_not_found_response();
         };
@@ -2378,6 +2395,7 @@ impl McpGateway {
             &entry.server_id,
             downstream_session_id,
             catalog_version,
+            response_resource_rewrite_possible,
         );
         PluginResult::Continue
     }
@@ -2424,8 +2442,12 @@ impl McpGateway {
                 None,
             );
         };
-        self.prepare_response_resource_bindings(ctx, downstream_session_id, &server.server_id)
-            .await;
+        let response_resource_rewrite_possible =
+            self.resource_response_rewrite_possible(&server.server_id);
+        if response_resource_rewrite_possible {
+            self.prepare_response_resource_bindings(ctx, downstream_session_id, &server.server_id)
+                .await;
+        }
         let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
             return session_not_found_response();
         };
@@ -2464,6 +2486,7 @@ impl McpGateway {
             &entry.server_id,
             downstream_session_id,
             catalog_version,
+            response_resource_rewrite_possible,
         );
         PluginResult::Continue
     }
@@ -2590,6 +2613,7 @@ impl McpGateway {
             &server_id,
             downstream_session_id,
             catalog_version,
+            self.resource_response_rewrite_possible(&server_id),
         );
         PluginResult::Continue
     }
@@ -3080,33 +3104,6 @@ impl Plugin for McpGateway {
         serde_json::to_vec(&value).ok()
     }
 
-    async fn after_proxy(
-        &self,
-        ctx: &mut RequestContext,
-        _response_status: u16,
-        response_headers: &mut HashMap<String, String>,
-    ) -> PluginResult {
-        if !self.should_buffer_response_body(ctx) {
-            return PluginResult::Continue;
-        }
-        let content_type = header_value(response_headers, "content-type");
-        if content_type.is_some_and(|value| {
-            super::utils::body_transform::is_event_stream_content_type(value)
-                || !mcp_content_type_is_json(value)
-        }) || header_value(response_headers, "content-encoding")
-            .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
-        {
-            return PluginResult::Continue;
-        }
-        // The transform may change the selected representation. Remove origin
-        // validators/integrity hashes before the body phase so clients cannot
-        // validate public-URI bytes against the upstream-native body.
-        for header in MCP_REWRITTEN_RESPONSE_VALIDATORS {
-            remove_header(response_headers, header);
-        }
-        PluginResult::Continue
-    }
-
     async fn transform_response_body_with_context(
         &self,
         ctx: &mut RequestContext,
@@ -3173,6 +3170,18 @@ impl Plugin for McpGateway {
             return None;
         }
         serde_json::to_vec(&value).ok()
+    }
+
+    fn on_response_body_transformed(
+        &self,
+        _ctx: &mut RequestContext,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        // The selected representation changed. Origin validators and integrity
+        // hashes describe the upstream-native bytes, not the public-URI body.
+        for header in MCP_REWRITTEN_RESPONSE_VALIDATORS {
+            remove_header(response_headers, header);
+        }
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -3360,15 +3369,6 @@ fn reverse_resource_uri(
         return ReverseResourceUri::Mapped(public_uri.to_string());
     }
 
-    // Check for an already-public URI only after exact upstream bindings: an
-    // upstream is allowed to use its own `mcp://` URI scheme, and an exact
-    // catalog entry for one must still be namespaced by this gateway.
-    if public_resource_uri_parts(upstream_uri)
-        .is_some_and(|(public_server_id, _)| public_server_id == server_id)
-    {
-        return ReverseResourceUri::Unchanged;
-    }
-
     let mut matched_template_uri: Option<String> = None;
     for entry in catalog
         .resource_templates
@@ -3386,10 +3386,20 @@ fn reverse_resource_uri(
         }
         matched_template_uri = Some(public_uri);
     }
-    match matched_template_uri {
-        Some(public_uri) => ReverseResourceUri::Mapped(public_uri),
-        None => ReverseResourceUri::Unchanged,
+    if let Some(public_uri) = matched_template_uri {
+        return ReverseResourceUri::Mapped(public_uri);
     }
+
+    // Check for an already-public URI only after exact and template upstream
+    // bindings: an upstream may use a native `mcp://` URI whose authority
+    // happens to equal this gateway's server id, and it must still be
+    // namespaced when a configured template matches it.
+    if public_resource_uri_parts(upstream_uri)
+        .is_some_and(|(public_server_id, _)| public_server_id == server_id)
+    {
+        return ReverseResourceUri::Unchanged;
+    }
+    ReverseResourceUri::Unchanged
 }
 
 fn expand_public_resource_template(

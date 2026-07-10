@@ -311,6 +311,14 @@ impl Plugin for PriorityOverridePlugin {
             .transform_response_body_with_context(ctx, body, content_type, response_headers)
             .await
     }
+    fn on_response_body_transformed(
+        &self,
+        ctx: &mut RequestContext,
+        response_headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        self.inner
+            .on_response_body_transformed(ctx, response_headers);
+    }
     async fn on_final_response_body(
         &self,
         ctx: &mut RequestContext,

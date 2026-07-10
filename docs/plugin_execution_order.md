@@ -75,6 +75,8 @@ Request In
 
 Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, CORS returns a `204` preflight response in phase 1 without ever reaching authentication. Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
 
+When a plugin returns a replacement body from `transform_response_body`, the core immediately calls that plugin's `on_response_body_transformed` callback before the next transform. This lets the transforming plugin invalidate representation-specific response headers only when it actually changed the body; the callback does not run when the transform returns `None`.
+
 For gateway-generated rejection responses, a small set of header-only `after_proxy` plugins opt in to still run. This preserves headers such as `Access-Control-Allow-Origin`, `traceparent`, and request IDs on rejected responses without treating them as backend responses.
 
 `after_proxy` rejections are also honored before anything is sent downstream. This matters for plugins like `response_size_limiting`, whose `Content-Length` fast path now replaces oversized backend responses instead of only logging a warning.
@@ -315,7 +317,7 @@ Given all built-in plugins enabled, the execution order is:
 | 44 | `ai_tool_governor` | 2978 | before_proxy, on_final_request_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector |
 | 45 | `ai_semantic_cache` | 2980 | before_proxy, after_proxy, on_final_response_body |
 | 46 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, normalize_response_body, response_stream_inspector |
-| 47 | `mcp_gateway` | 2992 | before_proxy, after_proxy, transform_request_body, transform_response_body |
+| 47 | `mcp_gateway` | 2992 | before_proxy, transform_request_body, transform_response_body |
 | 48 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body, response_stream_inspector |
 | 49 | `mesh_route_dispatch` | 2995 | before_proxy |
 | 50 | `request_transformer` | 3000 | before_proxy, transform_request_body |

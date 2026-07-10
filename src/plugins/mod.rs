@@ -2982,6 +2982,20 @@ pub trait Plugin: Send + Sync {
             .await
     }
 
+    /// Called immediately after this plugin returns a transformed response
+    /// body, before the next body transform runs.
+    ///
+    /// Use this for response headers that are valid only for the original body
+    /// representation, such as upstream validators or integrity digests. The
+    /// hook is not called when the transform returns `None`, so unchanged
+    /// responses retain their original headers.
+    fn on_response_body_transformed(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_headers: &mut HashMap<String, String>,
+    ) {
+    }
+
     /// Called after all `transform_response_body` hooks on buffered responses.
     ///
     /// Use this hook when the plugin must inspect or act on the final
