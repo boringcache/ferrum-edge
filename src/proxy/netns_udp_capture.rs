@@ -35,6 +35,7 @@
 //! live multi-pod node (the `netns-capture-live` follow-up).
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -194,6 +195,45 @@ fn capture_is_still_justified(
     })
 }
 
+fn udp_ready_marker_path(dir: &Path, pod_uid: &str) -> Option<PathBuf> {
+    if pod_uid.is_empty()
+        || pod_uid == "."
+        || pod_uid == ".."
+        || pod_uid.contains('/')
+        || pod_uid.contains('\\')
+    {
+        return None;
+    }
+    Some(dir.join(pod_uid))
+}
+
+fn write_udp_ready_marker(dir: &Path, pod_uid: &str) {
+    let Some(path) = udp_ready_marker_path(dir, pod_uid) else {
+        return;
+    };
+    if path.is_file() {
+        return;
+    }
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        warn!(pod_uid, dir = %dir.display(), %error, "Failed to create Ambient UDP readiness marker dir");
+        return;
+    }
+    if let Err(error) = std::fs::write(&path, b"") {
+        warn!(pod_uid, path = %path.display(), %error, "Failed to publish Ambient UDP readiness marker");
+    }
+}
+
+fn remove_udp_ready_marker(dir: &Path, pod_uid: &str) {
+    let Some(path) = udp_ready_marker_path(dir, pod_uid) else {
+        return;
+    };
+    if let Err(error) = std::fs::remove_file(&path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(pod_uid, path = %path.display(), %error, "Failed to remove Ambient UDP readiness marker");
+    }
+}
+
 /// Reconciles per-pod-netns UDP capture producers against the enrolled-pod set.
 pub struct NetnsUdpCaptureManager<B: NetnsUdpBackend> {
     /// The UDP capture port bound (dual-stack `[::]`) inside each pod netns.
@@ -220,6 +260,9 @@ pub struct NetnsUdpCaptureManager<B: NetnsUdpBackend> {
     /// Last unresolved-netns reason per pod UID, so persistent cgroup/proc
     /// visibility failures stay clear without warning every poll.
     unresolved_reasons: HashMap<String, String>,
+    /// Producer-to-node-agent readiness handshake. The node-agent keeps its
+    /// host-veth UDP guard closed until this marker exists.
+    ready_dir: Option<PathBuf>,
 }
 
 impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
@@ -239,7 +282,13 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             pending_teardowns: HashMap::new(),
             last_registry_uids: HashSet::new(),
             unresolved_reasons: HashMap::new(),
+            ready_dir: None,
         }
+    }
+
+    pub fn with_ready_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.ready_dir = dir;
+        self
     }
 
     /// Poll-and-reconcile until `shutdown` flips to `true`, then close every
@@ -362,6 +411,11 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             .collect();
         for netns in gone {
             if let Some(active) = self.active.remove(&netns) {
+                if let Some(dir) = &self.ready_dir {
+                    for uid in &active.pod_uids {
+                        remove_udp_ready_marker(dir, uid);
+                    }
+                }
                 // Close the producer (signal its loop to stop). Rather than drop
                 // the supervising task's handle fire-and-forget, RETAIN it keyed
                 // by netns so the open pass can await this teardown to completion
@@ -425,7 +479,20 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
         // membership (a shared netns may gain/lose pods without a socket rebind).
         for (netns, pod_uids) in desired {
             if let Some(active) = self.active.get_mut(&netns) {
+                if let Some(dir) = &self.ready_dir {
+                    for uid in active.pod_uids.difference(&pod_uids) {
+                        remove_udp_ready_marker(dir, uid);
+                    }
+                    for uid in pod_uids.difference(&active.pod_uids) {
+                        write_udp_ready_marker(dir, uid);
+                    }
+                }
                 active.pod_uids = pod_uids;
+                if let Some(dir) = &self.ready_dir {
+                    for uid in &active.pod_uids {
+                        write_udp_ready_marker(dir, uid);
+                    }
+                }
                 continue;
             }
             if let Some(guarded) = self.guarded.get_mut(&netns) {
@@ -436,6 +503,14 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             let Some(target) = targets.iter().find(|t| pod_uids.contains(&t.pod_uid)) else {
                 continue;
             };
+            // A marker can survive an ungraceful predecessor. Close the
+            // node-agent's BPF gate before any guarded retry and republish only
+            // after the producer reaches `Opened` below.
+            if let Some(dir) = &self.ready_dir {
+                for uid in &pod_uids {
+                    remove_udp_ready_marker(dir, uid);
+                }
+            }
             // Before installing fresh rules in this netns, await a prior
             // producer's teardown (registry flap: closed then reopened for the
             // same pod netns). Take the handle OUT of the map first, then await
@@ -468,8 +543,18 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                         capture_port = self.capture_port,
                         "Opened Ambient per-pod-netns UDP capture producer"
                     );
-                    self.active
-                        .insert(netns, ActiveUdpCapture { handle, pod_uids });
+                    self.active.insert(
+                        netns,
+                        ActiveUdpCapture {
+                            handle,
+                            pod_uids: pod_uids.clone(),
+                        },
+                    );
+                    if let Some(dir) = &self.ready_dir {
+                        for uid in &pod_uids {
+                            write_udp_ready_marker(dir, uid);
+                        }
+                    }
                 }
                 NetnsUdpOpenResult::Guarded(handle) => {
                     match self.guarded.entry(netns) {
@@ -530,6 +615,11 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             });
         }
         for (_, active) in self.active.drain() {
+            if let Some(dir) = &self.ready_dir {
+                for uid in &active.pod_uids {
+                    remove_udp_ready_marker(dir, uid);
+                }
+            }
             if let Some(handle) = active.handle.close() {
                 tasks.spawn(async move {
                     let _ = handle.await;
@@ -1540,6 +1630,30 @@ mod tests {
         // Idempotent: a second reconcile opens nothing new.
         assert_eq!(mgr.reconcile_once().await, 2);
         assert_eq!(opened.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn readiness_marker_is_post_open_idempotent_and_removed_before_close() {
+        let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let ready_root = tempfile::tempdir().unwrap();
+        let ready_dir = ready_root.path().join(".udp-ready");
+        let mut mgr = manager(source.clone(), backend).with_ready_dir(Some(ready_dir.clone()));
+
+        assert_eq!(mgr.reconcile_once().await, 1);
+        assert!(
+            ready_dir.join("pod-a").is_file(),
+            "readiness is published only after open succeeds"
+        );
+        assert_eq!(mgr.reconcile_once().await, 1, "reconcile stays idempotent");
+        assert!(ready_dir.join("pod-a").is_file());
+
+        source.0.lock().unwrap().clear();
+        assert_eq!(mgr.reconcile_once().await, 0);
+        assert!(
+            !ready_dir.join("pod-a").exists(),
+            "readiness closes before producer teardown"
+        );
     }
 
     #[tokio::test]

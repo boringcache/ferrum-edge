@@ -343,6 +343,75 @@ pub(crate) struct MeshUdpCaptureRuntime {
     pub reply_socket_factory: std::sync::Arc<dyn ReplySocketFactory>,
 }
 
+/// Per-producer ownership of the UDP session tasks spawned by one capture
+/// socket. Session creation is cold-path work (once per flow), so retaining
+/// join handles here does not add a lock to the per-datagram hot path. Closing
+/// the producer can then wait for every task to observe its stop signal before
+/// the pod-netns reply factory (and its stable netns fd) is released.
+#[cfg(target_os = "linux")]
+struct CaptureSessionTasks {
+    handles: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl CaptureSessionTasks {
+    fn new() -> Self {
+        Self {
+            handles: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn track(&self, handle: tokio::task::JoinHandle<()>) {
+        let mut handles = match self.handles.lock() {
+            Ok(handles) => handles,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        handles.retain(|task| !task.is_finished());
+        handles.push(handle);
+    }
+
+    fn take(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut handles = match self.handles.lock() {
+            Ok(handles) => handles,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        std::mem::take(&mut *handles)
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn await_session_tasks(tasks: &CaptureSessionTasks) {
+    let mut handles = tasks.take();
+    if handles.is_empty() {
+        return;
+    }
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        for task in &mut handles {
+            let _ = task.await;
+        }
+    })
+    .await;
+    if drained.is_err() {
+        for task in &handles {
+            task.abort();
+        }
+        for task in handles {
+            let _ = task.await;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn run_session_until_producer_stops<F>(session: F, mut producer_stop: watch::Receiver<bool>)
+where
+    F: std::future::Future<Output = ()>,
+{
+    tokio::select! {
+        _ = session => {}
+        _ = producer_stop.changed() => {}
+    }
+}
+
 /// Start the mesh UDP capture listener in the CURRENT network namespace
 /// (Sidecar: the injected pod's own netns). Binds the transparent socket here,
 /// then runs the shared capture loop with a current-netns reply-socket factory.
@@ -428,6 +497,7 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
             ahash::RandomState::default(),
             session_shard_amount,
         ));
+    let session_tasks = Arc::new(CaptureSessionTasks::new());
     if let Some(tx) = started_tx {
         let _ = tx.send(());
     }
@@ -510,6 +580,8 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
                                                 orig_dst,
                                                 chunk,
                                                 &reply_socket_factory,
+                                                &session_tasks,
+                                                shutdown_rx.clone(),
                                             );
                                         }
                                     }
@@ -522,6 +594,8 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
                                             orig_dst,
                                             data,
                                             &reply_socket_factory,
+                                            &session_tasks,
+                                            shutdown_rx.clone(),
                                         );
                                     }
                                 }
@@ -539,6 +613,18 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
             }
         }
     }
+    // Stop admission first, then remove every sender from the map and release
+    // its limiter slot. Each task also observes the producer stop directly, so
+    // a live tunnel or disabled idle timeout cannot outlive pod unenrollment.
+    let keys: Vec<_> = sessions.iter().map(|entry| *entry.key()).collect();
+    let mut removed = 0;
+    for key in keys {
+        if sessions.remove(&key).is_some() {
+            removed += 1;
+        }
+    }
+    session_limiter.release(removed);
+    await_session_tasks(&session_tasks).await;
     Ok(())
 }
 
@@ -664,6 +750,8 @@ fn handle_captured_datagram(
     orig_dst: Option<SocketAddr>,
     data: &[u8],
     reply_factory: &std::sync::Arc<dyn ReplySocketFactory>,
+    session_tasks: &std::sync::Arc<CaptureSessionTasks>,
+    producer_stop: watch::Receiver<bool>,
 ) -> bool {
     use tracing::debug;
 
@@ -748,6 +836,8 @@ fn handle_captured_datagram(
                 queued_bytes,
                 epoch,
                 reply_factory.clone(),
+                session_tasks.clone(),
+                producer_stop,
             );
             true
         }
@@ -954,17 +1044,22 @@ fn spawn_udp_egress_session(
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
     reply_factory: std::sync::Arc<dyn ReplySocketFactory>,
+    session_tasks: std::sync::Arc<CaptureSessionTasks>,
+    producer_stop: watch::Receiver<bool>,
 ) {
-    tokio::spawn(async move {
-        run_udp_egress_session(
-            &state,
-            &entry,
-            key,
-            rx,
-            last_activity,
-            queued_bytes,
-            epoch,
-            &reply_factory,
+    let handle = tokio::spawn(async move {
+        run_session_until_producer_stops(
+            run_udp_egress_session(
+                &state,
+                &entry,
+                key,
+                rx,
+                last_activity,
+                queued_bytes,
+                epoch,
+                &reply_factory,
+            ),
+            producer_stop,
         )
         .await;
         // Session teardown: remove the map entry and decrement the live count so
@@ -974,6 +1069,7 @@ fn spawn_udp_egress_session(
         // CONDITIONAL removal (codex r1 P2): see [`remove_session_if_owned`].
         remove_session_if_owned(&sessions, &session_limiter, &key, session_id);
     });
+    session_tasks.track(handle);
 }
 
 /// Tear down a finished/failed egress session: remove its map entry and
@@ -1690,6 +1786,35 @@ pub async fn start_mesh_udp_capture_listener(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn producer_stop_cancels_session_and_releases_owned_handle() {
+        struct ReleaseProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for ReleaseProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = ReleaseProbe(released.clone());
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let tasks = CaptureSessionTasks::new();
+        tasks.track(tokio::spawn(run_session_until_producer_stops(
+            async move {
+                let _probe = probe;
+                std::future::pending::<()>().await;
+            },
+            stop_rx,
+        )));
+
+        let _ = stop_tx.send(true);
+        await_session_tasks(&tasks).await;
+        assert!(
+            released.load(std::sync::atomic::Ordering::Acquire),
+            "session cancellation must release its pod-netns-owned factory/handle"
+        );
+    }
 
     /// Build a test session map sized via the same hot-path helper the
     /// listener uses ([`crate::util::sharding::pool_shard_amount`]). Pass `0`

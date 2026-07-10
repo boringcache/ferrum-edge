@@ -1994,12 +1994,19 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   Cleanup removes every duplicate guard jump and strictly detaches any
   partial live-capture OUTPUT path before releasing the guard. The guarded-to-live
   switch propagates xtables resource errors and also probes stale IPv6 guard chains
-  independently of the current IPv6 setting. The
-  pre-first-poll enrollment window remains tracked under #2013, and live source-capture
-  plus bind-collision verification remains #2038. The producer tears down only its own
-  rules on pod removal / config change / shutdown
-  (graceful shutdown AWAITS the per-netns teardown). When Ambient UDP capture is
-  disabled, mesh startup still runs a best-effort cleanup manager over the registry
+  independently of the current IPv6 setting. Enrollment also starts closed: the
+  node-agent marks each enrolled pod's BPF pod-IP entry UDP-not-ready before registry
+  publication, so the host-veth tc classifier drops pod-originated UDP until the
+  producer publishes `.udp-ready/<pod_uid>` after the guarded-to-live transition.
+  Re-enrollment removes stale readiness first, and both marker and BPF transitions
+  reconcile idempotently. Live source-capture plus bind-collision verification remains
+  #2038. The producer tears down only its own rules on pod removal / config change /
+  shutdown. Its stop signal is also threaded into every per-session tunnel task;
+  producer close removes the session senders, waits up to two seconds for those
+  tasks, then aborts any stragglers before the pod-netns reply factory and stable
+  netns handle are released. Graceful shutdown AWAITS the per-netns teardown.
+  When Ambient UDP capture is disabled, mesh startup still runs a best-effort
+  cleanup manager over the registry
   so stale pod-netns `FERRUM_MESH_UDP_*` rules from a prior enabled crash/kill are
   removed instead of black-holing workload UDP. Startup is **fail-closed**: an
   invalid capture config, a runtime image missing `sh`/`ip`/`iptables`, or a required

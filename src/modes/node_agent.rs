@@ -53,6 +53,7 @@ const DEFAULT_BPF_FS_PATH: &str = "/sys/fs/bpf";
 const DEFAULT_FALLBACK_MODE: &str = "fail";
 const CNI_METADATA_FETCH_TIMEOUT: Duration = Duration::from_millis(750);
 const POD_ENROLLMENT_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+const UDP_CAPTURE_READINESS_POLL: Duration = Duration::from_millis(250);
 
 static FAILED_POD_ENROLLMENT_ATTEMPTS: LazyLock<DashMap<String, FailedPodEnrollmentAttempt>> =
     LazyLock::new(DashMap::new);
@@ -85,9 +86,9 @@ pub struct NodeAgentConfig {
     /// Directory under which the node-agent publishes a per-pod registry file
     /// (`<dir>/<pod_uid>` containing the pod cgroup path plus optional
     /// `ipv4=`/`ipv6=` source-IP lines) for the mesh proxy's in-netns capture
-    /// listeners to consume. `Some` only when in-netns listeners are enabled AND
-    /// the proxy mode is `NodeWaypoint`; `None` disables publishing entirely
-    /// (the registry is meaningless outside that topology). Sourced from
+    /// listeners or Ambient UDP producer to consume. `Some` when NodeWaypoint
+    /// in-netns TCP capture or Ambient UDP capture needs the registry; `None`
+    /// disables publishing entirely. Sourced from
     /// `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`.
     pub node_waypoint_pod_registry_dir: Option<std::path::PathBuf>,
 }
@@ -299,13 +300,10 @@ impl NodeAgentConfig {
         // connect4/connect6 redirect path) MUST NOT suppress UDP registry
         // publication — doing so would leave the producer polling an empty
         // directory while pod UDP egress bypasses capture/authz (fail-open, #2013
-        // codex). The UDP producer installs its pod-netns rules on its own polling
-        // loop AFTER this registry entry appears; the enrollment→rules-installed
-        // window (during which pod UDP is not yet captured) is a known fail-open
-        // gap that needs a producer→node-agent readiness handshake + a fail-closed
-        // default posture to close, tracked as a live-verified follow-up (#2013 —
-        // there is no `.ready`-marker mirror because Ambient UDP has no default
-        // redirect to refuse against, unlike the NodeWaypoint TCP connect-hook path).
+        // codex). The node-agent writes the pod-IP map with UDP readiness closed
+        // before publishing this entry. The host-veth tc guard drops pod UDP until
+        // the producer installs its guard/socket/rules and publishes
+        // `.udp-ready/<uid>`.
         let should_publish_registry = node_waypoint_in_netns || capture_config.udp_capture_enabled;
         let node_waypoint_pod_registry_dir = if should_publish_registry {
             Some(std::path::PathBuf::from(
@@ -834,6 +832,9 @@ async fn run_with_backend(
     // first real pass waits a full backoff window rather than firing instantly.
     let mut retry_interval = tokio::time::interval(POD_ENROLLMENT_RETRY_BACKOFF);
     retry_interval.tick().await;
+    let mut udp_readiness_interval = tokio::time::interval(UDP_CAPTURE_READINESS_POLL);
+    udp_readiness_interval.tick().await;
+    let mut udp_ready_uids = HashSet::new();
 
     loop {
         if *shutdown_rx.borrow() {
@@ -947,6 +948,14 @@ async fn run_with_backend(
                     backend.as_mut(),
                     &pod_states,
                     metrics.as_ref(),
+                );
+            }
+            _ = udp_readiness_interval.tick(), if config.capture_config.udp_capture_enabled => {
+                reconcile_udp_capture_readiness(
+                    backend.as_mut(),
+                    &pod_states,
+                    config,
+                    &mut udp_ready_uids,
                 );
             }
         }
@@ -2723,7 +2732,7 @@ fn remove_pod_ready_marker(dir: &std::path::Path, pod_uid: &str) {
     if pod_registry_uid_is_unsafe(pod_uid) {
         return;
     }
-    for marker_dir in [".ready", ".ready4", ".ready6"] {
+    for marker_dir in [".ready", ".ready4", ".ready6", ".udp-ready"] {
         let path = dir.join(marker_dir).join(pod_uid);
         if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -2733,6 +2742,74 @@ fn remove_pod_ready_marker(dir: &std::path::Path, pod_uid: &str) {
                 path = %path.display(),
                 error = %e,
                 "Failed to remove node-waypoint readiness marker"
+            );
+        }
+    }
+}
+
+fn udp_ready_marker_exists(config: &NodeAgentConfig, pod_uid: &str) -> bool {
+    config
+        .node_waypoint_pod_registry_dir
+        .as_ref()
+        .filter(|_| !pod_registry_uid_is_unsafe(pod_uid))
+        .is_some_and(|dir| dir.join(".udp-ready").join(pod_uid).is_file())
+}
+
+fn pod_map_info(config: &NodeAgentConfig, udp_ready: bool) -> PodInfo {
+    PodInfo::for_capture(
+        config.capture_config.outbound_port,
+        config.capture_config.udp_capture_enabled,
+        udp_ready,
+    )
+}
+
+/// Open or close the host-veth enrollment guard from producer readiness
+/// markers. New pod map entries are always installed with `udp_ready=false`;
+/// only the producer's post-guard/post-bind marker can transition them open.
+fn reconcile_udp_capture_readiness(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    ready_uids: &mut HashSet<String>,
+) {
+    if !config.capture_config.udp_capture_enabled {
+        ready_uids.clear();
+        return;
+    }
+
+    ready_uids.retain(|uid| pod_states.contains_key(uid));
+    for state in pod_states.iter() {
+        if !state.attached {
+            continue;
+        }
+        let uid = state.key();
+        let ready = udp_ready_marker_exists(config, uid);
+        if ready_uids.contains(uid) == ready {
+            continue;
+        }
+        let info = pod_map_info(config, ready);
+        let v4_ok = state
+            .pod_ip
+            .is_none_or(|ip| backend.update_pod_ip(ip, &info).is_ok());
+        let v6_ok = state
+            .pod_ip6
+            .is_none_or(|ip| backend.update_pod_ip6(ip, &info).is_ok());
+        if v4_ok && v6_ok {
+            if ready {
+                ready_uids.insert(uid.clone());
+            } else {
+                ready_uids.remove(uid);
+            }
+            debug!(
+                pod_uid = uid.as_str(),
+                udp_ready = ready,
+                "Reconciled Ambient UDP producer readiness guard"
+            );
+        } else {
+            warn!(
+                pod_uid = uid.as_str(),
+                udp_ready = ready,
+                "Failed to reconcile Ambient UDP producer readiness guard; will retry"
             );
         }
     }
@@ -2942,6 +3019,16 @@ fn handle_pod_added(
         node_probe_ports: event.node_probe_ports.clone(),
     };
 
+    // A same-UID sandbox replacement must never inherit the old producer's
+    // readiness. Close the BPF UDP gate before publishing the new registry
+    // entry; the producer will publish a fresh marker only after its guard and
+    // TPROXY socket/rules are live.
+    if config.capture_config.udp_capture_enabled
+        && let Some(dir) = &config.node_waypoint_pod_registry_dir
+    {
+        remove_pod_ready_marker(dir, pod_uid);
+    }
+
     if let Some(ref cgroup) = cgroup_path {
         // Seed per-cgroup policy maps before connect hooks can run. Otherwise
         // the first connection from an annotated pod can observe missing
@@ -3058,10 +3145,7 @@ fn handle_pod_added(
                 }
             }
             if let Some(ip) = pod_ip {
-                let info = PodInfo {
-                    proxy_port: config.capture_config.outbound_port,
-                    cgroup_id: 0,
-                };
+                let info = pod_map_info(config, false);
                 if let Err(e) = backend.update_pod_ip(ip, &info) {
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IP map");
                     metrics.record_attach_error();
@@ -3075,10 +3159,7 @@ fn handle_pod_added(
                 }
             }
             if let Some(ip) = pod_ip6 {
-                let info = PodInfo {
-                    proxy_port: config.capture_config.outbound_port,
-                    cgroup_id: 0,
-                };
+                let info = pod_map_info(config, false);
                 if let Err(e) = backend.update_pod_ip6(ip, &info) {
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IPv6 map");
                     metrics.record_attach_error();
@@ -3239,10 +3320,7 @@ fn reconcile_existing_pod_ip(
         return PodIpReconcileResult::default();
     }
 
-    let info = PodInfo {
-        proxy_port: config.capture_config.outbound_port,
-        cgroup_id: 0,
-    };
+    let info = pod_map_info(config, udp_ready_marker_exists(config, pod_uid));
     if let Err(e) = backend.update_pod_ip(new_ip, &info) {
         warn!(pod_uid, %new_ip, error = %e, "Failed to update pod IP map for existing pod");
         metrics.record_attach_error();
@@ -3286,10 +3364,7 @@ fn reconcile_existing_pod_ip6(
         return PodIpReconcileResult::default();
     }
 
-    let info = PodInfo {
-        proxy_port: config.capture_config.outbound_port,
-        cgroup_id: 0,
-    };
+    let info = pod_map_info(config, udp_ready_marker_exists(config, pod_uid));
     if let Err(e) = backend.update_pod_ip6(new_ip, &info) {
         warn!(pod_uid, %new_ip, error = %e, "Failed to update pod IPv6 map for existing pod");
         metrics.record_attach_error();
@@ -5731,6 +5806,59 @@ mod tests {
     }
 
     #[test]
+    fn handle_pod_added_closes_udp_guard_before_registry_publication() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-udp")).unwrap();
+        let registry = tempfile::tempdir().unwrap();
+        let ready_dir = registry.path().join(".udp-ready");
+        std::fs::create_dir_all(&ready_dir).unwrap();
+        std::fs::write(ready_dir.join("pod-udp"), b"stale").unwrap();
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.udp_capture_enabled = true;
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations = HashMap::new();
+        let event = PodEvent {
+            pod_uid: "pod-udp",
+            pod_name: "pod-udp",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("10.0.0.9"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.9")),
+            node_probe_ports: Vec::new(),
+            pod_pid: None,
+            veth_iface_override: Some("veth-udp"),
+        };
+
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+        assert!(registry.path().join("pod-udp").is_file());
+        assert!(
+            !ready_dir.join("pod-udp").exists(),
+            "a stale producer marker must close before re-enrollment is published"
+        );
+        let info = &backend.pod_ips[&"10.0.0.9".parse().unwrap()];
+        assert!(info.capture_flags & ferrum_ebpf_common::POD_CAPTURE_FLAG_UDP_ENABLED != 0);
+        assert!(info.capture_flags & ferrum_ebpf_common::POD_CAPTURE_FLAG_UDP_READY == 0);
+    }
+
+    #[test]
     fn handle_pod_added_uses_status_pod_ips_ipv4_when_primary_is_ipv6() {
         let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth_test");
         let mut backend = MockEbpfBackend::default();
@@ -6817,7 +6945,7 @@ mod tests {
                 ip,
                 &PodInfo {
                     proxy_port: 15001,
-                    cgroup_id: 0,
+                    capture_flags: 0,
                 },
             )
             .unwrap();
@@ -7317,7 +7445,7 @@ mod tests {
                 ip,
                 &PodInfo {
                     proxy_port: 15001,
-                    cgroup_id: 0,
+                    capture_flags: 0,
                 },
             )
             .unwrap();
@@ -7684,7 +7812,7 @@ mod tests {
                 ip,
                 &PodInfo {
                     proxy_port: 15001,
-                    cgroup_id: 0,
+                    capture_flags: 0,
                 },
             )
             .unwrap();
@@ -7693,7 +7821,7 @@ mod tests {
                 ip6,
                 &PodInfo {
                     proxy_port: 15001,
-                    cgroup_id: 0,
+                    capture_flags: 0,
                 },
             )
             .unwrap();
@@ -7753,7 +7881,7 @@ mod tests {
                 ip,
                 &PodInfo {
                     proxy_port: 15001,
-                    cgroup_id: 0,
+                    capture_flags: 0,
                 },
             )
             .unwrap();
@@ -7825,6 +7953,80 @@ mod tests {
         assert_eq!(
             contents, "/sys/fs/cgroup/kubepods/poduid1\nipv4=10.1.2.3\nipv6=fd00::123\n",
             "registry entry carries the cgroup path and family-specific source pod IPs"
+        );
+    }
+
+    #[test]
+    fn udp_enrollment_guard_opens_only_after_producer_ready_marker() {
+        let registry = tempfile::tempdir().unwrap();
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.udp_capture_enabled = true;
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 5);
+        let pod_states = DashMap::new();
+        pod_states.insert(
+            "pod-a".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-a".to_string(),
+                pod_name: "pod-a".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: Some(ip),
+                pod_ip6: None,
+                cgroup_path: Some("/cg/a".to_string()),
+                veth_iface: Some("veth-a".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
+            },
+        );
+        let mut backend = MockEbpfBackend::default();
+        backend
+            .update_pod_ip(ip, &pod_map_info(&config, false))
+            .unwrap();
+        let mut ready_uids = HashSet::new();
+
+        reconcile_udp_capture_readiness(&mut backend, &pod_states, &config, &mut ready_uids);
+        assert!(
+            backend.pod_ips[&ip].capture_flags & ferrum_ebpf_common::POD_CAPTURE_FLAG_UDP_READY
+                == 0,
+            "registry publication alone must leave UDP fail-closed"
+        );
+
+        let ready_dir = registry.path().join(".udp-ready");
+        std::fs::create_dir_all(&ready_dir).unwrap();
+        std::fs::write(ready_dir.join("pod-a"), b"").unwrap();
+        reconcile_udp_capture_readiness(&mut backend, &pod_states, &config, &mut ready_uids);
+        assert!(
+            backend.pod_ips[&ip].capture_flags & ferrum_ebpf_common::POD_CAPTURE_FLAG_UDP_READY
+                != 0,
+            "only producer readiness may open the enrollment guard"
+        );
+
+        let stable = backend.pod_ips[&ip].clone();
+        reconcile_udp_capture_readiness(&mut backend, &pod_states, &config, &mut ready_uids);
+        assert_eq!(
+            backend.pod_ips[&ip], stable,
+            "ready reconcile is idempotent"
+        );
+
+        std::fs::remove_file(ready_dir.join("pod-a")).unwrap();
+        reconcile_udp_capture_readiness(&mut backend, &pod_states, &config, &mut ready_uids);
+        assert!(
+            backend.pod_ips[&ip].capture_flags & ferrum_ebpf_common::POD_CAPTURE_FLAG_UDP_READY
+                == 0,
+            "marker removal must close the BPF gate again"
         );
     }
 
@@ -8608,7 +8810,7 @@ mod tests {
                 ip,
                 &PodInfo {
                     proxy_port: 15001,
-                    cgroup_id: 0,
+                    capture_flags: 0,
                 },
             )
             .unwrap();
@@ -8723,7 +8925,7 @@ mod tests {
                 ip,
                 &PodInfo {
                     proxy_port: 15001,
-                    cgroup_id: 0,
+                    capture_flags: 0,
                 },
             )
             .unwrap();
@@ -8795,7 +8997,7 @@ mod tests {
                 ip,
                 &PodInfo {
                     proxy_port: 15001,
-                    cgroup_id: 0,
+                    capture_flags: 0,
                 },
             )
             .unwrap();
@@ -8885,7 +9087,7 @@ mod tests {
                 old_ip,
                 &PodInfo {
                     proxy_port: 15001,
-                    cgroup_id: 0,
+                    capture_flags: 0,
                 },
             )
             .unwrap();

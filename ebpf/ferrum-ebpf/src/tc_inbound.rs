@@ -12,6 +12,10 @@
 //! (>=32768).
 //! Explicitly configured local node source IPs can only bypass this guard with
 //! the relay mark, or for enrolled Kubernetes probe ports without the mark.
+//! The same classifier closes Ambient UDP enrollment: pod-IP metadata is
+//! inserted with UDP-not-ready before registry publication, so pod-originated
+//! UDP is dropped until the per-netns producer publishes readiness after its
+//! TPROXY socket and rules are live.
 
 use aya_ebpf::bindings::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT};
 use aya_ebpf::macros::classifier;
@@ -55,15 +59,23 @@ fn try_tc_inbound(ctx: &TcContext) -> Result<i32, i64> {
 
 #[inline(always)]
 fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
+    let src_ip: u32 = ctx.load(ETH_HDR_LEN + 12).map_err(|_| -1i64)?;
+    let protocol: u8 = ctx.load(ETH_HDR_LEN + 9).map_err(|_| -1i64)?;
+    if protocol == IPPROTO_UDP
+        && matches!(
+            unsafe { FERRUM_POD_IPS.get(&src_ip) },
+            Some(info) if info.udp_capture_not_ready()
+        )
+    {
+        return Ok(TC_ACT_SHOT);
+    }
+
     let dst_ip: u32 = ctx.load(ETH_HDR_LEN + 16).map_err(|_| -1i64)?;
     if unsafe { FERRUM_POD_IPS.get(&dst_ip) }.is_none() {
         return Ok(TC_ACT_OK);
     }
 
-    let src_ip: u32 = ctx.load(ETH_HDR_LEN + 12).map_err(|_| -1i64)?;
     let source_is_node = unsafe { FERRUM_NODE_IPS.get(&src_ip) }.is_some();
-
-    let protocol: u8 = ctx.load(ETH_HDR_LEN + 9).map_err(|_| -1i64)?;
     match protocol {
         IPPROTO_TCP => {
             let (dst_port, flags) = match tcp_dst_port_and_flags4(ctx) {
@@ -91,6 +103,24 @@ fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
 
 #[inline(always)]
 fn guard_ipv6(ctx: &TcContext) -> Result<i32, i64> {
+    let src_ip = CidrKey6 {
+        addr: [
+            ctx.load(ETH_HDR_LEN + 8).map_err(|_| -1i64)?,
+            ctx.load(ETH_HDR_LEN + 12).map_err(|_| -1i64)?,
+            ctx.load(ETH_HDR_LEN + 16).map_err(|_| -1i64)?,
+            ctx.load(ETH_HDR_LEN + 20).map_err(|_| -1i64)?,
+        ],
+    };
+    let next_header: u8 = ctx.load(ETH_HDR_LEN + 6).map_err(|_| -1i64)?;
+    if (next_header == IPPROTO_UDP || ipv6_extension_header(next_header))
+        && matches!(
+            unsafe { FERRUM_POD_IPS6.get(&src_ip) },
+            Some(info) if info.udp_capture_not_ready()
+        )
+    {
+        return Ok(TC_ACT_SHOT);
+    }
+
     let dst_ip = CidrKey6 {
         addr: [
             ctx.load(ETH_HDR_LEN + 24).map_err(|_| -1i64)?,
@@ -104,17 +134,7 @@ fn guard_ipv6(ctx: &TcContext) -> Result<i32, i64> {
         return Ok(TC_ACT_OK);
     }
 
-    let src_ip = CidrKey6 {
-        addr: [
-            ctx.load(ETH_HDR_LEN + 8).map_err(|_| -1i64)?,
-            ctx.load(ETH_HDR_LEN + 12).map_err(|_| -1i64)?,
-            ctx.load(ETH_HDR_LEN + 16).map_err(|_| -1i64)?,
-            ctx.load(ETH_HDR_LEN + 20).map_err(|_| -1i64)?,
-        ],
-    };
     let source_is_node = unsafe { FERRUM_NODE_IPS6.get(&src_ip) }.is_some();
-
-    let next_header: u8 = ctx.load(ETH_HDR_LEN + 6).map_err(|_| -1i64)?;
     match next_header {
         IPPROTO_TCP => {
             let (dst_port, flags) = match tcp_dst_port_and_flags6(ctx) {

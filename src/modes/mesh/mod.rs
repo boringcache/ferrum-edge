@@ -9527,7 +9527,11 @@ async fn serve_mesh_runtime(
                     source,
                     backend,
                     std::time::Duration::from_secs(2),
-                );
+                )
+                .with_ready_dir(Some(
+                    std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir)
+                        .join(".udp-ready"),
+                ));
                 let manager_shutdown = shutdown_tx.subscribe();
                 info!(
                     registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
