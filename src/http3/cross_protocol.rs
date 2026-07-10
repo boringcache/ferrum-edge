@@ -362,8 +362,8 @@ where
                 &mut headers,
             )
             .await;
-            let http_status = StatusCode::from_u16(status_code)
-                .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+            let http_status =
+                StatusCode::from_u16(status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
             let mut outcome = if matches!(flavor, HttpFlavor::Grpc) {
                 let normalized = normalize_h3_grpc_reject(http_status, &body, &headers);
                 apply_h3_grpc_reject_metadata(ctx, &normalized);

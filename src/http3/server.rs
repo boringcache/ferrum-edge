@@ -2068,17 +2068,11 @@ async fn handle_h3_request(
                     &mut rej_headers,
                 )
                 .await;
-                let status = StatusCode::from_u16(status_code)
-                    .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+                let status =
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
                 record_request(&state, status.as_u16());
-                send_h3_reject_flavor_aware(
-                    &mut stream,
-                    http_flavor,
-                    status,
-                    &body,
-                    &rej_headers,
-                )
-                .await?;
+                send_h3_reject_flavor_aware(&mut stream, http_flavor, status, &body, &rej_headers)
+                    .await?;
                 return Ok(());
             }
         };
@@ -3711,14 +3705,8 @@ async fn handle_h3_request(
                 plugin_execution_ns,
             )
             .await;
-            send_h3_reject_flavor_aware(
-                &mut stream,
-                http_flavor,
-                http_status,
-                &body,
-                &headers,
-            )
-            .await?;
+            send_h3_reject_flavor_aware(&mut stream, http_flavor, http_status, &body, &headers)
+                .await?;
             return Ok(());
         }
     }
@@ -4690,15 +4678,10 @@ async fn run_h3_backend_admission_or_send_reject(
                 &mut headers,
             )
             .await;
-            let http_status = StatusCode::from_u16(status_code)
-                .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
-            let log_status_code = h3_reject_log_status_and_metadata(
-                ctx,
-                flavor,
-                http_status,
-                &body,
-                &headers,
-            );
+            let http_status =
+                StatusCode::from_u16(status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+            let log_status_code =
+                h3_reject_log_status_and_metadata(ctx, flavor, http_status, &body, &headers);
             record_request(state, log_status_code);
             log_rejected_request(
                 plugins,

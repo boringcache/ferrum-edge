@@ -2930,7 +2930,7 @@ async fn non_retryable_sink_4xx_marks_sink_unhealthy_under_reject() {
 }
 
 #[tokio::test]
-async fn stream_capture_preflights_sink_health_before_dispatch_or_short_circuit() {
+async fn stream_capture_preflights_sink_health_before_dispatch_or_response_commit() {
     // A streaming response cannot be replaced after headers are committed, so
     // fail-closed sink health must be enforced while the AI request can still
     // be rejected, including candidates whose provider chooses SSE without a
@@ -2962,11 +2962,7 @@ async fn stream_capture_preflights_sink_health_before_dispatch_or_short_circuit(
         // health transition before the staged response commits.
         let mut precommit_ctx = make_ctx();
         let staged = plugin
-            .on_final_request_body_with_context(
-                &mut precommit_ctx,
-                &headers,
-                ai_request_body(),
-            )
+            .on_final_request_body_with_context(&mut precommit_ctx, &headers, ai_request_body())
             .await;
         if matches!(staged, PluginResult::Continue) {
             let mut driver_ctx = make_ctx();
@@ -3016,8 +3012,10 @@ async fn stream_capture_preflights_sink_health_before_dispatch_or_short_circuit(
                 PluginResult::Continue
             ));
 
-            // `before_proxy` enforces the same check before a later
-            // cache/federation plugin can short-circuit the request.
+            // `before_proxy` must allow downstream redaction before a later
+            // cache/federation plugin short-circuits. The rejection-aware
+            // after_proxy checkpoint still fails closed before the synthetic
+            // response commits and refreshes the staged request first.
             let mut short_circuit_ctx = make_ctx();
             short_circuit_ctx.metadata.insert(
                 "request_body".to_string(),
@@ -3029,14 +3027,38 @@ async fn stream_capture_preflights_sink_health_before_dispatch_or_short_circuit(
                 .before_proxy(&mut short_circuit_ctx, &mut short_circuit_headers)
                 .await;
             assert!(
-                matches!(
-                    before_proxy,
-                    PluginResult::Reject {
-                        status_code: 503,
-                        ..
-                    }
-                ),
-                "staged stream candidates must fail closed before downstream short-circuits"
+                matches!(before_proxy, PluginResult::Continue),
+                "request redactors must run before fail-closed short-circuit handling"
+            );
+            let original_hash = short_circuit_ctx
+                .metadata
+                .get("ai_transcript_audit.request_hash")
+                .cloned()
+                .expect("staged request hash");
+            short_circuit_ctx.metadata.insert(
+                "request_body".to_string(),
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"[REDACTED]"}],"stream":true}"#
+                    .to_string(),
+            );
+            let mut synthetic_headers =
+                HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+            let short_circuit = plugin
+                .after_proxy(&mut short_circuit_ctx, 200, &mut synthetic_headers)
+                .await;
+            assert!(matches!(
+                short_circuit,
+                PluginResult::Reject {
+                    status_code: 503,
+                    ..
+                }
+            ));
+            assert_ne!(
+                short_circuit_ctx
+                    .metadata
+                    .get("ai_transcript_audit.request_hash")
+                    .expect("refreshed request hash"),
+                &original_hash,
+                "short-circuit staging must refresh after downstream redaction"
             );
             saw_unhealthy_reject = true;
             break;

@@ -12376,8 +12376,7 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
             .after_proxy(ctx, *status_code, response_headers)
             .await
         {
-            reject @ PluginResult::Reject { .. }
-            | reject @ PluginResult::RejectBinary { .. } => {
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(parts) = plugin_result_into_reject_parts(reject) else {
                     warn!(
                         rejecting_plugin = plugin.name(),

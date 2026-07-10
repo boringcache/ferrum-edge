@@ -44,8 +44,8 @@ use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
 use super::utils::{
-    BatchConfigDefaults, BatchingLogger, LoggerHooks, PluginHttpClient, build_batch_config,
-    handle_http_batch_response, parse_http_endpoint, validate_batch_config,
+    BatchConfigDefaults, BatchingLogger, BatchingLoggerPermit, LoggerHooks, PluginHttpClient,
+    build_batch_config, handle_http_batch_response, parse_http_endpoint, validate_batch_config,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction,
@@ -339,6 +339,7 @@ pub struct AiTranscriptAudit {
     namespace: String,
     staging: Arc<DashMap<String, AuditStaging>>,
     pending_streams: Arc<DashMap<String, Arc<StreamSlot>>>,
+    stream_reservations: Arc<DashMap<String, BatchingLoggerPermit<AuditRecord>>>,
     rate_limiter: Arc<RecordsPerMinute>,
     sink_healthy: Arc<AtomicBool>,
     /// `true` when at least one capture path is enabled (validated in `new`).
@@ -590,6 +591,7 @@ impl AiTranscriptAudit {
             namespace,
             staging: Arc::new(DashMap::with_shard_amount(shard_amount)),
             pending_streams: Arc::new(DashMap::with_shard_amount(shard_amount)),
+            stream_reservations: Arc::new(DashMap::with_shard_amount(shard_amount)),
             rate_limiter: Arc::new(RecordsPerMinute::new(sampling.max_records_per_minute)),
             sink_healthy,
             active,
@@ -617,7 +619,12 @@ impl AiTranscriptAudit {
 
     fn enqueue(&self, record: AuditRecord) -> SinkOutcome {
         if !self.rate_limiter.try_acquire() {
+            self.stream_reservations.remove(&record.record_id);
             return SinkOutcome::Dropped;
+        }
+        if let Some((_, permit)) = self.stream_reservations.remove(&record.record_id) {
+            permit.send(record);
+            return SinkOutcome::Queued;
         }
         if self.logger.try_send(record) {
             SinkOutcome::Queued
@@ -648,9 +655,8 @@ impl AiTranscriptAudit {
         let sample_hit = self.staged_sample_hit(&ctx.metadata);
         let guardrail_selected =
             self.sampling.always_on_guardrail && guardrail_fired(&ctx.metadata);
-        let error_selected = response.is_some_and(|(status, _)| {
-            status >= 400 && self.sampling.always_on_error
-        });
+        let error_selected =
+            response.is_some_and(|(status, _)| status >= 400 && self.sampling.always_on_error);
         if !(sample_hit || guardrail_selected || error_selected) {
             return None;
         }
@@ -668,8 +674,21 @@ impl AiTranscriptAudit {
         }
         let sink_unhealthy_reject = self.on_sink_error == SinkErrorPolicy::Reject
             && !self.sink_healthy.load(Ordering::Relaxed);
-        let buffer_full_reject = self.on_buffer_full == BufferFullPolicy::Reject
-            && self.logger.queue_depth() >= self.logger.buffer_capacity();
+        let buffer_full_reject = if self.on_buffer_full == BufferFullPolicy::Reject {
+            let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
+                return None;
+            };
+            if self.stream_reservations.contains_key(&record_id) {
+                false
+            } else if let Some(permit) = self.logger.try_reserve() {
+                self.stream_reservations.insert(record_id, permit);
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
         if sink_unhealthy_reject || buffer_full_reject {
             ctx.metadata
                 .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
@@ -1206,9 +1225,10 @@ impl Plugin for AiTranscriptAudit {
         };
         self.stage_candidate(ctx, body.as_bytes());
         ctx.metadata.insert("request_body".to_string(), body);
-        if let Some(result) = self.stream_fail_closed_rejection(ctx, None) {
-            return result;
-        }
+        // Do not fail closed here: lower-priority request redactors and
+        // transforms have not run yet. Backend-bound requests are checked in
+        // the final-body hook; short-circuits are checked by the rejection-aware
+        // after_proxy hook after it refreshes the final request metadata.
         PluginResult::Continue
     }
 
@@ -1597,9 +1617,11 @@ impl Plugin for AiTranscriptAudit {
             return;
         }
 
-        // The final request-body hook preflights known fail-closed conditions.
-        // Once headers are committed this hook can only emit the record; a sink
-        // or queue failure that begins after preflight cannot retract the stream.
+        // The final pre-commit checkpoint reserved queue capacity for this
+        // selected stream when `on_buffer_full=reject`, so concurrent producers
+        // cannot consume its slot after headers commit. Sink health is still a
+        // point-in-time preflight; a later transport failure cannot retract an
+        // already-started stream, but the reserved recovery record is retained.
         let staging = self.staging.remove(&record_id).map(|(_, value)| value);
         let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(
