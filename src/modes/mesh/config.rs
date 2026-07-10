@@ -3769,7 +3769,7 @@ fn east_west_sni_hosts_overlap(a: &[String], b: &[String]) -> bool {
 
     let a_bases: Vec<String> = a
         .iter()
-        .filter_map(|host| east_west_per_port_alias_base(host))
+        .filter_map(|host| east_west_alias_claim_base(host))
         .collect();
     if !a_bases.is_empty() && crate::config::types::hosts_overlap(&a_bases, b) {
         return true;
@@ -3777,14 +3777,27 @@ fn east_west_sni_hosts_overlap(a: &[String], b: &[String]) -> bool {
 
     let b_bases: Vec<String> = b
         .iter()
-        .filter_map(|host| east_west_per_port_alias_base(host))
+        .filter_map(|host| east_west_alias_claim_base(host))
         .collect();
     !b_bases.is_empty() && crate::config::types::hosts_overlap(a, &b_bases)
 }
 
-fn east_west_per_port_alias_base(host: &str) -> Option<String> {
-    let (port_label, base) = host.split_once('.')?;
-    let port = port_label.strip_prefix('p')?;
+/// Return the base service FQDN claimed by a generated exact alias
+/// (`p<port>.<base>`) or by a wildcard alias owner (`*.<base>`).
+///
+/// The suffix must have Ferrum's `<service>.<namespace>.svc.<cluster-domain>`
+/// shape. This keeps unrelated explicit hosts such as `p9090.example.com`
+/// literal: runtime cross-cluster service routing never derives them as aliases.
+fn east_west_alias_claim_base(host: &str) -> Option<String> {
+    let (alias_label, base) = host.split_once('.')?;
+    if !mesh_service_fqdn_like(base) {
+        return None;
+    }
+    if alias_label == "*" {
+        return Some(base.to_string());
+    }
+
+    let port = alias_label.strip_prefix('p')?;
     // `cross_cluster_service_sni` renders a non-zero u16 without leading
     // zeroes. Recognize only that canonical generated namespace so an ordinary
     // hostname such as `p65536.example` is not reinterpreted as an alias.
@@ -3795,6 +3808,15 @@ fn east_west_per_port_alias_base(host: &str) -> Option<String> {
         return None;
     }
     Some(base.to_string())
+}
+
+fn mesh_service_fqdn_like(host: &str) -> bool {
+    let mut labels = host.split('.');
+    labels.next().is_some_and(|label| !label.is_empty())
+        && labels.next().is_some_and(|label| !label.is_empty())
+        && labels.next() == Some("svc")
+        && labels.next().is_some_and(|label| !label.is_empty())
+        && labels.all(|label| !label.is_empty())
 }
 
 /// Lower-case in-place hostname normalisation for mesh entries — matches

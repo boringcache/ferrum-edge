@@ -1192,6 +1192,63 @@ fn multi_cluster_rejects_base_fqdn_and_per_port_alias_same_network() {
     );
 }
 
+fn mesh_with_same_scope_east_west_snis(first: &str, second: &str) -> MeshConfig {
+    let trust_domain = TrustDomain::new("cluster-b.local").unwrap();
+    MeshConfig {
+        multi_cluster: Some(MultiClusterConfig {
+            east_west_gateways: vec![
+                EastWestGateway {
+                    name: "ew-first".to_string(),
+                    namespace: "mesh-system".to_string(),
+                    host: "eastwest-b.example".to_string(),
+                    port: 15443,
+                    sni_hosts: vec![first.to_string()],
+                    trust_domain: Some(trust_domain.clone()),
+                    network: Some("net-b".to_string()),
+                },
+                EastWestGateway {
+                    name: "ew-second".to_string(),
+                    namespace: "mesh-system".to_string(),
+                    host: "eastwest-b2.example".to_string(),
+                    port: 15443,
+                    sni_hosts: vec![second.to_string()],
+                    trust_domain: Some(trust_domain),
+                    network: Some("net-b".to_string()),
+                },
+            ],
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshConfig::default()
+    }
+}
+
+#[test]
+fn multi_cluster_rejects_base_fqdn_and_wildcard_alias_owner() {
+    let mesh = mesh_with_same_scope_east_west_snis(
+        "reviews.default.svc.cluster.local",
+        "*.reviews.default.svc.cluster.local",
+    );
+
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|err| err.contains("sni_hosts overlap")),
+        "a wildcard that owns every per-port alias overlaps the base-FQDN gateway, got: \
+         {errors:?}"
+    );
+}
+
+#[test]
+fn multi_cluster_keeps_non_service_prefixed_hosts_distinct() {
+    let mesh = mesh_with_same_scope_east_west_snis("example.com", "p9090.example.com");
+
+    let errors = mesh.validate();
+    assert!(
+        !errors.iter().any(|err| err.contains("sni_hosts overlap")),
+        "explicit non-service hosts do not participate in generated alias ownership, got: \
+         {errors:?}"
+    );
+}
+
 #[test]
 fn multi_cluster_does_not_treat_noncanonical_port_label_as_generated_alias() {
     let td_b = TrustDomain::new("cluster-b.local").unwrap();
