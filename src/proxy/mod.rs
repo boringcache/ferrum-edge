@@ -2203,6 +2203,7 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
     // `observability.emit_metadata: false` ineffective.
     metadata.remove(crate::plugins::ai_tool_governor::STREAM_REQUESTED_KEY);
     metadata.remove(crate::plugins::ai_tool_governor::STREAM_MODEL_KEY);
+    crate::plugins::mcp_gateway::redact_internal_log_metadata(metadata);
 }
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
@@ -27789,12 +27790,20 @@ mod tests {
             .insert("waf.rule_hits".to_string(), "SPOOFED".to_string());
         ctx.metadata
             .insert("waf.action".to_string(), "blocked".to_string());
+        ctx.metadata
+            .insert("mcp.needs_response_rewrite".to_string(), "true".to_string());
+        ctx.metadata.insert(
+            "mcp.response_rewrite.session".to_string(),
+            "internal-session-hash".to_string(),
+        );
 
         let metadata = clone_log_metadata(&ctx);
 
         assert!(!metadata.contains_key("request_body"));
         assert!(!metadata.contains_key("waf.rule_hits"));
         assert!(!metadata.contains_key("waf.action"));
+        assert!(!metadata.contains_key("mcp.needs_response_rewrite"));
+        assert!(!metadata.contains_key("mcp.response_rewrite.session"));
 
         ctx.set_waf_metadata("waf.rule_hits", "FE-SQLI-001");
         ctx.metadata

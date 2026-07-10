@@ -1266,6 +1266,12 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
         200,
         &HashMap::new(),
     ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &HashMap::from([("content-encoding".to_string(), "gzip".to_string(),)]),
+    ));
     let upstream_response = json!({
         "jsonrpc": "2.0",
         "id": 10,

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures_util::StreamExt;
-use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -43,6 +43,11 @@ const DEFAULT_MAX_MCP_CATALOG_BYTES_PER_LIST: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_UPSTREAM_JSON_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_UPSTREAM_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MCP_STREAMABLE_HTTP_ACCEPT: &str = "application/json, text/event-stream";
+const MCP_TEMPLATE_RESOURCE_URI_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 const MCP_REWRITTEN_RESPONSE_VALIDATORS: &[&str] = &[
     "etag",
     "last-modified",
@@ -352,7 +357,7 @@ struct McpCatalog {
     version: u64,
     last_refreshed_at: Option<Instant>,
     resource_templates_refreshed_at: Option<Instant>,
-    resource_templates_last_attempted_at: Option<Instant>,
+    resource_templates_last_attempted_at: HashMap<String, Instant>,
     last_refreshed_wall: DateTime<Utc>,
 }
 
@@ -366,7 +371,7 @@ impl Default for McpCatalog {
             version: 0,
             last_refreshed_at: None,
             resource_templates_refreshed_at: None,
-            resource_templates_last_attempted_at: None,
+            resource_templates_last_attempted_at: HashMap::new(),
             last_refreshed_wall: Utc::now(),
         }
     }
@@ -1513,6 +1518,7 @@ impl McpGateway {
         &self,
         ctx: &RequestContext,
         downstream_session_id: &str,
+        server_id: &str,
     ) {
         if !self.discovery.aggregate_resources {
             return;
@@ -1524,6 +1530,7 @@ impl McpGateway {
             let catalog = session.catalog.read().await;
             if catalog
                 .resource_templates_last_attempted_at
+                .get(server_id)
                 .is_some_and(|attempted| attempted.elapsed() < self.discovery.cache_ttl)
             {
                 return;
@@ -1534,6 +1541,7 @@ impl McpGateway {
             let mut catalog = session.catalog.write().await;
             if catalog
                 .resource_templates_last_attempted_at
+                .get(server_id)
                 .is_some_and(|attempted| attempted.elapsed() < self.discovery.cache_ttl)
             {
                 return;
@@ -1542,10 +1550,17 @@ impl McpGateway {
             // calls do not stampede an upstream that does not implement
             // resources/templates/list. Explicit template-list requests still
             // use ensure_resource_templates and surface refresh failures.
-            catalog.resource_templates_last_attempted_at = Some(Instant::now());
+            catalog
+                .resource_templates_last_attempted_at
+                .insert(server_id.to_string(), Instant::now());
         }
         if let Err(error) = self
-            .refresh_resource_templates(ctx, downstream_session_id, &session.catalog)
+            .refresh_resource_templates_for_server(
+                ctx,
+                downstream_session_id,
+                server_id,
+                &session.catalog,
+            )
             .await
         {
             warn!(
@@ -1710,7 +1725,68 @@ impl McpGateway {
             catalog.version = catalog.version.saturating_add(1);
         }
         catalog.resource_templates_refreshed_at = Some(Instant::now());
-        catalog.resource_templates_last_attempted_at = catalog.resource_templates_refreshed_at;
+        let attempted_at = catalog.resource_templates_refreshed_at;
+        for server in self
+            .servers
+            .values()
+            .filter(|server| server.enabled && server.expose_resources)
+        {
+            if let Some(attempted_at) = attempted_at {
+                catalog
+                    .resource_templates_last_attempted_at
+                    .insert(server.server_id.clone(), attempted_at);
+            }
+        }
+        catalog.last_refreshed_wall = discovered_at;
+        Ok(())
+    }
+
+    async fn refresh_resource_templates_for_server(
+        &self,
+        ctx: &RequestContext,
+        downstream_session_id: &str,
+        server_id: &str,
+        catalog_lock: &Arc<RwLock<McpCatalog>>,
+    ) -> Result<(), String> {
+        let server = self
+            .servers
+            .get(server_id)
+            .filter(|server| server.enabled && server.expose_resources)
+            .ok_or_else(|| format!("unknown or disabled MCP resource server {server_id:?}"))?;
+        let items = self
+            .request_upstream_list_pages(
+                ctx,
+                downstream_session_id,
+                server,
+                "resources/templates/list",
+                "resourceTemplates",
+            )
+            .await?;
+        let discovered_at = Utc::now();
+        let mut resource_templates = HashMap::new();
+        for item in items {
+            if let Some(entry) =
+                self.resource_template_entry_from_value(server, item, discovered_at)
+            {
+                resource_templates.insert(entry.public_uri_template.clone(), entry);
+            }
+        }
+
+        let mut catalog = catalog_lock.write().await;
+        let old_keys = catalog
+            .resource_templates
+            .iter()
+            .filter(|(_, entry)| entry.server_id == server_id)
+            .map(|(public_uri, _)| public_uri)
+            .collect::<HashSet<_>>();
+        let changed = old_keys != resource_templates.keys().collect::<HashSet<_>>();
+        catalog
+            .resource_templates
+            .retain(|_, entry| entry.server_id != server_id);
+        catalog.resource_templates.extend(resource_templates);
+        if changed || catalog.version == 0 {
+            catalog.version = catalog.version.saturating_add(1);
+        }
         catalog.last_refreshed_wall = discovered_at;
         Ok(())
     }
@@ -2274,7 +2350,7 @@ impl McpGateway {
                 None,
             );
         };
-        self.prepare_response_resource_bindings(ctx, downstream_session_id)
+        self.prepare_response_resource_bindings(ctx, downstream_session_id, &server.server_id)
             .await;
         let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
             return session_not_found_response();
@@ -2348,7 +2424,7 @@ impl McpGateway {
                 None,
             );
         };
-        self.prepare_response_resource_bindings(ctx, downstream_session_id)
+        self.prepare_response_resource_bindings(ctx, downstream_session_id, &server.server_id)
             .await;
         let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
             return session_not_found_response();
@@ -2593,10 +2669,15 @@ impl Plugin for McpGateway {
         ctx: &RequestContext,
         content_type: Option<&str>,
         _response_status: u16,
-        _response_headers: &HashMap<String, String>,
+        response_headers: &HashMap<String, String>,
     ) -> bool {
         if content_type
             .is_some_and(|value| super::utils::body_transform::is_event_stream_content_type(value))
+        {
+            return false;
+        }
+        if header_value(response_headers, "content-encoding")
+            .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
         {
             return false;
         }
@@ -3119,6 +3200,14 @@ fn mcp_content_type_is_json(value: &str) -> bool {
             .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("json"))
 }
 
+pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String>) {
+    metadata.remove(METADATA_RESPONSE_REWRITE_KEY);
+    metadata.remove(METADATA_RESPONSE_REWRITE_METHOD_KEY);
+    metadata.remove(METADATA_RESPONSE_REWRITE_SERVER_KEY);
+    metadata.remove(METADATA_RESPONSE_REWRITE_SESSION_KEY);
+    metadata.remove(METADATA_RESPONSE_REWRITE_CATALOG_VERSION_KEY);
+}
+
 impl ResponseRewriteOutcome {
     fn merge(self, other: Self) -> Self {
         match (self, other) {
@@ -3280,16 +3369,60 @@ fn reverse_resource_uri(
         return ReverseResourceUri::Unchanged;
     }
 
-    let template_matches = catalog.resource_templates.values().any(|entry| {
-        entry.enabled
-            && entry.server_id == server_id
-            && entry.uri_template_regex.is_match(upstream_uri)
-    });
-    if template_matches {
-        ReverseResourceUri::Mapped(public_resource_uri(server_id, upstream_uri))
-    } else {
-        ReverseResourceUri::Unchanged
+    let mut matched_template_uri: Option<String> = None;
+    for entry in catalog
+        .resource_templates
+        .values()
+        .filter(|entry| entry.enabled && entry.server_id == server_id)
+    {
+        let Some(public_uri) = expand_public_resource_template(entry, upstream_uri) else {
+            continue;
+        };
+        if matched_template_uri
+            .as_ref()
+            .is_some_and(|matched| matched != &public_uri)
+        {
+            return ReverseResourceUri::Ambiguous;
+        }
+        matched_template_uri = Some(public_uri);
     }
+    match matched_template_uri {
+        Some(public_uri) => ReverseResourceUri::Mapped(public_uri),
+        None => ReverseResourceUri::Unchanged,
+    }
+}
+
+fn expand_public_resource_template(
+    entry: &ResourceTemplateCatalogEntry,
+    upstream_uri: &str,
+) -> Option<String> {
+    let captures = entry.uri_template_regex.captures(upstream_uri)?;
+    let mut public_uri = String::with_capacity(entry.public_uri_template.len());
+    let mut index = 0;
+    let mut capture_index = 1;
+    while let Some(open_offset) = entry.public_uri_template[index..].find('{') {
+        let open = index + open_offset;
+        let close_offset = entry.public_uri_template[open + 1..].find('}')?;
+        let close = open + 1 + close_offset;
+        public_uri.push_str(&entry.public_uri_template[index..open]);
+        let expansion = captures.get(capture_index)?.as_str();
+        let expression = &entry.public_uri_template[open + 1..close];
+        if expression
+            .as_bytes()
+            .first()
+            .is_some_and(|operator| b"+#./;?&".contains(operator))
+        {
+            public_uri.push_str(expansion);
+        } else {
+            public_uri.push_str(
+                &utf8_percent_encode(expansion, MCP_TEMPLATE_RESOURCE_URI_ENCODE_SET).to_string(),
+            );
+        }
+        capture_index += 1;
+        index = close + 1;
+    }
+    public_uri.push_str(&entry.public_uri_template[index..]);
+    (capture_index == captures.len()).then_some(public_uri)
 }
 
 fn parse_mcp_envelope(body: &[u8]) -> Result<McpEnvelope, String> {
@@ -3825,7 +3958,7 @@ fn uri_template_regex(uri_template: &str) -> Result<Regex, String> {
         if expression.trim().is_empty() || expression.contains('{') {
             return Err("invalid URI template expression".to_string());
         }
-        pattern.push_str(".*");
+        pattern.push_str("(.*)");
         index = close + 1;
     }
     if uri_template[index..].contains('}') {
