@@ -44,7 +44,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use ring::digest;
 use ring::signature as ring_sig;
-use roxmltree::{Document, Node, NodeId};
+use roxmltree::{Document, Node, NodeId, ParsingOptions};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -76,6 +76,13 @@ const WSU_NAMESPACE_URI: &str =
 /// unauthenticated request path. Real signatures reference a handful of
 /// elements; 64 is far above any legitimate use.
 const MAX_SIGNED_REFERENCES: usize = 64;
+
+/// Bounds for attacker-controlled XML work before signature trust exists.
+/// Legitimate SOAP and SAML signatures stay far below these ceilings.
+const MAX_XML_NODES: u32 = 65_536;
+const MAX_CANONICALIZATION_DEPTH: usize = 256;
+const MAX_INCLUSIVE_NAMESPACE_PREFIXES: usize = 64;
+const MAX_INCLUSIVE_PREFIX_LIST_BYTES: usize = 4_096;
 
 // ── Config types ────────────────────────────────────────────────────────────
 
@@ -708,8 +715,7 @@ impl SoapWsSecurity {
     // ── X.509 signature verification ────────────────────────────────────
 
     fn validate_x509_signature(&self, security_block: &str, envelope: &str) -> Result<(), String> {
-        let document = Document::parse(envelope)
-            .map_err(|e| format!("WS-Security: malformed SOAP XML: {}", e))?;
+        let document = parse_bounded_xml(envelope, "SOAP")?;
         let security_node = selected_security_node(&document, envelope, security_block)?;
         let sig_node = unique_child_element(security_node, "Signature", "WS-Security")?
             .ok_or_else(|| "WS-Security: missing Signature element".to_string())?;
@@ -1054,8 +1060,7 @@ impl SoapWsSecurity {
         envelope: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<String>, String> {
-        let document = Document::parse(envelope)
-            .map_err(|e| format!("WS-Security: malformed SAML SOAP XML: {}", e))?;
+        let document = parse_bounded_xml(envelope, "SAML SOAP")?;
         let security_node = selected_security_node(&document, envelope, security_block)?;
         let assertion_node = match descendant_element(security_node, "Assertion") {
             Some(assertion) => assertion,
@@ -1635,6 +1640,22 @@ fn node_source<'a>(xml: &'a str, node: Node<'_, '_>) -> Result<&'a str, String> 
         .ok_or_else(|| "WS-Security: XML parser returned an invalid source range".to_string())
 }
 
+fn parse_bounded_xml<'a>(xml: &'a str, context: &str) -> Result<Document<'a>, String> {
+    Document::parse_with_options(
+        xml,
+        ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: MAX_XML_NODES,
+        },
+    )
+    .map_err(|error| {
+        format!(
+            "WS-Security: malformed or overly complex {} XML: {}",
+            context, error
+        )
+    })
+}
+
 fn selected_security_node<'a, 'input>(
     document: &'a Document<'input>,
     xml: &str,
@@ -1831,8 +1852,20 @@ fn parse_inclusive_namespaces(
     let prefix_list = parameter
         .attribute("PrefixList")
         .ok_or_else(|| format!("{}: InclusiveNamespaces missing PrefixList", context))?;
+    if prefix_list.len() > MAX_INCLUSIVE_PREFIX_LIST_BYTES {
+        return Err(format!(
+            "{}: InclusiveNamespaces PrefixList exceeds {} bytes",
+            context, MAX_INCLUSIVE_PREFIX_LIST_BYTES
+        ));
+    }
     let mut prefixes = Vec::new();
     for token in prefix_list.split_whitespace() {
+        if prefixes.len() >= MAX_INCLUSIVE_NAMESPACE_PREFIXES {
+            return Err(format!(
+                "{}: InclusiveNamespaces PrefixList contains more than {} prefixes",
+                context, MAX_INCLUSIVE_NAMESPACE_PREFIXES
+            ));
+        }
         let prefix = if token == "#default" { "" } else { token };
         if token == "xmlns" || token.contains(':') || token.starts_with('#') && token != "#default"
         {
@@ -1869,6 +1902,7 @@ fn exclusive_canonicalize(
         root,
         inclusive_prefixes,
         excluded_node,
+        0,
         &mut rendered_namespaces,
         &mut output,
     )?;
@@ -1880,8 +1914,7 @@ pub(crate) fn exclusive_canonicalize_element_for_test(
     local_name: &str,
     prefix_list: &str,
 ) -> Result<String, String> {
-    let document = Document::parse(xml)
-        .map_err(|e| format!("WS-Security: malformed XML test fixture: {}", e))?;
+    let document = parse_bounded_xml(xml, "test fixture")?;
     let root = document
         .descendants()
         .find(|node| node.has_tag_name(local_name))
@@ -1905,9 +1938,16 @@ fn canonicalize_node(
     node: Node<'_, '_>,
     inclusive_prefixes: &[String],
     excluded_node: Option<NodeId>,
+    depth: usize,
     rendered_namespaces: &mut HashMap<String, String>,
     output: &mut String,
 ) -> Result<(), String> {
+    if depth > MAX_CANONICALIZATION_DEPTH {
+        return Err(format!(
+            "WS-Security: exclusive c14n depth exceeds {} elements",
+            MAX_CANONICALIZATION_DEPTH
+        ));
+    }
     if excluded_node == Some(node.id()) {
         return Ok(());
     }
@@ -1939,10 +1979,9 @@ fn canonicalize_node(
     output.push('<');
     output.push_str(qname);
 
-    let mut required_prefixes: Vec<(String, bool)> = inclusive_prefixes
+    let mut required_prefixes: Vec<(&str, bool)> = inclusive_prefixes
         .iter()
-        .cloned()
-        .map(|prefix| (prefix, false))
+        .map(|prefix| (prefix.as_str(), false))
         .collect();
     let element_prefix = qname
         .split_once(':')
@@ -1974,7 +2013,7 @@ fn canonicalize_node(
         }
         let namespace_uri = if prefix.is_empty() {
             node.lookup_namespace_uri(None).unwrap_or("")
-        } else if let Some(uri) = node.lookup_namespace_uri(Some(&prefix)) {
+        } else if let Some(uri) = node.lookup_namespace_uri(Some(prefix)) {
             uri
         } else if required {
             return Err(format!(
@@ -1986,11 +2025,11 @@ fn canonicalize_node(
         };
 
         let already_rendered = rendered_namespaces
-            .get(&prefix)
+            .get(prefix)
             .map(String::as_str)
             .unwrap_or("");
         if namespace_uri != already_rendered {
-            namespace_declarations.push((prefix, namespace_uri.to_string()));
+            namespace_declarations.push((prefix.to_string(), namespace_uri.to_string()));
         }
     }
     namespace_declarations.sort_by(|left, right| left.0.cmp(&right.0));
@@ -2025,6 +2064,7 @@ fn canonicalize_node(
             child,
             inclusive_prefixes,
             excluded_node,
+            depth + usize::from(child.is_element()),
             rendered_namespaces,
             output,
         )?;
@@ -2044,13 +2084,13 @@ fn canonicalize_node(
     Ok(())
 }
 
-fn add_required_prefix(prefixes: &mut Vec<(String, bool)>, prefix: &str, required: bool) {
+fn add_required_prefix<'a>(prefixes: &mut Vec<(&'a str, bool)>, prefix: &'a str, required: bool) {
     if let Some((_, existing_required)) =
         prefixes.iter_mut().find(|(existing, _)| existing == prefix)
     {
         *existing_required |= required;
     } else {
-        prefixes.push((prefix.to_string(), required));
+        prefixes.push((prefix, required));
     }
 }
 

@@ -462,6 +462,23 @@ fn exclusive_c14n_reemits_inherited_namespaces_and_orders_attributes() {
 }
 
 #[test]
+fn exclusive_c14n_rejects_excessive_element_depth() {
+    let mut xml = String::from("<Root>");
+    for _ in 0..257 {
+        xml.push_str("<Nested>");
+    }
+    for _ in 0..257 {
+        xml.push_str("</Nested>");
+    }
+    xml.push_str("</Root>");
+
+    let error = soap_exclusive_canonicalize_element_for_test(&xml, "Root", "")
+        .expect_err("excessive c14n depth must fail closed");
+
+    assert!(error.contains("depth exceeds"), "unexpected error: {error}");
+}
+
+#[test]
 fn test_valid_username_token_config() {
     let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
     assert_eq!(plugin.name(), "soap_ws_security");
@@ -2329,6 +2346,54 @@ mod x509_roundtrip {
         assert!(is_reject(&result));
         assert!(
             reject_body(&result).contains("unsupported Transform algorithm"),
+            "unexpected rejection: {}",
+            reject_body(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_inclusive_namespace_prefix_list_is_rejected() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+        let prefix_list = (0..65)
+            .map(|index| format!("p{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let body = build_signed_soap_envelope(&cert).replacen(
+            "PrefixList=\"soap\"",
+            &format!("PrefixList=\"{prefix_list}\""),
+            1,
+        );
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(is_reject(&result));
+        assert!(
+            reject_body(&result).contains("more than 64 prefixes"),
+            "unexpected rejection: {}",
+            reject_body(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn overly_complex_soap_dom_is_rejected_before_signature_verification() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+        let many_nodes = "<N/>".repeat(66_000);
+        let body = build_signed_soap_envelope(&cert)
+            .replace("<soap:Body>", &format!("<soap:Body>{many_nodes}"));
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(is_reject(&result));
+        assert!(
+            reject_body(&result).contains("overly complex"),
             "unexpected rejection: {}",
             reject_body(&result)
         );
