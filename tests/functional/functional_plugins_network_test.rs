@@ -478,6 +478,9 @@ async fn compression_handles_mid_stream_backend_close_without_corrupting_output(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn response_transformer_never_emits_corrupt_json_for_truncated_or_trickled_body() {
+    const TRUNCATED_JSON_PREFIX: &[u8] = br#"{"status":"pending"#;
+    const TRICKLED_JSON: &[u8] = br#"{"status":"ready"}"#;
+
     for behavior in ["close-mid-body", "trickle-body"] {
         let reservation = reserve_port().await.expect("reserve port");
         let backend_port = reservation.port;
@@ -490,7 +493,7 @@ async fn response_transformer_never_emits_corrupt_json_for_truncated_or_trickled
                         ("Content-Length".into(), "64".into()),
                         ("Content-Type".into(), "application/json".into()),
                     ],
-                    body_prefix: br#"{"status":"pending"#.to_vec(),
+                    body_prefix: TRUNCATED_JSON_PREFIX.to_vec(),
                     reset: true,
                 })
                 .spawn()
@@ -500,16 +503,13 @@ async fn response_transformer_never_emits_corrupt_json_for_truncated_or_trickled
                     status: 200,
                     reason: "OK".into(),
                     headers: vec![
-                        ("Content-Length".into(), "4".into()),
+                        ("Content-Length".into(), TRICKLED_JSON.len().to_string()),
                         ("Content-Type".into(), "application/json".into()),
                         ("Connection".into(), "close".into()),
                     ],
-                    // Four delayed digits form one valid JSON number. This
-                    // exercises repeated DATA arrival without requiring the
-                    // fixture to synthesize different chunks.
-                    chunk: b"1".to_vec(),
+                    body: TRICKLED_JSON.to_vec(),
+                    chunk_size: 5,
                     pause: Duration::from_millis(75),
-                    count: 4,
                 })
                 .spawn()
                 .expect("spawn trickle backend"),
@@ -556,6 +556,11 @@ async fn response_transformer_never_emits_corrupt_json_for_truncated_or_trickled
             Err(error) => panic!("{behavior} unexpectedly failed before response: {error}"),
             Ok(response) => {
                 let status = response.status();
+                let response_is_json = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.starts_with("application/json"));
                 let body = tokio::time::timeout(Duration::from_secs(4), response.bytes()).await;
                 match body {
                     Err(_) => panic!("{behavior} body read exceeded the outer timeout"),
@@ -570,6 +575,21 @@ async fn response_transformer_never_emits_corrupt_json_for_truncated_or_trickled
                             !bytes.is_empty(),
                             "clean 5xx must carry an explicit error body"
                         );
+                        assert!(
+                            !bytes
+                                .windows(TRUNCATED_JSON_PREFIX.len())
+                                .any(|window| window == TRUNCATED_JSON_PREFIX),
+                            "clean 5xx must not forward the backend's truncated JSON prefix; bytes={bytes:?}"
+                        );
+                        if response_is_json {
+                            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_else(
+                                |error| {
+                                    panic!(
+                                        "clean JSON 5xx carried invalid JSON: {error}; bytes={bytes:?}"
+                                    )
+                                },
+                            );
+                        }
                     }
                     Ok(Ok(bytes)) => {
                         assert_eq!(status.as_u16(), 200, "behavior={behavior}");
@@ -582,9 +602,14 @@ async fn response_transformer_never_emits_corrupt_json_for_truncated_or_trickled
                             });
                         if behavior == "trickle-body" {
                             assert_eq!(
-                                parsed,
-                                json!(1111),
-                                "trickled scalar JSON must remain byte-semantically intact"
+                                parsed["status"],
+                                json!("ready"),
+                                "response_transformer must preserve the trickled object"
+                            );
+                            assert_eq!(
+                                parsed["gateway"],
+                                json!("ferrum"),
+                                "response_transformer must mutate the trickled object"
                             );
                         }
                     }

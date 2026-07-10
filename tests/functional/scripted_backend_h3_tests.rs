@@ -2083,16 +2083,16 @@ async fn h3_mid_body_reset_and_goaway_surface_protocol_error_family() {
 
         let logs = harness
             .wait_for_log_contains(
-                |logs| logs.contains("body_error_class") && logs.contains("protocol_error"),
+                |logs| logs.contains("\"body_error_class\":\"protocol_error\""),
                 Duration::from_secs(5),
             )
             .await;
         assert!(
-            logs.contains("body_error_class") && logs.contains("protocol_error"),
+            logs.contains("\"body_error_class\":\"protocol_error\""),
             "{name} must classify as the H3 protocol-error family; logs:\n{logs}"
         );
         assert!(
-            !logs.contains("body_error_class\\\":\\\"connection_reset"),
+            !logs.contains("\"body_error_class\":\"connection_reset\""),
             "{name} was falsely classified as a connection reset instead of a stream protocol error; logs:\n{logs}"
         );
 

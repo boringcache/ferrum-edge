@@ -548,7 +548,6 @@ async fn scripted_backend_stall_sheds_h3_frontend_request() {
         let url = slow_url.clone();
         inflight.push(tokio::spawn(async move {
             let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(8))
                 .pool_max_idle_per_host(0)
                 .http1_only()
                 .build()
