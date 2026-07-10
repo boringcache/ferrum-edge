@@ -164,6 +164,21 @@ impl Plugin for PriorityOverridePlugin {
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.inner.should_buffer_response_body(ctx)
     }
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        self.inner.may_release_response_body_under_retries(ctx)
+    }
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        self.inner.should_release_response_body_under_retries(
+            ctx,
+            response_status,
+            response_headers,
+        )
+    }
     fn should_release_response_body_before_content_type_rewrite(
         &self,
         ctx: &RequestContext,

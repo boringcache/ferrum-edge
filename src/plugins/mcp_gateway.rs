@@ -2688,6 +2688,22 @@ impl Plugin for McpGateway {
                 .is_some_and(|value| value == "true")
     }
 
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        self.should_buffer_response_body(ctx)
+    }
+
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && header_value(response_headers, "content-type").is_some_and(|value| {
+                super::utils::body_transform::is_event_stream_content_type(value)
+            })
+    }
+
     fn should_buffer_response_body_for_content_type(
         &self,
         ctx: &RequestContext,
@@ -3422,7 +3438,18 @@ fn expand_public_resource_template(
             .first()
             .is_some_and(|operator| b"+#./;?&".contains(operator))
         {
-            public_uri.push_str(expansion);
+            // The public URI suffix is percent-decoded once by
+            // `public_resource_uri_parts`. Escape an upstream percent byte so
+            // existing percent escapes survive that decode unchanged while
+            // reserved characters allowed by the URI-template operator remain
+            // literal.
+            let mut remainder = expansion;
+            while let Some(percent) = remainder.find('%') {
+                public_uri.push_str(&remainder[..percent]);
+                public_uri.push_str("%25");
+                remainder = &remainder[percent + 1..];
+            }
+            public_uri.push_str(remainder);
         } else {
             public_uri.push_str(
                 &utf8_percent_encode(expansion, MCP_TEMPLATE_RESOURCE_URI_ENCODE_SET).to_string(),

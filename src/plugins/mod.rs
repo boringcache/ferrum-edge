@@ -2759,6 +2759,36 @@ pub trait Plugin: Send + Sync {
         self.requires_response_body_buffering()
     }
 
+    /// Returns `true` when this active buffering plugin may release an
+    /// inherently streaming response after headers arrive even though retries
+    /// are configured.
+    ///
+    /// The proxy uses this pre-header signal to select a header-first streaming
+    /// transport for a retry attempt. After headers arrive, this plugin must
+    /// confirm the concrete response and every other active buffering plugin
+    /// must report that it does not need that content type. Keep the default
+    /// conservative: most response transforms and inspectors require a
+    /// replayable body while retries are in flight.
+    fn may_release_response_body_under_retries(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
+    /// Header-aware confirmation for
+    /// [`may_release_response_body_under_retries`].
+    ///
+    /// Called only after backend response headers arrive. Returning `true`
+    /// allows this response to stream and makes mid-body retry impossible; use
+    /// it only for inherently streaming representations whose retry decision is
+    /// complete from status and headers.
+    fn should_release_response_body_under_retries(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        false
+    }
+
     /// Returns `true` when a plugin that otherwise buffers this response can
     /// release it before the proxy applies the conservative content-type relabel
     /// guard.
