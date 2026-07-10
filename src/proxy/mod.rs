@@ -12360,26 +12360,46 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
     ctx: &mut RequestContext,
     status_code: u16,
     response_headers: &mut HashMap<String, String>,
-) {
+) -> Option<(u16, Vec<u8>)> {
     let previous_marker = ctx.metadata.insert(
         REJECTION_RESPONSE_METADATA_KEY.to_string(),
         "true".to_string(),
     );
 
+    let mut effective_status = status_code;
+    let mut replacement = None;
     for plugin in plugins.iter().filter(|p| p.applies_after_proxy_on_reject()) {
-        match plugin.after_proxy(ctx, status_code, response_headers).await {
-            PluginResult::Reject {
-                status_code: reject_status,
-                ..
-            }
-            | PluginResult::RejectBinary {
-                status_code: reject_status,
-                ..
-            } => {
-                // The gateway is already committed to emitting this rejection
-                // response (the status/body are fixed by the time after-proxy-on-
-                // reject hooks run), so a hook cannot replace it here — it is
-                // ignored and only logged. Known consequence: `ai_rate_limiter`'s
+        match plugin
+            .after_proxy(ctx, effective_status, response_headers)
+            .await
+        {
+            reject @ PluginResult::Reject { .. }
+            | reject @ PluginResult::RejectBinary { .. } => {
+                let reject_status = match &reject {
+                    PluginResult::Reject { status_code, .. }
+                    | PluginResult::RejectBinary { status_code, .. } => *status_code,
+                    PluginResult::Continue => unreachable!(),
+                };
+                if plugin.may_replace_rejection_response() {
+                    let parts = plugin_result_into_reject_parts(reject)
+                        .expect("reject result should convert to rejection parts");
+                    effective_status = parts.status_code;
+                    response_headers.clear();
+                    response_headers
+                        .insert("content-type".to_string(), "application/json".to_string());
+                    response_headers.extend(parts.headers);
+                    replacement = Some((effective_status, parts.body));
+                    warn!(
+                        rejecting_plugin = plugin.name(),
+                        replacement_status = effective_status,
+                        replaced_status = status_code,
+                        "after_proxy plugin replaced an uncommitted rejection response"
+                    );
+                    continue;
+                }
+                // This hook did not opt in to replacing an in-flight rejection,
+                // so preserve the historical behavior: ignore its Reject and
+                // only log it. Known consequence: `ai_rate_limiter`'s
                 // `on_unmetered_response: "reject"` is best-effort for synthetic
                 // `before_proxy` responses such as `ai_federation`'s — a federated
                 // 2xx missing usage metadata is still returned to the client. See
@@ -12389,7 +12409,7 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
                     attempted_reject_status = reject_status,
                     committed_status = status_code,
                     "after_proxy plugin returned Reject during rejection handling; \
-                     ignoring (response already committed)"
+                     ignoring (plugin did not opt in to replacement)"
                 );
             }
             PluginResult::Continue => {}
@@ -12402,6 +12422,7 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
     } else {
         ctx.metadata.remove(REJECTION_RESPONSE_METADATA_KEY);
     }
+    replacement
 }
 
 /// Rebuild `response_status` / `response_headers` for a plugin rejection
@@ -12442,7 +12463,12 @@ pub(crate) async fn apply_plugin_rejection_response(
     reject: RejectedResponseParts,
 ) -> Vec<u8> {
     let body = rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
-    apply_after_proxy_hooks_to_rejection(plugins, ctx, *response_status, response_headers).await;
+    if let Some((replacement_status, replacement_body)) =
+        apply_after_proxy_hooks_to_rejection(plugins, ctx, *response_status, response_headers).await
+    {
+        *response_status = replacement_status;
+        return replacement_body;
+    }
     body
 }
 
@@ -12674,7 +12700,12 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // one-shot response state (rotated session cookie, route overrides) is
     // emitted onto whatever the client actually receives. Runs LAST by design —
     // see the divergence note above.
-    apply_after_proxy_hooks_to_rejection(plugins, ctx, *status, headers).await;
+    if let Some((replacement_status, replacement_body)) =
+        apply_after_proxy_hooks_to_rejection(plugins, ctx, *status, headers).await
+    {
+        *status = replacement_status;
+        *body = replacement_body;
+    }
 }
 
 pub(crate) struct AfterProxyReject {
@@ -12762,7 +12793,10 @@ pub(crate) async fn run_after_proxy_hooks(
                 ctx.metadata
                     .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
                 ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
-                apply_after_proxy_hooks_to_rejection(plugins, ctx, status_code, &mut headers).await;
+                let replacement =
+                    apply_after_proxy_hooks_to_rejection(plugins, ctx, status_code, &mut headers)
+                        .await;
+                let (status_code, body) = replacement.unwrap_or((status_code, body));
                 return Some(AfterProxyReject {
                     status_code,
                     body,
@@ -26676,6 +26710,8 @@ mod tests {
 
     struct RejectHeaderPlugin;
 
+    struct ReplaceRejectPlugin;
+
     struct CustomNoTransformHeaderPlugin;
 
     struct CustomStrongEtagHeaderPlugin;
@@ -26809,6 +26845,34 @@ mod tests {
                 response_headers.insert("x-after-reject".to_string(), "applied".to_string());
             }
             PluginResult::Continue
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for ReplaceRejectPlugin {
+        fn name(&self) -> &str {
+            "replace_reject_plugin"
+        }
+
+        fn applies_after_proxy_on_reject(&self) -> bool {
+            true
+        }
+
+        fn may_replace_rejection_response(&self) -> bool {
+            true
+        }
+
+        async fn after_proxy(
+            &self,
+            _ctx: &mut RequestContext,
+            _response_status: u16,
+            _response_headers: &mut HashMap<String, String>,
+        ) -> PluginResult {
+            PluginResult::Reject {
+                status_code: 503,
+                body: "late fail-closed rejection".to_string(),
+                headers: HashMap::from([("x-replaced".to_string(), "true".to_string())]),
+            }
         }
     }
 
@@ -27092,6 +27156,36 @@ mod tests {
             Some("applied")
         );
         assert_eq!(body, br#"{"error":"blocked"}"#);
+        assert!(!ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY));
+    }
+
+    #[tokio::test]
+    async fn opted_in_after_proxy_hook_replaces_uncommitted_rejection() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ReplaceRejectPlugin)];
+        let mut ctx = RequestContext::new("203.0.113.10".into(), "GET".into(), "/body".into());
+        let mut response_status = 200;
+        let mut response_headers = HashMap::new();
+        let reject = RejectedResponseParts {
+            status_code: 200,
+            body: b"synthetic success".to_vec(),
+            headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+        };
+
+        let body = apply_plugin_rejection_response(
+            &plugins,
+            &mut ctx,
+            &mut response_status,
+            &mut response_headers,
+            reject,
+        )
+        .await;
+
+        assert_eq!(response_status, 503);
+        assert_eq!(
+            response_headers.get("x-replaced").map(String::as_str),
+            Some("true")
+        );
+        assert!(String::from_utf8_lossy(&body).contains("late fail-closed rejection"));
         assert!(!ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY));
     }
 

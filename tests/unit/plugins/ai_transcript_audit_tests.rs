@@ -2981,7 +2981,8 @@ async fn stream_capture_preflights_sink_health_before_dispatch_or_short_circuit(
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
-        let mut response_headers = headers.clone();
+        let mut response_headers =
+            HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
         let precommit = plugin
             .after_proxy(&mut precommit_ctx, 200, &mut response_headers)
             .await;
@@ -2999,6 +3000,21 @@ async fn stream_capture_preflights_sink_health_before_dispatch_or_short_circuit(
                     .map(String::as_str),
                 Some("rejected")
             );
+
+            // The marker denotes a potential provider-selected stream. A
+            // normal buffered JSON response still reaches the final-body hook,
+            // which owns its fail-closed enqueue decision.
+            let mut json_ctx = make_ctx();
+            plugin
+                .on_final_request_body_with_context(&mut json_ctx, &headers, ai_request_body())
+                .await;
+            let mut json_response_headers = headers.clone();
+            assert!(matches!(
+                plugin
+                    .after_proxy(&mut json_ctx, 200, &mut json_response_headers)
+                    .await,
+                PluginResult::Continue
+            ));
 
             // `before_proxy` enforces the same check before a later
             // cache/federation plugin can short-circuit the request.
@@ -3098,6 +3114,29 @@ async fn unsampled_stream_keeps_fail_open_sampling_semantics_when_sink_unhealthy
                 ..
             }
         ) {
+            // A sampling miss becomes selected once a provider returns an SSE
+            // error and always_capture_on_error applies. The final pre-commit
+            // check must therefore fail closed even though request preflight
+            // correctly allowed it before the response status was known.
+            let mut error_stream_ctx = make_ctx();
+            plugin
+                .on_final_request_body_with_context(
+                    &mut error_stream_ctx,
+                    &headers,
+                    ai_request_body(),
+                )
+                .await;
+            let mut sse_headers =
+                HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+            assert!(matches!(
+                plugin
+                    .after_proxy(&mut error_stream_ctx, 500, &mut sse_headers)
+                    .await,
+                PluginResult::Reject {
+                    status_code: 503,
+                    ..
+                }
+            ));
             saw_guardrail_reject = true;
             break;
         }

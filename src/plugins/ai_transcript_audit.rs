@@ -628,19 +628,43 @@ impl AiTranscriptAudit {
         }
     }
 
-    fn stream_fail_closed_rejection(&self, ctx: &mut RequestContext) -> Option<PluginResult> {
-        // Preflight only records already known to emit on a successful stream:
-        // sampling winners plus known request-side guardrail overrides. `On`
-        // tees every stream but still honors `sampling.rate` at emission time,
-        // so `stream_tee_wanted` would be too broad here. Error/response-side
-        // overrides are not knowable before backend dispatch.
+    fn stream_fail_closed_rejection(
+        &self,
+        ctx: &mut RequestContext,
+        response: Option<(u16, &HashMap<String, String>)>,
+    ) -> Option<PluginResult> {
+        // Request-side preflight only covers records already known to emit on a
+        // successful stream: sampling winners plus known request-side guardrail
+        // overrides. Once a response is available, error selection and the
+        // actual streaming shape can be included too. `On` tees every stream
+        // but still honors `sampling.rate` at emission time, so
+        // `stream_tee_wanted` would be too broad here.
         if self.capture.streaming == StreamingCapture::Off
             || !flag(&ctx.metadata, MD_CANDIDATE)
             || !flag(&ctx.metadata, &self.stream_marker_key())
-            || !(self.staged_sample_hit(&ctx.metadata)
-                || (self.sampling.always_on_guardrail && guardrail_fired(&ctx.metadata)))
         {
             return None;
+        }
+        let sample_hit = self.staged_sample_hit(&ctx.metadata);
+        let guardrail_selected =
+            self.sampling.always_on_guardrail && guardrail_fired(&ctx.metadata);
+        let error_selected = response.is_some_and(|(status, _)| {
+            status >= 400 && self.sampling.always_on_error
+        });
+        if !(sample_hit || guardrail_selected || error_selected) {
+            return None;
+        }
+        // Once response headers are available, only enforce the streaming
+        // fail-closed policy for a response that will actually bypass the
+        // buffered final-body hook. A staged candidate marker alone denotes
+        // potential SSE and must not reject an ordinary buffered JSON response.
+        if let Some((_status, headers)) = response {
+            let is_sse = headers
+                .get("content-type")
+                .is_some_and(|content_type| is_event_stream(content_type));
+            if !flag(&ctx.metadata, MD_STREAM_REQUEST) && !is_sse {
+                return None;
+            }
         }
         let sink_unhealthy_reject = self.on_sink_error == SinkErrorPolicy::Reject
             && !self.sink_healthy.load(Ordering::Relaxed);
@@ -1182,7 +1206,7 @@ impl Plugin for AiTranscriptAudit {
         };
         self.stage_candidate(ctx, body.as_bytes());
         ctx.metadata.insert("request_body".to_string(), body);
-        if let Some(result) = self.stream_fail_closed_rejection(ctx) {
+        if let Some(result) = self.stream_fail_closed_rejection(ctx, None) {
             return result;
         }
         PluginResult::Continue
@@ -1214,7 +1238,7 @@ impl Plugin for AiTranscriptAudit {
         if let Some("true") = ctx.metadata.get(MD_CANDIDATE).map(String::as_str) {
             self.refresh_staged_request(ctx, body);
             return self
-                .stream_fail_closed_rejection(ctx)
+                .stream_fail_closed_rejection(ctx, None)
                 .unwrap_or(PluginResult::Continue);
         }
         // Fallback for paths where the body was not available before
@@ -1228,7 +1252,7 @@ impl Plugin for AiTranscriptAudit {
             return PluginResult::Continue;
         }
         self.stage_candidate(ctx, body);
-        if let Some(result) = self.stream_fail_closed_rejection(ctx) {
+        if let Some(result) = self.stream_fail_closed_rejection(ctx, None) {
             return result;
         }
         PluginResult::Continue
@@ -1237,6 +1261,10 @@ impl Plugin for AiTranscriptAudit {
     // ---- reject-path request refresh ----
 
     fn applies_after_proxy_on_reject(&self) -> bool {
+        self.active
+    }
+
+    fn may_replace_rejection_response(&self) -> bool {
         self.active
     }
 
@@ -1253,8 +1281,8 @@ impl Plugin for AiTranscriptAudit {
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
-        _response_headers: &mut HashMap<String, String>,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if !self.active || !flag(&ctx.metadata, MD_CANDIDATE) {
             return PluginResult::Continue;
@@ -1269,7 +1297,7 @@ impl Plugin for AiTranscriptAudit {
         // downstream before_proxy short-circuits. Recheck so a sink failure that
         // began during backend work, or a guardrail override published after our
         // staging hook, cannot commit a selected stream unaudited.
-        self.stream_fail_closed_rejection(ctx)
+        self.stream_fail_closed_rejection(ctx, Some((response_status, response_headers)))
             .unwrap_or(PluginResult::Continue)
     }
 
