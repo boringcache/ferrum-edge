@@ -2532,6 +2532,8 @@ async fn handle_h3_request(
                 plugins: &plugins,
                 backend_admission_plugins: backend_admission_plugins.as_ref(),
                 requires_response_body_buffering: maybe_requires_response_body_buffering,
+                has_response_committed_hook: capabilities
+                    .has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK),
                 sticky_cookie_needed,
             })
             .await?
@@ -4490,6 +4492,21 @@ async fn handle_h3_request(
                 .await;
                 // Backend trailers no longer describe this (rejected) response.
                 response_trailers = None;
+            }
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        }
+
+        if capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
+            let phase_start = std::time::Instant::now();
+            for plugin in plugins.iter() {
+                plugin
+                    .on_response_committed(
+                        &mut ctx,
+                        response_status,
+                        &response_headers,
+                        &response_body,
+                    )
+                    .await;
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }

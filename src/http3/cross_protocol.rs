@@ -189,6 +189,7 @@ where
     pub plugins: &'a [Arc<dyn Plugin>],
     pub backend_admission_plugins: &'a [Arc<dyn Plugin>],
     pub requires_response_body_buffering: bool,
+    pub has_response_committed_hook: bool,
     pub sticky_cookie_needed: bool,
 }
 
@@ -481,9 +482,10 @@ fn strip_query_from_backend_url(url: &str) -> String {
 /// backend response headers (modify / reject), `inject_sticky_cookie`
 /// (sticky LB cookie), and buffered-response hooks
 /// (`on_response_body` / `transform_response_body` /
-/// `on_final_response_body`) on plain and gRPC responses when buffering is
-/// active. Without these, H3 clients on non-H3 backends would silently skip
-/// body validators, response transformers, sticky sessions, etc.
+/// `on_final_response_body` / `on_response_committed`) on plain and gRPC
+/// responses when buffering is active. Without these, H3 clients on non-H3
+/// backends would silently skip body validators, response transformers,
+/// exporters, sticky sessions, etc.
 pub(crate) async fn run<S>(
     request: CrossProtocolRequest<'_, S>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
@@ -513,6 +515,7 @@ where
         plugins,
         backend_admission_plugins,
         requires_response_body_buffering,
+        has_response_committed_hook,
         sticky_cookie_needed,
     } = request;
     let backend_start = Instant::now();
@@ -2215,6 +2218,19 @@ where
                     }
                 }
             }
+
+            if has_response_committed_hook {
+                for plugin in plugins {
+                    plugin
+                        .on_response_committed(
+                            ctx,
+                            response_status,
+                            &response_headers,
+                            &response_body,
+                        )
+                        .await;
+                }
+            }
         }
 
         if let Err(error) = send_response_headers(stream, response_status, &response_headers).await
@@ -3527,6 +3543,19 @@ where
                         .await;
                         break;
                     }
+                }
+            }
+
+            if has_response_committed_hook {
+                for plugin in plugins.iter() {
+                    plugin
+                        .on_response_committed(
+                            ctx,
+                            response_status,
+                            &plugin_response_headers,
+                            &response_body,
+                        )
+                        .await;
                 }
             }
 

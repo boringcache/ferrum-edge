@@ -12581,10 +12581,9 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // synthetic path's deliberately-late response-header hooks. This path
     // already performs plugin capability scans to decide whether body hooks
     // apply, so the additional scan remains confined to synthetic short-circuits.
-    if applied_synthetic_body_hooks
-        && plugins
-            .iter()
-            .any(|plugin| plugin.requires_response_committed_hook())
+    if plugins
+        .iter()
+        .any(|plugin| plugin.requires_response_committed_hook())
     {
         for plugin in plugins.iter() {
             plugin

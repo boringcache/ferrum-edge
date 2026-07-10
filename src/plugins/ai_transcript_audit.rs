@@ -44,8 +44,8 @@ use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
 use super::utils::{
-    BatchConfigDefaults, BatchingLogger, LoggerHooks, PluginHttpClient, build_batch_config,
-    handle_http_batch_response, parse_http_endpoint, validate_batch_config,
+    BatchConfigDefaults, BatchingLogger, BatchingLoggerPermit, LoggerHooks, PluginHttpClient,
+    build_batch_config, handle_http_batch_response, parse_http_endpoint, validate_batch_config,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction,
@@ -176,6 +176,7 @@ struct AuditStaging {
     request_hash: Option<String>,
     request_model: Option<String>,
     tool_names: Vec<String>,
+    commit_permit: Option<BatchingLoggerPermit<AuditRecord>>,
 }
 
 /// Response bytes captured by the streaming inspector, handed to
@@ -615,9 +616,13 @@ impl AiTranscriptAudit {
         }
     }
 
-    fn enqueue(&self, record: AuditRecord) -> SinkOutcome {
+    fn enqueue(&self, record: AuditRecord, staging: Option<&mut AuditStaging>) -> SinkOutcome {
         if !self.rate_limiter.try_acquire() {
             return SinkOutcome::Dropped;
+        }
+        if let Some(permit) = staging.and_then(|staging| staging.commit_permit.take()) {
+            permit.send(record);
+            return SinkOutcome::Queued;
         }
         if self.logger.try_send(record) {
             SinkOutcome::Queued
@@ -626,6 +631,45 @@ impl AiTranscriptAudit {
         } else {
             SinkOutcome::Dropped
         }
+    }
+
+    fn commit_may_emit(&self, sample_hit: bool) -> bool {
+        sample_hit || self.sampling.always_on_error || self.sampling.always_on_guardrail
+    }
+
+    /// Reserve fail-closed sink capacity before the response becomes
+    /// immutable. The permit is stored with the bounded request staging and is
+    /// consumed only after validators determine the final status/body.
+    fn ensure_commit_admission(&self, ctx: &mut RequestContext) -> PluginResult {
+        if !self.capture.response {
+            return PluginResult::Continue;
+        }
+        let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
+            return PluginResult::Continue;
+        };
+        let Some(mut staging) = self.staging.get_mut(&record_id) else {
+            return PluginResult::Continue;
+        };
+        if !self.commit_may_emit(staging.sample_hit) {
+            return PluginResult::Continue;
+        }
+
+        if self.on_buffer_full == BufferFullPolicy::Reject && staging.commit_permit.is_none() {
+            let Some(permit) = self.logger.try_reserve() else {
+                ctx.metadata
+                    .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
+                return reject_audit_unavailable();
+            };
+            staging.commit_permit = Some(permit);
+        }
+        if self.on_sink_error == SinkErrorPolicy::Reject
+            && !self.sink_healthy.load(Ordering::Relaxed)
+        {
+            ctx.metadata
+                .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
+            return reject_audit_unavailable();
+        }
+        PluginResult::Continue
     }
 
     fn sweep_staging(&self) {
@@ -741,6 +785,7 @@ impl AiTranscriptAudit {
                 request_hash: Some(request_hash),
                 request_model,
                 tool_names,
+                commit_permit: None,
             },
         );
     }
@@ -1166,7 +1211,11 @@ impl Plugin for AiTranscriptAudit {
         };
         self.stage_candidate(ctx, body.as_bytes());
         ctx.metadata.insert("request_body".to_string(), body);
-        PluginResult::Continue
+        if flag(&ctx.metadata, MD_STREAM_REQUEST) {
+            PluginResult::Continue
+        } else {
+            self.ensure_commit_admission(ctx)
+        }
     }
 
     /// The proxy only routes the context-aware final-body hook to plugins that
@@ -1232,17 +1281,20 @@ impl Plugin for AiTranscriptAudit {
         _response_status: u16,
         _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.active
-            || flag(&ctx.metadata, MD_FINAL_REQ_SEEN)
-            || !flag(&ctx.metadata, MD_CANDIDATE)
-        {
+        if !self.active || !flag(&ctx.metadata, MD_CANDIDATE) {
             return PluginResult::Continue;
         }
-        if let Some(body) = ctx.metadata.remove("request_body") {
+        if !flag(&ctx.metadata, MD_FINAL_REQ_SEEN)
+            && let Some(body) = ctx.metadata.remove("request_body")
+        {
             self.refresh_staged_request(ctx, body.as_bytes());
             ctx.metadata.insert("request_body".to_string(), body);
         }
-        PluginResult::Continue
+        if flag(&ctx.metadata, MD_STREAM_REQUEST) {
+            PluginResult::Continue
+        } else {
+            self.ensure_commit_admission(ctx)
+        }
     }
 
     // ---- buffered response capture ----
@@ -1351,14 +1403,11 @@ impl Plugin for AiTranscriptAudit {
         // committed. Record construction and enqueue happen later with the
         // final status/body. The committed 503 record remains a recovery probe:
         // a successful flush flips sink health back to true.
-        let sink_unhealthy_reject = self.on_sink_error == SinkErrorPolicy::Reject
-            && !self.sink_healthy.load(Ordering::Relaxed);
-        let queue_full_reject = self.on_buffer_full == BufferFullPolicy::Reject
-            && self.logger.queue_depth() >= self.logger.buffer_capacity();
-        if sink_unhealthy_reject || queue_full_reject {
-            ctx.metadata
-                .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
-            return reject_audit_unavailable();
+        if self.commit_may_emit(sample_hit) {
+            let admission = self.ensure_commit_admission(ctx);
+            if !matches!(admission, PluginResult::Continue) {
+                return admission;
+            }
         }
         ctx.metadata
             .insert(MD_SINK_STATUS.to_string(), "deferred".to_string());
@@ -1386,6 +1435,10 @@ impl Plugin for AiTranscriptAudit {
             self.staging.remove(&record_id);
             return;
         }
+        let request_rejected_for_sink = ctx
+            .metadata
+            .get(MD_SINK_STATUS)
+            .is_some_and(|status| status == "rejected");
 
         let sample_hit = self
             .staging
@@ -1400,7 +1453,7 @@ impl Plugin for AiTranscriptAudit {
         ctx.metadata
             .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
 
-        let staging = self.staging.remove(&record_id).map(|(_, value)| value);
+        let mut staging = self.staging.remove(&record_id).map(|(_, value)| value);
         if !emit {
             ctx.metadata
                 .insert(MD_SINK_STATUS.to_string(), "skipped".to_string());
@@ -1431,13 +1484,19 @@ impl Plugin for AiTranscriptAudit {
             reason,
             Some(response_headers),
         );
-        let status = match self.enqueue(record) {
+        let status = match self.enqueue(record, staging.as_mut()) {
             SinkOutcome::Queued => "queued",
             SinkOutcome::Dropped => "dropped",
             SinkOutcome::Rejected => "rejected",
         };
-        ctx.metadata
-            .insert(MD_SINK_STATUS.to_string(), status.to_string());
+        ctx.metadata.insert(
+            MD_SINK_STATUS.to_string(),
+            if request_rejected_for_sink {
+                "rejected".to_string()
+            } else {
+                status.to_string()
+            },
+        );
     }
 
     // ---- streaming (SSE) response capture ----
@@ -1557,7 +1616,7 @@ impl Plugin for AiTranscriptAudit {
 
         // A response already being streamed cannot be rejected, so the
         // fail-closed sink stance only applies to buffered responses.
-        let staging = self.staging.remove(&record_id).map(|(_, value)| value);
+        let mut staging = self.staging.remove(&record_id).map(|(_, value)| value);
         let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(
             &record_id,
@@ -1571,7 +1630,7 @@ impl Plugin for AiTranscriptAudit {
             reason,
             None,
         );
-        let status = match self.enqueue(record) {
+        let status = match self.enqueue(record, staging.as_mut()) {
             SinkOutcome::Queued => "queued",
             SinkOutcome::Dropped => "dropped",
             SinkOutcome::Rejected => "rejected",
@@ -1593,7 +1652,7 @@ impl Plugin for AiTranscriptAudit {
             return;
         };
         // Emit here only if no response hook already did (staging still present).
-        let Some((_, staging)) = self.staging.remove(&record_id) else {
+        let Some((_, mut staging)) = self.staging.remove(&record_id) else {
             return;
         };
 
@@ -1628,7 +1687,7 @@ impl Plugin for AiTranscriptAudit {
             reason,
             None,
         );
-        let _ = self.enqueue(record);
+        let _ = self.enqueue(record, Some(&mut staging));
     }
 }
 

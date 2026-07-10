@@ -2981,6 +2981,70 @@ async fn non_retryable_sink_4xx_marks_sink_unhealthy_under_reject() {
 }
 
 #[tokio::test]
+async fn unhealthy_sink_rejects_unsampled_candidate_that_may_emit_at_commit() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "sampling": { "rate": 0.0, "always_capture_on_error": true },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint.clone(),
+                    "batch_size": 1,
+                    "flush_interval_ms": 100,
+                    "max_retries": 0,
+                    "on_sink_error": "reject"
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let headers = json_headers();
+
+    // Emit one error record so the collector 401 marks the sink unhealthy.
+    let mut error_ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut error_ctx, &headers, ai_request_body())
+        .await;
+    plugin
+        .capture_final_response_body(&mut error_ctx, 500, &headers, br#"{"error":"backend"}"#)
+        .await;
+
+    let mut saw_reject = false;
+    for _ in 0..100 {
+        let mut ctx = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        let result = plugin
+            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        if matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ) {
+            saw_reject = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        saw_reject,
+        "an unsampled candidate that a later validator may turn into an error must fail closed"
+    );
+}
+
+#[tokio::test]
 async fn sink_2xx_after_4xx_restores_health() {
     // Recovery stays on the probe model: once the collector answers 2xx again,
     // the flushed probe records flip sink_healthy back and rejects stop.
