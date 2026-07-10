@@ -1899,6 +1899,10 @@ fn exclusive_canonicalize(
     Ok(output.into_bytes())
 }
 
+// Reached only via the lib target's `_test_support` shim (external unit tests);
+// the bin target duplicates the module tree with no caller, so it sees this as
+// dead code.
+#[allow(dead_code)]
 pub(crate) fn exclusive_canonicalize_element_for_test(
     xml: &str,
     local_name: &str,
@@ -2303,167 +2307,6 @@ fn find_attribute(element: &str, attr_name: &str) -> Option<String> {
     None
 }
 
-/// Find an element by its wsu:Id attribute value within the byte range
-/// `[range_start, range_end)` of `xml`.
-pub(crate) fn find_element_by_wsu_id_in_range(
-    xml: &str,
-    range_start: usize,
-    range_end: usize,
-    id: &str,
-) -> Option<String> {
-    if range_start > range_end || range_end > xml.len() {
-        return None;
-    }
-
-    let (mut namespaces, mut stack) = namespace_state_before_tag(xml, range_start)?;
-    let mut search_from = range_start;
-    while let Some(rel) = xml.get(search_from..range_end)?.find('<') {
-        let tag_start = search_from + rel;
-        let after_lt = xml.as_bytes().get(tag_start + 1)?;
-        if *after_lt == b'/' {
-            let tag_end_rel = find_start_tag_end(xml, tag_start)?;
-            let tag = xml.get(tag_start + 2..tag_start + tag_end_rel)?.trim();
-            revert_namespace_bindings_until(&mut stack, &mut namespaces, tag);
-            search_from = tag_start + tag_end_rel + 1;
-            continue;
-        }
-        if *after_lt == b'!' {
-            search_from = skip_markup_declaration(xml, tag_start).ok()?;
-            continue;
-        }
-        if *after_lt == b'?' {
-            search_from = skip_processing_instruction(xml, tag_start).ok()?;
-            continue;
-        }
-
-        let tag_end_rel = find_start_tag_end(xml, tag_start)?;
-        let tag = &xml[tag_start + 1..tag_start + tag_end_rel];
-        let element_name = extract_full_tag_name_from_tag(tag)?.to_string();
-        let previous_bindings = apply_namespace_declarations_with_history(tag, &mut namespaces);
-        let is_self_closing = tag.trim_end().ends_with('/');
-        let has_matching_id = tag_has_resolvable_wsu_id(tag, id, &namespaces);
-
-        if !is_self_closing {
-            stack.push(NamespaceFrame {
-                element_name,
-                previous_bindings,
-            });
-        } else if !previous_bindings.is_empty() {
-            revert_namespace_bindings(previous_bindings, &mut namespaces);
-        }
-
-        if !has_matching_id {
-            search_from = tag_start + tag_end_rel + 1;
-            continue;
-        }
-
-        if is_self_closing {
-            let tag_end = tag_start + tag_end_rel + 1;
-            if tag_end <= range_end {
-                return Some(xml[tag_start..tag_end].to_string());
-            }
-            return None;
-        }
-
-        let full_tag_name = extract_full_tag_name(&xml[tag_start..range_end])?;
-        let local_name = if let Some(colon_pos) = full_tag_name.find(':') {
-            &full_tag_name[colon_pos + 1..]
-        } else {
-            &full_tag_name
-        };
-
-        let closing = format!("</{}>", full_tag_name);
-        if let Some(close_pos) = xml[tag_start..range_end].find(&closing) {
-            let end = tag_start + close_pos + closing.len();
-            return Some(xml[tag_start..end].to_string());
-        }
-
-        let closing_no_prefix = format!("</{}>", local_name);
-        if let Some(close_pos) = xml[tag_start..range_end].find(&closing_no_prefix) {
-            let end = tag_start + close_pos + closing_no_prefix.len();
-            return Some(xml[tag_start..end].to_string());
-        }
-
-        search_from = tag_start + tag_end_rel + 1;
-    }
-
-    None
-}
-
-fn tag_has_resolvable_wsu_id(tag: &str, id: &str, namespaces: &HashMap<String, String>) -> bool {
-    scan_tag_attributes(tag, |name, value| {
-        is_resolvable_wsu_id_attribute_name(name, namespaces) && value == id
-    })
-}
-
-fn is_resolvable_wsu_id_attribute_name(name: &str, namespaces: &HashMap<String, String>) -> bool {
-    if name == "Id" {
-        return true;
-    }
-
-    let Some((prefix, local_name)) = name.rsplit_once(':') else {
-        return false;
-    };
-
-    local_name == "Id"
-        && namespaces
-            .get(prefix)
-            .is_some_and(|uri| uri == WSU_NAMESPACE_URI)
-}
-
-struct NamespaceFrame {
-    element_name: String,
-    previous_bindings: Vec<(String, Option<String>)>,
-}
-
-fn namespace_state_before_tag(
-    xml: &str,
-    target_tag_start: usize,
-) -> Option<(HashMap<String, String>, Vec<NamespaceFrame>)> {
-    let mut namespaces = HashMap::new();
-    let mut stack: Vec<NamespaceFrame> = Vec::new();
-    let mut search_from = 0usize;
-
-    while search_from < target_tag_start {
-        let rel = match xml.get(search_from..target_tag_start)?.find('<') {
-            Some(rel) => rel,
-            None => break,
-        };
-        let tag_start = search_from + rel;
-        let after_lt = *xml.as_bytes().get(tag_start + 1)?;
-
-        if after_lt == b'/' {
-            let tag_end_rel = find_start_tag_end(xml, tag_start)?;
-            let tag = xml.get(tag_start + 2..tag_start + tag_end_rel)?.trim();
-            revert_namespace_bindings_until(&mut stack, &mut namespaces, tag);
-            search_from = tag_start + tag_end_rel + 1;
-            continue;
-        }
-        if after_lt == b'!' {
-            search_from = skip_markup_declaration(xml, tag_start).ok()?;
-            continue;
-        }
-        if after_lt == b'?' {
-            search_from = skip_processing_instruction(xml, tag_start).ok()?;
-            continue;
-        }
-
-        let tag_end_rel = find_start_tag_end(xml, tag_start)?;
-        let tag = xml.get(tag_start + 1..tag_start + tag_end_rel)?;
-        if !tag.trim_end().ends_with('/') {
-            let element_name = extract_full_tag_name_from_tag(tag)?.to_string();
-            let previous_bindings = apply_namespace_declarations_with_history(tag, &mut namespaces);
-            stack.push(NamespaceFrame {
-                element_name,
-                previous_bindings,
-            });
-        }
-        search_from = tag_start + tag_end_rel + 1;
-    }
-
-    Some((namespaces, stack))
-}
-
 fn extract_full_tag_name_from_tag(tag: &str) -> Option<&str> {
     let trimmed = tag.trim_start();
     let end = trimmed
@@ -2473,52 +2316,6 @@ fn extract_full_tag_name_from_tag(tag: &str) -> Option<&str> {
         None
     } else {
         Some(&trimmed[..end])
-    }
-}
-
-fn apply_namespace_declarations_with_history(
-    tag: &str,
-    namespaces: &mut HashMap<String, String>,
-) -> Vec<(String, Option<String>)> {
-    let mut previous_bindings = Vec::new();
-    scan_tag_attributes(tag, |name, value| {
-        if let Some(prefix) = name.strip_prefix("xmlns:") {
-            previous_bindings.push((prefix.to_string(), namespaces.get(prefix).cloned()));
-            namespaces.insert(prefix.to_string(), value.to_string());
-        }
-        false
-    });
-    previous_bindings
-}
-
-fn revert_namespace_bindings_until(
-    stack: &mut Vec<NamespaceFrame>,
-    namespaces: &mut HashMap<String, String>,
-    closing_tag_name: &str,
-) {
-    while let Some(frame) = stack.pop() {
-        let matched = frame.element_name == closing_tag_name
-            || frame
-                .element_name
-                .rsplit_once(':')
-                .is_some_and(|(_, local_name)| local_name == closing_tag_name);
-        revert_namespace_bindings(frame.previous_bindings, namespaces);
-        if matched {
-            break;
-        }
-    }
-}
-
-fn revert_namespace_bindings(
-    previous_bindings: Vec<(String, Option<String>)>,
-    namespaces: &mut HashMap<String, String>,
-) {
-    for (prefix, previous) in previous_bindings.into_iter().rev() {
-        if let Some(uri) = previous {
-            namespaces.insert(prefix, uri);
-        } else {
-            namespaces.remove(&prefix);
-        }
     }
 }
 

@@ -1,6 +1,5 @@
 use ferrum_edge::_test_support::{
     soap_count_wsu_id_occurrences_for_test, soap_exclusive_canonicalize_element_for_test,
-    soap_find_element_by_wsu_id_for_test,
 };
 use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
 use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
@@ -343,107 +342,6 @@ fn count_wsu_id_occurrences_fails_closed_on_unterminated_comment() {
         err.contains("malformed XML comment"),
         "unexpected error: {err}"
     );
-}
-
-#[test]
-fn find_element_by_wsu_id_skips_comment_content_like_counter() {
-    let xml = r#"
-        <!-- <Signed wsu:Id="X">signed bytes</Signed> -->
-        <Unsigned xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" wsu:Id="X">backend bytes</Unsigned>
-    "#;
-
-    assert_eq!(
-        soap_count_wsu_id_occurrences_for_test(xml, "X").expect("comment content should not count"),
-        1
-    );
-    let resolved = soap_find_element_by_wsu_id_for_test(xml, "X")
-        .expect("real unsigned element should resolve");
-
-    assert!(resolved.starts_with("<Unsigned"));
-    assert!(resolved.contains("backend bytes"));
-    assert!(!resolved.contains("signed bytes"));
-}
-
-#[test]
-fn find_element_by_wsu_id_skips_cdata_and_pi_content_like_counter() {
-    let xml = r#"
-        <![CDATA[<Signed wsu:Id="X">signed bytes</Signed>]]>
-        <?debug <Other wsu:Id="X">signed bytes</Other>?>
-        <Real Id="X">backend bytes</Real>
-    "#;
-
-    assert_eq!(
-        soap_count_wsu_id_occurrences_for_test(xml, "X")
-            .expect("CDATA and PI content should not count"),
-        1
-    );
-    let resolved =
-        soap_find_element_by_wsu_id_for_test(xml, "X").expect("real element should resolve");
-
-    assert!(resolved.starts_with("<Real"));
-    assert!(resolved.contains("backend bytes"));
-    assert!(!resolved.contains("signed bytes"));
-}
-
-#[test]
-fn find_element_by_wsu_id_resolves_prefixed_id_bound_to_wsu_namespace() {
-    let xml = r#"
-        <soap:Body xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
-            <Target u:Id="B">signed body bytes</Target>
-        </soap:Body>
-    "#;
-
-    assert_eq!(
-        soap_count_wsu_id_occurrences_for_test(xml, "B")
-            .expect("prefixed local-name Id should count for duplicate protection"),
-        1
-    );
-    let resolved = soap_find_element_by_wsu_id_for_test(xml, "B")
-        .expect("WSU-bound prefixed Id should resolve");
-
-    assert!(resolved.starts_with("<Target"));
-    assert!(resolved.contains("signed body bytes"));
-}
-
-#[test]
-fn find_element_by_wsu_id_rejects_prefixed_id_bound_to_non_wsu_namespace() {
-    let xml = r#"
-        <soap:Body xmlns:evil="urn:not-wsu">
-            <Target evil:Id="B">signed body bytes</Target>
-        </soap:Body>
-    "#;
-
-    assert_eq!(
-        soap_count_wsu_id_occurrences_for_test(xml, "B")
-            .expect("broad duplicate protection still counts prefixed local-name Id"),
-        1
-    );
-    assert!(
-        soap_find_element_by_wsu_id_for_test(xml, "B").is_none(),
-        "non-WSU namespace prefixes must not resolve as WS-Security Utility IDs"
-    );
-}
-
-#[test]
-fn find_element_by_wsu_id_rejects_prefix_after_namespace_scope_ends() {
-    let xml = r#"
-        <soap:Body>
-            <Scoped xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
-                <Signed u:Id="A">signed body bytes</Signed>
-            </Scoped>
-            <Target u:Id="B">unbound prefixed id</Target>
-        </soap:Body>
-    "#;
-
-    assert!(
-        soap_find_element_by_wsu_id_for_test(xml, "B").is_none(),
-        "WSU prefixes must not remain resolvable after their namespace scope closes"
-    );
-    let resolved = soap_find_element_by_wsu_id_for_test(xml, "A")
-        .expect("WSU-bound id inside namespace scope should resolve");
-
-    assert!(resolved.starts_with("<Signed"));
-    assert!(resolved.contains("signed body bytes"));
 }
 
 #[test]
