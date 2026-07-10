@@ -316,7 +316,13 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             .all(|uid| udp_ready_marker_path(&ack_dir, uid).is_some_and(|marker| marker.is_file()))
     }
 
-    async fn await_udp_not_ready_ack(&self, pod_uids: &HashSet<String>) -> bool {
+    // Takes `&mut self` rather than `&self` on purpose: the reconcile future is
+    // `tokio::spawn`ed, so any borrow of `self` held across the `.await` below must
+    // keep the future `Send`. `NetnsUdpCaptureManager` is `Send` (its producer
+    // handles carry `Send` `FnOnce`/`FnMut` closures) but not `Sync`, so a shared
+    // `&self` held across the await would demand `Self: Sync` and fail to compile.
+    // A `&mut self` borrow only requires `Self: Send`, which holds.
+    async fn await_udp_not_ready_ack(&mut self, pod_uids: &HashSet<String>) -> bool {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         loop {
             if self.udp_not_ready_acknowledged(pod_uids) {
