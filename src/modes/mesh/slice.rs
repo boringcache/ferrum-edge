@@ -772,28 +772,30 @@ impl MeshSlice {
         // plugin tolerates the resulting superset at construction — see
         // `validate_scope_filter_identity` — and its cold-path `retain` does the
         // precise per-proxy narrowing.)
-        let ambient_udp_candidate_labels: Vec<BTreeMap<String, String>> =
+        let ambient_udp_policy_candidates: Vec<(String, BTreeMap<String, String>)> =
             if request.ambient_udp_source_scoping {
                 workloads
                     .iter()
                     .filter(|workload| workload.pod_uid.is_some())
-                    .map(|workload| labels_to_btree(&workload.selector.labels))
+                    .map(|workload| {
+                        (
+                            workload.namespace.clone(),
+                            labels_to_btree(&workload.selector.labels),
+                        )
+                    })
                     .collect()
             } else {
                 Vec::new()
             };
-        let policy_candidate_labels: Vec<&BTreeMap<String, String>> =
-            if request.ambient_udp_source_scoping && !ambient_udp_candidate_labels.is_empty() {
-                ambient_udp_candidate_labels.iter().collect()
-            } else if request.labels.is_empty() {
-                if candidate_label_sets.is_empty() {
-                    vec![&effective_labels]
-                } else {
-                    candidate_label_sets.iter().collect()
-                }
-            } else {
+        let policy_candidate_labels: Vec<&BTreeMap<String, String>> = if request.labels.is_empty() {
+            if candidate_label_sets.is_empty() {
                 vec![&effective_labels]
-            };
+            } else {
+                candidate_label_sets.iter().collect()
+            }
+        } else {
+            vec![&effective_labels]
+        };
         // Resolve the effective applicable Sidecar egress scope for this
         // workload. The returned scope is used downstream to narrow `services`,
         // `service_entries`, and `destination_rules`. Returns `None` when no
@@ -998,9 +1000,15 @@ impl MeshSlice {
             .mesh_policies
             .iter()
             .filter(|policy| {
-                policy_candidate_labels.iter().any(|labels| {
-                    policy_scope_applies_to_workload(policy, effective_namespace, *labels)
-                })
+                (!ambient_udp_policy_candidates.is_empty()
+                    && ambient_udp_policy_candidates
+                        .iter()
+                        .any(|(candidate_namespace, labels)| {
+                            policy_scope_applies_to_workload(policy, candidate_namespace, labels)
+                        }))
+                    || policy_candidate_labels.iter().any(|labels| {
+                        policy_scope_applies_to_workload(policy, effective_namespace, *labels)
+                    })
             })
             .cloned()
             .collect();
@@ -2979,6 +2987,57 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["default-ext", "infra-ext"]);
+    }
+
+    #[test]
+    fn ambient_udp_slice_keeps_cross_namespace_source_policy_candidates() {
+        let mut workload = make_workload(
+            "default",
+            "reviews",
+            HashMap::from([("app".into(), "reviews".into())]),
+        );
+        workload.pod_uid = Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".into());
+        let workload_id = workload.spiffe_id.clone();
+        let mesh = MeshConfig {
+            workloads: vec![workload],
+            services: vec![make_service_with_workload_refs(
+                "default",
+                "reviews",
+                vec![workload_id],
+            )],
+            mesh_policies: vec![make_policy(
+                "default-source-policy",
+                "default",
+                PolicyScope::Namespace {
+                    namespace: "default".into(),
+                },
+            )],
+            waypoint_bindings: vec![MeshWaypointBinding {
+                name: "waypoint".into(),
+                namespace: "infra".into(),
+                waypoint_for: "service".into(),
+                services: vec![MeshWaypointServiceRef {
+                    namespace: "default".into(),
+                    name: "reviews".into(),
+                }],
+            }],
+            ..MeshConfig::default()
+        };
+
+        let slice = MeshSlice::from_gateway_config(
+            &config_with_mesh(mesh),
+            MeshSliceRequest {
+                node_id: "node-1".into(),
+                namespace: "infra".into(),
+                waypoint_name: Some("waypoint".into()),
+                ambient_udp_source_scoping: true,
+                ..MeshSliceRequest::default()
+            },
+        );
+
+        assert_eq!(slice.workloads.len(), 1);
+        assert_eq!(slice.mesh_policies.len(), 1);
+        assert_eq!(slice.mesh_policies[0].name, "default-source-policy");
     }
 
     fn make_policy(name: &str, namespace: &str, scope: PolicyScope) -> MeshPolicy {
