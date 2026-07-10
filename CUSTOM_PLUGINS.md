@@ -226,7 +226,7 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `transform_response_body(&body, content_type, &headers)` | Post-backend (buffered) | No | Rewrite response body before sending to client |
 | `on_final_response_body(&mut ctx, status, &headers, &body)` | Post-backend (post-transform) | Yes | Validate the final response body after all transforms |
 | `response_stream_inspector(&ctx, status, content_type)` | Post-backend (streaming) | No (can truncate) | Create one stateful, per-response body inspector |
-| `on_response_stream_terminated(&ctx, status, outcome)` | Post-backend (streaming terminal) | No | Clean up or account for per-request streaming state; does not receive body bytes |
+| `on_response_stream_terminated(&mut ctx, status, outcome)` | Post-backend (streaming terminal) | No | Clean up/account for streaming state and write aggregate transaction metadata before logging; does not receive body bytes |
 | `log(&summary)` | Logging | No | Send transaction data to external systems |
 | `on_ws_frame(proxy_id, connection_id, direction, &message)` | WebSocket frame | Close* | Inspect/transform per-frame WebSocket traffic |
 
@@ -534,6 +534,8 @@ async fn transform_response_body(
 
 The inspector must own all per-response state. The proxy may move it into a detached H1/H2 task or drive it inside an H3 loop; it cannot borrow `RequestContext`. Keep accumulators bounded because SSE and similar streams may never end.
 
+For transaction-metadata write-back, use `ctx.response_stream_id()` in the factory as the key for a bounded plugin-owned shared slot (for example an `Arc<DashMap<u64, Arc<Mutex<...>>>>`). Give the inspector the slot handle, update it only at decision/window boundaries (never lock on every chunk), then remove the entry in `on_response_stream_terminated(&mut ctx, ..., outcome)` and fold the aggregate into `ctx.metadata`. The terminal hook runs for clean EOF, backend errors, policy cuts, and client disconnects, before `TransactionSummary.metadata` is finalized. Gate slot creation on both returning an inspector and the plugin's own observability setting; the no-inspector path must allocate nothing. Configuration such as metadata emission and argument hashing remains the plugin's responsibility—the core does not interpret or filter plugin fields.
+
 ```rust
 use bytes::Bytes;
 use crate::plugins::{ResponseStreamAction, ResponseStreamInspector};
@@ -610,10 +612,9 @@ The `ResponseStreamInspector` action contract is:
 - `on_end(&mut self)` is the clean end-of-stream flush for a trailing partial window. Its default returns an empty `Forward`.
 - Response headers are already committed before either hook runs. `Terminate` can only truncate the in-flight response; it cannot change the HTTP status, replace headers, or retract previously forwarded bytes.
 
-There are two current limitations to design around:
+There is one current transport limitation to design around:
 
 - In the standard HTTP proxy handler, inspectors currently attach only to the reqwest `ResponseBody::Streaming` arm, not the direct `StreamingH2` or `StreamingH3` arms ([#2055](https://github.com/ferrum-edge/ferrum-edge/issues/2055)). `forces_reqwest_dispatch()` prevents native-H3 selection for requests where it returns `true`; make that decision per request when possible. It does not itself exclude every direct-H2/HBONE case, so do not assume universal transport coverage until #2055 is resolved. The dedicated H3 frontend native and cross-protocol loops do drive inspectors, which is why the inspector must be portable across H1/H2 and H3 drivers.
-- The factory receives `&RequestContext`, but the inspector receives only chunks after it is created and cannot write per-request transaction metadata ([#2061](https://github.com/ferrum-edge/ferrum-edge/issues/2061)). Copy or clone the immutable inputs it needs into the inspector and use plugin-owned telemetry or logs for streamed findings.
 
 ### `Content-Type` relabeling trap
 

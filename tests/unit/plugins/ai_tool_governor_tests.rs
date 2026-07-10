@@ -6,11 +6,13 @@ use ferrum_edge::{
     plugins::{
         Plugin, PluginHttpClient, RequestContext, ResponseStreamAction, ResponseStreamInspector,
         ai_tool_governor::AiToolGovernor, available_plugins, create_plugin_with_http_client,
-        priority,
+        create_response_stream_inspector, priority,
     },
+    proxy::deferred_log::BodyOutcome,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::Arc;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -4055,6 +4057,108 @@ async fn streaming_legacy_function_call_released_in_dry_run() {
         out,
         body.as_bytes(),
         "dry-run must release every held frame"
+    );
+}
+
+#[tokio::test]
+async fn streamed_dry_run_decision_writes_transaction_metadata_at_termination() {
+    let plugin = Arc::new(make(json!({
+        "mode": "dry_run",
+        "tools": { "rm_rf": { "action": "deny" } },
+        "default_action": "allow",
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true },
+        "observability": { "emit_metadata": true, "hash_arguments": true }
+    })));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    assert_eq!(plugin.pending_stream_metadata_len(), 1);
+
+    let body = legacy_function_call_stream(&["rm_rf"], &["{\"path\":\"/etc\"}"]);
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(!terminated, "dry-run must forward the stream");
+    assert_eq!(out, body.as_bytes());
+    drop(inspector);
+
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_eq!(plugin.pending_stream_metadata_len(), 0);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("deny")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.tool_names")
+            .map(String::as_str),
+        Some("rm_rf")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.arguments_hashes")
+            .map(String::len),
+        Some(64)
+    );
+    assert_no_metadata_contains(&ctx, "/etc");
+}
+
+#[tokio::test]
+async fn streamed_metadata_honors_hash_arguments_false() {
+    let plugin = Arc::new(make(json!({
+        "mode": "dry_run",
+        "tools": { "rm_rf": { "action": "deny" } },
+        "default_action": "allow",
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true },
+        "observability": { "emit_metadata": true, "hash_arguments": false }
+    })));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let body = legacy_function_call_stream(&["rm_rf"], &["{\"path\":\"/etc\"}"]);
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(!terminated);
+    drop(inspector);
+
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("deny")
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_tool_governor.arguments_hashes")
+    );
+    assert_no_metadata_contains(&ctx, "/etc");
+}
+
+#[test]
+fn ineligible_stream_creates_no_governor_writeback_slot() {
+    let plugin = Arc::new(make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    })));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+
+    let inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 500, Some("text/event-stream"));
+    assert!(inspector.is_none());
+    assert_eq!(
+        plugin.pending_stream_metadata_len(),
+        0,
+        "no inspector must mean no per-request write-back allocation"
     );
 }
 

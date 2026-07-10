@@ -1482,7 +1482,7 @@ impl Plugin for AiTranscriptAudit {
 
     async fn on_response_stream_terminated(
         &self,
-        ctx: &RequestContext,
+        ctx: &mut RequestContext,
         response_status: u16,
         outcome: &crate::proxy::deferred_log::BodyOutcome,
     ) {
@@ -1524,6 +1524,10 @@ impl Plugin for AiTranscriptAudit {
                 None => (None, true, None), // abnormal end: on_end never ran
             }
         };
+        if let Some(response_hash) = hash.as_ref() {
+            ctx.metadata
+                .insert(MD_RESPONSE_HASH.to_string(), response_hash.clone());
+        }
         let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(
             &record_id,
@@ -1537,7 +1541,13 @@ impl Plugin for AiTranscriptAudit {
             reason,
             None,
         );
-        let _ = self.enqueue(record);
+        let status = match self.enqueue(record) {
+            SinkOutcome::Queued => "queued",
+            SinkOutcome::Dropped => "dropped",
+            SinkOutcome::Rejected => "rejected",
+        };
+        ctx.metadata
+            .insert(MD_SINK_STATUS.to_string(), status.to_string());
     }
 
     // ---- fallback emission ----
