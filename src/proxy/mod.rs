@@ -20,9 +20,10 @@
 //! 9. **Plugin: on_response_body** — raw backend body inspection before transforms:
 //!    AI token metrics, AI rate limiter
 //! 10. **Plugin: transform_response_body** — body rewrites (e.g., response_transformer)
-//! 11. **Plugin: on_final_response_body** — final client-visible body validation/storage:
+//! 11. **Plugin: on_final_response_body** — buffered body validation/storage:
 //!     body validation, response size limiting, response caching
-//! 12. **Plugin: log** — stdout/HTTP logging, Prometheus, OpenTelemetry
+//! 12. **Plugin: on_response_committed** — observe-only final buffered status/body export
+//! 13. **Plugin: log** — stdout/HTTP logging, Prometheus, OpenTelemetry
 //!
 //! Key design principles:
 //! - **Lock-free reads**: All config access uses `ArcSwap::load()` — no mutexes on the hot path
@@ -12635,10 +12636,11 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     headers: &mut HashMap<String, String>,
     body: &mut Vec<u8>,
     is_grpc_request: bool,
+    invoke_response_committed: bool,
 ) {
-    if !plugins.is_empty()
-        && should_apply_synthetic_response_body_hooks(*status, is_grpc_request, body, plugins, ctx)
-    {
+    let applied_synthetic_body_hooks = !plugins.is_empty()
+        && should_apply_synthetic_response_body_hooks(*status, is_grpc_request, body, plugins, ctx);
+    if applied_synthetic_body_hooks {
         // KNOWN ORDERING DIVERGENCE (accepted, documented trade-off):
         //
         // On the synthetic short-circuit path the response-BODY hooks
@@ -12675,6 +12677,32 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // emitted onto whatever the client actually receives. Runs LAST by design —
     // see the divergence note above.
     apply_after_proxy_hooks_to_rejection(plugins, ctx, *status, headers).await;
+
+    // Observe every client-visible rejection that flows through this finalizer —
+    // synthetic short-circuits, gRPC rejects, non-2xx rejects, empty-body rejects
+    // — only after final-body validators, rejection replacement, and the
+    // synthetic path's deliberately-late response-header hooks have run. The
+    // committed-hook capability scan runs unconditionally (no longer gated on
+    // whether body hooks applied) so exporters see the final response on all
+    // rejection shapes, not just synthetic paths that ran body hooks.
+    if invoke_response_committed
+        && plugins
+            .iter()
+            .any(|plugin| plugin.requires_response_committed_hook())
+    {
+        let status_code = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
+        let normalized = normalize_reject_response(status_code, body, headers, is_grpc_request);
+        for plugin in plugins.iter() {
+            plugin
+                .on_response_committed(
+                    ctx,
+                    normalized.http_status.as_u16(),
+                    &normalized.headers,
+                    &normalized.body,
+                )
+                .await;
+        }
+    }
 }
 
 pub(crate) struct AfterProxyReject {
@@ -12922,15 +12950,17 @@ pub(crate) async fn normalize_grpc_plugin_rejection_with_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     reject: RejectedResponseParts,
+    invoke_response_committed: bool,
 ) -> NormalizedRejectResponse {
     let status = StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
-    let normalized = finalize_reject_response_with_after_proxy_hooks(
+    let normalized = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
         plugins,
         ctx,
         status,
         &reject.body,
         reject.headers,
         true,
+        invoke_response_committed,
     )
     .await;
     apply_grpc_reject_metadata(ctx, &normalized);
@@ -12991,6 +13021,14 @@ fn build_grpc_web_error_response(
         status,
         message,
     );
+    build_grpc_web_error_response_from_parts(response, status, message)
+}
+
+fn build_grpc_web_error_response_from_parts(
+    response: crate::plugins::grpc_web::GrpcWebErrorResponse,
+    status: u32,
+    message: &str,
+) -> Response<ProxyBody> {
     let builder =
         headers_mod::apply_response_headers(Response::builder().status(200), &response.headers);
 
@@ -13004,8 +13042,29 @@ async fn finalize_reject_response_with_after_proxy_hooks(
     ctx: &mut RequestContext,
     status: StatusCode,
     body: &[u8],
+    headers: HashMap<String, String>,
+    is_grpc_request: bool,
+) -> NormalizedRejectResponse {
+    finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+        plugins,
+        ctx,
+        status,
+        body,
+        headers,
+        is_grpc_request,
+        true,
+    )
+    .await
+}
+
+async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status: StatusCode,
+    body: &[u8],
     mut headers: HashMap<String, String>,
     is_grpc_request: bool,
+    invoke_response_committed: bool,
 ) -> NormalizedRejectResponse {
     let mut response_status = status.as_u16();
     let mut response_body = body.to_vec();
@@ -13017,6 +13076,7 @@ async fn finalize_reject_response_with_after_proxy_hooks(
         &mut headers,
         &mut response_body,
         is_grpc_request,
+        invoke_response_committed,
     )
     .await;
     // Attribute the reject-path `after_proxy` + synthetic response-body hook time
@@ -13047,25 +13107,47 @@ async fn handle_backend_admission_rejection(
     is_grpc_request: bool,
     grpc_web_error_content_type: Option<&str>,
 ) -> Response<ProxyBody> {
-    let reject = finalize_reject_response_with_after_proxy_hooks(
+    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
         plugins,
         ctx,
         StatusCode::from_u16(rejection.status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
         &rejection.body,
         rejection.headers,
         is_grpc_request,
+        grpc_web_error_content_type.is_none(),
     )
     .await;
     apply_grpc_reject_metadata(ctx, &reject);
-    let grpc_web_response = grpc_web_error_content_type.and_then(|content_type| {
-        reject.grpc_status.map(|grpc_status| {
-            let message = reject
-                .grpc_message
-                .as_deref()
-                .unwrap_or_else(|| grpc_status_reason(grpc_status));
-            build_grpc_web_error_response(content_type, grpc_status, message)
-        })
-    });
+    let grpc_web_response = if let (Some(content_type), Some(grpc_status)) =
+        (grpc_web_error_content_type, reject.grpc_status)
+    {
+        let message = reject
+            .grpc_message
+            .as_deref()
+            .unwrap_or_else(|| grpc_status_reason(grpc_status));
+        let translated = crate::plugins::grpc_web::error_response_for_content_type(
+            content_type,
+            grpc_status,
+            message,
+        );
+        if plugins
+            .iter()
+            .any(|plugin| plugin.requires_response_committed_hook())
+        {
+            for plugin in plugins {
+                plugin
+                    .on_response_committed(ctx, 200, &translated.headers, &translated.body)
+                    .await;
+            }
+        }
+        Some(build_grpc_web_error_response_from_parts(
+            translated,
+            grpc_status,
+            message,
+        ))
+    } else {
+        None
+    };
     log_rejected_request_with_path(
         plugins,
         ctx,
@@ -14470,13 +14552,25 @@ async fn handle_proxy_request_inner(
         &ctx.headers,
         &state.mesh_egress_strip_baggage_keys,
     );
+    let stream_hooks_enabled = plugin_cache_view.requires_response_stream_hooks();
+    let maybe_requires_response_body_buffering =
+        plugin_cache_view.requires_response_body_buffering();
+
+    // Request-body transforms can change the per-request response policy (most
+    // notably `stream: true`). When either response buffering or streaming
+    // inspection is configured, finalize the already-required buffered request
+    // body before selecting a backend transport. The two PluginCache flags keep
+    // the ordinary no-body-policy path unchanged: no extra scan, clone, collect,
+    // or hook pass.
+    let reevaluate_response_policy_after_request_body = !is_grpc_request
+        && requires_request_body_buffering
+        && (maybe_requires_response_body_buffering || stream_hooks_enabled);
+    let mut request_body_prepared = false;
     // Pre-computed at config reload (see `PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT`)
     // so the proxy hot path does not re-scan the plugin list per request.
     let needs_final_request_body_context = requires_request_body_buffering
         && capabilities
             .has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
-    let proxy_headers: &HashMap<String, String> =
-        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
     let effective_query_string = query_string_after_plugin_strips(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
@@ -14523,7 +14617,7 @@ async fn handle_proxy_request_inner(
         &state,
         &epoch,
         &ctx.client_ip,
-        proxy_headers,
+        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
         ctx.orig_dst,
     );
     let lb_hash_key = selection.lb_hash_key;
@@ -14548,6 +14642,7 @@ async fn handle_proxy_request_inner(
 
     let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet> = None;
+    let mut preacquired_backend_admission = PreacquiredBackendAdmission::default();
 
     // Circuit breaker check — per-target when upstream is configured, per-proxy otherwise
     // `cb_admission_open_epoch` is re-captured on retry-target rotation (the gRPC
@@ -14585,6 +14680,196 @@ async fn handle_proxy_request_inner(
                 return Ok(build_response_from_normalized_reject(reject));
             }
         };
+
+    // Finalize the body only after fail-fast routing and breaker gates have
+    // admitted the request. This preserves the open-breaker behavior (no slow
+    // upload drain or body-plugin I/O before the immediate 503) while still
+    // updating response buffering and transport preference before dispatch.
+    let preparation_backend_host = upstream_target
+        .as_deref()
+        .map(|target| target.host.as_str())
+        .unwrap_or(proxy.backend_host.as_str());
+    let preparation_requires_direct_h2_for_sni = reevaluate_response_policy_after_request_body
+        && resolve_backend_connection_proxy_for_target(&proxy, upstream_target.as_deref())
+            .resolved_tls
+            .sni
+            .is_some();
+    let preparation_blocked_by_dispatch_policy = preparation_requires_direct_h2_for_sni
+        || denied_literal_backend_or_dns_override(
+            preparation_backend_host,
+            &proxy,
+            &state.env_config.backend_allow_ips,
+        )
+        .is_some()
+        || backend_dispatch::direct_http_mesh_transport_refusal(upstream_target.as_deref())
+            .is_some();
+    if reevaluate_response_policy_after_request_body && !preparation_blocked_by_dispatch_policy {
+        if !backend_admission_plugins.is_empty() {
+            let admission_proxy =
+                resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref());
+            let permits = match backend_dispatch::run_backend_admission_plugins(
+                backend_admission_plugins.as_ref(),
+                &ctx,
+                admission_proxy.as_ref(),
+                upstream_target.as_deref(),
+                ProxyProtocol::Http,
+            ) {
+                Ok(permits) => permits,
+                Err(rejection) => {
+                    release_circuit_breaker_probe_on_admission_reject(
+                        &state,
+                        &proxy,
+                        cb_target_key.as_deref(),
+                        cb_is_half_open_probe,
+                    );
+                    return Ok(handle_backend_admission_rejection(
+                        rejection,
+                        &plugins,
+                        &mut ctx,
+                        &state,
+                        start_time,
+                        plugin_execution_ns,
+                        Some(&original_request_path),
+                        is_grpc_request,
+                        grpc_web_response_content_type,
+                    )
+                    .await);
+                }
+            };
+            preacquired_backend_admission = PreacquiredBackendAdmission::acquired(permits);
+        }
+        let hook_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
+        client_request_body = match client_request_body {
+            ClientRequestBody::Streaming(request) => {
+                match buffer_request_body_for_before_proxy(
+                    *request,
+                    &method,
+                    &hook_headers,
+                    state.max_request_body_size_bytes,
+                )
+                .await
+                {
+                    Ok(body) => body,
+                    Err(RequestBodyBufferError::TooLarge) => {
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            cb_is_half_open_probe,
+                        );
+                        record_request(&state, 413);
+                        return Ok(build_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            r#"{"error":"Request body exceeds maximum size"}"#,
+                        ));
+                    }
+                    Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            cb_is_half_open_probe,
+                        );
+                        error!(
+                            proxy_id = %proxy.id,
+                            path = %ctx.path,
+                            error_kind = "client_disconnect",
+                            error = %error_message,
+                            "Client disconnected while finalizing request body before dispatch"
+                        );
+                        record_request(&state, 499);
+                        return Ok(build_response(
+                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                            r#"{"error":"Client disconnected"}"#,
+                        ));
+                    }
+                }
+            }
+            buffered => buffered,
+        };
+
+        client_request_body = match client_request_body {
+            ClientRequestBody::Buffered(body) => {
+                ctx.bytes_sent_observed
+                    .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                let mut body_hook_ctx = needs_final_request_body_context
+                    .then(|| ctx.clone_for_final_request_body_hooks());
+                let transformed = apply_request_body_plugins_with_context(
+                    &plugins,
+                    body_hook_ctx.as_mut(),
+                    &hook_headers,
+                    body,
+                )
+                .await;
+                let final_body_result = run_final_request_body_hooks(
+                    &plugins,
+                    body_hook_ctx.as_mut(),
+                    &hook_headers,
+                    &transformed,
+                )
+                .await;
+                if let Some(body_hook_ctx) = body_hook_ctx {
+                    let request_body = ctx.metadata.remove("request_body");
+                    ctx.metadata = body_hook_ctx.metadata;
+                    if let Some(body) = request_body {
+                        ctx.metadata.insert("request_body".to_string(), body);
+                    }
+                    ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+                    ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
+                    ctx.waf_score = body_hook_ctx.waf_score;
+                }
+                match final_body_result {
+                    PluginResult::Continue => {
+                        request_body_prepared = true;
+                        ClientRequestBody::Buffered(transformed)
+                    }
+                    reject @ PluginResult::Reject { .. }
+                    | reject @ PluginResult::RejectBinary { .. } => {
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            cb_is_half_open_probe,
+                        );
+                        let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                            record_request(&state, 500);
+                            return Ok(build_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                r#"{"error":"Internal error"}"#,
+                            ));
+                        };
+                        let status = StatusCode::from_u16(reject.status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let normalized = finalize_reject_response_with_after_proxy_hooks(
+                            &plugins,
+                            &mut ctx,
+                            status,
+                            &reject.body,
+                            reject.headers,
+                            is_grpc_request,
+                        )
+                        .await;
+                        apply_grpc_reject_metadata(&mut ctx, &normalized);
+                        log_rejected_request_with_path(
+                            &plugins,
+                            &ctx,
+                            normalized.http_status.as_u16(),
+                            start_time,
+                            "on_final_request_body",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                        )
+                        .await;
+                        record_request(&state, normalized.http_status.as_u16());
+                        return Ok(build_response_from_normalized_reject(normalized));
+                    }
+                }
+            }
+            bodyless => bodyless,
+        };
+    }
+    let proxy_headers: &HashMap<String, String> =
+        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
     // Check if this is a WebSocket upgrade request. WebSocket is a runtime
     // flavor in the new scheme-decoupled model — any HTTP-family proxy
@@ -15044,7 +15329,7 @@ async fn handle_proxy_request_inner(
                         ));
                     };
                     let normalized = normalize_grpc_plugin_rejection_with_after_proxy_hooks(
-                        &plugins, &mut ctx, reject,
+                        &plugins, &mut ctx, reject, true,
                     )
                     .await;
                     record_request(&state, normalized.http_status.as_u16());
@@ -16434,7 +16719,7 @@ async fn handle_proxy_request_inner(
                                 );
                                 let normalized =
                                     normalize_grpc_plugin_rejection_with_after_proxy_hooks(
-                                        &plugins, &mut ctx, reject,
+                                        &plugins, &mut ctx, reject, false,
                                     )
                                     .await;
                                 response_status = normalized.http_status.as_u16();
@@ -16518,77 +16803,37 @@ async fn handle_proxy_request_inner(
                                 );
                                 let normalized =
                                     normalize_grpc_plugin_rejection_with_after_proxy_hooks(
-                                        &plugins, &mut ctx, reject,
+                                        &plugins, &mut ctx, reject, false,
                                     )
                                     .await;
-                                response_status = normalized.http_status.as_u16();
-                                response_headers = normalized.headers;
+                                if let (Some(grpc_web_ct), Some(grpc_status)) =
+                                    (grpc_web_response_content_type, normalized.grpc_status)
+                                {
+                                    let message = normalized
+                                        .grpc_message
+                                        .as_deref()
+                                        .unwrap_or_else(|| grpc_status_reason(grpc_status));
+                                    let translated =
+                                        crate::plugins::grpc_web::error_response_for_content_type(
+                                            grpc_web_ct,
+                                            grpc_status,
+                                            message,
+                                        );
+                                    response_status = 200;
+                                    response_headers = translated.headers;
+                                    response_body = translated.body;
+                                } else {
+                                    response_status = normalized.http_status.as_u16();
+                                    response_headers = normalized.headers;
+                                    response_body = normalized.body;
+                                }
                                 plugin_response_headers = response_headers.clone();
                                 response_trailers.clear();
-                                response_body = normalized.body;
                                 break;
                             }
                         }
                     }
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                }
-
-                let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-                let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
-                let plugin_external_io_ms =
-                    ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-                let gateway_processing_ms = total_ms - backend_total_ms;
-                let gateway_overhead_ms =
-                    (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
-
-                // Log phase
-                if !plugins.is_empty() {
-                    // Resolve backend IP from DNS cache for gRPC tx log
-                    let grpc_resolved_ip = state
-                        .dns_cache
-                        .resolve(
-                            &proxy.backend_host,
-                            proxy.dns_override.as_deref(),
-                            proxy.dns_cache_ttl_seconds,
-                        )
-                        .await
-                        .ok()
-                        .map(|ip| ip.to_string());
-
-                    // gRPC buffered-success path — `response_body` holds the
-                    // full gRPC response frame (protobuf + trailers). Its
-                    // length is the bytes that will flow to the client.
-                    let bytes_sent = ctx
-                        .bytes_sent_observed
-                        .load(std::sync::atomic::Ordering::Acquire);
-                    let bytes_received = response_body.len() as u64;
-                    let summary = TransactionSummary {
-                        namespace: proxy.namespace.clone(),
-                        timestamp_received: ctx.timestamp_received.to_rfc3339(),
-                        client_ip: ctx.client_ip.clone(),
-                        consumer_username: ctx.effective_identity().map(str::to_owned),
-                        auth_method: ctx.auth_method,
-                        http_method: method,
-                        request_path: original_request_path.clone(),
-                        proxy_id: Some(proxy.id.clone()),
-                        proxy_name: proxy.name.clone(),
-                        backend_target: Some(strip_query_params(&grpc_backend_url).to_string()),
-                        backend_resolved_ip: grpc_resolved_ip,
-                        response_status_code: response_status,
-                        latency_total_ms: total_ms,
-                        latency_gateway_processing_ms: gateway_processing_ms,
-                        latency_backend_ttfb_ms: backend_total_ms,
-                        latency_backend_total_ms: backend_total_ms,
-                        latency_plugin_execution_ms: plugin_execution_ms,
-                        latency_plugin_external_io_ms: plugin_external_io_ms,
-                        latency_gateway_overhead_ms: gateway_overhead_ms,
-                        request_user_agent: ctx.headers.get("user-agent").cloned(),
-                        bytes_sent,
-                        bytes_received,
-                        metadata: clone_log_metadata(&ctx),
-                        ..TransactionSummary::default()
-                    };
-                    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
 
                 // Capture the backend's original trailer `set-cookie` (issue
@@ -16715,6 +16960,74 @@ async fn handle_proxy_request_inner(
                             })
                             .or_insert(cookie_val);
                     }
+                }
+
+                if capabilities.has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
+                    let phase_start = Instant::now();
+                    for plugin in plugins.iter() {
+                        plugin
+                            .on_response_committed(
+                                &mut ctx,
+                                response_status,
+                                &response_headers,
+                                &response_body,
+                            )
+                            .await;
+                    }
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                }
+
+                let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+                let plugin_external_io_ms =
+                    ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+                let gateway_processing_ms = total_ms - backend_total_ms;
+                let gateway_overhead_ms =
+                    (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
+
+                // Log only after committed exporters write their final metadata.
+                if !plugins.is_empty() {
+                    let grpc_resolved_ip = state
+                        .dns_cache
+                        .resolve(
+                            &proxy.backend_host,
+                            proxy.dns_override.as_deref(),
+                            proxy.dns_cache_ttl_seconds,
+                        )
+                        .await
+                        .ok()
+                        .map(|ip| ip.to_string());
+                    let bytes_sent = ctx
+                        .bytes_sent_observed
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    let bytes_received = response_body.len() as u64;
+                    let summary = TransactionSummary {
+                        namespace: proxy.namespace.clone(),
+                        timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                        client_ip: ctx.client_ip.clone(),
+                        consumer_username: ctx.effective_identity().map(str::to_owned),
+                        auth_method: ctx.auth_method,
+                        http_method: method,
+                        request_path: original_request_path.clone(),
+                        proxy_id: Some(proxy.id.clone()),
+                        proxy_name: proxy.name.clone(),
+                        backend_target: Some(strip_query_params(&grpc_backend_url).to_string()),
+                        backend_resolved_ip: grpc_resolved_ip,
+                        response_status_code: response_status,
+                        latency_total_ms: total_ms,
+                        latency_gateway_processing_ms: gateway_processing_ms,
+                        latency_backend_ttfb_ms: backend_total_ms,
+                        latency_backend_total_ms: backend_total_ms,
+                        latency_plugin_execution_ms: plugin_execution_ms,
+                        latency_plugin_external_io_ms: plugin_external_io_ms,
+                        latency_gateway_overhead_ms: gateway_overhead_ms,
+                        request_user_agent: ctx.headers.get("user-agent").cloned(),
+                        bytes_sent,
+                        bytes_received,
+                        metadata: clone_log_metadata(&ctx),
+                        ..TransactionSummary::default()
+                    };
+                    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
 
                 record_request(&state, response_status);
@@ -16944,7 +17257,7 @@ async fn handle_proxy_request_inner(
         &proxy,
         &plugins,
         &ctx,
-        plugin_cache_view.requires_response_body_buffering(),
+        maybe_requires_response_body_buffering,
     );
 
     // Determine if we can stream the request body to the backend without
@@ -16953,18 +17266,14 @@ async fn handle_proxy_request_inner(
     // failures.
     let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method);
     let stream_request_body = !has_retry && !requires_request_body_buffering;
-    // A response-stream inspector (e.g. ai_semantic_firewall `inspect`) is wired
-    // only on the reqwest streaming path, so a request that WILL be inspected must
-    // be dispatched via reqwest — otherwise a native-H3 backend would return
-    // `ResponseBody::StreamingH3` and bypass inspection. This is gated per request
-    // (a plugin returns `true` only for the specific requests it inspects, via
-    // `ctx` markers) so an inspect-mode proxy does NOT push its ordinary,
-    // never-inspected requests off the native-H3 fast path. (Direct-H2/HBONE are
-    // already excluded for these requests because `inspect`/`buffer` force
-    // request-body buffering, which disables those pools; native H3 does not gate
-    // on that, so it is excluded explicitly here.)
-    let requires_response_stream_inspection =
-        plugins.iter().any(|p| p.forces_reqwest_dispatch(&ctx));
+    // The reqwest pin is now an optimization rather than the correctness
+    // boundary: every streaming response arm can drive inspectors. Evaluate it
+    // from the finalized context so a body transform that adds/removes
+    // `stream: true` is reflected before the native-H3 decision commits.
+    let requires_response_stream_inspection = stream_hooks_enabled
+        && plugins
+            .iter()
+            .any(|plugin| plugin.forces_reqwest_dispatch(&ctx));
     let request_client_ip = ctx.client_ip.clone();
     let request_xff_append_ip = socket_ip.clone();
     let retry_config = if has_retry {
@@ -17200,12 +17509,14 @@ async fn handle_proxy_request_inner(
             upstream_target.as_deref(),
             &plugins,
             backend_admission_plugins.as_ref(),
+            std::mem::take(&mut preacquired_backend_admission),
             body_hook_ctx.as_mut(),
             &ctx,
             should_stream,
             requires_request_body_buffering,
             stream_request_body,
             has_retry,
+            request_body_prepared,
             &request_client_ip,
             &request_xff_append_ip,
             is_tls,
@@ -17536,12 +17847,14 @@ async fn handle_proxy_request_inner(
             upstream_target.as_deref(),
             &plugins,
             backend_admission_plugins.as_ref(),
+            std::mem::take(&mut preacquired_backend_admission),
             body_hook_ctx.as_mut(),
             &ctx,
             should_stream,
             requires_request_body_buffering,
             stream_request_body,
             false, // no retry — don't retain body
+            request_body_prepared,
             &request_client_ip,
             &request_xff_append_ip,
             is_tls,
@@ -18027,6 +18340,51 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
+    // Inject the sticky-session cookie before committed exporters observe the
+    // final header view. This remains after every rejection/body replacement so
+    // the cookie lands on the same response that will be sent downstream.
+    if sticky_cookie_needed
+        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
+    {
+        let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
+            &proxy,
+            &epoch.load_balancer,
+            upstream_id,
+            target,
+        );
+        if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
+            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
+            let default_cc = crate::config::types::HashOnCookieConfig::default();
+            let cookie_config = upstream
+                .as_ref()
+                .and_then(|u| u.hash_on_cookie_config.as_ref())
+                .unwrap_or(&default_cc);
+            let cookie_val = build_sticky_cookie_header(cookie_name, target, cookie_config);
+            response_headers
+                .entry("set-cookie".to_string())
+                .and_modify(|v| {
+                    v.push('\n');
+                    v.push_str(&cookie_val);
+                })
+                .or_insert(cookie_val);
+        }
+    }
+
+    // Observe the response only after final-body rejection replacement. The
+    // precomputed capability bit keeps this phase to one predictable branch
+    // when no exporter is configured.
+    if capabilities.has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
+        && let ResponseBody::Buffered(ref data) = response_body
+    {
+        let phase_start = Instant::now();
+        for plugin in plugins.iter() {
+            plugin
+                .on_response_committed(&mut ctx, response_status, &response_headers, data)
+                .await;
+        }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
     let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
     let plugin_external_io_ms =
@@ -18063,19 +18421,39 @@ async fn handle_proxy_request_inner(
             | ResponseBody::StreamingH2(_)
             | ResponseBody::StreamingH3(_)
     );
+    // Native H3 needs the backend's declared length to distinguish a complete
+    // body followed by a graceful QUIC close from truncation. Preserve it
+    // before an attached inspector strips the client-visible Content-Length.
+    let streaming_h3_backend_content_length =
+        matches!(&response_body, ResponseBody::StreamingH3(_))
+            .then(|| {
+                response_headers
+                    .get("content-length")
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .flatten();
     // Resolve the inspector before cloning the context into the deferred
     // logger. The resolver stamps a private stream id only when an inspector
     // actually attaches; the terminal hook uses that id to drain plugin-owned
     // aggregate state into transaction metadata.
-    let response_inspector = if matches!(response_body, ResponseBody::Streaming { .. }) {
+    let response_inspector = if body_will_stream && stream_hooks_enabled {
         let content_type = response_headers.get("content-type").map(String::as_str);
-        crate::plugins::create_response_stream_inspector(
+        crate::plugins::create_response_stream_inspector_for_enabled_plugins(
             &plugins,
             &mut ctx,
             response_status,
             content_type,
         )
     } else {
+        if body_will_stream {
+            let content_type = response_headers.get("content-type").map(String::as_str);
+            crate::plugins::notify_response_stream_selected(
+                &plugins,
+                &ctx,
+                response_status,
+                content_type,
+            );
+        }
         None
     };
     if response_inspector.is_some() {
@@ -18149,35 +18527,6 @@ async fn handle_proxy_request_inner(
         } else {
             None
         };
-
-    // Inject sticky session cookie when cookie-based consistent hashing selected a new session
-    if sticky_cookie_needed
-        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
-    {
-        let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
-            &proxy,
-            &epoch.load_balancer,
-            upstream_id,
-            target,
-        );
-        if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
-            let default_cc = crate::config::types::HashOnCookieConfig::default();
-            let cookie_config = upstream
-                .as_ref()
-                .and_then(|u| u.hash_on_cookie_config.as_ref())
-                .unwrap_or(&default_cc);
-            let cookie_val = build_sticky_cookie_header(cookie_name, target, cookie_config);
-            // Append to existing set-cookie or create new entry (newline-separated)
-            response_headers
-                .entry("set-cookie".to_string())
-                .and_modify(|v| {
-                    v.push('\n');
-                    v.push_str(&cookie_val);
-                })
-                .or_insert(cookie_val);
-        }
-    }
 
     record_request(&state, response_status);
 
@@ -18484,7 +18833,23 @@ async fn handle_proxy_request_inner(
                     h2_total_deadline,
                 )
             };
-            let mut body = body.with_lb_connection_guard(lb_connection_guard);
+            let mut body = if let Some(inspector) = response_inspector {
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                tokio::spawn(crate::proxy::body::run_proxy_body_response_inspection(
+                    body,
+                    inspector,
+                    tx,
+                    state.max_response_body_size_bytes,
+                    lb_connection_guard,
+                ));
+                crate::proxy::body::inspected_streaming_body(rx)
+            } else {
+                body.with_lb_connection_guard(lb_connection_guard)
+            };
+            // Deferred admission/dispatch outcomes stay on the client-visible
+            // body. The least-connections guard moves into the inspection task
+            // on a hit so a client cancel cannot under-count a provider-blocked
+            // inspector that still owns the backend stream.
             if let Some(permits) = backend_admission_permits.take() {
                 body = body.with_deferred_backend_admission_outcome(
                     permits,
@@ -18553,11 +18918,12 @@ async fn handle_proxy_request_inner(
             body
         }
         ResponseBody::StreamingH3(h3_resp) => {
-            let cl = response_headers
+            let client_content_length = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
             let success_on_drop_after_bytes =
-                h3_success_on_drop_after_response_bytes(inbound_version, cl);
+                h3_success_on_drop_after_response_bytes(inbound_version, client_content_length);
+            let backend_content_length = streaming_h3_backend_content_length;
             // Method + status thread into `H3FrameSource` so its graceful-close
             // recovery gate uses the same `is_response_body_complete` predicate
             // as the buffered path (HEAD/204/304 no-body responses included).
@@ -18571,7 +18937,7 @@ async fn handle_proxy_request_inner(
                     h3_resp.recv_stream,
                     h3_method,
                     response_status,
-                    cl,
+                    backend_content_length,
                     proxy.backend_read_timeout_ms,
                 )
             } else if state.max_response_body_size_bytes > 0 {
@@ -18580,7 +18946,7 @@ async fn handle_proxy_request_inner(
                     state.max_response_body_size_bytes,
                     h3_method,
                     response_status,
-                    cl,
+                    backend_content_length,
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
@@ -18591,16 +18957,27 @@ async fn handle_proxy_request_inner(
                     h3_resp.recv_stream,
                     h3_method,
                     response_status,
-                    cl,
+                    backend_content_length,
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
                     proxy.backend_read_timeout_ms,
                 )
             };
-            let mut body = body
-                .with_success_on_drop_after_response_bytes(success_on_drop_after_bytes)
-                .with_lb_connection_guard(lb_connection_guard);
+            let mut body = if let Some(inspector) = response_inspector {
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                tokio::spawn(crate::proxy::body::run_proxy_body_response_inspection(
+                    body,
+                    inspector,
+                    tx,
+                    state.max_response_body_size_bytes,
+                    lb_connection_guard,
+                ));
+                crate::proxy::body::inspected_streaming_body(rx)
+            } else {
+                body.with_lb_connection_guard(lb_connection_guard)
+            };
+            body = body.with_success_on_drop_after_response_bytes(success_on_drop_after_bytes);
             if let Some(permits) = backend_admission_permits.take() {
                 body = body.with_deferred_backend_admission_outcome(
                     permits,
@@ -19649,6 +20026,56 @@ enum BackendDispatchResult {
     AdmissionRejected(backend_dispatch::BackendAdmissionRejection),
 }
 
+/// Backend-admission result acquired before request-body finalization.
+///
+/// The explicit `was_run` bit distinguishes "admission ran and no plugin
+/// returned a permit" from "admission has not run yet". This lets the narrow
+/// post-transform response-policy path preserve fail-fast admission without
+/// invoking admission plugins twice on accepted requests.
+#[derive(Default)]
+pub(crate) struct PreacquiredBackendAdmission {
+    was_run: bool,
+    permits: Option<BackendAdmissionPermitSet>,
+}
+
+impl PreacquiredBackendAdmission {
+    pub(crate) fn acquired(permits: Option<BackendAdmissionPermitSet>) -> Self {
+        Self {
+            was_run: true,
+            permits,
+        }
+    }
+
+    pub(crate) fn take_if_acquired(&mut self) -> Option<Option<BackendAdmissionPermitSet>> {
+        self.was_run.then(|| {
+            self.was_run = false;
+            self.permits.take()
+        })
+    }
+
+    fn take_or_run(
+        &mut self,
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        ctx: &RequestContext,
+        proxy: &Proxy,
+        upstream_target: Option<&UpstreamTarget>,
+        protocol: ProxyProtocol,
+    ) -> Result<Option<BackendAdmissionPermitSet>, backend_dispatch::BackendAdmissionRejection>
+    {
+        if let Some(permits) = self.take_if_acquired() {
+            Ok(permits)
+        } else {
+            backend_dispatch::run_backend_admission_plugins(
+                plugins,
+                ctx,
+                proxy,
+                upstream_target,
+                protocol,
+            )
+        }
+    }
+}
+
 fn backend_dispatch_response(
     response: retry::BackendResponse,
     retained_body: Option<Bytes>,
@@ -19882,6 +20309,7 @@ async fn proxy_to_backend(
     upstream_target: Option<&UpstreamTarget>,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     backend_admission_plugins: &[Arc<dyn crate::plugins::Plugin>],
+    mut preacquired_backend_admission: PreacquiredBackendAdmission,
     mut ctx: Option<&mut RequestContext>,
     // Real, read-only request context for the response-side buffering decision.
     // Distinct from `ctx` above, which is the request-body-hook clone and is
@@ -19891,6 +20319,7 @@ async fn proxy_to_backend(
     requires_request_body_buffering: bool,
     stream_request_body: bool,
     retain_request_body: bool,
+    request_body_prepared: bool,
     client_ip: &str,
     xff_append_ip: &str,
     is_tls: bool,
@@ -19905,10 +20334,11 @@ async fn proxy_to_backend(
     // has completed.
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
     inbound_version: hyper::Version,
-    // Out-parameter: set to the instant the backend admission permit is
-    // acquired (immediately before the backend dial / send), so the caller's
-    // adaptive-concurrency sample measures only the backend interaction and not
-    // the request-body collection / final-body-hook time that precedes it.
+    // Out-parameter: reset immediately before the backend dial / send, after
+    // admission permits are available. A narrow response-policy reevaluation
+    // path may preacquire admission before body finalization to preserve
+    // fail-fast rejection; its client-upload/body-hook time must still stay out
+    // of the backend latency sample.
     // Left at its incoming value (the caller's `backend_start`) on paths that
     // never reach admission, so the fallback is the pre-fix behavior.
     backend_admission_started_at: &mut Instant,
@@ -19993,7 +20423,7 @@ async fn proxy_to_backend(
         {
             return reject;
         }
-        backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+        backend_admission_permits = match preacquired_backend_admission.take_or_run(
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -20079,7 +20509,7 @@ async fn proxy_to_backend(
         {
             return reject;
         }
-        backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+        backend_admission_permits = match preacquired_backend_admission.take_or_run(
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -20148,7 +20578,7 @@ async fn proxy_to_backend(
         {
             return reject;
         }
-        backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+        backend_admission_permits = match preacquired_backend_admission.take_or_run(
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -20176,6 +20606,7 @@ async fn proxy_to_backend(
             inbound_version,
             stream_request_body,
             retain_request_body,
+            request_body_prepared,
             stream_response,
             ctx_bytes_sent_observed,
         )
@@ -20273,7 +20704,7 @@ async fn proxy_to_backend(
             // limited requests intentionally do not enter this block: they must
             // stay on the reqwest path so local 413 checks and deferred backend
             // admission happen before any backend interaction.
-            let mut h2_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+            let mut h2_admission_permits = match preacquired_backend_admission.take_or_run(
                 backend_admission_plugins,
                 request_ctx,
                 proxy,
@@ -20618,29 +21049,40 @@ async fn proxy_to_backend(
                 //   2. Rejections from `run_final_request_body_hooks` still
                 //      surface the original on-wire size in the log summary.
                 // `fetch_max` preserves the largest observed value across
-                // retries where plugin transforms may shrink the body.
-                ctx_bytes_sent_observed.fetch_max(
-                    body_bytes.len() as u64,
-                    std::sync::atomic::Ordering::Release,
-                );
-                let body_bytes = apply_request_body_plugins_with_context(
-                    plugins,
-                    ctx.as_deref_mut(),
-                    headers,
-                    body_bytes,
-                )
-                .await;
-                match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
-                    PluginResult::Continue => {}
-                    reject @ PluginResult::Reject { .. }
-                    | reject @ PluginResult::RejectBinary { .. } => {
-                        return backend_dispatch_response(
-                            reject_result_to_backend_response(reject, resolved_ip.clone()),
-                            None,
-                            None,
-                        );
-                    }
+                // retries where plugin transforms may shrink the body. The
+                // pre-dispatch finalization path already recorded the raw
+                // client length before replacing this buffer with transformed
+                // bytes, so do not let an expanding transform overwrite that
+                // on-wire count here.
+                if !request_body_prepared {
+                    ctx_bytes_sent_observed.fetch_max(
+                        body_bytes.len() as u64,
+                        std::sync::atomic::Ordering::Release,
+                    );
                 }
+                let body_bytes = if request_body_prepared {
+                    body_bytes
+                } else {
+                    let body_bytes = apply_request_body_plugins_with_context(
+                        plugins,
+                        ctx.as_deref_mut(),
+                        headers,
+                        body_bytes,
+                    )
+                    .await;
+                    match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
+                        PluginResult::Continue => {}
+                        reject @ PluginResult::Reject { .. }
+                        | reject @ PluginResult::RejectBinary { .. } => {
+                            return backend_dispatch_response(
+                                reject_result_to_backend_response(reject, resolved_ip.clone()),
+                                None,
+                                None,
+                            );
+                        }
+                    }
+                    body_bytes
+                };
                 if !body_bytes.is_empty() {
                     // `Bytes::from(Vec<u8>)` is zero-cost (transfers ownership of
                     // the Vec without copying). The optional clone below is then
@@ -20874,7 +21316,7 @@ async fn proxy_to_backend(
         }
     };
 
-    backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+    backend_admission_permits = match preacquired_backend_admission.take_or_run(
         backend_admission_plugins,
         request_ctx,
         proxy,
@@ -20884,8 +21326,10 @@ async fn proxy_to_backend(
         Ok(permits) => permits,
         Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
     };
-    // Admission is acquired here, after request-body collection and final-body
-    // hooks, so the adaptive sample measures only the backend interaction.
+    // Ordinary requests acquire admission here after request-body collection
+    // and final-body hooks. The narrow post-transform policy path consumes its
+    // preacquired result here instead; either way, reset the timer now so the
+    // adaptive sample measures only the backend interaction.
     *backend_admission_started_at = Instant::now();
 
     // Send
@@ -24308,6 +24752,7 @@ async fn proxy_to_backend_http3(
     inbound_version: hyper::Version,
     stream_request_body: bool,
     retain_request_body: bool,
+    request_body_prepared: bool,
     stream_response: bool,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> (retry::BackendResponse, Option<Bytes>) {
@@ -24676,20 +25121,35 @@ async fn proxy_to_backend_http3(
         }
     };
 
-    ctx_bytes_sent_observed.fetch_max(request_body.len() as u64, Ordering::Release);
-
-    let request_body =
-        apply_request_body_plugins_with_context(plugins, ctx.as_deref_mut(), headers, request_body)
-            .await;
-    match run_final_request_body_hooks(plugins, ctx, headers, &request_body).await {
-        PluginResult::Continue => {}
-        reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-            return (
-                reject_result_to_backend_response(reject, resolved_ip.clone()),
-                None,
-            );
-        }
+    // Prepared buffers have already contributed their raw client-visible
+    // length before transformation. The buffer here may be larger after a
+    // transform, so counting it again would turn bytes_sent into backend-wire
+    // bytes instead of client-wire bytes.
+    if !request_body_prepared {
+        ctx_bytes_sent_observed.fetch_max(request_body.len() as u64, Ordering::Release);
     }
+
+    let request_body = if request_body_prepared {
+        request_body
+    } else {
+        let request_body = apply_request_body_plugins_with_context(
+            plugins,
+            ctx.as_deref_mut(),
+            headers,
+            request_body,
+        )
+        .await;
+        match run_final_request_body_hooks(plugins, ctx, headers, &request_body).await {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                return (
+                    reject_result_to_backend_response(reject, resolved_ip.clone()),
+                    None,
+                );
+            }
+        }
+        request_body
+    };
 
     let request_content_length = if !request_body.is_empty() {
         Some(request_body.len().to_string())
@@ -26676,6 +27136,8 @@ mod tests {
 
     struct RejectHeaderPlugin;
 
+    struct CommittedHeaderProbePlugin;
+
     struct CustomNoTransformHeaderPlugin;
 
     struct CustomStrongEtagHeaderPlugin;
@@ -26809,6 +27271,40 @@ mod tests {
                 response_headers.insert("x-after-reject".to_string(), "applied".to_string());
             }
             PluginResult::Continue
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for CommittedHeaderProbePlugin {
+        fn name(&self) -> &str {
+            "committed_header_probe"
+        }
+
+        fn requires_response_committed_hook(&self) -> bool {
+            true
+        }
+
+        async fn on_response_committed(
+            &self,
+            ctx: &mut RequestContext,
+            response_status: u16,
+            response_headers: &HashMap<String, String>,
+            body: &[u8],
+        ) {
+            ctx.metadata.insert(
+                "test:committed_status".to_string(),
+                response_status.to_string(),
+            );
+            if let Some(content_type) = response_headers.get("content-type") {
+                ctx.metadata.insert(
+                    "test:committed_content_type".to_string(),
+                    content_type.clone(),
+                );
+            }
+            ctx.metadata.insert(
+                "test:committed_body".to_string(),
+                String::from_utf8_lossy(body).into_owned(),
+            );
         }
     }
 
@@ -27200,6 +27696,42 @@ mod tests {
 
         assert_eq!(response.http_status, StatusCode::OK);
         assert_eq!(response.body, body);
+    }
+
+    #[tokio::test]
+    async fn non_grpc_reject_committed_hook_sees_default_content_type() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CommittedHeaderProbePlugin)];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        let body = br#"{"error":"blocked"}"#;
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 422,
+            body: bytes::Bytes::copy_from_slice(body),
+            headers: HashMap::new(),
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            ctx.metadata
+                .get("test:committed_content_type")
+                .map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("test:committed_status")
+                .map(String::as_str),
+            Some("422")
+        );
+        assert_eq!(
+            ctx.metadata.get("test:committed_body").map(String::as_str),
+            Some(r#"{"error":"blocked"}"#)
+        );
     }
 
     #[tokio::test]
@@ -27853,9 +28385,10 @@ mod tests {
             headers: HashMap::new(),
         };
 
-        let normalized =
-            normalize_grpc_plugin_rejection_with_after_proxy_hooks(&plugins, &mut ctx, reject)
-                .await;
+        let normalized = normalize_grpc_plugin_rejection_with_after_proxy_hooks(
+            &plugins, &mut ctx, reject, true,
+        )
+        .await;
 
         assert_eq!(normalized.http_status, StatusCode::OK);
         assert_eq!(
@@ -28453,12 +28986,14 @@ mod tests {
                 None,
                 plugins,
                 &[],
+                PreacquiredBackendAdmission::default(),
                 None,  // body-hook ctx (absent for response-only configs)
                 &ctx,  // real read-only request context
                 false, // stream_response: WAF requested buffering pre-flight
                 false, // requires_request_body_buffering
                 true,  // stream_request_body
                 false, // retain_request_body (non-retry -> downgrade active)
+                false, // request_body_prepared
                 "127.0.0.1",
                 "127.0.0.1",
                 false, // is_tls
@@ -28564,12 +29099,14 @@ mod tests {
             None,
             &plugins,
             &[],
+            PreacquiredBackendAdmission::default(),
             None,
             &ctx,
             false,
             false,
             true,
             true,
+            false,
             "127.0.0.1",
             "127.0.0.1",
             false,

@@ -98,6 +98,74 @@ fn request_context(source: Option<&str>) -> RequestContext {
     ctx
 }
 
+fn ambient_udp_request_context(peer: &str, baggage: Option<&str>) -> RequestContext {
+    let mut ctx = request_context(Some(peer));
+    ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    ctx.metadata
+        .insert("hbone_datagram".to_string(), "udp".to_string());
+    if let Some(baggage) = baggage {
+        ctx.headers
+            .insert("baggage".to_string(), baggage.to_string());
+    }
+    ctx.matched_proxy = Some(Arc::new(
+        serde_json::from_value::<Proxy>(json!({
+            "id": "__mesh-inbound-hbone-relay",
+            "namespace": "default",
+            "hosts": [],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "10.0.0.20",
+            "backend_port": 53
+        }))
+        .expect("relay proxy"),
+    ));
+    ctx
+}
+
+fn ambient_udp_source_scoping_slice() -> MeshSlice {
+    let workload = Workload {
+        spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/default/sa/client").expect("spiffe"),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "api".to_string())]),
+            namespace: None,
+        },
+        service_name: "api".to_string(),
+        addresses: vec!["10.0.0.20".to_string()],
+        ports: Vec::new(),
+        trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+        namespace: "default".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("client".to_string()),
+        pod_uid: Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string()),
+        node_waypoint: None,
+        remote_provenance: false,
+    };
+    MeshSlice {
+        namespace: "default".to_string(),
+        mesh_policies: vec![
+            policy_with_scope(
+                "api-deny",
+                PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
+                PolicyAction::Deny,
+            ),
+            policy_with_scope("mesh-allow", PolicyScope::MeshWide, PolicyAction::Allow),
+        ],
+        workloads: vec![workload.clone()],
+        ambient_udp_source_workloads: vec![workload],
+        ..MeshSlice::default()
+    }
+}
+
 fn stream_context() -> StreamConnectionContext {
     StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
@@ -473,6 +541,737 @@ async fn mesh_authz_ignores_hbone_baggage_from_untrusted_assertor() {
             .get("mesh_authz.ignored_baggage.untrusted_assertor")
             .map(String::as_str),
         Some("true")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_ambient_udp_applies_scope_for_validated_source_pod() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": ambient_udp_source_scoping_slice(),
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(
+            "source.principal=spiffe://cluster.local/ns/default/sa/client,source.pod_uid=6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        ),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "selector-scoped DENY for the attributed pod must apply, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("api-deny")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_ambient_udp_retains_identical_duplicate_pod_scopes() {
+    let mut slice = ambient_udp_source_scoping_slice();
+    let mut second_projection = slice.ambient_udp_source_workloads[0].clone();
+    second_projection.service_name = "api-alias".to_string();
+    slice.ambient_udp_source_workloads.push(second_projection);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(
+            "source.principal=spiffe://cluster.local/ns/default/sa/client,source.pod_uid=6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        ),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "one pod projected through multiple Services must retain its scoped policy, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("api-deny")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_ambient_udp_suppresses_conflicting_duplicate_pod_scopes() {
+    let mut slice = ambient_udp_source_scoping_slice();
+    let mut stale_principal_deny = allow_client_policy(PolicyAction::Deny);
+    stale_principal_deny.name = "stale-principal-deny".to_string();
+    stale_principal_deny.scope = PolicyScope::MeshWide;
+    slice.mesh_policies.push(stale_principal_deny);
+    let mut conflicting = slice.ambient_udp_source_workloads[0].clone();
+    conflicting.selector.labels = HashMap::from([("app".to_string(), "other".to_string())]);
+    slice.ambient_udp_source_workloads.push(conflicting);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(
+            "source.principal=spiffe://cluster.local/ns/default/sa/client,source.pod_uid=6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        ),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "conflicting pod evidence must use the gateway peer for mesh-wide evaluation, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_udp_source_scope")
+            .map(String::as_str),
+        Some("pod_not_in_slice")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_ambient_udp_missing_or_invalid_pod_evidence_uses_gateway_principal() {
+    let mut slice = ambient_udp_source_scoping_slice();
+    let mut stale_principal_deny = allow_client_policy(PolicyAction::Deny);
+    stale_principal_deny.name = "stale-principal-deny".to_string();
+    stale_principal_deny.scope = PolicyScope::MeshWide;
+    slice.mesh_policies.push(stale_principal_deny);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    for baggage in [
+        "source.principal=spiffe://cluster.local/ns/default/sa/client",
+        "source.principal=spiffe://cluster.local/ns/default/sa/client,source.pod_uid=not-a-uid",
+    ] {
+        let mut ctx = ambient_udp_request_context(
+            "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+            Some(baggage),
+        );
+
+        let result = plugin.authorize(&mut ctx).await;
+
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "unbound pod evidence must use the gateway peer for mesh-wide evaluation, got {result:?}"
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mesh_authz.ignored_udp_source_scope")
+                .map(String::as_str),
+            Some("missing_or_invalid_pod_uid")
+        );
+    }
+}
+
+#[tokio::test]
+async fn mesh_authz_ambient_udp_untrusted_stamp_cannot_activate_scoped_policy() {
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": ambient_udp_source_scoping_slice(),
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/default/sa/untrusted",
+        Some(
+            "source.principal=spiffe://cluster.local/ns/default/sa/client,source.pod_uid=6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        ),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "untrusted stamp must fall back to mesh-wide-only evaluation, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_baggage.untrusted_assertor")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_ambient_udp_rejects_principal_pod_mismatch_as_scope_evidence() {
+    let mut slice = ambient_udp_source_scoping_slice();
+    let mut stale_principal_deny = allow_client_policy(PolicyAction::Deny);
+    stale_principal_deny.name = "stale-principal-deny".to_string();
+    stale_principal_deny.scope = PolicyScope::MeshWide;
+    stale_principal_deny.rules[0].from[0].spiffe_id_pattern =
+        Some("spiffe://cluster.local/ns/default/sa/other".to_string());
+    slice.mesh_policies.push(stale_principal_deny);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(
+            "source.principal=spiffe://cluster.local/ns/default/sa/other,source.pod_uid=6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        ),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "mismatched evidence must discard the asserted principal before mesh-wide evaluation, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_udp_source_scope")
+            .map(String::as_str),
+        Some("principal_pod_mismatch")
+    );
+
+    let metrics = WorkloadMetrics::new(&json!({})).expect("metrics config");
+    let mut headers = std::mem::take(&mut ctx.headers);
+    let metrics_result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(metrics_result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/ferrum-system/sa/ztunnel"),
+        "downstream telemetry must use the authenticated peer after authz rejects the evidence"
+    );
+    assert_eq!(
+        ctx.metadata.get("mesh.ignored_baggage").map(String::as_str),
+        Some("principal_pod_mismatch")
+    );
+}
+
+/// A cross-namespace Ambient UDP slice: the terminating relay's destination
+/// namespace (`slice.namespace`) is `svc-ns`, while the validated source pod
+/// lives in `client-ns`. This isolates the two policy arms of the UDP
+/// authorization union — a `Namespace{svc-ns}` policy is DESTINATION-scoped only
+/// and a `Namespace{client-ns}` policy is SOURCE-scoped only — so a test can
+/// prove each arm is evaluated independently.
+fn ambient_udp_cross_namespace_slice(policies: Vec<MeshPolicy>) -> MeshSlice {
+    let client = Workload {
+        spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/client-ns/sa/client").expect("spiffe"),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "client".to_string())]),
+            namespace: None,
+        },
+        service_name: "client".to_string(),
+        addresses: vec!["10.0.1.20".to_string()],
+        ports: Vec::new(),
+        trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+        namespace: "client-ns".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("client".to_string()),
+        pod_uid: Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string()),
+        node_waypoint: None,
+        remote_provenance: false,
+    };
+    MeshSlice {
+        // Destination workload identity the relay terminates for. The
+        // construction-time retain filters `mesh_policies` to those applicable
+        // to THIS namespace/labels, exactly as normal (non-UDP) inbound HBONE
+        // evaluates.
+        namespace: "svc-ns".to_string(),
+        mesh_policies: policies,
+        workloads: vec![client.clone()],
+        ambient_udp_source_workloads: vec![client],
+        ..MeshSlice::default()
+    }
+}
+
+fn ambient_udp_service_waypoint_slice(policies: Vec<MeshPolicy>) -> MeshSlice {
+    let source = Workload {
+        spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/client-ns/sa/client")
+            .expect("source spiffe"),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "client".to_string())]),
+            namespace: None,
+        },
+        service_name: "client".to_string(),
+        addresses: vec!["10.0.1.20".to_string()],
+        ports: Vec::new(),
+        trust_domain: TrustDomain::new("cluster.local").expect("source trust domain"),
+        namespace: "client-ns".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("client".to_string()),
+        pod_uid: Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string()),
+        node_waypoint: None,
+        remote_provenance: false,
+    };
+    let destination = Workload {
+        spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/svc-ns/sa/reviews")
+            .expect("destination spiffe"),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+            namespace: None,
+        },
+        service_name: "reviews".to_string(),
+        addresses: vec!["10.0.2.30".to_string()],
+        ports: Vec::new(),
+        trust_domain: TrustDomain::new("cluster.local").expect("destination trust domain"),
+        namespace: "svc-ns".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("reviews".to_string()),
+        pod_uid: Some("7ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string()),
+        node_waypoint: None,
+        remote_provenance: false,
+    };
+    MeshSlice {
+        namespace: "waypoint-ns".to_string(),
+        waypoint_name: Some("reviews-waypoint".to_string()),
+        mesh_policies: policies,
+        workloads: vec![destination.clone()],
+        ambient_udp_source_workloads: vec![source],
+        services: vec![MeshService {
+            name: "reviews".to_string(),
+            namespace: "svc-ns".to_string(),
+            ports: vec![ServicePort {
+                port: 53,
+                protocol: AppProtocol::Udp,
+                name: Some("dns".to_string()),
+                target_port: None,
+            }],
+            workloads: vec![WorkloadRef {
+                spiffe_id: destination.spiffe_id,
+            }],
+            protocol_overrides: HashMap::new(),
+            cluster_ips: Vec::new(),
+        }],
+        ..MeshSlice::default()
+    }
+}
+
+const AMBIENT_UDP_CLIENT_BAGGAGE: &str = "source.principal=spiffe://cluster.local/ns/client-ns/sa/client,\
+     source.pod_uid=6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+
+/// A `from.principal`-keyed ALLOW that only matches the given SPIFFE id, with an
+/// arbitrary policy scope. Used to build applicable-but-unmatched vs. matched
+/// ALLOW policies for the union aggregation test.
+fn principal_scoped_policy(
+    name: &str,
+    scope: PolicyScope,
+    principal: &str,
+    action: PolicyAction,
+) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: "default".to_string(),
+        scope,
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some(principal.to_string()),
+                namespace_pattern: None,
+                trust_domain: Some(TrustDomain::new("cluster.local").expect("trust domain")),
+                trust_domain_pattern: None,
+            }],
+            to: Vec::new(),
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action,
+        }],
+    }
+}
+
+/// (a) A DESTINATION-namespace DENY-all must block a `udp` CONNECT even when the
+/// validated source pod's own namespace-scoped ALLOW would otherwise permit it.
+/// Before the union fix the branch evaluated ONLY source-scoped policies, so the
+/// destination DENY (scoped to a different namespace than the source pod) was
+/// filtered out and the request fell through to the source ALLOW.
+#[tokio::test]
+async fn mesh_authz_ambient_udp_destination_namespace_deny_blocks_source_allowed_connect() {
+    let slice = ambient_udp_cross_namespace_slice(vec![
+        // Destination-only: applies to svc-ns (the slice namespace), not client-ns.
+        policy_with_scope(
+            "dest-deny-all",
+            PolicyScope::Namespace {
+                namespace: "svc-ns".to_string(),
+            },
+            PolicyAction::Deny,
+        ),
+        // Source-only: applies to the client pod's namespace, not svc-ns.
+        policy_with_scope(
+            "client-allow",
+            PolicyScope::Namespace {
+                namespace: "client-ns".to_string(),
+            },
+            PolicyAction::Allow,
+        ),
+    ]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "destination-namespace DENY-all must run for a udp CONNECT, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("dest-deny-all")
+    );
+}
+
+/// ServiceWaypoint's slice namespace is the waypoint's own namespace, not the
+/// namespace of the Service it protects. Destination policy resolution must use
+/// the CONNECT authority/backend workload scope or a service-namespace DENY is
+/// lost after the construction-time waypoint-identity retain.
+#[tokio::test]
+async fn mesh_authz_service_waypoint_udp_resolves_destination_service_scope() {
+    let slice = ambient_udp_service_waypoint_slice(vec![
+        policy_with_scope(
+            "dest-deny-all",
+            PolicyScope::Namespace {
+                namespace: "svc-ns".to_string(),
+            },
+            PolicyAction::Deny,
+        ),
+        policy_with_scope(
+            "client-allow",
+            PolicyScope::Namespace {
+                namespace: "client-ns".to_string(),
+            },
+            PolicyAction::Allow,
+        ),
+    ]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+    );
+    ctx.matched_proxy = Some(Arc::new(
+        serde_json::from_value::<Proxy>(json!({
+            "id": "__mesh-inbound-hbone-relay",
+            "namespace": "",
+            "hosts": [],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "10.0.2.30",
+            "backend_port": 53
+        }))
+        .expect("service-waypoint relay proxy"),
+    ));
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "destination Service DENY must run at a cross-namespace waypoint, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("dest-deny-all")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_service_waypoint_udp_uses_exact_destination_workload_scope() {
+    let destination_selector = WorkloadSelector {
+        labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+        namespace: Some("svc-ns".to_string()),
+    };
+    let mut slice = ambient_udp_service_waypoint_slice(vec![policy_with_scope(
+        "reviews-only-deny",
+        PolicyScope::WorkloadSelector {
+            selector: destination_selector,
+        },
+        PolicyAction::Deny,
+    )]);
+    let mut other_destination = slice.workloads[0].clone();
+    other_destination.spiffe_id =
+        SpiffeId::new("spiffe://cluster.local/ns/svc-ns/sa/ratings").expect("other spiffe");
+    other_destination.selector.labels = HashMap::from([("app".to_string(), "ratings".to_string())]);
+    other_destination.service_account = Some("ratings".to_string());
+    other_destination.addresses = vec!["10.0.2.31".to_string()];
+    other_destination.pod_uid = None;
+    slice.services[0].workloads.push(WorkloadRef {
+        spiffe_id: other_destination.spiffe_id.clone(),
+    });
+    slice.workloads.push(other_destination);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+    );
+    ctx.matched_proxy = Some(Arc::new(
+        serde_json::from_value::<Proxy>(json!({
+            "id": "__mesh-inbound-hbone-relay",
+            "namespace": "",
+            "hosts": [],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "10.0.2.31",
+            "backend_port": 53
+        }))
+        .expect("service-waypoint relay proxy"),
+    ));
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "selector DENY for a sibling backend must not apply to the matched backend, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.node_waypoint_authorized_backend")
+            .map(String::as_str),
+        Some("10.0.2.31|53"),
+        "ServiceWaypoint UDP must bind later route overrides to the authorized backend"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_service_waypoint_udp_missing_destination_scope_fails_closed() {
+    let slice = ambient_udp_service_waypoint_slice(vec![policy_with_scope(
+        "client-allow",
+        PolicyScope::Namespace {
+            namespace: "client-ns".to_string(),
+        },
+        PolicyAction::Allow,
+    )]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("destination_scope_missing")
+    );
+}
+
+/// (b) A SOURCE-scoped DENY still blocks after the union: bringing destination
+/// policies in must not weaken the source-scoped enforcement this PR added.
+#[tokio::test]
+async fn mesh_authz_ambient_udp_source_scoped_deny_still_blocks_after_union() {
+    let slice = ambient_udp_cross_namespace_slice(vec![
+        // Destination-only ALLOW-all (matches everything for the destination).
+        policy_with_scope(
+            "dest-allow-all",
+            PolicyScope::Namespace {
+                namespace: "svc-ns".to_string(),
+            },
+            PolicyAction::Allow,
+        ),
+        // Source-only DENY-all keyed to the client pod's namespace.
+        policy_with_scope(
+            "client-deny",
+            PolicyScope::Namespace {
+                namespace: "client-ns".to_string(),
+            },
+            PolicyAction::Deny,
+        ),
+    ]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "source-scoped DENY must still deny under the union, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("client-deny")
+    );
+}
+
+/// (c) ALLOW aggregation across the union follows Istio "if any applicable ALLOW
+/// exists, at least one must match" semantics computed over the COMBINED set —
+/// not two independent decisions. A destination-scoped ALLOW that is applicable
+/// but does not match (`from.principal` = someone else) sets `saw_allow`, and a
+/// source-scoped ALLOW that DOES match the client satisfies it, so the request is
+/// allowed. A broken two-decision combination would let the destination arm alone
+/// resolve to implicit-deny and reject.
+#[tokio::test]
+async fn mesh_authz_ambient_udp_allow_aggregation_spans_union() {
+    let slice = ambient_udp_cross_namespace_slice(vec![
+        // Destination-scoped ALLOW that is applicable (svc-ns) but never matches
+        // this client principal — on its own it would implicit-deny.
+        principal_scoped_policy(
+            "dest-allow-other",
+            PolicyScope::Namespace {
+                namespace: "svc-ns".to_string(),
+            },
+            "spiffe://cluster.local/ns/svc-ns/sa/other",
+            PolicyAction::Allow,
+        ),
+        // Source-scoped ALLOW that matches the client principal.
+        principal_scoped_policy(
+            "client-allow",
+            PolicyScope::Namespace {
+                namespace: "client-ns".to_string(),
+            },
+            "spiffe://cluster.local/ns/client-ns/sa/client",
+            PolicyAction::Allow,
+        ),
+    ]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a matching source ALLOW must satisfy the union's ALLOW aggregation, got {result:?}"
+    );
+}
+
+/// (d) Absent source evidence must still fail closed to mesh-wide + DESTINATION
+/// policies. A destination-namespace DENY must run even when no source pod scope
+/// can be resolved (no `source.pod_uid` in baggage), instead of silently allowing.
+#[tokio::test]
+async fn mesh_authz_ambient_udp_absent_source_evidence_still_applies_destination_deny() {
+    let slice = ambient_udp_cross_namespace_slice(vec![policy_with_scope(
+        "dest-deny-all",
+        PolicyScope::Namespace {
+            namespace: "svc-ns".to_string(),
+        },
+        PolicyAction::Deny,
+    )]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    // Principal present but no pod_uid → source scope unresolved, evidence falls
+    // back to the authenticated gateway peer for mesh-wide-only source scoping.
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some("source.principal=spiffe://cluster.local/ns/client-ns/sa/client"),
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "destination DENY must run even with absent source pod evidence, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("dest-deny-all")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.ignored_udp_source_scope")
+            .map(String::as_str),
+        Some("missing_or_invalid_pod_uid")
     );
 }
 

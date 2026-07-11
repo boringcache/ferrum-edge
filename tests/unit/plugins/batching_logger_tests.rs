@@ -324,6 +324,50 @@ async fn try_send_batch_threshold_triggers_flush() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn reserved_slot_excludes_concurrent_reservation_until_send() {
+    let flushed = Arc::new(Mutex::new(Vec::<Vec<u32>>::new()));
+    let notify = Arc::new(Notify::new());
+    let notify_clone = Arc::clone(&notify);
+    let flushed_clone = Arc::clone(&flushed);
+    let logger = BatchingLogger::spawn(
+        test_logger_config("batching_logger_reserve", 1, 1),
+        move |batch| {
+            let notify = Arc::clone(&notify_clone);
+            let flushed = Arc::clone(&flushed_clone);
+            async move {
+                flushed.lock().unwrap().push(batch);
+                notify.notify_one();
+                Ok(())
+            }
+        },
+    );
+
+    let permit = logger.try_reserve().expect("first slot must reserve");
+    assert!(
+        logger.try_reserve().is_none(),
+        "a second response must not race into the reserved slot"
+    );
+    permit.send(7);
+    wait_for_flush(&notify).await;
+    assert_eq!(*flushed.lock().unwrap(), vec![vec![7]]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_unused_reservation_releases_capacity() {
+    let logger = BatchingLogger::spawn(
+        test_logger_config("batching_logger_reserve_drop", 1, 1),
+        move |_batch: Vec<u32>| async move { Ok(()) },
+    );
+
+    let permit = logger.try_reserve().expect("first slot must reserve");
+    drop(permit);
+    assert!(
+        logger.try_reserve().is_some(),
+        "dropping a non-emitting response permit must release its slot"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn oversized_batch_size_is_capped_before_flush_loop() {
     let flushed_len = Arc::new(AtomicUsize::new(0));
     let notify = Arc::new(Notify::new());

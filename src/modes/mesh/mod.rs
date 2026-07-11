@@ -181,6 +181,13 @@ impl MeshTopology {
     pub fn is_waypoint(self) -> bool {
         matches!(self, Self::NodeWaypoint | Self::ServiceWaypoint)
     }
+
+    /// Whether this topology terminates Ambient HBONE datagrams and can apply
+    /// trusted per-pod UDP source evidence at the destination.
+    #[inline]
+    fn uses_ambient_udp_source_scoping(self) -> bool {
+        matches!(self, Self::Ambient | Self::ServiceWaypoint)
+    }
 }
 
 /// Control-protocol source for mesh runtime config.
@@ -639,6 +646,7 @@ impl MeshRuntimeConfig {
             namespace: self.namespace.clone(),
             workload_spiffe_id: self.workload_spiffe_id.clone(),
             waypoint_name: self.service_waypoint_name(),
+            ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
             labels: self.workload_labels.clone(),
             // Same `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` interval the xDS
             // client uses — the knob is protocol-agnostic failover/failback.
@@ -654,6 +662,7 @@ impl MeshRuntimeConfig {
             namespace: self.namespace.clone(),
             workload_spiffe_id: self.workload_spiffe_id.clone(),
             waypoint_name: self.service_waypoint_name(),
+            ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
             stream_channel_capacity: self.xds_stream_channel_capacity,
             primary_retry_secs: self.xds_primary_retry_secs,
             connect_timeout_seconds: self.xds_connect_timeout_seconds,
@@ -871,6 +880,7 @@ impl MeshRuntimeConfig {
             enforce_sidecar_egress: self.sidecar_enforced,
             sidecar_egress_dry_run: self.sidecar_enforced_dry_run,
             enforce_sidecar_identity_narrowing: self.sidecar_identity_narrowing,
+            ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
         }
     }
 
@@ -8419,6 +8429,7 @@ fn inject_mesh_global_plugins(
         "cluster_domain": runtime.cluster_domain,
         "trust_domain_aliases": trust_domain_aliases,
         "per_pod_policy_scoping": runtime.topology == MeshTopology::NodeWaypoint,
+        "ambient_udp_source_scoping": runtime.topology.uses_ambient_udp_source_scoping(),
     });
     if runtime.topology == MeshTopology::NodeWaypoint {
         mesh_authz_config["cluster_domains"] =
@@ -17808,6 +17819,9 @@ mod tests {
         assert_eq!(runtime.native_client_config().waypoint_name, None);
         assert_eq!(runtime.xds_client_config().waypoint_name, None);
         assert_eq!(runtime.mesh_slice_request().waypoint_name, None);
+        assert!(!runtime.native_client_config().ambient_udp_source_scoping);
+        assert!(!runtime.xds_client_config().ambient_udp_source_scoping);
+        assert!(!runtime.mesh_slice_request().ambient_udp_source_scoping);
 
         runtime.topology = MeshTopology::ServiceWaypoint;
 
@@ -17822,6 +17836,21 @@ mod tests {
         assert_eq!(
             runtime.mesh_slice_request().waypoint_name.as_deref(),
             Some("api-waypoint")
+        );
+        assert!(runtime.native_client_config().ambient_udp_source_scoping);
+        assert!(runtime.xds_client_config().ambient_udp_source_scoping);
+        assert!(runtime.mesh_slice_request().ambient_udp_source_scoping);
+
+        let mut config = GatewayConfig::default();
+        inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+        let authz = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+            .expect("mesh_authz plugin injected");
+        assert_eq!(
+            authz.config.get("ambient_udp_source_scoping"),
+            Some(&serde_json::Value::Bool(true))
         );
     }
 
@@ -19793,6 +19822,7 @@ mod tests {
             labels_ambiguous: false,
             version: "test".to_string(),
             workloads: Vec::new(),
+            ambient_udp_source_workloads: Vec::new(),
             node_waypoint_assertors: Vec::new(),
             services: Vec::new(),
             local_inbound_services: Vec::new(),
@@ -22432,10 +22462,16 @@ mod tests {
                     .get("mesh_policies")
                     .and_then(|policies| policies.as_array())
                     .expect("mesh policies array");
-                assert_eq!(policies.len(), 1);
+                // Ambient preparation deliberately carries the pre-filter policy
+                // candidates for the UDP source/destination authorization union.
+                // `MeshAuthz::from_config` keeps that superset for UDP, then
+                // cold-path filters its ordinary destination policy slice.
                 assert_eq!(
-                    policies[0].get("name").and_then(|name| name.as_str()),
-                    Some("api-only")
+                    policies
+                        .iter()
+                        .filter_map(|policy| policy.get("name").and_then(|name| name.as_str()))
+                        .collect::<Vec<_>>(),
+                    vec!["api-only", "worker-only"]
                 );
                 assert_eq!(
                     mesh_slice

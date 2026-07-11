@@ -5,6 +5,7 @@
 //! `before_proxy` → `transform_request_body` → `on_final_request_body` →
 //! `backend_admission` → `after_proxy` → `normalize_response_body` →
 //! `on_response_body` → `transform_response_body` → `on_final_response_body` →
+//! `on_response_committed` (buffered responses only) →
 //! `on_response_stream_terminated` (streamed responses only) → `log` →
 //! `on_ws_frame`.
 //!
@@ -1676,7 +1677,15 @@ impl Drop for CompletionNotifyingInspector {
 /// only on the opted-in path, and is removed again when every plugin factory
 /// declines the concrete response, so terminal hooks cannot mistake an
 /// uninspected stream for one with pending write-back state.
+///
+/// This self-contained variant (which runs its own `requires_response_stream_hooks`
+/// scan) is now used only by external test crates; every gateway hot path resolves
+/// the capability through the `PluginCache` and calls
+/// [`create_response_stream_inspector_for_enabled_plugins`] directly.
+/// `#[allow(dead_code)]` because the binary target recompiles the source without
+/// those test crates, so it sees no caller.
 #[doc(hidden)]
+#[allow(dead_code)] // used only by tests/, dead code in the bin target
 pub fn create_response_stream_inspector(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -1689,6 +1698,28 @@ pub fn create_response_stream_inspector(
     {
         return None;
     }
+
+    create_response_stream_inspector_for_enabled_plugins(
+        plugins,
+        ctx,
+        response_status,
+        content_type,
+    )
+}
+
+/// Resolve inspectors after the caller has checked the PluginCache's
+/// precomputed response-stream-hooks capability.
+///
+/// Unlike [`create_response_stream_inspector`], this skips the redundant
+/// per-response capability scan. Request hot paths must use this entry point
+/// behind `PluginCacheRequestView::requires_response_stream_hooks()`.
+pub(crate) fn create_response_stream_inspector_for_enabled_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: u16,
+    content_type: Option<&str>,
+) -> Option<Box<dyn ResponseStreamInspector>> {
+    notify_response_stream_selected(plugins, ctx, response_status, content_type);
 
     ctx.response_stream_id =
         Some(NEXT_RESPONSE_STREAM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
@@ -1708,6 +1739,23 @@ pub fn create_response_stream_inspector(
         ctx.response_stream_id = None;
         ctx.response_stream_completion = None;
         None
+    }
+}
+
+/// Notify opted-in plugins that the final response will use a streaming body,
+/// even when the concrete transport cannot attach a chunk inspector.
+#[doc(hidden)]
+pub fn notify_response_stream_selected(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    response_status: u16,
+    content_type: Option<&str>,
+) {
+    for plugin in plugins
+        .iter()
+        .filter(|plugin| plugin.requires_response_stream_hooks())
+    {
+        plugin.on_response_stream_selected(ctx, response_status, content_type);
     }
 }
 
@@ -3211,6 +3259,31 @@ pub trait Plugin: Send + Sync {
         PluginResult::Continue
     }
 
+    /// Returns `true` when this plugin needs the observe-only committed response
+    /// hook for buffered responses.
+    ///
+    /// The plugin cache precomputes this capability so requests pay only a bit
+    /// test when no exporter needs the hook.
+    fn requires_response_committed_hook(&self) -> bool {
+        false
+    }
+
+    /// Observes the final client-visible buffered response after every
+    /// `on_final_response_body` hook and any resulting rejection replacement.
+    ///
+    /// This hook cannot mutate or reject the response. Exporters should keep
+    /// fail-closed admission checks in an earlier rejecting hook, then construct
+    /// and enqueue records here so status and body describe what the client will
+    /// receive.
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+    }
+
     /// Called exactly once when a streamed, non-buffered response body reaches a
     /// terminal state.
     ///
@@ -3347,6 +3420,18 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Called once after the final response headers select a streaming body,
+    /// before those headers are committed. Unlike
+    /// [`Self::response_stream_inspector`], this notification also runs for
+    /// direct H2/H3 transports that cannot attach a chunk inspector.
+    fn on_response_stream_selected(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _content_type: Option<&str>,
+    ) {
+    }
+
     /// Create a stateful [`ResponseStreamInspector`] for a streaming (non-buffered)
     /// response body, or `None` to stream it through unchanged. Called once per
     /// eligible response for **every** plugin that opts in via
@@ -3370,13 +3455,13 @@ pub trait Plugin: Send + Sync {
         None
     }
 
-    /// Returns `true` if THIS request's response must come back on the reqwest
-    /// streaming path rather than a native-H3 (or other advanced) backend
-    /// transport — e.g. because a response-stream inspector will run and is only
-    /// wired on the reqwest path. Evaluated per request just before backend
-    /// dispatch (after `before_proxy`), so a plugin can scope it to the requests
-    /// it actually inspects (via `ctx` markers) instead of forcing every request
-    /// on the proxy off the fast path. Zero overhead when `false` (default).
+    /// Returns `true` if THIS request should prefer the reqwest streaming path
+    /// over a native backend transport. Every streaming dispatch arm drives
+    /// response inspectors, so this is an optimization (for example to avoid a
+    /// transport-specific bridge), not the inspection correctness boundary.
+    /// Evaluated from the finalized request context immediately before backend
+    /// dispatch, so body-transform markers are visible. Zero overhead when no
+    /// response-stream plugin is configured or this returns `false` (default).
     fn forces_reqwest_dispatch(&self, _ctx: &RequestContext) -> bool {
         false
     }

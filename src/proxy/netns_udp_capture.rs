@@ -96,6 +96,10 @@ impl OpenedUdpCapture {
 /// can still remove the guard even after the pod's cgroup/proc lookup disappears.
 pub struct RetainedUdpGuard {
     cleanup: Option<Box<dyn FnMut() -> bool + Send>>,
+    /// Guard-only recovery used when an unverified identity replacement is
+    /// abandoned and the still-active producer's identity becomes current
+    /// again. Unlike `cleanup`, this must preserve normal capture rules.
+    recover_active: Option<Box<dyn FnMut() -> bool + Send>>,
 }
 
 impl RetainedUdpGuard {
@@ -103,6 +107,18 @@ impl RetainedUdpGuard {
     fn new(cleanup: Box<dyn FnMut() -> bool + Send>) -> Self {
         Self {
             cleanup: Some(cleanup),
+            recover_active: None,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn with_active_recovery(
+        cleanup: Box<dyn FnMut() -> bool + Send>,
+        recover_active: Box<dyn FnMut() -> bool + Send>,
+    ) -> Self {
+        Self {
+            cleanup: Some(cleanup),
+            recover_active: Some(recover_active),
         }
     }
 
@@ -113,14 +129,31 @@ impl RetainedUdpGuard {
         let cleaned = self.cleanup.as_mut().is_none_or(|cleanup| cleanup());
         if cleaned {
             self.cleanup.take();
+            self.recover_active.take();
         }
         cleaned
+    }
+
+    /// Remove only the replacement guard while preserving the producer whose
+    /// fixed identity is active again. Returns false when this guard did not
+    /// originate from an active-producer replacement or cleanup must retry.
+    fn recover_active(&mut self) -> bool {
+        let recovered = self
+            .recover_active
+            .as_mut()
+            .is_some_and(|recover| recover());
+        if recovered {
+            self.recover_active.take();
+            self.cleanup.take();
+        }
+        recovered
     }
 
     /// The backend successfully switched to live capture and already removed
     /// every guard jump. Drop cleanup ownership without touching the live rules.
     fn disarm(mut self) {
         self.cleanup.take();
+        self.recover_active.take();
     }
 }
 
@@ -133,6 +166,18 @@ pub enum NetnsUdpOpenResult {
     Failed,
 }
 
+/// Result of installing the fail-closed guard used before replacing an active
+/// producer whose fixed source identity changed.
+pub enum NetnsUdpGuardResult {
+    /// Every selected UDP egress path is guarded; replacing the producer is safe.
+    Installed(RetainedUdpGuard),
+    /// Guard installation failed after it may have changed netns state. Retain
+    /// cleanup ownership, but keep the old producer until a later verified try.
+    Unverified(RetainedUdpGuard),
+    /// The target could not be opened or validated, so no guard was attempted.
+    Failed,
+}
+
 /// Opens/closes per-pod-netns UDP capture. A trait so the manager's reconcile
 /// logic is unit-testable with a mock (no real netns, `setns`, or iptables).
 pub trait NetnsUdpBackend: Send + Sync + 'static {
@@ -140,6 +185,16 @@ pub trait NetnsUdpBackend: Send + Sync + 'static {
     /// pods sharing a netns open ONE producer. `Err` when the pod netns can't be
     /// resolved this round (terminating / PID race) — the transient-grace case.
     fn netns_key(&self, target: &PodCaptureTarget) -> Result<u64, String>;
+
+    /// Install and retain a scope-exact fail-closed guard without disturbing an
+    /// existing capture socket or its normal TPROXY rules. The manager calls
+    /// this before an identity-driven producer replacement so transient netns
+    /// races cannot turn a safe restart into plaintext bypass.
+    fn prepare_udp_capture_guard(
+        &self,
+        target: &PodCaptureTarget,
+        expected_netns: u64,
+    ) -> NetnsUdpGuardResult;
 
     /// Install UDP TPROXY rules + bind the capture socket + start the capture
     /// loop INSIDE the target pod's netns. `expected_netns` is the inode resolved
@@ -166,9 +221,27 @@ pub trait NetnsUdpCleanupBackend: Send + Sync + 'static {
 /// One active pod-netns UDP producer, keyed in the manager by netns inode.
 struct ActiveUdpCapture {
     handle: OpenedUdpCapture,
+    /// Evidence fixed for this producer. A registry identity change (or a
+    /// shared-netns ambiguity) forces a close/reopen so sessions can never keep
+    /// stamping stale or arbitrarily-selected pod evidence.
+    source_identity: Option<crate::modes::mesh::hbone::UdpSourceIdentity>,
     /// Pod UIDs currently justifying this netns's producer. A netns is closed
     /// only when NONE of its pods still justify it.
     pod_uids: HashSet<String>,
+}
+
+fn consistent_source_identity_for_netns(
+    targets: &[PodCaptureTarget],
+    pod_uids: &HashSet<String>,
+) -> Option<crate::modes::mesh::hbone::UdpSourceIdentity> {
+    let mut identities = targets
+        .iter()
+        .filter(|target| pod_uids.contains(&target.pod_uid))
+        .map(|target| target.source_identity.as_ref());
+    let first = identities.next().flatten()?.clone();
+    identities
+        .all(|identity| identity == Some(&first))
+        .then_some(first)
 }
 
 /// One netns whose producer is not active but whose selected UDP egress is
@@ -424,18 +497,106 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
         // Open producers for newly-seen netns; for an existing netns, refresh pod
         // membership (a shared netns may gain/lose pods without a socket rebind).
         for (netns, pod_uids) in desired {
-            if let Some(active) = self.active.get_mut(&netns) {
-                active.pod_uids = pod_uids;
+            let source_identity = consistent_source_identity_for_netns(&targets, &pod_uids);
+            // Any target in this netns can open it — they share the namespace.
+            let Some(mut target) = targets
+                .iter()
+                .find(|t| pod_uids.contains(&t.pod_uid))
+                .cloned()
+            else {
                 continue;
+            };
+            target.source_identity = source_identity.clone();
+            let identity_unchanged = self
+                .active
+                .get(&netns)
+                .is_some_and(|active| active.source_identity == source_identity);
+            if identity_unchanged {
+                if let Some(active) = self.active.get_mut(&netns) {
+                    active.pod_uids = pod_uids;
+                }
+                if self.guarded.contains_key(&netns) {
+                    let recovered = self
+                        .guarded
+                        .get_mut(&netns)
+                        .is_some_and(|guarded| guarded.handle.recover_active());
+                    if recovered {
+                        self.guarded.remove(&netns);
+                        info!(
+                            netns_inode = netns,
+                            "Removed stale Ambient UDP replacement guard after source identity reverted"
+                        );
+                    } else {
+                        warn!(
+                            netns_inode = netns,
+                            "Could not remove stale Ambient UDP replacement guard; retaining cleanup ownership and retrying"
+                        );
+                    }
+                }
+                continue;
+            }
+
+            // Source evidence is fixed for a producer, so an identity change
+            // requires replacement. Establish a verified DROP guard while the
+            // old producer still owns the socket/rules. If preflight or guard
+            // verification fails, retain the old producer: its stale stamp is
+            // still destination-validated against the live pod UID/SPIFFE pair,
+            // while tearing it down here would create plaintext bypass.
+            if self.active.contains_key(&netns) {
+                match self.backend.prepare_udp_capture_guard(&target, netns) {
+                    NetnsUdpGuardResult::Installed(handle) => {
+                        if let Some(old_guard) = self.guarded.remove(&netns) {
+                            old_guard.handle.disarm();
+                        }
+                        self.guarded.insert(
+                            netns,
+                            GuardedUdpCapture {
+                                handle,
+                                pod_uids: pod_uids.clone(),
+                            },
+                        );
+                    }
+                    NetnsUdpGuardResult::Unverified(handle) => {
+                        match self.guarded.entry(netns) {
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                entry.get_mut().pod_uids = pod_uids.clone();
+                                handle.disarm();
+                            }
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(GuardedUdpCapture {
+                                    handle,
+                                    pod_uids: pod_uids.clone(),
+                                });
+                            }
+                        }
+                        if let Some(active) = self.active.get_mut(&netns) {
+                            active.pod_uids = pod_uids;
+                        }
+                        continue;
+                    }
+                    NetnsUdpGuardResult::Failed => {
+                        if let Some(active) = self.active.get_mut(&netns) {
+                            active.pod_uids = pod_uids;
+                        }
+                        continue;
+                    }
+                }
+            }
+            if let Some(active) = self.active.remove(&netns) {
+                if let Some(task) = active.handle.close() {
+                    if let Some(prior) = self.pending_teardowns.remove(&netns) {
+                        let _ = prior.await;
+                    }
+                    self.pending_teardowns.insert(netns, task);
+                }
+                info!(
+                    netns_inode = netns,
+                    "Restarting Ambient UDP capture producer after source identity changed"
+                );
             }
             if let Some(guarded) = self.guarded.get_mut(&netns) {
                 guarded.pod_uids = pod_uids.clone();
             }
-            // New netns: open one producer. Any target in this netns can open it —
-            // they share the namespace.
-            let Some(target) = targets.iter().find(|t| pod_uids.contains(&t.pod_uid)) else {
-                continue;
-            };
             // Before installing fresh rules in this netns, await a prior
             // producer's teardown (registry flap: closed then reopened for the
             // same pod netns). Take the handle OUT of the map first, then await
@@ -454,7 +615,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                      before reopen; proceeding to reinstall rules"
                 );
             }
-            match self.backend.open_udp_capture(target, netns) {
+            match self.backend.open_udp_capture(&target, netns) {
                 NetnsUdpOpenResult::Opened(handle) => {
                     // The successful backend transition removed all guard jumps.
                     // Disarm the older stable cleanup handle so it cannot later
@@ -468,8 +629,14 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                         capture_port = self.capture_port,
                         "Opened Ambient per-pod-netns UDP capture producer"
                     );
-                    self.active
-                        .insert(netns, ActiveUdpCapture { handle, pod_uids });
+                    self.active.insert(
+                        netns,
+                        ActiveUdpCapture {
+                            handle,
+                            source_identity,
+                            pod_uids,
+                        },
+                    );
                 }
                 NetnsUdpOpenResult::Guarded(handle) => {
                     match self.guarded.entry(netns) {
@@ -902,6 +1069,151 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         super::netns_capture::netns_inode_for_cgroup(&target.cgroup_path).map_err(|e| e.to_string())
     }
 
+    fn prepare_udp_capture_guard(
+        &self,
+        target: &PodCaptureTarget,
+        expected_netns: u64,
+    ) -> NetnsUdpGuardResult {
+        use crate::capture::{Ip6TablesMode, IptablesPlan};
+
+        if IptablesPlan::udp_setup_script(&self.capture_config).is_empty() {
+            return NetnsUdpGuardResult::Failed;
+        }
+        let include_v6 = self.capture_config.ip6tables_mode != Ip6TablesMode::Disabled;
+        let teardown_script = IptablesPlan::udp_teardown_script(include_v6);
+        let guard_script = IptablesPlan::udp_fail_closed_script(&self.capture_config);
+        let guard_teardown_script = IptablesPlan::udp_fail_closed_teardown_script();
+        let capture_output_release_script = IptablesPlan::udp_capture_output_release_script();
+
+        let netns = match super::netns_capture::open_pod_netns_handle(&target.cgroup_path) {
+            Ok(file) => Arc::new(file),
+            Err(error) => {
+                warn!(
+                    pod_uid = %target.pod_uid,
+                    cgroup = %target.cgroup_path,
+                    %error,
+                    "Ambient UDP producer replacement: could not open pod netns before guarding"
+                );
+                return NetnsUdpGuardResult::Failed;
+            }
+        };
+        let opened_netns = match netns
+            .metadata()
+            .map(|m| std::os::unix::fs::MetadataExt::ino(&m))
+        {
+            Ok(inode) => inode,
+            Err(error) => {
+                warn!(
+                    pod_uid = %target.pod_uid,
+                    %error,
+                    "Ambient UDP producer replacement: could not validate pod netns before guarding"
+                );
+                return NetnsUdpGuardResult::Failed;
+            }
+        };
+        if opened_netns != expected_netns {
+            warn!(
+                pod_uid = %target.pod_uid,
+                reconciled_netns_inode = expected_netns,
+                opened_netns_inode = opened_netns,
+                "Ambient UDP producer replacement: pod netns changed before guard installation"
+            );
+            return NetnsUdpGuardResult::Failed;
+        }
+        match super::netns_capture::host_netns_inode() {
+            Ok(host_ino) if opened_netns == host_ino => {
+                warn!(
+                    pod_uid = %target.pod_uid,
+                    netns_inode = opened_netns,
+                    "Ambient UDP producer replacement: refusing to guard the host/proxy netns"
+                );
+                return NetnsUdpGuardResult::Failed;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    pod_uid = %target.pod_uid,
+                    %error,
+                    "Ambient UDP producer replacement: could not compare pod and host netns"
+                );
+                return NetnsUdpGuardResult::Failed;
+            }
+        }
+
+        let retained_guard = {
+            let cleanup_netns = netns.clone();
+            let cleanup_pod_uid = target.pod_uid.clone();
+            let recovery_netns = netns.clone();
+            let recovery_pod_uid = target.pod_uid.clone();
+            let recovery_guard_teardown = guard_teardown_script.clone();
+            RetainedUdpGuard::with_active_recovery(
+                Box::new(move || {
+                    let capture_release = capture_output_release_script.clone();
+                    if let Err(error) =
+                        super::netns_capture::run_in_netns(cleanup_netns.as_ref(), move || {
+                            run_shell_script(&capture_release)
+                        })
+                    {
+                        warn!(
+                            pod_uid = %cleanup_pod_uid,
+                            %error,
+                            "Ambient UDP producer replacement: capture cleanup failed with guard retained"
+                        );
+                        return false;
+                    }
+                    let strict_release = guard_teardown_script.clone();
+                    if let Err(error) =
+                        super::netns_capture::run_in_netns(cleanup_netns.as_ref(), move || {
+                            run_shell_script(&strict_release)
+                        })
+                    {
+                        warn!(
+                            pod_uid = %cleanup_pod_uid,
+                            %error,
+                            "Ambient UDP producer replacement: guard cleanup failed; will retry"
+                        );
+                        return false;
+                    }
+                    let cleanup = teardown_script.clone();
+                    let _ = super::netns_capture::run_in_netns(cleanup_netns.as_ref(), move || {
+                        run_shell_script(&cleanup)
+                    });
+                    true
+                }),
+                Box::new(move || {
+                    let strict_release = recovery_guard_teardown.clone();
+                    if let Err(error) =
+                        super::netns_capture::run_in_netns(recovery_netns.as_ref(), move || {
+                            run_shell_script(&strict_release)
+                        })
+                    {
+                        warn!(
+                            pod_uid = %recovery_pod_uid,
+                            %error,
+                            "Ambient UDP producer replacement: could not release reverted-identity guard"
+                        );
+                        return false;
+                    }
+                    true
+                }),
+            )
+        };
+        let guard_result = super::netns_capture::run_in_netns(netns.as_ref(), move || {
+            run_shell_script(&guard_script)
+        });
+        match guard_result {
+            Ok(()) => NetnsUdpGuardResult::Installed(retained_guard),
+            Err(error) => {
+                warn!(
+                    pod_uid = %target.pod_uid,
+                    %error,
+                    "Ambient UDP producer replacement: fail-closed guard could not be verified; retaining old producer"
+                );
+                NetnsUdpGuardResult::Unverified(retained_guard)
+            }
+        }
+    }
+
     fn open_udp_capture(
         &self,
         target: &PodCaptureTarget,
@@ -1060,7 +1372,11 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         // paths AND moved into the loop's cleanup task.
         let teardown = {
             let netns = netns.clone();
-            let teardown_script = teardown_script.clone();
+            // A verified replacement guard may coexist with this live producer
+            // while its task shuts down. Remove only normal capture state here;
+            // guard ownership lives in the manager and must survive until the
+            // replacement socket and rules are ready.
+            let teardown_script = capture_teardown_script.clone();
             move || {
                 let netns = netns.clone();
                 let teardown_script = teardown_script.clone();
@@ -1185,6 +1501,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
             recvmmsg_batch_size: self.recvmmsg_batch_size,
             session_shard_amount: self.session_shard_amount,
             session_limiter: self.session_limiter.clone(),
+            source_identity: target.source_identity.clone().map(Arc::new),
             reply_socket_factory,
         };
 
@@ -1231,6 +1548,14 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
 impl NetnsUdpBackend for ProxyNetnsUdpBackend {
     fn netns_key(&self, _target: &PodCaptureTarget) -> Result<u64, String> {
         Err("Ambient per-pod-netns UDP capture is Linux-only".to_string())
+    }
+
+    fn prepare_udp_capture_guard(
+        &self,
+        _target: &PodCaptureTarget,
+        _expected_netns: u64,
+    ) -> NetnsUdpGuardResult {
+        NetnsUdpGuardResult::Failed
     }
 
     fn open_udp_capture(
@@ -1307,6 +1632,11 @@ mod tests {
         events: Arc<Mutex<Vec<Event>>>,
         /// netns inodes for which `open_udp_capture` should fail (retry testing).
         fail_open: Mutex<HashSet<u64>>,
+        /// Netns inodes whose identity-replacement guard cannot be installed.
+        fail_guard_prepare: Mutex<HashSet<u64>>,
+        /// Netns inodes whose replacement guard attempt is unverified after it
+        /// may have installed a partial guard.
+        unverified_guard_prepare: Mutex<HashSet<u64>>,
         /// Retained-guard cleanup fails once for these netns, exercising manager
         /// ownership across a transient xtables-style cleanup error.
         fail_guard_cleanup_once: Arc<Mutex<HashSet<u64>>>,
@@ -1328,6 +1658,8 @@ mod tests {
                 closed: Arc::new(Mutex::new(Vec::new())),
                 events: Arc::new(Mutex::new(Vec::new())),
                 fail_open: Mutex::new(HashSet::new()),
+                fail_guard_prepare: Mutex::new(HashSet::new()),
+                unverified_guard_prepare: Mutex::new(HashSet::new()),
                 fail_guard_cleanup_once: Arc::new(Mutex::new(HashSet::new())),
                 slow_teardown: false,
             }
@@ -1364,6 +1696,24 @@ mod tests {
             }
         }
 
+        fn set_fail_guard_prepare(&self, netns: u64, fail: bool) {
+            let mut set = self.fail_guard_prepare.lock().unwrap();
+            if fail {
+                set.insert(netns);
+            } else {
+                set.remove(&netns);
+            }
+        }
+
+        fn set_unverified_guard_prepare(&self, netns: u64, unverified: bool) {
+            let mut set = self.unverified_guard_prepare.lock().unwrap();
+            if unverified {
+                set.insert(netns);
+            } else {
+                set.remove(&netns);
+            }
+        }
+
         fn fail_next_guard_cleanup(&self, netns: u64) {
             self.fail_guard_cleanup_once.lock().unwrap().insert(netns);
         }
@@ -1380,6 +1730,57 @@ mod tests {
                 Some(Some(netns)) => Ok(*netns),
                 _ => Err(format!("netns unresolved for {}", target.cgroup_path)),
             }
+        }
+
+        fn prepare_udp_capture_guard(
+            &self,
+            _target: &PodCaptureTarget,
+            expected_netns: u64,
+        ) -> NetnsUdpGuardResult {
+            if self
+                .fail_guard_prepare
+                .lock()
+                .unwrap()
+                .contains(&expected_netns)
+            {
+                return NetnsUdpGuardResult::Failed;
+            }
+            if self
+                .unverified_guard_prepare
+                .lock()
+                .unwrap()
+                .contains(&expected_netns)
+            {
+                let cleanup_closed = self.closed.clone();
+                let cleanup_events = self.events.clone();
+                let recovery_closed = self.closed.clone();
+                let recovery_events = self.events.clone();
+                return NetnsUdpGuardResult::Unverified(RetainedUdpGuard::with_active_recovery(
+                    Box::new(move || {
+                        cleanup_closed.lock().unwrap().push(expected_netns);
+                        cleanup_events
+                            .lock()
+                            .unwrap()
+                            .push(Event::TornDown(expected_netns));
+                        true
+                    }),
+                    Box::new(move || {
+                        recovery_closed.lock().unwrap().push(expected_netns);
+                        recovery_events
+                            .lock()
+                            .unwrap()
+                            .push(Event::TornDown(expected_netns));
+                        true
+                    }),
+                ));
+            }
+            let closed = self.closed.clone();
+            let events = self.events.clone();
+            NetnsUdpGuardResult::Installed(RetainedUdpGuard::new(Box::new(move || {
+                closed.lock().unwrap().push(expected_netns);
+                events.lock().unwrap().push(Event::TornDown(expected_netns));
+                true
+            })))
         }
 
         fn open_udp_capture(
@@ -1490,6 +1891,7 @@ mod tests {
                 .map(|t| PodCaptureTarget {
                     pod_uid: t.pod_uid.clone(),
                     cgroup_path: t.cgroup_path.clone(),
+                    source_identity: t.source_identity.clone(),
                     source_ips: t.source_ips,
                 })
                 .collect()
@@ -1500,8 +1902,25 @@ mod tests {
         PodCaptureTarget {
             pod_uid: uid.to_string(),
             cgroup_path: cgroup.to_string(),
+            source_identity: None,
             source_ips: Default::default(),
         }
+    }
+
+    #[test]
+    fn shared_netns_conflicting_source_evidence_is_suppressed() {
+        let uid_a = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        let uid_b = "6ba7b811-9dad-11d1-80b4-00c04fd430c8";
+        let principal =
+            crate::identity::SpiffeId::new("spiffe://cluster.local/ns/default/sa/client").unwrap();
+        let mut a = target(uid_a, "/cg/shared");
+        a.source_identity =
+            crate::modes::mesh::hbone::UdpSourceIdentity::new(principal.clone(), uid_a);
+        let mut b = target(uid_b, "/cg/shared");
+        b.source_identity = crate::modes::mesh::hbone::UdpSourceIdentity::new(principal, uid_b);
+        let uids = HashSet::from([uid_a.to_string(), uid_b.to_string()]);
+
+        assert!(consistent_source_identity_for_netns(&[a, b], &uids).is_none());
     }
 
     fn manager(
@@ -1540,6 +1959,130 @@ mod tests {
         // Idempotent: a second reconcile opens nothing new.
         assert_eq!(mgr.reconcile_once().await, 2);
         assert_eq!(opened.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn identity_change_keeps_active_producer_until_replacement_guard_is_verified() {
+        let uid = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        let source = Arc::new(StaticSource(Mutex::new(vec![target(uid, "/cg/a")])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let opened = backend.opened.clone();
+        let closed = backend.closed.clone();
+        let mut mgr = manager(source.clone(), backend);
+
+        mgr.reconcile_once().await;
+        let mut attributed = target(uid, "/cg/a");
+        attributed.source_identity = crate::modes::mesh::hbone::UdpSourceIdentity::new(
+            crate::identity::SpiffeId::new("spiffe://cluster.local/ns/default/sa/client").unwrap(),
+            uid,
+        );
+        *source.0.lock().unwrap() = vec![attributed];
+        mgr.backend.set_fail_guard_prepare(100, true);
+
+        mgr.reconcile_once().await;
+
+        assert_eq!(*opened.lock().unwrap(), vec![100]);
+        assert!(
+            closed.lock().unwrap().is_empty(),
+            "pre-guard failure must not tear down the live producer"
+        );
+        assert!(
+            mgr.active
+                .get(&100)
+                .is_some_and(|active| active.source_identity.is_none()),
+            "the old producer remains active until replacement is guarded"
+        );
+
+        mgr.backend.set_fail_guard_prepare(100, false);
+        mgr.reconcile_once().await;
+
+        assert_eq!(*opened.lock().unwrap(), vec![100, 100]);
+        assert_eq!(*closed.lock().unwrap(), vec![100]);
+        assert!(
+            mgr.active
+                .get(&100)
+                .is_some_and(|active| active.source_identity.is_some())
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_revert_releases_unverified_guard_without_restarting_active_producer() {
+        let uid = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        let source = Arc::new(StaticSource(Mutex::new(vec![target(uid, "/cg/a")])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let opened = backend.opened.clone();
+        let released = backend.closed.clone();
+        let mut mgr = manager(source.clone(), backend);
+
+        mgr.reconcile_once().await;
+        let mut attributed = target(uid, "/cg/a");
+        attributed.source_identity = crate::modes::mesh::hbone::UdpSourceIdentity::new(
+            crate::identity::SpiffeId::new("spiffe://cluster.local/ns/default/sa/client").unwrap(),
+            uid,
+        );
+        *source.0.lock().unwrap() = vec![attributed];
+        mgr.backend.set_unverified_guard_prepare(100, true);
+        mgr.reconcile_once().await;
+        assert_eq!(mgr.guarded.len(), 1);
+        assert_eq!(*opened.lock().unwrap(), vec![100]);
+
+        *source.0.lock().unwrap() = vec![target(uid, "/cg/a")];
+        mgr.reconcile_once().await;
+
+        assert!(mgr.guarded.is_empty());
+        assert_eq!(*opened.lock().unwrap(), vec![100]);
+        assert_eq!(
+            *released.lock().unwrap(),
+            vec![100],
+            "identity reversion must release only the retained guard"
+        );
+        assert!(
+            mgr.active
+                .get(&100)
+                .is_some_and(|active| active.source_identity.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn unverified_guard_retry_refreshes_shared_netns_membership() {
+        let uid_a = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        let uid_b = "16b2c3d4-9dad-11d1-80b4-00c04fd430c8";
+        let attributed = |uid: &str, principal: &str| {
+            let mut capture_target = target(uid, "/cg/a");
+            capture_target.source_identity = crate::modes::mesh::hbone::UdpSourceIdentity::new(
+                crate::identity::SpiffeId::new(principal).unwrap(),
+                uid,
+            );
+            capture_target
+        };
+        let source = Arc::new(StaticSource(Mutex::new(vec![attributed(
+            uid_a,
+            "spiffe://cluster.local/ns/default/sa/old-client",
+        )])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let mut mgr = manager(source.clone(), backend);
+
+        mgr.reconcile_once().await;
+        mgr.backend.set_unverified_guard_prepare(100, true);
+        *source.0.lock().unwrap() = vec![attributed(
+            uid_a,
+            "spiffe://cluster.local/ns/default/sa/new-client",
+        )];
+        mgr.reconcile_once().await;
+
+        *source.0.lock().unwrap() = vec![
+            attributed(uid_a, "spiffe://cluster.local/ns/default/sa/new-client"),
+            attributed(uid_b, "spiffe://cluster.local/ns/default/sa/sidecar"),
+        ];
+        mgr.reconcile_once().await;
+
+        assert_eq!(
+            mgr.guarded
+                .get(&100)
+                .map(|guarded| guarded.pod_uids.clone()),
+            Some(HashSet::from([uid_a.to_string(), uid_b.to_string()])),
+            "the retained cleanup handle must track the current shared-netns membership"
+        );
     }
 
     #[tokio::test]

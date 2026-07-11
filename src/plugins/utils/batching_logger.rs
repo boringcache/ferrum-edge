@@ -111,6 +111,30 @@ pub struct BatchingLogger<T: Send + 'static> {
     hooks: LoggerHooks<T>,
 }
 
+/// An atomically reserved queue slot for a record that will be constructed
+/// later. Dropping an unused permit releases both the channel slot and the
+/// logger's depth accounting.
+pub struct BatchingLoggerPermit<T: Send + 'static> {
+    permit: Option<mpsc::OwnedPermit<T>>,
+    queue_depth: Arc<AtomicUsize>,
+}
+
+impl<T: Send + 'static> BatchingLoggerPermit<T> {
+    pub fn send(mut self, item: T) {
+        if let Some(permit) = self.permit.take() {
+            permit.send(item);
+        }
+    }
+}
+
+impl<T: Send + 'static> Drop for BatchingLoggerPermit<T> {
+    fn drop(&mut self) {
+        if self.permit.is_some() {
+            decrement_queue_depth(&self.queue_depth);
+        }
+    }
+}
+
 type FailedBatchHook<T> = Arc<dyn Fn(Vec<T>, String) + Send + Sync>;
 type OverflowHook<T> = Arc<dyn Fn(T, &'static str) + Send + Sync>;
 type HighWaterHook = Arc<dyn Fn(usize, usize) + Send + Sync>;
@@ -228,6 +252,30 @@ impl<T: Send + 'static> BatchingLogger<T> {
                 decrement_queue_depth(&self.queue_depth);
                 self.record_drop("worker unavailable during shutdown");
                 false
+            }
+        }
+    }
+
+    /// Atomically reserve one bounded-channel slot without constructing the
+    /// item yet. This supports fail-closed plugins that must guarantee enqueue
+    /// capacity before a response becomes immutable, while filling the record
+    /// only after later validators determine the final status and body.
+    pub fn try_reserve(&self) -> Option<BatchingLoggerPermit<T>> {
+        self.queue_depth.fetch_add(1, Ordering::Relaxed);
+        match self.sender.clone().try_reserve_owned() {
+            Ok(permit) => Some(BatchingLoggerPermit {
+                permit: Some(permit),
+                queue_depth: Arc::clone(&self.queue_depth),
+            }),
+            Err(mpsc::error::TrySendError::Full(_sender)) => {
+                decrement_queue_depth(&self.queue_depth);
+                self.record_drop("buffer full while reserving a commit slot");
+                None
+            }
+            Err(mpsc::error::TrySendError::Closed(_sender)) => {
+                decrement_queue_depth(&self.queue_depth);
+                self.record_drop("worker unavailable while reserving a commit slot");
+                None
             }
         }
     }

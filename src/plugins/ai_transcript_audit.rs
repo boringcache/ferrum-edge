@@ -44,14 +44,14 @@ use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
 use super::utils::{
-    BatchConfigDefaults, BatchingLogger, LoggerHooks, PluginHttpClient, build_batch_config,
-    handle_http_batch_response, parse_http_endpoint, validate_batch_config,
+    BatchConfigDefaults, BatchingLogger, BatchingLoggerPermit, LoggerHooks, PluginHttpClient,
+    build_batch_config, handle_http_batch_response, parse_http_endpoint, validate_batch_config,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction,
     ResponseStreamInspector, TransactionSummary,
 };
-use crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY;
+use crate::proxy::{REJECTION_RESPONSE_METADATA_KEY, SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY};
 
 /// Schema version stamped onto every emitted record.
 const RECORD_VERSION: u32 = 1;
@@ -176,6 +176,7 @@ struct AuditStaging {
     request_hash: Option<String>,
     request_model: Option<String>,
     tool_names: Vec<String>,
+    commit_permit: Option<BatchingLoggerPermit<AuditRecord>>,
 }
 
 /// Response bytes captured by the streaming inspector, handed to
@@ -615,9 +616,13 @@ impl AiTranscriptAudit {
         }
     }
 
-    fn enqueue(&self, record: AuditRecord) -> SinkOutcome {
+    fn enqueue(&self, record: AuditRecord, staging: Option<&mut AuditStaging>) -> SinkOutcome {
         if !self.rate_limiter.try_acquire() {
             return SinkOutcome::Dropped;
+        }
+        if let Some(permit) = staging.and_then(|staging| staging.commit_permit.take()) {
+            permit.send(record);
+            return SinkOutcome::Queued;
         }
         if self.logger.try_send(record) {
             SinkOutcome::Queued
@@ -626,6 +631,45 @@ impl AiTranscriptAudit {
         } else {
             SinkOutcome::Dropped
         }
+    }
+
+    fn commit_may_emit(&self, sample_hit: bool) -> bool {
+        sample_hit || self.sampling.always_on_error || self.sampling.always_on_guardrail
+    }
+
+    /// Reserve fail-closed sink capacity before the response becomes
+    /// immutable. The permit is stored with the bounded request staging and is
+    /// consumed only after validators determine the final status/body.
+    fn ensure_commit_admission(&self, ctx: &mut RequestContext) -> PluginResult {
+        if !self.requires_response_committed_hook() {
+            return PluginResult::Continue;
+        }
+        let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
+            return PluginResult::Continue;
+        };
+        let Some(mut staging) = self.staging.get_mut(&record_id) else {
+            return PluginResult::Continue;
+        };
+        if !self.commit_may_emit(staging.sample_hit) {
+            return PluginResult::Continue;
+        }
+
+        if self.on_buffer_full == BufferFullPolicy::Reject && staging.commit_permit.is_none() {
+            let Some(permit) = self.logger.try_reserve() else {
+                ctx.metadata
+                    .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
+                return reject_audit_unavailable();
+            };
+            staging.commit_permit = Some(permit);
+        }
+        if self.on_sink_error == SinkErrorPolicy::Reject
+            && !self.sink_healthy.load(Ordering::Relaxed)
+        {
+            ctx.metadata
+                .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
+            return reject_audit_unavailable();
+        }
+        PluginResult::Continue
     }
 
     fn sweep_staging(&self) {
@@ -741,6 +785,7 @@ impl AiTranscriptAudit {
                 request_hash: Some(request_hash),
                 request_model,
                 tool_names,
+                commit_permit: None,
             },
         );
     }
@@ -774,6 +819,24 @@ impl AiTranscriptAudit {
             staged.request_model = parsed.as_ref().and_then(extract_model);
             if self.capture.tool_calls {
                 staged.tool_names = parsed.as_ref().map(extract_tool_names).unwrap_or_default();
+            }
+        }
+        // Re-detect `stream` on the FINAL backend-visible body: a
+        // `request_transformer` may have added OR removed `"stream": true`
+        // after `before_proxy` staged the candidate. `MD_STREAM_REQUEST` drives
+        // the later buffer-vs-stream response decision
+        // (`buffered_response_capture_wanted`), so — mirroring
+        // `ai_tool_governor` — the marker must track the final body in BOTH
+        // directions. An unparseable body cannot rule out `stream: true`, so
+        // conservatively mark it streaming; only a parsed, provably
+        // non-streaming body clears the marker.
+        match parsed.as_ref() {
+            Some(json) if json.get("stream").and_then(Value::as_bool) != Some(true) => {
+                ctx.metadata.remove(MD_STREAM_REQUEST);
+            }
+            Some(_) | None => {
+                ctx.metadata
+                    .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
             }
         }
         ctx.metadata
@@ -1047,28 +1110,21 @@ impl AiTranscriptAudit {
         // then streamed too, so its body is not buffered-captured — the log
         // fallback still records the request side, status, and error reason.
         // Forcing a buffer to catch that body would risk the failure above for
-        // the common SSE success case. The marker is derived from the
-        // pre-transform body because this decision is made before request-body
-        // transforms run; a later transformer that rewrites `stream` cannot be
-        // reflected here (same ordering limit as the AI-candidate
-        // classification; proxy-core follow-up: issue #2055).
+        // the common SSE success case. The marker is refreshed from the final
+        // backend-visible body by `on_final_request_body_with_context`
+        // (via `refresh_staged_request` for an already-classified candidate, or
+        // `stage_candidate` otherwise) — after transforms and before this
+        // response policy is committed — in both directions, so a
+        // transformer-added or -removed `stream` value is reflected here.
         if flag(&ctx.metadata, MD_STREAM_REQUEST) {
             return false;
         }
         match ctx.metadata.get(MD_CANDIDATE).map(String::as_str) {
             Some("true") => true,
-            // `before_proxy` classified the pre-transform body as non-AI. This
-            // decision is locked in before `on_final_request_body_with_context`
-            // could re-stage a candidate that a later request-body transformer
-            // (ordered after priority 2924) turned into an AI payload, so such a
-            // request's *buffered* response body is not captured. That is a
-            // deliberate tradeoff: buffering every JSON POST response instead
-            // would re-introduce the over-buffering of ordinary non-AI traffic a
-            // prior review flagged. The stream marker has the same pre-transform
-            // limit: only bodies that classified as AI at staging time are
-            // marked for stream inspection (proxy-core follow-up: issue #2055).
-            // The transaction is still audited request-side via the `log`
-            // fallback.
+            // The final transformed body was classified as non-AI. Do not
+            // buffer every JSON POST response: that would over-buffer ordinary
+            // non-AI traffic. The transaction is still audited request-side via
+            // the `log` fallback.
             Some("false") => false,
             _ => {
                 ctx.method == "POST"
@@ -1078,6 +1134,17 @@ impl AiTranscriptAudit {
                         .is_some_and(|content_type| is_json_content_type(content_type))
             }
         }
+    }
+
+    fn buffered_response_capture_enabled(
+        &self,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.capture.response
+            || (self.capture.streaming != StreamingCapture::Off
+                && response_headers
+                    .get("content-type")
+                    .is_some_and(|content_type| is_event_stream(content_type)))
     }
 }
 
@@ -1110,10 +1177,11 @@ impl Plugin for AiTranscriptAudit {
     /// - `before_proxy` terminators (`ai_federation`, `ai_semantic_cache`
     ///   hits) consume it and short-circuit — their transactions must still
     ///   be audited via the response/log hooks;
-    /// - the proxy's response stream-vs-buffer decision runs (it reads
-    ///   `ai_transcript_audit.candidate` via `should_buffer_response_body`);
-    /// - `forces_reqwest_dispatch` is evaluated ahead of backend dispatch (it
-    ///   reads the stream marker written during staging).
+    /// - the proxy's post-transform response stream-vs-buffer decision runs (it
+    ///   reads `ai_transcript_audit.candidate` via
+    ///   `should_buffer_response_body`);
+    /// - the final `forces_reqwest_dispatch` preference is evaluated (it reads
+    ///   the stream marker written during staging).
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.active
     }
@@ -1155,7 +1223,11 @@ impl Plugin for AiTranscriptAudit {
         };
         self.stage_candidate(ctx, body.as_bytes());
         ctx.metadata.insert("request_body".to_string(), body);
-        PluginResult::Continue
+        if flag(&ctx.metadata, MD_STREAM_REQUEST) {
+            PluginResult::Continue
+        } else {
+            self.ensure_commit_admission(ctx)
+        }
     }
 
     /// The proxy only routes the context-aware final-body hook to plugins that
@@ -1221,17 +1293,27 @@ impl Plugin for AiTranscriptAudit {
         _response_status: u16,
         _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.active
-            || flag(&ctx.metadata, MD_FINAL_REQ_SEEN)
-            || !flag(&ctx.metadata, MD_CANDIDATE)
-        {
+        if !self.active || !flag(&ctx.metadata, MD_CANDIDATE) {
             return PluginResult::Continue;
         }
-        if let Some(body) = ctx.metadata.remove("request_body") {
+        if !flag(&ctx.metadata, MD_FINAL_REQ_SEEN)
+            && let Some(body) = ctx.metadata.remove("request_body")
+        {
             self.refresh_staged_request(ctx, body.as_bytes());
             ctx.metadata.insert("request_body".to_string(), body);
         }
-        PluginResult::Continue
+        if flag(&ctx.metadata, MD_STREAM_REQUEST) {
+            PluginResult::Continue
+        } else if ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY) {
+            // `apply_after_proxy_hooks_to_rejection` is replaying header hooks
+            // over an already-fixed response and ignores replacement rejects.
+            // Admission ran in `before_proxy` (or the normal backend
+            // `after_proxy` pass); do not stamp a new rejected verdict whose
+            // 503 cannot replace the response at this point.
+            PluginResult::Continue
+        } else {
+            self.ensure_commit_admission(ctx)
+        }
     }
 
     // ---- buffered response capture ----
@@ -1273,9 +1355,9 @@ impl Plugin for AiTranscriptAudit {
     async fn on_final_response_body(
         &self,
         ctx: &mut RequestContext,
-        response_status: u16,
+        _response_status: u16,
         response_headers: &HashMap<String, String>,
-        body: &[u8],
+        _body: &[u8],
     ) -> PluginResult {
         // `capture.response` gates buffered *JSON* responses. A buffered SSE body
         // can still reach this hook when streaming capture is enabled but the
@@ -1284,11 +1366,7 @@ impl Plugin for AiTranscriptAudit {
         // path left to attach the response transcript. Honor the streaming
         // policy (`response_body_capture_allowed` already permits SSE) even when
         // buffered JSON capture is off.
-        let buffered_sse_capture = self.capture.streaming != StreamingCapture::Off
-            && response_headers
-                .get("content-type")
-                .is_some_and(|content_type| is_event_stream(content_type));
-        if !self.capture.response && !buffered_sse_capture {
+        if !self.buffered_response_capture_enabled(response_headers) {
             return PluginResult::Continue;
         }
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
@@ -1313,10 +1391,61 @@ impl Plugin for AiTranscriptAudit {
             ctx.metadata.insert("request_body".to_string(), body);
         }
 
-        let captures_response_body = response_body_capture_allowed(self.capture, response_headers);
-        let response_hash = captures_response_body.then(|| self.redactor.keyed_hash_hex(body));
+        // Peek (do not consume) the staging entry for the fail-closed gate. The
+        // observe-only committed hook consumes it after every validator has run.
+        let sample_hit = self
+            .staging
+            .get(&record_id)
+            .map(|staging| staging.sample_hit)
+            .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
+        // The transaction-log `sampled` flag carries the sampling ROLL (matching
+        // the exported record's `sampled` field), not the emit decision —
+        // `sink_status` already conveys whether a record was emitted.
+        ctx.metadata
+            .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
 
-        // Peek (do not consume) the staging entry to make the emit decision.
+        if self.commit_may_emit(sample_hit) {
+            let admission = self.ensure_commit_admission(ctx);
+            if !matches!(admission, PluginResult::Continue) {
+                return admission;
+            }
+        }
+
+        // Keep rejection-capable sink admission here, before the response is
+        // committed. Record construction and enqueue happen later with the
+        // final status/body. The committed 503 record remains a recovery probe:
+        // a successful flush flips sink health back to true.
+        ctx.metadata
+            .insert(MD_SINK_STATUS.to_string(), "deferred".to_string());
+        PluginResult::Continue
+    }
+
+    fn requires_response_committed_hook(&self) -> bool {
+        self.capture.response || self.capture.streaming != StreamingCapture::Off
+    }
+
+    async fn on_response_committed(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) {
+        if !self.buffered_response_capture_enabled(response_headers) {
+            return;
+        }
+        let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
+            return;
+        };
+        if !flag(&ctx.metadata, MD_CANDIDATE) {
+            self.staging.remove(&record_id);
+            return;
+        }
+        let request_rejected_for_sink = ctx
+            .metadata
+            .get(MD_SINK_STATUS)
+            .is_some_and(|status| status == "rejected");
+
         let sample_hit = self
             .staging
             .get(&record_id)
@@ -1327,67 +1456,39 @@ impl Plugin for AiTranscriptAudit {
             guardrail_fired(&ctx.metadata),
             response_status >= 400,
         );
+        ctx.metadata
+            .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
 
+        let mut staging = self.staging.remove(&record_id).map(|(_, value)| value);
+        if !emit {
+            // A fail-closed rejection (`on_sink_error`/`on_buffer_full: reject`)
+            // stamps `MD_SINK_STATUS = "rejected"` and returns a 503 in the
+            // admission phase; that verdict is terminal. A later not-emitting
+            // decision must not overwrite it, or the client-visible 503 would be
+            // logged as `skipped` and the fail-closed audit trail lost.
+            ctx.metadata.insert(
+                MD_SINK_STATUS.to_string(),
+                if request_rejected_for_sink {
+                    "rejected".to_string()
+                } else {
+                    "skipped".to_string()
+                },
+            );
+            return;
+        }
+
+        let captures_response_body = response_body_capture_allowed(self.capture, response_headers);
+        let response_hash = captures_response_body.then(|| self.redactor.keyed_hash_hex(body));
         if let Some(response_hash) = response_hash.as_ref() {
             ctx.metadata
                 .insert(MD_RESPONSE_HASH.to_string(), response_hash.clone());
         }
-        // The transaction-log `sampled` flag carries the sampling ROLL (matching
-        // the exported record's `sampled` field), not the emit decision —
-        // `sink_status` already conveys whether a record was emitted.
-        ctx.metadata
-            .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
-
-        if !emit {
-            // Leave the staging entry in place. A later same-phase validator
-            // (`body_validator` 2950, `openapi_validator` 2960) can still turn
-            // this response into a 4xx/5xx after us; the `log` fallback then
-            // re-evaluates `always_capture_on_error` against the final
-            // client-visible status and is the only path that can emit that
-            // plugin-generated error. Discarding staging here would drop it.
-            // The stamped status is deliberately non-terminal: `log()` runs
-            // after the summary metadata was captured and cannot rewrite it,
-            // so a terminal "skipped" would lie whenever the fallback later
-            // emits. `deferred` = no record was emitted at response time, but
-            // one may still be emitted via the log fallback — correlate by
-            // `record_id` against the collector.
-            ctx.metadata
-                .insert(MD_SINK_STATUS.to_string(), "deferred".to_string());
-            return PluginResult::Continue;
-        }
-        // A response hook is emitting now, so consume the staging entry to keep
-        // the `log` fallback from emitting a duplicate. Accepted limitation: a
-        // later same-phase validator (2950/2960) that replaces the response
-        // AFTER this emit leaves the exported record with the backend
-        // status/body; the transaction log carries the client-visible status
-        // plus `record_id` for correlation. No hook exists that has the final
-        // status, the body, and fail-closed rejection at once — proxy-core
-        // follow-up: issue #2056.
-        let staging = self.staging.remove(&record_id).map(|(_, value)| value);
         let (response_excerpt, response_truncated) = if captures_response_body {
             self.shape_body(body, self.limits.max_response_bytes)
         } else {
             (None, false)
         };
-        // Fail-closed stance while the sink is unhealthy: the client request
-        // is rejected, but the record is still built and enqueued below. The
-        // background flush of those queued records is the recovery probe — a
-        // successful batch send flips `sink_healthy` back to true. Without
-        // this, one transient sink outage would reject audited traffic
-        // forever (nothing would ever enqueue, so nothing could ever flush).
-        let sink_unhealthy_reject = self.on_sink_error == SinkErrorPolicy::Reject
-            && !self.sink_healthy.load(Ordering::Relaxed);
-
-        // When we are about to fail closed, the client-visible outcome is the 503
-        // from `reject_audit_unavailable()`, not the backend status — stamp that
-        // on the record so the collector does not read a fail-closed outage as a
-        // successful 2xx transaction.
-        let record_status = if sink_unhealthy_reject {
-            503
-        } else {
-            response_status
-        };
-        let envelope = self.envelope_from_ctx(ctx, record_status);
+        let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(
             &record_id,
             envelope,
@@ -1400,25 +1501,44 @@ impl Plugin for AiTranscriptAudit {
             reason,
             Some(response_headers),
         );
-        let status = match self.enqueue(record) {
+        let status = match self.enqueue(record, staging.as_mut()) {
             SinkOutcome::Queued => "queued",
             SinkOutcome::Dropped => "dropped",
             SinkOutcome::Rejected => "rejected",
         };
-        if sink_unhealthy_reject || status == "rejected" {
-            ctx.metadata
-                .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
-            return reject_audit_unavailable();
-        }
-        ctx.metadata
-            .insert(MD_SINK_STATUS.to_string(), status.to_string());
-        PluginResult::Continue
+        ctx.metadata.insert(
+            MD_SINK_STATUS.to_string(),
+            if request_rejected_for_sink {
+                "rejected".to_string()
+            } else {
+                status.to_string()
+            },
+        );
     }
 
     // ---- streaming (SSE) response capture ----
 
     fn requires_response_stream_hooks(&self) -> bool {
         self.capture.streaming != StreamingCapture::Off
+            || (self.capture.response && self.on_buffer_full == BufferFullPolicy::Reject)
+    }
+
+    fn on_response_stream_selected(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        _content_type: Option<&str>,
+    ) {
+        let Some(record_id) = ctx.metadata.get(MD_RECORD_ID) else {
+            return;
+        };
+        // A streamed response cannot be rejected after its headers commit.
+        // Release capacity reserved by the conservative pre-header buffering
+        // decision for every content type and transport, including direct
+        // H2/H3 responses for which no chunk inspector attaches.
+        if let Some(mut staging) = self.staging.get_mut(record_id) {
+            staging.commit_permit.take();
+        }
     }
 
     fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
@@ -1433,12 +1553,13 @@ impl Plugin for AiTranscriptAudit {
         response_status: u16,
         content_type: Option<&str>,
     ) -> Option<Box<dyn ResponseStreamInspector>> {
+        if !content_type.is_some_and(is_event_stream) {
+            return None;
+        }
+        let record_id = ctx.metadata.get(MD_RECORD_ID)?.clone();
         if self.capture.streaming == StreamingCapture::Off
             || !flag(&ctx.metadata, &self.stream_marker_key())
         {
-            return None;
-        }
-        if !content_type.is_some_and(is_event_stream) {
             return None;
         }
         // In `sampled` mode the marker alone is not enough: only tee streams
@@ -1447,7 +1568,6 @@ impl Plugin for AiTranscriptAudit {
         if !self.stream_tee_wanted(&ctx.metadata) {
             return None;
         }
-        let record_id = ctx.metadata.get(MD_RECORD_ID)?.clone();
         let sample_hit = self.staged_sample_hit(&ctx.metadata);
         // 2xx SSE is the normal capture path. A non-2xx SSE is teed too when the
         // record will emit anyway — either `always_capture_on_error` is set, or
@@ -1530,9 +1650,9 @@ impl Plugin for AiTranscriptAudit {
             return;
         }
 
-        // A response already being streamed cannot be rejected, so the
-        // fail-closed sink stance only applies to buffered responses.
-        let staging = self.staging.remove(&record_id).map(|(_, value)| value);
+        // A response already being streamed cannot run a new rejecting
+        // admission, so stream-terminal enqueue is best-effort.
+        let mut staging = self.staging.remove(&record_id).map(|(_, value)| value);
         let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(
             &record_id,
@@ -1546,7 +1666,7 @@ impl Plugin for AiTranscriptAudit {
             reason,
             None,
         );
-        let status = match self.enqueue(record) {
+        let status = match self.enqueue(record, staging.as_mut()) {
             SinkOutcome::Queued => "queued",
             SinkOutcome::Dropped => "dropped",
             SinkOutcome::Rejected => "rejected",
@@ -1568,7 +1688,7 @@ impl Plugin for AiTranscriptAudit {
             return;
         };
         // Emit here only if no response hook already did (staging still present).
-        let Some((_, staging)) = self.staging.remove(&record_id) else {
+        let Some((_, mut staging)) = self.staging.remove(&record_id) else {
             return;
         };
 
@@ -1603,7 +1723,7 @@ impl Plugin for AiTranscriptAudit {
             reason,
             None,
         );
-        let _ = self.enqueue(record);
+        let _ = self.enqueue(record, Some(&mut staging));
     }
 }
 

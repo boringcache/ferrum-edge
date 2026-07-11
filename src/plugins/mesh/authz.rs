@@ -64,8 +64,21 @@ use crate::plugins::{
     StreamConnectionContext, priority,
 };
 
+pub(crate) const IGNORED_UDP_SOURCE_SCOPE_METADATA: &str = "mesh_authz.ignored_udp_source_scope";
+
 pub struct MeshAuthz {
     slice: MeshSlice,
+    /// Unfiltered policy superset used only for Ambient UDP CONNECTs carrying
+    /// validated per-pod evidence. Ordinary Ambient/Sidecar traffic continues
+    /// to use the construction-time workload filter in `slice.mesh_policies`.
+    ambient_udp_source_policies: Vec<MeshPolicy>,
+    ambient_udp_source_scopes: HashMap<[u8; 16], crate::modes::mesh::runtime::PolicyScopeCache>,
+    ambient_udp_source_scoping: bool,
+    /// ServiceWaypoint UDP relays terminate for workloads outside the
+    /// waypoint's own namespace. Their destination policy scope must therefore
+    /// be resolved from the CONNECT authority/backend, not from
+    /// `slice.namespace` (the waypoint namespace).
+    ambient_udp_destination_scope_required: bool,
     destination_policy_scopes_by_upstream:
         HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
     destination_policy_scopes_by_backend:
@@ -85,6 +98,7 @@ pub struct MeshAuthz {
     destination_route_upstreams_requiring_scope: HashSet<String>,
     has_route_upstream_metadata: bool,
     has_header_rules: bool,
+    ambient_udp_has_header_rules: bool,
     /// Additional SPIFFE trust domains accepted as equivalent to the peer
     /// cert's trust domain when authorising HBONE baggage `source.principal`.
     /// Default empty: strict same-trust-domain match.
@@ -117,6 +131,14 @@ pub struct MeshAuthz {
     /// conditions pays nothing and the common cases (a handful of keys)
     /// avoid building the full attribute namespace per request.
     condition_keys: ConditionAttributeKeys,
+    ambient_udp_condition_keys: ConditionAttributeKeys,
+    /// Monotonic-ms of the last emitted `principal_pod_mismatch` warning, or
+    /// `0` before the first. Gates a rate-limited operator warning when the
+    /// node-agent-derived HBONE source SPIFFE fails to byte-match the CP-derived
+    /// slice `Workload.spiffe_id` for the same pod UID, so per-pod Ambient UDP
+    /// scoping silently degrades to mesh-wide. Lock-free (`&self` hot path);
+    /// see [`Self::warn_udp_principal_pod_mismatch`].
+    udp_principal_pod_mismatch_warn_last_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Which Istio `when:` attribute keys the loaded policies actually reference.
@@ -324,6 +346,8 @@ struct NodeWaypointRouteTargetConfig {
 struct ServicePortDestinationScopes {
     scopes: Vec<crate::modes::mesh::runtime::PolicyScopeCache>,
     endpoint_backends: HashSet<DestinationBackendKey>,
+    endpoint_scopes:
+        HashMap<DestinationBackendKey, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
 }
 
 impl ConditionAttributeKeys {
@@ -435,6 +459,7 @@ fn destination_policy_scopes_for_service_port(
 ) -> ServicePortDestinationScopes {
     let mut scopes = Vec::new();
     let mut endpoint_backends = HashSet::new();
+    let mut endpoint_scopes: HashMap<_, Vec<_>> = HashMap::new();
     for workload in
         crate::modes::mesh::matched_local_service_workloads(service, workloads, multi_cluster)
     {
@@ -453,16 +478,22 @@ fn destination_policy_scopes_for_service_port(
         if app_port == 0 {
             continue;
         }
-        scopes.push(crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload));
+        let workload_scope = crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload);
+        scopes.push(workload_scope.clone());
         for address in &workload.addresses {
             if let Some(key) = DestinationBackendKey::new(address, app_port) {
-                endpoint_backends.insert(key);
+                endpoint_backends.insert(key.clone());
+                endpoint_scopes
+                    .entry(key)
+                    .or_default()
+                    .push(workload_scope.clone());
             }
         }
     }
     ServicePortDestinationScopes {
         scopes,
         endpoint_backends,
+        endpoint_scopes,
     }
 }
 
@@ -657,10 +688,10 @@ fn destination_policy_scope_index(
                     index.by_backend.insert(key, scopes.scopes.clone());
                 }
             }
-            for endpoint in &scopes.endpoint_backends {
+            for (endpoint, endpoint_scopes) in &scopes.endpoint_scopes {
                 index
                     .by_backend
-                    .insert(endpoint.clone(), scopes.scopes.clone());
+                    .insert(endpoint.clone(), endpoint_scopes.clone());
                 index
                     .backend_aliases_by_backend
                     .insert(endpoint.clone(), vec![endpoint.clone()]);
@@ -951,6 +982,55 @@ impl TrustedAssertor {
 /// override this list to add their names.
 const DEFAULT_TRUSTED_HBONE_ASSERTOR_SA_NAMES: &[&str] = &["ztunnel", "waypoint"];
 
+fn ambient_udp_source_scope_index(
+    slice: &MeshSlice,
+) -> HashMap<[u8; 16], crate::modes::mesh::runtime::PolicyScopeCache> {
+    let mut scopes = HashMap::new();
+    let mut ambiguous = HashSet::new();
+    for workload in &slice.ambient_udp_source_workloads {
+        let Some(raw_uid) = workload.pod_uid.as_deref() else {
+            continue;
+        };
+        let Ok(uid) = crate::modes::mesh::node_waypoint::parse_pod_uid(raw_uid) else {
+            continue;
+        };
+        if ambiguous.contains(&uid) {
+            continue;
+        }
+        let candidate = crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload);
+        match scopes.entry(uid) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) if entry.get() == &candidate => {
+                // Kubernetes may project one pod through multiple Services.
+                // Identical attestations are one scope, not an ambiguity.
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                entry.remove();
+                ambiguous.insert(uid);
+            }
+        }
+    }
+    scopes
+}
+
+fn normalize_authz_policies(policies: &mut [MeshPolicy]) {
+    for policy in policies {
+        normalize_mesh_policy_header_names(policy);
+        for rule in &mut policy.rules {
+            for request in &mut rule.to {
+                for host in &mut request.hosts {
+                    *host = normalize_request_match_host_pattern(host);
+                }
+                for host in &mut request.not_hosts {
+                    *host = normalize_request_match_host_pattern(host);
+                }
+            }
+        }
+    }
+}
+
 impl MeshAuthz {
     pub fn new(config: &Value) -> Result<Self, String> {
         // Whether the policies arrived via a `mesh_slice` (the slice-apply path
@@ -1021,6 +1101,20 @@ impl MeshAuthz {
             .get("per_pod_policy_scoping")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let ambient_udp_source_scoping = config
+            .get("ambient_udp_source_scoping")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut ambient_udp_source_policies = if ambient_udp_source_scoping {
+            slice.mesh_policies.clone()
+        } else {
+            Vec::new()
+        };
+        let ambient_udp_source_scopes = if ambient_udp_source_scoping {
+            ambient_udp_source_scope_index(&slice)
+        } else {
+            HashMap::new()
+        };
 
         if !per_pod_policy_scoping {
             validate_scope_filter_identity(&slice, from_slice)?;
@@ -1038,21 +1132,14 @@ impl MeshAuthz {
             });
         }
 
-        for policy in &mut slice.mesh_policies {
-            normalize_mesh_policy_header_names(policy);
-            for rule in &mut policy.rules {
-                for request in &mut rule.to {
-                    for host in &mut request.hosts {
-                        *host = normalize_request_match_host_pattern(host);
-                    }
-                    for host in &mut request.not_hosts {
-                        *host = normalize_request_match_host_pattern(host);
-                    }
-                }
-            }
-        }
+        normalize_authz_policies(&mut slice.mesh_policies);
+        normalize_authz_policies(&mut ambient_udp_source_policies);
         let has_header_rules = mesh_policies_have_header_rules(&slice.mesh_policies);
         let condition_keys = ConditionAttributeKeys::from_policies(&slice.mesh_policies);
+        let ambient_udp_has_header_rules =
+            mesh_policies_have_header_rules(&ambient_udp_source_policies);
+        let ambient_udp_condition_keys =
+            ConditionAttributeKeys::from_policies(&ambient_udp_source_policies);
         // Whether any namespace/selector-scoped (non-mesh-wide) policy is loaded.
         // The stream path fails closed on a missing per-pod scope only when such
         // policies exist; otherwise mesh-wide-only evaluation is complete.
@@ -1071,18 +1158,30 @@ impl MeshAuthz {
                         .iter()
                         .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny))
             });
+        let ambient_udp_destination_scope_required =
+            ambient_udp_source_scoping && slice.waypoint_name.is_some();
         let mut has_route_upstream_metadata = false;
-        let destination_policy_scope_index = if per_pod_policy_scoping {
-            let cluster_domains = normalized_cluster_domains(config);
-            let (route_metadata_present, route_upstreams) =
-                parse_node_waypoint_route_upstreams(config)?;
-            has_route_upstream_metadata = route_metadata_present;
-            destination_policy_scope_index(&slice, &cluster_domains, &route_upstreams)
-        } else {
-            DestinationPolicyScopeIndex::default()
-        };
+        let destination_policy_scope_index =
+            if per_pod_policy_scoping || ambient_udp_destination_scope_required {
+                let cluster_domains = normalized_cluster_domains(config);
+                let route_upstreams = if per_pod_policy_scoping {
+                    let (route_metadata_present, route_upstreams) =
+                        parse_node_waypoint_route_upstreams(config)?;
+                    has_route_upstream_metadata = route_metadata_present;
+                    route_upstreams
+                } else {
+                    Vec::new()
+                };
+                destination_policy_scope_index(&slice, &cluster_domains, &route_upstreams)
+            } else {
+                DestinationPolicyScopeIndex::default()
+            };
         Ok(Self {
             slice,
+            ambient_udp_source_policies,
+            ambient_udp_source_scopes,
+            ambient_udp_source_scoping,
+            ambient_udp_destination_scope_required,
             destination_policy_scopes_by_upstream: destination_policy_scope_index.by_upstream,
             destination_policy_scopes_by_backend: destination_policy_scope_index.by_backend,
             destination_policy_scopes_by_namespaced_backend: destination_policy_scope_index
@@ -1100,12 +1199,58 @@ impl MeshAuthz {
                 .route_upstreams_requiring_scope,
             has_route_upstream_metadata,
             has_header_rules,
+            ambient_udp_has_header_rules,
             trust_domain_aliases,
             trusted_hbone_assertors,
             per_pod_policy_scoping,
             has_scoped_policies,
             condition_keys,
+            ambient_udp_condition_keys,
+            udp_principal_pod_mismatch_warn_last_ms: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Emit a rate-limited (one per ~30s) structured warning when an Ambient
+    /// UDP CONNECT's asserted `source.pod_uid` is present in the slice scope
+    /// index but the honored `source.principal` does not byte-match the CP's
+    /// `Workload.spiffe_id` for that pod. This is the observable signal for the
+    /// otherwise-silent cross-component derivation divergence between the
+    /// node-agent's published SPIFFE (`spiffe://<trust_domain>/ns/<ns>/sa/<sa>`,
+    /// `node_agent.rs`) and the CP-derived slice identity: when they diverge,
+    /// per-pod scoping fails closed to mesh-wide with no other trace. The
+    /// fail-closed fallback itself is unchanged; this only makes it visible.
+    fn warn_udp_principal_pod_mismatch(&self, asserted: Option<&str>, expected: &str) {
+        use std::sync::atomic::Ordering;
+        // ~30s window: divergence is a configuration/derivation fault, not a
+        // per-request condition, so one line per window per proxy is enough to
+        // surface it without pegging the log pipeline under a UDP flood.
+        const WINDOW_MS: u64 = 30_000;
+        let now = crate::socket_opts::monotonic_now_ms();
+        let last = self
+            .udp_principal_pod_mismatch_warn_last_ms
+            .load(Ordering::Relaxed);
+        // Emit on the first event (`last == 0`) or after a full window. A single
+        // CAS claims the window; losers stay silent. `saturating_sub` guards a
+        // coarse clock that does not advance between calls.
+        if last != 0 && now.saturating_sub(last) < WINDOW_MS {
+            return;
+        }
+        if self
+            .udp_principal_pod_mismatch_warn_last_ms
+            .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        tracing::warn!(
+            asserted_source_principal = asserted.unwrap_or("<none>"),
+            expected_slice_spiffe_id = %expected,
+            "mesh_authz: Ambient UDP source pod UID matched the slice but its asserted \
+             source.principal does not byte-match the CP-derived Workload.spiffe_id; per-pod \
+             UDP policy scoping is degrading to mesh-wide for this workload. Verify the \
+             node-agent FERRUM_MESH_TRUST_DOMAIN and service-account SPIFFE derivation match \
+             the control plane's Workload identity"
+        );
     }
 
     /// Build the Istio `when:` attribute map for an HTTP-family request,
@@ -1121,18 +1266,18 @@ impl MeshAuthz {
     /// rules exist; conditions on `request.headers[...]` reuse that map.
     fn build_http_condition_attributes(
         &self,
+        keys: &ConditionAttributeKeys,
         ctx: &RequestContext,
         source_principal: Option<&SpiffeId>,
         port: Option<u16>,
-        source_ip: Option<std::net::IpAddr>,
-        remote_ip: Option<std::net::IpAddr>,
+        source_ips: (Option<std::net::IpAddr>, Option<std::net::IpAddr>),
         headers: &BTreeMap<String, String>,
     ) -> BTreeMap<String, MeshAuthzAttribute> {
         let mut attributes = BTreeMap::new();
-        let keys = &self.condition_keys;
         if !keys.any {
             return attributes;
         }
+        let (source_ip, remote_ip) = source_ips;
         if keys.source_principal
             && let Some(principal) = source_principal
         {
@@ -1634,6 +1779,15 @@ impl Plugin for MeshAuthz {
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
+        let ambient_udp_source_scope_request = self.ambient_udp_source_scoping
+            && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+            && ctx
+                .metadata
+                .get(crate::modes::mesh::hbone::HBONE_DATAGRAM_METADATA_KEY)
+                .is_some_and(|value| value == "udp")
+            && ctx.matched_proxy.as_ref().is_some_and(|proxy| {
+                proxy.id == crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID
+            });
         let unauthenticated_hbone_baggage = is_hbone_request(ctx)
             && has_baggage_header_from_request(ctx)
             && !is_authenticated_hbone_request(ctx);
@@ -1644,16 +1798,33 @@ impl Plugin for MeshAuthz {
                 "true".to_string(),
             );
         }
-        let (source_principal, baggage_outcome) = self.resolve_source_principal(ctx);
-        // Capture the resolved authz principal up front so the
+        let (mut source_principal, baggage_outcome) = self.resolve_source_principal(ctx);
+        let ambient_udp_source_scope =
+            if ambient_udp_source_scope_request && baggage_outcome == BaggageOutcome::Honored {
+                match self.ambient_udp_source_scope(ctx, source_principal.as_ref()) {
+                    Ok(scope) => scope,
+                    Err(reason) => {
+                        ctx.metadata.insert(
+                            IGNORED_UDP_SOURCE_SCOPE_METADATA.to_string(),
+                            reason.to_string(),
+                        );
+                        // The asserted principal and pod UID are one evidence
+                        // bundle. If the live slice cannot bind them exactly,
+                        // discard both before mesh-wide evaluation and fall
+                        // back to the authenticated attesting gateway SVID.
+                        source_principal = ctx.peer_spiffe_id.clone();
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        // Capture the final authz principal up front so the
         // /mesh/policy-denies/recent drilldown records the identity the rule
         // actually saw, including the HBONE baggage rewrite for trusted
-        // assertors. `source_principal` is moved into `MeshAuthzRequest`
-        // below, so we own a separate `String` here. For the synthesised
-        // deny paths (untrusted_assertor / trust_domain_mismatch /
-        // unauthenticated_baggage) `resolve_source_principal` already
-        // returns the peer cert identity (or `None`), so logging this value
-        // is consistent across all branches.
+        // assertors or the authenticated gateway fallback after invalid UDP
+        // pod evidence. `source_principal` is moved into `MeshAuthzRequest`
+        // below, so we own a separate `String` here.
         let source_for_log = source_principal.as_ref().map(|id| id.as_str().to_string());
         let trust_domain_mismatch = baggage_outcome == BaggageOutcome::TrustDomainMismatch;
         let untrusted_assertor = baggage_outcome == BaggageOutcome::UntrustedAssertor;
@@ -1675,7 +1846,12 @@ impl Plugin for MeshAuthz {
             .raw_header_get("host")
             .or_else(|| ctx.raw_header_get(":authority"))
             .map(str::to_string);
-        let headers = if self.has_header_rules {
+        let has_header_rules = if ambient_udp_source_scope_request {
+            self.ambient_udp_has_header_rules
+        } else {
+            self.has_header_rules
+        };
+        let headers = if has_header_rules {
             ctx.materialize_headers();
             if host.is_none() {
                 host = ctx.headers.get("host").cloned();
@@ -1709,12 +1885,17 @@ impl Plugin for MeshAuthz {
         // the keys some loaded policy references (`condition_keys`). Without
         // this, condition-gated DENY rules never fired and condition-gated
         // ALLOW rules never matched — a fail-open hole this closes.
+        let condition_keys = if ambient_udp_source_scope_request {
+            &self.ambient_udp_condition_keys
+        } else {
+            &self.condition_keys
+        };
         let attributes = self.build_http_condition_attributes(
+            condition_keys,
             ctx,
             source_principal.as_ref(),
             port,
-            source_ip,
-            remote_ip,
+            (source_ip, remote_ip),
             &headers,
         );
         let request = MeshAuthzRequest {
@@ -1743,8 +1924,104 @@ impl Plugin for MeshAuthz {
         // never clones the full `MeshSlice` (which carries workloads,
         // services, destination_rules, etc. the authz engine never reads).
         let mut scope_missing = false;
-        let mut node_waypoint_authorized_destination = None;
-        let decision = if self.per_pod_policy_scoping {
+        let mut authorized_destination = None;
+        let decision = if ambient_udp_source_scope_request {
+            // Ambient UDP inbound relay. Evaluate the UNION of:
+            //
+            //   1. DESTINATION-scoped policies. Plain Ambient uses
+            //      `self.slice.mesh_policies`, retained at construction to the
+            //      destination workload identity just like non-UDP inbound HBONE.
+            //      ServiceWaypoint is different: `slice.namespace` is the
+            //      WAYPOINT namespace, while the protected Service/backends may be
+            //      elsewhere. For it, resolve the synthesized relay's exact
+            //      CONNECT-authority backend through the precomputed destination
+            //      scope index and test the full policy superset against those
+            //      backing-workload scopes. Missing destination evidence fails
+            //      closed; it never falls back to waypoint-namespace filtering.
+            //
+            //   2. the SOURCE-scoped policies applicable to the asserted source-pod
+            //      scope from `ambient_udp_source_policies` (the pre-retain full
+            //      clone), or mesh-wide-only when the source evidence is
+            //      absent/invalid. Absent/invalid source evidence therefore still
+            //      fails closed to mesh-wide + destination policies (never broader
+            //      than before this change).
+            //
+            // Both sets feed ONE `evaluate_mesh_authorization_policies` iterator so
+            // the deny-first / "if any ALLOW is applicable at least one must match"
+            // aggregation is computed once across the combined set. Combining two
+            // separate decisions would break that aggregation (a destination-only
+            // ALLOW plus a source-only ALLOW must not each independently deny).
+            //
+            // Dedup is predicate-only and allocation-free. Plain Ambient chains
+            // the retained destination set with source-only entries from the full
+            // superset. ServiceWaypoint filters the full superset once with
+            // `destination_applies || source_applies`, so a policy applying to
+            // both arms is yielded only once.
+            let source_scope = ambient_udp_source_scope;
+            if self.ambient_udp_destination_scope_required {
+                let destination_scope_match = ctx
+                    .matched_proxy
+                    .as_ref()
+                    .and_then(|proxy| self.destination_scope_match_for_proxy(proxy));
+                let Some(destination_scope_match) = destination_scope_match else {
+                    ctx.metadata.insert(
+                        "mesh_authz.destination_scope_missing".to_string(),
+                        "true".to_string(),
+                    );
+                    ctx.metadata.insert(
+                        "mesh_authz.deny_policy".to_string(),
+                        "destination_scope_missing".to_string(),
+                    );
+                    self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
+                    return PluginResult::Reject {
+                        status_code: 403,
+                        body: r#"{"error":"Mesh authorization denied: missing destination policy scope"}"#
+                            .into(),
+                        headers: HashMap::new(),
+                    };
+                };
+                // Authorization runs before `before_proxy`, where
+                // `mesh_route_dispatch` may attempt to replace this relay's
+                // destination. Stamp the exact destination that supplied the
+                // scopes evaluated below; the route-dispatch guard then rejects
+                // any different post-authz backend instead of letting the UDP
+                // handler dial a workload whose policies were never evaluated.
+                authorized_destination =
+                    Some(destination_scope_match.authorized_destination.clone());
+                let destination_scopes = destination_scope_match.scopes;
+                evaluate_mesh_authorization_policies(
+                    self.ambient_udp_source_policies.iter().filter(|policy| {
+                        let destination_applies = destination_scopes
+                            .iter()
+                            .any(|scope| scope.policy_applies(policy));
+                        let source_applies = source_scope.map_or_else(
+                            || matches!(policy.scope, PolicyScope::MeshWide),
+                            |scope| scope.policy_applies(policy),
+                        );
+                        destination_applies || source_applies
+                    }),
+                    &request,
+                )
+            } else {
+                evaluate_mesh_authorization_policies(
+                    self.slice.mesh_policies.iter().chain(
+                        self.ambient_udp_source_policies.iter().filter(|policy| {
+                            let source_applies = source_scope.map_or_else(
+                                || matches!(policy.scope, PolicyScope::MeshWide),
+                                |scope| scope.policy_applies(policy),
+                            );
+                            source_applies
+                                && !policy_scope_applies_to_workload(
+                                    policy,
+                                    &self.slice.namespace,
+                                    &self.slice.labels,
+                                )
+                        }),
+                    ),
+                    &request,
+                )
+            }
+        } else if self.per_pod_policy_scoping {
             if self.has_scoped_policies {
                 ctx.metadata.insert(
                     NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA.to_string(),
@@ -1763,8 +2040,7 @@ impl Plugin for MeshAuthz {
             if can_use_destination_scope
                 && let Some(destination_scope_match) = destination_scope_match
             {
-                node_waypoint_authorized_destination =
-                    Some(destination_scope_match.authorized_destination);
+                authorized_destination = Some(destination_scope_match.authorized_destination);
                 evaluate_destination_policy_scopes(
                     &self.slice.mesh_policies,
                     destination_scope_match.scopes,
@@ -1850,9 +2126,14 @@ impl Plugin for MeshAuthz {
                 .insert("mesh_authz.scope_missing".to_string(), "true".to_string());
         }
         let result = self.decision_to_result(decision, &mut ctx.metadata);
-        if self.has_scoped_policies
+        // NodeWaypoint stamps destinations when scoped policy filtering is
+        // active. ServiceWaypoint UDP must stamp as well: its exact backend
+        // supplied the destination scopes above even though per-pod scoping is
+        // disabled for that topology. In both cases, route dispatch must remain
+        // bound to the destination whose policies were authorized.
+        if (self.has_scoped_policies || self.ambient_udp_destination_scope_required)
             && matches!(result, PluginResult::Continue)
-            && let Some(destination) = node_waypoint_authorized_destination
+            && let Some(destination) = authorized_destination
         {
             match destination {
                 NodeWaypointAuthorizedDestination::Upstream(upstream_id) => {
@@ -2001,6 +2282,36 @@ impl Plugin for MeshAuthz {
 }
 
 impl MeshAuthz {
+    fn ambient_udp_source_scope(
+        &self,
+        ctx: &RequestContext,
+        source_principal: Option<&SpiffeId>,
+    ) -> Result<Option<&crate::modes::mesh::runtime::PolicyScopeCache>, &'static str> {
+        let identity = HboneIdentity::from_baggage_values(
+            ctx.raw_header_values(BAGGAGE_HEADER)
+                .chain(ctx.headers.get(BAGGAGE_HEADER).map(String::as_str)),
+        );
+        let Some(pod_uid) = identity.source_pod_uid else {
+            return Err("missing_or_invalid_pod_uid");
+        };
+        let Some(scope) = self.ambient_udp_source_scopes.get(&pod_uid) else {
+            return Err("pod_not_in_slice");
+        };
+        if source_principal != Some(&scope.spiffe_id) {
+            // The pod UID is in the slice but the asserted principal does not
+            // byte-match the CP's Workload.spiffe_id — the cross-component
+            // derivation divergence described on `warn_udp_principal_pod_mismatch`.
+            // Surface it (rate-limited) so operators see why per-pod scoping is
+            // not applying; the fail-closed mesh-wide fallback is unchanged.
+            self.warn_udp_principal_pod_mismatch(
+                source_principal.map(SpiffeId::as_str),
+                scope.spiffe_id.as_str(),
+            );
+            return Err("principal_pod_mismatch");
+        }
+        Ok(Some(scope))
+    }
+
     /// Resolve the SPIFFE identity used for authz, applying the HBONE baggage
     /// trust-assertor and trust-domain checks.
     ///

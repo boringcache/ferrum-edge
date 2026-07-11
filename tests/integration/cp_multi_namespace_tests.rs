@@ -612,6 +612,7 @@ async fn native_mesh_subscribe_filters_tenant_slice_and_trust_material() {
         workload_spiffe_id: String::new(),
         labels: HashMap::new(),
         waypoint_name: String::new(),
+        ambient_udp_source_scoping: false,
     });
     let mut stream = client.mesh_subscribe(req).await.unwrap().into_inner();
     let first = timeout(Duration::from_secs(5), stream.message())
@@ -645,6 +646,7 @@ async fn native_mesh_subscribe_rejects_missing_claim_in_multi_scope() {
         workload_spiffe_id: String::new(),
         labels: HashMap::new(),
         waypoint_name: String::new(),
+        ambient_udp_source_scoping: false,
     });
     let err = client.mesh_subscribe(req).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);

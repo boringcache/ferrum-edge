@@ -74,6 +74,9 @@ message MeshSubscribeRequest {
   // Optional GAMMA ServiceWaypoint name. When set, the CP narrows the
   // returned MeshSlice to services bound to this waypoint.
   string waypoint_name = 6;
+  // Ambient UDP consumers need the namespace-visible policy candidate
+  // superset so trusted per-pod baggage can be scoped at the destination.
+  bool ambient_udp_source_scoping = 7;
 }
 
 message MeshConfigUpdate {

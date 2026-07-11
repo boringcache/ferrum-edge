@@ -49,6 +49,10 @@ pub struct MeshSliceRequest {
     /// referenced by admitted services. Defaults to `false` for a one-release
     /// dry-run window.
     pub enforce_sidecar_identity_narrowing: bool,
+    /// Keep the namespace-visible AuthorizationPolicy candidate superset needed
+    /// for destination-side Ambient UDP per-pod source scoping. The consumer
+    /// re-filters it only after trusted pod evidence is validated.
+    pub ambient_udp_source_scoping: bool,
 }
 
 impl Default for MeshSliceRequest {
@@ -63,6 +67,7 @@ impl Default for MeshSliceRequest {
             enforce_sidecar_egress: false,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            ambient_udp_source_scoping: false,
         }
     }
 }
@@ -84,6 +89,7 @@ impl MeshSliceRequest {
             enforce_sidecar_egress: false,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            ambient_udp_source_scoping: false,
         }
     }
 
@@ -103,6 +109,7 @@ impl MeshSliceRequest {
             enforce_sidecar_egress: false,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            ambient_udp_source_scoping: false,
         }
     }
 
@@ -141,6 +148,11 @@ impl MeshSliceRequest {
     /// aliases during Sidecar egress matching.
     pub fn with_cluster_domain(mut self, cluster_domain: String) -> Self {
         self.cluster_domain = cluster_domain;
+        self
+    }
+
+    pub fn with_ambient_udp_source_scoping(mut self, enabled: bool) -> Self {
+        self.ambient_udp_source_scoping = enabled;
         self
     }
 
@@ -191,6 +203,12 @@ pub struct MeshSlice {
     pub version: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workloads: Vec<Workload>,
+    /// Workloads eligible to bind trusted Ambient UDP `source.pod_uid`
+    /// evidence. Kept separate from `workloads` because ServiceWaypoint narrows
+    /// that field to destination backends, while a source pod normally is not a
+    /// backend of the service whose waypoint terminates its HBONE datagram.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ambient_udp_source_workloads: Vec<Workload>,
     /// Exact NodeWaypoint SPIFFE IDs trusted to assert HBONE source workload
     /// identity for this slice. Unlike `workloads`, this inventory is derived
     /// from scope-authorized `Workload.node_waypoint` endpoints before
@@ -459,6 +477,7 @@ impl MeshSlice {
             // to) its local labels; omitting it would keep the stale precedence.
             && self.labels_ambiguous == other.labels_ambiguous
             && self.workloads == other.workloads
+            && self.ambient_udp_source_workloads == other.ambient_udp_source_workloads
             && self.node_waypoint_assertors == other.node_waypoint_assertors
             && self.services == other.services
             && self.local_inbound_services == other.local_inbound_services
@@ -760,6 +779,31 @@ impl MeshSlice {
         // plugin tolerates the resulting superset at construction — see
         // `validate_scope_filter_identity` — and its cold-path `retain` does the
         // precise per-proxy narrowing.)
+        let ambient_udp_source_workloads: Vec<Workload> = if request.ambient_udp_source_scoping {
+            mesh.workloads
+                .iter()
+                .filter(|workload| workload.pod_uid.is_some())
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Carry policy candidates for both sides of the UDP authorization
+        // union. Source candidates come from the pod-UID inventory; waypoint
+        // destination candidates come from the destination-visible workload
+        // view and must remain present even when their pod UID was stripped at
+        // the CP boundary or never existed (for example, WorkloadEntry).
+        let ambient_udp_policy_candidates: Vec<(String, BTreeMap<String, String>)> =
+            ambient_udp_source_workloads
+                .iter()
+                .chain(workloads.iter())
+                .map(|workload| {
+                    (
+                        workload.namespace.clone(),
+                        labels_to_btree(&workload.selector.labels),
+                    )
+                })
+                .collect();
         let policy_candidate_labels: Vec<&BTreeMap<String, String>> = if request.labels.is_empty() {
             if candidate_label_sets.is_empty() {
                 vec![&effective_labels]
@@ -973,9 +1017,15 @@ impl MeshSlice {
             .mesh_policies
             .iter()
             .filter(|policy| {
-                policy_candidate_labels.iter().any(|labels| {
-                    policy_scope_applies_to_workload(policy, effective_namespace, *labels)
-                })
+                (!ambient_udp_policy_candidates.is_empty()
+                    && ambient_udp_policy_candidates
+                        .iter()
+                        .any(|(candidate_namespace, labels)| {
+                            policy_scope_applies_to_workload(policy, candidate_namespace, labels)
+                        }))
+                    || policy_candidate_labels.iter().any(|labels| {
+                        policy_scope_applies_to_workload(policy, effective_namespace, *labels)
+                    })
             })
             .cloned()
             .collect();
@@ -1194,6 +1244,7 @@ impl MeshSlice {
             labels_ambiguous,
             version,
             workloads,
+            ambient_udp_source_workloads,
             node_waypoint_assertors,
             services,
             local_inbound_services,
@@ -2956,6 +3007,72 @@ mod tests {
         assert_eq!(names, vec!["default-ext", "infra-ext"]);
     }
 
+    #[test]
+    fn ambient_udp_slice_keeps_cross_namespace_source_policy_candidates() {
+        let mut destination = make_workload(
+            "default",
+            "reviews",
+            HashMap::from([("app".into(), "reviews".into())]),
+        );
+        destination.pod_uid = Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8".into());
+        let destination_id = destination.spiffe_id.clone();
+        let mut source = make_workload(
+            "clients",
+            "client",
+            HashMap::from([("app".into(), "client".into())]),
+        );
+        source.pod_uid = Some("16b2c3d4-9dad-11d1-80b4-00c04fd430c8".into());
+        let mesh = MeshConfig {
+            workloads: vec![destination, source],
+            services: vec![make_service_with_workload_refs(
+                "default",
+                "reviews",
+                vec![destination_id],
+            )],
+            mesh_policies: vec![make_policy(
+                "clients-source-policy",
+                "clients",
+                PolicyScope::Namespace {
+                    namespace: "clients".into(),
+                },
+            )],
+            waypoint_bindings: vec![MeshWaypointBinding {
+                name: "waypoint".into(),
+                namespace: "infra".into(),
+                waypoint_for: "service".into(),
+                services: vec![MeshWaypointServiceRef {
+                    namespace: "default".into(),
+                    name: "reviews".into(),
+                }],
+            }],
+            ..MeshConfig::default()
+        };
+
+        let slice = MeshSlice::from_gateway_config(
+            &config_with_mesh(mesh),
+            MeshSliceRequest {
+                node_id: "node-1".into(),
+                namespace: "infra".into(),
+                waypoint_name: Some("waypoint".into()),
+                ambient_udp_source_scoping: true,
+                ..MeshSliceRequest::default()
+            },
+        );
+
+        assert_eq!(slice.workloads.len(), 1);
+        assert_eq!(slice.workloads[0].service_name, "reviews");
+        assert_eq!(slice.ambient_udp_source_workloads.len(), 2);
+        assert!(
+            slice
+                .ambient_udp_source_workloads
+                .iter()
+                .any(|workload| workload.service_name == "client"),
+            "source scope inventory must survive destination-workload narrowing"
+        );
+        assert_eq!(slice.mesh_policies.len(), 1);
+        assert_eq!(slice.mesh_policies[0].name, "clients-source-policy");
+    }
+
     fn make_policy(name: &str, namespace: &str, scope: PolicyScope) -> MeshPolicy {
         MeshPolicy {
             name: name.into(),
@@ -3076,6 +3193,7 @@ mod tests {
             enforce_sidecar_egress: false,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            ambient_udp_source_scoping: false,
         }
     }
 
@@ -3093,6 +3211,7 @@ mod tests {
             enforce_sidecar_egress: false,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            ambient_udp_source_scoping: false,
         }
     }
 
@@ -3115,6 +3234,7 @@ mod tests {
             labels_ambiguous: false,
             version: "v1".into(),
             workloads: vec![make_workload("ns", "web", HashMap::new())],
+            ambient_udp_source_workloads: Vec::new(),
             node_waypoint_assertors: Vec::new(),
             services: vec![make_service("ns", "web")],
             local_inbound_services: Vec::new(),
@@ -3171,6 +3291,15 @@ mod tests {
         };
         let b = MeshSlice::default();
         assert!(!a.content_eq(&b));
+    }
+
+    #[test]
+    fn content_eq_detects_ambient_udp_source_workloads_change() {
+        let a = MeshSlice {
+            ambient_udp_source_workloads: vec![make_workload("ns", "client", HashMap::new())],
+            ..MeshSlice::default()
+        };
+        assert!(!a.content_eq(&MeshSlice::default()));
     }
 
     #[test]
@@ -4236,6 +4365,7 @@ mod tests {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             waypoint_name: None,
+            ambient_udp_source_scoping: false,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // The slice should inherit labels from the matched workload.
@@ -4293,6 +4423,7 @@ mod tests {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             waypoint_name: None,
+            ambient_udp_source_scoping: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -4374,6 +4505,7 @@ mod tests {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             waypoint_name: None,
+            ambient_udp_source_scoping: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -4446,6 +4578,7 @@ mod tests {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             waypoint_name: None,
+            ambient_udp_source_scoping: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -4491,6 +4624,7 @@ mod tests {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             waypoint_name: None,
+            ambient_udp_source_scoping: false,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // Explicit labels should be used, not the workload's labels.
@@ -4929,6 +5063,7 @@ mod tests {
                 sidecar_egress_dry_run: false,
                 enforce_sidecar_identity_narrowing: false,
                 waypoint_name: None,
+                ambient_udp_source_scoping: false,
             },
         );
 
@@ -5682,6 +5817,7 @@ mod tests {
             enforce_sidecar_egress: true,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            ambient_udp_source_scoping: false,
         }
     }
 
@@ -5699,6 +5835,7 @@ mod tests {
             enforce_sidecar_egress: true,
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
+            ambient_udp_source_scoping: false,
         }
     }
 
