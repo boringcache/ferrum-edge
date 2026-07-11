@@ -61,23 +61,32 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 10. on_final_response_body │ Final client-visible body validation/storage
+│ 10. on_final_response_body │ Buffered body validation/storage
 └────────────┬────────────┘
              │
-             │  Streamed non-buffered bodies skip phases 7-10 and call
+             ▼
+┌─────────────────────────┐
+│ 11. on_response_committed │ Observe final buffered response
+└────────────┬────────────┘
+             │
+             │  Streamed non-buffered bodies skip phases 7-11 and call
              │  on_response_stream_terminated here when the body terminates.
              │
              ▼
 ┌─────────────────────────┐
-│ 11. log                 │  Logging & observability (fire-and-forget)
+│ 12. log                 │  Logging & observability (fire-and-forget)
 └─────────────────────────┘
 ```
 
 Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, CORS returns a `204` preflight response in phase 1 without ever reaching authentication. Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
 
+When a plugin returns a replacement body from `transform_response_body`, the core immediately calls that plugin's `on_response_body_transformed` callback before the next transform. This lets the transforming plugin invalidate representation-specific response headers only when it actually changed the body; the callback does not run when the transform returns `None`.
+
 For gateway-generated rejection responses, a small set of header-only `after_proxy` plugins opt in to still run. This preserves headers such as `Access-Control-Allow-Origin`, `traceparent`, and request IDs on rejected responses without treating them as backend responses.
 
 `after_proxy` rejections are also honored before anything is sent downstream. This matters for plugins like `response_size_limiting`, whose `Content-Length` fast path now replaces oversized backend responses instead of only logging a warning.
+
+`on_response_committed` is buffered-only and observe-only. It receives mutable request context plus the final client-visible status, headers, and body after every `on_final_response_body` hook and any rejection replacement. It cannot mutate or reject the response. Exporters use it for record construction while retaining fail-closed sink admission in an earlier rejecting hook. The proxy gates the phase on a precomputed per-protocol capability bit, so no plugin scan occurs on the normal buffered path when no exporter needs it.
 
 `on_response_stream_terminated` is streaming-only. It receives mutable request context plus the terminal body outcome and response status, cannot replace the response or access a full body buffer, and fires before the final `TransactionSummary.metadata` snapshot and `log` from the same deferred terminal path used for streaming accounting. It is distinct from `ResponseStreamInspector` chunk inspection: this hook is for state cleanup, accounting, and aggregate metadata write-back after the stream ends. Plugins can key bounded shared inspector state by `ctx.response_stream_id()`, remove it here on every terminal outcome (including client disconnect), and write the aggregate into `ctx.metadata`; for example, `ai_tool_governor` writes streamed dry-run decisions before transaction logging. `request_deduplication` uses the same hook to release a non-buffered streamed marker on clean completion (`body_completed`) but intentionally retains it until `inflight_ttl_seconds` when the stream is interrupted (client disconnect or backend error), so a same-key retry cannot re-execute a side-effecting operation that has no replayable response or tombstone.
 
@@ -304,7 +313,7 @@ Given all built-in plugins enabled, the execution order is:
 | 33 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
 | 34 | `ws_rate_limiting` | 2910 | on_ws_frame |
 | 35 | `udp_rate_limiting` | 2915 | on_udp_datagram |
-| 36 | `ai_transcript_audit` | 2924 | before_proxy, on_final_request_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated, log |
+| 36 | `ai_transcript_audit` | 2924 | before_proxy, on_final_request_body, on_final_response_body, on_response_committed, response_stream_inspector, on_response_stream_terminated, log |
 | 37 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
 | 38 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_stream_connect, on_udp_datagram |
 | 39 | `fault_injection` | 2940 | before_proxy, on_stream_connect |
@@ -315,7 +324,7 @@ Given all built-in plugins enabled, the execution order is:
 | 44 | `ai_tool_governor` | 2978 | before_proxy, on_final_request_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
 | 45 | `ai_semantic_cache` | 2980 | before_proxy, after_proxy, on_final_response_body |
 | 46 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, normalize_response_body, response_stream_inspector |
-| 47 | `mcp_gateway` | 2992 | before_proxy, transform_request_body |
+| 47 | `mcp_gateway` | 2992 | before_proxy, transform_request_body, transform_response_body |
 | 48 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body, response_stream_inspector |
 | 49 | `mesh_route_dispatch` | 2995 | before_proxy |
 | 50 | `request_transformer` | 3000 | before_proxy, transform_request_body |
@@ -453,7 +462,7 @@ The `compression` plugin runs at priority 4050 — after `response_transformer` 
 
 ### Logging runs last (9000+)
 
-Logging plugins run in phase 11 (`log`) which is fire-and-forget after the response is sent to the client. They are outside the hot path and do not affect request latency. Their relative ordering within the logging band (9000–9300) does not impact behavior.
+Logging plugins run in phase 12 (`log`) and are fire-and-forget. They are outside the hot path and do not affect request latency. Their relative ordering within the logging band (9000–9300) does not impact behavior.
 
 All logging plugins receive the `TransactionSummary` struct which includes an `error_class` field for failed transactions. This field classifies gateway-level errors (e.g., `ConnectionTimeout`, `TlsError`, `DnsLookupError`) to help operators quickly identify root causes. See [docs/error_classification.md](error_classification.md) for the full list of error classes and debugging guidance.
 
@@ -596,7 +605,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `ai_request_guard` | ✓ | ✓ | | | | Validates JSON request bodies |
 | `ai_stream_router` | ✓ | | | | | Claims `stream: true` OpenAI Chat Completions, route-overrides to a provider, normalizes provider SSE to OpenAI SSE |
 | `ai_federation` | ✓ | ✓ | | | | Routes to AI providers, normalizes responses |
-| `mcp_gateway` | ✓ | ✓ | | | | Parses MCP JSON-RPC, emits `mcp.*` metadata, and routes namespaced MCP tools/resources/prompts |
+| `mcp_gateway` | ✓ | ✓ | | | | Parses MCP JSON-RPC, emits `mcp.*` metadata, routes namespaced MCP tools/resources/prompts, and reverse-maps routed JSON results |
 | `a2a_gateway` | ✓ | ✓ | | | | Detects A2A HTTP/REST/gRPC methods, rewrites HTTP Agent Cards, applies method policy, and emits `a2a.*` metadata |
 | `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing |
 | `ai_token_metrics` | ✓ | ✓ | | | | Parses JSON response bodies for token usage |

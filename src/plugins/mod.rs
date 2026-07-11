@@ -5,6 +5,7 @@
 //! `before_proxy` → `transform_request_body` → `on_final_request_body` →
 //! `backend_admission` → `after_proxy` → `normalize_response_body` →
 //! `on_response_body` → `transform_response_body` → `on_final_response_body` →
+//! `on_response_committed` (buffered responses only) →
 //! `on_response_stream_terminated` (streamed responses only) → `log` →
 //! `on_ws_frame`.
 //!
@@ -513,6 +514,11 @@ pub struct RequestContext {
     pub(crate) a2a_gateway_binding: Option<&'static str>,
     pub(crate) a2a_gateway_is_agent_card: bool,
     pub(crate) a2a_gateway_streaming: bool,
+    /// Exact upstream/public resource URI pair used to route an MCP
+    /// `resources/read` request. Kept out of public metadata so upstream URI
+    /// details cannot enter transaction logs, while the response hook can
+    /// preserve the public URI spelling the client actually requested.
+    pub(crate) mcp_response_resource_binding: Option<(String, String)>,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -765,6 +771,7 @@ impl RequestContext {
             a2a_gateway_binding: None,
             a2a_gateway_is_agent_card: false,
             a2a_gateway_streaming: false,
+            mcp_response_resource_binding: None,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_score: 0,
@@ -856,6 +863,7 @@ impl RequestContext {
             a2a_gateway_binding: self.a2a_gateway_binding,
             a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
             a2a_gateway_streaming: self.a2a_gateway_streaming,
+            mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_score: self.waf_score,
@@ -1363,17 +1371,10 @@ impl RequestContext {
     /// Returns `Some(meta)` if a mirror request was dispatched and completed
     /// before the timeout. The 5-second timeout is a safety net — the mirror
     /// task always completes within the proxy's `backend_read_timeout_ms`
-    /// (set via `reqwest::RequestBuilder::timeout`). Since this runs after
-    /// the response is sent to the client, the wait has zero impact on
-    /// client-facing latency.
+    /// (set via `reqwest::RequestBuilder::timeout`). Callers on a client-visible
+    /// response path must run this in a detached task.
     pub async fn collect_mirror_result(&self) -> Option<MirrorResponseMeta> {
-        let rx = self.mirror_result_rx.as_ref()?;
-        let mut rx_clone = rx.clone();
-        match tokio::time::timeout(std::time::Duration::from_secs(5), rx_clone.changed()).await {
-            Ok(Ok(())) => rx_clone.borrow().clone(),
-            // Timeout or sender dropped — return whatever is currently available
-            _ => rx.borrow().clone(),
-        }
+        collect_mirror_result(self.mirror_result_rx.clone()?).await
     }
 
     /// Return the stable authenticated identity for downstream policy and
@@ -1676,7 +1677,15 @@ impl Drop for CompletionNotifyingInspector {
 /// only on the opted-in path, and is removed again when every plugin factory
 /// declines the concrete response, so terminal hooks cannot mistake an
 /// uninspected stream for one with pending write-back state.
+///
+/// This self-contained variant (which runs its own `requires_response_stream_hooks`
+/// scan) is now used only by external test crates; every gateway hot path resolves
+/// the capability through the `PluginCache` and calls
+/// [`create_response_stream_inspector_for_enabled_plugins`] directly.
+/// `#[allow(dead_code)]` because the binary target recompiles the source without
+/// those test crates, so it sees no caller.
 #[doc(hidden)]
+#[allow(dead_code)] // used only by tests/, dead code in the bin target
 pub fn create_response_stream_inspector(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -1689,6 +1698,28 @@ pub fn create_response_stream_inspector(
     {
         return None;
     }
+
+    create_response_stream_inspector_for_enabled_plugins(
+        plugins,
+        ctx,
+        response_status,
+        content_type,
+    )
+}
+
+/// Resolve inspectors after the caller has checked the PluginCache's
+/// precomputed response-stream-hooks capability.
+///
+/// Unlike [`create_response_stream_inspector`], this skips the redundant
+/// per-response capability scan. Request hot paths must use this entry point
+/// behind `PluginCacheRequestView::requires_response_stream_hooks()`.
+pub(crate) fn create_response_stream_inspector_for_enabled_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: u16,
+    content_type: Option<&str>,
+) -> Option<Box<dyn ResponseStreamInspector>> {
+    notify_response_stream_selected(plugins, ctx, response_status, content_type);
 
     ctx.response_stream_id =
         Some(NEXT_RESPONSE_STREAM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
@@ -1708,6 +1739,23 @@ pub fn create_response_stream_inspector(
         ctx.response_stream_id = None;
         ctx.response_stream_completion = None;
         None
+    }
+}
+
+/// Notify opted-in plugins that the final response will use a streaming body,
+/// even when the concrete transport cannot attach a chunk inspector.
+#[doc(hidden)]
+pub fn notify_response_stream_selected(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    response_status: u16,
+    content_type: Option<&str>,
+) {
+    for plugin in plugins
+        .iter()
+        .filter(|plugin| plugin.requires_response_stream_hooks())
+    {
+        plugin.on_response_stream_selected(ctx, response_status, content_type);
     }
 }
 
@@ -2219,7 +2267,21 @@ pub async fn log_with_mirror(
         plugin.log_with_mesh_key(summary, mesh_key.as_ref()).await;
     }
     crate::runtime_metrics::global_ref().record_transaction(summary);
-    if let Some(mirror_result) = ctx.collect_mirror_result().await {
+
+    // Mirror completion and mirror-summary logging are fully detached from the
+    // primary transaction. Buffered response paths call `log_with_mirror`
+    // before handing the response to hyper, so awaiting the mirror receiver
+    // here would make a stalled shadow target client-visible. Do not clone the
+    // summary or plugin list when this request was not mirrored.
+    let Some(mirror_result_rx) = ctx.mirror_result_rx.clone() else {
+        return;
+    };
+    let summary = summary.clone();
+    let plugins = plugins.to_vec();
+    tokio::spawn(async move {
+        let Some(mirror_result) = collect_mirror_result(mirror_result_rx).await else {
+            return;
+        };
         let mirror_summary = summary.as_mirror_entry(mirror_result);
         let mirror_mesh_key = if precompute_mesh_key {
             crate::plugins::mesh::prometheus_helpers::mesh_request_key(&mirror_summary)
@@ -2231,6 +2293,16 @@ pub async fn log_with_mirror(
                 .log_with_mesh_key(&mirror_summary, mirror_mesh_key.as_ref())
                 .await;
         }
+    });
+}
+
+async fn collect_mirror_result(
+    mut rx: tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>,
+) -> Option<MirrorResponseMeta> {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed()).await {
+        Ok(Ok(())) => rx.borrow().clone(),
+        // Timeout or sender dropped — return whatever is currently available.
+        _ => rx.borrow().clone(),
     }
 }
 
@@ -2905,6 +2977,36 @@ pub trait Plugin: Send + Sync {
         self.requires_response_body_buffering()
     }
 
+    /// Returns `true` when this active buffering plugin may release an
+    /// inherently streaming response after headers arrive even though retries
+    /// are configured.
+    ///
+    /// The proxy uses this pre-header signal to select a header-first streaming
+    /// transport for a retry attempt. After headers arrive, this plugin must
+    /// confirm the concrete response and every other active buffering plugin
+    /// must report that it does not need that content type. Keep the default
+    /// conservative: most response transforms and inspectors require a
+    /// replayable body while retries are in flight.
+    fn may_release_response_body_under_retries(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
+    /// Header-aware confirmation for
+    /// [`may_release_response_body_under_retries`].
+    ///
+    /// Called only after backend response headers arrive. Returning `true`
+    /// allows this response to stream and makes mid-body retry impossible; use
+    /// it only for inherently streaming representations whose retry decision is
+    /// complete from status and headers.
+    fn should_release_response_body_under_retries(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        false
+    }
+
     /// Returns `true` when a plugin that otherwise buffers this response can
     /// release it before the proxy applies the conservative content-type relabel
     /// guard.
@@ -3128,6 +3230,20 @@ pub trait Plugin: Send + Sync {
             .await
     }
 
+    /// Called immediately after this plugin returns a transformed response
+    /// body, before the next body transform runs.
+    ///
+    /// Use this for response headers that are valid only for the original body
+    /// representation, such as upstream validators or integrity digests. The
+    /// hook is not called when the transform returns `None`, so unchanged
+    /// responses retain their original headers.
+    fn on_response_body_transformed(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_headers: &mut HashMap<String, String>,
+    ) {
+    }
+
     /// Called after all `transform_response_body` hooks on buffered responses.
     ///
     /// Use this hook when the plugin must inspect or act on the final
@@ -3141,6 +3257,31 @@ pub trait Plugin: Send + Sync {
         _body: &[u8],
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Returns `true` when this plugin needs the observe-only committed response
+    /// hook for buffered responses.
+    ///
+    /// The plugin cache precomputes this capability so requests pay only a bit
+    /// test when no exporter needs the hook.
+    fn requires_response_committed_hook(&self) -> bool {
+        false
+    }
+
+    /// Observes the final client-visible buffered response after every
+    /// `on_final_response_body` hook and any resulting rejection replacement.
+    ///
+    /// This hook cannot mutate or reject the response. Exporters should keep
+    /// fail-closed admission checks in an earlier rejecting hook, then construct
+    /// and enqueue records here so status and body describe what the client will
+    /// receive.
+    async fn on_response_committed(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
     }
 
     /// Called exactly once when a streamed, non-buffered response body reaches a
@@ -3279,6 +3420,18 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Called once after the final response headers select a streaming body,
+    /// before those headers are committed. Unlike
+    /// [`Self::response_stream_inspector`], this notification also runs for
+    /// direct H2/H3 transports that cannot attach a chunk inspector.
+    fn on_response_stream_selected(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _content_type: Option<&str>,
+    ) {
+    }
+
     /// Create a stateful [`ResponseStreamInspector`] for a streaming (non-buffered)
     /// response body, or `None` to stream it through unchanged. Called once per
     /// eligible response for **every** plugin that opts in via
@@ -3302,13 +3455,13 @@ pub trait Plugin: Send + Sync {
         None
     }
 
-    /// Returns `true` if THIS request's response must come back on the reqwest
-    /// streaming path rather than a native-H3 (or other advanced) backend
-    /// transport — e.g. because a response-stream inspector will run and is only
-    /// wired on the reqwest path. Evaluated per request just before backend
-    /// dispatch (after `before_proxy`), so a plugin can scope it to the requests
-    /// it actually inspects (via `ctx` markers) instead of forcing every request
-    /// on the proxy off the fast path. Zero overhead when `false` (default).
+    /// Returns `true` if THIS request should prefer the reqwest streaming path
+    /// over a native backend transport. Every streaming dispatch arm drives
+    /// response inspectors, so this is an optimization (for example to avoid a
+    /// transport-specific bridge), not the inspection correctness boundary.
+    /// Evaluated from the finalized request context immediately before backend
+    /// dispatch, so body-transform markers are visible. Zero overhead when no
+    /// response-stream plugin is configured or this returns `false` (default).
     fn forces_reqwest_dispatch(&self, _ctx: &RequestContext) -> bool {
         false
     }

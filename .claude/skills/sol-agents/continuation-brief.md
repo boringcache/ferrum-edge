@@ -1,0 +1,32 @@
+# Continuation-agent brief (resume a dead agent's PR)
+
+You are resuming a PR whose previous agent died mid-loop (model-capacity outage). All rules
+of /Volumes/JustusStorage/Conductor2/workspaces/ferrum-edge/san-diego/.context/agent-brief.md
+apply (no local builds/tests — `cargo fmt --all` only; one `@codex review` per round; never
+merge; final report). Do NOT create a new worktree or branch — work in the existing worktree
+given in your prompt (the branch is checked out there).
+
+Resume procedure, in order:
+1. `git status` + `git log --oneline -5` in the worktree. If there is uncommitted WIP, read it,
+   decide finish-or-discard on its merits, and fold it into a proper commit if kept.
+2. `git fetch origin` and check whether origin/main moved; merge it only if GitHub reports a
+   conflict on the PR (check `mergeable` via `gh pr view`).
+3. Reconstruct review state: fetch ALL codex review threads
+   (`gh api graphql` reviewThreads query from the main brief) and the PR comment timeline.
+   Identify unresolved findings and whether the last `@codex review` trigger predates the
+   latest push (if so, a re-trigger is needed AFTER you finish fixes).
+4. Triage CI: `gh pr checks <PR>`. For each failure, read the log
+   (`gh run view <id> --log-failed` or the jobs API). Failures whose log shows
+   "cargo fetch failed ... likely a crates.io/registry outage" are stale outage artifacts —
+   rerun them (`gh run rerun <id> --failed`). Known-flake list is in the main brief. Anything
+   else: fix for real.
+5. Then continue the normal loop: verify each unresolved codex finding in code, fix or rebut
+   with evidence, fmt, commit, push, post exactly ONE `@codex review` summarizing dispositions,
+   wait/poll, repeat until codex is clean AND CI is green. Report final state.
+
+## REVIEW BOT STATUS (updated 2026-07-10, later)
+Codex credits are RESTORED — the default review trigger is `@codex review` again
+(bot login `chatgpt-codex-connector`; clean verdict = "Didn't find any major issues").
+Reviews from the Claude GitHub app (`@claude review`, login `claude`) may also exist in a
+PR's history — treat BOTH bots' threads as review state; resolve/rebut findings from either.
+One trigger per round, only after pushing.
