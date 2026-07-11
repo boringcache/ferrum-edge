@@ -624,6 +624,39 @@ fn test_request_view_stays_on_single_generation_after_rebuild() {
     );
 }
 
+#[tokio::test]
+async fn test_request_view_precomputes_response_committed_hook_capability() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["audit"])],
+        vec![make_plugin_config_with_json(
+            "audit",
+            "ai_transcript_audit",
+            json!({
+                "capture": { "request": true, "response": true },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest"
+                }
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let view = cache.request_view("p1", ProxyProtocol::Http);
+
+    assert!(
+        view.capabilities()
+            .has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
+    );
+    assert!(
+        !cache
+            .request_view("missing", ProxyProtocol::Http)
+            .capabilities()
+            .has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
+    );
+}
+
 #[test]
 fn test_request_view_precomputes_authorize_plugins() {
     let config = make_config(

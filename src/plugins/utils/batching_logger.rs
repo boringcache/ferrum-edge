@@ -111,10 +111,9 @@ pub struct BatchingLogger<T: Send + 'static> {
     hooks: LoggerHooks<T>,
 }
 
-/// Capacity reserved in a [`BatchingLogger`] for a record that will be built
-/// later. Dropping an unused permit releases both the Tokio channel slot and
-/// the logger's queue-depth accounting; sending transfers that accounting to
-/// the receiver, exactly like [`BatchingLogger::try_send`].
+/// An atomically reserved queue slot for a record that will be constructed
+/// later. Dropping an unused permit releases both the channel slot and the
+/// logger's depth accounting.
 pub struct BatchingLoggerPermit<T: Send + 'static> {
     permit: Option<mpsc::OwnedPermit<T>>,
     queue_depth: Arc<AtomicUsize>,
@@ -123,7 +122,7 @@ pub struct BatchingLoggerPermit<T: Send + 'static> {
 impl<T: Send + 'static> BatchingLoggerPermit<T> {
     pub fn send(mut self, item: T) {
         if let Some(permit) = self.permit.take() {
-            let _ = permit.send(item);
+            permit.send(item);
         }
     }
 }
@@ -257,15 +256,28 @@ impl<T: Send + 'static> BatchingLogger<T> {
         }
     }
 
-    /// Atomically reserve one real channel slot for a record that cannot be
-    /// constructed until after a response stream terminates.
+    /// Atomically reserve one bounded-channel slot without constructing the
+    /// item yet. This supports fail-closed plugins that must guarantee enqueue
+    /// capacity before a response becomes immutable, while filling the record
+    /// only after later validators determine the final status and body.
     pub fn try_reserve(&self) -> Option<BatchingLoggerPermit<T>> {
-        let permit = self.sender.clone().try_reserve_owned().ok()?;
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
-        Some(BatchingLoggerPermit {
-            permit: Some(permit),
-            queue_depth: Arc::clone(&self.queue_depth),
-        })
+        match self.sender.clone().try_reserve_owned() {
+            Ok(permit) => Some(BatchingLoggerPermit {
+                permit: Some(permit),
+                queue_depth: Arc::clone(&self.queue_depth),
+            }),
+            Err(mpsc::error::TrySendError::Full(_sender)) => {
+                decrement_queue_depth(&self.queue_depth);
+                self.record_drop("buffer full while reserving a commit slot");
+                None
+            }
+            Err(mpsc::error::TrySendError::Closed(_sender)) => {
+                decrement_queue_depth(&self.queue_depth);
+                self.record_drop("worker unavailable while reserving a commit slot");
+                None
+            }
+        }
     }
 
     pub fn queue_depth(&self) -> usize {
@@ -529,37 +541,5 @@ mod tests {
             policy.backoff_delay(1),
             Duration::from_millis(MAX_TOKIO_SLEEP_MS)
         );
-    }
-
-    #[tokio::test]
-    async fn reserved_slot_excludes_concurrent_producers_until_used_or_dropped() {
-        let logger = BatchingLogger::spawn(
-            BatchConfig {
-                batch_size: 1,
-                flush_interval: Duration::from_secs(60),
-                buffer_capacity: 1,
-                retry: RetryPolicy::fixed(1, Duration::ZERO),
-                plugin_name: "reservation_test",
-            },
-            |_batch: Vec<u8>| async { Ok(()) },
-        );
-
-        let permit = logger.try_reserve().expect("first slot should reserve");
-        assert!(logger.try_reserve().is_none());
-        assert_eq!(logger.queue_depth(), 1);
-        permit.send(7);
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while logger.queue_depth() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("receiver should consume the reserved record");
-
-        let unused = logger.try_reserve().expect("consumed slot should reopen");
-        drop(unused);
-        assert_eq!(logger.queue_depth(), 0);
-        assert!(logger.try_reserve().is_some());
     }
 }

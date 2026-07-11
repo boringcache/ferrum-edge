@@ -20,9 +20,10 @@
 //! 9. **Plugin: on_response_body** — raw backend body inspection before transforms:
 //!    AI token metrics, AI rate limiter
 //! 10. **Plugin: transform_response_body** — body rewrites (e.g., response_transformer)
-//! 11. **Plugin: on_final_response_body** — final client-visible body validation/storage:
+//! 11. **Plugin: on_final_response_body** — buffered body validation/storage:
 //!     body validation, response size limiting, response caching
-//! 12. **Plugin: log** — stdout/HTTP logging, Prometheus, OpenTelemetry
+//! 12. **Plugin: on_response_committed** — observe-only final buffered status/body export
+//! 13. **Plugin: log** — stdout/HTTP logging, Prometheus, OpenTelemetry
 //!
 //! Key design principles:
 //! - **Lock-free reads**: All config access uses `ArcSwap::load()` — no mutexes on the hot path
@@ -12355,15 +12356,11 @@ pub(crate) async fn log_rejected_request_with_path(
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
 }
 
-/// Run rejection-aware `after_proxy` hooks over a response that has not yet
-/// been committed. An explicitly opted-in fail-closed hook may replace all
-/// three response parts in place; taking mutable status/body/header arguments
-/// keeps every protocol caller from accidentally discarding that replacement.
-pub(crate) async fn apply_after_proxy_hooks_to_rejection(
+async fn run_after_proxy_hooks_on_rejection(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     status_code: &mut u16,
-    response_body: &mut Vec<u8>,
+    mut response_body: Option<&mut Vec<u8>>,
     response_headers: &mut HashMap<String, String>,
 ) {
     let previous_marker = ctx.metadata.insert(
@@ -12377,22 +12374,25 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
             .await
         {
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-                let Some(parts) = plugin_result_into_reject_parts(reject) else {
+                let Some(reject) = plugin_result_into_reject_parts(reject) else {
                     warn!(
                         rejecting_plugin = plugin.name(),
                         "after_proxy rejection could not be normalized"
                     );
                     continue;
                 };
-                let reject_status = parts.status_code;
-                if plugin.may_replace_rejection_response() {
+                let reject_status = reject.status_code;
+                if plugin.may_replace_rejection_response()
+                    && let Some(body) = response_body.as_deref_mut()
+                {
                     let replaced_status = *status_code;
-                    *status_code = parts.status_code;
-                    *response_body = parts.body;
-                    response_headers.clear();
-                    response_headers
-                        .insert("content-type".to_string(), "application/json".to_string());
-                    response_headers.extend(parts.headers);
+                    *status_code = reject.status_code;
+                    *body = reject.body;
+                    // Keep headers already attached by earlier decorators (for
+                    // example CORS and correlation IDs), discard only the stale
+                    // length, and let explicit replacement headers win.
+                    response_headers.remove("content-length");
+                    response_headers.extend(reject.headers);
                     warn!(
                         rejecting_plugin = plugin.name(),
                         replacement_status = *status_code,
@@ -12401,9 +12401,10 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
                     );
                     continue;
                 }
-                // This hook did not opt in to replacing an in-flight rejection,
-                // so preserve the historical behavior: ignore its Reject and
-                // only log it. Known consequence: `ai_rate_limiter`'s
+                // The gateway is already committed to emitting this rejection
+                // response (the status/body are fixed by the time after-proxy-on-
+                // reject hooks run), so a hook cannot replace it here — it is
+                // ignored and only logged. Known consequence: `ai_rate_limiter`'s
                 // `on_unmetered_response: "reject"` is best-effort for synthetic
                 // `before_proxy` responses such as `ai_federation`'s — a federated
                 // 2xx missing usage metadata is still returned to the client. See
@@ -12413,7 +12414,7 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
                     attempted_reject_status = reject_status,
                     committed_status = *status_code,
                     "after_proxy plugin returned Reject during rejection handling; \
-                     ignoring (plugin did not opt in to replacement)"
+                     ignoring (response already committed)"
                 );
             }
             PluginResult::Continue => {}
@@ -12426,6 +12427,34 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
     } else {
         ctx.metadata.remove(REJECTION_RESPONSE_METADATA_KEY);
     }
+}
+
+pub(crate) async fn apply_after_proxy_hooks_to_rejection(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status_code: u16,
+    response_headers: &mut HashMap<String, String>,
+) {
+    let mut status_code = status_code;
+    run_after_proxy_hooks_on_rejection(plugins, ctx, &mut status_code, None, response_headers)
+        .await;
+}
+
+async fn apply_replaceable_after_proxy_hooks_to_rejection(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status_code: &mut u16,
+    response_body: &mut Vec<u8>,
+    response_headers: &mut HashMap<String, String>,
+) {
+    run_after_proxy_hooks_on_rejection(
+        plugins,
+        ctx,
+        status_code,
+        Some(response_body),
+        response_headers,
+    )
+    .await;
 }
 
 /// Rebuild `response_status` / `response_headers` for a plugin rejection
@@ -12467,7 +12496,7 @@ pub(crate) async fn apply_plugin_rejection_response(
 ) -> Vec<u8> {
     let mut body =
         rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
-    apply_after_proxy_hooks_to_rejection(
+    apply_replaceable_after_proxy_hooks_to_rejection(
         plugins,
         ctx,
         response_status,
@@ -12667,10 +12696,11 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     headers: &mut HashMap<String, String>,
     body: &mut Vec<u8>,
     is_grpc_request: bool,
+    invoke_response_committed: bool,
 ) {
-    if !plugins.is_empty()
-        && should_apply_synthetic_response_body_hooks(*status, is_grpc_request, body, plugins, ctx)
-    {
+    let applied_synthetic_body_hooks = !plugins.is_empty()
+        && should_apply_synthetic_response_body_hooks(*status, is_grpc_request, body, plugins, ctx);
+    if applied_synthetic_body_hooks {
         // KNOWN ORDERING DIVERGENCE (accepted, documented trade-off):
         //
         // On the synthetic short-circuit path the response-BODY hooks
@@ -12706,7 +12736,33 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // one-shot response state (rotated session cookie, route overrides) is
     // emitted onto whatever the client actually receives. Runs LAST by design —
     // see the divergence note above.
-    apply_after_proxy_hooks_to_rejection(plugins, ctx, status, body, headers).await;
+    apply_replaceable_after_proxy_hooks_to_rejection(plugins, ctx, status, body, headers).await;
+
+    // Observe every client-visible rejection that flows through this finalizer —
+    // synthetic short-circuits, gRPC rejects, non-2xx rejects, empty-body rejects
+    // — only after final-body validators, rejection replacement, and the
+    // synthetic path's deliberately-late response-header hooks have run. The
+    // committed-hook capability scan runs unconditionally (no longer gated on
+    // whether body hooks applied) so exporters see the final response on all
+    // rejection shapes, not just synthetic paths that ran body hooks.
+    if invoke_response_committed
+        && plugins
+            .iter()
+            .any(|plugin| plugin.requires_response_committed_hook())
+    {
+        let status_code = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
+        let normalized = normalize_reject_response(status_code, body, headers, is_grpc_request);
+        for plugin in plugins.iter() {
+            plugin
+                .on_response_committed(
+                    ctx,
+                    normalized.http_status.as_u16(),
+                    &normalized.headers,
+                    &normalized.body,
+                )
+                .await;
+        }
+    }
 }
 
 pub(crate) struct AfterProxyReject {
@@ -12794,7 +12850,7 @@ pub(crate) async fn run_after_proxy_hooks(
                 ctx.metadata
                     .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
                 ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
-                apply_after_proxy_hooks_to_rejection(
+                apply_replaceable_after_proxy_hooks_to_rejection(
                     plugins,
                     ctx,
                     &mut status_code,
@@ -12961,15 +13017,17 @@ pub(crate) async fn normalize_grpc_plugin_rejection_with_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     reject: RejectedResponseParts,
+    invoke_response_committed: bool,
 ) -> NormalizedRejectResponse {
     let status = StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
-    let normalized = finalize_reject_response_with_after_proxy_hooks(
+    let normalized = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
         plugins,
         ctx,
         status,
         &reject.body,
         reject.headers,
         true,
+        invoke_response_committed,
     )
     .await;
     apply_grpc_reject_metadata(ctx, &normalized);
@@ -13030,6 +13088,14 @@ fn build_grpc_web_error_response(
         status,
         message,
     );
+    build_grpc_web_error_response_from_parts(response, status, message)
+}
+
+fn build_grpc_web_error_response_from_parts(
+    response: crate::plugins::grpc_web::GrpcWebErrorResponse,
+    status: u32,
+    message: &str,
+) -> Response<ProxyBody> {
     let builder =
         headers_mod::apply_response_headers(Response::builder().status(200), &response.headers);
 
@@ -13043,8 +13109,29 @@ async fn finalize_reject_response_with_after_proxy_hooks(
     ctx: &mut RequestContext,
     status: StatusCode,
     body: &[u8],
+    headers: HashMap<String, String>,
+    is_grpc_request: bool,
+) -> NormalizedRejectResponse {
+    finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+        plugins,
+        ctx,
+        status,
+        body,
+        headers,
+        is_grpc_request,
+        true,
+    )
+    .await
+}
+
+async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status: StatusCode,
+    body: &[u8],
     mut headers: HashMap<String, String>,
     is_grpc_request: bool,
+    invoke_response_committed: bool,
 ) -> NormalizedRejectResponse {
     let mut response_status = status.as_u16();
     let mut response_body = body.to_vec();
@@ -13056,6 +13143,7 @@ async fn finalize_reject_response_with_after_proxy_hooks(
         &mut headers,
         &mut response_body,
         is_grpc_request,
+        invoke_response_committed,
     )
     .await;
     // Attribute the reject-path `after_proxy` + synthetic response-body hook time
@@ -13086,25 +13174,47 @@ async fn handle_backend_admission_rejection(
     is_grpc_request: bool,
     grpc_web_error_content_type: Option<&str>,
 ) -> Response<ProxyBody> {
-    let reject = finalize_reject_response_with_after_proxy_hooks(
+    let reject = finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
         plugins,
         ctx,
         StatusCode::from_u16(rejection.status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
         &rejection.body,
         rejection.headers,
         is_grpc_request,
+        grpc_web_error_content_type.is_none(),
     )
     .await;
     apply_grpc_reject_metadata(ctx, &reject);
-    let grpc_web_response = grpc_web_error_content_type.and_then(|content_type| {
-        reject.grpc_status.map(|grpc_status| {
-            let message = reject
-                .grpc_message
-                .as_deref()
-                .unwrap_or_else(|| grpc_status_reason(grpc_status));
-            build_grpc_web_error_response(content_type, grpc_status, message)
-        })
-    });
+    let grpc_web_response = if let (Some(content_type), Some(grpc_status)) =
+        (grpc_web_error_content_type, reject.grpc_status)
+    {
+        let message = reject
+            .grpc_message
+            .as_deref()
+            .unwrap_or_else(|| grpc_status_reason(grpc_status));
+        let translated = crate::plugins::grpc_web::error_response_for_content_type(
+            content_type,
+            grpc_status,
+            message,
+        );
+        if plugins
+            .iter()
+            .any(|plugin| plugin.requires_response_committed_hook())
+        {
+            for plugin in plugins {
+                plugin
+                    .on_response_committed(ctx, 200, &translated.headers, &translated.body)
+                    .await;
+            }
+        }
+        Some(build_grpc_web_error_response_from_parts(
+            translated,
+            grpc_status,
+            message,
+        ))
+    } else {
+        None
+    };
     log_rejected_request_with_path(
         plugins,
         ctx,
@@ -15286,7 +15396,7 @@ async fn handle_proxy_request_inner(
                         ));
                     };
                     let normalized = normalize_grpc_plugin_rejection_with_after_proxy_hooks(
-                        &plugins, &mut ctx, reject,
+                        &plugins, &mut ctx, reject, true,
                     )
                     .await;
                     record_request(&state, normalized.http_status.as_u16());
@@ -16676,7 +16786,7 @@ async fn handle_proxy_request_inner(
                                 );
                                 let normalized =
                                     normalize_grpc_plugin_rejection_with_after_proxy_hooks(
-                                        &plugins, &mut ctx, reject,
+                                        &plugins, &mut ctx, reject, false,
                                     )
                                     .await;
                                 response_status = normalized.http_status.as_u16();
@@ -16760,77 +16870,37 @@ async fn handle_proxy_request_inner(
                                 );
                                 let normalized =
                                     normalize_grpc_plugin_rejection_with_after_proxy_hooks(
-                                        &plugins, &mut ctx, reject,
+                                        &plugins, &mut ctx, reject, false,
                                     )
                                     .await;
-                                response_status = normalized.http_status.as_u16();
-                                response_headers = normalized.headers;
+                                if let (Some(grpc_web_ct), Some(grpc_status)) =
+                                    (grpc_web_response_content_type, normalized.grpc_status)
+                                {
+                                    let message = normalized
+                                        .grpc_message
+                                        .as_deref()
+                                        .unwrap_or_else(|| grpc_status_reason(grpc_status));
+                                    let translated =
+                                        crate::plugins::grpc_web::error_response_for_content_type(
+                                            grpc_web_ct,
+                                            grpc_status,
+                                            message,
+                                        );
+                                    response_status = 200;
+                                    response_headers = translated.headers;
+                                    response_body = translated.body;
+                                } else {
+                                    response_status = normalized.http_status.as_u16();
+                                    response_headers = normalized.headers;
+                                    response_body = normalized.body;
+                                }
                                 plugin_response_headers = response_headers.clone();
                                 response_trailers.clear();
-                                response_body = normalized.body;
                                 break;
                             }
                         }
                     }
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                }
-
-                let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-                let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
-                let plugin_external_io_ms =
-                    ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-                let gateway_processing_ms = total_ms - backend_total_ms;
-                let gateway_overhead_ms =
-                    (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
-
-                // Log phase
-                if !plugins.is_empty() {
-                    // Resolve backend IP from DNS cache for gRPC tx log
-                    let grpc_resolved_ip = state
-                        .dns_cache
-                        .resolve(
-                            &proxy.backend_host,
-                            proxy.dns_override.as_deref(),
-                            proxy.dns_cache_ttl_seconds,
-                        )
-                        .await
-                        .ok()
-                        .map(|ip| ip.to_string());
-
-                    // gRPC buffered-success path — `response_body` holds the
-                    // full gRPC response frame (protobuf + trailers). Its
-                    // length is the bytes that will flow to the client.
-                    let bytes_sent = ctx
-                        .bytes_sent_observed
-                        .load(std::sync::atomic::Ordering::Acquire);
-                    let bytes_received = response_body.len() as u64;
-                    let summary = TransactionSummary {
-                        namespace: proxy.namespace.clone(),
-                        timestamp_received: ctx.timestamp_received.to_rfc3339(),
-                        client_ip: ctx.client_ip.clone(),
-                        consumer_username: ctx.effective_identity().map(str::to_owned),
-                        auth_method: ctx.auth_method,
-                        http_method: method,
-                        request_path: original_request_path.clone(),
-                        proxy_id: Some(proxy.id.clone()),
-                        proxy_name: proxy.name.clone(),
-                        backend_target: Some(strip_query_params(&grpc_backend_url).to_string()),
-                        backend_resolved_ip: grpc_resolved_ip,
-                        response_status_code: response_status,
-                        latency_total_ms: total_ms,
-                        latency_gateway_processing_ms: gateway_processing_ms,
-                        latency_backend_ttfb_ms: backend_total_ms,
-                        latency_backend_total_ms: backend_total_ms,
-                        latency_plugin_execution_ms: plugin_execution_ms,
-                        latency_plugin_external_io_ms: plugin_external_io_ms,
-                        latency_gateway_overhead_ms: gateway_overhead_ms,
-                        request_user_agent: ctx.headers.get("user-agent").cloned(),
-                        bytes_sent,
-                        bytes_received,
-                        metadata: clone_log_metadata(&ctx),
-                        ..TransactionSummary::default()
-                    };
-                    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
 
                 // Capture the backend's original trailer `set-cookie` (issue
@@ -16957,6 +17027,74 @@ async fn handle_proxy_request_inner(
                             })
                             .or_insert(cookie_val);
                     }
+                }
+
+                if capabilities.has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
+                    let phase_start = Instant::now();
+                    for plugin in plugins.iter() {
+                        plugin
+                            .on_response_committed(
+                                &mut ctx,
+                                response_status,
+                                &response_headers,
+                                &response_body,
+                            )
+                            .await;
+                    }
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                }
+
+                let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+                let plugin_external_io_ms =
+                    ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+                let gateway_processing_ms = total_ms - backend_total_ms;
+                let gateway_overhead_ms =
+                    (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
+
+                // Log only after committed exporters write their final metadata.
+                if !plugins.is_empty() {
+                    let grpc_resolved_ip = state
+                        .dns_cache
+                        .resolve(
+                            &proxy.backend_host,
+                            proxy.dns_override.as_deref(),
+                            proxy.dns_cache_ttl_seconds,
+                        )
+                        .await
+                        .ok()
+                        .map(|ip| ip.to_string());
+                    let bytes_sent = ctx
+                        .bytes_sent_observed
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    let bytes_received = response_body.len() as u64;
+                    let summary = TransactionSummary {
+                        namespace: proxy.namespace.clone(),
+                        timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                        client_ip: ctx.client_ip.clone(),
+                        consumer_username: ctx.effective_identity().map(str::to_owned),
+                        auth_method: ctx.auth_method,
+                        http_method: method,
+                        request_path: original_request_path.clone(),
+                        proxy_id: Some(proxy.id.clone()),
+                        proxy_name: proxy.name.clone(),
+                        backend_target: Some(strip_query_params(&grpc_backend_url).to_string()),
+                        backend_resolved_ip: grpc_resolved_ip,
+                        response_status_code: response_status,
+                        latency_total_ms: total_ms,
+                        latency_gateway_processing_ms: gateway_processing_ms,
+                        latency_backend_ttfb_ms: backend_total_ms,
+                        latency_backend_total_ms: backend_total_ms,
+                        latency_plugin_execution_ms: plugin_execution_ms,
+                        latency_plugin_external_io_ms: plugin_external_io_ms,
+                        latency_gateway_overhead_ms: gateway_overhead_ms,
+                        request_user_agent: ctx.headers.get("user-agent").cloned(),
+                        bytes_sent,
+                        bytes_received,
+                        metadata: clone_log_metadata(&ctx),
+                        ..TransactionSummary::default()
+                    };
+                    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
 
                 record_request(&state, response_status);
@@ -18269,6 +18407,51 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
+    // Inject the sticky-session cookie before committed exporters observe the
+    // final header view. This remains after every rejection/body replacement so
+    // the cookie lands on the same response that will be sent downstream.
+    if sticky_cookie_needed
+        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
+    {
+        let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
+            &proxy,
+            &epoch.load_balancer,
+            upstream_id,
+            target,
+        );
+        if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
+            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
+            let default_cc = crate::config::types::HashOnCookieConfig::default();
+            let cookie_config = upstream
+                .as_ref()
+                .and_then(|u| u.hash_on_cookie_config.as_ref())
+                .unwrap_or(&default_cc);
+            let cookie_val = build_sticky_cookie_header(cookie_name, target, cookie_config);
+            response_headers
+                .entry("set-cookie".to_string())
+                .and_modify(|v| {
+                    v.push('\n');
+                    v.push_str(&cookie_val);
+                })
+                .or_insert(cookie_val);
+        }
+    }
+
+    // Observe the response only after final-body rejection replacement. The
+    // precomputed capability bit keeps this phase to one predictable branch
+    // when no exporter is configured.
+    if capabilities.has(PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
+        && let ResponseBody::Buffered(ref data) = response_body
+    {
+        let phase_start = Instant::now();
+        for plugin in plugins.iter() {
+            plugin
+                .on_response_committed(&mut ctx, response_status, &response_headers, data)
+                .await;
+        }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
     let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
     let plugin_external_io_ms =
@@ -18329,6 +18512,15 @@ async fn handle_proxy_request_inner(
             content_type,
         )
     } else {
+        if body_will_stream {
+            let content_type = response_headers.get("content-type").map(String::as_str);
+            crate::plugins::notify_response_stream_selected(
+                &plugins,
+                &ctx,
+                response_status,
+                content_type,
+            );
+        }
         None
     };
     if response_inspector.is_some() {
@@ -18402,35 +18594,6 @@ async fn handle_proxy_request_inner(
         } else {
             None
         };
-
-    // Inject sticky session cookie when cookie-based consistent hashing selected a new session
-    if sticky_cookie_needed
-        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
-    {
-        let strategy = backend_dispatch::hash_on_strategy_for_selected_target(
-            &proxy,
-            &epoch.load_balancer,
-            upstream_id,
-            target,
-        );
-        if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
-            let default_cc = crate::config::types::HashOnCookieConfig::default();
-            let cookie_config = upstream
-                .as_ref()
-                .and_then(|u| u.hash_on_cookie_config.as_ref())
-                .unwrap_or(&default_cc);
-            let cookie_val = build_sticky_cookie_header(cookie_name, target, cookie_config);
-            // Append to existing set-cookie or create new entry (newline-separated)
-            response_headers
-                .entry("set-cookie".to_string())
-                .and_modify(|v| {
-                    v.push('\n');
-                    v.push_str(&cookie_val);
-                })
-                .or_insert(cookie_val);
-        }
-    }
 
     record_request(&state, response_status);
 
@@ -27042,6 +27205,8 @@ mod tests {
 
     struct ReplaceRejectPlugin;
 
+    struct CommittedHeaderProbePlugin;
+
     struct CustomNoTransformHeaderPlugin;
 
     struct CustomStrongEtagHeaderPlugin;
@@ -27203,6 +27368,40 @@ mod tests {
                 body: "late fail-closed rejection".to_string(),
                 headers: HashMap::from([("x-replaced".to_string(), "true".to_string())]),
             }
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for CommittedHeaderProbePlugin {
+        fn name(&self) -> &str {
+            "committed_header_probe"
+        }
+
+        fn requires_response_committed_hook(&self) -> bool {
+            true
+        }
+
+        async fn on_response_committed(
+            &self,
+            ctx: &mut RequestContext,
+            response_status: u16,
+            response_headers: &HashMap<String, String>,
+            body: &[u8],
+        ) {
+            ctx.metadata.insert(
+                "test:committed_status".to_string(),
+                response_status.to_string(),
+            );
+            if let Some(content_type) = response_headers.get("content-type") {
+                ctx.metadata.insert(
+                    "test:committed_content_type".to_string(),
+                    content_type.clone(),
+                );
+            }
+            ctx.metadata.insert(
+                "test:committed_body".to_string(),
+                String::from_utf8_lossy(body).into_owned(),
+            );
         }
     }
 
@@ -27490,32 +27689,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opted_in_after_proxy_hook_replaces_uncommitted_rejection() {
-        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ReplaceRejectPlugin)];
+    async fn opted_in_replacement_preserves_earlier_rejection_decorators() {
+        let plugins: Vec<Arc<dyn Plugin>> =
+            vec![Arc::new(RejectHeaderPlugin), Arc::new(ReplaceRejectPlugin)];
         let mut ctx = RequestContext::new("203.0.113.10".into(), "GET".into(), "/body".into());
-        let mut response_status = 200;
-        let mut response_headers = HashMap::new();
-        let reject = RejectedResponseParts {
-            status_code: 200,
-            body: b"synthetic success".to_vec(),
-            headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
-        };
+        let mut status = 200;
+        let mut headers = HashMap::from([
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("content-length".to_string(), "17".to_string()),
+        ]);
+        let mut body = b"synthetic success".to_vec();
 
-        let body = apply_plugin_rejection_response(
+        apply_reject_after_proxy_and_synthetic_body_hooks(
             &plugins,
             &mut ctx,
-            &mut response_status,
-            &mut response_headers,
-            reject,
+            &mut status,
+            &mut headers,
+            &mut body,
+            false,
+            false,
         )
         .await;
 
-        assert_eq!(response_status, 503);
+        assert_eq!(status, 503);
+        assert_eq!(body, b"late fail-closed rejection");
         assert_eq!(
-            response_headers.get("x-replaced").map(String::as_str),
-            Some("true")
+            headers.get("x-after-reject").map(String::as_str),
+            Some("applied"),
+            "replacement must retain CORS/correlation-style headers from earlier hooks"
         );
-        assert!(String::from_utf8_lossy(&body).contains("late fail-closed rejection"));
+        assert_eq!(headers.get("x-replaced").map(String::as_str), Some("true"));
+        assert!(!headers.contains_key("content-length"));
         assert!(!ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY));
     }
 
@@ -27624,6 +27828,42 @@ mod tests {
 
         assert_eq!(response.http_status, StatusCode::OK);
         assert_eq!(response.body, body);
+    }
+
+    #[tokio::test]
+    async fn non_grpc_reject_committed_hook_sees_default_content_type() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CommittedHeaderProbePlugin)];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        let body = br#"{"error":"blocked"}"#;
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 422,
+            body: bytes::Bytes::copy_from_slice(body),
+            headers: HashMap::new(),
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            ctx.metadata
+                .get("test:committed_content_type")
+                .map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("test:committed_status")
+                .map(String::as_str),
+            Some("422")
+        );
+        assert_eq!(
+            ctx.metadata.get("test:committed_body").map(String::as_str),
+            Some(r#"{"error":"blocked"}"#)
+        );
     }
 
     #[tokio::test]
@@ -28277,9 +28517,10 @@ mod tests {
             headers: HashMap::new(),
         };
 
-        let normalized =
-            normalize_grpc_plugin_rejection_with_after_proxy_hooks(&plugins, &mut ctx, reject)
-                .await;
+        let normalized = normalize_grpc_plugin_rejection_with_after_proxy_hooks(
+            &plugins, &mut ctx, reject, true,
+        )
+        .await;
 
         assert_eq!(normalized.http_status, StatusCode::OK);
         assert_eq!(

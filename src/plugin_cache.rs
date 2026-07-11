@@ -346,6 +346,20 @@ impl Plugin for PriorityOverridePlugin {
             .on_final_response_body(ctx, response_status, response_headers, body)
             .await
     }
+    fn requires_response_committed_hook(&self) -> bool {
+        self.inner.requires_response_committed_hook()
+    }
+    async fn on_response_committed(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+    ) {
+        self.inner
+            .on_response_committed(ctx, response_status, response_headers, body)
+            .await;
+    }
     async fn on_response_stream_terminated(
         &self,
         ctx: &mut RequestContext,
@@ -393,6 +407,15 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn requires_response_stream_hooks(&self) -> bool {
         self.inner.requires_response_stream_hooks()
+    }
+    fn on_response_stream_selected(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        content_type: Option<&str>,
+    ) {
+        self.inner
+            .on_response_stream_selected(ctx, response_status, content_type);
     }
     fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
         self.inner.forces_reqwest_dispatch(ctx)
@@ -559,7 +582,8 @@ impl PluginCapabilities {
     pub const HAS_BODY_BEFORE_AUTHENTICATE: u16 = 1 << 5;
     pub const NEEDS_DECODED_QUERY_PARAMS: u16 = 1 << 6;
     pub const NEEDS_FINAL_REQUEST_BODY_CONTEXT: u16 = 1 << 7;
-    pub const HAS_RESPONSE_STREAM_HOOKS: u16 = 1 << 8;
+    pub const HAS_RESPONSE_COMMITTED_HOOK: u16 = 1 << 8;
+    pub const HAS_RESPONSE_STREAM_HOOKS: u16 = 1 << 9;
 
     #[inline(always)]
     pub fn has(self, flag: u16) -> bool {
@@ -618,6 +642,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.needs_final_request_body_context() {
             caps |= PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT;
+        }
+        if p.requires_response_committed_hook() {
+            caps |= PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK;
         }
         if p.requires_response_stream_hooks() {
             caps |= PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS;

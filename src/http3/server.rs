@@ -1391,6 +1391,7 @@ async fn handle_h3_request(
                     &mut headers,
                     &mut reject_body,
                     matches!(http_flavor, HttpFlavor::Grpc),
+                    true,
                 )
                 .await;
                 plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -1516,6 +1517,7 @@ async fn handle_h3_request(
             &mut headers,
             &mut reject_body,
             matches!(http_flavor, HttpFlavor::Grpc),
+            true,
         )
         .await;
         plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
@@ -1591,6 +1593,7 @@ async fn handle_h3_request(
                         &mut headers,
                         &mut reject_body,
                         matches!(http_flavor, HttpFlavor::Grpc),
+                        true,
                     )
                     .await;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -1719,6 +1722,7 @@ async fn handle_h3_request(
                         &mut headers,
                         &mut reject_body,
                         matches!(http_flavor, HttpFlavor::Grpc),
+                        true,
                     )
                     .await;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -1798,6 +1802,7 @@ async fn handle_h3_request(
                         &mut headers,
                         &mut reject_body,
                         matches!(http_flavor, HttpFlavor::Grpc),
+                        true,
                     )
                     .await;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -2033,24 +2038,18 @@ async fn handle_h3_request(
         ) {
             Ok(result) => result,
             Err(()) => {
-                let mut status_code = 503;
-                let mut body =
-                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#
-                        .to_vec();
+                record_request(&state, 503);
                 let mut rej_headers = HashMap::new();
-                apply_after_proxy_hooks_to_rejection(
-                    &plugins,
-                    &mut ctx,
-                    &mut status_code,
-                    &mut body,
-                    &mut rej_headers,
+                apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, 503, &mut rej_headers)
+                    .await;
+                send_h3_reject_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                    &rej_headers,
                 )
-                .await;
-                let status =
-                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
-                record_request(&state, status.as_u16());
-                send_h3_reject_flavor_aware(&mut stream, http_flavor, status, &body, &rej_headers)
-                    .await?;
+                .await?;
                 return Ok(());
             }
         };
@@ -2723,6 +2722,8 @@ async fn handle_h3_request(
                 backend_admission_plugins: backend_admission_plugins.as_ref(),
                 preacquired_backend_admission,
                 requires_response_body_buffering: maybe_requires_response_body_buffering,
+                has_response_committed_hook: capabilities
+                    .has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK),
                 requires_response_stream_hooks: stream_hooks_enabled,
                 sticky_cookie_needed,
             })
@@ -3868,24 +3869,21 @@ async fn handle_h3_request(
                 .await?;
                 return Ok(());
             };
-            let mut status_code = reject.status_code;
-            let mut body = reject.body;
             let mut headers = reject.headers;
             apply_after_proxy_hooks_to_rejection(
                 &plugins,
                 &mut ctx,
-                &mut status_code,
-                &mut body,
+                reject.status_code,
                 &mut headers,
             )
             .await;
             let http_status =
-                StatusCode::from_u16(status_code).unwrap_or(StatusCode::PAYLOAD_TOO_LARGE);
+                StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::PAYLOAD_TOO_LARGE);
             let log_status_code = h3_reject_log_status_and_metadata(
                 &mut ctx,
                 http_flavor,
                 http_status,
-                &body,
+                &reject.body,
                 &headers,
             );
             record_request(&state, log_status_code);
@@ -3898,8 +3896,14 @@ async fn handle_h3_request(
                 plugin_execution_ns,
             )
             .await;
-            send_h3_reject_flavor_aware(&mut stream, http_flavor, http_status, &body, &headers)
-                .await?;
+            send_h3_reject_flavor_aware(
+                &mut stream,
+                http_flavor,
+                http_status,
+                &reject.body,
+                &headers,
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -4716,6 +4720,25 @@ async fn handle_h3_request(
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
 
+        response_headers
+            .entry("content-type".to_string())
+            .or_insert_with(|| "application/json".to_string());
+
+        if capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
+            let phase_start = std::time::Instant::now();
+            for plugin in plugins.iter() {
+                plugin
+                    .on_response_committed(
+                        &mut ctx,
+                        response_status,
+                        &response_headers,
+                        &response_body,
+                    )
+                    .await;
+            }
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        }
+
         let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
         let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
         let plugin_external_io_ms = ctx
@@ -4765,12 +4788,8 @@ async fn handle_h3_request(
 
         // Build and send buffered response
         let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let mut resp_builder =
+        let resp_builder =
             apply_response_headers(Response::builder().status(status), &response_headers);
-
-        if !response_headers.contains_key("content-type") {
-            resp_builder = resp_builder.header("content-type", "application/json");
-        }
 
         let resp = resp_builder
             .body(())
@@ -4865,21 +4884,39 @@ async fn run_h3_backend_admission_or_send_reject(
                 cb_target_key,
                 cb_is_half_open_probe,
             );
-            let mut status_code = rejection.status_code;
-            let mut body = rejection.body;
             let mut headers = rejection.headers;
-            apply_after_proxy_hooks_to_rejection(
-                plugins,
+            apply_after_proxy_hooks_to_rejection(plugins, ctx, rejection.status_code, &mut headers)
+                .await;
+            let http_status = StatusCode::from_u16(rejection.status_code)
+                .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+            let log_status_code = h3_reject_log_status_and_metadata(
                 ctx,
-                &mut status_code,
-                &mut body,
-                &mut headers,
-            )
-            .await;
-            let http_status =
-                StatusCode::from_u16(status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
-            let log_status_code =
-                h3_reject_log_status_and_metadata(ctx, flavor, http_status, &body, &headers);
+                flavor,
+                http_status,
+                &rejection.body,
+                &headers,
+            );
+            if plugins
+                .iter()
+                .any(|plugin| plugin.requires_response_committed_hook())
+            {
+                let normalized = crate::proxy::normalize_reject_response(
+                    http_status,
+                    &rejection.body,
+                    &headers,
+                    matches!(flavor, HttpFlavor::Grpc),
+                );
+                for plugin in plugins {
+                    plugin
+                        .on_response_committed(
+                            ctx,
+                            normalized.http_status.as_u16(),
+                            &normalized.headers,
+                            &normalized.body,
+                        )
+                        .await;
+                }
+            }
             record_request(state, log_status_code);
             log_rejected_request(
                 plugins,
@@ -4890,7 +4927,8 @@ async fn run_h3_backend_admission_or_send_reject(
                 plugin_execution_ns,
             )
             .await;
-            send_h3_reject_flavor_aware(stream, flavor, http_status, &body, &headers).await?;
+            send_h3_reject_flavor_aware(stream, flavor, http_status, &rejection.body, &headers)
+                .await?;
             Ok(Err(()))
         }
     }

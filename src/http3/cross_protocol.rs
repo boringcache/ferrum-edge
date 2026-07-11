@@ -195,6 +195,7 @@ where
     pub backend_admission_plugins: &'a [Arc<dyn Plugin>],
     pub preacquired_backend_admission: crate::proxy::PreacquiredBackendAdmission,
     pub requires_response_body_buffering: bool,
+    pub has_response_committed_hook: bool,
     pub requires_response_stream_hooks: bool,
     pub sticky_cookie_needed: bool,
 }
@@ -358,28 +359,25 @@ where
             if let Some(slot) = pending_slot_to_release_before_reject {
                 drop(slot.take());
             }
-            let mut status_code = rejection.status_code;
-            let mut body = rejection.body;
             let mut headers = rejection.headers;
             crate::proxy::apply_after_proxy_hooks_to_rejection(
                 plugins,
                 ctx,
-                &mut status_code,
-                &mut body,
+                rejection.status_code,
                 &mut headers,
             )
             .await;
-            let http_status =
-                StatusCode::from_u16(status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+            let http_status = StatusCode::from_u16(rejection.status_code)
+                .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
             let mut outcome = if matches!(flavor, HttpFlavor::Grpc) {
-                let normalized = normalize_h3_grpc_reject(http_status, &body, &headers);
+                let normalized = normalize_h3_grpc_reject(http_status, &rejection.body, &headers);
                 apply_h3_grpc_reject_metadata(ctx, &normalized);
                 write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await?
             } else {
                 write_reject_with_headers(
                     stream,
                     http_status,
-                    &body,
+                    &rejection.body,
                     &headers,
                     backend_start,
                     bytes_sent,
@@ -491,9 +489,10 @@ fn strip_query_from_backend_url(url: &str) -> String {
 /// backend response headers (modify / reject), `inject_sticky_cookie`
 /// (sticky LB cookie), and buffered-response hooks
 /// (`on_response_body` / `transform_response_body` /
-/// `on_final_response_body`) on plain and gRPC responses when buffering is
-/// active. Without these, H3 clients on non-H3 backends would silently skip
-/// body validators, response transformers, sticky sessions, etc.
+/// `on_final_response_body` / `on_response_committed`) on plain and gRPC
+/// responses when buffering is active. Without these, H3 clients on non-H3
+/// backends would silently skip body validators, response transformers,
+/// exporters, sticky sessions, etc.
 pub(crate) async fn run<S>(
     request: CrossProtocolRequest<'_, S>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
@@ -526,6 +525,7 @@ where
         backend_admission_plugins,
         preacquired_backend_admission,
         requires_response_body_buffering,
+        has_response_committed_hook,
         requires_response_stream_hooks,
         sticky_cookie_needed,
     } = request;
@@ -587,8 +587,11 @@ where
                         plugins,
                         ctx,
                         reject,
-                        backend_start,
-                        raw_prebuffered_body_bytes,
+                        has_response_committed_hook,
+                        RejectWriteAccounting {
+                            backend_start,
+                            bytes_sent: raw_prebuffered_body_bytes,
+                        },
                     )
                     .await;
                 }
@@ -624,6 +627,7 @@ where
                 backend_admission_plugins,
                 preacquired_backend_admission,
                 requires_response_body_buffering,
+                has_response_committed_hook,
                 requires_response_stream_hooks,
                 sticky_cookie_needed,
             )
@@ -654,6 +658,7 @@ where
                 plugins,
                 backend_admission_plugins,
                 requires_response_body_buffering,
+                has_response_committed_hook,
                 sticky_cookie_needed,
             )
             .await
@@ -1197,6 +1202,7 @@ async fn dispatch_plain<S>(
     backend_admission_plugins: &[Arc<dyn Plugin>],
     mut preacquired_backend_admission: crate::proxy::PreacquiredBackendAdmission,
     requires_response_body_buffering: bool,
+    has_response_committed_hook: bool,
     requires_response_stream_hooks: bool,
     sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
@@ -2083,11 +2089,31 @@ where
             None,
             backend_admission_elapsed,
         );
-        let mut outcome = write_reject_with_headers(
-            stream,
-            StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        let reject_status =
+            StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let normalized = crate::proxy::normalize_reject_response(
+            reject_status,
             &reject.body,
             &reject.headers,
+            false,
+        );
+        if has_response_committed_hook {
+            for plugin in plugins {
+                plugin
+                    .on_response_committed(
+                        ctx,
+                        normalized.http_status.as_u16(),
+                        &normalized.headers,
+                        &normalized.body,
+                    )
+                    .await;
+            }
+        }
+        let mut outcome = write_reject_with_headers(
+            stream,
+            normalized.http_status,
+            &normalized.body,
+            &normalized.headers,
             backend_start,
             bytes_sent,
         )
@@ -2241,6 +2267,19 @@ where
                         .await;
                         break;
                     }
+                }
+            }
+
+            if has_response_committed_hook {
+                for plugin in plugins {
+                    plugin
+                        .on_response_committed(
+                            ctx,
+                            response_status,
+                            &response_headers,
+                            &response_body,
+                        )
+                        .await;
                 }
             }
         }
@@ -2966,6 +3005,7 @@ async fn dispatch_grpc<S>(
     plugins: &[Arc<dyn Plugin>],
     backend_admission_plugins: &[Arc<dyn Plugin>],
     requires_response_body_buffering: bool,
+    has_response_committed_hook: bool,
     sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
@@ -3391,8 +3431,11 @@ where
                         body: Bytes::from(reject.body),
                         headers: reject.headers,
                     },
-                    backend_start,
-                    bytes_sent,
+                    has_response_committed_hook,
+                    RejectWriteAccounting {
+                        backend_start,
+                        bytes_sent,
+                    },
                 )
                 .await
                 {
@@ -3630,6 +3673,19 @@ where
                 })
             {
                 response_trailers.clear();
+            }
+
+            if has_response_committed_hook {
+                for plugin in plugins.iter() {
+                    plugin
+                        .on_response_committed(
+                            ctx,
+                            response_status,
+                            &response_headers,
+                            &response_body,
+                        )
+                        .await;
+                }
             }
 
             if let Err(error) =
@@ -4265,23 +4321,23 @@ async fn apply_buffered_plain_plugin_reject(
         warn!("buffered plain reject helper received a non-reject plugin result");
         return;
     };
-    *response_status = reject.status_code;
-    *response_body = reject.body;
-    *response_headers = reject.headers;
+    let mut headers = reject.headers;
     crate::proxy::apply_after_proxy_hooks_to_rejection(
         plugins,
         ctx,
-        response_status,
-        response_body,
-        response_headers,
+        reject.status_code,
+        &mut headers,
     )
     .await;
-    if !response_headers
+    if !headers
         .keys()
         .any(|key| key.eq_ignore_ascii_case("content-type"))
     {
-        response_headers.insert("content-type".to_string(), "application/json".to_string());
+        headers.insert("content-type".to_string(), "application/json".to_string());
     }
+    *response_status = reject.status_code;
+    *response_headers = headers;
+    *response_body = reject.body;
 }
 
 async fn apply_buffered_grpc_plugin_reject(
@@ -4297,20 +4353,17 @@ async fn apply_buffered_grpc_plugin_reject(
         warn!("buffered gRPC reject helper received a non-reject plugin result");
         return;
     };
-    let mut status_code = reject.status_code;
-    let mut body = reject.body;
     let mut headers = reject.headers;
     crate::proxy::apply_after_proxy_hooks_to_rejection(
         plugins,
         ctx,
-        &mut status_code,
-        &mut body,
+        reject.status_code,
         &mut headers,
     )
     .await;
     let normalized = normalize_h3_grpc_reject(
-        StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
-        &body,
+        StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+        &reject.body,
         &headers,
     );
     apply_h3_grpc_reject_metadata(ctx, &normalized);
@@ -5039,18 +5092,27 @@ where
 /// emitting the right wire format for the flavor: trailers-only gRPC for
 /// Grpc, HTTP + headers for Plain, 501 is never reached (WebSocket is
 /// rejected upstream).
+struct RejectWriteAccounting {
+    backend_start: Instant,
+    bytes_sent: u64,
+}
+
 async fn write_final_body_reject<S>(
     stream: &mut RequestStream<S, Bytes>,
     flavor: HttpFlavor,
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     reject: PluginResult,
-    backend_start: Instant,
-    bytes_sent: u64,
+    has_response_committed_hook: bool,
+    accounting: RejectWriteAccounting,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    let RejectWriteAccounting {
+        backend_start,
+        bytes_sent,
+    } = accounting;
     let Some(parts) = crate::proxy::plugin_result_into_reject_parts(reject) else {
         warn!("final body reject helper received a non-reject plugin result");
         return if matches!(flavor, HttpFlavor::Grpc) {
@@ -5073,28 +5135,44 @@ where
             .await
         };
     };
-    let mut status_code = parts.status_code;
-    let mut body = parts.body;
+    let http_status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_REQUEST);
     let mut headers = parts.headers;
     crate::proxy::apply_after_proxy_hooks_to_rejection(
         plugins,
         ctx,
-        &mut status_code,
-        &mut body,
+        http_status.as_u16(),
         &mut headers,
     )
     .await;
-    let http_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_REQUEST);
+    let normalized = crate::proxy::normalize_reject_response(
+        http_status,
+        &parts.body,
+        &headers,
+        matches!(flavor, HttpFlavor::Grpc),
+    );
     if matches!(flavor, HttpFlavor::Grpc) {
-        let normalized = normalize_h3_grpc_reject(http_status, &body, &headers);
         apply_h3_grpc_reject_metadata(ctx, &normalized);
+    }
+    if has_response_committed_hook {
+        for plugin in plugins {
+            plugin
+                .on_response_committed(
+                    ctx,
+                    normalized.http_status.as_u16(),
+                    &normalized.headers,
+                    &normalized.body,
+                )
+                .await;
+        }
+    }
+    if matches!(flavor, HttpFlavor::Grpc) {
         write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await
     } else {
         write_reject_with_headers(
             stream,
-            http_status,
-            &body,
-            &headers,
+            normalized.http_status,
+            &normalized.body,
+            &normalized.headers,
             backend_start,
             bytes_sent,
         )
@@ -5225,19 +5303,16 @@ where
         )
         .await;
     };
-    let mut status_code = parts.status_code;
-    let mut body = parts.body;
+    let http_status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_REQUEST);
     let mut headers = parts.headers;
     crate::proxy::apply_after_proxy_hooks_to_rejection(
         plugins,
         ctx,
-        &mut status_code,
-        &mut body,
+        http_status.as_u16(),
         &mut headers,
     )
     .await;
-    let http_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_REQUEST);
-    let normalized = normalize_h3_grpc_reject(http_status, &body, &headers);
+    let normalized = normalize_h3_grpc_reject(http_status, &parts.body, &headers);
     apply_h3_grpc_reject_metadata(ctx, &normalized);
     write_normalized_grpc_reject_send(stream, &normalized, backend_start, bytes_sent).await
 }
