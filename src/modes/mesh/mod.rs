@@ -22462,10 +22462,16 @@ mod tests {
                     .get("mesh_policies")
                     .and_then(|policies| policies.as_array())
                     .expect("mesh policies array");
-                assert_eq!(policies.len(), 1);
+                // Ambient preparation deliberately carries the pre-filter policy
+                // candidates for the UDP source/destination authorization union.
+                // `MeshAuthz::from_config` keeps that superset for UDP, then
+                // cold-path filters its ordinary destination policy slice.
                 assert_eq!(
-                    policies[0].get("name").and_then(|name| name.as_str()),
-                    Some("api-only")
+                    policies
+                        .iter()
+                        .filter_map(|policy| policy.get("name").and_then(|name| name.as_str()))
+                        .collect::<Vec<_>>(),
+                    vec!["api-only", "worker-only"]
                 );
                 assert_eq!(
                     mesh_slice
