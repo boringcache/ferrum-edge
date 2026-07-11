@@ -154,6 +154,14 @@ fn http1_parser_max_buf_size(configured_header_limit: usize) -> usize {
 /// invoked on a backend response" path (response_headers came from upstream).
 pub(crate) const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 
+/// Companion marker set only while an uncommitted rejection body may still be
+/// replaced by an opted-in `after_proxy` hook. The ordinary rejection replay
+/// path sets [`REJECTION_RESPONSE_METADATA_KEY`] without this marker, so a
+/// fail-closed plugin can distinguish a replacement that will reach the client
+/// from a reject result that proxy core must ignore.
+pub(crate) const REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY: &str =
+    "ferrum:replaceable_rejection_response";
+
 /// Marker recorded in `ctx.metadata` for the duration of
 /// [`apply_synthetic_response_body_hooks`] — i.e. while the response-body hook
 /// pipeline (`on_response_body`, `transform_response_body_with_context`,
@@ -12363,6 +12371,15 @@ async fn run_after_proxy_hooks_on_rejection(
     mut response_body: Option<&mut Vec<u8>>,
     response_headers: &mut HashMap<String, String>,
 ) {
+    let previous_replaceable_marker = if response_body.is_some() {
+        ctx.metadata.insert(
+            REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        )
+    } else {
+        ctx.metadata
+            .remove(REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY)
+    };
     let previous_marker = ctx.metadata.insert(
         REJECTION_RESPONSE_METADATA_KEY.to_string(),
         "true".to_string(),
@@ -12393,6 +12410,13 @@ async fn run_after_proxy_hooks_on_rejection(
                     // describing the representation that is being replaced.
                     // Explicit replacement headers below then define the new
                     // body and win over any retained decorator header.
+                    let preserve_origin_vary = response_headers
+                        .get("vary")
+                        .is_some_and(|value| {
+                            value
+                                .split(',')
+                                .any(|token| token.trim().eq_ignore_ascii_case("origin"))
+                        });
                     for header in [
                         "content-length",
                         "content-encoding",
@@ -12415,6 +12439,19 @@ async fn run_after_proxy_hooks_on_rejection(
                         response_headers.remove(header);
                     }
                     response_headers.extend(reject.headers);
+                    if preserve_origin_vary {
+                        response_headers
+                            .entry("vary".to_string())
+                            .and_modify(|value| {
+                                if !value
+                                    .split(',')
+                                    .any(|token| token.trim().eq_ignore_ascii_case("origin"))
+                                {
+                                    value.push_str(", Origin");
+                                }
+                            })
+                            .or_insert_with(|| "Origin".to_string());
+                    }
                     warn!(
                         rejecting_plugin = plugin.name(),
                         replacement_status = *status_code,
@@ -12448,6 +12485,15 @@ async fn run_after_proxy_hooks_on_rejection(
             .insert(REJECTION_RESPONSE_METADATA_KEY.to_string(), previous_marker);
     } else {
         ctx.metadata.remove(REJECTION_RESPONSE_METADATA_KEY);
+    }
+    if let Some(previous_marker) = previous_replaceable_marker {
+        ctx.metadata.insert(
+            REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY.to_string(),
+            previous_marker,
+        );
+    } else {
+        ctx.metadata
+            .remove(REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY);
     }
 }
 
@@ -27742,7 +27788,10 @@ mod tests {
             ),
             ("age".to_string(), "120".to_string()),
             ("pragma".to_string(), "cache".to_string()),
-            ("vary".to_string(), "accept-encoding".to_string()),
+            (
+                "vary".to_string(),
+                "accept-encoding, Origin".to_string(),
+            ),
             ("warning".to_string(), "110 stale".to_string()),
         ]);
         let mut body = b"synthetic success".to_vec();
@@ -27782,7 +27831,6 @@ mod tests {
             "expires",
             "age",
             "pragma",
-            "vary",
             "warning",
         ] {
             assert!(
@@ -27790,7 +27838,12 @@ mod tests {
                 "replacement retained stale {stale_header}"
             );
         }
+        assert_eq!(headers.get("vary").map(String::as_str), Some("Origin"));
         assert!(!ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY));
+        assert!(
+            !ctx.metadata
+                .contains_key(REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY)
+        );
     }
 
     fn ai_json_response(content: &str) -> Vec<u8> {

@@ -51,7 +51,10 @@ use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction,
     ResponseStreamInspector, TransactionSummary,
 };
-use crate::proxy::{REJECTION_RESPONSE_METADATA_KEY, SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY};
+use crate::proxy::{
+    REJECTION_RESPONSE_METADATA_KEY, REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY,
+    SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY,
+};
 
 /// Schema version stamped onto every emitted record.
 const RECORD_VERSION: u32 = 1;
@@ -1364,6 +1367,16 @@ impl Plugin for AiTranscriptAudit {
             self.refresh_staged_request(ctx, body.as_bytes());
             ctx.metadata.insert("request_body".to_string(), body);
         }
+        if ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY)
+            && !ctx
+                .metadata
+                .contains_key(REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY)
+        {
+            // Proxy core cannot apply a fresh reject while replaying hooks over
+            // an already-fixed response. Only the explicitly replaceable pass
+            // may perform fail-closed admission here.
+            return PluginResult::Continue;
+        }
         if self.capture.streaming != StreamingCapture::Off {
             let stream_admission =
                 self.stream_fail_closed_rejection(ctx, response_status, response_headers);
@@ -1371,20 +1384,17 @@ impl Plugin for AiTranscriptAudit {
                 return stream_admission;
             }
         }
-        if self.buffered_response_capture_wanted(ctx) {
+        if flag(&ctx.metadata, MD_STREAM_REQUEST) {
+            // Stream admission above is selective: unsampled successful
+            // streams must not consume buffered-response capacity.
+            PluginResult::Continue
+        } else if self.buffered_response_capture_wanted(ctx) {
             // Streaming and buffered capture are independent policies. A
             // response that remains JSON still needs the buffered path's
             // admission even when streaming capture is also configured. Both
             // checks reuse the same per-record permit when they select the
             // same eventual audit record.
             self.ensure_commit_admission(ctx)
-        } else if ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY) {
-            // `apply_after_proxy_hooks_to_rejection` is replaying header hooks
-            // over an already-fixed response and ignores replacement rejects.
-            // Admission ran in `before_proxy` (or the normal backend
-            // `after_proxy` pass); do not stamp a new rejected verdict whose
-            // 503 cannot replace the response at this point.
-            PluginResult::Continue
         } else {
             self.ensure_commit_admission(ctx)
         }
