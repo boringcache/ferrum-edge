@@ -2002,12 +2002,13 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   exist (a case where nft-backed iptables returns exit status 2 while legacy
   returns 1), while any other non-1 status on an existence or jump probe still
   aborts the install and retains the fail-closed cleanup owner. Enrollment also
-  starts closed: the
-  node-agent marks each enrolled pod's BPF pod-IP entry UDP-not-ready before registry
+  starts closed: the node-agent marks each enrolled pod's BPF pod-IP entry UDP-not-ready before registry
   publication, so the host-veth tc classifier drops pod-originated UDP until the
   producer publishes `.udp-ready/<pod_uid>` after the guarded-to-live transition.
   Re-enrollment removes stale readiness first, and both marker and BPF transitions
-  reconcile idempotently. Producer stop removes readiness and waits for the
+  reconcile idempotently. Producer stop first persists
+  `.udp-ack-required/<pod_uid>`, invalidates stale acknowledgements, then removes
+  readiness and waits for the
   node-agent's `.udp-not-ready/<pod_uid>` acknowledgement that the BPF gate closed;
   if the acknowledgement is unavailable, stop retains the in-netns DROP guard
   instead of reopening plaintext. Live source-capture plus bind-collision
@@ -2020,9 +2021,9 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   and retain-guard decision. Graceful shutdown AWAITS the per-netns teardown.
   When Ambient UDP capture is disabled, mesh startup still runs a best-effort
   cleanup manager over the registry so stale pod-netns `FERRUM_MESH_UDP_*` rules
-  from a prior enabled crash/kill are
-  removed instead of black-holing workload UDP. If it observes a stale
-  `.udp-ready` marker, cleanup retracts every marker first and waits for the
+  from a prior enabled crash/kill are removed instead of black-holing workload
+  UDP. If it observes a stale `.udp-ready` marker, cleanup durably records the
+  pending ack before retracting readiness and waits for the
   node-agent's closed-gate acknowledgement against one shared deadline; without
   that acknowledgement it preserves the stale rules fail-closed and retries
   instead of reopening plaintext. Startup is **fail-closed**: an

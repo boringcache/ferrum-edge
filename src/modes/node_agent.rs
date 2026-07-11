@@ -475,22 +475,21 @@ pub async fn run(
 
     // Fail closed when Ambient UDP capture needs the per-pod registry but the
     // node would take the iptables `handle_fallback()` path (#2013). The
-    // `NetnsUdpCaptureManager` producer on the mesh proxy polls the per-pod
+    // `NetnsUdpCaptureManager` producer and disabled `NetnsUdpCleanupManager`
+    // on the mesh proxy poll the per-pod
     // registry (`node_waypoint_pod_registry_dir`) as its ONLY source of enrolled
     // pods, and that registry is populated exclusively by the eBPF-backed pod
     // watcher (`run_with_backend` → `handle_kube_pod_applied` → `publish_pod_
     // registry`). `handle_fallback()` only applies host-netns iptables and never
     // runs the pod watcher, so it would leave the producer polling an empty
-    // directory while pod UDP egress bypasses capture/authz entirely — a silent
-    // fail-open. Host-netns iptables also cannot install pod-netns UDP TPROXY
+    // directory while enabled capture bypasses authz or disabled cleanup strands
+    // stale fail-closed guards. Host-netns iptables also cannot install pod-netns UDP TPROXY
     // rules at all (the `addrtype --dst-type LOCAL` direction split is
     // pod-netns-only; see `handle_fallback_with`). Refuse startup with an
-    // actionable error rather than run in a state where `FERRUM_MESH_CAPTURE_UDP_
-    // ENABLED=true` silently captures nothing, mirroring `create_backend`'s
-    // refusal to no-op when eBPF is unavailable.
+    // actionable error rather than silently break either lifecycle phase,
+    // mirroring `create_backend`'s refusal to no-op when eBPF is unavailable.
     if ambient_udp_registry_requires_ebpf(
         probe.supports_ebpf(),
-        config.capture_config.udp_capture_enabled,
         config.node_waypoint_pod_registry_dir.is_some(),
     ) {
         metrics.set_topology_degraded(probe.degradation_reason().unwrap_or("unknown"));
@@ -502,15 +501,15 @@ pub async fn run(
             }
         }
         anyhow::bail!(
-            "Ambient UDP capture is enabled (FERRUM_MESH_CAPTURE_UDP_ENABLED=true) but this node \
+            "Ambient UDP lifecycle cleanup requires the per-pod registry, but this node \
              cannot run eBPF capture (kernel_release={}, cgroup_v2={}, bpf_fs={}, reason={}), so the \
              node-agent would fall back to host-netns iptables — which never runs the pod watcher \
              that publishes the per-pod registry the mesh proxy's UDP capture producer polls, and \
              cannot install pod-netns UDP TPROXY rules from the host netns. Continuing would leave \
              pod UDP egress uncaptured and unauthorized (fail-open). Remediation: upgrade this node \
              to kernel >= 5.7 with cgroup v2 + bpffs mounted (use the -ebpf image variant), or \
-             disable Ambient UDP capture on this node (FERRUM_MESH_CAPTURE_UDP_ENABLED=false). \
-             FERRUM_NODE_AGENT_FALLBACK_MODE=iptables does not support Ambient UDP capture.",
+             disable the Ambient topology on this node. FERRUM_NODE_AGENT_FALLBACK_MODE=iptables \
+             does not support the Ambient UDP producer or its disabled stale-rule cleanup.",
             probe.kernel_release,
             probe.cgroup_v2_available,
             probe.bpf_fs_available,
@@ -558,21 +557,15 @@ pub async fn run(
 /// Returns `true` when ALL hold:
 /// - `supports_ebpf` is `false` (the node would take the `handle_fallback()`
 ///   iptables path, which never runs the pod watcher / `publish_pod_registry`),
-/// - `udp_capture_enabled` is `true` (the Ambient `NetnsUdpCaptureManager`
-///   producer will poll the per-pod registry as its source of enrolled pods), and
 /// - `registry_dir_configured` is `true` (a registry directory is actually set,
-///   so the producer has somewhere to poll).
+///   so either the producer or disabled cleanup manager has somewhere to poll).
 ///
 /// When `true`, the node-agent must fail startup rather than silently run in a
 /// state where pod UDP egress bypasses capture/authz (fail-open, #2013). This is
 /// split out as a pure function so the fail-closed decision is unit-testable
 /// without the Linux-gated capture path.
-fn ambient_udp_registry_requires_ebpf(
-    supports_ebpf: bool,
-    udp_capture_enabled: bool,
-    registry_dir_configured: bool,
-) -> bool {
-    !supports_ebpf && udp_capture_enabled && registry_dir_configured
+fn ambient_udp_registry_requires_ebpf(supports_ebpf: bool, registry_dir_configured: bool) -> bool {
+    !supports_ebpf && registry_dir_configured
 }
 
 async fn start_node_agent_admin_listeners(
@@ -2978,7 +2971,11 @@ fn reconcile_udp_capture_readiness(
             .node_waypoint_pod_registry_dir
             .as_ref()
             .is_some_and(|dir| dir.join(".udp-not-ready").join(uid).is_file());
-        if ready_uids.contains(uid) == ready && (ready || not_ready_ack_exists) {
+        // Stable ready state requires the mutually-exclusive marker posture:
+        // ready => no close ack, not-ready => close ack present. If removal of a
+        // stale ack failed transiently, keep reconciling until it is gone rather
+        // than letting producer teardown trust it while the BPF gate is open.
+        if ready_uids.contains(uid) == ready && not_ready_ack_exists != ready {
             continue;
         }
         if ready {
@@ -5152,34 +5149,31 @@ mod tests {
 
     #[test]
     fn ambient_udp_registry_requires_ebpf_fails_closed_on_iptables_fallback() {
-        // Ambient UDP capture enabled + a configured registry + a node that
+        // Ambient UDP lifecycle + a configured registry + a node that
         // cannot run eBPF (would take the iptables `handle_fallback()` path) must
         // refuse startup: `handle_fallback()` never runs the pod watcher that
-        // populates the registry, so the UDP producer would poll an empty
-        // directory while pod UDP egress bypasses capture (fail-open, #2013).
+        // populates the registry, so producer startup or disabled stale-rule
+        // cleanup would poll an empty directory (#2013).
         assert!(
-            ambient_udp_registry_requires_ebpf(false, true, true),
-            "no eBPF + UDP capture + configured registry must fail closed"
+            ambient_udp_registry_requires_ebpf(false, true),
+            "no eBPF + configured Ambient lifecycle registry must fail closed"
         );
 
         // eBPF-capable nodes run `run_with_backend`, which publishes the
         // registry via the pod watcher — no need to refuse.
         assert!(
-            !ambient_udp_registry_requires_ebpf(true, true, true),
+            !ambient_udp_registry_requires_ebpf(true, true),
             "eBPF-capable node publishes the registry; must not refuse"
         );
 
-        // No UDP capture means no producer polling the registry, so the iptables
-        // fallback is fine (TCP capture is handled separately).
-        assert!(
-            !ambient_udp_registry_requires_ebpf(false, false, true),
-            "no UDP capture must not refuse the iptables fallback"
-        );
+        // Disabled capture still runs the registry-dependent stale-rule cleanup,
+        // so fallback must refuse rather than strand retained guards forever.
+        assert!(ambient_udp_registry_requires_ebpf(false, true));
 
         // Without a configured registry directory there is nothing for the
-        // producer to poll, so there is no fail-open to guard against here.
+        // producer or cleanup manager to poll, so there is no lifecycle to guard.
         assert!(
-            !ambient_udp_registry_requires_ebpf(false, true, false),
+            !ambient_udp_registry_requires_ebpf(false, false),
             "no registry configured means no registry-dependent producer to protect"
         );
     }
@@ -8611,6 +8605,21 @@ mod tests {
         assert_eq!(
             backend.pod_ips[&ip], stable,
             "ready reconcile is idempotent"
+        );
+
+        let ack_dir = registry.path().join(".udp-not-ready");
+        std::fs::create_dir_all(&ack_dir).unwrap();
+        std::fs::write(ack_dir.join("pod-a"), b"stale").unwrap();
+        reconcile_udp_capture_readiness(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &mut ready_uids,
+        );
+        assert!(
+            !ack_dir.join("pod-a").exists(),
+            "ready reconcile must retry removal of a stale close acknowledgement"
         );
 
         std::fs::remove_file(ready_dir.join("pod-a")).unwrap();

@@ -235,15 +235,97 @@ fn write_udp_ready_marker(dir: &Path, pod_uid: &str) {
     }
 }
 
-fn remove_udp_ready_marker(dir: &Path, pod_uid: &str) {
+fn remove_udp_ready_marker(dir: &Path, pod_uid: &str) -> bool {
     let Some(path) = udp_ready_marker_path(dir, pod_uid) else {
+        return false;
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            warn!(pod_uid, path = %path.display(), %error, "Failed to remove Ambient UDP readiness marker");
+            false
+        }
+    }
+}
+
+fn udp_ack_required_dir(ready_dir: &Path) -> Option<PathBuf> {
+    ready_dir.parent().map(|dir| dir.join(".udp-ack-required"))
+}
+
+fn persist_udp_ack_requirement(ready_dir: &Path, pod_uid: &str) -> bool {
+    let Some(dir) = udp_ack_required_dir(ready_dir) else {
+        return false;
+    };
+    let Some(path) = udp_ready_marker_path(&dir, pod_uid) else {
+        return false;
+    };
+    if path.is_file() {
+        return true;
+    }
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        warn!(pod_uid, dir = %dir.display(), %error, "Failed to create durable Ambient UDP ack-requirement dir");
+        return false;
+    }
+    if let Err(error) = std::fs::write(&path, b"") {
+        warn!(pod_uid, path = %path.display(), %error, "Failed to persist Ambient UDP ack requirement");
+        return false;
+    }
+    true
+}
+
+fn remove_udp_handshake_marker(dir: &Path, pod_uid: &str, marker: &str) -> bool {
+    let Some(path) = udp_ready_marker_path(&dir.join(marker), pod_uid) else {
+        return false;
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            warn!(pod_uid, path = %path.display(), %error, "Failed to remove Ambient UDP handshake marker");
+            false
+        }
+    }
+}
+
+/// Durably record that a fresh node-agent close acknowledgement is required
+/// before retracting producer readiness. The durable marker lets a replacement
+/// cleanup process recover the handshake after this process exits. A stale ack
+/// is removed before readiness so it can never authorize this new handoff.
+fn request_udp_gate_close(ready_dir: &Path, pod_uids: &HashSet<String>) -> bool {
+    if !pod_uids
+        .iter()
+        .all(|uid| persist_udp_ack_requirement(ready_dir, uid))
+    {
+        return false;
+    }
+    let Some(registry_dir) = ready_dir.parent() else {
+        return false;
+    };
+    if !pod_uids
+        .iter()
+        .all(|uid| remove_udp_handshake_marker(registry_dir, uid, ".udp-not-ready"))
+    {
+        return false;
+    }
+    pod_uids
+        .iter()
+        .all(|uid| remove_udp_ready_marker(ready_dir, uid))
+}
+
+fn clear_udp_ack_requirement(ready_dir: &Path, pod_uids: &HashSet<String>) {
+    let Some(registry_dir) = ready_dir.parent() else {
         return;
     };
-    if let Err(error) = std::fs::remove_file(&path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(pod_uid, path = %path.display(), %error, "Failed to remove Ambient UDP readiness marker");
+    for uid in pod_uids {
+        remove_udp_handshake_marker(registry_dir, uid, ".udp-ack-required");
     }
+}
+
+fn udp_ack_requirement_exists(ready_dir: &Path, pod_uid: &str) -> bool {
+    udp_ack_required_dir(ready_dir)
+        .and_then(|dir| udp_ready_marker_path(&dir, pod_uid))
+        .is_some_and(|path| path.is_file())
 }
 
 /// Reconciles per-pod-netns UDP capture producers against the enrolled-pod set.
@@ -444,28 +526,36 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
         // ~1s total instead. The ordering the handshake needs is preserved: marker
         // removal precedes the ack wait, and `handle.close(retain_guard)` still
         // runs only after the ack decision for that netns.
-        let mut closing: Vec<(u64, ActiveUdpCapture)> = Vec::with_capacity(gone.len());
+        let mut closing: Vec<(u64, ActiveUdpCapture, bool)> = Vec::with_capacity(gone.len());
         for netns in gone {
             if let Some(active) = self.active.remove(&netns) {
-                if let Some(dir) = &self.ready_dir {
-                    for uid in &active.pod_uids {
-                        remove_udp_ready_marker(dir, uid);
-                    }
+                let close_requested = self
+                    .ready_dir
+                    .as_ref()
+                    .is_none_or(|dir| request_udp_gate_close(dir, &active.pod_uids));
+                if !close_requested {
+                    warn!(
+                        netns_inode = netns,
+                        "Ambient UDP producer could not persist its close handshake; retaining the fail-closed guard"
+                    );
                 }
-                closing.push((netns, active));
+                closing.push((netns, active, close_requested));
             }
         }
         if !closing.is_empty() {
             let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-            while closing
-                .iter()
-                .any(|(_, active)| !self.udp_not_ready_acknowledged(&active.pod_uids))
-                && tokio::time::Instant::now() < ack_deadline
+            while closing.iter().any(|(_, active, requested)| {
+                *requested && !self.udp_not_ready_acknowledged(&active.pod_uids)
+            }) && tokio::time::Instant::now() < ack_deadline
             {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            for (netns, active) in closing {
-                let retain_guard = !self.udp_not_ready_acknowledged(&active.pod_uids);
+            for (netns, active, close_requested) in closing {
+                let retain_guard =
+                    !close_requested || !self.udp_not_ready_acknowledged(&active.pod_uids);
+                if !retain_guard && let Some(dir) = &self.ready_dir {
+                    clear_udp_ack_requirement(dir, &active.pod_uids);
+                }
                 if retain_guard {
                     warn!(
                         netns_inode = netns,
@@ -537,7 +627,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             if let Some(active) = self.active.get_mut(&netns) {
                 if let Some(dir) = &self.ready_dir {
                     for uid in active.pod_uids.difference(&pod_uids) {
-                        remove_udp_ready_marker(dir, uid);
+                        let _ = remove_udp_ready_marker(dir, uid);
                     }
                     for uid in pod_uids.difference(&active.pod_uids) {
                         write_udp_ready_marker(dir, uid);
@@ -564,7 +654,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             // after the producer reaches `Opened` below.
             if let Some(dir) = &self.ready_dir {
                 for uid in &pod_uids {
-                    remove_udp_ready_marker(dir, uid);
+                    let _ = remove_udp_ready_marker(dir, uid);
                 }
             }
             // Before installing fresh rules in this netns, await a prior
@@ -670,24 +760,36 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                 }
             });
         }
-        let active_captures: Vec<_> = self.active.drain().collect();
-        for (_, active) in &active_captures {
-            if let Some(dir) = &self.ready_dir {
-                for uid in &active.pod_uids {
-                    remove_udp_ready_marker(dir, uid);
+        let ready_dir = self.ready_dir.clone();
+        let active_captures: Vec<_> = self
+            .active
+            .drain()
+            .map(|(netns, active)| {
+                let close_requested = ready_dir
+                    .as_ref()
+                    .is_none_or(|dir| request_udp_gate_close(dir, &active.pod_uids));
+                if !close_requested {
+                warn!(
+                    netns_inode = netns,
+                    "Ambient UDP shutdown could not persist its close handshake; retaining the fail-closed guard"
+                );
                 }
-            }
-        }
+                (netns, active, close_requested)
+            })
+            .collect();
         let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        while active_captures
-            .iter()
-            .any(|(_, active)| !self.udp_not_ready_acknowledged(&active.pod_uids))
-            && tokio::time::Instant::now() < ack_deadline
+        while active_captures.iter().any(|(_, active, requested)| {
+            *requested && !self.udp_not_ready_acknowledged(&active.pod_uids)
+        }) && tokio::time::Instant::now() < ack_deadline
         {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        for (_, active) in active_captures {
-            let retain_guard = !self.udp_not_ready_acknowledged(&active.pod_uids);
+        for (_, active, close_requested) in active_captures {
+            let retain_guard =
+                !close_requested || !self.udp_not_ready_acknowledged(&active.pod_uids);
+            if !retain_guard && let Some(dir) = &self.ready_dir {
+                clear_udp_ack_requirement(dir, &active.pod_uids);
+            }
             if let Some(handle) = active.handle.close(retain_guard) {
                 tasks.spawn(async move {
                     let _ = handle.await;
@@ -866,32 +968,48 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
                 continue;
             }
             let mut requires_ack = self.pending_ack_netns.contains_key(&netns);
+            let mut marker_exists = false;
             if let Some(dir) = &self.ready_dir {
                 for uid in &pod_uids {
-                    let marker_exists =
+                    marker_exists |=
                         udp_ready_marker_path(dir, uid).is_some_and(|marker| marker.is_file());
-                    requires_ack |= marker_exists;
-                    remove_udp_ready_marker(dir, uid);
+                    requires_ack |= udp_ack_requirement_exists(dir, uid);
                 }
             }
+            requires_ack |= marker_exists;
+            // A ready marker is the request edge: persist the requirement and
+            // invalidate any stale ack before retracting readiness. If that
+            // ordering cannot be completed, this pass is never allowed to trust
+            // an old ack or remove the retained guard.
+            let handshake_valid = !marker_exists
+                || self
+                    .ready_dir
+                    .as_ref()
+                    .is_some_and(|dir| request_udp_gate_close(dir, &pod_uids));
             if requires_ack {
                 self.pending_ack_netns.insert(netns, pod_uids.clone());
             }
-            candidates.push((netns, target, pod_uids, requires_ack));
+            candidates.push((netns, target, pod_uids, requires_ack, handshake_valid));
         }
-        if candidates.iter().any(|candidate| candidate.3) {
+        if candidates
+            .iter()
+            .any(|candidate| candidate.3 && candidate.4)
+        {
             let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-            while candidates.iter().any(|(_, _, pod_uids, requires_ack)| {
-                *requires_ack && !self.udp_not_ready_acknowledged(pod_uids)
-            }) && tokio::time::Instant::now() < ack_deadline
+            while candidates
+                .iter()
+                .any(|(_, _, pod_uids, requires_ack, valid)| {
+                    *requires_ack && *valid && !self.udp_not_ready_acknowledged(pod_uids)
+                })
+                && tokio::time::Instant::now() < ack_deadline
             {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
 
         let mut cleaned = 0;
-        for (netns, target, pod_uids, requires_ack) in candidates {
-            if requires_ack && !self.udp_not_ready_acknowledged(&pod_uids) {
+        for (netns, target, pod_uids, requires_ack, handshake_valid) in candidates {
+            if !handshake_valid || (requires_ack && !self.udp_not_ready_acknowledged(&pod_uids)) {
                 warn!(
                     netns_inode = netns,
                     pod_uid = %target.pod_uid,
@@ -900,6 +1018,9 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
                 continue;
             }
             self.pending_ack_netns.remove(&netns);
+            if let Some(dir) = &self.ready_dir {
+                clear_udp_ack_requirement(dir, &pod_uids);
+            }
             if self.backend.cleanup_udp_capture(&target, netns) {
                 self.cleaned_netns.insert(netns);
                 cleaned += 1;
@@ -2084,6 +2205,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_persists_ack_requirement_before_retracting_readiness() {
+        let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let retained = backend.retained_guards.clone();
+        let registry_root = tempfile::tempdir().unwrap();
+        let ready_dir = registry_root.path().join(".udp-ready");
+        let mut mgr = manager(source, backend).with_ready_dir(Some(ready_dir.clone()));
+
+        assert_eq!(mgr.reconcile_once().await, 1);
+        mgr.shutdown_all().await;
+
+        assert!(!ready_dir.join("pod-a").exists());
+        assert!(
+            registry_root
+                .path()
+                .join(".udp-ack-required")
+                .join("pod-a")
+                .is_file(),
+            "shutdown must durably record the unacknowledged handoff before removing readiness"
+        );
+        assert_eq!(*retained.lock().unwrap(), vec![100]);
+    }
+
+    #[tokio::test]
     async fn shutdown_all_cleans_retained_guard() {
         let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
         let backend = MockBackend::new(&[("/cg/a", Some(100))]);
@@ -2224,6 +2369,9 @@ mod tests {
         let ready_dir = registry_root.path().join(".udp-ready");
         std::fs::create_dir_all(&ready_dir).unwrap();
         std::fs::write(ready_dir.join("pod-a"), b"").unwrap();
+        let ack_dir = registry_root.path().join(".udp-not-ready");
+        std::fs::create_dir_all(&ack_dir).unwrap();
+        std::fs::write(ack_dir.join("pod-a"), b"stale").unwrap();
         let mut mgr = cleanup_manager(source, backend).with_ready_dir(Some(ready_dir.clone()));
 
         assert_eq!(mgr.cleanup_once().await, 0);
@@ -2235,20 +2383,37 @@ mod tests {
             cleaned.lock().unwrap().is_empty(),
             "rules must remain fail closed while the host-veth gate closure is unverified"
         );
-
-        mgr.backend.set_netns("/cg/a", None);
-        assert_eq!(mgr.cleanup_once().await, 0);
         assert!(
-            mgr.pending_ack_netns.contains_key(&100),
-            "transient netns lookup misses must preserve the pending handshake"
+            !ack_dir.join("pod-a").exists(),
+            "the durable handoff must invalidate a stale ack before retracting readiness"
         );
-        mgr.backend.set_netns("/cg/a", Some(100));
+        assert!(
+            registry_root
+                .path()
+                .join(".udp-ack-required")
+                .join("pod-a")
+                .is_file(),
+            "the ack requirement must survive a cleanup-manager restart"
+        );
 
-        let ack_dir = registry_root.path().join(".udp-not-ready");
-        std::fs::create_dir_all(&ack_dir).unwrap();
+        // Recreate the manager to prove the durable requirement, rather than its
+        // in-memory pending map, preserves the guard-handoff contract.
+        let source = mgr.source.clone();
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let restarted_cleaned = backend.closed.clone();
+        let mut mgr = cleanup_manager(source, backend).with_ready_dir(Some(ready_dir.clone()));
+
         std::fs::write(ack_dir.join("pod-a"), b"").unwrap();
         assert_eq!(mgr.cleanup_once().await, 1);
-        assert_eq!(*cleaned.lock().unwrap(), vec![100]);
+        assert_eq!(*restarted_cleaned.lock().unwrap(), vec![100]);
+        assert!(
+            !registry_root
+                .path()
+                .join(".udp-ack-required")
+                .join("pod-a")
+                .exists(),
+            "a verified handoff clears the durable pending record"
+        );
     }
 
     #[test]

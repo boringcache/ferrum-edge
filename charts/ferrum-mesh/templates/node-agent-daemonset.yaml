@@ -63,8 +63,8 @@
 {{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED" -}}
 {{- $ambientUdpCaptureEnabled = has (lower (trim (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED")))) (list "true" "1") -}}
 {{- end -}}
-{{- $ambientUdpLifecycle := eq $ambientTopology "ambient" -}}
-{{- $ambientUdpProducer := and (eq $ambientTopology "ambient") $ambientUdpCaptureEnabled -}}
+{{- $ambientUdpLifecycle := and .Values.ambient.enabled (eq $ambientTopology "ambient") -}}
+{{- $ambientUdpProducer := and $ambientUdpLifecycle $ambientUdpCaptureEnabled -}}
 {{- $nodeAgentPublishesRegistry := or $nodeWaypointRegistryEnabled $ambientUdpLifecycle -}}
 {{- $nodeAgentManagedEnv := list
   "FERRUM_MODE"
