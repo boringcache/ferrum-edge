@@ -788,9 +788,15 @@ impl MeshSlice {
         } else {
             Vec::new()
         };
+        // Carry policy candidates for both sides of the UDP authorization
+        // union. Source candidates come from the pod-UID inventory; waypoint
+        // destination candidates come from the destination-visible workload
+        // view and must remain present even when their pod UID was stripped at
+        // the CP boundary or never existed (for example, WorkloadEntry).
         let ambient_udp_policy_candidates: Vec<(String, BTreeMap<String, String>)> =
             ambient_udp_source_workloads
                 .iter()
+                .chain(workloads.iter())
                 .map(|workload| {
                     (
                         workload.namespace.clone(),

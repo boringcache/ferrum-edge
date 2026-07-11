@@ -96,8 +96,8 @@ pub struct XdsAdsServer {
     ambient_udp_source_scoping_nodes: Arc<DashMap<String, ()>>,
     /// Per-stream bearer boundary. Network handlers set this on their cloned
     /// server after JWT verification; an explicit `ns` claim restricts the
-    /// Ambient UDP source workload/policy superset to the subscribed namespace.
-    restrict_ambient_udp_sources_to_request_namespace: bool,
+    /// Ambient UDP source workload/policy superset to the claim's namespaces.
+    ambient_udp_source_bearer_namespaces: Option<HashSet<String>>,
     /// Mirror of `EnvConfig.mesh_sidecar_enforced`. When `true`, the slice
     /// builder applies Istio `Sidecar` egress scope narrowing. Default
     /// `false` preserves existing CP behavior.
@@ -280,7 +280,7 @@ impl XdsAdsServer {
             workload_identities: Arc::new(DashMap::new()),
             waypoint_names: Arc::new(DashMap::new()),
             ambient_udp_source_scoping_nodes: Arc::new(DashMap::new()),
-            restrict_ambient_udp_sources_to_request_namespace: false,
+            ambient_udp_source_bearer_namespaces: None,
             sidecar_enforced,
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
@@ -375,7 +375,7 @@ impl XdsAdsServer {
             config,
             &request,
             &self.scope,
-            self.restrict_ambient_udp_sources_to_request_namespace,
+            self.ambient_udp_source_bearer_namespaces.as_ref(),
         )
     }
 
@@ -1631,7 +1631,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
 
         let mut requests = request.into_inner();
         let mut server = self.clone();
-        server.restrict_ambient_udp_sources_to_request_namespace = allowed.is_present();
+        server.ambient_udp_source_bearer_namespaces = allowed.0.clone();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
 
@@ -1917,7 +1917,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
 
         let mut requests = request.into_inner();
         let mut server = self.clone();
-        server.restrict_ambient_udp_sources_to_request_namespace = allowed.is_present();
+        server.ambient_udp_source_bearer_namespaces = allowed.0.clone();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
 
@@ -3067,9 +3067,16 @@ mod tests {
             },
             rules: Vec::new(),
         });
-        let server = test_server(config.clone());
-        let mut bearer_restricted_server = test_server(config.clone());
-        bearer_restricted_server.restrict_ambient_udp_sources_to_request_namespace = true;
+        let source_scope =
+            CpScope::Set(HashSet::from(["infra".to_string(), "clients".to_string()]));
+        let server = test_server(config.clone()).with_scope(source_scope.clone());
+        let mut bearer_multi_namespace_server =
+            test_server(config.clone()).with_scope(source_scope.clone());
+        bearer_multi_namespace_server.ambient_udp_source_bearer_namespaces =
+            Some(HashSet::from(["infra".to_string(), "clients".to_string()]));
+        let mut bearer_restricted_server = test_server(config.clone()).with_scope(source_scope);
+        bearer_restricted_server.ambient_udp_source_bearer_namespaces =
+            Some(HashSet::from(["infra".to_string()]));
 
         let without_udp = server.filter_config_for_xds_request(
             &config,
@@ -3084,6 +3091,12 @@ mod tests {
             true,
         );
         let bearer_restricted = bearer_restricted_server.filter_config_for_xds_request(
+            &config,
+            "infra",
+            Some("waypoint".to_string()),
+            true,
+        );
+        let bearer_multi_namespace = bearer_multi_namespace_server.filter_config_for_xds_request(
             &config,
             "infra",
             Some("waypoint".to_string()),
@@ -3105,6 +3118,15 @@ mod tests {
                 .len(),
             1,
             "xDS prefilter must retain source policies before snapshot slicing"
+        );
+        assert_eq!(
+            bearer_multi_namespace
+                .mesh
+                .expect("mesh should remain")
+                .mesh_policies
+                .len(),
+            1,
+            "xDS prefilter must retain every bearer-authorized source namespace"
         );
         let restricted_mesh = bearer_restricted.mesh.expect("mesh should remain");
         assert!(restricted_mesh.workloads.is_empty());

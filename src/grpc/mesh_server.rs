@@ -3,6 +3,7 @@
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use futures_util::stream;
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -290,13 +291,13 @@ impl MeshGrpcServer {
         &self,
         config: &GatewayConfig,
         request: &MeshSliceRequest,
-        restrict_ambient_udp_sources_to_request_namespace: bool,
+        bearer_namespaces: Option<&HashSet<String>>,
     ) -> GatewayConfig {
         CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
             config,
             request,
             &self.scope,
-            restrict_ambient_udp_sources_to_request_namespace,
+            bearer_namespaces,
         )
     }
 
@@ -304,13 +305,13 @@ impl MeshGrpcServer {
         config: &GatewayConfig,
         request: &MeshSliceRequest,
         scope: &CpScope,
-        restrict_ambient_udp_sources_to_request_namespace: bool,
+        bearer_namespaces: Option<&HashSet<String>>,
     ) -> GatewayConfig {
         CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
             config,
             request,
             scope,
-            restrict_ambient_udp_sources_to_request_namespace,
+            bearer_namespaces,
         )
     }
 
@@ -360,7 +361,7 @@ impl MeshGrpcServer {
         slice_request: MeshSliceRequest,
         previous_slice: &MeshSlice,
         scope: &CpScope,
-        restrict_ambient_udp_sources_to_request_namespace: bool,
+        bearer_namespaces: Option<&HashSet<String>>,
     ) -> Result<(MeshSlice, Option<MeshConfigUpdate>), Status> {
         let mut candidate = stream_config.clone();
         apply_incremental_to_config_snapshot(&mut candidate, delta);
@@ -368,7 +369,7 @@ impl MeshGrpcServer {
             &candidate,
             &slice_request,
             scope,
-            restrict_ambient_udp_sources_to_request_namespace,
+            bearer_namespaces,
         );
         candidate.normalize_fields();
         candidate.normalize_mesh_fields();
@@ -474,7 +475,7 @@ impl MeshConfigSync for MeshGrpcServer {
         let node_id = inner.node_id;
         let node_version = inner.ferrum_version;
         let node_namespace = inner.namespace;
-        let restrict_ambient_udp_sources_to_request_namespace = allowed.is_present();
+        let bearer_namespaces = allowed.0.clone();
 
         let slice_request = MeshSliceRequest::from_native(
             node_id.clone(),
@@ -497,7 +498,7 @@ impl MeshConfigSync for MeshGrpcServer {
         let mut initial_config = self.filter_config_for_request(
             config.as_ref(),
             &slice_request,
-            restrict_ambient_udp_sources_to_request_namespace,
+            bearer_namespaces.as_ref(),
         );
         initial_config.normalize_fields();
         initial_config.normalize_mesh_fields();
@@ -519,7 +520,7 @@ impl MeshConfigSync for MeshGrpcServer {
         let config_for_recovery = self.config.clone();
         let stream_slice_request = slice_request.clone();
         let stream_scope = self.scope.clone();
-        let restrict_stream_ambient_udp_sources = restrict_ambient_udp_sources_to_request_namespace;
+        let stream_bearer_namespaces = bearer_namespaces;
         let stream = BroadcastStream::new(rx).filter_map(move |result| {
             let slice_request = stream_slice_request.clone();
             match result {
@@ -528,7 +529,7 @@ impl MeshConfigSync for MeshGrpcServer {
                         config.as_ref(),
                         &slice_request,
                         &stream_scope,
-                        restrict_stream_ambient_udp_sources,
+                        stream_bearer_namespaces.as_ref(),
                     );
                     config.normalize_fields();
                     config.normalize_mesh_fields();
@@ -556,7 +557,7 @@ impl MeshConfigSync for MeshGrpcServer {
                         slice_request,
                         &previous_slice,
                         &stream_scope,
-                        restrict_stream_ambient_udp_sources,
+                        stream_bearer_namespaces.as_ref(),
                     ) {
                         Ok((next_slice, maybe_update)) => {
                             if maybe_update.is_some() {
@@ -584,7 +585,7 @@ impl MeshConfigSync for MeshGrpcServer {
                         current.as_ref(),
                         &slice_request,
                         &stream_scope,
-                        restrict_stream_ambient_udp_sources,
+                        stream_bearer_namespaces.as_ref(),
                     );
                     current_config.normalize_fields();
                     current_config.normalize_mesh_fields();
@@ -811,7 +812,7 @@ mod tests {
             slice_request,
             &previous_slice,
             &CpScope::Single("ferrum".to_string()),
-            false,
+            None,
         )
         .expect("mesh delta should build");
 

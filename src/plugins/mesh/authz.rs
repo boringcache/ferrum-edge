@@ -346,6 +346,8 @@ struct NodeWaypointRouteTargetConfig {
 struct ServicePortDestinationScopes {
     scopes: Vec<crate::modes::mesh::runtime::PolicyScopeCache>,
     endpoint_backends: HashSet<DestinationBackendKey>,
+    endpoint_scopes:
+        HashMap<DestinationBackendKey, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
 }
 
 impl ConditionAttributeKeys {
@@ -457,6 +459,7 @@ fn destination_policy_scopes_for_service_port(
 ) -> ServicePortDestinationScopes {
     let mut scopes = Vec::new();
     let mut endpoint_backends = HashSet::new();
+    let mut endpoint_scopes: HashMap<_, Vec<_>> = HashMap::new();
     for workload in
         crate::modes::mesh::matched_local_service_workloads(service, workloads, multi_cluster)
     {
@@ -475,16 +478,22 @@ fn destination_policy_scopes_for_service_port(
         if app_port == 0 {
             continue;
         }
-        scopes.push(crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload));
+        let workload_scope = crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload);
+        scopes.push(workload_scope.clone());
         for address in &workload.addresses {
             if let Some(key) = DestinationBackendKey::new(address, app_port) {
-                endpoint_backends.insert(key);
+                endpoint_backends.insert(key.clone());
+                endpoint_scopes
+                    .entry(key)
+                    .or_default()
+                    .push(workload_scope.clone());
             }
         }
     }
     ServicePortDestinationScopes {
         scopes,
         endpoint_backends,
+        endpoint_scopes,
     }
 }
 
@@ -679,10 +688,10 @@ fn destination_policy_scope_index(
                     index.by_backend.insert(key, scopes.scopes.clone());
                 }
             }
-            for endpoint in &scopes.endpoint_backends {
+            for (endpoint, endpoint_scopes) in &scopes.endpoint_scopes {
                 index
                     .by_backend
-                    .insert(endpoint.clone(), scopes.scopes.clone());
+                    .insert(endpoint.clone(), endpoint_scopes.clone());
                 index
                     .backend_aliases_by_backend
                     .insert(endpoint.clone(), vec![endpoint.clone()]);

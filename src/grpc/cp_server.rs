@@ -729,14 +729,14 @@ impl CpGrpcServer {
         request: &MeshSliceRequest,
         scope: &CpScope,
     ) -> GatewayConfig {
-        Self::filter_config_to_mesh_request_for_scope_and_bearer(config, request, scope, false)
+        Self::filter_config_to_mesh_request_for_scope_and_bearer(config, request, scope, None)
     }
 
     pub(crate) fn filter_config_to_mesh_request_for_scope_and_bearer(
         config: &GatewayConfig,
         request: &MeshSliceRequest,
         scope: &CpScope,
-        restrict_ambient_udp_sources_to_request_namespace: bool,
+        bearer_namespaces: Option<&HashSet<String>>,
     ) -> GatewayConfig {
         let mut filtered = config.clone();
         Self::filter_non_mesh_config_to_namespace(&mut filtered, &request.namespace);
@@ -746,7 +746,7 @@ impl CpGrpcServer {
                 request,
                 true,
                 Some(scope),
-                restrict_ambient_udp_sources_to_request_namespace,
+                bearer_namespaces,
             );
         }
         if scope.requires_namespace_claim_by_default() {
@@ -760,7 +760,7 @@ impl CpGrpcServer {
             namespace: namespace.to_string(),
             ..MeshSliceRequest::default()
         };
-        Self::filter_mesh_config_to_request(mesh, &request, false, None, false);
+        Self::filter_mesh_config_to_request(mesh, &request, false, None, None);
     }
 
     fn filter_mesh_config_to_request(
@@ -768,7 +768,7 @@ impl CpGrpcServer {
         request: &MeshSliceRequest,
         allow_cross_namespace_mesh_visibility: bool,
         scope: Option<&CpScope>,
-        restrict_ambient_udp_sources_to_request_namespace: bool,
+        bearer_namespaces: Option<&HashSet<String>>,
     ) {
         let namespace = request.namespace.as_str();
         let mut visible_namespaces =
@@ -777,7 +777,8 @@ impl CpGrpcServer {
         // A ServiceWaypoint terminates traffic for destination-visible services,
         // but trusted Ambient UDP evidence can name a source pod from any
         // namespace this CP is allowed to serve. An explicit bearer claim
-        // further pins this superset to the subscribed namespace. Preserve only
+        // further intersects this superset with all namespaces authorized by
+        // that claim. Preserve only
         // pod-addressable source workloads and their policy namespaces beyond
         // the destination view; the slice builder performs the exact
         // UID/SPIFFE/selector bind.
@@ -788,8 +789,8 @@ impl CpGrpcServer {
                 .filter(|workload| {
                     workload.pod_uid.is_some()
                         && Self::ambient_udp_source_namespace_allowed(&workload.namespace, scope)
-                        && (!restrict_ambient_udp_sources_to_request_namespace
-                            || workload.namespace == request.namespace)
+                        && bearer_namespaces
+                            .is_none_or(|allowed| allowed.contains(&workload.namespace))
                 })
                 .map(|workload| workload.namespace.clone())
                 .collect()
@@ -2589,7 +2590,7 @@ mod tests {
                 "clients".to_string(),
                 "default".to_string(),
             ])),
-            true,
+            Some(&HashSet::from(["infra".to_string()])),
         );
         let strict_config = CpGrpcServer::filter_config_to_namespace(&config, "infra");
 

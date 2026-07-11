@@ -1029,6 +1029,60 @@ async fn mesh_authz_service_waypoint_udp_resolves_destination_service_scope() {
 }
 
 #[tokio::test]
+async fn mesh_authz_service_waypoint_udp_uses_exact_destination_workload_scope() {
+    let destination_selector = WorkloadSelector {
+        labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+        namespace: Some("svc-ns".to_string()),
+    };
+    let mut slice = ambient_udp_service_waypoint_slice(vec![policy_with_scope(
+        "reviews-only-deny",
+        PolicyScope::WorkloadSelector {
+            selector: destination_selector,
+        },
+        PolicyAction::Deny,
+    )]);
+    let mut other_destination = slice.workloads[0].clone();
+    other_destination.spiffe_id =
+        SpiffeId::new("spiffe://cluster.local/ns/svc-ns/sa/ratings").expect("other spiffe");
+    other_destination.selector.labels = HashMap::from([("app".to_string(), "ratings".to_string())]);
+    other_destination.service_account = Some("ratings".to_string());
+    other_destination.addresses = vec!["10.0.2.31".to_string()];
+    other_destination.pod_uid = None;
+    slice.services[0].workloads.push(WorkloadRef {
+        spiffe_id: other_destination.spiffe_id.clone(),
+    });
+    slice.workloads.push(other_destination);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = ambient_udp_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+    );
+    ctx.matched_proxy = Some(Arc::new(
+        serde_json::from_value::<Proxy>(json!({
+            "id": "__mesh-inbound-hbone-relay",
+            "namespace": "",
+            "hosts": [],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "10.0.2.31",
+            "backend_port": 53
+        }))
+        .expect("service-waypoint relay proxy"),
+    ));
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "selector DENY for a sibling backend must not apply to the matched backend, got {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn mesh_authz_service_waypoint_udp_missing_destination_scope_fails_closed() {
     let slice = ambient_udp_service_waypoint_slice(vec![policy_with_scope(
         "client-allow",
