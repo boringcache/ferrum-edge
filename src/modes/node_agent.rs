@@ -488,8 +488,11 @@ pub async fn run(
     // pod-netns-only; see `handle_fallback_with`). Refuse startup with an
     // actionable error rather than silently break either lifecycle phase,
     // mirroring `create_backend`'s refusal to no-op when eBPF is unavailable.
+    let ambient_topology = resolve_ferrum_var("FERRUM_MESH_TOPOLOGY")
+        .is_some_and(|topology| topology.trim().eq_ignore_ascii_case("ambient"));
     if ambient_udp_registry_requires_ebpf(
         probe.supports_ebpf(),
+        ambient_topology,
         config.node_waypoint_pod_registry_dir.is_some(),
     ) {
         metrics.set_topology_degraded(probe.degradation_reason().unwrap_or("unknown"));
@@ -557,6 +560,8 @@ pub async fn run(
 /// Returns `true` when ALL hold:
 /// - `supports_ebpf` is `false` (the node would take the `handle_fallback()`
 ///   iptables path, which never runs the pod watcher / `publish_pod_registry`),
+/// - `ambient_topology` is `true` (the registry is needed for the Ambient UDP
+///   producer or disabled stale-rule cleanup), and
 /// - `registry_dir_configured` is `true` (a registry directory is actually set,
 ///   so either the producer or disabled cleanup manager has somewhere to poll).
 ///
@@ -564,8 +569,12 @@ pub async fn run(
 /// state where pod UDP egress bypasses capture/authz (fail-open, #2013). This is
 /// split out as a pure function so the fail-closed decision is unit-testable
 /// without the Linux-gated capture path.
-fn ambient_udp_registry_requires_ebpf(supports_ebpf: bool, registry_dir_configured: bool) -> bool {
-    !supports_ebpf && registry_dir_configured
+fn ambient_udp_registry_requires_ebpf(
+    supports_ebpf: bool,
+    ambient_topology: bool,
+    registry_dir_configured: bool,
+) -> bool {
+    !supports_ebpf && ambient_topology && registry_dir_configured
 }
 
 async fn start_node_agent_admin_listeners(
@@ -5232,25 +5241,30 @@ mod tests {
         // populates the registry, so producer startup or disabled stale-rule
         // cleanup would poll an empty directory (#2013).
         assert!(
-            ambient_udp_registry_requires_ebpf(false, true),
+            ambient_udp_registry_requires_ebpf(false, true, true),
             "no eBPF + configured Ambient lifecycle registry must fail closed"
         );
 
         // eBPF-capable nodes run `run_with_backend`, which publishes the
         // registry via the pod watcher — no need to refuse.
         assert!(
-            !ambient_udp_registry_requires_ebpf(true, true),
+            !ambient_udp_registry_requires_ebpf(true, true, true),
             "eBPF-capable node publishes the registry; must not refuse"
         );
 
         // Disabled capture still runs the registry-dependent stale-rule cleanup,
         // so fallback must refuse rather than strand retained guards forever.
-        assert!(ambient_udp_registry_requires_ebpf(false, true));
+        assert!(ambient_udp_registry_requires_ebpf(false, true, true));
+
+        // NodeWaypoint also has a registry-backed in-netns path, but its
+        // established iptables fallback remains valid when Ambient lifecycle
+        // cleanup is not selected.
+        assert!(!ambient_udp_registry_requires_ebpf(false, false, true));
 
         // Without a configured registry directory there is nothing for the
         // producer or cleanup manager to poll, so there is no lifecycle to guard.
         assert!(
-            !ambient_udp_registry_requires_ebpf(false, false),
+            !ambient_udp_registry_requires_ebpf(false, true, false),
             "no registry configured means no registry-dependent producer to protect"
         );
     }

@@ -7835,10 +7835,25 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         "unroutable UDP must not reach the destination echo"
     );
 
-    // Pod deletion: removing the registry entry must close the socket and remove
-    // every producer-owned rule/route. The bounded poll prevents a stuck cleanup
-    // from hanging the live job indefinitely.
+    // Pod deletion: removing the registry entry starts the fail-closed shutdown
+    // handshake. Mirror the node-agent by waiting for the producer's durable ack
+    // requirement before publishing the closed-gate acknowledgement; only then
+    // may the producer remove its retained guard and every remaining rule/route.
     std::fs::remove_file(&registry_entry).expect("delete UDP pod registry entry");
+    let ack_required = registry.path().join(".udp-ack-required").join(POD_UID);
+    let ack_deadline = Instant::now() + Duration::from_secs(5);
+    while !ack_required.exists() && Instant::now() < ack_deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        ack_required.exists(),
+        "producer did not request the node-agent UDP close acknowledgement\n{}",
+        captured_output(&temp_a)
+    );
+    let not_ready_dir = registry.path().join(".udp-not-ready");
+    std::fs::create_dir_all(&not_ready_dir).expect("create UDP not-ready ack directory");
+    std::fs::write(not_ready_dir.join(POD_UID), b"")
+        .expect("publish node-agent UDP not-ready acknowledgement");
     wait_for_udp_capture_snapshot(pod.pid(), capture_port, false, Duration::from_secs(12))
         .expect("pod deletion must remove UDP rules/listener");
 
