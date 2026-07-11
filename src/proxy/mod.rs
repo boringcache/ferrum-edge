@@ -2204,6 +2204,7 @@ enum ClientRequestBody {
 enum RequestBodyBufferError {
     TooLarge,
     ClientDisconnected(String),
+    TimedOut,
 }
 
 pub(crate) fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
@@ -2221,6 +2222,7 @@ async fn buffer_request_body_for_before_proxy(
     method: &str,
     headers: &HashMap<String, String>,
     max_request_body_size_bytes: usize,
+    request_body_read_timeout_ms: u64,
 ) -> Result<ClientRequestBody, RequestBodyBufferError> {
     if !request_may_have_body(method, headers) {
         return Ok(ClientRequestBody::Streaming(Box::new(request)));
@@ -2237,9 +2239,15 @@ async fn buffer_request_body_for_before_proxy(
     let (_parts, body) = request.into_parts();
     let body_bytes = if max_request_body_size_bytes > 0 {
         let limited = http_body_util::Limited::new(body, max_request_body_size_bytes);
-        limited
-            .collect()
-            .await
+        let collect = limited.collect();
+        let collected = if request_body_read_timeout_ms > 0 {
+            tokio::time::timeout(Duration::from_millis(request_body_read_timeout_ms), collect)
+                .await
+                .map_err(|_| RequestBodyBufferError::TimedOut)?
+        } else {
+            collect.await
+        };
+        collected
             .map_err(|e| {
                 // Limited::collect() returns either a LengthLimitError (the body
                 // actually exceeded the cap -> 413) or the underlying transport
@@ -2258,8 +2266,15 @@ async fn buffer_request_body_for_before_proxy(
             .to_bytes()
             .to_vec()
     } else {
-        body.collect()
-            .await
+        let collect = body.collect();
+        let collected = if request_body_read_timeout_ms > 0 {
+            tokio::time::timeout(Duration::from_millis(request_body_read_timeout_ms), collect)
+                .await
+                .map_err(|_| RequestBodyBufferError::TimedOut)?
+        } else {
+            collect.await
+        };
+        collected
             .map_err(|e| RequestBodyBufferError::ClientDisconnected(e.to_string()))?
             .to_bytes()
             .to_vec()
@@ -14120,6 +14135,7 @@ async fn handle_proxy_request_inner(
                     &method,
                     &ctx.headers,
                     state.max_request_body_size_bytes,
+                    proxy.backend_read_timeout_ms,
                 )
                 .await
                 {
@@ -14153,6 +14169,13 @@ async fn handle_proxy_request_inner(
                         return Ok(build_response(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
                             r#"{"error":"Client disconnected"}"#,
+                        ));
+                    }
+                    Err(RequestBodyBufferError::TimedOut) => {
+                        record_request(&state, 408);
+                        return Ok(build_response(
+                            StatusCode::REQUEST_TIMEOUT,
+                            r#"{"error":"Request body read timed out"}"#,
                         ));
                     }
                 }
@@ -14270,6 +14293,7 @@ async fn handle_proxy_request_inner(
                     &method,
                     &ctx.headers,
                     state.max_request_body_size_bytes,
+                    proxy.backend_read_timeout_ms,
                 )
                 .await
                 {
@@ -14306,6 +14330,13 @@ async fn handle_proxy_request_inner(
                         return Ok(build_response(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
                             r#"{"error":"Client disconnected"}"#,
+                        ));
+                    }
+                    Err(RequestBodyBufferError::TimedOut) => {
+                        record_request(&state, 408);
+                        return Ok(build_response(
+                            StatusCode::REQUEST_TIMEOUT,
+                            r#"{"error":"Request body read timed out"}"#,
                         ));
                     }
                 }
@@ -14664,6 +14695,7 @@ async fn handle_proxy_request_inner(
                     &method,
                     &hook_headers,
                     state.max_request_body_size_bytes,
+                    proxy.backend_read_timeout_ms,
                 )
                 .await
                 {
@@ -14699,6 +14731,19 @@ async fn handle_proxy_request_inner(
                         return Ok(build_response(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
                             r#"{"error":"Client disconnected"}"#,
+                        ));
+                    }
+                    Err(RequestBodyBufferError::TimedOut) => {
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            cb_is_half_open_probe,
+                        );
+                        record_request(&state, 408);
+                        return Ok(build_response(
+                            StatusCode::REQUEST_TIMEOUT,
+                            r#"{"error":"Request body read timed out"}"#,
                         ));
                     }
                 }
