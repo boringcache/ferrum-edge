@@ -513,6 +513,11 @@ pub struct RequestContext {
     pub(crate) a2a_gateway_binding: Option<&'static str>,
     pub(crate) a2a_gateway_is_agent_card: bool,
     pub(crate) a2a_gateway_streaming: bool,
+    /// Exact upstream/public resource URI pair used to route an MCP
+    /// `resources/read` request. Kept out of public metadata so upstream URI
+    /// details cannot enter transaction logs, while the response hook can
+    /// preserve the public URI spelling the client actually requested.
+    pub(crate) mcp_response_resource_binding: Option<(String, String)>,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -765,6 +770,7 @@ impl RequestContext {
             a2a_gateway_binding: None,
             a2a_gateway_is_agent_card: false,
             a2a_gateway_streaming: false,
+            mcp_response_resource_binding: None,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_score: 0,
@@ -856,6 +862,7 @@ impl RequestContext {
             a2a_gateway_binding: self.a2a_gateway_binding,
             a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
             a2a_gateway_streaming: self.a2a_gateway_streaming,
+            mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_score: self.waf_score,
@@ -1363,17 +1370,10 @@ impl RequestContext {
     /// Returns `Some(meta)` if a mirror request was dispatched and completed
     /// before the timeout. The 5-second timeout is a safety net — the mirror
     /// task always completes within the proxy's `backend_read_timeout_ms`
-    /// (set via `reqwest::RequestBuilder::timeout`). Since this runs after
-    /// the response is sent to the client, the wait has zero impact on
-    /// client-facing latency.
+    /// (set via `reqwest::RequestBuilder::timeout`). Callers on a client-visible
+    /// response path must run this in a detached task.
     pub async fn collect_mirror_result(&self) -> Option<MirrorResponseMeta> {
-        let rx = self.mirror_result_rx.as_ref()?;
-        let mut rx_clone = rx.clone();
-        match tokio::time::timeout(std::time::Duration::from_secs(5), rx_clone.changed()).await {
-            Ok(Ok(())) => rx_clone.borrow().clone(),
-            // Timeout or sender dropped — return whatever is currently available
-            _ => rx.borrow().clone(),
-        }
+        collect_mirror_result(self.mirror_result_rx.clone()?).await
     }
 
     /// Return the stable authenticated identity for downstream policy and
@@ -2219,7 +2219,21 @@ pub async fn log_with_mirror(
         plugin.log_with_mesh_key(summary, mesh_key.as_ref()).await;
     }
     crate::runtime_metrics::global_ref().record_transaction(summary);
-    if let Some(mirror_result) = ctx.collect_mirror_result().await {
+
+    // Mirror completion and mirror-summary logging are fully detached from the
+    // primary transaction. Buffered response paths call `log_with_mirror`
+    // before handing the response to hyper, so awaiting the mirror receiver
+    // here would make a stalled shadow target client-visible. Do not clone the
+    // summary or plugin list when this request was not mirrored.
+    let Some(mirror_result_rx) = ctx.mirror_result_rx.clone() else {
+        return;
+    };
+    let summary = summary.clone();
+    let plugins = plugins.to_vec();
+    tokio::spawn(async move {
+        let Some(mirror_result) = collect_mirror_result(mirror_result_rx).await else {
+            return;
+        };
         let mirror_summary = summary.as_mirror_entry(mirror_result);
         let mirror_mesh_key = if precompute_mesh_key {
             crate::plugins::mesh::prometheus_helpers::mesh_request_key(&mirror_summary)
@@ -2231,6 +2245,16 @@ pub async fn log_with_mirror(
                 .log_with_mesh_key(&mirror_summary, mirror_mesh_key.as_ref())
                 .await;
         }
+    });
+}
+
+async fn collect_mirror_result(
+    mut rx: tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>,
+) -> Option<MirrorResponseMeta> {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed()).await {
+        Ok(Ok(())) => rx.borrow().clone(),
+        // Timeout or sender dropped — return whatever is currently available.
+        _ => rx.borrow().clone(),
     }
 }
 
@@ -2905,6 +2929,36 @@ pub trait Plugin: Send + Sync {
         self.requires_response_body_buffering()
     }
 
+    /// Returns `true` when this active buffering plugin may release an
+    /// inherently streaming response after headers arrive even though retries
+    /// are configured.
+    ///
+    /// The proxy uses this pre-header signal to select a header-first streaming
+    /// transport for a retry attempt. After headers arrive, this plugin must
+    /// confirm the concrete response and every other active buffering plugin
+    /// must report that it does not need that content type. Keep the default
+    /// conservative: most response transforms and inspectors require a
+    /// replayable body while retries are in flight.
+    fn may_release_response_body_under_retries(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
+    /// Header-aware confirmation for
+    /// [`may_release_response_body_under_retries`].
+    ///
+    /// Called only after backend response headers arrive. Returning `true`
+    /// allows this response to stream and makes mid-body retry impossible; use
+    /// it only for inherently streaming representations whose retry decision is
+    /// complete from status and headers.
+    fn should_release_response_body_under_retries(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        false
+    }
+
     /// Returns `true` when a plugin that otherwise buffers this response can
     /// release it before the proxy applies the conservative content-type relabel
     /// guard.
@@ -3126,6 +3180,20 @@ pub trait Plugin: Send + Sync {
     ) -> Option<Vec<u8>> {
         self.transform_response_body(body, content_type, response_headers)
             .await
+    }
+
+    /// Called immediately after this plugin returns a transformed response
+    /// body, before the next body transform runs.
+    ///
+    /// Use this for response headers that are valid only for the original body
+    /// representation, such as upstream validators or integrity digests. The
+    /// hook is not called when the transform returns `None`, so unchanged
+    /// responses retain their original headers.
+    fn on_response_body_transformed(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_headers: &mut HashMap<String, String>,
+    ) {
     }
 
     /// Called after all `transform_response_body` hooks on buffered responses.

@@ -7537,14 +7537,14 @@ fn live_source_capture_slice(
     }
 }
 
-/// The `#2084` XFAIL gate below keys on this literal, which the Ambient UDP
+/// The status-2 regression diagnostic below keys on this literal, which the Ambient UDP
 /// producer emits from `IptablesPlan::udp_fail_closed_script` (see
 /// `src/capture/mod.rs`, the `-C OUTPUT` guard-inspect branch). It is a shared
 /// substring of the runtime line `<binary> could not inspect active UDP
 /// fail-closed guard (status <N>)`, so it matches regardless of the iptables
 /// backend's actual `<binary>`/status. If the source message ever drifts, the
-/// gate would silently stop matching and the live lane would go red with no
-/// explanation — so `udp_fail_closed_guard_probe_literal_matches_source` below
+/// diagnostic would stop identifying the regression clearly — so
+/// `udp_fail_closed_guard_probe_literal_matches_source` below
 /// reconstructs the guard script via the same pub constructor and fails loudly
 /// the moment this literal no longer appears in it.
 #[cfg(target_os = "linux")]
@@ -7553,7 +7553,7 @@ const UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL: &str =
 
 /// Drift guard for `UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL`. Builds the fail-closed
 /// UDP guard script from the exact pub constructor the producer runs and asserts
-/// the XFAIL-gate literal is still present, so a source-side wording change
+/// the diagnostic literal is still present, so a source-side wording change
 /// breaks this fast unit-style check instead of the root-only live lane.
 #[cfg(target_os = "linux")]
 #[test]
@@ -7570,7 +7570,7 @@ fn udp_fail_closed_guard_probe_literal_matches_source() {
     assert!(
         script.contains(UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL),
         "the UDP fail-closed guard-inspect literal drifted in src/capture/mod.rs; update \
-         UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL and the #2084 XFAIL gate together.\n--- script ---\n{script}"
+         UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL and the live regression diagnostic together.\n--- script ---\n{script}"
     );
 }
 
@@ -7706,15 +7706,10 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         .expect("capture-disabled pod must have no UDP rules/listener");
     disabled_a.stop();
 
-    // NOTE (#2084): the production alternating-guard installer probes an OUTPUT
-    // jump to generation A (`-C OUTPUT ... -j FERRUM_UDP_FAIL_CLOSED_A`) before
-    // creating that user chain. On nft-backed iptables a missing target chain is
-    // reported as exit status 2, not 1, and the producer treats status 2 as an
-    // xtables resource error and retries forever without ever reaching first
-    // install. That producer-side incompatibility is the ground truth, so the
-    // #2084 XFAIL is gated below on the producer's own runtime error signature
-    // (after gateway A with UDP capture starts) rather than on a separate,
-    // backend-divergent standalone probe here.
+    // #2085 fixed fresh-netns installation by checking generation-A chain
+    // existence before probing the OUTPUT jump. The live gate below therefore
+    // treats every installation timeout, including the old status-2 signature,
+    // as a real regression.
     let ports_a = reserve_mesh_ports().await;
     let a_outbound = ports_a.outbound;
     let mut gateway_a = LiveGatewayChild::new(spawn_mesh_gateway(
@@ -7758,33 +7753,14 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     {
         let status = gateway_a.poll_status();
         let gateway_a_output = captured_output(&temp_a);
-        // Authoritative #2084 gate keyed on the producer's own runtime error.
-        // On nft-backed iptables a `-C OUTPUT ... -j FERRUM_UDP_FAIL_CLOSED_A`
-        // probe of a not-yet-created target chain returns exit status 2 (legacy
-        // iptables returns 1); the producer treats status 2 as an xtables
-        // resource error and retries forever, so first install never converges
-        // and the snapshot stays empty for the full 20s. The producer is the
-        // ground truth here, so we detect that precise status-2 guard-inspect
-        // signature in gateway A's captured output and XFAIL until the source
-        // fix (#2084) lands. Any other install timeout remains a hard failure.
-        if status == "still running"
-            && gateway_a_output.contains(UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL)
-            && gateway_a_output.contains("guard (status 2)")
-        {
-            eprintln!(
-                "XFAIL #2084: the Ambient UDP producer's in-netns fail-closed guard probe \
-                 returns status 2 on this iptables backend, so first install never converges: \
-                 {error}; gateway A {status}"
-            );
-            gateway_a.stop();
-            gateway_b.stop();
-            cp_a.shutdown().await;
-            cp_b.shutdown().await;
-            echo_task.abort();
-            return;
-        }
+        // #2085 made first-install detection portable by checking chain existence
+        // before probing the OUTPUT jump. A status-2 guard-inspection error is now
+        // a genuine xtables/runtime regression and must fail the required live lane.
+        let status_2_regression = gateway_a_output.contains(UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL)
+            && gateway_a_output.contains("guard (status 2)");
         panic!(
-            "real manager/backend must install one UDP producer: {error}; gateway A {status}\n{gateway_a_output}"
+            "real manager/backend must install one UDP producer: {error}; gateway A {status}; \
+             status-2 guard regression after #2085 fix: {status_2_regression}\n{gateway_a_output}"
         );
     }
 

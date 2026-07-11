@@ -2238,6 +2238,7 @@ jobs:
               src/proxy/mesh_udp_capture.rs|src/proxy/mesh_udp_frame.rs|src/proxy/mod.rs|\
               src/proxy/netns_capture.rs|src/proxy/netns_udp_capture.rs|src/proxy/tcp_proxy.rs|src/proxy/udp_batch.rs|\
               src/router_cache.rs|src/socket_opts.rs|\
+              src/service_discovery/*|src/service_discovery/**|\
               tests/functional/functional_mesh_mode_test.rs|\
               tests/k8s/lib/*|tests/k8s/lib/**|tests/k8s/node_waypoint_ebpf_live/*|tests/k8s/node_waypoint_ebpf_live/**|\
               tests/*capture*|tests/*ebpf*|tests/*netns*|tests/*node_waypoint*)
