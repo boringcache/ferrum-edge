@@ -2949,12 +2949,9 @@ impl Plugin for AiToolGovernor {
     }
 
     fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
-        // The stream inspector is only wired on the reqwest streaming path, so
-        // any request that may produce an inspected SSE response must dispatch
-        // via reqwest: an SSE `Accept` header, a shared streaming marker from
-        // an earlier plugin, or this plugin's own request-body detection of
-        // `"stream": true` (set in `before_proxy`) — the latter catches a
-        // plain POST to a direct H2/H3 backend that answers with SSE.
+        // Prefer reqwest for requests already known to produce inspected SSE.
+        // Inspector correctness no longer depends on this pin: direct-H2 and
+        // native-H3 response arms drive the same inspector chain.
         self.enabled
             && self.inspect.streaming_response_tool_calls
             && (is_sse_request(ctx)
@@ -2975,19 +2972,10 @@ impl Plugin for AiToolGovernor {
     /// to run after normalization). Reordering is not an option here: 2978 is
     /// deliberately before semantic cache/federation on the request path.
     ///
-    /// DISPATCH LIMITATION (shared with `ai_semantic_firewall`'s `inspect`): the
-    /// SSE inspector is wired only on the reqwest `ResponseBody::Streaming` arm,
-    /// not `StreamingH2`/`StreamingH3`. `forces_reqwest_dispatch` excludes native
-    /// H3, and direct-H2/HBONE are excluded because the inspected request forces
-    /// request-body buffering. Two residual gaps therefore exist and are tracked
-    /// as a proxy-core follow-up, issue #2055 (they need the dispatch layer to route ALL
-    /// inspected-streaming requests through reqwest, or inspectors attached to
-    /// the StreamingH2/H3 arms): (1) a `request_transformer` that adds
-    /// `"stream": true` for a backend already classified H3-capable can dispatch
-    /// via native H3 before the final-body re-detection pins reqwest; (2) a
-    /// bodyless SSE request (e.g. GET with `Accept: text/event-stream`) is not
-    /// buffered, so a direct-H2 backend can answer `StreamingH2` uninspected.
-    /// Buffered responses and reqwest-path SSE remain governed.
+    /// The proxy drives this inspector on reqwest, direct-H2, and native-H3
+    /// streaming responses. Request-body transforms are finalized before the
+    /// response buffer/stream and transport decisions, so a transformed
+    /// `stream` marker is visible to both policy checks.
     fn response_stream_inspector(
         &self,
         ctx: &RequestContext,

@@ -47,11 +47,11 @@ denied one cannot leak content that arrived after the held call. With
 multi-choice (`n > 1`) streams, a batch is finalized only once **every** choice
 holding tool calls has reported a `finish_reason` (or the stream ends), and
 later tool-call deltas form a new, independently governed batch. The plugin detects `"stream": true`
-in JSON POST bodies and pins those requests onto the reqwest dispatch path
-where the SSE inspector is wired, so a client-sent streaming request cannot
-bypass streaming inspection by targeting a direct HTTP/2 or native HTTP/3
-backend; the narrow proxy-core edge cases where a response can still stream on
-an uninspected arm are described under [Limitations (MVP)](#limitations-mvp).
+in JSON POST bodies and prefers the reqwest dispatch path for those requests.
+Inspection itself is dispatch-arm-independent: reqwest, direct HTTP/2, and
+native HTTP/3 streaming responses all drive the same inspector chain, including
+requests whose final body transform introduced the streaming marker and
+bodyless requests whose backend unexpectedly answers with SSE.
 Requests marked streaming still buffer a plain-JSON fallback
 response so `tool_calls` in it are governed (a `text/event-stream` response
 is released back to the stream path only when streaming inspection is enabled
@@ -354,18 +354,7 @@ so disabling metadata/hash observability cannot be bypassed by lifecycle state.
   on a shared proxy would break unrelated routes.
 - The plugin governs tool calls; it does not execute tools, manage MCP sessions,
   or replace `mcp_gateway`/A2A routing.
-- Streaming inspection rides the proxy's reqwest dispatch arm (the same
-  mechanism `ai_semantic_firewall` uses): governed streaming requests are pinned
-  to it via `forces_reqwest_dispatch`, but a response streamed on the direct
-  HTTP/2 or native HTTP/3 arm is not inspected. Two proxy-core gaps remain:
-  a `request_transformer` that **adds** `stream: true` after the dispatch
-  decision on an HTTP/3-classified backend, and a request that stages no JSON
-  body whose backend nevertheless answers with tool-call SSE. Neither is
-  client-controllable against real AI providers — a client-sent `stream: true`
-  JSON POST is detected and pinned, and OpenAI/Anthropic/Gemini-shaped backends
-  do not emit tool-call streams for bodyless requests. Buffered responses and
-  reqwest-arm streams are always governed — including a stream-marked
-  request's plain-JSON SSE fallback delivered on the streaming path, which
-  the inspector now attaches to regardless of the response `Content-Type`.
-  Shared proxy-core follow-up:
-  [#2055](https://github.com/ferrum-edge/ferrum-edge/issues/2055).
+- Streaming inspection is transport-independent across reqwest, direct HTTP/2,
+  and native HTTP/3 response arms. `forces_reqwest_dispatch` remains a scoped
+  optimization for requests already known to stream, while final request-body
+  transforms are reflected in both dispatch and response buffering decisions.
