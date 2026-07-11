@@ -123,6 +123,35 @@ async fn collect_flushed_logs(harness: &GatewayHarness) -> String {
     }
 }
 
+/// GET the backend capability registry and return the single entry (tests
+/// configure a single proxy so the registry holds exactly one). Returns
+/// `None` until the async warmup probe has classified the backend.
+async fn fetch_capability_entry(harness: &GatewayHarness) -> Option<Value> {
+    let body = harness.get_admin_json("/backend-capabilities").await.ok()?;
+    body["entries"].as_array()?.first().cloned()
+}
+
+/// Poll the capability registry until the backend is classified
+/// `plain_http.h2_tls == "supported"`, or the deadline expires. Direct-H2
+/// dispatch (`ResponseBody::StreamingH2`) only engages once the backend is
+/// proven h2-over-TLS capable; before that the request falls back to the
+/// reqwest arm, so tests that mean to exercise the direct-H2 inspector must
+/// gate on this first.
+async fn wait_for_h2_tls_supported(harness: &GatewayHarness, timeout: Duration) -> Option<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(entry) = fetch_capability_entry(harness).await
+            && entry["plain_http"]["h2_tls"].as_str() == Some("supported")
+        {
+            return Some(entry);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Build a file-mode YAML that points a gRPC proxy at the given port over
 /// plain HTTP (h2c — the gateway's gRPC pool performs an h2c handshake
 /// when `backend_scheme: http`). Callers can merge additional overrides
@@ -1429,6 +1458,150 @@ async fn h2_tls_backend_fixture_can_complete_handshake() {
         .expect("unary completes");
     assert_eq!(response.grpc_status(), Some(0));
     assert_eq!(backend.handshakes_completed(), 1);
+}
+
+// A bodyless request has no request-body marker for the governor's reqwest
+// preference. The response must still be governed when capability warmup sends
+// it through the direct-H2 `StreamingH2` arm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn bodyless_direct_h2_sse_response_is_governed() {
+    const DENIED_SSE: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"rm_rf\",\"arguments\":\"{\\\"path\\\":\\\"/etc\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    let ca = TestCa::new("h2-bodyless-governor").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::DrainRequestBody)
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/event-stream".into()),
+            ("content-length", DENIED_SSE.len().to_string()),
+        ]))
+        .step(H2Step::RespondData {
+            data: Bytes::from_static(DENIED_SSE.as_bytes()),
+            end_stream: true,
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "direct-h2-governor",
+            "listen_path": "/events",
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "pool_enable_http2": true,
+            "backend_tls_verify_server_cert": false,
+            "plugins": [{"plugin_config_id": "governor"}],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "governor",
+            "proxy_id": "direct-h2-governor",
+            "plugin_name": "ai_tool_governor",
+            "scope": "proxy",
+            "enabled": true,
+            "config": {
+                "mode": "enforce",
+                "tools": {"rm_rf": {"action": "deny"}},
+                "default_action": "allow",
+                "inspect": {
+                    "response_tool_calls": false,
+                    "streaming_response_tool_calls": true
+                },
+                "observability": {"emit_metadata": true}
+            }
+        }, {
+            "id": "access-log",
+            "plugin_name": "stdout_logging",
+            "scope": "global",
+            "enabled": true,
+            "config": {}
+        }]
+    });
+    let harness = GatewayHarness::builder()
+        .file_config(serde_yaml::to_string(&config).expect("yaml"))
+        .pool_warmup_enabled(true)
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    // Direct-H2 dispatch (`ResponseBody::StreamingH2`) only engages once the
+    // async warmup probe has classified the backend h2-over-TLS capable.
+    // Until then the request falls back to the reqwest arm, which governed SSE
+    // before this PR — so without this gate a regression that stopped wiring
+    // the inspector onto `StreamingH2` could still pass here. Prove the
+    // direct-H2 arm is reachable before firing the request.
+    let entry = wait_for_h2_tls_supported(&harness, Duration::from_secs(15))
+        .await
+        .expect("backend must be classified h2_tls=supported for the direct-H2 arm");
+    assert_eq!(
+        entry["plain_http"]["h2_tls"].as_str(),
+        Some("supported"),
+        "precondition: direct-H2 streaming arm requires h2_tls=supported; entry: {entry:#?}"
+    );
+
+    let response = reqwest::Client::new()
+        .get(harness.proxy_url("/events/live"))
+        .send()
+        .await
+        .expect("bodyless request");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().get("content-length").is_none(),
+        "an attached inspector may cut or transform the body"
+    );
+    let body = response.text().await.expect("response body");
+    assert!(
+        body.contains("ai_tool_governor_tool_blocked"),
+        "governor must terminate the direct-H2 stream: {body}"
+    );
+    assert!(
+        !body.contains("/etc"),
+        "held denied tool-call frames must not leak: {body}"
+    );
+    let logs = harness
+        .wait_for_log_contains(
+            &|logs: &str| logs.contains("ai_tool_governor.decision") && logs.contains("deny"),
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        logs.contains("ai_tool_governor.decision") && logs.contains("deny"),
+        "stream-terminal metadata must be written before summary logging: {logs}"
+    );
+    assert!(backend.received_stream_count() >= 1);
+    let step_errors = backend.step_errors().await;
+    let unexpected_step_errors: Vec<_> = step_errors
+        .iter()
+        // Capability warmup may open a speculative H2 connection and drop it
+        // before sending the client preface. The governed response and received
+        // GET above prove the real direct-H2 connection completed; do not treat
+        // that independent probe disconnect as a script failure.
+        .filter(|error| {
+            !error.starts_with("h2 handshake failed: connection error detected: unspecific protocol error detected")
+        })
+        .collect();
+    assert!(
+        unexpected_step_errors.is_empty(),
+        "{} unexpected script step error(s): {unexpected_step_errors:?}",
+        unexpected_step_errors.len()
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -1408,8 +1408,35 @@ fn udp_fail_closed_commands_for_family(
     ]
     .join("\n");
 
+    // First-install portability (issue #2084). The active-guard probe below is a
+    // `-C OUTPUT ... -j FERRUM_UDP_FAIL_CLOSED_A` rule check. On a fresh pod netns
+    // chain A does not exist yet, and the exit status for "jump references a
+    // missing user chain" is NOT portable: legacy iptables returns 1 (which we
+    // read as "A not active"), but nft-backed iptables (Ubuntu 24.04 runners)
+    // returns 2, which the strict `status -ne 1` handler treats as a genuine
+    // xtables resource error and aborts the install — the producer then retries
+    // forever without ever binding the transparent socket.
+    //
+    // To make first-install detection portable WITHOUT weakening fail-closed
+    // handling of real resource errors, establish chain A's existence separately
+    // (via `-S`, a chain listing that does not depend on the missing-target
+    // status quirk) BEFORE interpreting the jump probe:
+    //   * chain A absent  -> first install (or A fully removed): take the
+    //     install/replace-B path directly, never touching the jump probe.
+    //   * chain A present -> the jump probe is meaningful: an active jump swaps to
+    //     B, an absent jump (status 1) reinstalls A, and any other status is a
+    //     genuine xtables error that still aborts the install fail-closed.
+    // The existence check itself fails closed too: `-S` returns 1 only for an
+    // absent chain; any other non-zero status (e.g. an xtables-lock timeout)
+    // aborts rather than being misread as absence.
+    let a_exists = format!(
+        "{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -S {UDP_FAIL_CLOSED_CHAIN_A} >/dev/null 2>&1"
+    );
+
     vec![format!(
-        "if {a_active}; then\n{replace_a}\nelse\nstatus=$?\nif [ \"$status\" -ne 1 ]; then\n  echo \"{binary} could not inspect active UDP fail-closed guard (status $status)\" >&2\n  exit \"$status\"\nfi\n{replace_b_or_install}\nfi"
+        "if {a_exists}; then\n\
+         if {a_active}; then\n{replace_a}\nelse\nstatus=$?\nif [ \"$status\" -ne 1 ]; then\n  echo \"{binary} could not inspect active UDP fail-closed guard (status $status)\" >&2\n  exit \"$status\"\nfi\n{replace_b_or_install}\nfi\n\
+         else\nstatus=$?\nif [ \"$status\" -ne 1 ]; then\n  echo \"{binary} could not inspect UDP fail-closed guard chain {UDP_FAIL_CLOSED_CHAIN_A} (status $status)\" >&2\n  exit \"$status\"\nfi\n{replace_b_or_install}\nfi"
     )]
 }
 
@@ -2214,7 +2241,7 @@ fn udp_fail_closed_release_for(binary: &str) -> Vec<String> {
 fn udp_strict_output_jump_release_for(binary: &str, chain: &str) -> String {
     let jump = format!("-p udp -j {chain}");
     format!(
-        "while true; do\n  if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C OUTPUT {jump} 2>/dev/null; then\n    {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -D OUTPUT {jump}\n  else\n    status=$?\n    if [ \"$status\" -eq 1 ]; then\n      break\n    fi\n    echo \"{binary} could not check OUTPUT jump {chain} (status $status)\" >&2\n    exit \"$status\"\n  fi\ndone"
+        "if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -S {chain} >/dev/null 2>&1; then\n  while true; do\n    if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C OUTPUT {jump} 2>/dev/null; then\n      {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -D OUTPUT {jump}\n    else\n      status=$?\n      if [ \"$status\" -eq 1 ]; then\n        break\n      fi\n      echo \"{binary} could not check OUTPUT jump {chain} (status $status)\" >&2\n      exit \"$status\"\n    fi\n  done\nelse\n  status=$?\n  if [ \"$status\" -ne 1 ]; then\n    echo \"{binary} could not inspect UDP fail-closed guard chain {chain} before release (status $status)\" >&2\n    exit \"$status\"\n  fi\nfi"
     )
 }
 
@@ -2311,20 +2338,186 @@ mod tests {
         assert!(script.contains("-p udp -d 10.0.0.0/8 -j RETURN"));
         assert!(script.contains("-p udp --dport 53 -j RETURN"));
         assert!(script.contains("-p udp -d 0.0.0.0/0 -m addrtype ! --dst-type LOCAL -j DROP"));
-        let then_block = script
-            .split_once("; then\n")
-            .and_then(|(_, rest)| rest.split_once("\nelse\n").map(|(block, _)| block))
+        // The active-guard swap (chain A currently active -> repopulate and
+        // activate chain B, then release A) lives in the inner `-C OUTPUT ... -j A`
+        // then-branch. Anchor on that probe so the assertion survives the outer
+        // chain-existence guard (issue #2084) rather than the first `; then`.
+        let a_active_probe =
+            format!("-C OUTPUT -p udp -j {UDP_FAIL_CLOSED_CHAIN_A} 2>/dev/null; then\n");
+        let active_branch = script
+            .split_once(a_active_probe.as_str())
+            .map(|(_, rest)| rest)
             .expect("alternating guard switch");
-        let build_replacement = then_block
+        let build_replacement = active_branch
             .find(&format!("-F {UDP_FAIL_CLOSED_CHAIN_B}"))
             .expect("replacement guard is populated");
-        let insert_replacement = then_block
+        let insert_replacement = active_branch
             .find(&format!("-I OUTPUT 1 -p udp -j {UDP_FAIL_CLOSED_CHAIN_B}"))
             .expect("replacement guard is activated");
-        let remove_previous = then_block
+        let remove_previous = active_branch
             .find(&format!("-D OUTPUT -p udp -j {UDP_FAIL_CLOSED_CHAIN_A}"))
             .expect("previous guard is removed");
         assert!(build_replacement < insert_replacement && insert_replacement < remove_previous);
+    }
+
+    /// Issue #2084: on a fresh pod netns neither guard chain exists. The install
+    /// must FIRST establish chain A's existence (via `-S`, which is portable and
+    /// returns 1 for an absent chain on both legacy and nft-backed iptables)
+    /// BEFORE probing the OUTPUT jump. Otherwise the `-C OUTPUT ... -j
+    /// FERRUM_UDP_FAIL_CLOSED_A` probe references a missing user chain, whose exit
+    /// status is non-portable (1 on legacy, 2 on nft-backed / Ubuntu 24.04
+    /// runners), and the strict `status -ne 1` handler misreads status 2 as a
+    /// genuine xtables error and aborts the first install forever.
+    #[test]
+    fn udp_fail_closed_script_probes_chain_existence_before_jump() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.udp_capture_enabled = true;
+
+        let script = IptablesPlan::udp_fail_closed_script(&config);
+
+        let existence_probe = format!("-S {UDP_FAIL_CLOSED_CHAIN_A} >/dev/null 2>&1");
+        let existence_idx = script
+            .find(&existence_probe)
+            .expect("chain existence is probed before the jump");
+        let jump_probe = format!("-C OUTPUT -p udp -j {UDP_FAIL_CLOSED_CHAIN_A} 2>/dev/null");
+        let jump_idx = script
+            .find(&jump_probe)
+            .expect("active-guard jump is still probed");
+        assert!(
+            existence_idx < jump_idx,
+            "chain existence must be established before the jump probe:\n{script}"
+        );
+    }
+
+    /// The chain-absence branch (fresh netns) must take the install/replace-B path
+    /// -- it can never fall through to the active-guard swap, which would try to
+    /// release a jump to a chain that does not exist yet.
+    #[test]
+    fn udp_fail_closed_script_absent_chain_installs_guard() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.udp_capture_enabled = true;
+
+        let script = IptablesPlan::udp_fail_closed_script(&config);
+
+        // The outer existence guard's else-branch (chain A absent) installs chain
+        // A and activates its OUTPUT jump. Anchor on the existence-probe handler's
+        // unique message: everything after it is the install/replace-B path taken
+        // when chain A does not exist. (Splitting on `\nelse\n` alone is
+        // ambiguous — the strict jump-release loops each contain their own
+        // `else`.)
+        let existence_handler = format!(
+            "could not inspect UDP fail-closed guard chain {UDP_FAIL_CLOSED_CHAIN_A} (status $status)"
+        );
+        let absent_branch = script
+            .split_once(existence_handler.as_str())
+            .map(|(_, tail)| tail)
+            .expect("existence guard has an absent-chain branch");
+        let build_a = absent_branch
+            .find(&format!("-N {UDP_FAIL_CLOSED_CHAIN_A}"))
+            .expect("absent-chain branch (re)builds guard A");
+        let activate_a = absent_branch
+            .find(&format!("-I OUTPUT 1 -p udp -j {UDP_FAIL_CLOSED_CHAIN_A}"))
+            .expect("absent-chain branch activates guard A");
+        assert!(
+            build_a < activate_a,
+            "absent-chain branch builds guard A before activating its jump:\n{script}"
+        );
+    }
+
+    /// Model nft-backed iptables, where `-C OUTPUT ... -j <missing-chain>`
+    /// returns status 2. A fresh netns must install and activate guard A without
+    /// ever issuing that non-portable jump probe for absent guard B.
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn udp_fail_closed_script_executes_first_install_with_nft_missing_chain_status() {
+        use std::process::Command;
+
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.udp_capture_enabled = true;
+        config.ip6tables_mode = Ip6TablesMode::Disabled;
+        let script = IptablesPlan::udp_fail_closed_script(&config);
+        let harness = format!(
+            r#"
+a_exists=0
+b_exists=0
+a_active=0
+b_active=0
+iptables() {{
+  case "$*" in
+    *"-S {UDP_FAIL_CLOSED_CHAIN_A}"*) [ "$a_exists" -eq 1 ] ;;
+    *"-S {UDP_FAIL_CLOSED_CHAIN_B}"*) [ "$b_exists" -eq 1 ] ;;
+    *"-C OUTPUT -p udp -j {UDP_FAIL_CLOSED_CHAIN_A}"*)
+      [ "$a_exists" -eq 1 ] || return 2
+      [ "$a_active" -eq 1 ]
+      ;;
+    *"-C OUTPUT -p udp -j {UDP_FAIL_CLOSED_CHAIN_B}"*)
+      [ "$b_exists" -eq 1 ] || return 2
+      [ "$b_active" -eq 1 ]
+      ;;
+    *"-N {UDP_FAIL_CLOSED_CHAIN_A}"*) a_exists=1 ;;
+    *"-N {UDP_FAIL_CLOSED_CHAIN_B}"*) b_exists=1 ;;
+    *"-I OUTPUT 1 -p udp -j {UDP_FAIL_CLOSED_CHAIN_A}"*) a_active=1 ;;
+    *"-I OUTPUT 1 -p udp -j {UDP_FAIL_CLOSED_CHAIN_B}"*) b_active=1 ;;
+    *"-D OUTPUT -p udp -j {UDP_FAIL_CLOSED_CHAIN_A}"*) a_active=0 ;;
+    *"-D OUTPUT -p udp -j {UDP_FAIL_CLOSED_CHAIN_B}"*) b_active=0 ;;
+    *) return 0 ;;
+  esac
+}}
+{script}
+[ "$a_exists" -eq 1 ] && [ "$a_active" -eq 1 ] && [ "$b_active" -eq 0 ]
+"#
+        );
+
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(harness)
+            .output()
+            .expect("execute generated fail-closed script with nft-modeling shim");
+        assert!(
+            output.status.success(),
+            "fresh-netns first install must succeed when missing-chain jump probes return status 2: status={:?}\nstdout={}\nstderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Fail-closed must be preserved for genuine xtables resource errors on BOTH
+    /// the existence probe and the jump probe: any non-1 status aborts the install
+    /// with the binary's own exit code (so `set -e` propagates it and the producer
+    /// retains the fail-closed cleanup owner) rather than being misread as
+    /// chain/jump absence.
+    #[test]
+    fn udp_fail_closed_script_aborts_on_genuine_resource_error() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.udp_capture_enabled = true;
+
+        let script = IptablesPlan::udp_fail_closed_script(&config);
+
+        // The outer existence and active-jump probes plus each strict release
+        // chain-existence probe preserve the same status contract: status 1
+        // alone means absent, while every other non-zero status aborts.
+        assert_eq!(
+            script.matches("if [ \"$status\" -ne 1 ]; then").count(),
+            6,
+            "all chain-existence probes must fail closed on non-1 status:\n{script}"
+        );
+        assert!(
+            script.contains("could not inspect UDP fail-closed guard chain"),
+            "chain-existence probe reports and re-raises a genuine resource error:\n{script}"
+        );
+        assert!(
+            script.contains("could not inspect active UDP fail-closed guard"),
+            "jump probe still reports and re-raises a genuine resource error:\n{script}"
+        );
+        // The two outer handlers and both error paths in each of the four
+        // expanded strict-release blocks re-raise the binary's status, so
+        // `set -e` aborts and the producer keeps the fail-closed cleanup owner.
+        assert_eq!(
+            script.matches("exit \"$status\"").count(),
+            10,
+            "every strict probe re-raises the xtables status to fail closed:\n{script}"
+        );
     }
 
     #[test]
@@ -3617,12 +3810,24 @@ mod tests {
         // v6 table teardown guarded behind the ip6tables (mangle) probe...
         assert!(script.contains("command -v ip6tables") && script.contains("ip6tables -t mangle"));
         for chain in [UDP_FAIL_CLOSED_CHAIN_A, UDP_FAIL_CLOSED_CHAIN_B] {
+            let existence_probe = format!(
+                "if iptables -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -S {chain} >/dev/null 2>&1"
+            );
+            let jump_release = format!(
+                "while true; do\n    if iptables -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} \
+                 -C OUTPUT -p udp -j {chain}"
+            );
+            let existence_idx = script
+                .find(&existence_probe)
+                .unwrap_or_else(|| panic!("teardown must probe v4 guard chain {chain}: {script}"));
+            let release_idx = script.find(&jump_release).unwrap_or_else(|| {
+                panic!(
+                    "teardown must loop over every duplicate v4 guard jump for {chain}: {script}"
+                )
+            });
             assert!(
-                script.contains(&format!(
-                    "while true; do\n  if iptables -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} \
-                     -C OUTPUT -p udp -j {chain}"
-                )),
-                "teardown must loop over every duplicate v4 guard jump for {chain}: {script}"
+                existence_idx < release_idx,
+                "teardown must establish v4 guard-chain existence before probing its jump for {chain}: {script}"
             );
         }
         assert!(
