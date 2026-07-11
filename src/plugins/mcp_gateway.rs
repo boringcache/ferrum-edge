@@ -2584,17 +2584,58 @@ impl McpGateway {
             None
         };
         // Tool/prompt response preparation may have populated templates for
-        // just the selected server. Honor a URI returned from that cache before
-        // attempting an all-server refresh: an unrelated resource server that
-        // does not implement template discovery must not make the freshly
-        // returned URI unreadable.
+        // just the selected server. Honor a fresh URI returned from that cache
+        // before attempting an all-server refresh: an unrelated resource server
+        // that does not implement template discovery must not make the freshly
+        // returned URI unreadable. When the template catalog TTL has expired,
+        // refresh the selected server before accepting the cached template so
+        // removed templates do not remain routable.
         let cached_template_route = if route.is_none() {
             let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
                 return session_not_found_response();
             };
-            let catalog = catalog_lock.read().await;
-            resource_template_route(&catalog, &public_uri)
-                .map(|(server_id, upstream_uri)| (server_id, upstream_uri, catalog.version))
+            let cached_route = {
+                let catalog = catalog_lock.read().await;
+                resource_template_route(&catalog, &public_uri).map(|(server_id, upstream_uri)| {
+                    (
+                        server_id,
+                        upstream_uri,
+                        catalog.version,
+                        catalog.resource_templates_are_stale(self.discovery.cache_ttl),
+                    )
+                })
+            };
+            match cached_route {
+                Some((server_id, upstream_uri, catalog_version, false)) => {
+                    Some((server_id, upstream_uri, catalog_version))
+                }
+                Some((server_id, _, _, true)) => {
+                    // The response-binding refresh path records a per-server
+                    // attempt before I/O, preventing repeated requests to an
+                    // unsupported or temporarily unavailable upstream. It is
+                    // deliberately fail-open here: this route was previously
+                    // discovered and remains safer than making a transient
+                    // discovery outage break a long-lived session. A successful
+                    // refresh still removes routes the upstream withdrew.
+                    self.prepare_response_resource_bindings(ctx, downstream_session_id, &server_id)
+                        .await;
+                    let catalog = catalog_lock.read().await;
+                    match resource_template_route(&catalog, &public_uri) {
+                        Some((server_id, upstream_uri)) => {
+                            Some((server_id, upstream_uri, catalog.version))
+                        }
+                        None => {
+                            return json_rpc_error(
+                                envelope.id.clone(),
+                                -32007,
+                                "Unknown MCP resource",
+                                None,
+                            );
+                        }
+                    }
+                }
+                None => None,
+            }
         } else {
             None
         };

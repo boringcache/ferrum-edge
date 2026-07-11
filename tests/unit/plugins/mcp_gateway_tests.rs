@@ -3,6 +3,8 @@ use ferrum_edge::config::types::{BackendScheme, BackendTlsConfig};
 use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, PluginResult, create_plugin, priority};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -112,6 +114,66 @@ fn known_json_response_headers(body: &[u8]) -> HashMap<String, String> {
         ("content-type".to_string(), "application/json".to_string()),
         ("content-length".to_string(), body.len().to_string()),
     ])
+}
+
+async fn reverse_mapped_tool_resource_uri(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    session_id: &str,
+    id: u64,
+) -> String {
+    let request = json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": {"name": "github.create_pr", "arguments": {"repo": "payments-api"}}
+    });
+    let (mut ctx, mut headers) = mcp_ctx(request.clone());
+    headers.insert("mcp-session-id".to_string(), session_id.to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            &serde_json::to_vec(&request).unwrap(),
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("tool request should be rewritten");
+    let response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0", "id": id, "result": {"content": [{
+            "type": "resource_link", "uri": "file:///project/generated.txt", "name": "Generated"
+        }]}
+    }))
+    .unwrap();
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &response,
+            Some("application/json"),
+            &known_json_response_headers(&response),
+        )
+        .await
+        .expect("selected-server template should reverse-map the resource link");
+    serde_json::from_slice::<Value>(&rewritten).unwrap()["result"]["content"][0]["uri"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn route_resource_uri(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    session_id: &str,
+    id: u64,
+    public_uri: &str,
+) -> PluginResult {
+    let request = json!({
+        "jsonrpc": "2.0", "id": id, "method": "resources/read",
+        "params": {"uri": public_uri}
+    });
+    let (mut ctx, mut headers) = mcp_ctx(request);
+    headers.insert("mcp-session-id".to_string(), session_id.to_string());
+    plugin.before_proxy(&mut ctx, &mut headers).await
 }
 
 async fn start_mcp_catalog_server() -> MockServer {
@@ -2022,6 +2084,126 @@ async fn aggregate_resource_read_reuses_selected_server_template_cache() {
             .as_deref()
             == Some("resources/templates/list")
     }));
+    let primary_requests = primary.received_requests().await.unwrap();
+    assert_eq!(
+        primary_requests
+            .iter()
+            .filter(|request| {
+                request
+                    .body_json::<Value>()
+                    .ok()
+                    .and_then(|body| {
+                        body.get("method")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some("resources/templates/list")
+            })
+            .count(),
+        1,
+        "a fresh selected-server template must be accepted without another refresh"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_stale_resource_template_is_removed_by_selected_server_refresh() {
+    let server = start_mcp_catalog_server().await;
+    let unrelated = start_mcp_catalog_server().await;
+    let template_requests = Arc::new(AtomicUsize::new(0));
+    let response_counter = Arc::clone(&template_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "resources/templates/list"}),
+        ))
+        .respond_with(move |_: &wiremock::Request| {
+            let templates = if response_counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                json!([{"uriTemplate": "file:///project/{path}", "name": "Project file"}])
+            } else {
+                json!([])
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": "upstream", "result": {"resourceTemplates": templates}
+            }))
+        })
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let unrelated_template_requests = Arc::new(AtomicUsize::new(0));
+    let unrelated_counter = Arc::clone(&unrelated_template_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "resources/templates/list"}),
+        ))
+        .respond_with(move |_: &wiremock::Request| {
+            unrelated_counter.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(500)
+        })
+        .with_priority(1)
+        .mount(&unrelated)
+        .await;
+
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["discovery"]["cache_ttl_seconds"] = json!(1);
+    config["servers"]["unrelated"] = json!({
+        "upstream_url": format!("{}/mcp", unrelated.uri()),
+        "namespace": "unrelated",
+        "enabled": true,
+        "expose_tools": true,
+        "expose_resources": true,
+        "expose_prompts": true
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let public_uri = reverse_mapped_tool_resource_uri(&plugin, &session_id, 35).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let result = route_resource_uri(&plugin, &session_id, 36, &public_uri).await;
+    let (_, body, _) = reject_json(result);
+    assert_eq!(body["error"]["code"], -32007);
+    assert_eq!(template_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(unrelated_template_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn aggregate_stale_resource_template_serves_stale_when_refresh_fails() {
+    let server = start_mcp_catalog_server().await;
+    let template_requests = Arc::new(AtomicUsize::new(0));
+    let response_counter = Arc::clone(&template_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "resources/templates/list"}),
+        ))
+        .respond_with(move |_: &wiremock::Request| {
+            if response_counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": "upstream", "result": {"resourceTemplates": [
+                        {"uriTemplate": "file:///project/{path}", "name": "Project file"}
+                    ]}
+                }))
+            } else {
+                ResponseTemplate::new(500)
+            }
+        })
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["discovery"]["cache_ttl_seconds"] = json!(1);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let public_uri = reverse_mapped_tool_resource_uri(&plugin, &session_id, 37).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    assert!(matches!(
+        route_resource_uri(&plugin, &session_id, 38, &public_uri).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(template_requests.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
