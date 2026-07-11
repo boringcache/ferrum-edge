@@ -4,3 +4,5 @@
 # Git must unignore the directory before it can unignore tracked rule contents.
 !rules/
 !rules/**
+!skills/
+!skills/**
