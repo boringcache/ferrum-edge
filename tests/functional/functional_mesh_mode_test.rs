@@ -7340,23 +7340,19 @@ fn udp_capture_snapshot(pid: u32, capture_port: u16) -> Result<UdpCaptureSnapsho
         .filter(|line| line.contains("lookup 33133"))
         .count();
     let port_suffix = format!(":{:04X}", capture_port);
-    let listeners = run_in_live_netns(pid, move || {
-        let mut count = 0;
-        for path in ["/proc/net/udp", "/proc/net/udp6"] {
-            let Ok(contents) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            count += contents
-                .lines()
-                .filter(|line| {
-                    line.split_whitespace()
-                        .nth(1)
-                        .is_some_and(|local| local.ends_with(&port_suffix))
-                })
-                .count();
-        }
-        Ok(count)
-    })?;
+    // Read procfs from a single-threaded process whose own network namespace is
+    // the pod's. An in-process `setns` only switches the calling test thread,
+    // while `/proc/self/net` may still resolve through the multithreaded test
+    // process and report the host namespace instead.
+    let listener_tables = netns_command(pid, "cat /proc/net/udp /proc/net/udp6")?;
+    let listeners = listener_tables
+        .lines()
+        .filter(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .is_some_and(|local| local.ends_with(&port_suffix))
+        })
+        .count();
     Ok(UdpCaptureSnapshot {
         output_jumps: rules
             .lines()
