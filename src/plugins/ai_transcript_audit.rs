@@ -676,13 +676,11 @@ impl AiTranscriptAudit {
         &self,
         ctx: &RequestContext,
         response_status: u16,
-        content_type: Option<&str>,
+        _content_type: Option<&str>,
     ) -> bool {
         if self.capture.streaming == StreamingCapture::Off
             || !flag(&ctx.metadata, MD_CANDIDATE)
             || !flag(&ctx.metadata, &self.stream_marker_key())
-            || (!flag(&ctx.metadata, MD_STREAM_REQUEST)
-                && !content_type.is_some_and(is_event_stream))
         {
             return false;
         }
@@ -1367,7 +1365,19 @@ impl Plugin for AiTranscriptAudit {
             ctx.metadata.insert("request_body".to_string(), body);
         }
         if self.capture.streaming != StreamingCapture::Off {
-            self.stream_fail_closed_rejection(ctx, response_status, response_headers)
+            let stream_admission =
+                self.stream_fail_closed_rejection(ctx, response_status, response_headers);
+            if !matches!(stream_admission, PluginResult::Continue) {
+                return stream_admission;
+            }
+        }
+        if self.buffered_response_capture_wanted(ctx) {
+            // Streaming and buffered capture are independent policies. A
+            // response that remains JSON still needs the buffered path's
+            // admission even when streaming capture is also configured. Both
+            // checks reuse the same per-record permit when they select the
+            // same eventual audit record.
+            self.ensure_commit_admission(ctx)
         } else if ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY) {
             // `apply_after_proxy_hooks_to_rejection` is replaying header hooks
             // over an already-fixed response and ignores replacement rejects.

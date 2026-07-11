@@ -12402,6 +12402,15 @@ async fn run_after_proxy_hooks_on_rejection(
                         "content-digest",
                         "repr-digest",
                         "etag",
+                        "last-modified",
+                        "cache-control",
+                        "cdn-cache-control",
+                        "surrogate-control",
+                        "expires",
+                        "age",
+                        "pragma",
+                        "vary",
+                        "warning",
                     ] {
                         response_headers.remove(header);
                     }
@@ -27717,6 +27726,24 @@ mod tests {
             ("content-digest".to_string(), "sha-256=:stale:".to_string()),
             ("repr-digest".to_string(), "sha-256=:stale:".to_string()),
             ("etag".to_string(), "\"stale\"".to_string()),
+            (
+                "last-modified".to_string(),
+                "Wed, 01 Jan 2025 00:00:00 GMT".to_string(),
+            ),
+            (
+                "cache-control".to_string(),
+                "public, max-age=3600".to_string(),
+            ),
+            ("cdn-cache-control".to_string(), "max-age=3600".to_string()),
+            ("surrogate-control".to_string(), "max-age=3600".to_string()),
+            (
+                "expires".to_string(),
+                "Wed, 01 Jan 2030 00:00:00 GMT".to_string(),
+            ),
+            ("age".to_string(), "120".to_string()),
+            ("pragma".to_string(), "cache".to_string()),
+            ("vary".to_string(), "accept-encoding".to_string()),
+            ("warning".to_string(), "110 stale".to_string()),
         ]);
         let mut body = b"synthetic success".to_vec();
 
@@ -27748,6 +27775,15 @@ mod tests {
             "content-digest",
             "repr-digest",
             "etag",
+            "last-modified",
+            "cache-control",
+            "cdn-cache-control",
+            "surrogate-control",
+            "expires",
+            "age",
+            "pragma",
+            "vary",
+            "warning",
         ] {
             assert!(
                 !headers.contains_key(stale_header),
