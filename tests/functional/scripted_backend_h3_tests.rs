@@ -1735,6 +1735,10 @@ async fn bodyless_native_h3_sse_response_is_governed() {
         .step(H3Step::RespondData(bytes::Bytes::from_static(
             DENIED_SSE.as_bytes(),
         )))
+        // Keep the scripted connection alive long enough for the gateway to
+        // parse HEADERS and attach the response inspector before script-end
+        // teardown can race recv_response() on CI.
+        .step(H3Step::StallFor(Duration::from_millis(50)))
         .spawn()
         .expect("spawn h3 backend");
 
@@ -1771,7 +1775,10 @@ async fn bodyless_native_h3_sse_response_is_governed() {
     });
     let harness = GatewayHarness::builder()
         .file_config(serde_yaml::to_string(&config).expect("yaml"))
-        .pool_warmup_enabled(true)
+        // Initial capability refresh establishes h3=supported without issuing
+        // a request. Pool warmup would consume this fixture's single scripted
+        // H3 stream before the regression GET reaches it.
+        .pool_warmup_enabled(false)
         .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
         .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")
         .spawn()
