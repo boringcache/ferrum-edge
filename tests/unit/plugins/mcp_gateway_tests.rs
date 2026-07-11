@@ -2109,6 +2109,7 @@ async fn aggregate_resource_read_reuses_selected_server_template_cache() {
 #[tokio::test]
 async fn aggregate_stale_resource_template_is_removed_by_selected_server_refresh() {
     let server = start_mcp_catalog_server().await;
+    let unrelated = start_mcp_catalog_server().await;
     let template_requests = Arc::new(AtomicUsize::new(0));
     let response_counter = Arc::clone(&template_requests);
     Mock::given(method("POST"))
@@ -2129,9 +2130,31 @@ async fn aggregate_stale_resource_template_is_removed_by_selected_server_refresh
         .with_priority(1)
         .mount(&server)
         .await;
+    let unrelated_template_requests = Arc::new(AtomicUsize::new(0));
+    let unrelated_counter = Arc::clone(&unrelated_template_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "resources/templates/list"}),
+        ))
+        .respond_with(move |_: &wiremock::Request| {
+            unrelated_counter.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(500)
+        })
+        .with_priority(1)
+        .mount(&unrelated)
+        .await;
 
     let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
     config["discovery"]["cache_ttl_seconds"] = json!(1);
+    config["servers"]["unrelated"] = json!({
+        "upstream_url": format!("{}/mcp", unrelated.uri()),
+        "namespace": "unrelated",
+        "enabled": true,
+        "expose_tools": true,
+        "expose_resources": true,
+        "expose_prompts": true
+    });
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
     let public_uri = reverse_mapped_tool_resource_uri(&plugin, &session_id, 35).await;
@@ -2141,6 +2164,7 @@ async fn aggregate_stale_resource_template_is_removed_by_selected_server_refresh
     let (_, body, _) = reject_json(result);
     assert_eq!(body["error"]["code"], -32007);
     assert_eq!(template_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(unrelated_template_requests.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

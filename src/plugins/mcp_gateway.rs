@@ -2620,8 +2620,19 @@ impl McpGateway {
                     self.prepare_response_resource_bindings(ctx, downstream_session_id, &server_id)
                         .await;
                     let catalog = catalog_lock.read().await;
-                    resource_template_route(&catalog, &public_uri)
-                        .map(|(server_id, upstream_uri)| (server_id, upstream_uri, catalog.version))
+                    match resource_template_route(&catalog, &public_uri) {
+                        Some((server_id, upstream_uri)) => {
+                            Some((server_id, upstream_uri, catalog.version))
+                        }
+                        None => {
+                            return json_rpc_error(
+                                envelope.id.clone(),
+                                -32007,
+                                "Unknown MCP resource",
+                                None,
+                            );
+                        }
+                    }
                 }
                 None => None,
             }
