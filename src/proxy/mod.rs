@@ -12506,7 +12506,7 @@ pub(crate) async fn apply_after_proxy_hooks_to_rejection(
         .await;
 }
 
-async fn apply_replaceable_after_proxy_hooks_to_rejection(
+pub(crate) async fn apply_replaceable_after_proxy_hooks_to_rejection(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     status_code: &mut u16,

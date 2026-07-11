@@ -1586,7 +1586,10 @@ async fn possible_final_sse_relabel_is_admitted_before_header_rewrite() {
 }
 
 #[tokio::test]
-async fn unsampled_success_stream_does_not_consume_fail_closed_capacity() {
+async fn unsampled_stream_with_error_override_reserves_fail_closed_capacity() {
+    // A 2xx stream can still fail after headers commit. With the error override
+    // enabled, even a sampling miss must reserve its terminal audit slot before
+    // bytes flow, so a concurrent candidate cannot consume the sole capacity.
     let plugin = AiTranscriptAudit::new(
         &json!({
             "capture": { "response": false, "streaming_response": "sampled" },
@@ -1624,15 +1627,18 @@ async fn unsampled_success_stream_does_not_consume_fail_closed_capacity() {
         PluginResult::Continue
     ));
 
-    let mut error = make_ctx();
+    let mut concurrent = make_ctx();
     plugin
-        .on_final_request_body_with_context(&mut error, &request_headers, stream_body)
+        .on_final_request_body_with_context(&mut concurrent, &request_headers, stream_body)
         .await;
     assert!(matches!(
         plugin
-            .after_proxy(&mut error, 500, &mut response_headers)
+            .after_proxy(&mut concurrent, 200, &mut response_headers)
             .await,
-        PluginResult::Continue
+        PluginResult::Reject {
+            status_code: 503,
+            ..
+        }
     ));
 }
 

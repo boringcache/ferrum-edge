@@ -678,7 +678,7 @@ impl AiTranscriptAudit {
     fn stream_commit_selected(
         &self,
         ctx: &RequestContext,
-        response_status: u16,
+        _response_status: u16,
         _content_type: Option<&str>,
     ) -> bool {
         if self.capture.streaming == StreamingCapture::Off
@@ -695,7 +695,10 @@ impl AiTranscriptAudit {
             // emission; the permit is released if the stream completes without
             // an emission override.
             || self.sampling.always_on_guardrail
-            || (self.sampling.always_on_error && response_status >= 400)
+            // A 2xx stream can still terminate with a body error after headers
+            // commit. Reserve before commit whenever terminal errors override
+            // sampling so that later failure records remain fail-closed.
+            || self.sampling.always_on_error
     }
 
     fn stream_fail_closed_rejection(
@@ -739,8 +742,9 @@ impl AiTranscriptAudit {
         }
         let now = Instant::now();
         let ttl = self.staging_ttl;
-        self.staging
-            .retain(|_, staging| now.duration_since(staging.captured_at) < ttl);
+        self.staging.retain(|_, staging| {
+            staging.commit_permit.is_some() || now.duration_since(staging.captured_at) < ttl
+        });
     }
 
     fn shape_body(&self, raw: &[u8], max_bytes: usize) -> (Option<String>, bool) {
