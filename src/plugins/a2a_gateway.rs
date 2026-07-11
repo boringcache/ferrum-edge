@@ -15,6 +15,7 @@ use url::Url;
 use super::{
     HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext, ResponseStreamAction,
     ResponseStreamInspector,
+    utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key},
 };
 
 const DEFAULT_ENDPOINT_PATH: &str = "/a2a";
@@ -327,14 +328,15 @@ impl A2aSseStreamInspector {
             return;
         }
         self.emitted = true;
-        let task_state = self.task_state.as_deref().unwrap_or("");
+        let task_state =
+            redacted_a2a_metadata_value("a2a.task_state", self.task_state.as_deref().unwrap_or(""));
         match (self.task_id.as_deref(), self.context_id.as_deref()) {
             (Some(task_id), Some(context_id)) => tracing::info!(
                 target: "a2a_gateway",
                 {
                     "a2a.stream_events" = self.stream_events,
-                    "a2a.task_id" = task_id,
-                    "a2a.context_id" = context_id,
+                    "a2a.task_id" = redacted_a2a_metadata_value("a2a.task_id", task_id),
+                    "a2a.context_id" = redacted_a2a_metadata_value("a2a.context_id", context_id),
                     "a2a.task_state" = task_state
                 },
                 "observed A2A SSE response metadata"
@@ -343,7 +345,7 @@ impl A2aSseStreamInspector {
                 target: "a2a_gateway",
                 {
                     "a2a.stream_events" = self.stream_events,
-                    "a2a.task_id" = task_id,
+                    "a2a.task_id" = redacted_a2a_metadata_value("a2a.task_id", task_id),
                     "a2a.task_state" = task_state
                 },
                 "observed A2A SSE response metadata"
@@ -352,7 +354,7 @@ impl A2aSseStreamInspector {
                 target: "a2a_gateway",
                 {
                     "a2a.stream_events" = self.stream_events,
-                    "a2a.context_id" = context_id,
+                    "a2a.context_id" = redacted_a2a_metadata_value("a2a.context_id", context_id),
                     "a2a.task_state" = task_state
                 },
                 "observed A2A SSE response metadata"
@@ -366,6 +368,51 @@ impl A2aSseStreamInspector {
                 "observed A2A SSE response metadata"
             ),
         }
+    }
+}
+
+fn redacted_a2a_metadata_value<'a>(key: &str, value: &'a str) -> &'a str {
+    if is_sensitive_metadata_key(key) {
+        REDACTED_PLACEHOLDER
+    } else {
+        value
+    }
+}
+
+#[cfg(test)]
+fn redacted_a2a_metadata_value_with_extras<'a>(
+    key: &str,
+    value: &'a str,
+    extras: &[String],
+) -> &'a str {
+    if crate::plugins::utils::metadata_redaction::is_sensitive_metadata_key_with_extras(key, extras)
+    {
+        REDACTED_PLACEHOLDER
+    } else {
+        value
+    }
+}
+
+#[cfg(test)]
+mod a2a_metadata_redaction_tests {
+    use super::redacted_a2a_metadata_value_with_extras;
+
+    #[test]
+    fn redacts_stream_observation_values_with_operator_metadata_keys() {
+        let extras = vec!["a2a.task_id".to_string(), "a2a.context_id".to_string()];
+
+        assert_eq!(
+            redacted_a2a_metadata_value_with_extras("a2a.task_id", "task-9", &extras),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            redacted_a2a_metadata_value_with_extras("a2a.context_id", "ctx-4", &extras),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            redacted_a2a_metadata_value_with_extras("a2a.task_state", "completed", &extras),
+            "completed"
+        );
     }
 }
 
