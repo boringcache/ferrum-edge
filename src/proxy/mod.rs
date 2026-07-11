@@ -2207,6 +2207,22 @@ enum RequestBodyBufferError {
     TimedOut,
 }
 
+async fn collect_request_body_with_timeout<F, T, E>(
+    collect: F,
+    request_body_read_timeout_ms: u64,
+) -> Result<Result<T, E>, RequestBodyBufferError>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    if request_body_read_timeout_ms == 0 {
+        return Ok(collect.await);
+    }
+
+    tokio::time::timeout(Duration::from_millis(request_body_read_timeout_ms), collect)
+        .await
+        .map_err(|_| RequestBodyBufferError::TimedOut)
+}
+
 pub(crate) fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
     !matches!(method, "GET" | "HEAD" | "OPTIONS")
         || headers.contains_key("content-length")
@@ -2239,14 +2255,9 @@ async fn buffer_request_body_for_before_proxy(
     let (_parts, body) = request.into_parts();
     let body_bytes = if max_request_body_size_bytes > 0 {
         let limited = http_body_util::Limited::new(body, max_request_body_size_bytes);
-        let collect = limited.collect();
-        let collected = if request_body_read_timeout_ms > 0 {
-            tokio::time::timeout(Duration::from_millis(request_body_read_timeout_ms), collect)
-                .await
-                .map_err(|_| RequestBodyBufferError::TimedOut)?
-        } else {
-            collect.await
-        };
+        let collected =
+            collect_request_body_with_timeout(limited.collect(), request_body_read_timeout_ms)
+                .await?;
         collected
             .map_err(|e| {
                 // Limited::collect() returns either a LengthLimitError (the body
@@ -2266,14 +2277,8 @@ async fn buffer_request_body_for_before_proxy(
             .to_bytes()
             .to_vec()
     } else {
-        let collect = body.collect();
-        let collected = if request_body_read_timeout_ms > 0 {
-            tokio::time::timeout(Duration::from_millis(request_body_read_timeout_ms), collect)
-                .await
-                .map_err(|_| RequestBodyBufferError::TimedOut)?
-        } else {
-            collect.await
-        };
+        let collected =
+            collect_request_body_with_timeout(body.collect(), request_body_read_timeout_ms).await?;
         collected
             .map_err(|e| RequestBodyBufferError::ClientDisconnected(e.to_string()))?
             .to_bytes()
@@ -26031,6 +26036,46 @@ fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn stalled_buffered_probe_times_out_and_releases_slot_neutral() {
+        use crate::circuit_breaker::CircuitBreaker;
+        use crate::config::types::CircuitBreakerConfig;
+
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            timeout_seconds: 0,
+            failure_status_codes: vec![500],
+            half_open_max_requests: 1,
+            trip_on_connection_errors: true,
+        });
+        cb.record_failure(500, false, false);
+        assert!(
+            cb.can_execute().unwrap(),
+            "the request claims the probe slot"
+        );
+        assert_eq!(cb.half_open_in_flight(), 1);
+
+        let stalled_upload = std::future::pending::<Result<(), ()>>();
+        let result = super::collect_request_body_with_timeout(stalled_upload, 30_000).await;
+        assert!(
+            matches!(result, Err(super::RequestBodyBufferError::TimedOut)),
+            "a never-ending buffered upload must hit the configured deadline"
+        );
+
+        cb.record_neutral(true);
+        assert_eq!(cb.half_open_in_flight(), 0);
+        assert_eq!(
+            cb.state_name(),
+            "half_open",
+            "a client upload timeout releases the slot without healing or tripping the breaker"
+        );
+        assert!(
+            cb.can_execute().unwrap(),
+            "the released single probe slot admits the next recovery probe"
+        );
+    }
+
     use super::*;
     use crate::config::types::{LoadBalancerAlgorithm, PluginAssociation};
     use crate::plugins::PluginHttpClient;
