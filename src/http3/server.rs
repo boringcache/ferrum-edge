@@ -46,6 +46,29 @@ use crate::proxy::{
 };
 use crate::tls::{CrlList, TlsPolicy};
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum H3RequestBodyReadError<E> {
+    Read(E),
+    TimedOut,
+}
+
+pub(super) async fn collect_h3_request_body_with_timeout<F, T, E>(
+    collect: F,
+    request_body_read_timeout_ms: u64,
+) -> Result<T, H3RequestBodyReadError<E>>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    if request_body_read_timeout_ms == 0 {
+        return collect.await.map_err(H3RequestBodyReadError::Read);
+    }
+
+    tokio::time::timeout(Duration::from_millis(request_body_read_timeout_ms), collect)
+        .await
+        .map_err(|_| H3RequestBodyReadError::TimedOut)?
+        .map_err(H3RequestBodyReadError::Read)
+}
+
 /// Optional HTTP/3 listener settings that don't affect the core bind contract.
 #[derive(Default)]
 pub struct Http3ListenerOptions {
@@ -2102,17 +2125,22 @@ async fn handle_h3_request(
         let body_was_prebuffered = prebuffered_body_data.is_some();
         let mut body_data = prebuffered_body_data.take().unwrap_or_default();
         if !body_was_prebuffered {
-            while let Some(chunk) = stream.recv_data().await.inspect_err(|_error| {
-                release_h3_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                );
-            })? {
-                let bytes = chunk.chunk();
-                if content_length_limit > 0 && body_data.len() + bytes.len() > content_length_limit
-                {
+            let collect = async {
+                while let Some(chunk) = stream.recv_data().await? {
+                    let bytes = chunk.chunk();
+                    if content_length_limit > 0
+                        && body_data.len() + bytes.len() > content_length_limit
+                    {
+                        return Ok::<_, h3::error::StreamError>(false);
+                    }
+                    body_data.extend_from_slice(bytes);
+                }
+                Ok(true)
+            };
+            match collect_h3_request_body_with_timeout(collect, proxy.backend_read_timeout_ms).await
+            {
+                Ok(true) => {}
+                Ok(false) => {
                     release_h3_circuit_breaker_probe_on_admission_reject(
                         &state,
                         &proxy,
@@ -2131,7 +2159,34 @@ async fn handle_h3_request(
                     .await?;
                     return Ok(());
                 }
-                body_data.extend_from_slice(bytes);
+                Err(H3RequestBodyReadError::Read(error)) => {
+                    release_h3_circuit_breaker_probe_on_admission_reject(
+                        &state,
+                        &proxy,
+                        cb_target_key.as_deref(),
+                        cb_is_half_open_probe,
+                    );
+                    return Err(error.into());
+                }
+                Err(H3RequestBodyReadError::TimedOut) => {
+                    release_h3_circuit_breaker_probe_on_admission_reject(
+                        &state,
+                        &proxy,
+                        cb_target_key.as_deref(),
+                        cb_is_half_open_probe,
+                    );
+                    record_request(&state, StatusCode::REQUEST_TIMEOUT.as_u16());
+                    send_h3_error_flavor_aware(
+                        &mut stream,
+                        http_flavor,
+                        StatusCode::REQUEST_TIMEOUT,
+                        r#"{"error":"Request body read timed out"}"#,
+                        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                        "Request body read timed out",
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
         }
         let raw_request_body_bytes = body_data.len() as u64;
@@ -8452,6 +8507,42 @@ fn record_request(state: &ProxyState, status: u16) {
             .fetch_add(1, Ordering::Relaxed);
     }
     crate::runtime_metrics::global_ref().record_http_status(status);
+}
+
+#[cfg(test)]
+mod h3_request_body_timeout_tests {
+    #[tokio::test(start_paused = true)]
+    async fn stalled_buffered_probe_times_out_and_releases_slot_neutral() {
+        use crate::circuit_breaker::CircuitBreaker;
+        use crate::config::types::CircuitBreakerConfig;
+
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            timeout_seconds: 0,
+            failure_status_codes: vec![500],
+            half_open_max_requests: 1,
+            trip_on_connection_errors: true,
+        });
+        cb.record_failure(500, false, false);
+        assert!(
+            cb.can_execute().unwrap(),
+            "the H3 request claims the probe slot"
+        );
+        assert_eq!(cb.half_open_in_flight(), 1);
+
+        let stalled_upload = std::future::pending::<Result<(), ()>>();
+        let result = super::collect_h3_request_body_with_timeout(stalled_upload, 30_000).await;
+        assert_eq!(result, Err(super::H3RequestBodyReadError::TimedOut));
+
+        cb.record_neutral(true);
+        assert_eq!(cb.half_open_in_flight(), 0);
+        assert_eq!(cb.state_name(), "half_open");
+        assert!(
+            cb.can_execute().unwrap(),
+            "the released H3 probe slot admits the next recovery probe"
+        );
+    }
 }
 
 #[cfg(test)]
