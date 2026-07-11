@@ -12495,17 +12495,6 @@ async fn run_after_proxy_hooks_on_rejection(
     }
 }
 
-pub(crate) async fn apply_after_proxy_hooks_to_rejection(
-    plugins: &[Arc<dyn Plugin>],
-    ctx: &mut RequestContext,
-    status_code: u16,
-    response_headers: &mut HashMap<String, String>,
-) {
-    let mut status_code = status_code;
-    run_after_proxy_hooks_on_rejection(plugins, ctx, &mut status_code, None, response_headers)
-        .await;
-}
-
 pub(crate) async fn apply_replaceable_after_proxy_hooks_to_rejection(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
