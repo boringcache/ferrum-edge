@@ -2261,8 +2261,10 @@ jobs:
               src/proxy/hbone_pool.rs|src/proxy/hbone_proxy.rs|src/proxy/mesh_mtls_pool.rs|\
               src/proxy/mesh_tcp_egress.rs|src/proxy/mesh_tcp_inbound.rs|\
               src/proxy/mesh_udp_capture.rs|src/proxy/mesh_udp_frame.rs|src/proxy/mod.rs|\
-              src/proxy/netns_capture.rs|src/proxy/tcp_proxy.rs|src/proxy/udp_batch.rs|\
+              src/proxy/netns_capture.rs|src/proxy/netns_udp_capture.rs|src/proxy/tcp_proxy.rs|src/proxy/udp_batch.rs|\
               src/router_cache.rs|src/socket_opts.rs|\
+              src/service_discovery/*|src/service_discovery/**|\
+              tests/functional/functional_mesh_mode_test.rs|\
               tests/k8s/lib/*|tests/k8s/lib/**|tests/k8s/node_waypoint_ebpf_live/*|tests/k8s/node_waypoint_ebpf_live/**|\
               tests/*capture*|tests/*ebpf*|tests/*netns*|tests/*node_waypoint*)
                 changed=true
@@ -2475,7 +2477,7 @@ jobs:
           RUST_BACKTRACE: 1
 
   netns-capture-live:
-    name: Node-Waypoint In-Netns Capture Live Test
+    name: Netns Source Capture Live Tests
     needs: detect-ebpf-live-changes
     # The netns tests require privileged live-kernel operations; the path gate
     # keeps unrelated PRs fast while preserving coverage for capture/proxy paths.
@@ -2505,11 +2507,25 @@ jobs:
           echo "In-netns live test binary: $BIN"
           echo "test_bin=$BIN" >> "$GITHUB_OUTPUT"
 
+          cargo build --bin ferrum-edge
+          mapfile -t functional_bins < <(
+            cargo test --test functional_tests --no-run --message-format=json-render-diagnostics \
+              | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("test"))) | .executable'
+          )
+          if [ "${#functional_bins[@]}" -ne 1 ]; then
+            printf 'Expected exactly one functional test binary, found %s:\n' "${#functional_bins[@]}" >&2
+            printf '%s\n' "${functional_bins[@]}" >&2
+            exit 1
+          fi
+          FUNCTIONAL_BIN="${functional_bins[0]}"
+          echo "Source-capture functional test binary: $FUNCTIONAL_BIN"
+          echo "functional_test_bin=$FUNCTIONAL_BIN" >> "$GITHUB_OUTPUT"
+
       - name: Preflight netns capture prerequisites
         run: |
           set -euo pipefail
           sudo -n true
-          for bin in unshare ip iptables; do
+          for bin in unshare nsenter setpriv timeout ip iptables iptables-save; do
             command -v "$bin" >/dev/null 2>&1 || {
               echo "::error::$bin is required for strict netns live tests"
               exit 1
@@ -2541,6 +2557,7 @@ jobs:
           echo "In-netns live test binary: $BIN"
           set +e
           output="$(sudo -E "FERRUM_LIVE_TESTS_REQUIRED=1" \
+            timeout --signal=KILL 120s \
             "$BIN" proxy::netns_capture::live_netns_tests socket_opts::original_dst_live_tests proxy::mesh_udp_capture::live_netns_tests --ignored --nocapture --test-threads=1 2>&1)"
           status=$?
           set -e
@@ -2554,6 +2571,37 @@ jobs:
           fi
           if ! grep -Eq '^test result: ok\. 4 passed; 0 failed;' <<<"$output"; then
             echo "::error::expected exactly 4 netns live tests to pass"
+            exit 1
+          fi
+
+      - name: Run full UDP and raw-TCP source-capture live e2e as root
+        # Runs two real-gateway functional tests under the same strict live-test
+        # gate: Ambient's NetnsUdpCaptureManager installs the per-pod producer
+        # and relays UDP over HBONE with transparent VIP:port replies; the raw-TCP
+        # counterpart uses the production REDIRECT plan and Sidecar mesh-mTLS.
+        # Hard timeout is a final guard against a wedged kernel/netns operation.
+        run: |
+          set -euo pipefail
+          BIN="${{ steps.build_test_bin.outputs.functional_test_bin }}"
+          echo "Source-capture functional test binary: $BIN"
+          set +e
+          output="$(sudo -E \
+            "FERRUM_LIVE_TESTS_REQUIRED=1" \
+            "FERRUM_SKIP_GATEWAY_BUILD=1" \
+            timeout --signal=KILL 240s \
+            "$BIN" functional_mesh_live_source_capture --ignored --nocapture --test-threads=1 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          if grep -q '^SKIP:' <<<"$output"; then
+            echo "::error::source-capture live tests skipped under required CI mode"
+            exit 1
+          fi
+          if ! grep -Eq '^test result: ok\. 2 passed; 0 failed;' <<<"$output"; then
+            echo "::error::expected exactly 2 full source-capture live tests to pass"
             exit 1
           fi
         env:

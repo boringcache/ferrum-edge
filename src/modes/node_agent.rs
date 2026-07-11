@@ -2784,17 +2784,16 @@ fn remove_udp_not_ready_ack(dir: &std::path::Path, pod_uid: &str) {
     }
 }
 
-/// Reap orphaned `.udp-not-ready/<uid>` acks whose pod is no longer tracked.
+/// Reap orphaned UDP handshake markers whose pod is no longer tracked.
 ///
 /// Kubernetes pod UIDs are unique per pod lifetime, so an enroll→remove cycle
-/// writes a `.udp-not-ready/<uid>` ack (see `handle_pod_removed`) that no future
-/// reconcile ever revisits. Left unswept these files accumulate one inode per
-/// pod ever seen on the node — unbounded on a `/run` tmpfs with a finite inode
-/// budget. The producer has already consumed the ack by the time the pod leaves
-/// `pod_states` (the mesh proxy observes the registry removal and reads the ack
-/// to decide `retain_guard`), so an ack for a UID absent from `pod_states` is
-/// safe to remove. The scan is bounded per call so a large backlog drains over
-/// several reconcile ticks rather than stalling one.
+/// writes `.udp-not-ready/<uid>`, while a producer whose stop acknowledgement
+/// times out can leave `.udp-ack-required/<uid>` after the registry entry is
+/// gone. Left unswept these files accumulate one inode per pod ever seen on the
+/// node. The grace below gives the proxy time to consume a late acknowledgement;
+/// after that, markers for a UID absent from `pod_states` cannot participate in
+/// another handoff and are safe to remove. The scan is bounded per directory per
+/// call so a large backlog drains over several reconcile ticks.
 fn reap_orphaned_udp_not_ready_acks(
     dir: &std::path::Path,
     pod_states: &DashMap<String, PodAttachmentState>,
@@ -2802,28 +2801,29 @@ fn reap_orphaned_udp_not_ready_acks(
     // The proxy polls the registry every ~2s. Keep a much wider grace so a
     // freshly-published pod-removal ack cannot be reaped before the producer
     // observes the registry removal and consumes it.
-    reap_orphaned_udp_not_ready_acks_older_than(
-        dir,
-        pod_states,
-        std::time::Duration::from_secs(30),
-    );
+    let minimum_age = std::time::Duration::from_secs(30);
+    for marker_dir in [".udp-not-ready", ".udp-ack-required"] {
+        reap_orphaned_udp_handshake_markers_older_than(dir, marker_dir, pod_states, minimum_age);
+    }
 }
 
-fn reap_orphaned_udp_not_ready_acks_older_than(
+fn reap_orphaned_udp_handshake_markers_older_than(
     dir: &std::path::Path,
+    marker_dir: &str,
     pod_states: &DashMap<String, PodAttachmentState>,
     minimum_age: std::time::Duration,
 ) {
     const MAX_REAP_PER_PASS: usize = 256;
-    let ack_dir = dir.join(".udp-not-ready");
+    let ack_dir = dir.join(marker_dir);
     let entries = match std::fs::read_dir(&ack_dir) {
         Ok(entries) => entries,
         Err(error) => {
             if error.kind() != std::io::ErrorKind::NotFound {
                 warn!(
                     path = %ack_dir.display(),
+                    marker_dir,
                     %error,
-                    "Failed to scan Ambient UDP not-ready ack dir for orphan cleanup"
+                    "Failed to scan Ambient UDP handshake dir for orphan cleanup"
                 );
             }
             return;
@@ -2853,8 +2853,9 @@ fn reap_orphaned_udp_not_ready_acks_older_than(
         {
             warn!(
                 pod_uid = uid.as_str(),
+                marker_dir,
                 %error,
-                "Failed to reap orphaned Ambient UDP not-ready acknowledgement"
+                "Failed to reap orphaned Ambient UDP handshake marker"
             );
             continue;
         }
@@ -3225,6 +3226,18 @@ fn handle_pod_added(
     // for this pod. Cheap to build but only needed on the cold failure paths
     // below, so each `remember_failed_pod_enrollment` call clones it.
     let enrollment_snapshot = RetryablePodEnrollment::from_event(event);
+
+    if config.capture_config.udp_capture_enabled && pod_ip.is_none() && pod_ip6.is_none() {
+        warn!(
+            pod_uid,
+            pod_name,
+            namespace,
+            "Ambient UDP enrollment has no pod source IP yet; deferring until the readiness guard can be keyed"
+        );
+        metrics.record_attach_error();
+        remember_failed_pod_enrollment(&state_key, attempt_signature, enrollment_snapshot);
+        return;
+    }
 
     let mut state = PodAttachmentState {
         pod_uid: pod_uid.to_string(),
@@ -5822,6 +5835,9 @@ mod tests {
         std::fs::write(ack_dir.join("pod-live"), b"").unwrap();
         std::fs::write(ack_dir.join("pod-gone-1"), b"").unwrap();
         std::fs::write(ack_dir.join("pod-gone-2"), b"").unwrap();
+        let required_dir = registry.path().join(".udp-ack-required");
+        std::fs::create_dir_all(&required_dir).unwrap();
+        std::fs::write(required_dir.join("pod-gone-1"), b"").unwrap();
 
         let ip = std::net::Ipv4Addr::new(10, 0, 0, 7);
         let pod_states = DashMap::new();
@@ -5866,8 +5882,9 @@ mod tests {
             "fresh pod-removal acks must survive long enough for the proxy poll"
         );
 
-        reap_orphaned_udp_not_ready_acks_older_than(
+        reap_orphaned_udp_handshake_markers_older_than(
             registry.path(),
+            ".udp-not-ready",
             &pod_states,
             std::time::Duration::ZERO,
         );
@@ -5878,6 +5895,16 @@ mod tests {
         assert!(
             !ack_dir.join("pod-gone-2").exists(),
             "orphaned ack for a departed pod must be reaped"
+        );
+        reap_orphaned_udp_handshake_markers_older_than(
+            registry.path(),
+            ".udp-ack-required",
+            &pod_states,
+            std::time::Duration::ZERO,
+        );
+        assert!(
+            !required_dir.join("pod-gone-1").exists(),
+            "orphaned durable ack requirement must be reaped"
         );
     }
 

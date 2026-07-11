@@ -151,10 +151,25 @@ impl MeshCpHandle {
 }
 
 async fn start_static_mesh_cp(slice: MeshSlice) -> MeshCpHandle {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mesh CP");
-    let addr = listener.local_addr().expect("mesh CP local addr");
+    start_static_mesh_cp_on(
+        slice,
+        "127.0.0.1:0".parse().expect("loopback CP bind"),
+        None,
+    )
+    .await
+}
+
+/// Variant used by the root/netns live source-capture test. The control plane
+/// listens on the host side of a veth so a Sidecar process running inside the
+/// throwaway pod netns can subscribe without sharing the host network namespace.
+async fn start_static_mesh_cp_on(
+    slice: MeshSlice,
+    bind_addr: SocketAddr,
+    advertised_ip: Option<std::net::IpAddr>,
+) -> MeshCpHandle {
+    let listener = TcpListener::bind(bind_addr).await.expect("bind mesh CP");
+    let bound_addr = listener.local_addr().expect("mesh CP local addr");
+    let addr = SocketAddr::new(advertised_ip.unwrap_or(bound_addr.ip()), bound_addr.port());
     let (request_tx, request_rx) = watch::channel(None);
     let subscribe_count = Arc::new(AtomicUsize::new(0));
     let cp = StaticMeshControlPlane {
@@ -353,14 +368,38 @@ struct MeshGatewaySpawnOptions<'a> {
 }
 
 fn spawn_mesh_gateway(temp: &TempDir, options: MeshGatewaySpawnOptions<'_>) -> Child {
+    let mut cmd = Command::new(binary_path());
+    configure_mesh_gateway_command(&mut cmd, temp, options);
+    cmd.spawn().expect("spawn mesh gateway")
+}
+
+fn spawn_mesh_gateway_in_netns(
+    temp: &TempDir,
+    options: MeshGatewaySpawnOptions<'_>,
+    netns_pid: u32,
+) -> Child {
+    let mut cmd = Command::new("nsenter");
+    cmd.arg(format!("--net=/proc/{netns_pid}/ns/net"))
+        .arg("--")
+        .arg("setpriv")
+        .args(["--reuid=1337", "--regid=1337", "--clear-groups", "--"])
+        .arg(binary_path());
+    configure_mesh_gateway_command(&mut cmd, temp, options);
+    cmd.spawn().expect("spawn mesh gateway inside pod netns")
+}
+
+fn configure_mesh_gateway_command(
+    cmd: &mut Command,
+    temp: &TempDir,
+    options: MeshGatewaySpawnOptions<'_>,
+) {
     let stdout =
         std::fs::File::create(temp.path().join("mesh.stdout.log")).expect("create stdout capture");
     let stderr =
         std::fs::File::create(temp.path().join("mesh.stderr.log")).expect("create stderr capture");
     std::fs::create_dir_all(temp.path().join("node-waypoint-pods"))
         .expect("create node-waypoint pod registry dir");
-    let mut cmd = Command::new(binary_path());
-    scrub_ferrum_env(&mut cmd);
+    scrub_ferrum_env(cmd);
     cmd.args(["run"])
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
@@ -416,7 +455,6 @@ fn spawn_mesh_gateway(temp: &TempDir, options: MeshGatewaySpawnOptions<'_>) -> C
     for (key, value) in options.env_overrides {
         cmd.env(key, value);
     }
-    cmd.spawn().expect("spawn mesh gateway")
 }
 
 fn kill_child(child: &mut Child) {
@@ -6590,8 +6628,8 @@ async fn functional_mesh_ambient_ws_egress_rejects_untrusted_client_gateway() {
 // datagram in -> local UDP echo backend -> framed datagram back. The source
 // side TPROXY capture is NOT needed (the client synthesizes the `udp` CONNECT),
 // so these run without root/netns. The full source-capture e2e (TPROXY ->
-// tunnel -> unframe -> app -> return-source-spoofing) still needs a live
-// netns/root env and is tracked separately as the remaining UDP gap.
+// tunnel -> unframe -> app -> return-source-spoofing) is covered by the
+// Linux/root-gated `functional_mesh_live_source_capture_*` tests below.
 
 /// Test-only server-cert verifier that accepts any certificate. The functional
 /// gateway SVIDs carry only a SPIFFE URI SAN (no IP/DNS SAN), so a standard
@@ -7034,4 +7072,1148 @@ async fn functional_mesh_udp_dest_untrusted_peer_fails_closed() {
             );
         }
     }
+}
+
+// ===================================================================
+// Live source-capture e2e — root + Linux netns only (#2038)
+// ===================================================================
+
+#[cfg(target_os = "linux")]
+fn live_source_capture_tests_required() -> bool {
+    std::env::var("FERRUM_LIVE_TESTS_REQUIRED")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn skip_or_fail_live_source_capture(reason: &str) {
+    if live_source_capture_tests_required() {
+        panic!("required live source-capture test prerequisite missing: {reason}");
+    }
+    eprintln!("SKIP: {reason}");
+}
+
+#[cfg(target_os = "linux")]
+fn live_source_capture_prerequisites() -> bool {
+    // Safety: `geteuid` is always sound and never fails.
+    if unsafe { libc::geteuid() } != 0 {
+        skip_or_fail_live_source_capture("not root; cannot create/enter network namespaces");
+        return false;
+    }
+    for binary in [
+        "unshare",
+        "nsenter",
+        "setpriv",
+        "sh",
+        "ip",
+        "iptables",
+        "iptables-save",
+    ] {
+        let present = Command::new("sh")
+            .args(["-c", &format!("command -v {binary} >/dev/null 2>&1")])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !present {
+            skip_or_fail_live_source_capture(&format!("`{binary}` is unavailable"));
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(target_os = "linux")]
+struct LiveGatewayChild(Option<Child>);
+
+#[cfg(target_os = "linux")]
+impl LiveGatewayChild {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            kill_child(&mut child);
+        }
+    }
+
+    fn poll_status(&mut self) -> String {
+        match self.0.as_mut().map(Child::try_wait) {
+            Some(Ok(Some(status))) => format!("exited with {status}"),
+            Some(Ok(None)) => "still running".to_string(),
+            Some(Err(error)) => format!("status check failed: {error}"),
+            None => "already stopped".to_string(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LiveGatewayChild {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// A pod-shaped network namespace plus a synthetic cgroup directory. Production
+/// cgroup resolution only needs `cgroup.procs`, so this lets the real manager and
+/// backend resolve `/proc/<pid>/ns/net` without mutating the runner's cgroup tree.
+#[cfg(target_os = "linux")]
+struct LivePodNetns {
+    child: Child,
+    cgroup_dir: TempDir,
+}
+
+#[cfg(target_os = "linux")]
+impl LivePodNetns {
+    fn spawn(default_via_loopback: bool) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+
+        let route = if default_via_loopback {
+            "ip route add default dev lo || exit 98;"
+        } else {
+            ""
+        };
+        let script = format!(
+            "set -e; command -v ip >/dev/null 2>&1 || exit 97; \
+             ip link set lo up || exit 98; {route} exec sleep 300"
+        );
+        let mut child = Command::new("unshare")
+            .args(["--net", "sh", "-c", &script])
+            .spawn()
+            .map_err(|error| format!("spawn unshare netns child: {error}"))?;
+
+        let host_netns_inode = match std::fs::metadata("/proc/self/ns/net") {
+            Ok(metadata) => metadata.ino(),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("read host netns identity: {error}"));
+            }
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let _ = child.wait();
+                    return Err(format!(
+                        "netns child exited during setup with code {:?}",
+                        status.code()
+                    ));
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("poll netns child: {error}"));
+                }
+                Ok(None) => {
+                    let child_netns_inode =
+                        std::fs::metadata(format!("/proc/{}/ns/net", child.id()))
+                            .map(|metadata| metadata.ino())
+                            .ok();
+                    if child_netns_inode.is_some_and(|inode| inode != host_netns_inode) {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err("netns child did not unshare within 3s".to_string());
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+
+        // Give the child shell a bounded moment to finish loopback/default-route
+        // setup after `unshare(2)` changed the namespace identity.
+        std::thread::sleep(Duration::from_millis(100));
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = child.wait();
+                return Err(format!(
+                    "netns child exited after unshare with code {:?}",
+                    status.code()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("poll configured netns child: {error}"));
+            }
+            Ok(None) => {}
+        }
+
+        let cgroup_dir = match TempDir::new() {
+            Ok(dir) => dir,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("temp cgroup dir: {error}"));
+            }
+        };
+        if let Err(error) = std::fs::write(
+            cgroup_dir.path().join("cgroup.procs"),
+            format!("{}\n", child.id()),
+        ) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("write synthetic cgroup.procs: {error}"));
+        }
+        Ok(Self { child, cgroup_dir })
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn publish(&self, registry_dir: &std::path::Path, pod_uid: &str) -> Result<PathBuf, String> {
+        std::fs::create_dir_all(registry_dir)
+            .map_err(|error| format!("create pod registry: {error}"))?;
+        let path = registry_dir.join(pod_uid);
+        std::fs::write(&path, format!("{}\n", self.cgroup_dir.path().display()))
+            .map_err(|error| format!("publish pod registry entry: {error}"))?;
+        Ok(path)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LivePodNetns {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_in_live_netns<T, F>(pid: u32, operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    use std::os::fd::AsRawFd;
+
+    std::thread::spawn(move || {
+        let netns = std::fs::File::open(format!("/proc/{pid}/ns/net"))
+            .map_err(|error| format!("open pod netns: {error}"))?;
+        // Safety: `netns` is an open network-namespace handle owned by this
+        // throwaway thread; the thread exits without returning to the runtime.
+        if unsafe { libc::setns(netns.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+            return Err(format!("setns: {}", std::io::Error::last_os_error()));
+        }
+        operation()
+    })
+    .join()
+    .map_err(|_| "pod-netns operation thread panicked".to_string())?
+}
+
+#[cfg(target_os = "linux")]
+fn netns_command(pid: u32, script: &str) -> Result<String, String> {
+    let output = Command::new("nsenter")
+        .arg(format!("--net=/proc/{pid}/ns/net"))
+        .args(["--", "sh", "-c", script])
+        .output()
+        .map_err(|error| format!("run netns command: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "netns command failed ({:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct UdpCaptureSnapshot {
+    output_jumps: usize,
+    reinject_jumps: usize,
+    outbound_jumps: usize,
+    route_rules: usize,
+    listeners: usize,
+    ferrum_rule_lines: usize,
+}
+
+#[cfg(target_os = "linux")]
+fn udp_capture_snapshot(pid: u32, capture_port: u16) -> Result<UdpCaptureSnapshot, String> {
+    let rules = netns_command(pid, "iptables-save -t mangle")?;
+    let route_rules = netns_command(pid, "ip rule show")?
+        .lines()
+        .filter(|line| line.contains("lookup 33133"))
+        .count();
+    let port_suffix = format!(":{:04X}", capture_port);
+    // Read procfs from a single-threaded process whose own network namespace is
+    // the pod's. An in-process `setns` only switches the calling test thread,
+    // while `/proc/self/net` may still resolve through the multithreaded test
+    // process and report the host namespace instead.
+    let listener_tables = netns_command(pid, "cat /proc/net/udp /proc/net/udp6")?;
+    let listeners = listener_tables
+        .lines()
+        .filter(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .is_some_and(|local| local.ends_with(&port_suffix))
+        })
+        .count();
+    Ok(UdpCaptureSnapshot {
+        output_jumps: rules
+            .lines()
+            .filter(|line| {
+                line.starts_with("-A OUTPUT ") && line.contains("FERRUM_MESH_UDP_OUTPUT_MARK")
+            })
+            .count(),
+        reinject_jumps: rules
+            .lines()
+            .filter(|line| {
+                line.starts_with("-A PREROUTING ") && line.contains("FERRUM_MESH_UDP_REINJECT")
+            })
+            .count(),
+        outbound_jumps: rules
+            .lines()
+            .filter(|line| {
+                line.starts_with("-A PREROUTING ") && line.contains("FERRUM_MESH_UDP_OUTBOUND")
+            })
+            .count(),
+        route_rules,
+        listeners,
+        ferrum_rule_lines: rules
+            .lines()
+            .filter(|line| {
+                line.contains("FERRUM_MESH_UDP") || line.contains("FERRUM_UDP_FAIL_CLOSED")
+            })
+            .count(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_udp_capture_snapshot(
+    pid: u32,
+    capture_port: u16,
+    active: bool,
+    timeout: Duration,
+) -> Result<UdpCaptureSnapshot, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let observation = match udp_capture_snapshot(pid, capture_port) {
+            Ok(snapshot) => {
+                let ready = if active {
+                    snapshot.output_jumps == 1
+                        && snapshot.reinject_jumps == 1
+                        && snapshot.outbound_jumps == 1
+                        && snapshot.route_rules == 1
+                        && snapshot.listeners == 1
+                } else {
+                    snapshot.ferrum_rule_lines == 0
+                        && snapshot.route_rules == 0
+                        && snapshot.listeners == 0
+                };
+                if ready {
+                    return Ok(snapshot);
+                }
+                format!("{snapshot:?}")
+            }
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "UDP capture state did not become {} within {timeout:?}; last={}",
+                if active { "active" } else { "absent" },
+                observation
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn udp_round_trip_from_netns(
+    pid: u32,
+    destination: SocketAddr,
+    payload: &'static [u8],
+    timeout: Duration,
+) -> Result<(Vec<u8>, SocketAddr), String> {
+    run_in_live_netns(pid, move || {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind pod UDP client: {error}"))?;
+        socket
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| format!("set UDP client timeout: {error}"))?;
+        socket
+            .send_to(payload, destination)
+            .map_err(|error| format!("send UDP to {destination}: {error}"))?;
+        let mut buf = [0u8; 2048];
+        let (n, source) = socket
+            .recv_from(&mut buf)
+            .map_err(|error| format!("receive UDP reply: {error}"))?;
+        Ok((buf[..n].to_vec(), source))
+    })
+}
+
+#[cfg(target_os = "linux")]
+async fn start_counting_udp_echo() -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind live source-capture UDP echo");
+    let port = socket.local_addr().expect("UDP echo address").port();
+    let received = Arc::new(AtomicUsize::new(0));
+    let received_task = received.clone();
+    let task = tokio::spawn(async move {
+        let mut buf = [0u8; 65535];
+        loop {
+            let Ok((n, peer)) = socket.recv_from(&mut buf).await else {
+                return;
+            };
+            received_task.fetch_add(1, Ordering::Relaxed);
+            if socket.send_to(&buf[..n], peer).await.is_err() {
+                return;
+            }
+        }
+    });
+    (port, received, task)
+}
+
+#[cfg(target_os = "linux")]
+fn live_source_capture_slice(
+    node_id: &str,
+    b_spiffe: &str,
+    workload_address: &str,
+    cluster_ip: &str,
+    service_port: u16,
+    protocol: AppProtocol,
+) -> MeshSlice {
+    let b_id = SpiffeId::new(b_spiffe).expect("live source-capture B SPIFFE id");
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        workloads: vec![Workload {
+            spiffe_id: b_id.clone(),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "source-capture-echo".to_string())]),
+                namespace: Some("ferrum".to_string()),
+            },
+            service_name: "source-capture-echo".to_string(),
+            addresses: vec![workload_address.to_string()],
+            ports: vec![WorkloadPort {
+                port: service_port,
+                protocol,
+                name: Some("live-source-capture".to_string()),
+            }],
+            trust_domain: TrustDomain::new("cluster.local").expect("live trust domain"),
+            namespace: "ferrum".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("source-capture-echo".to_string()),
+            pod_uid: None,
+            node_waypoint: None,
+            remote_provenance: false,
+        }],
+        services: vec![MeshService {
+            cluster_ips: vec![cluster_ip.to_string()],
+            name: "source-capture-echo".to_string(),
+            namespace: "ferrum".to_string(),
+            ports: vec![ServicePort {
+                port: service_port,
+                protocol,
+                name: Some("live-source-capture".to_string()),
+                target_port: None,
+            }],
+            workloads: vec![WorkloadRef { spiffe_id: b_id }],
+            protocol_overrides: HashMap::new(),
+        }],
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-strict".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::new(),
+        }],
+        ..MeshSlice::default()
+    }
+}
+
+/// The status-2 regression diagnostic below keys on this literal, which the Ambient UDP
+/// producer emits from `IptablesPlan::udp_fail_closed_script` (see
+/// `src/capture/mod.rs`, the `-C OUTPUT` guard-inspect branch). It is a shared
+/// substring of the runtime line `<binary> could not inspect active UDP
+/// fail-closed guard (status <N>)`, so it matches regardless of the iptables
+/// backend's actual `<binary>`/status. If the source message ever drifts, the
+/// diagnostic would stop identifying the regression clearly — so
+/// `udp_fail_closed_guard_probe_literal_matches_source` below
+/// reconstructs the guard script via the same pub constructor and fails loudly
+/// the moment this literal no longer appears in it.
+#[cfg(target_os = "linux")]
+const UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL: &str =
+    "could not inspect active UDP fail-closed guard (status ";
+
+/// Drift guard for `UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL`. Builds the fail-closed
+/// UDP guard script from the exact pub constructor the producer runs and asserts
+/// the diagnostic literal is still present, so a source-side wording change
+/// breaks this fast unit-style check instead of the root-only live lane.
+#[cfg(target_os = "linux")]
+#[test]
+fn udp_fail_closed_guard_probe_literal_matches_source() {
+    let mut config = ferrum_edge::capture::CaptureConfig::explicit(15006, 15001);
+    config.mode = ferrum_edge::capture::CaptureMode::Iptables;
+    config.udp_capture_enabled = true;
+    config.ip6tables_mode = ferrum_edge::capture::Ip6TablesMode::Disabled;
+    let script = ferrum_edge::capture::IptablesPlan::udp_fail_closed_script(&config);
+    assert!(
+        !script.is_empty(),
+        "UDP fail-closed guard script must be non-empty for a UDP-capture config"
+    );
+    assert!(
+        script.contains(UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL),
+        "the UDP fail-closed guard-inspect literal drifted in src/capture/mod.rs; update \
+         UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL and the live regression diagnostic together.\n--- script ---\n{script}"
+    );
+}
+
+/// Full Ambient producer path: the real `NetnsUdpCaptureManager` resolves a
+/// synthetic cgroup, the real backend installs production UDP-only TPROXY rules
+/// and binds capture/reply sockets inside the pod netns, and the captured flow
+/// traverses gateway A's HBONE datagram tunnel plus gateway B's real destination
+/// relay before returning from the original VIP:port.
+#[cfg(target_os = "linux")]
+#[ignore = "requires root + netns + iptables/TPROXY + iproute2"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
+    if !live_source_capture_prerequisites() {
+        return;
+    }
+    ensure_gateway_built().expect("build gateway for live UDP source-capture test");
+
+    const VIP: &str = "192.0.2.40";
+    const UNROUTABLE_VIP: &str = "192.0.2.41";
+    const POD_UID: &str = "functional-udp-source-capture-pod";
+    let capture_port = ferrum_edge::capture::DEFAULT_UDP_OUTBOUND_PORT;
+    let pod = match LivePodNetns::spawn(true) {
+        Ok(pod) => pod,
+        Err(error) => {
+            skip_or_fail_live_source_capture(&format!("cannot create UDP pod netns: {error}"));
+            return;
+        }
+    };
+    let registry = TempDir::new().expect("UDP pod registry tempdir");
+    let registry_entry = pod
+        .publish(registry.path(), POD_UID)
+        .expect("publish UDP pod registry entry");
+
+    let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client-app";
+    let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/udp-echo";
+    let temp_a_disabled = TempDir::new().expect("disabled gateway A tempdir");
+    let temp_a = TempDir::new().expect("gateway A tempdir");
+    let temp_b = TempDir::new().expect("gateway B tempdir");
+    let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, b_spiffe);
+    let (echo_port, echo_received, echo_task) = start_counting_udp_echo().await;
+    let node_a = "functional-live-udp-source-a";
+    let node_b = "functional-live-udp-source-b";
+    let cp_a = start_static_mesh_cp(live_source_capture_slice(
+        node_a,
+        b_spiffe,
+        "127.0.0.1",
+        VIP,
+        echo_port,
+        AppProtocol::Udp,
+    ))
+    .await;
+    let cp_b = start_static_mesh_cp(live_source_capture_slice(
+        node_b,
+        b_spiffe,
+        "127.0.0.1",
+        VIP,
+        echo_port,
+        AppProtocol::Udp,
+    ))
+    .await;
+
+    let ports_b = reserve_mesh_ports().await;
+    let b_hbone_port = ports_b.hbone;
+    let mut gateway_b = LiveGatewayChild::new(spawn_mesh_gateway(
+        &temp_b,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp_b.addr,
+            ports: ports_b,
+            node_id: node_b,
+            config_protocol: "native",
+            topology: "ambient",
+            waypoint_name: None,
+            env_overrides: vec![
+                ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                ("FERRUM_LOG_LEVEL", "debug".to_string()),
+                ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
+                ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
+                ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
+                (
+                    "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                    svids.b.trust_bundle_path.clone(),
+                ),
+            ],
+        },
+    ));
+    assert!(
+        wait_for_tcp_port(b_hbone_port, STARTUP_TIMEOUT).await,
+        "UDP destination HBONE listener did not bind\n{}",
+        captured_output(&temp_b)
+    );
+
+    // Disabled-mode negative: the same enrolled pod produces no rules and no
+    // capture socket. The cleanup manager is allowed to run, but it must never
+    // install state while the feature flag is off.
+    let ports_disabled = reserve_mesh_ports().await;
+    let disabled_outbound = ports_disabled.outbound;
+    let mut disabled_a = LiveGatewayChild::new(spawn_mesh_gateway(
+        &temp_a_disabled,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp_a.addr,
+            ports: ports_disabled,
+            node_id: node_a,
+            config_protocol: "native",
+            topology: "ambient",
+            waypoint_name: None,
+            env_overrides: vec![
+                ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", a_spiffe.to_string()),
+                ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.a.cert_path.clone()),
+                ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.a.key_path.clone()),
+                (
+                    "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                    svids.a.trust_bundle_path.clone(),
+                ),
+                (
+                    "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR",
+                    registry.path().display().to_string(),
+                ),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "false".to_string()),
+                ("FERRUM_MESH_IP6TABLES_ENABLED", "false".to_string()),
+            ],
+        },
+    ));
+    assert!(
+        wait_for_tcp_port(disabled_outbound, STARTUP_TIMEOUT).await,
+        "UDP-disabled gateway A did not start\n{}",
+        captured_output(&temp_a_disabled)
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    wait_for_udp_capture_snapshot(pod.pid(), capture_port, false, Duration::from_secs(6))
+        .expect("capture-disabled pod must have no UDP rules/listener");
+    disabled_a.stop();
+
+    // #2085 fixed fresh-netns installation by checking generation-A chain
+    // existence before probing the OUTPUT jump. The live gate below therefore
+    // treats every installation timeout, including the old status-2 signature,
+    // as a real regression.
+    let ports_a = reserve_mesh_ports().await;
+    let a_outbound = ports_a.outbound;
+    let mut gateway_a = LiveGatewayChild::new(spawn_mesh_gateway(
+        &temp_a,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp_a.addr,
+            ports: ports_a,
+            node_id: node_a,
+            config_protocol: "native",
+            topology: "ambient",
+            waypoint_name: None,
+            env_overrides: vec![
+                ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                ("FERRUM_LOG_LEVEL", "debug".to_string()),
+                ("FERRUM_POOL_WARMUP_ENABLED", "true".to_string()),
+                ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", a_spiffe.to_string()),
+                ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.a.cert_path.clone()),
+                ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.a.key_path.clone()),
+                (
+                    "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                    svids.a.trust_bundle_path.clone(),
+                ),
+                (
+                    "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR",
+                    registry.path().display().to_string(),
+                ),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true".to_string()),
+                ("FERRUM_MESH_CAPTURE_UDP_PORT", capture_port.to_string()),
+                ("FERRUM_MESH_IP6TABLES_ENABLED", "false".to_string()),
+                ("FERRUM_MESH_EGRESS_HBONE_PORT", b_hbone_port.to_string()),
+            ],
+        },
+    ));
+    assert!(
+        wait_for_tcp_port(a_outbound, STARTUP_TIMEOUT).await,
+        "UDP source gateway A did not start\n{}",
+        captured_output(&temp_a)
+    );
+    if let Err(error) =
+        wait_for_udp_capture_snapshot(pod.pid(), capture_port, true, Duration::from_secs(20))
+    {
+        let status = gateway_a.poll_status();
+        let gateway_a_output = captured_output(&temp_a);
+        // #2085 made first-install detection portable by checking chain existence
+        // before probing the OUTPUT jump. A status-2 guard-inspection error is now
+        // a genuine xtables/runtime regression and must fail the required live lane.
+        let status_2_regression = gateway_a_output.contains(UDP_FAIL_CLOSED_GUARD_PROBE_LITERAL)
+            && gateway_a_output.contains("guard (status 2)");
+        panic!(
+            "real manager/backend must install one UDP producer: {error}; gateway A {status}; \
+             status-2 guard regression after #2085 fix: {status_2_regression}\n{gateway_a_output}"
+        );
+    }
+
+    // Let at least two additional 2s reconcile passes run, then prove neither
+    // the manager nor the idempotent scripts duplicated listeners/rules/routes.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let reconciled = udp_capture_snapshot(pod.pid(), capture_port)
+        .expect("inspect reconciled UDP producer state");
+    assert_eq!(
+        reconciled.output_jumps, 1,
+        "duplicate OUTPUT jump: {reconciled:?}"
+    );
+    assert_eq!(
+        reconciled.reinject_jumps, 1,
+        "duplicate reinject jump: {reconciled:?}"
+    );
+    assert_eq!(
+        reconciled.outbound_jumps, 1,
+        "duplicate outbound jump: {reconciled:?}"
+    );
+    assert_eq!(
+        reconciled.route_rules, 1,
+        "duplicate fwmark rule: {reconciled:?}"
+    );
+    assert_eq!(
+        reconciled.listeners, 1,
+        "duplicate UDP listener: {reconciled:?}"
+    );
+
+    let destination: SocketAddr = format!("{VIP}:{echo_port}").parse().expect("UDP VIP");
+    let deadline = Instant::now() + Duration::from_secs(18);
+    let (reply, source) = loop {
+        match udp_round_trip_from_netns(
+            pod.pid(),
+            destination,
+            b"udp-source-capture-live",
+            Duration::from_secs(3),
+        ) {
+            Ok(result) => break result,
+            Err(error) if Instant::now() < deadline => {
+                eprintln!("UDP source-capture retry while HBONE capability converges: {error}");
+            }
+            Err(error) => panic!(
+                "full UDP source-capture round trip timed out: {error}\n--- gateway A ---\n{}\n--- gateway B ---\n{}",
+                captured_output(&temp_a),
+                captured_output(&temp_b)
+            ),
+        }
+    };
+    assert_eq!(reply, b"udp-source-capture-live");
+    assert_eq!(
+        source, destination,
+        "the pod client must see the reply sourced from its original VIP:port"
+    );
+
+    // Strict route negative: a second TEST-NET VIP is still TPROXY-captured, but
+    // it is absent from `mesh_udp_egress`, so no tunnel/backend traffic occurs.
+    let received_before = echo_received.load(Ordering::Relaxed);
+    let unroutable: SocketAddr = format!("{UNROUTABLE_VIP}:{echo_port}")
+        .parse()
+        .expect("unroutable UDP VIP");
+    assert!(
+        udp_round_trip_from_netns(
+            pod.pid(),
+            unroutable,
+            b"must-fail-closed",
+            Duration::from_secs(2),
+        )
+        .is_err(),
+        "a UDP destination absent from the route table must fail closed"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        echo_received.load(Ordering::Relaxed),
+        received_before,
+        "unroutable UDP must not reach the destination echo"
+    );
+
+    // Pod deletion: removing the registry entry must close the socket and remove
+    // every producer-owned rule/route. The bounded poll prevents a stuck cleanup
+    // from hanging the live job indefinitely.
+    std::fs::remove_file(&registry_entry).expect("delete UDP pod registry entry");
+    wait_for_udp_capture_snapshot(pod.pid(), capture_port, false, Duration::from_secs(12))
+        .expect("pod deletion must remove UDP rules/listener");
+
+    // Closing A ends the CONNECT stream. B's relay-completion log is emitted
+    // only by `handle_hbone_udp_request` after it accepted the UDP-marked HBONE
+    // CONNECT and relayed the framed datagrams, so this proves the round trip did
+    // not pass through a direct/plaintext dial from A to the loopback echo.
+    gateway_a.stop();
+    assert!(
+        wait_for_captured_output(
+            &temp_b,
+            "HBONE UDP tunnel relay completed",
+            Duration::from_secs(5),
+        )
+        .await,
+        "gateway B did not confirm the UDP HBONE relay\n{}",
+        captured_output(&temp_b)
+    );
+    gateway_b.stop();
+    cp_a.shutdown().await;
+    cp_b.shutdown().await;
+    echo_task.abort();
+}
+
+#[cfg(target_os = "linux")]
+struct LiveVethPod {
+    pod: LivePodNetns,
+    host_if: String,
+    host_ip: std::net::Ipv4Addr,
+}
+
+#[cfg(target_os = "linux")]
+impl LiveVethPod {
+    fn spawn() -> Result<Self, String> {
+        let pod = LivePodNetns::spawn(false)?;
+        let suffix = format!("{:x}", std::process::id());
+        let host_if = format!("fh{}", &suffix[suffix.len().saturating_sub(8)..]);
+        let pod_if = format!("fp{}", &suffix[suffix.len().saturating_sub(8)..]);
+        let host_ip = std::net::Ipv4Addr::new(10, 203, 8, 1);
+        let pod_ip = std::net::Ipv4Addr::new(10, 203, 8, 2);
+        let _ = Command::new("ip").args(["link", "del", &host_if]).status();
+        let setup = Command::new("ip")
+            .args([
+                "link", "add", &host_if, "type", "veth", "peer", "name", &pod_if,
+            ])
+            .status()
+            .map_err(|error| format!("create veth: {error}"))?;
+        if !setup.success() {
+            return Err(format!("create veth failed with {setup}"));
+        }
+        let move_peer = Command::new("ip")
+            .args(["link", "set", &pod_if, "netns", &pod.pid().to_string()])
+            .status()
+            .map_err(|error| format!("move veth peer: {error}"))?;
+        if !move_peer.success() {
+            let _ = Command::new("ip").args(["link", "del", &host_if]).status();
+            return Err(format!("move veth peer failed with {move_peer}"));
+        }
+        for args in [
+            vec!["addr", "add", "10.203.8.1/30", "dev", host_if.as_str()],
+            vec!["link", "set", host_if.as_str(), "up"],
+        ] {
+            let status = Command::new("ip")
+                .args(args.iter().copied())
+                .status()
+                .map_err(|error| format!("configure host veth: {error}"))?;
+            if !status.success() {
+                let _ = Command::new("ip").args(["link", "del", &host_if]).status();
+                return Err(format!("host veth command {args:?} failed with {status}"));
+            }
+        }
+        if let Err(error) = netns_command(
+            pod.pid(),
+            &format!(
+                "set -e; ip addr add {pod_ip}/30 dev {pod_if}; \
+                 ip link set {pod_if} up; ip route add default via {host_ip} dev {pod_if}"
+            ),
+        ) {
+            let _ = Command::new("ip").args(["link", "del", &host_if]).status();
+            return Err(error);
+        }
+        Ok(Self {
+            pod,
+            host_if,
+            host_ip,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LiveVethPod {
+    fn drop(&mut self) {
+        let _ = Command::new("ip")
+            .args(["link", "del", &self.host_if])
+            .status();
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn start_tcp_echo_all_interfaces() -> (u16, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("0.0.0.0:0")
+        .await
+        .expect("bind live TCP echo");
+    let port = listener.local_addr().expect("TCP echo address").port();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let Ok(n) = stream.read(&mut buf).await else {
+                    return;
+                };
+                let _ = stream.write_all(&buf[..n]).await;
+            });
+        }
+    });
+    (port, task)
+}
+
+#[cfg(target_os = "linux")]
+fn make_source_svids_readable_by_sidecar(temp: &TempDir, svids: &TwoGatewaySvids) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("make SVID tempdir traversable");
+    for path in [
+        &svids.a.cert_path,
+        &svids.a.key_path,
+        &svids.a.trust_bundle_path,
+    ] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+            .expect("make source SVID fixture readable by uid 1337");
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_tcp_port_in_netns(pid: u32, port: u16, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let connected = run_in_live_netns(pid, move || {
+            Ok(std::net::TcpStream::connect_timeout(
+                &SocketAddr::from(([127, 0, 0, 1], port)),
+                Duration::from_millis(200),
+            )
+            .is_ok())
+        })
+        .unwrap_or(false);
+        if connected {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_captured_output(temp: &TempDir, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if captured_output(temp).contains(needle) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn tcp_round_trip_from_netns(
+    pid: u32,
+    destination: SocketAddr,
+    payload: &'static [u8],
+) -> Result<(Vec<u8>, SocketAddr), String> {
+    use std::io::{Read, Write};
+
+    run_in_live_netns(pid, move || {
+        let mut stream = std::net::TcpStream::connect_timeout(&destination, Duration::from_secs(5))
+            .map_err(|error| format!("connect TCP VIP {destination}: {error}"))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|error| format!("set TCP read timeout: {error}"))?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .map_err(|error| format!("set TCP write timeout: {error}"))?;
+        stream
+            .write_all(payload)
+            .map_err(|error| format!("write TCP payload: {error}"))?;
+        let mut reply = vec![0u8; payload.len()];
+        stream
+            .read_exact(&mut reply)
+            .map_err(|error| format!("read TCP echo: {error}"))?;
+        let peer = stream
+            .peer_addr()
+            .map_err(|error| format!("read TCP peer address: {error}"))?;
+        Ok((reply, peer))
+    })
+}
+
+/// Raw-TCP counterpart to the UDP live gate: production iptables REDIRECT rules
+/// capture a client in a fresh pod netns, `SO_ORIGINAL_DST` selects the strict
+/// VIP:port route, and a real Sidecar source opens the mesh-mTLS CONNECT tunnel
+/// to gateway B's destination relay and TCP echo.
+#[cfg(target_os = "linux")]
+#[ignore = "requires root + netns/veth + iptables REDIRECT"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_mesh_live_source_capture_raw_tcp_mtls_round_trip() {
+    if !live_source_capture_prerequisites() {
+        return;
+    }
+    ensure_gateway_built().expect("build gateway for live raw-TCP source-capture test");
+
+    const VIP: &str = "192.0.2.50";
+    let veth = match LiveVethPod::spawn() {
+        Ok(veth) => veth,
+        Err(error) => {
+            skip_or_fail_live_source_capture(&format!(
+                "cannot create raw-TCP pod netns/veth: {error}"
+            ));
+            return;
+        }
+    };
+    let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client-app";
+    let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/tcp-echo";
+    let temp_a = TempDir::new().expect("TCP gateway A tempdir");
+    let temp_b = TempDir::new().expect("TCP gateway B tempdir");
+    let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, b_spiffe);
+    make_source_svids_readable_by_sidecar(&temp_b, &svids);
+    let (echo_port, echo_task) = start_tcp_echo_all_interfaces().await;
+    let workload_address = veth.host_ip.to_string();
+    let node_a = "functional-live-tcp-source-a";
+    let node_b = "functional-live-tcp-source-b";
+    let cp_a = start_static_mesh_cp_on(
+        live_source_capture_slice(
+            node_a,
+            b_spiffe,
+            &workload_address,
+            VIP,
+            echo_port,
+            AppProtocol::Tcp,
+        ),
+        "0.0.0.0:0".parse().expect("wildcard CP bind"),
+        Some(std::net::IpAddr::V4(veth.host_ip)),
+    )
+    .await;
+    let cp_b = start_static_mesh_cp(live_source_capture_slice(
+        node_b,
+        b_spiffe,
+        &workload_address,
+        VIP,
+        echo_port,
+        AppProtocol::Tcp,
+    ))
+    .await;
+
+    let ports_b = reserve_mesh_ports().await;
+    let b_inbound = ports_b.inbound;
+    let mut gateway_b = LiveGatewayChild::new(spawn_mesh_gateway(
+        &temp_b,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp_b.addr,
+            ports: ports_b,
+            node_id: node_b,
+            config_protocol: "native",
+            topology: "sidecar",
+            waypoint_name: None,
+            env_overrides: vec![
+                ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
+                ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
+                ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
+                (
+                    "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                    svids.b.trust_bundle_path.clone(),
+                ),
+                (
+                    "FERRUM_MESH_INBOUND_LISTEN_ADDR",
+                    format!("0.0.0.0:{b_inbound}"),
+                ),
+            ],
+        },
+    ));
+    assert!(
+        wait_for_tcp_port(b_inbound, STARTUP_TIMEOUT).await,
+        "raw-TCP destination mesh-mTLS listener did not bind\n{}",
+        captured_output(&temp_b)
+    );
+
+    let ports_a = reserve_mesh_ports().await;
+    let a_inbound = ports_a.inbound;
+    let a_outbound = ports_a.outbound;
+    let mut gateway_a = LiveGatewayChild::new(spawn_mesh_gateway_in_netns(
+        &temp_a,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp_a.addr,
+            ports: ports_a,
+            node_id: node_a,
+            config_protocol: "native",
+            topology: "sidecar",
+            waypoint_name: None,
+            env_overrides: vec![
+                ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                ("FERRUM_LOG_LEVEL", "debug".to_string()),
+                ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", a_spiffe.to_string()),
+                ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.a.cert_path.clone()),
+                ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.a.key_path.clone()),
+                (
+                    "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                    svids.a.trust_bundle_path.clone(),
+                ),
+                ("FERRUM_MESH_CAPTURE_MODE", "iptables".to_string()),
+                ("FERRUM_MESH_PROXY_UID", "1337".to_string()),
+                ("FERRUM_MESH_EGRESS_MTLS_PORT", b_inbound.to_string()),
+            ],
+        },
+        veth.pod.pid(),
+    ));
+    assert!(
+        wait_for_tcp_port_in_netns(veth.pod.pid(), a_outbound, STARTUP_TIMEOUT).await,
+        "raw-TCP source Sidecar listener did not bind inside the pod netns\n{}",
+        captured_output(&temp_a)
+    );
+
+    let mut capture_config = ferrum_edge::capture::CaptureConfig::explicit(a_inbound, a_outbound);
+    capture_config.mode = ferrum_edge::capture::CaptureMode::Iptables;
+    capture_config.proxy_uid = Some(1337);
+    capture_config.ip6tables_mode = ferrum_edge::capture::Ip6TablesMode::Disabled;
+    let setup_script = ferrum_edge::capture::IptablesPlan::for_config(&capture_config).script();
+    netns_command(veth.pod.pid(), &setup_script).expect("install production TCP REDIRECT rules");
+
+    // Gateway A runs as uid 1337 inside the pod netns. Deny that uid direct
+    // access to the echo port while leaving B's mesh-mTLS listener reachable.
+    // A plaintext/direct-target regression therefore cannot reach the backend;
+    // the round trip can succeed only through B's CONNECT relay (which runs in
+    // the host netns and dials the echo as the destination gateway).
+    netns_command(
+        veth.pod.pid(),
+        &format!(
+            "iptables -w 5 -t filter -I OUTPUT 1 -p tcp --dport {echo_port} \
+             -m owner --uid-owner 1337 -j REJECT"
+        ),
+    )
+    .expect("isolate raw-TCP echo from gateway A direct dials");
+
+    let destination: SocketAddr = format!("{VIP}:{echo_port}").parse().expect("TCP VIP");
+    let (reply, peer) = tcp_round_trip_from_netns(
+        veth.pod.pid(),
+        destination,
+        b"raw-tcp-source-capture-live",
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "full raw-TCP source-capture round trip failed: {error}\n--- gateway A ---\n{}\n--- gateway B ---\n{}",
+            captured_output(&temp_a),
+            captured_output(&temp_b)
+        )
+    });
+    assert_eq!(reply, b"raw-tcp-source-capture-live");
+    assert_eq!(
+        peer, destination,
+        "the REDIRECTed TCP client must retain the original VIP:port as its peer"
+    );
+
+    gateway_a.stop();
+    gateway_b.stop();
+    cp_a.shutdown().await;
+    cp_b.shutdown().await;
+    echo_task.abort();
 }

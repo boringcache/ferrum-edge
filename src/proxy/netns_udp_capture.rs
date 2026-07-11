@@ -653,8 +653,16 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             // node-agent's BPF gate before any guarded retry and republish only
             // after the producer reaches `Opened` below.
             if let Some(dir) = &self.ready_dir {
+                let mut readiness_retracted = true;
                 for uid in &pod_uids {
-                    let _ = remove_udp_ready_marker(dir, uid);
+                    readiness_retracted &= remove_udp_ready_marker(dir, uid);
+                }
+                if !readiness_retracted {
+                    warn!(
+                        netns_inode = netns,
+                        "Ambient UDP producer could not retract stale readiness; retrying before opening capture"
+                    );
+                    continue;
                 }
             }
             // Before installing fresh rules in this netns, await a prior
@@ -1889,7 +1897,7 @@ mod tests {
     }
 
     fn cleanup_manager(
-        source: Arc<StaticSource>,
+        source: Arc<dyn PodCaptureSource>,
         backend: MockBackend,
     ) -> NetnsUdpCleanupManager<MockBackend> {
         NetnsUdpCleanupManager::new(source, backend, Duration::from_secs(2))
