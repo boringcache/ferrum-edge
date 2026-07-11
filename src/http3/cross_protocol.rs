@@ -575,8 +575,10 @@ where
                         ctx,
                         reject,
                         has_response_committed_hook,
-                        backend_start,
-                        raw_prebuffered_body_bytes,
+                        RejectWriteAccounting {
+                            backend_start,
+                            bytes_sent: raw_prebuffered_body_bytes,
+                        },
                     )
                     .await;
                 }
@@ -3397,8 +3399,10 @@ where
                         headers: reject.headers,
                     },
                     has_response_committed_hook,
-                    backend_start,
-                    bytes_sent,
+                    RejectWriteAccounting {
+                        backend_start,
+                        bytes_sent,
+                    },
                 )
                 .await
                 {
@@ -5054,6 +5058,11 @@ where
 /// emitting the right wire format for the flavor: trailers-only gRPC for
 /// Grpc, HTTP + headers for Plain, 501 is never reached (WebSocket is
 /// rejected upstream).
+struct RejectWriteAccounting {
+    backend_start: Instant,
+    bytes_sent: u64,
+}
+
 async fn write_final_body_reject<S>(
     stream: &mut RequestStream<S, Bytes>,
     flavor: HttpFlavor,
@@ -5061,12 +5070,15 @@ async fn write_final_body_reject<S>(
     ctx: &mut RequestContext,
     reject: PluginResult,
     has_response_committed_hook: bool,
-    backend_start: Instant,
-    bytes_sent: u64,
+    accounting: RejectWriteAccounting,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    let RejectWriteAccounting {
+        backend_start,
+        bytes_sent,
+    } = accounting;
     let Some(parts) = crate::proxy::plugin_result_into_reject_parts(reject) else {
         warn!("final body reject helper received a non-reject plugin result");
         return if matches!(flavor, HttpFlavor::Grpc) {
