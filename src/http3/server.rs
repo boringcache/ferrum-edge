@@ -2037,6 +2037,7 @@ async fn handle_h3_request(
         ) {
             Ok(result) => result,
             Err(()) => {
+                let phase_start = std::time::Instant::now();
                 let mut reject_status = 503;
                 let mut reject_body =
                     br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#
@@ -2052,7 +2053,44 @@ async fn handle_h3_request(
                 .await;
                 let reject_status =
                     StatusCode::from_u16(reject_status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
-                record_request(&state, reject_status.as_u16());
+                let log_status_code = h3_reject_log_status_and_metadata(
+                    &mut ctx,
+                    http_flavor,
+                    reject_status,
+                    &reject_body,
+                    &rej_headers,
+                );
+                if capabilities
+                    .has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
+                {
+                    let normalized = crate::proxy::normalize_reject_response(
+                        reject_status,
+                        &reject_body,
+                        &rej_headers,
+                        matches!(http_flavor, HttpFlavor::Grpc),
+                    );
+                    for plugin in plugins.iter() {
+                        plugin
+                            .on_response_committed(
+                                &mut ctx,
+                                normalized.http_status.as_u16(),
+                                &normalized.headers,
+                                &normalized.body,
+                            )
+                            .await;
+                    }
+                }
+                plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                record_request(&state, log_status_code);
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    log_status_code,
+                    start_time,
+                    "circuit_breaker",
+                    plugin_execution_ns,
+                )
+                .await;
                 send_h3_reject_flavor_aware(
                     &mut stream,
                     http_flavor,

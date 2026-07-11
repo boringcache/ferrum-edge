@@ -180,6 +180,10 @@ struct AuditStaging {
     request_model: Option<String>,
     tool_names: Vec<String>,
     commit_permit: Option<BatchingLoggerPermit<AuditRecord>>,
+    /// True only after the response path confirms that this transaction is
+    /// actively streaming. A pre-commit reservation alone is not sufficient:
+    /// requests abandoned before stream selection must remain TTL-collectable.
+    stream_active: bool,
 }
 
 /// Response bytes captured by the streaming inspector, handed to
@@ -743,7 +747,8 @@ impl AiTranscriptAudit {
         let now = Instant::now();
         let ttl = self.staging_ttl;
         self.staging.retain(|_, staging| {
-            staging.commit_permit.is_some() || now.duration_since(staging.captured_at) < ttl
+            (staging.stream_active && staging.commit_permit.is_some())
+                || now.duration_since(staging.captured_at) < ttl
         });
     }
 
@@ -851,6 +856,7 @@ impl AiTranscriptAudit {
                 request_model,
                 tool_names,
                 commit_permit: None,
+                stream_active: false,
             },
         );
     }
@@ -1624,6 +1630,9 @@ impl Plugin for AiTranscriptAudit {
         // terminal hook or log fallback consumes it after the response ends.
         // Other streams still release any conservative buffered-response slot.
         if self.stream_commit_selected(ctx, response_status, content_type) {
+            if let Some(mut staging) = self.staging.get_mut(record_id) {
+                staging.stream_active = true;
+            }
             return;
         }
         if let Some(mut staging) = self.staging.get_mut(record_id) {
@@ -1705,6 +1714,12 @@ impl Plugin for AiTranscriptAudit {
         let Some((_, slot)) = self.pending_streams.remove(&record_id) else {
             return; // not a stream we teed
         };
+        // The response is no longer active. Normally this hook or the immediate
+        // log fallback consumes staging; clearing the marker also ensures an
+        // unexpectedly orphaned terminal record can be reclaimed after its TTL.
+        if let Some(mut staging) = self.staging.get_mut(&record_id) {
+            staging.stream_active = false;
+        }
         let downstream_terminated = slot.downstream_terminated.load(Ordering::Relaxed);
         let captured = slot.captured.lock().ok().and_then(|mut guard| guard.take());
         let sample_hit = self
