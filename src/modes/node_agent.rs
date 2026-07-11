@@ -956,12 +956,13 @@ async fn run_with_backend(
                 );
             }
             _ = udp_readiness_interval.tick(), if udp_readiness_reconcile_enabled(config) => {
-                reconcile_udp_capture_readiness(
+                reconcile_udp_capture_readiness_with_sync_state(
                     backend.as_mut(),
                     &pod_states,
                     config,
                     metrics.as_ref(),
                     &mut udp_ready_uids,
+                    startup_ready.load(Ordering::Acquire),
                 );
             }
         }
@@ -2797,13 +2798,20 @@ fn remove_udp_not_ready_ack(dir: &std::path::Path, pod_uid: &str) {
 fn reap_orphaned_udp_not_ready_acks(
     dir: &std::path::Path,
     pod_states: &DashMap<String, PodAttachmentState>,
+    initial_pod_sync_complete: bool,
 ) {
     // The proxy polls the registry every ~2s. Keep a much wider grace so a
     // freshly-published pod-removal ack cannot be reaped before the producer
     // observes the registry removal and consumes it.
     let minimum_age = std::time::Duration::from_secs(30);
     for marker_dir in [".udp-not-ready", ".udp-ack-required"] {
-        reap_orphaned_udp_handshake_markers_older_than(dir, marker_dir, pod_states, minimum_age);
+        reap_orphaned_udp_handshake_markers_older_than(
+            dir,
+            marker_dir,
+            pod_states,
+            initial_pod_sync_complete,
+            minimum_age,
+        );
     }
 }
 
@@ -2811,8 +2819,16 @@ fn reap_orphaned_udp_handshake_markers_older_than(
     dir: &std::path::Path,
     marker_dir: &str,
     pod_states: &DashMap<String, PodAttachmentState>,
+    initial_pod_sync_complete: bool,
     minimum_age: std::time::Duration,
 ) {
+    // Until the initial watcher relist completes, absence from `pod_states` is
+    // unknown rather than orphaned. Preserve both sides of the durable handoff
+    // so a restart cannot drop the producer guard before the node-agent has
+    // re-established authoritative pod state and emitted a fresh close ack.
+    if !initial_pod_sync_complete {
+        return;
+    }
     const MAX_REAP_PER_PASS: usize = 256;
     let ack_dir = dir.join(marker_dir);
     let entries = match std::fs::read_dir(&ack_dir) {
@@ -2888,12 +2904,13 @@ fn udp_readiness_reconcile_enabled(config: &NodeAgentConfig) -> bool {
 /// Open or close the host-veth enrollment guard from producer readiness
 /// markers. New pod map entries are always installed with `udp_ready=false`;
 /// only the producer's post-guard/post-bind marker can transition them open.
-fn reconcile_udp_capture_readiness(
+fn reconcile_udp_capture_readiness_with_sync_state(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
     config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
     ready_uids: &mut HashSet<String>,
+    initial_pod_sync_complete: bool,
 ) {
     if !config.capture_config.udp_capture_enabled {
         // Disabled is an intentional pass-through posture, but the stale-rule
@@ -2949,7 +2966,7 @@ fn reconcile_udp_capture_readiness(
             }
         }
         if let Some(dir) = &config.node_waypoint_pod_registry_dir {
-            reap_orphaned_udp_not_ready_acks(dir, pod_states);
+            reap_orphaned_udp_not_ready_acks(dir, pod_states, initial_pod_sync_complete);
         }
         clear_partial_capture_state_if_recovered(pod_states, metrics);
         return;
@@ -3033,9 +3050,22 @@ fn reconcile_udp_capture_readiness(
     // Bounded sweep of not-ready acks for pods that have fully left the node so
     // the `.udp-not-ready/` dir does not grow one inode per pod ever enrolled.
     if let Some(dir) = &config.node_waypoint_pod_registry_dir {
-        reap_orphaned_udp_not_ready_acks(dir, pod_states);
+        reap_orphaned_udp_not_ready_acks(dir, pod_states, initial_pod_sync_complete);
     }
     clear_partial_capture_state_if_recovered(pod_states, metrics);
+}
+
+#[cfg(test)]
+fn reconcile_udp_capture_readiness(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    ready_uids: &mut HashSet<String>,
+) {
+    reconcile_udp_capture_readiness_with_sync_state(
+        backend, pod_states, config, metrics, ready_uids, true,
+    );
 }
 
 fn handle_pod_added(
@@ -5809,6 +5839,28 @@ mod tests {
     }
 
     #[test]
+    fn unsynced_pod_preserves_udp_ack_requirement() {
+        let registry = tempfile::tempdir().unwrap();
+        let required_dir = registry.path().join(".udp-ack-required");
+        std::fs::create_dir_all(&required_dir).unwrap();
+        std::fs::write(required_dir.join("pod-unknown"), b"").unwrap();
+        let pod_states = DashMap::new();
+
+        reap_orphaned_udp_handshake_markers_older_than(
+            registry.path(),
+            ".udp-ack-required",
+            &pod_states,
+            false,
+            std::time::Duration::ZERO,
+        );
+
+        assert!(
+            required_dir.join("pod-unknown").exists(),
+            "an un-synced pod is uncertain, so its durable ack requirement must survive"
+        );
+    }
+
+    #[test]
     fn reconcile_reaps_orphaned_udp_not_ready_acks() {
         // A pod that enrolled and then left the node leaves a `.udp-not-ready/<uid>`
         // ack that no reconcile revisits; without reaping these accumulate one inode
@@ -5886,6 +5938,7 @@ mod tests {
             registry.path(),
             ".udp-not-ready",
             &pod_states,
+            true,
             std::time::Duration::ZERO,
         );
         assert!(
@@ -5900,6 +5953,7 @@ mod tests {
             registry.path(),
             ".udp-ack-required",
             &pod_states,
+            true,
             std::time::Duration::ZERO,
         );
         assert!(
