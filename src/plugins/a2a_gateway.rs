@@ -341,18 +341,12 @@ impl A2aSseStreamInspector {
             context_id: self.context_id.take(),
             task_state: self.task_state.take(),
         };
-        match self.observation.lock() {
-            Ok(mut slot) => {
-                if slot.is_none() {
-                    *slot = Some(observation);
-                }
-            }
-            Err(poisoned) => {
-                let mut slot = poisoned.into_inner();
-                if slot.is_none() {
-                    *slot = Some(observation);
-                }
-            }
+        let mut slot = self
+            .observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(observation);
         }
     }
 }
