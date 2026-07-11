@@ -3700,9 +3700,10 @@ fn validate_multi_cluster(
     // aware host-overlap semantics the selector uses. Two gateways on the SAME
     // network whose trust domains OVERLAP (a TD-less gateway is a wildcard that
     // overlaps every trust domain; two specific TDs overlap only when EQUAL) AND
-    // whose `sni_hosts` OVERLAP under `hosts_overlap` (so
-    // `*.default.svc.cluster.local` vs `reviews.default.svc.cluster.local` is
-    // caught, not only literal string equality) can BOTH route the same
+    // whose `sni_hosts` OVERLAP under east-west alias-aware host semantics (so
+    // `*.default.svc.cluster.local` vs `reviews.default.svc.cluster.local`, and
+    // `reviews.default.svc.cluster.local` vs `p9090.reviews.default.svc.cluster.local`,
+    // are caught, not only literal string equality) can BOTH route the same
     // destination FQDN, and `select_east_west_gateway_for_network` would silently
     // pick whichever is first. On a CLIENT data plane these are remote gateways
     // across networks, so a DIFFERENT network is never a collision; on an
@@ -3744,17 +3745,78 @@ fn validate_multi_cluster(
                 .iter()
                 .map(|sni| sni.to_ascii_lowercase())
                 .collect();
-            if crate::config::types::hosts_overlap(&earlier_snis, &later_snis) {
+            if east_west_sni_hosts_overlap(&earlier_snis, &later_snis) {
                 errors.push(format!(
                     "EastWestGateway '{}': sni_hosts overlap EastWestGateway '{}' on the same \
                      network for an overlapping trust domain (both can route the same destination \
-                     FQDN; selection would silently pick one — disambiguate by sni_hosts, network, \
-                     or trust_domain)",
+                     FQDN or per-port SNI alias; selection would silently pick one — disambiguate \
+                     by sni_hosts, network, or trust_domain)",
                     later.name, earlier.name
                 ));
             }
         }
     }
+}
+
+/// East-west gateway selection treats a service base FQDN as also owning its
+/// generated `p<port>.<base-fqdn>` aliases. Validation must therefore reject not
+/// only raw host/wildcard overlaps, but also a configured base FQDN on one
+/// gateway and a configured per-port alias of that base FQDN on another gateway.
+fn east_west_sni_hosts_overlap(a: &[String], b: &[String]) -> bool {
+    if crate::config::types::hosts_overlap(a, b) {
+        return true;
+    }
+
+    let a_bases: Vec<String> = a
+        .iter()
+        .filter_map(|host| east_west_alias_claim_base(host))
+        .collect();
+    if !a_bases.is_empty() && crate::config::types::hosts_overlap(&a_bases, b) {
+        return true;
+    }
+
+    let b_bases: Vec<String> = b
+        .iter()
+        .filter_map(|host| east_west_alias_claim_base(host))
+        .collect();
+    !b_bases.is_empty() && crate::config::types::hosts_overlap(a, &b_bases)
+}
+
+/// Return the base service FQDN claimed by a generated exact alias
+/// (`p<port>.<base>`) or by a wildcard alias owner (`*.<base>`).
+///
+/// The suffix must have Ferrum's `<service>.<namespace>.svc.<cluster-domain>`
+/// shape. This keeps unrelated explicit hosts such as `p9090.example.com`
+/// literal: runtime cross-cluster service routing never derives them as aliases.
+fn east_west_alias_claim_base(host: &str) -> Option<String> {
+    let (alias_label, base) = host.split_once('.')?;
+    if !mesh_service_fqdn_like(base) {
+        return None;
+    }
+    if alias_label == "*" {
+        return Some(base.to_string());
+    }
+
+    let port = alias_label.strip_prefix('p')?;
+    // `cross_cluster_service_sni` renders a non-zero u16 without leading
+    // zeroes. Recognize only that canonical generated namespace so an ordinary
+    // hostname such as `p65536.example` is not reinterpreted as an alias.
+    let Ok(port_number) = port.parse::<u16>() else {
+        return None;
+    };
+    if base.is_empty() || port.starts_with('0') || port_number == 0 {
+        return None;
+    }
+    Some(base.to_string())
+}
+
+fn mesh_service_fqdn_like(host: &str) -> bool {
+    let mut labels = host.split('.');
+    labels.next().is_some_and(|label| !label.is_empty())
+        && labels.next().is_some_and(|label| !label.is_empty())
+        && labels.next() == Some("svc")
+        && labels.next().is_some_and(|label| !label.is_empty())
+        && labels.all(|label| !label.is_empty())
 }
 
 /// Lower-case in-place hostname normalisation for mesh entries — matches

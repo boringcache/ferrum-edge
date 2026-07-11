@@ -7,7 +7,8 @@
 //!
 //! Each proxy gets a merged plugin list: global plugins + proxy-scoped plugins,
 //! sorted by priority. Pre-computed flags (`requires_response_body_buffering`,
-//! `requires_request_body_buffering`, `requires_ws_frame_hooks`) enable O(1)
+//! `requires_request_body_buffering`, `requires_ws_frame_hooks`, and
+//! protocol-scoped response-stream hooks) enable O(1)
 //! upper-bound decisions on the hot path instead of per-request plugin
 //! iteration.
 //!
@@ -164,6 +165,21 @@ impl Plugin for PriorityOverridePlugin {
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.inner.should_buffer_response_body(ctx)
     }
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        self.inner.may_release_response_body_under_retries(ctx)
+    }
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        self.inner.should_release_response_body_under_retries(
+            ctx,
+            response_status,
+            response_headers,
+        )
+    }
     fn should_release_response_body_before_content_type_rewrite(
         &self,
         ctx: &RequestContext,
@@ -310,6 +326,14 @@ impl Plugin for PriorityOverridePlugin {
         self.inner
             .transform_response_body_with_context(ctx, body, content_type, response_headers)
             .await
+    }
+    fn on_response_body_transformed(
+        &self,
+        ctx: &mut RequestContext,
+        response_headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        self.inner
+            .on_response_body_transformed(ctx, response_headers);
     }
     async fn on_final_response_body(
         &self,
@@ -559,6 +583,7 @@ impl PluginCapabilities {
     pub const NEEDS_DECODED_QUERY_PARAMS: u16 = 1 << 6;
     pub const NEEDS_FINAL_REQUEST_BODY_CONTEXT: u16 = 1 << 7;
     pub const HAS_RESPONSE_COMMITTED_HOOK: u16 = 1 << 8;
+    pub const HAS_RESPONSE_STREAM_HOOKS: u16 = 1 << 9;
 
     #[inline(always)]
     pub fn has(self, flag: u16) -> bool {
@@ -620,6 +645,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.requires_response_committed_hook() {
             caps |= PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK;
+        }
+        if p.requires_response_stream_hooks() {
+            caps |= PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS;
         }
     }
     PluginPhaseData {
@@ -941,6 +969,14 @@ impl PluginCacheRequestView {
     /// Check WebSocket frame-hook requirement from this request view.
     pub fn requires_ws_frame_hooks(&self) -> bool {
         self.requires_ws_frame_hooks
+    }
+
+    /// Check whether any protocol-compatible plugin opted into response-stream
+    /// inspection or terminal hooks. Precomputed at cache-build time so the
+    /// common response path does not scan plugins per request.
+    pub fn requires_response_stream_hooks(&self) -> bool {
+        self.capabilities
+            .has(PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS)
     }
 }
 

@@ -2672,6 +2672,135 @@ pub(crate) async fn run_response_inspection(
     }
 }
 
+/// Drive a response-stream inspector over an already constructed proxy body.
+///
+/// This is the transport-independent counterpart of [`run_response_inspection`]
+/// for direct HTTP/2 and native HTTP/3 backend responses. The source body keeps
+/// its protocol-specific timeout and trailer filtering (plus source-side size
+/// limiting where that transport builder requires it); this task owns it and
+/// the least-connections guard until backend EOF, policy termination, error, or
+/// downstream cancellation. Deferred admission and dispatch outcomes remain on
+/// the client-visible outer body. DATA frames are held until the inspector
+/// releases them, while sanitized trailer frames pass through unchanged on a
+/// clean stream. This driver independently caps released inspector output, so
+/// expansion and terminal events cannot bypass the operator limit.
+pub(crate) async fn run_proxy_body_response_inspection(
+    mut body: ProxyBody,
+    mut inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
+    tx: tokio::sync::mpsc::Sender<Result<Frame<Bytes>, BoxError>>,
+    max_response_body_size_bytes: usize,
+    _lb_connection_guard: super::LoadBalancerConnectionGuard,
+) {
+    use crate::plugins::ResponseStreamAction;
+    use http_body_util::BodyExt;
+
+    let mut trailing_frame: Option<Frame<Bytes>> = None;
+    let mut emitted_bytes: usize = 0;
+    loop {
+        let frame = tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            next = body.frame() => next,
+        };
+        let Some(frame) = frame else { break };
+        match frame {
+            Ok(frame) => match frame.into_data() {
+                Ok(bytes) => match inspector.on_chunk(&bytes).await {
+                    ResponseStreamAction::Forward(out) => {
+                        if !out.is_empty() {
+                            if max_response_body_size_bytes > 0
+                                && emitted_bytes.saturating_add(out.len())
+                                    > max_response_body_size_bytes
+                            {
+                                let _ = tx
+                                    .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                                        "response body exceeds maximum size",
+                                    ) as BoxError))
+                                    .await;
+                                return;
+                            }
+                            emitted_bytes = emitted_bytes.saturating_add(out.len());
+                            if tx.send(Ok(Frame::data(out))).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    ResponseStreamAction::Terminate(final_bytes) => {
+                        if let Some(bytes) = final_bytes
+                            && !bytes.is_empty()
+                        {
+                            if max_response_body_size_bytes > 0
+                                && emitted_bytes.saturating_add(bytes.len())
+                                    > max_response_body_size_bytes
+                            {
+                                let _ = tx
+                                    .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                                        "response body exceeds maximum size",
+                                    ) as BoxError))
+                                    .await;
+                                return;
+                            }
+                            let _ = tx.send(Ok(Frame::data(bytes))).await;
+                        }
+                        return;
+                    }
+                },
+                Err(frame) => {
+                    // A trailing frame must stay behind bytes the inspector is
+                    // still holding for `on_end()`. Sending trailers now and a
+                    // final released DATA frame afterward would violate HTTP
+                    // frame ordering. Policy termination deliberately drops it.
+                    trailing_frame = Some(frame);
+                }
+            },
+            Err(error) => {
+                let _ = tx.send(Err(error)).await;
+                return;
+            }
+        }
+    }
+
+    match inspector.on_end().await {
+        ResponseStreamAction::Forward(out) => {
+            if !out.is_empty() {
+                if max_response_body_size_bytes > 0
+                    && emitted_bytes.saturating_add(out.len()) > max_response_body_size_bytes
+                {
+                    let _ = tx
+                        .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                            "response body exceeds maximum size",
+                        ) as BoxError))
+                        .await;
+                    return;
+                }
+                if tx.send(Ok(Frame::data(out))).await.is_err() {
+                    return;
+                }
+            }
+            if let Some(frame) = trailing_frame {
+                let _ = tx.send(Ok(frame)).await;
+            }
+        }
+        ResponseStreamAction::Terminate(final_bytes) => {
+            if let Some(bytes) = final_bytes
+                && !bytes.is_empty()
+            {
+                if max_response_body_size_bytes > 0
+                    && emitted_bytes.saturating_add(bytes.len()) > max_response_body_size_bytes
+                {
+                    let _ = tx
+                        .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                            "response body exceeds maximum size",
+                        ) as BoxError))
+                        .await;
+                    return;
+                }
+                let _ = tx.send(Ok(Frame::data(bytes))).await;
+            }
+        }
+    }
+}
+
 /// HTTP/2 streaming body wrapped in a [`StripHopByHopTrailers`] filter so
 /// hop-by-hop names (RFC 9110 §7.6.1, response-direction set) cannot leak
 /// downstream via TRAILERS frames. Used for the gRPC streaming response path

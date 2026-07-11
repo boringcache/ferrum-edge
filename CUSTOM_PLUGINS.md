@@ -267,7 +267,7 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn may_modify_response_content_type(&self, &ctx, backend_content_type) -> bool` | `false` | Set when `after_proxy` may relabel the backend `Content-Type`; this prevents an unsafe buffer-to-stream downgrade. The answer must match the current request and backend type exactly. |
 | `fn requires_response_stream_hooks(&self) -> bool` | `false` | Config-time opt-in for streaming response inspection. |
 | `fn response_stream_inspector(&self, &ctx, status, content_type) -> Option<Box<dyn ResponseStreamInspector>>` | `None` | Create state owned by one eligible streaming response, or return `None` for passthrough. |
-| `fn forces_reqwest_dispatch(&self, &ctx) -> bool` | `false` | Per-request native-H3 dispatch override for requests whose response inspector must run. See the current transport limitation below. |
+| `fn forces_reqwest_dispatch(&self, &ctx) -> bool` | `false` | Optional per-request native-H3 dispatch override when reqwest is operationally preferable; inspectors do not require it for transport coverage. |
 | `fn applies_after_proxy_on_reject(&self) -> bool` | `false` | Set to `true` if your plugin's `after_proxy` should also run on gateway-generated rejection responses (e.g., CORS headers on error responses). |
 | `fn requires_ws_frame_hooks(&self) -> bool` | `false` | Set to `true` if your plugin implements `on_ws_frame()`. Pre-computed per proxy for zero overhead when unused. |
 | `fn warmup_hostnames(&self) -> Vec<String>` | `[]` | Hostnames your plugin connects to (for DNS pre-warming at startup). |
@@ -610,12 +610,12 @@ impl Plugin for MySseInspector {
     }
 
     fn forces_reqwest_dispatch(&self, _ctx: &RequestContext) -> bool {
-        true // Prevents native H3 only; direct H2 remains subject to #2055.
+        true // Optional transport preference; inspection does not depend on it.
     }
 }
 ```
 
-On today's standard HTTP handler, the example also requires `pool_enable_http2: false` on a plain-HTTPS proxy to exclude the direct-H2 arm and guarantee reqwest dispatch. That setting is not a universal workaround for gRPC or mesh H2 transports, and a backend TLS SNI override may require direct H2. Until #2055 is resolved, test every backend transport the plugin can select; constrain enforcing routes to supported dispatch or provide a buffered fallback where inspectors are not wired. In production, also narrow `forces_reqwest_dispatch()` with a request marker when only some requests can be inspected, rather than moving all traffic off native H3.
+The proxy drives inspectors on reqwest, direct HTTP/2, and native HTTP/3 response arms. Use `forces_reqwest_dispatch()` only as a scoped transport preference when reqwest is operationally desirable for a request; it is not required for inspector coverage.
 
 The `ResponseStreamInspector` action contract is:
 
@@ -623,9 +623,7 @@ The `ResponseStreamInspector` action contract is:
 - `on_end(&mut self)` is the clean end-of-stream flush for a trailing partial window. Its default returns an empty `Forward`.
 - Response headers are already committed before either hook runs. `Terminate` can only truncate the in-flight response; it cannot change the HTTP status, replace headers, or retract previously forwarded bytes.
 
-There is one current transport limitation to design around:
-
-- In the standard HTTP proxy handler, inspectors currently attach only to the reqwest `ResponseBody::Streaming` arm, not the direct `StreamingH2` or `StreamingH3` arms ([#2055](https://github.com/ferrum-edge/ferrum-edge/issues/2055)). `forces_reqwest_dispatch()` prevents native-H3 selection for requests where it returns `true`; make that decision per request when possible. It does not itself exclude every direct-H2/HBONE case, so do not assume universal transport coverage until #2055 is resolved. The dedicated H3 frontend native and cross-protocol loops do drive inspectors, which is why the inspector must be portable across H1/H2 and H3 drivers.
+Inspectors must remain portable across the detached H1/H2 driver and the native H3 event loop. They cannot borrow request context, must keep accumulators bounded, and must treat `on_downstream_terminated()` as the signal that a later inspector cut bytes they had already observed.
 
 ### `Content-Type` relabeling trap
 
