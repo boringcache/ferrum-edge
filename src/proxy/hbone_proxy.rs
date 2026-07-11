@@ -70,7 +70,7 @@ pub(super) fn tag_request_metadata(ctx: &mut RequestContext) {
 /// honors the HBONE CONNECT for a `udp`-marked tunnel — UDP HBONE must never be
 /// weaker than byte-stream HBONE for authz. Only observability surfaces that
 /// want to distinguish the datagram tunnel read this sub-key (codex r5 P1).
-pub(super) const HBONE_DATAGRAM_METADATA_KEY: &str = "hbone_datagram";
+pub(super) use crate::modes::mesh::hbone::HBONE_DATAGRAM_METADATA_KEY;
 
 /// Tag metadata for a datagram-over-HBONE CONNECT (F3 §3.3 Stage 4). It rides
 /// the SAME SVID-mTLS H2 CONNECT as the byte-stream relay, so it keeps

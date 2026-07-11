@@ -16,8 +16,8 @@ use crate::modes::mesh::MeshTrafficDirection;
 use crate::modes::mesh::config::TracingProvider;
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::plugins::mesh::authz::{
-    TrustedAssertor, is_trusted_hbone_assertor, parse_trust_domain_aliases,
-    parse_trusted_hbone_assertors,
+    IGNORED_UDP_SOURCE_SCOPE_METADATA, TrustedAssertor, is_trusted_hbone_assertor,
+    parse_trust_domain_aliases, parse_trusted_hbone_assertors,
 };
 use crate::plugins::otel_tracing::{
     OtelTracing, SpanData, SpanKind, TraceExporter, build_traceparent, ensure_trace_metadata,
@@ -322,9 +322,19 @@ impl WorkloadMetrics {
         // the assertor gate any authenticated workload pod could forge a baggage
         // `source.principal` and mis-attribute its own traffic to a victim
         // workload across metrics, the service graph, spans, and access logs.
-        let baggage_source_principal = hbone_identity
-            .as_ref()
-            .and_then(|identity| identity.source_principal.clone());
+        let rejected_udp_source_scope =
+            ctx.metadata.get(IGNORED_UDP_SOURCE_SCOPE_METADATA).cloned();
+        if let Some(reason) = rejected_udp_source_scope.as_ref() {
+            ctx.metadata
+                .insert("mesh.ignored_baggage".to_string(), reason.clone());
+        }
+        let baggage_source_principal = if rejected_udp_source_scope.is_some() {
+            None
+        } else {
+            hbone_identity
+                .as_ref()
+                .and_then(|identity| identity.source_principal.clone())
+        };
         let source_identity = match (ctx.peer_spiffe_id.as_ref(), baggage_source_principal) {
             (Some(peer), Some(baggage)) => {
                 if !is_trusted_hbone_assertor(&self.trusted_hbone_assertors, peer) {

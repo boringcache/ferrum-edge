@@ -338,78 +338,13 @@ pub(crate) struct MeshUdpCaptureRuntime {
     pub recvmmsg_batch_size: usize,
     pub session_shard_amount: usize,
     pub session_limiter: std::sync::Arc<MeshUdpSessionLimiter>,
+    /// Per-pod evidence fixed by the Ambient capture manager. `None` for the
+    /// Sidecar current-netns listener and for old/malformed registry entries;
+    /// those sessions retain the mesh-wide authorization posture.
+    pub source_identity: Option<std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>>,
     /// Builds each session's transparent reply socket in the SAME netns as the
     /// capture socket (current-netns for Sidecar, pod-netns for Ambient).
     pub reply_socket_factory: std::sync::Arc<dyn ReplySocketFactory>,
-}
-
-/// Per-producer ownership of the UDP session tasks spawned by one capture
-/// socket. Session creation is cold-path work (once per flow), so retaining
-/// join handles here does not add a lock to the per-datagram hot path. Closing
-/// the producer can then wait for every task to observe its stop signal before
-/// the pod-netns reply factory (and its stable netns fd) is released.
-#[cfg(target_os = "linux")]
-struct CaptureSessionTasks {
-    handles: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
-}
-
-#[cfg(target_os = "linux")]
-impl CaptureSessionTasks {
-    fn new() -> Self {
-        Self {
-            handles: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    fn track(&self, handle: tokio::task::JoinHandle<()>) {
-        let mut handles = match self.handles.lock() {
-            Ok(handles) => handles,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        handles.retain(|task| !task.is_finished());
-        handles.push(handle);
-    }
-
-    fn take(&self) -> Vec<tokio::task::JoinHandle<()>> {
-        let mut handles = match self.handles.lock() {
-            Ok(handles) => handles,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        std::mem::take(&mut *handles)
-    }
-}
-
-#[cfg(target_os = "linux")]
-async fn await_session_tasks(tasks: &CaptureSessionTasks) {
-    let mut handles = tasks.take();
-    if handles.is_empty() {
-        return;
-    }
-    let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        for task in &mut handles {
-            let _ = task.await;
-        }
-    })
-    .await;
-    if drained.is_err() {
-        for task in &handles {
-            task.abort();
-        }
-        for task in handles {
-            let _ = task.await;
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-async fn run_session_until_producer_stops<F>(session: F, mut producer_stop: watch::Receiver<bool>)
-where
-    F: std::future::Future<Output = ()>,
-{
-    tokio::select! {
-        _ = session => {}
-        _ = producer_stop.changed() => {}
-    }
 }
 
 /// Start the mesh UDP capture listener in the CURRENT network namespace
@@ -446,6 +381,7 @@ pub async fn start_mesh_udp_capture_listener(
             recvmmsg_batch_size,
             session_shard_amount,
             session_limiter: std::sync::Arc::new(MeshUdpSessionLimiter::new(max_sessions)),
+            source_identity: None,
             reply_socket_factory: std::sync::Arc::new(CurrentNetnsReplySocketFactory),
         },
         shutdown,
@@ -485,6 +421,7 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
         recvmmsg_batch_size,
         session_shard_amount,
         session_limiter,
+        source_identity,
         reply_socket_factory,
     } = runtime;
     let frontend_socket = Arc::new(frontend_socket);
@@ -497,7 +434,12 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
             ahash::RandomState::default(),
             session_shard_amount,
         ));
-    let session_tasks = Arc::new(CaptureSessionTasks::new());
+    // Producer-local cancellation for every session task. The listener's
+    // shutdown receiver drives the accept loop and cleanup sweep; this separate
+    // channel is fired on ANY loop exit (including identity-driven Ambient
+    // producer replacement) so old tunnels cannot outlive their fixed evidence.
+    let (session_stop_tx, session_stop_rx) = watch::channel(false);
+    let mut session_tasks = tokio::task::JoinSet::new();
     if let Some(tx) = started_tx {
         let _ = tx.send(());
     }
@@ -527,6 +469,11 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
 
     loop {
         tokio::select! {
+            completed = session_tasks.join_next(), if !session_tasks.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    warn!(%error, "Ambient UDP capture session task failed");
+                }
+            }
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
                     info!(addr = %addr, "Mesh UDP capture listener shutting down");
@@ -579,9 +526,10 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
                                                 client,
                                                 orig_dst,
                                                 chunk,
+                                                source_identity.as_ref(),
                                                 &reply_socket_factory,
-                                                &session_tasks,
-                                                shutdown_rx.clone(),
+                                                &session_stop_rx,
+                                                &mut session_tasks,
                                             );
                                         }
                                     }
@@ -593,9 +541,10 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
                                             client,
                                             orig_dst,
                                             data,
+                                            source_identity.as_ref(),
                                             &reply_socket_factory,
-                                            &session_tasks,
-                                            shutdown_rx.clone(),
+                                            &session_stop_rx,
+                                            &mut session_tasks,
                                         );
                                     }
                                 }
@@ -613,18 +562,13 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
             }
         }
     }
-    // Stop admission first, then remove every sender from the map and release
-    // its limiter slot. Each task also observes the producer stop directly, so
-    // a live tunnel or disabled idle timeout cannot outlive pod unenrollment.
-    let keys: Vec<_> = sessions.iter().map(|entry| *entry.key()).collect();
-    let mut removed = 0;
-    for key in keys {
-        if sessions.remove(&key).is_some() {
-            removed += 1;
-        }
-    }
-    session_limiter.release(removed);
-    await_session_tasks(&session_tasks).await;
+    let _ = session_stop_tx.send(true);
+    // The producer handle does not finish until every tunnel opened with its
+    // fixed source evidence is gone. This makes manager-side replacement wait
+    // for the old identity's sessions, including sessions still connecting and
+    // not yet polling the cancellation receiver.
+    session_tasks.shutdown().await;
+    remove_all_capture_sessions(&sessions, &session_limiter);
     Ok(())
 }
 
@@ -749,9 +693,10 @@ fn handle_captured_datagram(
     client: SocketAddr,
     orig_dst: Option<SocketAddr>,
     data: &[u8],
+    source_identity: Option<&std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>>,
     reply_factory: &std::sync::Arc<dyn ReplySocketFactory>,
-    session_tasks: &std::sync::Arc<CaptureSessionTasks>,
-    producer_stop: watch::Receiver<bool>,
+    session_shutdown: &watch::Receiver<bool>,
+    session_tasks: &mut tokio::task::JoinSet<()>,
 ) -> bool {
     use tracing::debug;
 
@@ -835,9 +780,10 @@ fn handle_captured_datagram(
                 last_activity,
                 queued_bytes,
                 epoch,
+                source_identity.cloned(),
                 reply_factory.clone(),
-                session_tasks.clone(),
-                producer_stop,
+                session_shutdown.clone(),
+                session_tasks,
             );
             true
         }
@@ -1043,23 +989,23 @@ fn spawn_udp_egress_session(
     last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
+    source_identity: Option<std::sync::Arc<crate::modes::mesh::hbone::UdpSourceIdentity>>,
     reply_factory: std::sync::Arc<dyn ReplySocketFactory>,
-    session_tasks: std::sync::Arc<CaptureSessionTasks>,
-    producer_stop: watch::Receiver<bool>,
+    session_shutdown: watch::Receiver<bool>,
+    session_tasks: &mut tokio::task::JoinSet<()>,
 ) {
-    let handle = tokio::spawn(async move {
-        run_session_until_producer_stops(
-            run_udp_egress_session(
-                &state,
-                &entry,
-                key,
-                rx,
-                last_activity,
-                queued_bytes,
-                epoch,
-                &reply_factory,
-            ),
-            producer_stop,
+    session_tasks.spawn(async move {
+        run_udp_egress_session(
+            &state,
+            &entry,
+            key,
+            rx,
+            last_activity,
+            queued_bytes,
+            epoch,
+            source_identity.as_deref(),
+            &reply_factory,
+            session_shutdown,
         )
         .await;
         // Session teardown: remove the map entry and decrement the live count so
@@ -1069,7 +1015,25 @@ fn spawn_udp_egress_session(
         // CONDITIONAL removal (codex r1 P2): see [`remove_session_if_owned`].
         remove_session_if_owned(&sessions, &session_limiter, &key, session_id);
     });
-    session_tasks.track(handle);
+}
+
+/// Remove every session owned by a capture producer and release exactly the
+/// slots this call won. Session tasks race through conditional removal; only
+/// one side can remove each key, so the shared Ambient limiter cannot be
+/// double-decremented.
+#[cfg(target_os = "linux")]
+fn remove_all_capture_sessions(
+    sessions: &dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
+    session_limiter: &MeshUdpSessionLimiter,
+) {
+    let keys: Vec<CaptureSessionKey> = sessions.iter().map(|entry| *entry.key()).collect();
+    let mut removed = 0;
+    for key in keys {
+        if sessions.remove(&key).is_some() {
+            removed += 1;
+        }
+    }
+    session_limiter.release(removed);
 }
 
 /// Tear down a finished/failed egress session: remove its map entry and
@@ -1112,7 +1076,9 @@ async fn run_udp_egress_session(
     last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
+    source_identity: Option<&crate::modes::mesh::hbone::UdpSourceIdentity>,
     reply_factory: &std::sync::Arc<dyn ReplySocketFactory>,
+    mut session_shutdown: watch::Receiver<bool>,
 ) {
     use super::{LoadBalancerConnectionGuard, backend_dispatch};
     use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
@@ -1349,6 +1315,7 @@ async fn run_udp_egress_session(
                 expected_peer.as_ref(),
                 expected_trust_domain.as_ref(),
                 sni_override,
+                source_identity,
             )
             .await
         {
@@ -1605,12 +1572,20 @@ async fn run_udp_egress_session(
         }
     };
 
+    let producer_cancelled = async move {
+        if *session_shutdown.borrow() {
+            return;
+        }
+        let _ = session_shutdown.changed().await;
+    };
+
     // Any arm completing ends the session (and, on return, the caller's
     // `remove_session_if_owned` frees the slot + decrements `active_sessions`).
     tokio::select! {
         _ = return_path => {}
         _ = egress_loop => {}
         _ = watchdog => {}
+        _ = producer_cancelled => {}
     }
 }
 
@@ -1786,35 +1761,6 @@ pub async fn start_mesh_udp_capture_listener(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn producer_stop_cancels_session_and_releases_owned_handle() {
-        struct ReleaseProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
-        impl Drop for ReleaseProbe {
-            fn drop(&mut self) {
-                self.0.store(true, std::sync::atomic::Ordering::Release);
-            }
-        }
-
-        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let probe = ReleaseProbe(released.clone());
-        let (stop_tx, stop_rx) = watch::channel(false);
-        let tasks = CaptureSessionTasks::new();
-        tasks.track(tokio::spawn(run_session_until_producer_stops(
-            async move {
-                let _probe = probe;
-                std::future::pending::<()>().await;
-            },
-            stop_rx,
-        )));
-
-        let _ = stop_tx.send(true);
-        await_session_tasks(&tasks).await;
-        assert!(
-            released.load(std::sync::atomic::Ordering::Acquire),
-            "session cancellation must release its pod-netns-owned factory/handle"
-        );
-    }
 
     /// Build a test session map sized via the same hot-path helper the
     /// listener uses ([`crate::util::sharding::pool_shard_amount`]). Pass `0`
@@ -2019,6 +1965,35 @@ listen_port: 15011
         );
         assert!(matches!(outcome, SessionAdmission::Admitted { .. }));
         assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn producer_session_removal_releases_every_owned_slot() {
+        let sessions = new_sessions(0);
+        let limiter = MeshUdpSessionLimiter::new(4);
+        let mut receivers = Vec::new();
+        for (client, destination) in [
+            ("10.0.0.5:40000", "10.96.0.10:53"),
+            ("10.0.0.6:40001", "10.96.0.11:53"),
+        ] {
+            match admit_or_refresh_session(
+                &sessions,
+                &limiter,
+                key(client, destination),
+                b"x",
+                routable,
+            ) {
+                SessionAdmission::Admitted { rx, .. } => receivers.push(rx),
+                other => panic!("expected Admitted, got {}", admission_name(&other)),
+            }
+        }
+        assert_eq!(limiter.active_count(), 2);
+
+        remove_all_capture_sessions(&sessions, &limiter);
+
+        assert!(sessions.is_empty());
+        assert_eq!(limiter.active_count(), 0);
+        drop(receivers);
     }
 
     #[test]

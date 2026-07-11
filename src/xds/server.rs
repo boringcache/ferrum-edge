@@ -93,6 +93,11 @@ pub struct XdsAdsServer {
     /// Cleared when the node's last stream ends.
     workload_identities: Arc<DashMap<String, String>>,
     waypoint_names: Arc<DashMap<String, String>>,
+    ambient_udp_source_scoping_nodes: Arc<DashMap<String, ()>>,
+    /// Per-stream bearer boundary. Network handlers set this on their cloned
+    /// server after JWT verification; an explicit `ns` claim restricts the
+    /// Ambient UDP source workload/policy superset to the claim's namespaces.
+    ambient_udp_source_bearer_namespaces: Option<HashSet<String>>,
     /// Mirror of `EnvConfig.mesh_sidecar_enforced`. When `true`, the slice
     /// builder applies Istio `Sidecar` egress scope narrowing. Default
     /// `false` preserves existing CP behavior.
@@ -176,6 +181,7 @@ struct XdsStreamGuard {
     active_streams: Arc<XdsStreamRegistry>,
     workload_identities: Arc<DashMap<String, String>>,
     waypoint_names: Arc<DashMap<String, String>>,
+    ambient_udp_source_scoping_nodes: Arc<DashMap<String, ()>>,
 }
 
 impl XdsStreamGuard {
@@ -185,6 +191,7 @@ impl XdsStreamGuard {
         active_streams: Arc<XdsStreamRegistry>,
         workload_identities: Arc<DashMap<String, String>>,
         waypoint_names: Arc<DashMap<String, String>>,
+        ambient_udp_source_scoping_nodes: Arc<DashMap<String, ()>>,
     ) -> Self {
         Self {
             node_id: None,
@@ -193,6 +200,7 @@ impl XdsStreamGuard {
             active_streams,
             workload_identities,
             waypoint_names,
+            ambient_udp_source_scoping_nodes,
         }
     }
 
@@ -216,6 +224,7 @@ impl XdsStreamGuard {
             self.nonce_tracker.remove_node(&node_id);
             self.workload_identities.remove(&node_id);
             self.waypoint_names.remove(&node_id);
+            self.ambient_udp_source_scoping_nodes.remove(&node_id);
         }
     }
 }
@@ -270,6 +279,8 @@ impl XdsAdsServer {
             active_streams: Arc::new(XdsStreamRegistry::new(DEFAULT_XDS_MAX_STREAMS_PER_NODE)),
             workload_identities: Arc::new(DashMap::new()),
             waypoint_names: Arc::new(DashMap::new()),
+            ambient_udp_source_scoping_nodes: Arc::new(DashMap::new()),
+            ambient_udp_source_bearer_namespaces: None,
             sidecar_enforced,
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
@@ -349,6 +360,7 @@ impl XdsAdsServer {
         config: &GatewayConfig,
         namespace: &str,
         waypoint_name: Option<String>,
+        ambient_udp_source_scoping: bool,
     ) -> GatewayConfig {
         let request = MeshSliceRequest {
             namespace: namespace.to_string(),
@@ -357,8 +369,14 @@ impl XdsAdsServer {
         }
         .with_enforce_sidecar_egress(self.sidecar_enforced)
         .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run)
-        .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing);
-        CpGrpcServer::filter_config_to_mesh_request_for_scope(config, &request, &self.scope)
+        .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing)
+        .with_ambient_udp_source_scoping(ambient_udp_source_scoping);
+        CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            config,
+            &request,
+            &self.scope,
+            self.ambient_udp_source_bearer_namespaces.as_ref(),
+        )
     }
 
     fn replace_stream_config_if_changed(
@@ -382,10 +400,15 @@ impl XdsAdsServer {
         stream_config: &mut XdsStreamConfig,
         namespace: &str,
         waypoint_name: Option<String>,
+        ambient_udp_source_scoping: bool,
     ) -> bool {
         let current = self.config.load_full();
-        let filtered =
-            self.filter_config_for_xds_request(current.as_ref(), namespace, waypoint_name);
+        let filtered = self.filter_config_for_xds_request(
+            current.as_ref(),
+            namespace,
+            waypoint_name,
+            ambient_udp_source_scoping,
+        );
         self.replace_stream_config_if_changed(stream_config, filtered)
     }
 
@@ -395,6 +418,7 @@ impl XdsAdsServer {
         update: &ConfigUpdate,
         namespace: &str,
         waypoint_name: Option<String>,
+        ambient_udp_source_scoping: bool,
     ) -> bool {
         if self.namespace_broadcasts.is_some() {
             // Multi-namespace broadcast payloads are ConfigSync-strict on purpose.
@@ -404,14 +428,19 @@ impl XdsAdsServer {
                 stream_config,
                 namespace,
                 waypoint_name,
+                ambient_udp_source_scoping,
             );
         }
         let previous_fingerprint = stream_config.fingerprint.clone();
         if !stream_config.apply_update(update) {
             return false;
         }
-        let filtered =
-            self.filter_config_for_xds_request(&stream_config.config, namespace, waypoint_name);
+        let filtered = self.filter_config_for_xds_request(
+            &stream_config.config,
+            namespace,
+            waypoint_name,
+            ambient_udp_source_scoping,
+        );
         *stream_config = XdsStreamConfig::new(filtered);
         stream_config.fingerprint != previous_fingerprint
     }
@@ -422,7 +451,8 @@ impl XdsAdsServer {
         update: &ConfigUpdate,
         namespace: &str,
     ) {
-        let _ = self.apply_xds_update_to_stream_config(stream_config, update, namespace, None);
+        let _ =
+            self.apply_xds_update_to_stream_config(stream_config, update, namespace, None, false);
     }
 
     fn updates_for_namespace(&self, namespace: &str) -> broadcast::Receiver<ConfigUpdate> {
@@ -472,7 +502,11 @@ impl XdsAdsServer {
             .with_cluster_domain(self.cluster_domain.clone())
             .with_enforce_sidecar_egress(self.sidecar_enforced)
             .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run)
-            .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing);
+            .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing)
+            .with_ambient_udp_source_scoping(
+                self.ambient_udp_source_scoping_nodes
+                    .contains_key(metadata_key),
+            );
         let mut config = config.clone();
         config.normalize_fields();
         config.normalize_mesh_fields();
@@ -550,10 +584,19 @@ impl XdsAdsServer {
             state_key,
             metadata.waypoint_name,
         );
-        if identity_changed || waypoint_changed {
+        let udp_scope_changed = if metadata.ambient_udp_source_scoping {
+            self.ambient_udp_source_scoping_nodes
+                .insert(state_key.to_string(), ())
+                .is_none()
+        } else {
+            self.ambient_udp_source_scoping_nodes
+                .remove(state_key)
+                .is_some()
+        };
+        if identity_changed || waypoint_changed || udp_scope_changed {
             self.invalidate_snapshot_for_config_update(state_key);
         }
-        identity_changed || waypoint_changed
+        identity_changed || waypoint_changed || udp_scope_changed
     }
 
     fn reconcile_optional_string_state(
@@ -575,6 +618,11 @@ impl XdsAdsServer {
             .map(|entry| entry.value().clone())
     }
 
+    fn ambient_udp_source_scoping_for_state_key(&self, state_key: &str) -> bool {
+        self.ambient_udp_source_scoping_nodes
+            .contains_key(state_key)
+    }
+
     fn stream_guard(&self) -> XdsStreamGuard {
         XdsStreamGuard::new(
             self.snapshot_cache.clone(),
@@ -582,6 +630,7 @@ impl XdsAdsServer {
             self.active_streams.clone(),
             self.workload_identities.clone(),
             self.waypoint_names.clone(),
+            self.ambient_udp_source_scoping_nodes.clone(),
         )
     }
 
@@ -1380,6 +1429,7 @@ impl XdsAdsServer {
         stream_config: &mut XdsStreamConfig,
         namespace: &str,
         waypoint_name: Option<String>,
+        ambient_udp_source_scoping: bool,
     ) {
         // Catch-up runs on the request path before a stream has emitted its
         // first response. We intentionally do not invalidate the per-node
@@ -1395,6 +1445,7 @@ impl XdsAdsServer {
                         &update,
                         namespace,
                         waypoint_name.clone(),
+                        ambient_udp_source_scoping,
                     );
                 }
                 Err(broadcast::error::TryRecvError::Empty) => return,
@@ -1407,6 +1458,7 @@ impl XdsAdsServer {
                         stream_config,
                         namespace,
                         waypoint_name.clone(),
+                        ambient_udp_source_scoping,
                     );
                 }
                 Err(broadcast::error::TryRecvError::Closed) => return,
@@ -1578,7 +1630,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         );
 
         let mut requests = request.into_inner();
-        let server = self.clone();
+        let mut server = self.clone();
+        server.ambient_udp_source_bearer_namespaces = allowed.0.clone();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
 
@@ -1591,6 +1644,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 server.config.load_full().as_ref(),
                 &stream_namespace,
                 None,
+                false,
             ));
             let mut last_snapshot: Option<Arc<XdsSnapshot>> = None;
             loop {
@@ -1652,6 +1706,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 &mut stream_config,
                                 &stream_namespace,
                                 server.waypoint_name_for_state_key(&current_state_key),
+                                server.ambient_udp_source_scoping_for_state_key(&current_state_key),
                             );
                         }
 
@@ -1689,6 +1744,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 &mut stream_config,
                                 &stream_namespace,
                                 server.waypoint_name_for_state_key(&current_state_key),
+                                server.ambient_udp_source_scoping_for_state_key(&current_state_key),
                             );
                         }
 
@@ -1733,6 +1789,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                     &update,
                                     &stream_namespace,
                                     server.waypoint_name_for_state_key(current_state_key),
+                                    server.ambient_udp_source_scoping_for_state_key(current_state_key),
                                 ) {
                                     continue;
                                 }
@@ -1761,6 +1818,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                         &mut stream_config,
                                         &stream_namespace,
                                         None,
+                                        false,
                                     );
                                     continue;
                                 };
@@ -1769,6 +1827,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                         &mut stream_config,
                                         &stream_namespace,
                                         None,
+                                        false,
                                     );
                                     continue;
                                 };
@@ -1776,6 +1835,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                     &mut stream_config,
                                     &stream_namespace,
                                     server.waypoint_name_for_state_key(current_state_key),
+                                    server.ambient_udp_source_scoping_for_state_key(current_state_key),
                                 );
                                 server.invalidate_snapshot_for_config_update(current_state_key);
                                 if subscriptions.is_empty() {
@@ -1856,7 +1916,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         );
 
         let mut requests = request.into_inner();
-        let server = self.clone();
+        let mut server = self.clone();
+        server.ambient_udp_source_bearer_namespaces = allowed.0.clone();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
 
@@ -1869,6 +1930,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 server.config.load_full().as_ref(),
                 &stream_namespace,
                 None,
+                false,
             ));
             let mut last_sent_snapshot_by_type: HashMap<String, Arc<XdsSnapshot>> = HashMap::new();
             let mut last_accepted_snapshot_by_type: HashMap<String, Arc<XdsSnapshot>> =
@@ -1932,6 +1994,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 &mut stream_config,
                                 &stream_namespace,
                                 server.waypoint_name_for_state_key(&current_state_key),
+                                server.ambient_udp_source_scoping_for_state_key(&current_state_key),
                             );
                         }
 
@@ -1969,6 +2032,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 &mut stream_config,
                                 &stream_namespace,
                                 server.waypoint_name_for_state_key(&current_state_key),
+                                server.ambient_udp_source_scoping_for_state_key(&current_state_key),
                             );
                         }
 
@@ -2021,6 +2085,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                     &update,
                                     &stream_namespace,
                                     server.waypoint_name_for_state_key(current_state_key),
+                                    server.ambient_udp_source_scoping_for_state_key(current_state_key),
                                 ) {
                                     continue;
                                 }
@@ -2051,6 +2116,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                         &mut stream_config,
                                         &stream_namespace,
                                         None,
+                                        false,
                                     );
                                     continue;
                                 };
@@ -2059,6 +2125,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                         &mut stream_config,
                                         &stream_namespace,
                                         None,
+                                        false,
                                     );
                                     continue;
                                 };
@@ -2066,6 +2133,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                     &mut stream_config,
                                     &stream_namespace,
                                     server.waypoint_name_for_state_key(current_state_key),
+                                    server.ambient_udp_source_scoping_for_state_key(current_state_key),
                                 );
                                 server.invalidate_snapshot_for_config_update(current_state_key);
                                 if subscriptions.is_empty() {
@@ -2335,10 +2403,11 @@ fn should_send_delta_response(
 mod tests {
     use super::*;
     use crate::config::db_loader::IncrementalResult;
-    use crate::identity::spiffe::SpiffeId;
+    use crate::identity::spiffe::{SpiffeId, TrustDomain};
     use crate::modes::mesh::config::{
-        AppProtocol, MeshConfig, MeshService, MeshSidecar, MeshSidecarEgress, MeshWaypointBinding,
-        MeshWaypointServiceRef, MtlsMode, PeerAuthentication, ServicePort,
+        AppProtocol, MeshConfig, MeshPolicy, MeshService, MeshSidecar, MeshSidecarEgress,
+        MeshWaypointBinding, MeshWaypointServiceRef, MtlsMode, PeerAuthentication, PolicyScope,
+        ServicePort, Workload, WorkloadSelector,
     };
     use chrono::{TimeZone, Utc};
     use prost::Message;
@@ -2673,6 +2742,7 @@ mod tests {
             active_streams.clone(),
             Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
         );
         first
             .set_node_id("node-a")
@@ -2682,6 +2752,7 @@ mod tests {
             snapshot_cache.clone(),
             nonce_tracker.clone(),
             active_streams.clone(),
+            Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),
         );
@@ -2705,6 +2776,7 @@ mod tests {
             snapshot_cache,
             nonce_tracker,
             active_streams.clone(),
+            Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),
         );
@@ -2818,7 +2890,7 @@ mod tests {
         };
         let server = test_server_with_sidecar_enforcement(config.clone(), true);
 
-        let filtered = server.filter_config_for_xds_request(&config, "default", None);
+        let filtered = server.filter_config_for_xds_request(&config, "default", None, false);
         let mesh = filtered.mesh.as_ref().expect("mesh should remain");
         assert!(
             mesh.services
@@ -2936,13 +3008,18 @@ mod tests {
             crate::xds::carrier::XdsNodeMetadata {
                 workload_spiffe_id: None,
                 waypoint_name: Some("waypoint".to_string()),
+                ambient_udp_source_scoping: false,
             },
         ));
         assert!(server.waypoint_names.get(&tenant_key).is_some());
         assert!(server.waypoint_names.get(bare_node_key).is_none());
 
-        let filtered =
-            server.filter_config_for_xds_request(&config, "infra", Some("waypoint".to_string()));
+        let filtered = server.filter_config_for_xds_request(
+            &config,
+            "infra",
+            Some("waypoint".to_string()),
+            false,
+        );
         let stream_config = XdsStreamConfig::new(filtered);
         let snapshot = server.snapshot_for_stream_config_with_cache_key(
             &tenant_key,
@@ -2955,6 +3032,105 @@ mod tests {
             snapshot_cluster_names(&snapshot),
             vec!["cluster/default/reviews/8080".to_string()]
         );
+    }
+
+    #[test]
+    fn xds_prefilter_preserves_waypoint_udp_source_policies_when_metadata_enables_scoping() {
+        let mut config = waypoint_gateway_config("reviews", 0);
+        let mesh = config.mesh.as_mut().expect("mesh should exist");
+        mesh.workloads.push(Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/clients/sa/client")
+                .expect("source SPIFFE ID"),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "client".to_string())]),
+                namespace: Some("clients".to_string()),
+            },
+            service_name: "client".to_string(),
+            addresses: vec!["10.2.0.11".to_string()],
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("cluster.local").expect("source trust domain"),
+            namespace: "clients".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("client".to_string()),
+            pod_uid: Some("16b2c3d4-9dad-11d1-80b4-00c04fd430c8".to_string()),
+            node_waypoint: None,
+            remote_provenance: false,
+        });
+        mesh.mesh_policies.push(MeshPolicy {
+            name: "clients-source-policy".to_string(),
+            namespace: "clients".to_string(),
+            scope: PolicyScope::Namespace {
+                namespace: "clients".to_string(),
+            },
+            rules: Vec::new(),
+        });
+        let source_scope =
+            CpScope::Set(HashSet::from(["infra".to_string(), "clients".to_string()]));
+        let server = test_server(config.clone()).with_scope(source_scope.clone());
+        let mut bearer_multi_namespace_server =
+            test_server(config.clone()).with_scope(source_scope.clone());
+        bearer_multi_namespace_server.ambient_udp_source_bearer_namespaces =
+            Some(HashSet::from(["infra".to_string(), "clients".to_string()]));
+        let mut bearer_restricted_server = test_server(config.clone()).with_scope(source_scope);
+        bearer_restricted_server.ambient_udp_source_bearer_namespaces =
+            Some(HashSet::from(["infra".to_string()]));
+
+        let without_udp = server.filter_config_for_xds_request(
+            &config,
+            "infra",
+            Some("waypoint".to_string()),
+            false,
+        );
+        let with_udp = server.filter_config_for_xds_request(
+            &config,
+            "infra",
+            Some("waypoint".to_string()),
+            true,
+        );
+        let bearer_restricted = bearer_restricted_server.filter_config_for_xds_request(
+            &config,
+            "infra",
+            Some("waypoint".to_string()),
+            true,
+        );
+        let bearer_multi_namespace = bearer_multi_namespace_server.filter_config_for_xds_request(
+            &config,
+            "infra",
+            Some("waypoint".to_string()),
+            true,
+        );
+
+        assert!(
+            without_udp
+                .mesh
+                .expect("mesh should remain")
+                .mesh_policies
+                .is_empty()
+        );
+        assert_eq!(
+            with_udp
+                .mesh
+                .expect("mesh should remain")
+                .mesh_policies
+                .len(),
+            1,
+            "xDS prefilter must retain source policies before snapshot slicing"
+        );
+        assert_eq!(
+            bearer_multi_namespace
+                .mesh
+                .expect("mesh should remain")
+                .mesh_policies
+                .len(),
+            1,
+            "xDS prefilter must retain every bearer-authorized source namespace"
+        );
+        let restricted_mesh = bearer_restricted.mesh.expect("mesh should remain");
+        assert!(restricted_mesh.workloads.is_empty());
+        assert!(restricted_mesh.mesh_policies.is_empty());
     }
 
     #[test]
@@ -2971,6 +3147,7 @@ mod tests {
             &update,
             "infra",
             Some("waypoint".to_string()),
+            false,
         ));
         let state_key = xds_state_key("infra", "node-a");
         server.reconcile_node_metadata(
@@ -2978,6 +3155,7 @@ mod tests {
             crate::xds::carrier::XdsNodeMetadata {
                 workload_spiffe_id: None,
                 waypoint_name: Some("waypoint".to_string()),
+                ambient_udp_source_scoping: false,
             },
         );
         let snapshot =
@@ -3203,7 +3381,7 @@ mod tests {
             .send(full_config_update(&new_config))
             .expect("pending update should send");
         let mut stream_config = XdsStreamConfig::new(old_config);
-        server.catch_up_pending_updates(&mut updates, &mut stream_config, "default", None);
+        server.catch_up_pending_updates(&mut updates, &mut stream_config, "default", None, false);
         let mut subscriptions = HashMap::new();
         let request = DiscoveryRequest {
             type_url: super::super::translator::CDS_TYPE_URL.to_string(),
@@ -3268,7 +3446,7 @@ mod tests {
             .send(full_config_update(&new_config))
             .expect("pending update should send");
         let mut stream_config = XdsStreamConfig::new(old_config);
-        server.catch_up_pending_updates(&mut updates, &mut stream_config, "default", None);
+        server.catch_up_pending_updates(&mut updates, &mut stream_config, "default", None, false);
         let request = DeltaDiscoveryRequest {
             type_url: super::super::translator::CDS_TYPE_URL.to_string(),
             resource_names_subscribe: vec!["*".to_string()],

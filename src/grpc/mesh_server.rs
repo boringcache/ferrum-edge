@@ -3,6 +3,7 @@
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use futures_util::stream;
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -290,16 +291,28 @@ impl MeshGrpcServer {
         &self,
         config: &GatewayConfig,
         request: &MeshSliceRequest,
+        bearer_namespaces: Option<&HashSet<String>>,
     ) -> GatewayConfig {
-        CpGrpcServer::filter_config_to_mesh_request_for_scope(config, request, &self.scope)
+        CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            config,
+            request,
+            &self.scope,
+            bearer_namespaces,
+        )
     }
 
     fn filter_config_for_request_and_scope(
         config: &GatewayConfig,
         request: &MeshSliceRequest,
         scope: &CpScope,
+        bearer_namespaces: Option<&HashSet<String>>,
     ) -> GatewayConfig {
-        CpGrpcServer::filter_config_to_mesh_request_for_scope(config, request, scope)
+        CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            config,
+            request,
+            scope,
+            bearer_namespaces,
+        )
     }
 
     #[allow(clippy::result_large_err)]
@@ -348,10 +361,16 @@ impl MeshGrpcServer {
         slice_request: MeshSliceRequest,
         previous_slice: &MeshSlice,
         scope: &CpScope,
+        bearer_namespaces: Option<&HashSet<String>>,
     ) -> Result<(MeshSlice, Option<MeshConfigUpdate>), Status> {
         let mut candidate = stream_config.clone();
         apply_incremental_to_config_snapshot(&mut candidate, delta);
-        candidate = Self::filter_config_for_request_and_scope(&candidate, &slice_request, scope);
+        candidate = Self::filter_config_for_request_and_scope(
+            &candidate,
+            &slice_request,
+            scope,
+            bearer_namespaces,
+        );
         candidate.normalize_fields();
         candidate.normalize_mesh_fields();
         // Advance the per-stream base BEFORE building the wire frame: the delta
@@ -456,6 +475,7 @@ impl MeshConfigSync for MeshGrpcServer {
         let node_id = inner.node_id;
         let node_version = inner.ferrum_version;
         let node_namespace = inner.namespace;
+        let bearer_namespaces = allowed.0.clone();
 
         let slice_request = MeshSliceRequest::from_native(
             node_id.clone(),
@@ -468,12 +488,18 @@ impl MeshConfigSync for MeshGrpcServer {
         .with_enforce_sidecar_egress(self.sidecar_enforced)
         .with_sidecar_egress_dry_run(self.sidecar_enforced_dry_run)
         .with_enforce_sidecar_identity_narrowing(self.sidecar_identity_narrowing);
+        let slice_request =
+            slice_request.with_ambient_udp_source_scoping(inner.ambient_udp_source_scoping);
         // Register the receiver before loading the initial snapshot so a
         // concurrent CP broadcast is either captured by this stream or already
         // reflected in the loaded snapshot.
         let rx = self.mesh_update_tx.subscribe();
         let config = self.config.load_full();
-        let mut initial_config = self.filter_config_for_request(config.as_ref(), &slice_request);
+        let mut initial_config = self.filter_config_for_request(
+            config.as_ref(),
+            &slice_request,
+            bearer_namespaces.as_ref(),
+        );
         initial_config.normalize_fields();
         initial_config.normalize_mesh_fields();
         let initial_slice = MeshSlice::from_gateway_config(&initial_config, slice_request.clone());
@@ -494,6 +520,7 @@ impl MeshConfigSync for MeshGrpcServer {
         let config_for_recovery = self.config.clone();
         let stream_slice_request = slice_request.clone();
         let stream_scope = self.scope.clone();
+        let stream_bearer_namespaces = bearer_namespaces;
         let stream = BroadcastStream::new(rx).filter_map(move |result| {
             let slice_request = stream_slice_request.clone();
             match result {
@@ -502,6 +529,7 @@ impl MeshConfigSync for MeshGrpcServer {
                         config.as_ref(),
                         &slice_request,
                         &stream_scope,
+                        stream_bearer_namespaces.as_ref(),
                     );
                     config.normalize_fields();
                     config.normalize_mesh_fields();
@@ -529,6 +557,7 @@ impl MeshConfigSync for MeshGrpcServer {
                         slice_request,
                         &previous_slice,
                         &stream_scope,
+                        stream_bearer_namespaces.as_ref(),
                     ) {
                         Ok((next_slice, maybe_update)) => {
                             if maybe_update.is_some() {
@@ -556,6 +585,7 @@ impl MeshConfigSync for MeshGrpcServer {
                         current.as_ref(),
                         &slice_request,
                         &stream_scope,
+                        stream_bearer_namespaces.as_ref(),
                     );
                     current_config.normalize_fields();
                     current_config.normalize_mesh_fields();
@@ -782,6 +812,7 @@ mod tests {
             slice_request,
             &previous_slice,
             &CpScope::Single("ferrum".to_string()),
+            None,
         )
         .expect("mesh delta should build");
 
@@ -822,6 +853,7 @@ mod tests {
             &full_config,
             &slice_request,
             &scope,
+            None,
         );
         let mesh = stream_config.mesh.as_ref().expect("mesh should remain");
         assert_eq!(mesh.workloads.len(), 1);
@@ -854,6 +886,7 @@ mod tests {
             slice_request,
             &previous_slice,
             &scope,
+            None,
         )
         .expect("mesh delta should build");
 
