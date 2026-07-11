@@ -1422,6 +1422,116 @@ async fn selected_stream_reserves_queue_capacity_before_commit() {
 }
 
 #[tokio::test]
+async fn response_guardrail_candidate_reserves_stream_capacity_before_commit() {
+    let plugin = AiTranscriptAudit::new(
+        &json!({
+            "capture": { "response": false, "streaming_response": "sampled" },
+            "sampling": {
+                "rate": 0.0,
+                "always_capture_on_error": false,
+                "always_capture_on_guardrail": true
+            },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/x",
+                "batch_size": 1,
+                "flush_interval_ms": 100,
+                "buffer_capacity": 1,
+                "on_buffer_full": "reject"
+            }
+        }),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let request_headers = json_headers();
+    let stream_body =
+        br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+
+    let mut first = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut first, &request_headers, stream_body)
+        .await;
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut first, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    plugin.on_response_stream_selected(&first, 200, Some("text/event-stream"));
+
+    let mut second = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut second, &request_headers, stream_body)
+        .await;
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut second, 200, &mut response_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 503,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn possible_final_sse_relabel_is_admitted_before_header_rewrite() {
+    let plugin = AiTranscriptAudit::new(
+        &json!({
+            "capture": { "response": false, "streaming_response": "sampled" },
+            "sampling": {
+                "rate": 0.0,
+                "always_capture_on_error": false,
+                "always_capture_on_guardrail": true
+            },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/x",
+                "batch_size": 1,
+                "flush_interval_ms": 100,
+                "buffer_capacity": 1,
+                "on_buffer_full": "reject"
+            }
+        }),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let request_headers = json_headers();
+    let stream_body =
+        br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+    let mut original_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    let mut first = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut first, &request_headers, stream_body)
+        .await;
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut first, 200, &mut original_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    plugin.on_response_stream_selected(&first, 200, Some("text/event-stream"));
+
+    let mut second = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut second, &request_headers, stream_body)
+        .await;
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut second, 200, &mut original_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 503,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
 async fn unsampled_success_stream_does_not_consume_fail_closed_capacity() {
     let plugin = AiTranscriptAudit::new(
         &json!({

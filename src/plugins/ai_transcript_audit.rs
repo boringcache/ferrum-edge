@@ -689,7 +689,11 @@ impl AiTranscriptAudit {
 
         let sample_hit = self.staged_sample_hit(&ctx.metadata);
         sample_hit
-            || (self.sampling.always_on_guardrail && guardrail_fired(&ctx.metadata))
+            // A response-side streaming inspector can fire the guardrail only
+            // after headers commit. Reserve now for that possible terminal
+            // emission; the permit is released if the stream completes without
+            // an emission override.
+            || self.sampling.always_on_guardrail
             || (self.sampling.always_on_error && response_status >= 400)
     }
 

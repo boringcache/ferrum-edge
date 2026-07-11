@@ -12389,9 +12389,22 @@ async fn run_after_proxy_hooks_on_rejection(
                     *status_code = reject.status_code;
                     *body = reject.body;
                     // Keep headers already attached by earlier decorators (for
-                    // example CORS and correlation IDs), discard only the stale
-                    // length, and let explicit replacement headers win.
-                    response_headers.remove("content-length");
+                    // example CORS and correlation IDs), but discard metadata
+                    // describing the representation that is being replaced.
+                    // Explicit replacement headers below then define the new
+                    // body and win over any retained decorator header.
+                    for header in [
+                        "content-length",
+                        "content-encoding",
+                        "content-range",
+                        "content-md5",
+                        "digest",
+                        "content-digest",
+                        "repr-digest",
+                        "etag",
+                    ] {
+                        response_headers.remove(header);
+                    }
                     response_headers.extend(reject.headers);
                     warn!(
                         rejecting_plugin = plugin.name(),
@@ -27697,6 +27710,13 @@ mod tests {
         let mut headers = HashMap::from([
             ("content-type".to_string(), "text/plain".to_string()),
             ("content-length".to_string(), "17".to_string()),
+            ("content-encoding".to_string(), "gzip".to_string()),
+            ("content-range".to_string(), "bytes 0-16/17".to_string()),
+            ("content-md5".to_string(), "stale-md5".to_string()),
+            ("digest".to_string(), "sha-256=stale".to_string()),
+            ("content-digest".to_string(), "sha-256=:stale:".to_string()),
+            ("repr-digest".to_string(), "sha-256=:stale:".to_string()),
+            ("etag".to_string(), "\"stale\"".to_string()),
         ]);
         let mut body = b"synthetic success".to_vec();
 
@@ -27719,7 +27739,21 @@ mod tests {
             "replacement must retain CORS/correlation-style headers from earlier hooks"
         );
         assert_eq!(headers.get("x-replaced").map(String::as_str), Some("true"));
-        assert!(!headers.contains_key("content-length"));
+        for stale_header in [
+            "content-length",
+            "content-encoding",
+            "content-range",
+            "content-md5",
+            "digest",
+            "content-digest",
+            "repr-digest",
+            "etag",
+        ] {
+            assert!(
+                !headers.contains_key(stale_header),
+                "replacement retained stale {stale_header}"
+            );
+        }
         assert!(!ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY));
     }
 
