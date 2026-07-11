@@ -12410,13 +12410,11 @@ async fn run_after_proxy_hooks_on_rejection(
                     // describing the representation that is being replaced.
                     // Explicit replacement headers below then define the new
                     // body and win over any retained decorator header.
-                    let preserve_origin_vary = response_headers
-                        .get("vary")
-                        .is_some_and(|value| {
-                            value
-                                .split(',')
-                                .any(|token| token.trim().eq_ignore_ascii_case("origin"))
-                        });
+                    let preserve_origin_vary = response_headers.get("vary").is_some_and(|value| {
+                        value
+                            .split(',')
+                            .any(|token| token.trim().eq_ignore_ascii_case("origin"))
+                    });
                     for header in [
                         "content-length",
                         "content-encoding",
@@ -27788,10 +27786,7 @@ mod tests {
             ),
             ("age".to_string(), "120".to_string()),
             ("pragma".to_string(), "cache".to_string()),
-            (
-                "vary".to_string(),
-                "accept-encoding, Origin".to_string(),
-            ),
+            ("vary".to_string(), "accept-encoding, Origin".to_string()),
             ("warning".to_string(), "110 stale".to_string()),
         ]);
         let mut body = b"synthetic success".to_vec();
