@@ -853,7 +853,7 @@ mod tests {
             &full_config,
             &slice_request,
             &scope,
-            false,
+            None,
         );
         let mesh = stream_config.mesh.as_ref().expect("mesh should remain");
         assert_eq!(mesh.workloads.len(), 1);
@@ -886,7 +886,7 @@ mod tests {
             slice_request,
             &previous_slice,
             &scope,
-            false,
+            None,
         )
         .expect("mesh delta should build");
 

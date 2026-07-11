@@ -1924,7 +1924,7 @@ impl Plugin for MeshAuthz {
         // never clones the full `MeshSlice` (which carries workloads,
         // services, destination_rules, etc. the authz engine never reads).
         let mut scope_missing = false;
-        let mut node_waypoint_authorized_destination = None;
+        let mut authorized_destination = None;
         let decision = if ambient_udp_source_scope_request {
             // Ambient UDP inbound relay. Evaluate the UNION of:
             //
@@ -1959,12 +1959,11 @@ impl Plugin for MeshAuthz {
             // both arms is yielded only once.
             let source_scope = ambient_udp_source_scope;
             if self.ambient_udp_destination_scope_required {
-                let destination_scopes = ctx
+                let destination_scope_match = ctx
                     .matched_proxy
                     .as_ref()
-                    .and_then(|proxy| self.destination_scope_match_for_proxy(proxy))
-                    .map(|matched| matched.scopes);
-                let Some(destination_scopes) = destination_scopes else {
+                    .and_then(|proxy| self.destination_scope_match_for_proxy(proxy));
+                let Some(destination_scope_match) = destination_scope_match else {
                     ctx.metadata.insert(
                         "mesh_authz.destination_scope_missing".to_string(),
                         "true".to_string(),
@@ -1981,6 +1980,15 @@ impl Plugin for MeshAuthz {
                         headers: HashMap::new(),
                     };
                 };
+                // Authorization runs before `before_proxy`, where
+                // `mesh_route_dispatch` may attempt to replace this relay's
+                // destination. Stamp the exact destination that supplied the
+                // scopes evaluated below; the route-dispatch guard then rejects
+                // any different post-authz backend instead of letting the UDP
+                // handler dial a workload whose policies were never evaluated.
+                authorized_destination =
+                    Some(destination_scope_match.authorized_destination.clone());
+                let destination_scopes = destination_scope_match.scopes;
                 evaluate_mesh_authorization_policies(
                     self.ambient_udp_source_policies.iter().filter(|policy| {
                         let destination_applies = destination_scopes
@@ -2032,8 +2040,7 @@ impl Plugin for MeshAuthz {
             if can_use_destination_scope
                 && let Some(destination_scope_match) = destination_scope_match
             {
-                node_waypoint_authorized_destination =
-                    Some(destination_scope_match.authorized_destination);
+                authorized_destination = Some(destination_scope_match.authorized_destination);
                 evaluate_destination_policy_scopes(
                     &self.slice.mesh_policies,
                     destination_scope_match.scopes,
@@ -2121,7 +2128,7 @@ impl Plugin for MeshAuthz {
         let result = self.decision_to_result(decision, &mut ctx.metadata);
         if self.has_scoped_policies
             && matches!(result, PluginResult::Continue)
-            && let Some(destination) = node_waypoint_authorized_destination
+            && let Some(destination) = authorized_destination
         {
             match destination {
                 NodeWaypointAuthorizedDestination::Upstream(upstream_id) => {

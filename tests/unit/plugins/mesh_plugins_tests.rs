@@ -1080,6 +1080,13 @@ async fn mesh_authz_service_waypoint_udp_uses_exact_destination_workload_scope()
         matches!(result, PluginResult::Continue),
         "selector DENY for a sibling backend must not apply to the matched backend, got {result:?}"
     );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.node_waypoint_authorized_backend")
+            .map(String::as_str),
+        Some("10.0.2.31|53"),
+        "ServiceWaypoint UDP must bind later route overrides to the authorized backend"
+    );
 }
 
 #[tokio::test]
