@@ -170,6 +170,10 @@ pub(crate) const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_respo
 /// precise signal; the normal buffered backend-response path never sets it.
 pub(crate) const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
 
+/// Internal marker carried only on a response-decision context clone while an
+/// effective retry policy is active. It never reaches transaction metadata.
+const RETRY_RESPONSE_BUFFERING_METADATA_KEY: &str = "ferrum:retry_response_buffering";
+
 /// Marker recorded in `ctx.metadata` when the ORIGINAL backend response was a
 /// range/partial response (`206` or carrying `Content-Range`), captured before
 /// any `after_proxy` hook can mutate the response headers. A plugin whose
@@ -194,6 +198,22 @@ pub(crate) const NO_TRANSFORM_RESPONSE_METADATA_KEY: &str = "ferrum:no_transform
 /// headers. Compression reads this to avoid returning transformed bytes with
 /// the origin's strong validator.
 pub(crate) const STRONG_ETAG_RESPONSE_METADATA_KEY: &str = "ferrum:strong_etag_response";
+
+/// Marker proving that the original backend response metadata below was
+/// captured before any `after_proxy` hook mutated its headers.
+pub(crate) const ORIGINAL_RESPONSE_METADATA_STAMPED_KEY: &str =
+    "ferrum:original_response_metadata_stamped";
+
+/// Parsed `Content-Length` from the original backend response. Body transforms
+/// use this snapshot when a later gateway plugin (notably `compression`)
+/// removes the wire header before the buffered-body phase.
+pub(crate) const ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY: &str =
+    "ferrum:original_response_content_length";
+
+/// Marker that the original backend response carried a non-identity
+/// `Content-Encoding`. This distinguishes origin encoding from an encoding
+/// selected later by the gateway compression plugin.
+pub(crate) const ORIGIN_ENCODED_RESPONSE_METADATA_KEY: &str = "ferrum:origin_encoded_response";
 
 /// The ORIGINAL backend HTTP status, captured at the start of
 /// `run_after_proxy_hooks` before any `after_proxy` hook can reject the response
@@ -261,6 +281,31 @@ pub(crate) fn stamp_original_response_metadata(
     response_status: u16,
     response_headers: &HashMap<String, String>,
 ) {
+    ctx.metadata.insert(
+        ORIGINAL_RESPONSE_METADATA_STAMPED_KEY.to_string(),
+        "true".to_string(),
+    );
+    ctx.metadata
+        .remove(ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY);
+    if let Some(content_length) = response_headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        ctx.metadata.insert(
+            ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY.to_string(),
+            content_length.to_string(),
+        );
+    }
+    ctx.metadata.remove(ORIGIN_ENCODED_RESPONSE_METADATA_KEY);
+    if response_headers
+        .get("content-encoding")
+        .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
+    {
+        ctx.metadata.insert(
+            ORIGIN_ENCODED_RESPONSE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
     if response_status == 206 || response_headers.contains_key("content-range") {
         ctx.metadata
             .insert(RANGE_RESPONSE_METADATA_KEY.to_string(), "true".to_string());
@@ -1040,6 +1085,25 @@ pub(crate) fn should_stream_response_body(
     }
 }
 
+pub(crate) fn retry_response_decision_context(ctx: &RequestContext) -> RequestContext {
+    let mut retry_ctx = ctx.clone();
+    retry_ctx.metadata.insert(
+        RETRY_RESPONSE_BUFFERING_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    retry_ctx
+}
+
+pub(crate) fn plugins_may_release_response_body_under_retries(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+) -> bool {
+    plugins.iter().any(|plugin| {
+        plugin.should_buffer_response_body(ctx)
+            && plugin.may_release_response_body_under_retries(ctx)
+    })
+}
+
 #[derive(Debug, Default)]
 struct LaterHeaderSimulation {
     cache_control_no_transform: bool,
@@ -1097,9 +1161,10 @@ fn simulate_later_after_proxy_headers(
 /// plugin that needs the body (caching/compression/transform, or `waf` for an
 /// allowlisted content-type) is never affected. An explicit
 /// [`ResponseBodyMode::Buffer`] is always honored, and a `None` context leaves
-/// the pre-flight decision unchanged — callers pass `None` when retries are
-/// configured, since a retry may need to replay the response body and a
-/// non-final attempt must stay buffered.
+/// the pre-flight decision unchanged. Retry-enabled callers pass a marked
+/// context clone: ordinary responses stay buffered, while every active
+/// buffering plugin must explicitly opt an inherently streaming response out
+/// after headers arrive.
 ///
 /// If any plugin can mutate the response `Content-Type` in a later
 /// `after_proxy` hook, the helper keeps the original buffered decision. That
@@ -1129,6 +1194,38 @@ pub(crate) fn refine_stream_response_for_content_type(
     let mut simulated_ctx = ctx.clone();
     stamp_original_response_metadata(&mut simulated_ctx, response_status, response_headers);
     let mut simulated_response_headers = response_headers.clone();
+    if simulated_ctx
+        .metadata
+        .contains_key(RETRY_RESPONSE_BUFFERING_METADATA_KEY)
+    {
+        if plugins
+            .iter()
+            .any(|plugin| plugin.may_modify_response_content_type(ctx, content_type))
+        {
+            return false;
+        }
+        let mut saw_retry_release_plugin = false;
+        let all_active_plugins_release = plugins.iter().all(|plugin| {
+            if !plugin.should_buffer_response_body(&simulated_ctx) {
+                true
+            } else if plugin.may_release_response_body_under_retries(&simulated_ctx) {
+                saw_retry_release_plugin = true;
+                plugin.should_release_response_body_under_retries(
+                    &simulated_ctx,
+                    response_status,
+                    response_headers,
+                )
+            } else {
+                !plugin.should_buffer_response_body_for_content_type(
+                    &simulated_ctx,
+                    content_type,
+                    response_status,
+                    response_headers,
+                )
+            }
+        });
+        return saw_retry_release_plugin && all_active_plugins_release;
+    }
     let all_active_plugins_can_release_before_content_type_rewrite =
         plugins.iter().enumerate().all(|(index, plugin)| {
             let can_release = if plugin.should_buffer_response_body(&simulated_ctx) {
@@ -2197,12 +2294,16 @@ pub(crate) fn store_request_body_metadata(
 
 pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<String, String>) {
     metadata.remove("request_body");
+    metadata.remove(ORIGINAL_RESPONSE_METADATA_STAMPED_KEY);
+    metadata.remove(ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY);
+    metadata.remove(ORIGIN_ENCODED_RESPONSE_METADATA_KEY);
     // ai_tool_governor uses these request-scoped markers to select the
     // inspectable streaming path and seed approval correlation. They are
     // lifecycle bookkeeping, not observability metadata, and must never make
     // `observability.emit_metadata: false` ineffective.
     metadata.remove(crate::plugins::ai_tool_governor::STREAM_REQUESTED_KEY);
     metadata.remove(crate::plugins::ai_tool_governor::STREAM_MODEL_KEY);
+    crate::plugins::mcp_gateway::redact_internal_log_metadata(metadata);
 }
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
@@ -12454,6 +12555,7 @@ async fn apply_synthetic_response_body_hooks(
         {
             response_headers.insert("content-length".to_string(), transformed.len().to_string());
             *response_body = transformed;
+            plugin.on_response_body_transformed(ctx, response_headers);
         }
     }
 
@@ -14368,13 +14470,25 @@ async fn handle_proxy_request_inner(
         &ctx.headers,
         &state.mesh_egress_strip_baggage_keys,
     );
+    let stream_hooks_enabled = plugin_cache_view.requires_response_stream_hooks();
+    let maybe_requires_response_body_buffering =
+        plugin_cache_view.requires_response_body_buffering();
+
+    // Request-body transforms can change the per-request response policy (most
+    // notably `stream: true`). When either response buffering or streaming
+    // inspection is configured, finalize the already-required buffered request
+    // body before selecting a backend transport. The two PluginCache flags keep
+    // the ordinary no-body-policy path unchanged: no extra scan, clone, collect,
+    // or hook pass.
+    let reevaluate_response_policy_after_request_body = !is_grpc_request
+        && requires_request_body_buffering
+        && (maybe_requires_response_body_buffering || stream_hooks_enabled);
+    let mut request_body_prepared = false;
     // Pre-computed at config reload (see `PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT`)
     // so the proxy hot path does not re-scan the plugin list per request.
     let needs_final_request_body_context = requires_request_body_buffering
         && capabilities
             .has(crate::plugin_cache::PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT);
-    let proxy_headers: &HashMap<String, String> =
-        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
     let effective_query_string = query_string_after_plugin_strips(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
@@ -14421,7 +14535,7 @@ async fn handle_proxy_request_inner(
         &state,
         &epoch,
         &ctx.client_ip,
-        proxy_headers,
+        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
         ctx.orig_dst,
     );
     let lb_hash_key = selection.lb_hash_key;
@@ -14446,6 +14560,7 @@ async fn handle_proxy_request_inner(
 
     let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet> = None;
+    let mut preacquired_backend_admission = PreacquiredBackendAdmission::default();
 
     // Circuit breaker check — per-target when upstream is configured, per-proxy otherwise
     // `cb_admission_open_epoch` is re-captured on retry-target rotation (the gRPC
@@ -14483,6 +14598,196 @@ async fn handle_proxy_request_inner(
                 return Ok(build_response_from_normalized_reject(reject));
             }
         };
+
+    // Finalize the body only after fail-fast routing and breaker gates have
+    // admitted the request. This preserves the open-breaker behavior (no slow
+    // upload drain or body-plugin I/O before the immediate 503) while still
+    // updating response buffering and transport preference before dispatch.
+    let preparation_backend_host = upstream_target
+        .as_deref()
+        .map(|target| target.host.as_str())
+        .unwrap_or(proxy.backend_host.as_str());
+    let preparation_requires_direct_h2_for_sni = reevaluate_response_policy_after_request_body
+        && resolve_backend_connection_proxy_for_target(&proxy, upstream_target.as_deref())
+            .resolved_tls
+            .sni
+            .is_some();
+    let preparation_blocked_by_dispatch_policy = preparation_requires_direct_h2_for_sni
+        || denied_literal_backend_or_dns_override(
+            preparation_backend_host,
+            &proxy,
+            &state.env_config.backend_allow_ips,
+        )
+        .is_some()
+        || backend_dispatch::direct_http_mesh_transport_refusal(upstream_target.as_deref())
+            .is_some();
+    if reevaluate_response_policy_after_request_body && !preparation_blocked_by_dispatch_policy {
+        if !backend_admission_plugins.is_empty() {
+            let admission_proxy =
+                resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref());
+            let permits = match backend_dispatch::run_backend_admission_plugins(
+                backend_admission_plugins.as_ref(),
+                &ctx,
+                admission_proxy.as_ref(),
+                upstream_target.as_deref(),
+                ProxyProtocol::Http,
+            ) {
+                Ok(permits) => permits,
+                Err(rejection) => {
+                    release_circuit_breaker_probe_on_admission_reject(
+                        &state,
+                        &proxy,
+                        cb_target_key.as_deref(),
+                        cb_is_half_open_probe,
+                    );
+                    return Ok(handle_backend_admission_rejection(
+                        rejection,
+                        &plugins,
+                        &mut ctx,
+                        &state,
+                        start_time,
+                        plugin_execution_ns,
+                        Some(&original_request_path),
+                        is_grpc_request,
+                        grpc_web_response_content_type,
+                    )
+                    .await);
+                }
+            };
+            preacquired_backend_admission = PreacquiredBackendAdmission::acquired(permits);
+        }
+        let hook_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
+        client_request_body = match client_request_body {
+            ClientRequestBody::Streaming(request) => {
+                match buffer_request_body_for_before_proxy(
+                    *request,
+                    &method,
+                    &hook_headers,
+                    state.max_request_body_size_bytes,
+                )
+                .await
+                {
+                    Ok(body) => body,
+                    Err(RequestBodyBufferError::TooLarge) => {
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            cb_is_half_open_probe,
+                        );
+                        record_request(&state, 413);
+                        return Ok(build_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            r#"{"error":"Request body exceeds maximum size"}"#,
+                        ));
+                    }
+                    Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            cb_is_half_open_probe,
+                        );
+                        error!(
+                            proxy_id = %proxy.id,
+                            path = %ctx.path,
+                            error_kind = "client_disconnect",
+                            error = %error_message,
+                            "Client disconnected while finalizing request body before dispatch"
+                        );
+                        record_request(&state, 499);
+                        return Ok(build_response(
+                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                            r#"{"error":"Client disconnected"}"#,
+                        ));
+                    }
+                }
+            }
+            buffered => buffered,
+        };
+
+        client_request_body = match client_request_body {
+            ClientRequestBody::Buffered(body) => {
+                ctx.bytes_sent_observed
+                    .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                let mut body_hook_ctx = needs_final_request_body_context
+                    .then(|| ctx.clone_for_final_request_body_hooks());
+                let transformed = apply_request_body_plugins_with_context(
+                    &plugins,
+                    body_hook_ctx.as_mut(),
+                    &hook_headers,
+                    body,
+                )
+                .await;
+                let final_body_result = run_final_request_body_hooks(
+                    &plugins,
+                    body_hook_ctx.as_mut(),
+                    &hook_headers,
+                    &transformed,
+                )
+                .await;
+                if let Some(body_hook_ctx) = body_hook_ctx {
+                    let request_body = ctx.metadata.remove("request_body");
+                    ctx.metadata = body_hook_ctx.metadata;
+                    if let Some(body) = request_body {
+                        ctx.metadata.insert("request_body".to_string(), body);
+                    }
+                    ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
+                    ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
+                    ctx.waf_score = body_hook_ctx.waf_score;
+                }
+                match final_body_result {
+                    PluginResult::Continue => {
+                        request_body_prepared = true;
+                        ClientRequestBody::Buffered(transformed)
+                    }
+                    reject @ PluginResult::Reject { .. }
+                    | reject @ PluginResult::RejectBinary { .. } => {
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            cb_is_half_open_probe,
+                        );
+                        let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                            record_request(&state, 500);
+                            return Ok(build_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                r#"{"error":"Internal error"}"#,
+                            ));
+                        };
+                        let status = StatusCode::from_u16(reject.status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let normalized = finalize_reject_response_with_after_proxy_hooks(
+                            &plugins,
+                            &mut ctx,
+                            status,
+                            &reject.body,
+                            reject.headers,
+                            is_grpc_request,
+                        )
+                        .await;
+                        apply_grpc_reject_metadata(&mut ctx, &normalized);
+                        log_rejected_request_with_path(
+                            &plugins,
+                            &ctx,
+                            normalized.http_status.as_u16(),
+                            start_time,
+                            "on_final_request_body",
+                            plugin_execution_ns,
+                            Some(&original_request_path),
+                        )
+                        .await;
+                        record_request(&state, normalized.http_status.as_u16());
+                        return Ok(build_response_from_normalized_reject(normalized));
+                    }
+                }
+            }
+            bodyless => bodyless,
+        };
+    }
+    let proxy_headers: &HashMap<String, String> =
+        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
     // Check if this is a WebSocket upgrade request. WebSocket is a runtime
     // flavor in the new scheme-decoupled model — any HTTP-family proxy
@@ -16383,6 +16688,10 @@ async fn handle_proxy_request_inner(
                                 transformed.len().to_string(),
                             );
                             response_body = transformed;
+                            plugin.on_response_body_transformed(
+                                &mut ctx,
+                                &mut plugin_response_headers,
+                            );
                         }
                     }
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -16838,7 +17147,7 @@ async fn handle_proxy_request_inner(
         &proxy,
         &plugins,
         &ctx,
-        plugin_cache_view.requires_response_body_buffering(),
+        maybe_requires_response_body_buffering,
     );
 
     // Determine if we can stream the request body to the backend without
@@ -16847,18 +17156,14 @@ async fn handle_proxy_request_inner(
     // failures.
     let has_retry = crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method);
     let stream_request_body = !has_retry && !requires_request_body_buffering;
-    // A response-stream inspector (e.g. ai_semantic_firewall `inspect`) is wired
-    // only on the reqwest streaming path, so a request that WILL be inspected must
-    // be dispatched via reqwest — otherwise a native-H3 backend would return
-    // `ResponseBody::StreamingH3` and bypass inspection. This is gated per request
-    // (a plugin returns `true` only for the specific requests it inspects, via
-    // `ctx` markers) so an inspect-mode proxy does NOT push its ordinary,
-    // never-inspected requests off the native-H3 fast path. (Direct-H2/HBONE are
-    // already excluded for these requests because `inspect`/`buffer` force
-    // request-body buffering, which disables those pools; native H3 does not gate
-    // on that, so it is excluded explicitly here.)
-    let requires_response_stream_inspection =
-        plugins.iter().any(|p| p.forces_reqwest_dispatch(&ctx));
+    // The reqwest pin is now an optimization rather than the correctness
+    // boundary: every streaming response arm can drive inspectors. Evaluate it
+    // from the finalized context so a body transform that adds/removes
+    // `stream: true` is reflected before the native-H3 decision commits.
+    let requires_response_stream_inspection = stream_hooks_enabled
+        && plugins
+            .iter()
+            .any(|plugin| plugin.forces_reqwest_dispatch(&ctx));
     let request_client_ip = ctx.client_ip.clone();
     let request_xff_append_ip = socket_ip.clone();
     let retry_config = if has_retry {
@@ -17094,12 +17399,14 @@ async fn handle_proxy_request_inner(
             upstream_target.as_deref(),
             &plugins,
             backend_admission_plugins.as_ref(),
+            std::mem::take(&mut preacquired_backend_admission),
             body_hook_ctx.as_mut(),
             &ctx,
             should_stream,
             requires_request_body_buffering,
             stream_request_body,
             has_retry,
+            request_body_prepared,
             &request_client_ip,
             &request_xff_append_ip,
             is_tls,
@@ -17370,6 +17677,8 @@ async fn handle_proxy_request_inner(
                     current_target.as_deref(),
                     retained_body.as_deref(),
                     h3_retry_stream_response,
+                    &plugins,
+                    &ctx,
                     &ctx.client_ip,
                     &request_xff_append_ip,
                     is_tls,
@@ -17386,6 +17695,8 @@ async fn handle_proxy_request_inner(
                     current_target.as_deref(),
                     retained_body.as_deref(),
                     should_stream && is_last_attempt,
+                    &plugins,
+                    &ctx,
                     &ctx.client_ip,
                     &request_xff_append_ip,
                     is_tls,
@@ -17426,12 +17737,14 @@ async fn handle_proxy_request_inner(
             upstream_target.as_deref(),
             &plugins,
             backend_admission_plugins.as_ref(),
+            std::mem::take(&mut preacquired_backend_admission),
             body_hook_ctx.as_mut(),
             &ctx,
             should_stream,
             requires_request_body_buffering,
             stream_request_body,
             false, // no retry — don't retain body
+            request_body_prepared,
             &request_client_ip,
             &request_xff_append_ip,
             is_tls,
@@ -17869,6 +18182,7 @@ async fn handle_proxy_request_inner(
                 response_headers
                     .insert("content-length".to_string(), transformed.len().to_string());
                 *data = transformed;
+                plugin.on_response_body_transformed(&mut ctx, &mut response_headers);
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -17952,13 +18266,24 @@ async fn handle_proxy_request_inner(
             | ResponseBody::StreamingH2(_)
             | ResponseBody::StreamingH3(_)
     );
+    // Native H3 needs the backend's declared length to distinguish a complete
+    // body followed by a graceful QUIC close from truncation. Preserve it
+    // before an attached inspector strips the client-visible Content-Length.
+    let streaming_h3_backend_content_length =
+        matches!(&response_body, ResponseBody::StreamingH3(_))
+            .then(|| {
+                response_headers
+                    .get("content-length")
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .flatten();
     // Resolve the inspector before cloning the context into the deferred
     // logger. The resolver stamps a private stream id only when an inspector
     // actually attaches; the terminal hook uses that id to drain plugin-owned
     // aggregate state into transaction metadata.
-    let response_inspector = if matches!(response_body, ResponseBody::Streaming { .. }) {
+    let response_inspector = if body_will_stream && stream_hooks_enabled {
         let content_type = response_headers.get("content-type").map(String::as_str);
-        crate::plugins::create_response_stream_inspector(
+        crate::plugins::create_response_stream_inspector_for_enabled_plugins(
             &plugins,
             &mut ctx,
             response_status,
@@ -18373,7 +18698,23 @@ async fn handle_proxy_request_inner(
                     h2_total_deadline,
                 )
             };
-            let mut body = body.with_lb_connection_guard(lb_connection_guard);
+            let mut body = if let Some(inspector) = response_inspector {
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                tokio::spawn(crate::proxy::body::run_proxy_body_response_inspection(
+                    body,
+                    inspector,
+                    tx,
+                    state.max_response_body_size_bytes,
+                    lb_connection_guard,
+                ));
+                crate::proxy::body::inspected_streaming_body(rx)
+            } else {
+                body.with_lb_connection_guard(lb_connection_guard)
+            };
+            // Deferred admission/dispatch outcomes stay on the client-visible
+            // body. The least-connections guard moves into the inspection task
+            // on a hit so a client cancel cannot under-count a provider-blocked
+            // inspector that still owns the backend stream.
             if let Some(permits) = backend_admission_permits.take() {
                 body = body.with_deferred_backend_admission_outcome(
                     permits,
@@ -18442,11 +18783,12 @@ async fn handle_proxy_request_inner(
             body
         }
         ResponseBody::StreamingH3(h3_resp) => {
-            let cl = response_headers
+            let client_content_length = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
             let success_on_drop_after_bytes =
-                h3_success_on_drop_after_response_bytes(inbound_version, cl);
+                h3_success_on_drop_after_response_bytes(inbound_version, client_content_length);
+            let backend_content_length = streaming_h3_backend_content_length;
             // Method + status thread into `H3FrameSource` so its graceful-close
             // recovery gate uses the same `is_response_body_complete` predicate
             // as the buffered path (HEAD/204/304 no-body responses included).
@@ -18460,7 +18802,7 @@ async fn handle_proxy_request_inner(
                     h3_resp.recv_stream,
                     h3_method,
                     response_status,
-                    cl,
+                    backend_content_length,
                     proxy.backend_read_timeout_ms,
                 )
             } else if state.max_response_body_size_bytes > 0 {
@@ -18469,7 +18811,7 @@ async fn handle_proxy_request_inner(
                     state.max_response_body_size_bytes,
                     h3_method,
                     response_status,
-                    cl,
+                    backend_content_length,
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
@@ -18480,16 +18822,27 @@ async fn handle_proxy_request_inner(
                     h3_resp.recv_stream,
                     h3_method,
                     response_status,
-                    cl,
+                    backend_content_length,
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
                     proxy.backend_read_timeout_ms,
                 )
             };
-            let mut body = body
-                .with_success_on_drop_after_response_bytes(success_on_drop_after_bytes)
-                .with_lb_connection_guard(lb_connection_guard);
+            let mut body = if let Some(inspector) = response_inspector {
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                tokio::spawn(crate::proxy::body::run_proxy_body_response_inspection(
+                    body,
+                    inspector,
+                    tx,
+                    state.max_response_body_size_bytes,
+                    lb_connection_guard,
+                ));
+                crate::proxy::body::inspected_streaming_body(rx)
+            } else {
+                body.with_lb_connection_guard(lb_connection_guard)
+            };
+            body = body.with_success_on_drop_after_response_bytes(success_on_drop_after_bytes);
             if let Some(permits) = backend_admission_permits.take() {
                 body = body.with_deferred_backend_admission_outcome(
                     permits,
@@ -19122,6 +19475,8 @@ pub(crate) async fn proxy_to_backend_retry(
     upstream_target: Option<&UpstreamTarget>,
     request_body: Option<&[u8]>,
     stream_response: bool,
+    plugins: &[Arc<dyn Plugin>],
+    request_ctx: &RequestContext,
     client_ip: &str,
     xff_append_ip: &str,
     is_tls: bool,
@@ -19359,6 +19714,21 @@ pub(crate) async fn proxy_to_backend_retry(
             let status = response.status().as_u16();
             let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
             collect_response_headers(response.headers(), &mut resp_headers);
+            let retry_ctx = (!stream_response
+                && plugins_may_release_response_body_under_retries(plugins, request_ctx))
+            .then(|| retry_response_decision_context(request_ctx));
+            let stream_response = if stream_response {
+                true
+            } else {
+                refine_stream_response_for_content_type(
+                    false,
+                    proxy,
+                    plugins,
+                    retry_ctx.as_ref(),
+                    status,
+                    &resp_headers,
+                )
+            };
 
             // Enforce response body size limit — mirrors the logic in
             // `proxy_to_backend`. Without this the retry path would accept
@@ -19519,6 +19889,56 @@ enum BackendDispatchResult {
         streaming_h2_read_timeout_ms: Option<u64>,
     },
     AdmissionRejected(backend_dispatch::BackendAdmissionRejection),
+}
+
+/// Backend-admission result acquired before request-body finalization.
+///
+/// The explicit `was_run` bit distinguishes "admission ran and no plugin
+/// returned a permit" from "admission has not run yet". This lets the narrow
+/// post-transform response-policy path preserve fail-fast admission without
+/// invoking admission plugins twice on accepted requests.
+#[derive(Default)]
+pub(crate) struct PreacquiredBackendAdmission {
+    was_run: bool,
+    permits: Option<BackendAdmissionPermitSet>,
+}
+
+impl PreacquiredBackendAdmission {
+    pub(crate) fn acquired(permits: Option<BackendAdmissionPermitSet>) -> Self {
+        Self {
+            was_run: true,
+            permits,
+        }
+    }
+
+    pub(crate) fn take_if_acquired(&mut self) -> Option<Option<BackendAdmissionPermitSet>> {
+        self.was_run.then(|| {
+            self.was_run = false;
+            self.permits.take()
+        })
+    }
+
+    fn take_or_run(
+        &mut self,
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        ctx: &RequestContext,
+        proxy: &Proxy,
+        upstream_target: Option<&UpstreamTarget>,
+        protocol: ProxyProtocol,
+    ) -> Result<Option<BackendAdmissionPermitSet>, backend_dispatch::BackendAdmissionRejection>
+    {
+        if let Some(permits) = self.take_if_acquired() {
+            Ok(permits)
+        } else {
+            backend_dispatch::run_backend_admission_plugins(
+                plugins,
+                ctx,
+                proxy,
+                upstream_target,
+                protocol,
+            )
+        }
+    }
 }
 
 fn backend_dispatch_response(
@@ -19754,6 +20174,7 @@ async fn proxy_to_backend(
     upstream_target: Option<&UpstreamTarget>,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     backend_admission_plugins: &[Arc<dyn crate::plugins::Plugin>],
+    mut preacquired_backend_admission: PreacquiredBackendAdmission,
     mut ctx: Option<&mut RequestContext>,
     // Real, read-only request context for the response-side buffering decision.
     // Distinct from `ctx` above, which is the request-body-hook clone and is
@@ -19763,6 +20184,7 @@ async fn proxy_to_backend(
     requires_request_body_buffering: bool,
     stream_request_body: bool,
     retain_request_body: bool,
+    request_body_prepared: bool,
     client_ip: &str,
     xff_append_ip: &str,
     is_tls: bool,
@@ -19777,10 +20199,11 @@ async fn proxy_to_backend(
     // has completed.
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
     inbound_version: hyper::Version,
-    // Out-parameter: set to the instant the backend admission permit is
-    // acquired (immediately before the backend dial / send), so the caller's
-    // adaptive-concurrency sample measures only the backend interaction and not
-    // the request-body collection / final-body-hook time that precedes it.
+    // Out-parameter: reset immediately before the backend dial / send, after
+    // admission permits are available. A narrow response-policy reevaluation
+    // path may preacquire admission before body finalization to preserve
+    // fail-fast rejection; its client-upload/body-hook time must still stay out
+    // of the backend latency sample.
     // Left at its incoming value (the caller's `backend_start`) on paths that
     // never reach admission, so the fallback is the pre-fix behavior.
     backend_admission_started_at: &mut Instant,
@@ -19796,14 +20219,15 @@ async fn proxy_to_backend(
     let backend_admission_permits: Option<BackendAdmissionPermitSet>;
 
     // Context for the response-side buffer->stream downgrade. Use the real
-    // request context (not the request-body-hook clone), but suppress the
-    // downgrade entirely when retries are configured: a retry may need to
-    // replay the response body, so every attempt must stay buffered rather than
-    // stream a non-final response. Non-retry requests get the real context so
-    // response-inspection-only configs (e.g. `waf` `response_body_inspection`)
-    // actually benefit.
+    // request context (not the request-body-hook clone). Retry-enabled requests
+    // use a private marked clone so ordinary responses remain buffered while an
+    // inherently streaming representation can be released only when every
+    // active buffering plugin explicitly opts in.
+    let retry_response_ctx = (retain_request_body
+        && plugins_may_release_response_body_under_retries(plugins, request_ctx))
+    .then(|| retry_response_decision_context(request_ctx));
     let response_decision_ctx = if retain_request_body {
-        None
+        retry_response_ctx.as_ref()
     } else {
         Some(request_ctx)
     };
@@ -19864,7 +20288,7 @@ async fn proxy_to_backend(
         {
             return reject;
         }
-        backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+        backend_admission_permits = match preacquired_backend_admission.take_or_run(
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -19950,7 +20374,7 @@ async fn proxy_to_backend(
         {
             return reject;
         }
-        backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+        backend_admission_permits = match preacquired_backend_admission.take_or_run(
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -20019,7 +20443,7 @@ async fn proxy_to_backend(
         {
             return reject;
         }
-        backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+        backend_admission_permits = match preacquired_backend_admission.take_or_run(
             backend_admission_plugins,
             request_ctx,
             proxy,
@@ -20047,6 +20471,7 @@ async fn proxy_to_backend(
             inbound_version,
             stream_request_body,
             retain_request_body,
+            request_body_prepared,
             stream_response,
             ctx_bytes_sent_observed,
         )
@@ -20144,7 +20569,7 @@ async fn proxy_to_backend(
             // limited requests intentionally do not enter this block: they must
             // stay on the reqwest path so local 413 checks and deferred backend
             // admission happen before any backend interaction.
-            let mut h2_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+            let mut h2_admission_permits = match preacquired_backend_admission.take_or_run(
                 backend_admission_plugins,
                 request_ctx,
                 proxy,
@@ -20489,29 +20914,40 @@ async fn proxy_to_backend(
                 //   2. Rejections from `run_final_request_body_hooks` still
                 //      surface the original on-wire size in the log summary.
                 // `fetch_max` preserves the largest observed value across
-                // retries where plugin transforms may shrink the body.
-                ctx_bytes_sent_observed.fetch_max(
-                    body_bytes.len() as u64,
-                    std::sync::atomic::Ordering::Release,
-                );
-                let body_bytes = apply_request_body_plugins_with_context(
-                    plugins,
-                    ctx.as_deref_mut(),
-                    headers,
-                    body_bytes,
-                )
-                .await;
-                match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
-                    PluginResult::Continue => {}
-                    reject @ PluginResult::Reject { .. }
-                    | reject @ PluginResult::RejectBinary { .. } => {
-                        return backend_dispatch_response(
-                            reject_result_to_backend_response(reject, resolved_ip.clone()),
-                            None,
-                            None,
-                        );
-                    }
+                // retries where plugin transforms may shrink the body. The
+                // pre-dispatch finalization path already recorded the raw
+                // client length before replacing this buffer with transformed
+                // bytes, so do not let an expanding transform overwrite that
+                // on-wire count here.
+                if !request_body_prepared {
+                    ctx_bytes_sent_observed.fetch_max(
+                        body_bytes.len() as u64,
+                        std::sync::atomic::Ordering::Release,
+                    );
                 }
+                let body_bytes = if request_body_prepared {
+                    body_bytes
+                } else {
+                    let body_bytes = apply_request_body_plugins_with_context(
+                        plugins,
+                        ctx.as_deref_mut(),
+                        headers,
+                        body_bytes,
+                    )
+                    .await;
+                    match run_final_request_body_hooks(plugins, ctx, headers, &body_bytes).await {
+                        PluginResult::Continue => {}
+                        reject @ PluginResult::Reject { .. }
+                        | reject @ PluginResult::RejectBinary { .. } => {
+                            return backend_dispatch_response(
+                                reject_result_to_backend_response(reject, resolved_ip.clone()),
+                                None,
+                                None,
+                            );
+                        }
+                    }
+                    body_bytes
+                };
                 if !body_bytes.is_empty() {
                     // `Bytes::from(Vec<u8>)` is zero-cost (transfers ownership of
                     // the Vec without copying). The optional clone below is then
@@ -20745,7 +21181,7 @@ async fn proxy_to_backend(
         }
     };
 
-    backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
+    backend_admission_permits = match preacquired_backend_admission.take_or_run(
         backend_admission_plugins,
         request_ctx,
         proxy,
@@ -20755,8 +21191,10 @@ async fn proxy_to_backend(
         Ok(permits) => permits,
         Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
     };
-    // Admission is acquired here, after request-body collection and final-body
-    // hooks, so the adaptive sample measures only the backend interaction.
+    // Ordinary requests acquire admission here after request-body collection
+    // and final-body hooks. The narrow post-transform policy path consumes its
+    // preacquired result here instead; either way, reset the timer now so the
+    // adaptive sample measures only the backend interaction.
     *backend_admission_started_at = Instant::now();
 
     // Send
@@ -24179,6 +24617,7 @@ async fn proxy_to_backend_http3(
     inbound_version: hyper::Version,
     stream_request_body: bool,
     retain_request_body: bool,
+    request_body_prepared: bool,
     stream_response: bool,
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> (retry::BackendResponse, Option<Bytes>) {
@@ -24547,20 +24986,35 @@ async fn proxy_to_backend_http3(
         }
     };
 
-    ctx_bytes_sent_observed.fetch_max(request_body.len() as u64, Ordering::Release);
-
-    let request_body =
-        apply_request_body_plugins_with_context(plugins, ctx.as_deref_mut(), headers, request_body)
-            .await;
-    match run_final_request_body_hooks(plugins, ctx, headers, &request_body).await {
-        PluginResult::Continue => {}
-        reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
-            return (
-                reject_result_to_backend_response(reject, resolved_ip.clone()),
-                None,
-            );
-        }
+    // Prepared buffers have already contributed their raw client-visible
+    // length before transformation. The buffer here may be larger after a
+    // transform, so counting it again would turn bytes_sent into backend-wire
+    // bytes instead of client-wire bytes.
+    if !request_body_prepared {
+        ctx_bytes_sent_observed.fetch_max(request_body.len() as u64, Ordering::Release);
     }
+
+    let request_body = if request_body_prepared {
+        request_body
+    } else {
+        let request_body = apply_request_body_plugins_with_context(
+            plugins,
+            ctx.as_deref_mut(),
+            headers,
+            request_body,
+        )
+        .await;
+        match run_final_request_body_hooks(plugins, ctx, headers, &request_body).await {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                return (
+                    reject_result_to_backend_response(reject, resolved_ip.clone()),
+                    None,
+                );
+            }
+        }
+        request_body
+    };
 
     let request_content_length = if !request_body.is_empty() {
         Some(request_body.len().to_string())
@@ -25199,6 +25653,8 @@ async fn proxy_to_backend_http3_retry(
     upstream_target: Option<&UpstreamTarget>,
     request_body: Option<&[u8]>,
     stream_response: bool,
+    plugins: &[Arc<dyn Plugin>],
+    request_ctx: &RequestContext,
     client_ip: &str,
     xff_append_ip: &str,
     is_tls: bool,
@@ -25256,8 +25712,11 @@ async fn proxy_to_backend_http3_retry(
     );
 
     let body_bytes = bytes::Bytes::copy_from_slice(request_body.unwrap_or(&[]));
+    let may_release_after_headers =
+        !stream_response && plugins_may_release_response_body_under_retries(plugins, request_ctx);
+    let retry_ctx = may_release_after_headers.then(|| retry_response_decision_context(request_ctx));
 
-    if stream_response {
+    if stream_response || may_release_after_headers {
         let connection_pool = state.connection_pool.clone();
         let proxy_clone = proxy.clone();
         let h3_result = if let Some(target) = upstream_target {
@@ -25309,19 +25768,43 @@ async fn proxy_to_backend_http3_retry(
                         state.max_response_body_size_bytes,
                     );
                 }
-                debug!(
-                    proxy_id = %proxy.id,
-                    status = response.status,
-                    "HTTP/3 backend streaming retry request successful"
-                );
-                let headers = std::mem::take(&mut response.headers);
-                retry::BackendResponse {
-                    status_code: response.status,
-                    body: ResponseBody::StreamingH3(Box::new(response)),
-                    headers,
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: None,
+                let should_stream = if stream_response {
+                    true
+                } else {
+                    refine_stream_response_for_content_type(
+                        false,
+                        proxy,
+                        plugins,
+                        retry_ctx.as_ref(),
+                        response.status,
+                        &response.headers,
+                    )
+                };
+                if should_stream {
+                    debug!(
+                        proxy_id = %proxy.id,
+                        status = response.status,
+                        "HTTP/3 backend streaming retry request successful"
+                    );
+                    let headers = std::mem::take(&mut response.headers);
+                    retry::BackendResponse {
+                        status_code: response.status,
+                        body: ResponseBody::StreamingH3(Box::new(response)),
+                        headers,
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: None,
+                    }
+                } else {
+                    drain_h3_streaming_response_to_buffered(
+                        response,
+                        state,
+                        proxy,
+                        method,
+                        backend_url,
+                        resolved_ip,
+                    )
+                    .await
                 }
             }
             Err(e) => {
@@ -26570,6 +27053,8 @@ mod tests {
         buffer_content_type: &'static str,
     }
 
+    struct RetrySseReleasePlugin;
+
     #[async_trait]
     impl Plugin for ContentTypeBufferPlugin {
         fn name(&self) -> &str {
@@ -26592,6 +27077,36 @@ mod tests {
             _response_headers: &HashMap<String, String>,
         ) -> bool {
             content_type == Some(self.buffer_content_type)
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for RetrySseReleasePlugin {
+        fn name(&self) -> &str {
+            "retry_sse_release_plugin"
+        }
+
+        fn requires_response_body_buffering(&self) -> bool {
+            true
+        }
+
+        fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+            true
+        }
+
+        fn may_release_response_body_under_retries(&self, _ctx: &RequestContext) -> bool {
+            true
+        }
+
+        fn should_release_response_body_under_retries(
+            &self,
+            _ctx: &RequestContext,
+            _response_status: u16,
+            response_headers: &HashMap<String, String>,
+        ) -> bool {
+            response_headers
+                .get("content-type")
+                .is_some_and(|value| value.starts_with("text/event-stream"))
         }
     }
 
@@ -27779,12 +28294,35 @@ mod tests {
             .insert("waf.rule_hits".to_string(), "SPOOFED".to_string());
         ctx.metadata
             .insert("waf.action".to_string(), "blocked".to_string());
+        ctx.metadata
+            .insert("mcp.needs_response_rewrite".to_string(), "true".to_string());
+        ctx.metadata.insert(
+            "mcp.response_rewrite.session".to_string(),
+            "internal-session-hash".to_string(),
+        );
+        ctx.metadata.insert(
+            ORIGINAL_RESPONSE_METADATA_STAMPED_KEY.to_string(),
+            "true".to_string(),
+        );
+        ctx.metadata.insert(
+            ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY.to_string(),
+            "128".to_string(),
+        );
+        ctx.metadata.insert(
+            ORIGIN_ENCODED_RESPONSE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
 
         let metadata = clone_log_metadata(&ctx);
 
         assert!(!metadata.contains_key("request_body"));
         assert!(!metadata.contains_key("waf.rule_hits"));
         assert!(!metadata.contains_key("waf.action"));
+        assert!(!metadata.contains_key("mcp.needs_response_rewrite"));
+        assert!(!metadata.contains_key("mcp.response_rewrite.session"));
+        assert!(!metadata.contains_key(ORIGINAL_RESPONSE_METADATA_STAMPED_KEY));
+        assert!(!metadata.contains_key(ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY));
+        assert!(!metadata.contains_key(ORIGIN_ENCODED_RESPONSE_METADATA_KEY));
 
         ctx.set_waf_metadata("waf.rule_hits", "FE-SQLI-001");
         ctx.metadata
@@ -28180,6 +28718,7 @@ mod tests {
         proxy.backend_port = 1;
         proxy.dns_override = Some("127.0.0.1".to_string());
         proxy.resolved_tls.sni = Some("backend.mesh.internal".to_string());
+        let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
 
         let resp = proxy_to_backend_retry(
             &state,
@@ -28190,6 +28729,8 @@ mod tests {
             None,
             None,
             true,
+            &[],
+            &ctx,
             "127.0.0.1",
             "127.0.0.1",
             true,
@@ -28237,12 +28778,14 @@ mod tests {
                 None,
                 plugins,
                 &[],
+                PreacquiredBackendAdmission::default(),
                 None,  // body-hook ctx (absent for response-only configs)
                 &ctx,  // real read-only request context
                 false, // stream_response: WAF requested buffering pre-flight
                 false, // requires_request_body_buffering
                 true,  // stream_request_body
                 false, // retain_request_body (non-retry -> downgrade active)
+                false, // request_body_prepared
                 "127.0.0.1",
                 "127.0.0.1",
                 false, // is_tls
@@ -28315,6 +28858,90 @@ mod tests {
             matches!(json_body, ResponseBody::Buffered(_)),
             "allowlisted (json) response must stay buffered so the WAF can scan it"
         );
+    }
+
+    #[tokio::test]
+    async fn retry_enabled_dispatch_releases_inherently_streaming_sse_after_headers() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/events"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_bytes(b"data: ready\n\n".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.backend_host = server.address().ip().to_string();
+        proxy.backend_port = server.address().port();
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RetrySseReleasePlugin)];
+        let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/events".into());
+        let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let initial = proxy_to_backend(
+            &state,
+            &proxy,
+            &format!("{}/events", server.uri()),
+            "GET",
+            &HashMap::new(),
+            ClientRequestBody::Buffered(Vec::new()),
+            None,
+            &plugins,
+            &[],
+            PreacquiredBackendAdmission::default(),
+            None,
+            &ctx,
+            false,
+            false,
+            true,
+            true,
+            false,
+            "127.0.0.1",
+            "127.0.0.1",
+            false,
+            false,
+            false,
+            false,
+            &bytes_sent,
+            hyper::Version::HTTP_11,
+            &mut std::time::Instant::now(),
+        )
+        .await;
+        let initial_response = match initial {
+            BackendDispatchResult::Response { response, .. } => *response,
+            BackendDispatchResult::AdmissionRejected(_) => {
+                panic!("test does not configure backend admission plugins")
+            }
+        };
+        assert!(matches!(
+            initial_response.body,
+            ResponseBody::Streaming { .. }
+        ));
+
+        let retry_response = proxy_to_backend_retry(
+            &state,
+            &proxy,
+            &format!("{}/events", server.uri()),
+            "GET",
+            &HashMap::new(),
+            None,
+            None,
+            false,
+            &plugins,
+            &ctx,
+            "127.0.0.1",
+            "127.0.0.1",
+            false,
+            hyper::Version::HTTP_11,
+        )
+        .await;
+        assert!(matches!(
+            retry_response.body,
+            ResponseBody::Streaming { .. }
+        ));
     }
 
     #[tokio::test]
@@ -30259,8 +30886,8 @@ mod tests {
             &binary_headers,
         ));
 
-        // No request context (the proxy passes None when retries are
-        // configured): keep the pre-flight buffering decision.
+        // No request context (including retry configurations with no eligible
+        // release plugin): keep the pre-flight buffering decision.
         assert!(!refine_stream_response_for_content_type(
             false,
             &proxy,
@@ -30282,6 +30909,57 @@ mod tests {
             Some(&ctx),
             200,
             &binary_headers,
+        ));
+
+        let retry_ctx = retry_response_decision_context(&ctx);
+        let sse_headers = HashMap::from([(
+            "content-type".to_string(),
+            "text/event-stream; charset=utf-8".to_string(),
+        )]);
+        let retry_sse_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RetrySseReleasePlugin)];
+        assert!(refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &retry_sse_plugins,
+            Some(&retry_ctx),
+            200,
+            &sse_headers,
+        ));
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &retry_sse_plugins,
+            Some(&retry_ctx),
+            200,
+            &json_headers,
+        ));
+        let retry_sse_with_json_only_inspector: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(RetrySseReleasePlugin),
+            Arc::new(ContentTypeBufferPlugin {
+                buffer_content_type: "application/json",
+            }),
+        ];
+        assert!(refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &retry_sse_with_json_only_inspector,
+            Some(&retry_ctx),
+            200,
+            &sse_headers,
+        ));
+        let retry_sse_blocked_by_other_buffering_plugin: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(RetrySseReleasePlugin),
+            Arc::new(ResponseBufferPlugin {
+                should_buffer: true,
+            }),
+        ];
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &retry_sse_blocked_by_other_buffering_plugin,
+            Some(&retry_ctx),
+            200,
+            &sse_headers,
         ));
     }
 

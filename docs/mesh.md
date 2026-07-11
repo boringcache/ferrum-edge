@@ -1995,7 +1995,14 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   Cleanup removes every duplicate guard jump and strictly detaches any
   partial live-capture OUTPUT path before releasing the guard. The guarded-to-live
   switch propagates xtables resource errors and also probes stale IPv6 guard chains
-  independently of the current IPv6 setting. Enrollment also starts closed: the
+  independently of the current IPv6 setting. First-install detection is portable
+  across iptables backends: the guard establishes chain existence with `-S` before
+  every OUTPUT-jump probe, including strict release of the inactive generation.
+  A fresh pod netns therefore never checks a jump whose target chain does not yet
+  exist (a case where nft-backed iptables returns exit status 2 while legacy
+  returns 1), while any other non-1 status on an existence or jump probe still
+  aborts the install and retains the fail-closed cleanup owner. Enrollment also
+  starts closed: the
   node-agent marks each enrolled pod's BPF pod-IP entry UDP-not-ready before registry
   publication, so the host-veth tc classifier drops pod-originated UDP until the
   producer publishes `.udp-ready/<pod_uid>` after the guarded-to-live transition.
@@ -2012,8 +2019,8 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   signal, so global shutdown cannot race ahead of the manager's marker retraction
   and retain-guard decision. Graceful shutdown AWAITS the per-netns teardown.
   When Ambient UDP capture is disabled, mesh startup still runs a best-effort
-  cleanup manager over the registry
-  so stale pod-netns `FERRUM_MESH_UDP_*` rules from a prior enabled crash/kill are
+  cleanup manager over the registry so stale pod-netns `FERRUM_MESH_UDP_*` rules
+  from a prior enabled crash/kill are
   removed instead of black-holing workload UDP. If it observes a stale
   `.udp-ready` marker, cleanup retracts every marker first and waits for the
   node-agent's closed-gate acknowledgement against one shared deadline; without
