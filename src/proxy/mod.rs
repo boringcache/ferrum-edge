@@ -14177,11 +14177,12 @@ async fn handle_proxy_request_inner(
                         ));
                     }
                     Err(RequestBodyBufferError::TimedOut) => {
-                        record_request(&state, 408);
-                        return Ok(build_response(
-                            StatusCode::REQUEST_TIMEOUT,
-                            r#"{"error":"Request body read timed out"}"#,
-                        ));
+                        let response = build_request_body_timeout_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
                     }
                 }
             }
@@ -14338,11 +14339,12 @@ async fn handle_proxy_request_inner(
                         ));
                     }
                     Err(RequestBodyBufferError::TimedOut) => {
-                        record_request(&state, 408);
-                        return Ok(build_response(
-                            StatusCode::REQUEST_TIMEOUT,
-                            r#"{"error":"Request body read timed out"}"#,
-                        ));
+                        let response = build_request_body_timeout_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
                     }
                 }
             }
@@ -14745,11 +14747,13 @@ async fn handle_proxy_request_inner(
                             cb_target_key.as_deref(),
                             cb_is_half_open_probe,
                         );
-                        record_request(&state, 408);
-                        return Ok(build_response(
-                            StatusCode::REQUEST_TIMEOUT,
-                            r#"{"error":"Request body read timed out"}"#,
-                        ));
+                        drop(preacquired_backend_admission.take_if_acquired());
+                        let response = build_request_body_timeout_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
                     }
                 }
             }
@@ -22132,6 +22136,30 @@ fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
         })
 }
 
+fn build_request_body_timeout_response(
+    is_grpc_request: bool,
+    grpc_web_response_content_type: Option<&str>,
+) -> Response<ProxyBody> {
+    const MESSAGE: &str = "Request body read timed out";
+    if let Some(content_type) = grpc_web_response_content_type {
+        return build_grpc_web_error_response(
+            content_type,
+            grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+            MESSAGE,
+        );
+    }
+    if is_grpc_request {
+        return grpc_proxy::build_grpc_error_response(
+            grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+            MESSAGE,
+        );
+    }
+    build_response(
+        StatusCode::REQUEST_TIMEOUT,
+        r#"{"error":"Request body read timed out"}"#,
+    )
+}
+
 fn build_plain_text_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
@@ -26036,7 +26064,7 @@ fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn stalled_buffered_probe_times_out_and_releases_slot_neutral() {
         use crate::circuit_breaker::CircuitBreaker;
         use crate::config::types::CircuitBreakerConfig;
@@ -26057,7 +26085,7 @@ mod tests {
         assert_eq!(cb.half_open_in_flight(), 1);
 
         let stalled_upload = std::future::pending::<Result<(), ()>>();
-        let result = super::collect_request_body_with_timeout(stalled_upload, 30_000).await;
+        let result = super::collect_request_body_with_timeout(stalled_upload, 10).await;
         assert!(
             matches!(result, Err(super::RequestBodyBufferError::TimedOut)),
             "a never-ending buffered upload must hit the configured deadline"
@@ -26073,6 +26101,26 @@ mod tests {
         assert!(
             cb.can_execute().unwrap(),
             "the released single probe slot admits the next recovery probe"
+        );
+    }
+
+    #[test]
+    fn request_body_timeout_uses_grpc_deadline_response() {
+        let response = super::build_request_body_timeout_response(true, None);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("grpc-status")
+                .and_then(|value| value.to_str().ok()),
+            Some("4")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/grpc")
         );
     }
 
