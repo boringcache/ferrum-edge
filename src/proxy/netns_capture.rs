@@ -72,6 +72,11 @@ use super::{ListenerTlsSource, ProxyState, SourceIpOverride, run_accept_loop};
 pub struct PodCaptureTarget {
     pub pod_uid: String,
     pub cgroup_path: String,
+    /// Workload SPIFFE identity attested by the node-agent for this registry
+    /// entry. Ambient UDP capture stamps it together with `pod_uid` into the
+    /// existing trusted HBONE baggage channel. Missing/malformed registry
+    /// evidence leaves this `None` and preserves mesh-wide authorization.
+    pub source_identity: Option<crate::modes::mesh::hbone::UdpSourceIdentity>,
     /// Source pod IPs, if the node-agent published them. Used to override the
     /// loopback peer of accepted in-netns capture connections so client-IP
     /// authz conditions, logs, and IP-keyed plugins see the real same-family pod
@@ -109,7 +114,8 @@ pub trait PodCaptureSource: Send + Sync {
 
 /// Filesystem registry source: the node-agent writes one file per enrolled pod,
 /// named `<pod_uid>`, whose first line is the pod cgroup path and whose
-/// optional keyed lines carry same-family source IP overrides (`ipv4=<addr>`,
+/// optional keyed lines carry the node-agent-derived workload SPIFFE identity
+/// (`spiffe_id=<id>`) and same-family source IP overrides (`ipv4=<addr>`,
 /// `ipv6=<addr>`). Removing the file (on pod teardown) drops the pod from the
 /// set. This mirrors the existing "pinned path is the entire node-agent ↔
 /// mesh-proxy IPC surface" contract.
@@ -147,17 +153,24 @@ impl PodCaptureSource for DirectoryCaptureSource {
                 continue;
             }
             let mut source_ips = PodCaptureSourceIps::default();
+            let mut source_principal = None;
             for line in lines {
                 let line = line.trim();
-                if let Some(value) = line.strip_prefix("ipv4=") {
+                if let Some(value) = line.strip_prefix("spiffe_id=") {
+                    source_principal = crate::identity::SpiffeId::new(value.trim()).ok();
+                } else if let Some(value) = line.strip_prefix("ipv4=") {
                     source_ips.ipv4 = value.trim().parse::<Ipv4Addr>().ok();
                 } else if let Some(value) = line.strip_prefix("ipv6=") {
                     source_ips.ipv6 = value.trim().parse::<Ipv6Addr>().ok();
                 }
             }
+            let source_identity = source_principal.and_then(|principal| {
+                crate::modes::mesh::hbone::UdpSourceIdentity::new(principal, pod_uid.clone())
+            });
             targets.push(PodCaptureTarget {
                 pod_uid,
                 cgroup_path,
+                source_identity,
                 source_ips,
             });
         }
@@ -1134,6 +1147,7 @@ mod tests {
         PodCaptureTarget {
             pod_uid: uid.to_string(),
             cgroup_path: cgroup.to_string(),
+            source_identity: None,
             source_ips: PodCaptureSourceIps::default(),
         }
     }
@@ -1182,6 +1196,28 @@ mod tests {
     fn directory_source_absent_dir_is_empty_not_error() {
         let source = DirectoryCaptureSource::new("/definitely/not/a/dir");
         assert!(source.list_targets().is_empty());
+    }
+
+    #[test]
+    fn directory_source_pairs_attested_spiffe_with_registry_pod_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let pod_uid = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        std::fs::write(
+            dir.path().join(pod_uid),
+            "/sys/fs/cgroup/pod\nspiffe_id=spiffe://cluster.local/ns/team-a/sa/client\n",
+        )
+        .unwrap();
+
+        let target = DirectoryCaptureSource::new(dir.path())
+            .list_targets()
+            .pop()
+            .expect("registry target");
+        let identity = target.source_identity.expect("valid source identity");
+        assert_eq!(identity.pod_uid, pod_uid);
+        assert_eq!(
+            identity.principal.as_str(),
+            "spiffe://cluster.local/ns/team-a/sa/client"
+        );
     }
 
     #[tokio::test]
@@ -1290,6 +1326,7 @@ mod tests {
         let source = Arc::new(StaticSource(vec![PodCaptureTarget {
             pod_uid: "pod-a".to_string(),
             cgroup_path: "/cg/a".to_string(),
+            source_identity: None,
             source_ips,
         }]));
         let backend = MockBackend::new(&[("/cg/a", Some(100))]);
@@ -1325,6 +1362,7 @@ mod tests {
         let targets = Arc::new(Mutex::new(vec![PodCaptureTarget {
             pod_uid: "pod-a".to_string(),
             cgroup_path: "/cg/a".to_string(),
+            source_identity: None,
             source_ips: PodCaptureSourceIps::default(),
         }]));
 
@@ -1523,6 +1561,7 @@ mod tests {
         let targets = Arc::new(Mutex::new(vec![PodCaptureTarget {
             pod_uid: "pod-a".to_string(),
             cgroup_path: "/cg/a".to_string(),
+            source_identity: None,
             source_ips: PodCaptureSourceIps::default(),
         }]));
         struct DynSource(Arc<Mutex<Vec<PodCaptureTarget>>>);

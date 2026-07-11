@@ -29,7 +29,10 @@ use crate::config::PoolConfig;
 use crate::config::types::{Proxy, UpstreamTarget};
 use crate::dns::DnsCache;
 use crate::identity::{SharedSvidBundle, SvidBundle};
-use crate::modes::mesh::hbone::{BAGGAGE_HEADER, ISTIO_HBONE_PORT, baggage_header_for_source};
+use crate::modes::mesh::hbone::{
+    BAGGAGE_HEADER, ISTIO_HBONE_PORT, UdpSourceIdentity, baggage_header_for_source,
+    baggage_header_for_udp_source,
+};
 use crate::retry::ErrorClass;
 use crate::tls::backend::BackendSvidGeneration;
 use crate::tls::spiffe::{SpiffeTlsError, build_spiffe_outbound_config};
@@ -805,6 +808,7 @@ impl HboneConnectionPool {
         expected_peer: Option<&crate::identity::SpiffeId>,
         expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
         sni_override: Option<&str>,
+        asserted_source: Option<&UdpSourceIdentity>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
         let (source_identity, _fingerprint) = self.current_svid_identity_cached()?;
         let pool_config = self.pool_config.for_proxy(proxy);
@@ -839,7 +843,10 @@ impl HboneConnectionPool {
             Some(connect_timeout),
         )
         .await?;
-        let baggage = baggage_header_for_source(&source_identity);
+        let baggage = asserted_source.map_or_else(
+            || baggage_header_for_source(&source_identity),
+            baggage_header_for_udp_source,
+        );
         tokio::time::timeout(
             connect_timeout,
             open_h2_connect_stream(
@@ -892,6 +899,7 @@ impl HboneConnectionPool {
                 app_port,
                 app_policy_port,
                 expected_peer,
+                None,
                 None,
                 None,
             )
