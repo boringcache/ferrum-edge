@@ -2126,7 +2126,12 @@ impl Plugin for MeshAuthz {
                 .insert("mesh_authz.scope_missing".to_string(), "true".to_string());
         }
         let result = self.decision_to_result(decision, &mut ctx.metadata);
-        if self.has_scoped_policies
+        // NodeWaypoint stamps destinations when scoped policy filtering is
+        // active. ServiceWaypoint UDP must stamp as well: its exact backend
+        // supplied the destination scopes above even though per-pod scoping is
+        // disabled for that topology. In both cases, route dispatch must remain
+        // bound to the destination whose policies were authorized.
+        if (self.has_scoped_policies || self.ambient_udp_destination_scope_required)
             && matches!(result, PluginResult::Continue)
             && let Some(destination) = authorized_destination
         {
