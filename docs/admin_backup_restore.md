@@ -68,10 +68,18 @@ cat ferrum-backup.json | jq '.counts'
 Replaces the entire gateway configuration with the provided backup payload. This is a **destructive operation**, but the payload is validated before any data is deleted:
 
 1. **Validates** the payload for internal consistency (config version compatibility, resource ID uniqueness, consumer identity/credential uniqueness, regex listen_path compilation and length limits, listen_path+hosts uniqueness, stream proxy configuration including response_body_mode, upstream references). If validation fails, the request returns `400` with detailed errors and **existing config is NOT deleted**.
-2. **Snapshots** the current namespace configuration for recovery
+2. **Snapshots** the current namespace configuration for recovery (best-effort — see below)
 3. **Deletes** all existing proxies, consumers, plugin configs, upstreams, and junction table entries
 4. **Imports** the provided resources in dependency order
-5. **Rolls back** to the snapshot if any import persistence step fails
+5. **Rolls back** to the snapshot if the delete or any import persistence step fails
+
+### Recovery snapshot is best-effort
+
+The recovery snapshot in step 2 is captured via `load_full_config`, which **rejects an already-invalid namespace** (dangling references, conflicting listen_paths, invalid regex). Restore is precisely the tool an operator uses to *repair* such a namespace, so a snapshot failure must never block it: when the prior config cannot be snapshotted, restore logs a structured warning, marks rollback **unavailable**, and proceeds. If a later step then fails, the `500` response says the prior config could not be auto-restored and manual recovery is required (the `rollback` field is `"unavailable"`). A restore that imports cleanly still succeeds and repairs the namespace.
+
+### API specs are not restored by rollback
+
+`api_specs` are admin-only metadata that live **outside** `GatewayConfig`, so the delete phase removes them but the config rollback cannot bring them back. When a failed restore rolls back a namespace that carried specs, the `500` response reports `api_specs_not_restored` (the count) and `api_specs_note` (guidance). Re-submit the affected specs with `POST /api-specs` after recovery. Successful restores are unaffected — they replace the namespace, including specs, from scratch.
 
 ### Safety Guard
 
@@ -156,18 +164,27 @@ curl -s -X POST "$TARGET/restore?confirm=true" \
 
 ### Error Handling
 
-If any resource type fails during import, the endpoint removes the partial import, reapplies the pre-restore snapshot, and returns `500 Internal Server Error`:
+If the delete or any resource type fails during import, the endpoint removes the partial state, reapplies the pre-restore snapshot, and returns `500 Internal Server Error`:
 
 ```json
 {
   "error": "Restore failed; restore rolled back and prior config retained",
   "restore_errors": [
     "consumers: unique constraint violation on username"
-  ]
+  ],
+  "rollback": "completed",
+  "api_specs_not_restored": 2,
+  "api_specs_note": "2 API spec(s) were removed and cannot be restored by rollback; re-submit them via POST /api-specs"
 }
 ```
 
-The rollback is best-effort because it uses the same database backend that reported the import failure. If rollback itself fails, the `500` response says that rollback was incomplete, includes `rollback_errors`, and instructs the operator to perform manual recovery. The payload is still validated before the snapshot and delete phases; validation failures return `400` and leave existing config untouched.
+The `rollback` field reports the outcome:
+
+- `completed` — the prior config was reapplied and retained.
+- `incomplete` — reapplying the prior config failed; the response includes `rollback_errors` and instructs the operator to perform manual recovery. The rollback is best-effort because it uses the same database backend that reported the failure.
+- `unavailable` — the prior config could not be snapshotted (it was already invalid/unloadable), so no rollback was attempted; manual recovery is required.
+
+`api_specs_not_restored` / `api_specs_note` appear only when the namespace carried API specs, which a config rollback cannot restore (see above). The payload is still validated before the snapshot and delete phases; validation failures return `400` and leave existing config untouched.
 
 ## Restore vs. Batch
 

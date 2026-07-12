@@ -428,7 +428,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9000/restore?confirm=true"
 ```
 
-The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Before replacement, restore snapshots the current namespace. Database inserts are chunked into 1,000-record transactions for large-scale imports; if any insert fails, Ferrum clears the partial import, reapplies the snapshot, and returns `500 Internal Server Error` confirming that the prior config was retained. If that best-effort rollback also encounters a persistence failure, the `500` response warns that rollback was incomplete and manual recovery is required.
+The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Before replacement, restore takes a best-effort snapshot of the current namespace. Database inserts are chunked into 1,000-record transactions for large-scale imports; if the delete or any insert fails, Ferrum clears the partial state, reapplies the snapshot, and returns `500 Internal Server Error` with a `rollback` field (`completed` / `incomplete` / `unavailable`). Rollback is `unavailable` when the prior config was already invalid and could not be snapshotted — restore still proceeds so it can repair the namespace, but a later failure then requires manual recovery. API specs are admin-only metadata that a config rollback cannot restore; a failed restore reports `api_specs_not_restored` so operators can re-submit them via `POST /api-specs`.
 
 See [admin_backup_restore.md](admin_backup_restore.md) for details.
 

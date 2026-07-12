@@ -3193,9 +3193,18 @@ paths:
       description: |
         **Replacement operation** — snapshots the current namespace, deletes
         all existing resources, and imports the provided configuration. If any
-        import persistence step fails, Ferrum clears the partial import and
+        import (or the delete) step fails, Ferrum clears the partial state and
         reapplies the snapshot. Requires `?confirm=true` query parameter to
         prevent accidental invocation.
+
+        The recovery snapshot is **best-effort**: it uses `load_full_config`,
+        which rejects an already-invalid namespace. When the prior config
+        cannot be snapshotted (the case an operator runs restore to *repair*),
+        the restore still proceeds but WITHOUT rollback capability, and a
+        subsequent failure returns a `500` stating that the prior config could
+        not be auto-restored (manual recovery). `api_specs` are admin-only
+        metadata outside the config and are NOT restored by rollback; a failed
+        restore reports how many must be re-submitted via `POST /api-specs`.
 
         Accepts the same JSON format produced by `GET /backup`. Resources are
         imported in dependency order (consumers & upstreams first, then proxies,
@@ -3240,7 +3249,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/RestoreResponse"
         "500":
-          description: Import failed. The prior configuration was reapplied, or the response warns that the best-effort rollback was incomplete.
+          description: >-
+            Restore failed (import, delete, or preparation). The prior
+            configuration was reapplied, or the response warns that the
+            best-effort rollback was incomplete or unavailable.
           content:
             application/json:
               schema:
@@ -3254,11 +3266,31 @@ paths:
                     items:
                       type: string
                     description: Persistence or preparation errors that caused the restore to fail
+                  rollback:
+                    type: string
+                    enum: [completed, incomplete, unavailable]
+                    description: >-
+                      Outcome of the best-effort rollback. `completed` — prior
+                      config reapplied; `incomplete` — reapply failed (see
+                      `rollback_errors`); `unavailable` — the prior config
+                      could not be snapshotted, so no rollback was attempted.
                   rollback_errors:
                     type: array
                     items:
                       type: string
                     description: Present only when reapplying the prior configuration was incomplete
+                  api_specs_not_restored:
+                    type: integer
+                    description: >-
+                      Number of API specs present before the restore that a
+                      config rollback cannot restore. Present only when the
+                      namespace carried specs.
+                  api_specs_note:
+                    type: string
+                    description: >-
+                      Operator guidance to re-submit the affected API specs via
+                      POST /api-specs. Present only when `api_specs_not_restored`
+                      is set.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
