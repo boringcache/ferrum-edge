@@ -1,9 +1,45 @@
 use chrono::Utc;
 use ferrum_edge::config::db_backend::{
-    IncrementalResult, NamespacedResourceId, extract_db_hostname, extract_known_ids, redact_url,
+    AtomicClearVerification, DeleteAllResourcesError, DeleteMode, IncrementalResult,
+    NamespaceResourceCounts, NamespacedResourceId, classify_atomic_clear_verification,
+    extract_db_hostname, extract_known_ids, redact_url,
 };
 use ferrum_edge::config::types::GatewayConfig;
 use std::collections::HashMap;
+
+#[test]
+fn ambiguous_atomic_clear_verification_classifies_all_outcomes() {
+    let prior = NamespaceResourceCounts {
+        proxies: 2,
+        consumers: 3,
+        plugin_configs: 4,
+        upstreams: 5,
+        api_specs: 1,
+    };
+
+    assert_eq!(
+        classify_atomic_clear_verification(prior, Ok::<_, ()>(NamespaceResourceCounts::default())),
+        AtomicClearVerification::ClearCommitted
+    );
+    assert_eq!(
+        classify_atomic_clear_verification(prior, Ok::<_, ()>(prior)),
+        AtomicClearVerification::PriorConfigIntact
+    );
+    assert_eq!(
+        classify_atomic_clear_verification(prior, Err::<NamespaceResourceCounts, _>(())),
+        AtomicClearVerification::UnknownOutcome
+    );
+}
+
+#[test]
+fn delete_error_preserves_unknown_commit_result() {
+    let error = DeleteAllResourcesError::with_unknown_commit_result(
+        DeleteMode::Atomic,
+        anyhow::anyhow!("commit acknowledgement lost"),
+    );
+    assert_eq!(error.mode(), DeleteMode::Atomic);
+    assert!(error.has_unknown_commit_result());
+}
 
 // ---------------------------------------------------------------------------
 // extract_db_hostname — tests for MongoDB URLs

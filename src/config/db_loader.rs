@@ -45,9 +45,42 @@ use tracing::{debug, error, info, warn};
 // Re-export trait types so existing `use crate::config::db_loader::{IncrementalResult, ...}` works.
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
-    ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult, NamespacedResourceId,
-    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SortOrder, extract_db_hostname, redact_url,
+    ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult, NamespaceResourceCounts,
+    NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError,
+    SortOrder, extract_db_hostname, redact_url,
 };
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FullLoadPurpose {
+    Runtime,
+    RestoreSnapshot,
+}
+
+impl FullLoadPurpose {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Runtime => "load_full_config",
+            Self::RestoreSnapshot => "load_namespace_snapshot",
+        }
+    }
+
+    fn map_row_error(
+        self,
+        resource_type: &'static str,
+        resource_id: Option<String>,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if self == Self::RestoreSnapshot {
+            anyhow::Error::new(SnapshotDataIntegrityError::new(
+                resource_type,
+                resource_id,
+                error,
+            ))
+        } else {
+            error
+        }
+    }
+}
 
 struct PluginConfigRef {
     id: String,
@@ -975,7 +1008,14 @@ impl DatabaseStore {
                 operation, source
             ),
         };
-        anyhow::Error::new(ProxyPluginAssociationLoadError::new(message))
+        if operation == "load_namespace_snapshot" {
+            // Snapshot callers must distinguish an unavailable database from a
+            // row-integrity failure. Query failures are availability failures;
+            // decode/dangling-association paths retain the typed marker below.
+            anyhow::anyhow!(message)
+        } else {
+            anyhow::Error::new(ProxyPluginAssociationLoadError::new(message))
+        }
     }
 
     fn proxy_plugin_association_proxy_id(
@@ -1285,10 +1325,18 @@ impl DatabaseStore {
         let mut tx = self.pool().begin().await?;
         self.configure_full_load_snapshot(&mut tx).await?;
 
-        let proxies = self.load_proxies_tx(namespace, &mut tx).await?;
-        let consumers = self.load_consumers_tx(namespace, &mut tx).await?;
-        let plugin_configs = self.load_plugin_configs_tx(namespace, &mut tx).await?;
-        let upstreams = self.load_upstreams_tx(namespace, &mut tx).await?;
+        let proxies = self
+            .load_proxies_tx(namespace, FullLoadPurpose::Runtime, &mut tx)
+            .await?;
+        let consumers = self
+            .load_consumers_tx(namespace, FullLoadPurpose::Runtime, &mut tx)
+            .await?;
+        let plugin_configs = self
+            .load_plugin_configs_tx(namespace, FullLoadPurpose::Runtime, &mut tx)
+            .await?;
+        let upstreams = self
+            .load_upstreams_tx(namespace, FullLoadPurpose::Runtime, &mut tx)
+            .await?;
         tx.commit().await?;
 
         let mut config = GatewayConfig {
@@ -1387,10 +1435,13 @@ impl DatabaseStore {
         let mut tx = self.pool().begin().await?;
         self.configure_full_load_snapshot(&mut tx).await?;
 
-        let proxies = self.load_proxies_tx(namespace, &mut tx).await?;
-        let consumers = self.load_consumers_tx(namespace, &mut tx).await?;
-        let plugin_configs = self.load_plugin_configs_tx(namespace, &mut tx).await?;
-        let upstreams = self.load_upstreams_tx(namespace, &mut tx).await?;
+        let purpose = FullLoadPurpose::RestoreSnapshot;
+        let proxies = self.load_proxies_tx(namespace, purpose, &mut tx).await?;
+        let consumers = self.load_consumers_tx(namespace, purpose, &mut tx).await?;
+        let plugin_configs = self
+            .load_plugin_configs_tx(namespace, purpose, &mut tx)
+            .await?;
+        let upstreams = self.load_upstreams_tx(namespace, purpose, &mut tx).await?;
         tx.commit().await?;
 
         let mut config = GatewayConfig {
@@ -1420,23 +1471,6 @@ impl DatabaseStore {
         Ok(config)
     }
 
-    /// List ApiSpecs from the authoritative primary pool (never the read
-    /// replica). Used to enumerate the specs a destructive restore is about to
-    /// remove so the rollback recovery report cannot omit a spec that has not
-    /// yet replicated.
-    pub async fn list_api_specs_authoritative(
-        &self,
-        namespace: &str,
-        filter: &crate::config::db_backend::ApiSpecListFilter,
-    ) -> Result<
-        crate::config::db_backend::PaginatedResult<crate::config::types::ApiSpec>,
-        anyhow::Error,
-    > {
-        let primary_pool = self.pool();
-        self.list_api_specs_from_admin_read(namespace, filter, &primary_pool)
-            .await
-    }
-
     /// Count ApiSpecs from the authoritative primary pool without hydrating rows.
     pub async fn count_api_specs(&self, namespace: &str) -> Result<u64, anyhow::Error> {
         let start = Instant::now();
@@ -1448,6 +1482,37 @@ impl DatabaseStore {
         let count: i64 = row.try_get("cnt")?;
         self.check_slow_query("count_api_specs", start);
         u64::try_from(count).map_err(|_| anyhow::anyhow!("api_specs count cannot be negative"))
+    }
+
+    pub async fn count_namespace_resources(
+        &self,
+        namespace: &str,
+    ) -> Result<NamespaceResourceCounts, anyhow::Error> {
+        let sql = self.q("SELECT \
+             (SELECT COUNT(*) FROM proxies WHERE namespace = ?) AS proxies, \
+             (SELECT COUNT(*) FROM consumers WHERE namespace = ?) AS consumers, \
+             (SELECT COUNT(*) FROM plugin_configs WHERE namespace = ?) AS plugin_configs, \
+             (SELECT COUNT(*) FROM upstreams WHERE namespace = ?) AS upstreams, \
+             (SELECT COUNT(*) FROM api_specs WHERE namespace = ?) AS api_specs");
+        let row = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(namespace)
+            .bind(namespace)
+            .bind(namespace)
+            .bind(namespace)
+            .fetch_one(&self.pool())
+            .await?;
+        let count = |column: &str| -> Result<u64, anyhow::Error> {
+            let value: i64 = row.try_get(column)?;
+            u64::try_from(value).map_err(|_| anyhow::anyhow!("{} count cannot be negative", column))
+        };
+        Ok(NamespaceResourceCounts {
+            proxies: count("proxies")?,
+            consumers: count("consumers")?,
+            plugin_configs: count("plugin_configs")?,
+            upstreams: count("upstreams")?,
+            api_specs: count("api_specs")?,
+        })
     }
 
     async fn configure_full_load_snapshot(
@@ -1513,6 +1578,7 @@ impl DatabaseStore {
     async fn load_proxies_tx(
         &self,
         namespace: &str,
+        purpose: FullLoadPurpose,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     ) -> Result<Vec<Proxy>, anyhow::Error> {
         let start = Instant::now();
@@ -1522,8 +1588,17 @@ impl DatabaseStore {
         // query or decode error rejects the whole candidate instead of
         // publishing proxies with silently empty plugin lists.
         let mut plugins_by_proxy = self
-            .load_proxy_plugin_associations_for_namespace_tx(namespace, "load_full_config", tx)
-            .await?;
+            .load_proxy_plugin_associations_for_namespace_tx(namespace, purpose.operation(), tx)
+            .await
+            .map_err(|error| {
+                if purpose == FullLoadPurpose::RestoreSnapshot
+                    && is_proxy_plugin_association_load_error(&error)
+                {
+                    purpose.map_row_error("proxy_plugin", None, error)
+                } else {
+                    error
+                }
+            })?;
 
         // Load proxies in chunks to avoid unbounded SELECT * at scale.
         let mut proxies = Vec::new();
@@ -1546,9 +1621,12 @@ impl DatabaseStore {
                 .await?;
             let fetched = rows.len();
             for row in rows {
-                let id: String = row.try_get("id")?;
+                let id: String = row.try_get("id").map_err(|error| {
+                    purpose.map_row_error("proxy", None, anyhow::Error::new(error))
+                })?;
                 let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
-                let proxy = row_to_proxy(&row, id.clone(), plugins)?;
+                let proxy = row_to_proxy(&row, id.clone(), plugins)
+                    .map_err(|error| purpose.map_row_error("proxy", Some(id.clone()), error))?;
                 proxies.push(proxy);
                 last_id = Some(id);
             }
@@ -1556,7 +1634,8 @@ impl DatabaseStore {
                 break;
             }
         }
-        Self::ensure_no_unmatched_proxy_plugin_associations("load_full_config", &plugins_by_proxy)?;
+        Self::ensure_no_unmatched_proxy_plugin_associations(purpose.operation(), &plugins_by_proxy)
+            .map_err(|error| purpose.map_row_error("proxy_plugin", None, error))?;
 
         self.check_slow_query("load_proxies", start);
         Ok(proxies)
@@ -1565,6 +1644,7 @@ impl DatabaseStore {
     async fn load_consumers_tx(
         &self,
         namespace: &str,
+        purpose: FullLoadPurpose,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     ) -> Result<Vec<Consumer>, anyhow::Error> {
         let start = Instant::now();
@@ -1588,8 +1668,14 @@ impl DatabaseStore {
                 .await?;
             let fetched = rows.len();
             for row in rows {
-                let id: String = row.try_get("id")?;
-                consumers.push(row_to_consumer(&row)?);
+                let id: String = row.try_get("id").map_err(|error| {
+                    purpose.map_row_error("consumer", None, anyhow::Error::new(error))
+                })?;
+                consumers.push(
+                    row_to_consumer(&row).map_err(|error| {
+                        purpose.map_row_error("consumer", Some(id.clone()), error)
+                    })?,
+                );
                 last_id = Some(id);
             }
             if (fetched as i64) < self.full_load_page_size {
@@ -1604,6 +1690,7 @@ impl DatabaseStore {
     async fn load_plugin_configs_tx(
         &self,
         namespace: &str,
+        purpose: FullLoadPurpose,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     ) -> Result<Vec<PluginConfig>, anyhow::Error> {
         let start = Instant::now();
@@ -1627,8 +1714,12 @@ impl DatabaseStore {
                 .await?;
             let fetched = rows.len();
             for row in rows {
-                let id: String = row.try_get("id")?;
-                configs.push(row_to_plugin_config(&row)?);
+                let id: String = row.try_get("id").map_err(|error| {
+                    purpose.map_row_error("plugin_config", None, anyhow::Error::new(error))
+                })?;
+                configs.push(row_to_plugin_config(&row).map_err(|error| {
+                    purpose.map_row_error("plugin_config", Some(id.clone()), error)
+                })?);
                 last_id = Some(id);
             }
             if (fetched as i64) < self.full_load_page_size {
@@ -2679,6 +2770,7 @@ impl DatabaseStore {
     async fn load_upstreams_tx(
         &self,
         namespace: &str,
+        purpose: FullLoadPurpose,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     ) -> Result<Vec<Upstream>, anyhow::Error> {
         let start = Instant::now();
@@ -2702,8 +2794,14 @@ impl DatabaseStore {
                 .await?;
             let fetched = rows.len();
             for row in rows {
-                let id: String = row.try_get("id")?;
-                upstreams.push(row_to_upstream(&row)?);
+                let id: String = row.try_get("id").map_err(|error| {
+                    purpose.map_row_error("upstream", None, anyhow::Error::new(error))
+                })?;
+                upstreams.push(
+                    row_to_upstream(&row).map_err(|error| {
+                        purpose.map_row_error("upstream", Some(id.clone()), error)
+                    })?,
+                );
                 last_id = Some(id);
             }
             if (fetched as i64) < self.full_load_page_size {
@@ -6812,6 +6910,13 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::load_namespace_snapshot(self, namespace).await
     }
 
+    async fn count_namespace_resources(
+        &self,
+        namespace: &str,
+    ) -> Result<NamespaceResourceCounts, anyhow::Error> {
+        DatabaseStore::count_namespace_resources(self, namespace).await
+    }
+
     async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error> {
         DatabaseStore::latest_change_sequence(self, namespace).await
     }
@@ -7197,17 +7302,6 @@ impl DatabaseBackend for DatabaseStore {
         anyhow::Error,
     > {
         DatabaseStore::list_api_specs(self, namespace, filter).await
-    }
-
-    async fn list_api_specs_authoritative(
-        &self,
-        namespace: &str,
-        filter: &crate::config::db_backend::ApiSpecListFilter,
-    ) -> Result<
-        crate::config::db_backend::PaginatedResult<crate::config::types::ApiSpec>,
-        anyhow::Error,
-    > {
-        DatabaseStore::list_api_specs_authoritative(self, namespace, filter).await
     }
 
     async fn count_api_specs(&self, namespace: &str) -> Result<u64, anyhow::Error> {

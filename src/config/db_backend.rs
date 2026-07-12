@@ -173,6 +173,88 @@ pub enum DeleteMode {
     NonAtomic,
 }
 
+/// Authoritative resource counts used to resolve an ambiguous atomic clear.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NamespaceResourceCounts {
+    pub proxies: u64,
+    pub consumers: u64,
+    pub plugin_configs: u64,
+    pub upstreams: u64,
+    pub api_specs: u64,
+}
+
+impl NamespaceResourceCounts {
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicClearVerification {
+    ClearCommitted,
+    PriorConfigIntact,
+    UnknownOutcome,
+}
+
+pub fn classify_atomic_clear_verification<E>(
+    prior: NamespaceResourceCounts,
+    verification: Result<NamespaceResourceCounts, E>,
+) -> AtomicClearVerification {
+    match verification {
+        Ok(post_clear) if post_clear == prior => AtomicClearVerification::PriorConfigIntact,
+        Ok(post_clear) if post_clear.is_empty() => AtomicClearVerification::ClearCommitted,
+        Ok(_) | Err(_) => AtomicClearVerification::UnknownOutcome,
+    }
+}
+
+/// A row/document that exists but cannot be decoded into its resource type.
+///
+/// The display text is intentionally safe for admin responses: it identifies
+/// the resource without including serialized row contents or credential data.
+#[derive(Debug)]
+pub struct SnapshotDataIntegrityError {
+    resource_type: &'static str,
+    resource_id: Option<String>,
+    source: anyhow::Error,
+}
+
+impl SnapshotDataIntegrityError {
+    pub fn new(
+        resource_type: &'static str,
+        resource_id: Option<String>,
+        source: anyhow::Error,
+    ) -> Self {
+        Self {
+            resource_type,
+            resource_id,
+            source,
+        }
+    }
+}
+
+impl std::fmt::Display for SnapshotDataIntegrityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.resource_id.as_deref() {
+            Some(id) => write!(
+                formatter,
+                "data-integrity failure decoding {} resource '{}'",
+                self.resource_type, id
+            ),
+            None => write!(
+                formatter,
+                "data-integrity failure decoding {} resource (id unavailable)",
+                self.resource_type
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotDataIntegrityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 impl DeleteMode {
     pub fn is_atomic(self) -> bool {
         matches!(self, Self::Atomic)
@@ -183,16 +265,33 @@ impl DeleteMode {
 #[derive(Debug)]
 pub struct DeleteAllResourcesError {
     mode: DeleteMode,
+    unknown_commit_result: bool,
     source: anyhow::Error,
 }
 
 impl DeleteAllResourcesError {
     pub fn new(mode: DeleteMode, source: anyhow::Error) -> Self {
-        Self { mode, source }
+        Self {
+            mode,
+            unknown_commit_result: false,
+            source,
+        }
+    }
+
+    pub fn with_unknown_commit_result(mode: DeleteMode, source: anyhow::Error) -> Self {
+        Self {
+            mode,
+            unknown_commit_result: true,
+            source,
+        }
     }
 
     pub fn mode(&self) -> DeleteMode {
         self.mode
+    }
+
+    pub fn has_unknown_commit_result(&self) -> bool {
+        self.unknown_commit_result
     }
 }
 
@@ -293,6 +392,13 @@ pub trait DatabaseBackend: Send + Sync {
         &self,
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error>;
+
+    /// Count namespace resources on the authoritative primary without
+    /// deserializing rows/documents.
+    async fn count_namespace_resources(
+        &self,
+        namespace: &str,
+    ) -> Result<NamespaceResourceCounts, anyhow::Error>;
 
     // -----------------------------------------------------------------------
     // Incremental polling
@@ -676,22 +782,6 @@ pub trait DatabaseBackend: Send + Sync {
         namespace: &str,
         filter: &ApiSpecListFilter,
     ) -> Result<PaginatedResult<ApiSpec>, anyhow::Error>;
-
-    /// List ApiSpecs using the authoritative primary read path.
-    ///
-    /// Mirrors [`list_namespaces_authoritative`](Self::list_namespaces_authoritative):
-    /// [`list_api_specs`](Self::list_api_specs) may serve from a read replica that
-    /// can lag, but a restore rollback snapshot must enumerate the specs it is
-    /// about to destroy from the primary so the recovery report cannot silently
-    /// omit a spec that only exists on the primary yet. The default delegates to
-    /// `list_api_specs` for backends without a replica split (e.g. MongoDB).
-    async fn list_api_specs_authoritative(
-        &self,
-        namespace: &str,
-        filter: &ApiSpecListFilter,
-    ) -> Result<PaginatedResult<ApiSpec>, anyhow::Error> {
-        self.list_api_specs(namespace, filter).await
-    }
 
     /// Count ApiSpecs in a namespace using the authoritative primary read path.
     ///

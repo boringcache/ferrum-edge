@@ -78,7 +78,7 @@ Replaces the entire gateway configuration with the provided backup payload. This
 The recovery snapshot in step 2 is captured with a **non-validating raw load from the primary** (`load_namespace_snapshot`), *not* the validating `load_full_config`. That distinction matters two ways:
 
 - **Invalid-but-present config still snapshots.** An already-invalid namespace (dangling references, conflicting listen_paths, invalid regex) — precisely what an operator runs restore to *repair* — loads its raw rows without the fatal validation pipeline, so the snapshot succeeds and rollback stays available throughout the repair. A restore that imports cleanly succeeds and repairs the namespace; if a later step fails, rollback reapplies the (still invalid) prior config.
-- **A genuine database failure aborts the restore.** If the snapshot cannot be taken at all — a real connectivity/timeout error rather than invalid content — the restore **aborts with `503` before deleting anything** and leaves the prior config untouched. This is fail-safe: a config that is valid but merely transiently unreachable is never wiped when we cannot capture a rollback point. Retry once the database is reachable.
+- **An unreadable snapshot aborts the restore.** Connectivity/timeouts return `503`; corrupt or undecodable stored rows/documents return `500` with `failure_class: "data_integrity"` and a safe resource type/id when available. Both abort before deleting anything. Semantic config invalidity alone is still tolerated by this raw snapshot path.
 
 Both the config resources and the `api_specs` count are read from the **primary**, never a lagging read replica, so the recovery report is authoritative.
 
@@ -190,8 +190,23 @@ The `rollback` field reports the outcome:
 - `completed` — the prior config was reapplied and retained.
 - `incomplete` — reapplying the prior config failed; the response includes `rollback_errors` and instructs the operator to perform manual recovery. The rollback is best-effort because it uses the same database backend that reported the failure.
 - `not_needed` — the **clear itself failed atomically** (SQL runs it in one transaction; replica-set MongoDB in a multi-document transaction). Nothing was deleted, so the prior config — including its `api_specs` — is fully intact and no compensating re-import runs. Only standalone (non-replica-set) MongoDB, whose clear deletes collections one-by-one, can leave a partial state and take the `completed`/`incomplete` path on a delete failure.
+- `unknown_outcome` — MongoDB reported an unknown transaction commit result and Ferrum could not verify whether the clear committed (the verification query failed or returned a state matching neither the held snapshot nor an empty namespace). Ferrum does not claim the prior config was retained; inspect the namespace and recover manually.
 
-There is no `unavailable` outcome: when the prior config cannot be snapshotted for rollback, the restore **aborts before any delete** and returns `503` (not `500`) with an `error` explaining that the existing config was NOT deleted. This is the fail-safe path — the destructive delete never runs when a rollback point cannot be captured.
+For an unknown MongoDB commit result, Ferrum verifies authoritative namespace
+counts before classifying the failure. An empty namespace is treated as a
+committed clear and rolled back from the held in-memory snapshot; counts matching
+the snapshot retain `not_needed`. A definitive atomic abort continues to take the
+`not_needed` short-circuit without a compensating clear, preserving `api_specs`.
+
+When the prior config cannot be snapshotted for rollback, restore **aborts before
+any delete**. Connectivity failures return `503` with
+`failure_class: "connectivity"`. Stored row/document integrity failures return
+`500` with `failure_class: "data_integrity"` and identify the offending resource
+type/id when safely available. Both are fail-safe paths: the destructive delete
+never runs when an exact rollback point cannot be captured. Data-integrity
+failures use `500` because the database is reachable but its stored configuration
+cannot be decoded; this lets operators distinguish persistent corruption from a
+retryable availability problem.
 
 `api_specs_not_restored` / `api_specs_note` appear only when the namespace carried API specs, which config restore and rollback cannot recreate (see above). The payload is still validated before the snapshot and delete phases; validation failures return `400` and leave existing config untouched.
 
@@ -200,8 +215,21 @@ There is no `unavailable` outcome: when the prior config cannot be snapshotted f
 ```json
 {
   "error": "Restore aborted: the prior configuration could not be snapshotted for rollback (database unavailable). Existing config was NOT deleted; retry once the database is reachable.",
+  "failure_class": "connectivity",
   "restore_errors": [
     "failed to snapshot prior config for rollback: pool timed out while waiting for an open connection"
+  ]
+}
+```
+
+#### Restore aborted — `500` data integrity
+
+```json
+{
+  "error": "Restore aborted: the prior configuration contains a data-integrity error and could not be snapshotted for rollback. Existing config was NOT deleted; repair the identified stored resource before retrying.",
+  "failure_class": "data_integrity",
+  "restore_errors": [
+    "data-integrity failure decoding proxy resource 'proxy-123'"
   ]
 }
 ```

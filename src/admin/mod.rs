@@ -34,7 +34,10 @@ use crate::admin::backup::{
     parse_backup_resources, parse_restore_confirm,
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
-use crate::config::db_backend::DatabaseBackend;
+use crate::config::db_backend::{
+    AtomicClearVerification, DatabaseBackend, NamespaceResourceCounts, SnapshotDataIntegrityError,
+    classify_atomic_clear_verification,
+};
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,
 };
@@ -2728,15 +2731,23 @@ struct RestoreSnapshot {
     api_specs_total: usize,
 }
 
+impl RestoreSnapshot {
+    fn resource_counts(&self) -> NamespaceResourceCounts {
+        NamespaceResourceCounts {
+            proxies: u64::try_from(self.payload.proxies.len()).unwrap_or(u64::MAX),
+            consumers: u64::try_from(self.payload.consumers.len()).unwrap_or(u64::MAX),
+            plugin_configs: u64::try_from(self.payload.plugin_configs.len()).unwrap_or(u64::MAX),
+            upstreams: u64::try_from(self.payload.upstreams.len()).unwrap_or(u64::MAX),
+            api_specs: u64::try_from(self.api_specs_total).unwrap_or(u64::MAX),
+        }
+    }
+}
+
 /// Capture an authoritative snapshot of `namespace` for restore rollback.
 ///
-/// Returns `Err` ONLY when the prior state cannot be read from the primary due
-/// to a genuine database/connectivity failure. It does NOT fail on an
-/// invalid-but-present config: the snapshot loads raw rows without the fatal
-/// validation pipeline (see [`DatabaseBackend::load_namespace_snapshot`]), so a
-/// namespace an operator runs restore to *repair* still snapshots and keeps
-/// rollback available. The caller treats an `Err` here as fail-safe: it aborts
-/// the destructive restore rather than wiping a config it cannot roll back to.
+/// It does not fail semantic validation of an invalid-but-present config, but
+/// it does fail closed for either database unavailability or row/document
+/// integrity errors that prevent an exact rollback snapshot.
 ///
 /// Both the config resources and the `api_specs` count are read from the
 /// PRIMARY (never a lagging read replica) so the recovery report is authoritative.
@@ -3080,13 +3091,7 @@ async fn finish_failed_restore(
     json_response(StatusCode::INTERNAL_SERVER_ERROR, &response)
 }
 
-/// Finalize a restore whose atomic clear (`delete_all_resources`) failed. On an
-/// atomic backend (SQL transaction, replica-set MongoDB) a clear failure commits
-/// NOTHING, so the prior config — including `api_specs` — is fully intact. No
-/// rollback is needed or safe here: re-running the clear could delete admin-only
-/// `api_specs` or duplicate resources if the original error was transient. This
-/// records the audit event and returns a `500` stating the prior config was
-/// retained, without any compensating delete/import.
+/// Finalize a restore whose atomic clear definitively aborted.
 async fn finish_atomic_delete_failure(
     state: &AdminState,
     db: Arc<dyn DatabaseBackend>,
@@ -3115,6 +3120,38 @@ async fn finish_atomic_delete_failure(
             "error": "Restore failed while clearing existing config; the clear is atomic, so the prior config was retained",
             "restore_errors": [format!("failed to clear existing config: {}", delete_error)],
             "rollback": "not_needed",
+        }),
+    )
+}
+
+async fn finish_unknown_atomic_delete_failure(
+    state: &AdminState,
+    db: Arc<dyn DatabaseBackend>,
+    actor: &AuditActor,
+    namespace: &str,
+    delete_error: String,
+) -> Response<Full<Bytes>> {
+    let event = audit::AuditEvent::new(
+        actor,
+        "restore",
+        "gateway_config",
+        namespace,
+        namespace,
+        audit::update_diff(
+            json!({"replaced_namespace": namespace}),
+            json!({"rollback": "unknown_outcome"}),
+        ),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event) {
+        log_audit_enqueue_failure(&error);
+    }
+
+    json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &json!({
+            "error": "Restore failed while clearing existing config; the atomic clear outcome could not be verified. Manual recovery is required.",
+            "restore_errors": [format!("failed to clear existing config: {}", delete_error)],
+            "rollback": "unknown_outcome",
         }),
     )
 }
@@ -4514,24 +4551,35 @@ async fn handle_restore(
     // fatal validation pipeline, so an invalid-but-present config (exactly what
     // restore is used to repair) still snapshots and keeps rollback available.
     //
-    // Fail-safe: if the snapshot cannot be taken at all, that means a genuine
-    // database/connectivity failure — NOT an unloadable-but-present config. We
-    // must NOT proceed to delete, or a transiently-unreachable-yet-valid config
-    // would be wiped with no way to roll back. Abort with 503 and leave the
-    // prior config untouched.
+    // Fail-safe: abort before delete if either the primary is unavailable or a
+    // corrupt row/document prevents an exact rollback snapshot.
     let snapshot = match snapshot_namespace_for_rollback(db.as_ref(), namespace).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
+            let data_integrity = error
+                .downcast_ref::<SnapshotDataIntegrityError>()
+                .map(ToString::to_string);
             error!(
                 namespace = %namespace,
                 error = %error,
                 "Restore: aborting — prior config could not be snapshotted for rollback; existing config NOT deleted"
             );
+            if let Some(integrity_error) = data_integrity {
+                return Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({
+                        "error": "Restore aborted: the prior configuration contains a data-integrity error and could not be snapshotted for rollback. Existing config was NOT deleted; repair the identified stored resource before retrying.",
+                        "restore_errors": [integrity_error],
+                        "failure_class": "data_integrity",
+                    }),
+                ));
+            }
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({
                     "error": "Restore aborted: the prior configuration could not be snapshotted for rollback (database unavailable). Existing config was NOT deleted; retry once the database is reachable.",
                     "restore_errors": [format!("failed to snapshot prior config for rollback: {}", error)],
+                    "failure_class": "connectivity",
                 }),
             ));
         }
@@ -4542,11 +4590,56 @@ async fn handle_restore(
     if let Err(e) = db.delete_all_resources(namespace).await {
         error!("Restore: failed to delete existing resources: {}", e);
         if e.mode().is_atomic() {
-            // Atomic clear (SQL transaction, replica-set Mongo): a failure commits
-            // NOTHING, so the prior config is fully intact. Do NOT roll back — a
-            // second clear + re-import would be unnecessary and could delete
-            // admin-only `api_specs` or duplicate resources if the error was
-            // transient. Return 500 and retain the prior config as-is.
+            if e.has_unknown_commit_result() {
+                let verification = db.count_namespace_resources(namespace).await;
+                if let Err(error) = &verification {
+                    error!(
+                        namespace = %namespace,
+                        error = %error,
+                        "Restore: failed to verify ambiguous atomic clear outcome"
+                    );
+                }
+                return Ok(
+                    match classify_atomic_clear_verification(
+                        snapshot.resource_counts(),
+                        verification,
+                    ) {
+                        AtomicClearVerification::ClearCommitted => {
+                            finish_failed_restore(
+                                state,
+                                db.clone(),
+                                actor,
+                                namespace,
+                                vec![format!("failed to clear existing config: {}", e)],
+                                &snapshot,
+                            )
+                            .await
+                        }
+                        AtomicClearVerification::PriorConfigIntact => {
+                            finish_atomic_delete_failure(
+                                state,
+                                db.clone(),
+                                actor,
+                                namespace,
+                                e.to_string(),
+                            )
+                            .await
+                        }
+                        AtomicClearVerification::UnknownOutcome => {
+                            finish_unknown_atomic_delete_failure(
+                                state,
+                                db.clone(),
+                                actor,
+                                namespace,
+                                e.to_string(),
+                            )
+                            .await
+                        }
+                    },
+                );
+            }
+            // A definitive atomic abort retains the prior config, including
+            // api_specs. Preserve the short-circuit and do not re-clear it.
             return Ok(finish_atomic_delete_failure(
                 state,
                 db.clone(),
