@@ -2591,17 +2591,35 @@ fn restore_payload_from_config(config: GatewayConfig) -> RestorePayload {
     }
 }
 
+/// Identity of an `api_specs` row present before a destructive restore.
+///
+/// API specs are admin-only metadata outside `GatewayConfig`, so a config
+/// rollback restores the spec-owned proxy/upstream/plugins but NOT the
+/// `api_specs` ownership row. Capturing the `(id, proxy_id)` pair lets a
+/// rolled-back restore tell the operator exactly which specs vanished and which
+/// now-hand-managed proxies they must clear before re-submitting.
+struct LostApiSpec {
+    id: String,
+    proxy_id: String,
+}
+
+/// Upper bound on the number of `api_specs` identities captured for a rollback
+/// recovery report. Far above any realistic per-namespace spec count; keeps the
+/// snapshot query and the `500` response bounded.
+const RESTORE_SNAPSHOT_API_SPEC_CAP: u32 = 500;
+
 /// Best-effort snapshot of a namespace captured before a destructive restore so
 /// a failed import — or a failed clear — can be compensated back to the prior
 /// state on every database backend.
 struct RestoreSnapshot {
     /// Prior config resources (proxies/consumers/plugin_configs/upstreams).
     payload: RestorePayload,
-    /// Number of `api_specs` rows present before deletion. API specs are
-    /// admin-only metadata that live OUTSIDE `GatewayConfig`, so a config
-    /// rollback cannot restore them. A non-zero count is surfaced to the
-    /// operator so they can re-submit the affected specs after recovery.
-    api_spec_count: usize,
+    /// `api_specs` present before deletion. API specs are admin-only metadata
+    /// that live OUTSIDE `GatewayConfig`, so a config rollback cannot restore
+    /// them. The captured identities are surfaced to the operator so they know
+    /// exactly which specs to re-submit (and which restored resources to clear
+    /// first) after recovery.
+    api_specs: Vec<LostApiSpec>,
 }
 
 /// Capture a best-effort snapshot of `namespace` for restore rollback.
@@ -2627,34 +2645,39 @@ async fn snapshot_namespace_for_rollback(
         }
     };
 
-    // `api_specs` are not part of `GatewayConfig`, so count them separately for
-    // rollback bookkeeping. This is best-effort: a count failure must not
-    // disable rollback of the config resources we already captured.
-    let api_spec_count = match db
+    // `api_specs` are not part of `GatewayConfig`, so capture their identities
+    // separately for rollback bookkeeping. This is best-effort: a lookup failure
+    // must not disable rollback of the config resources we already captured. The
+    // summary listing carries `id`/`proxy_id` without hydrating the spec blob.
+    let api_specs = match db
         .list_api_specs(
             namespace,
             &crate::config::db_backend::ApiSpecListFilter {
-                limit: 1,
+                limit: RESTORE_SNAPSHOT_API_SPEC_CAP,
                 ..Default::default()
             },
         )
         .await
     {
-        Ok(result) => usize::try_from(result.total).unwrap_or(0),
+        Ok(result) => result
+            .items
+            .into_iter()
+            .map(|spec| LostApiSpec {
+                id: spec.id,
+                proxy_id: spec.proxy_id,
+            })
+            .collect(),
         Err(error) => {
             warn!(
                 namespace = %namespace,
                 error = %error,
-                "Restore: failed to count existing api_specs for rollback bookkeeping; assuming none"
+                "Restore: failed to list existing api_specs for rollback bookkeeping; assuming none"
             );
-            0
+            Vec::new()
         }
     };
 
-    Some(RestoreSnapshot {
-        payload,
-        api_spec_count,
-    })
+    Some(RestoreSnapshot { payload, api_specs })
 }
 
 #[derive(Default)]
@@ -2964,24 +2987,74 @@ async fn finish_failed_restore(
 
     // A config rollback restores proxies/consumers/plugin_configs/upstreams but
     // NOT `api_specs` (admin-only metadata outside `GatewayConfig`). When the
-    // prior namespace carried specs, tell the operator how many they must
-    // re-submit. Only meaningful when a snapshot was actually captured.
+    // prior namespace carried specs, give the operator a genuinely usable
+    // recovery path: list exactly which specs vanished (by `id` + `proxy_id`) and
+    // spell out that the restored resources are now hand-managed, so a plain
+    // `POST /api-specs` would collide on route/name/id and must be preceded by
+    // deleting the restored proxy (and its upstream/plugins). Only meaningful
+    // when a snapshot was actually captured.
     if let Some(snapshot) = snapshot
-        && snapshot.api_spec_count > 0
+        && !snapshot.api_specs.is_empty()
     {
+        let count = snapshot.api_specs.len();
         warn!(
             namespace = %namespace,
-            api_spec_count = snapshot.api_spec_count,
+            api_spec_count = count,
             "Restore: rollback restored config resources but NOT api_specs; operator must re-submit affected API specs"
         );
-        response["api_specs_not_restored"] = json!(snapshot.api_spec_count);
+        response["api_specs_not_restored"] = json!(count);
+        response["api_specs_lost"] = json!(
+            snapshot
+                .api_specs
+                .iter()
+                .map(|spec| json!({ "id": spec.id, "proxy_id": spec.proxy_id }))
+                .collect::<Vec<_>>()
+        );
         response["api_specs_note"] = json!(format!(
-            "{} API spec(s) were removed and cannot be restored by rollback; re-submit them via POST /api-specs",
-            snapshot.api_spec_count
+            "{count} API spec(s) were removed and cannot be restored by rollback. Their proxy/upstream/plugin resources were reapplied as hand-managed (api_spec_id cleared), so re-submitting a spec via POST /api-specs first requires deleting the restored proxy (and its upstream/plugins) to avoid route/name/id collisions, then re-submitting the original spec document. Affected specs are listed in api_specs_lost."
         ));
     }
 
     json_response(StatusCode::INTERNAL_SERVER_ERROR, &response)
+}
+
+/// Finalize a restore whose atomic clear (`delete_all_resources`) failed. On an
+/// atomic backend (SQL transaction, replica-set MongoDB) a clear failure commits
+/// NOTHING, so the prior config — including `api_specs` — is fully intact. No
+/// rollback is needed or safe here: re-running the clear could delete admin-only
+/// `api_specs` or duplicate resources if the original error was transient. This
+/// records the audit event and returns a `500` stating the prior config was
+/// retained, without any compensating delete/import.
+async fn finish_atomic_delete_failure(
+    state: &AdminState,
+    db: Arc<dyn DatabaseBackend>,
+    actor: &AuditActor,
+    namespace: &str,
+    delete_error: String,
+) -> Response<Full<Bytes>> {
+    let event = audit::AuditEvent::new(
+        actor,
+        "restore",
+        "gateway_config",
+        namespace,
+        namespace,
+        audit::update_diff(
+            json!({"replaced_namespace": namespace}),
+            json!({"rollback": "not_needed"}),
+        ),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+        log_audit_enqueue_failure(&error);
+    }
+
+    json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &json!({
+            "error": "Restore failed while clearing existing config; the clear is atomic, so the prior config was retained",
+            "restore_errors": [format!("failed to clear existing config: {}", delete_error)],
+            "rollback": "not_needed",
+        }),
+    )
 }
 
 /// Allowed credential types for consumer authentication plugins.
@@ -4396,7 +4469,22 @@ async fn handle_restore(
     // the prior state has been snapshotted best-effort above).
     if let Err(e) = db.delete_all_resources(namespace).await {
         error!("Restore: failed to delete existing resources: {}", e);
-        // A partial clear (standalone Mongo deletes collections one-by-one) can
+        if db.delete_all_resources_is_atomic() {
+            // Atomic clear (SQL transaction, replica-set Mongo): a failure commits
+            // NOTHING, so the prior config is fully intact. Do NOT roll back — a
+            // second clear + re-import would be unnecessary and could delete
+            // admin-only `api_specs` or duplicate resources if the error was
+            // transient. Return 500 and retain the prior config as-is.
+            return Ok(finish_atomic_delete_failure(
+                state,
+                db.clone(),
+                actor,
+                namespace,
+                e.to_string(),
+            )
+            .await);
+        }
+        // Non-atomic clear (standalone Mongo deletes collections one-by-one) can
         // leave the namespace in a mixed state, so attempt the same best-effort
         // rollback the import-failure path uses.
         return Ok(finish_failed_restore(
