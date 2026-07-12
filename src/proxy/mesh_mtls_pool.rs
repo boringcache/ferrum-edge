@@ -394,6 +394,7 @@ pub struct MeshMtlsConnectionPool {
     entries: DashMap<String, Vec<MeshMtlsPoolEntry>>,
     creation_locks: DashMap<String, Arc<Mutex<()>>>,
     gateway_svid: SharedSvidBundle,
+    crls: crate::tls::CrlList,
     svid_identity_cache: ArcSwap<Option<MeshMtlsSvidIdentityCache>>,
     /// Shared backend SVID generation counter (same `Arc` the HTTP/H2/gRPC/H3
     /// pools stamp into their `|svidg=` key fields). Mesh mTLS keys embed the
@@ -444,10 +445,29 @@ impl MeshMtlsConnectionPool {
         shard_amount: usize,
         backend_svid_generation: BackendSvidGeneration,
     ) -> Self {
+        Self::new_with_svid_generation_and_crls(
+            pool_config,
+            dns_cache,
+            gateway_svid,
+            Arc::new(Vec::new()),
+            shard_amount,
+            backend_svid_generation,
+        )
+    }
+
+    pub fn new_with_svid_generation_and_crls(
+        pool_config: PoolConfig,
+        dns_cache: DnsCache,
+        gateway_svid: SharedSvidBundle,
+        crls: crate::tls::CrlList,
+        shard_amount: usize,
+        backend_svid_generation: BackendSvidGeneration,
+    ) -> Self {
         Self {
             entries: DashMap::with_shard_amount(shard_amount),
             creation_locks: DashMap::with_shard_amount(shard_amount),
             gateway_svid,
+            crls,
             svid_identity_cache: ArcSwap::new(Arc::new(None)),
             backend_svid_generation,
             // Low-cardinality, rotation-only map — default sharding is fine.
@@ -775,6 +795,7 @@ impl MeshMtlsConnectionPool {
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
+            &self.crls,
             proxy,
             dial_host,
             mtls_port,
@@ -880,6 +901,7 @@ impl MeshMtlsConnectionPool {
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
+            &self.crls,
             proxy,
             dial_host,
             mtls_port,
@@ -981,6 +1003,7 @@ impl MeshMtlsConnectionPool {
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
+            &self.crls,
             proxy,
             dial_host,
             mtls_port,
@@ -1311,6 +1334,7 @@ impl MeshMtlsConnectionPool {
             expected_peer.cloned(),
             expected_trust_domain.cloned(),
             vec![b"h2".to_vec()],
+            self.crls.clone(),
         )?;
         let connector = TlsConnector::from(tls_config);
         // SNI: the destination service FQDN for a cross-cluster east-west dial

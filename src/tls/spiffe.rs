@@ -150,6 +150,8 @@ pub fn build_spiffe_client_cert_verifier(
 /// - Optionally scopes verification to a single trust domain
 ///   (`expected_trust_domain`) when no peer is pinned.
 /// - Advertises the given `alpn_protocols`.
+/// - Applies `crls` to outbound peer-chain verification; an empty list leaves
+///   revocation checking disabled, matching the no-CRL deployment behavior.
 ///
 /// `expected_peer` and `expected_trust_domain` are mutually exclusive in
 /// practice (the pinned-peer path already constrains the domain): when BOTH are
@@ -169,6 +171,7 @@ pub fn build_spiffe_outbound_config(
     expected_peer: Option<SpiffeId>,
     expected_trust_domain: Option<TrustDomain>,
     alpn_protocols: Vec<Vec<u8>>,
+    crls: CrlList,
 ) -> Result<Arc<ClientConfig>, SpiffeTlsError> {
     if bundle_slot.load_full().is_none() {
         return Err(SpiffeTlsError::NoSvid);
@@ -178,8 +181,12 @@ pub fn build_spiffe_outbound_config(
         .with_safe_default_protocol_versions()
         .map_err(|e| SpiffeTlsError::Rustls(e.to_string()))?;
 
-    let verifier =
-        SpiffeServerCertVerifier::new(bundle_slot.clone(), expected_peer, expected_trust_domain);
+    let verifier = SpiffeServerCertVerifier::new(
+        bundle_slot.clone(),
+        expected_peer,
+        expected_trust_domain,
+        crls,
+    );
     let resolver = SpiffeClientCertResolver::new(bundle_slot);
 
     let mut cfg: ClientConfig = builder
@@ -389,6 +396,9 @@ struct SpiffeServerCertVerifier {
     /// east-west dials to the target's remote trust domain so a federated cert
     /// from a DIFFERENT trust domain cannot complete the handshake.
     expected_trust_domain: Option<TrustDomain>,
+    /// End-entity CRLs applied to outbound mesh peers. Empty when no CRL file
+    /// is configured, in which case revocation checking is skipped.
+    crls: CrlList,
     schemes: Vec<rustls::SignatureScheme>,
     peer_verifier_cache: ArcSwap<Option<SpiffePeerVerifierCache>>,
 }
@@ -398,11 +408,13 @@ impl SpiffeServerCertVerifier {
         slot: SharedBundleSlot,
         expected_peer: Option<SpiffeId>,
         expected_trust_domain: Option<TrustDomain>,
+        crls: CrlList,
     ) -> Self {
         Self {
             slot,
             expected_peer,
             expected_trust_domain,
+            crls,
             schemes: rustls::crypto::ring::default_provider()
                 .signature_verification_algorithms
                 .supported_schemes(),
@@ -438,11 +450,7 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
             intermediates,
             self.expected_peer.as_ref(),
             self.expected_trust_domain.as_ref(),
-            // Outbound/backend mesh CRL is intentionally unchanged here: the PR
-            // scopes revocation enforcement to inbound mesh peers. Passing an
-            // empty slice skips `.with_crls(...)`, so behavior is identical to
-            // before. Outbound CRL is a possible follow-up.
-            &[],
+            &self.crls,
         )
         .map(|_| rustls::client::danger::ServerCertVerified::assertion())
         .map_err(|e| rustls::Error::General(format!("SPIFFE outbound verify: {e}")))
@@ -688,9 +696,8 @@ fn build_peer_chain_verifier(
         Arc::new(rustls::crypto::ring::default_provider()),
     );
     // Mirror the operator-CA mesh path: when CRLs are configured, enforce
-    // end-entity revocation for inbound mesh peers. Empty CRLs skip this so
-    // behavior is unchanged for deployments without a CRL file (and for the
-    // outbound/non-cached callers that pass an empty slice).
+    // end-entity revocation for inbound and outbound mesh peers. Empty CRLs
+    // skip this so behavior is unchanged for deployments without a CRL file.
     if !crls.is_empty() {
         builder = builder
             .with_crls(crls.iter().cloned())
