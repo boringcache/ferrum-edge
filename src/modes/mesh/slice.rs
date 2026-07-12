@@ -606,6 +606,18 @@ impl MeshSlice {
         )
     }
 
+    /// Resolve the workload-level PeerAuthentication mode without consulting
+    /// `portLevelMtls`. Listener-wide fallback policy must use this resolver:
+    /// mesh transport ports (15006/15008/15090) are not workload app ports.
+    pub fn resolve_workload_mtls_mode(&self) -> MtlsMode {
+        resolve_peer_auth_mtls_mode(
+            &self.peer_authentications,
+            &self.namespace,
+            &self.labels,
+            |pa| pa.mtls_mode,
+        )
+    }
+
     /// Resolve the effective inbound mTLS mode for `port`, FAILING CLOSED on an
     /// ambiguous shared-SPIFFE slice whose partial label intersection cannot
     /// confirm a candidate-only selector PeerAuthentication.
@@ -630,7 +642,27 @@ impl MeshSlice {
     /// resolved its authoritative labels) is enforcement-IDENTICAL to the plain
     /// resolver.
     pub fn resolve_inbound_mtls_mode_fail_closed(&self, port: u16) -> MtlsMode {
-        let resolved = self.resolve_effective_mtls_mode(port);
+        self.resolve_inbound_mtls_mode_fail_closed_with(|pa| peer_auth_effective_mode(pa, port))
+    }
+
+    /// Workload-level counterpart to
+    /// [`Self::resolve_inbound_mtls_mode_fail_closed`]. This preserves the
+    /// ambiguous-label fail-closed escalation while deliberately excluding
+    /// every app-port override from the listener-wide fallback.
+    pub fn resolve_inbound_workload_mtls_mode_fail_closed(&self) -> MtlsMode {
+        self.resolve_inbound_mtls_mode_fail_closed_with(|pa| pa.mtls_mode)
+    }
+
+    fn resolve_inbound_mtls_mode_fail_closed_with(
+        &self,
+        mode_for: impl Fn(&PeerAuthentication) -> MtlsMode + Copy,
+    ) -> MtlsMode {
+        let resolved = resolve_peer_auth_mtls_mode(
+            &self.peer_authentications,
+            &self.namespace,
+            &self.labels,
+            mode_for,
+        );
         if !self.labels_ambiguous {
             return resolved;
         }
@@ -660,7 +692,7 @@ impl MeshSlice {
             if !peer_auth_selector_namespace_matches(pa, &self.namespace) {
                 continue;
             }
-            let candidate = peer_auth_effective_mode(pa, port);
+            let candidate = mode_for(pa);
             if peer_auth_mtls_restrictiveness(candidate) < peer_auth_mtls_restrictiveness(effective)
             {
                 effective = candidate;
@@ -668,7 +700,6 @@ impl MeshSlice {
         }
         if effective != resolved {
             tracing::warn!(
-                port,
                 resolved = ?resolved,
                 fail_closed = ?effective,
                 "mesh PeerAuthentication: ambiguous shared-SPIFFE slice carries a candidate-only \
@@ -2784,6 +2815,17 @@ pub fn resolve_effective_mtls_mode<L: WorkloadLabels + ?Sized>(
     labels: &L,
     port: u16,
 ) -> MtlsMode {
+    resolve_peer_auth_mtls_mode(peer_auths, namespace, labels, |pa| {
+        peer_auth_effective_mode(pa, port)
+    })
+}
+
+fn resolve_peer_auth_mtls_mode<'a, L: WorkloadLabels + ?Sized>(
+    peer_auths: &'a [PeerAuthentication],
+    namespace: &str,
+    labels: &L,
+    mode_for: impl Fn(&'a PeerAuthentication) -> MtlsMode,
+) -> MtlsMode {
     let mut best: Option<(PeerAuthScope, &PeerAuthentication)> = None;
 
     for pa in peer_auths {
@@ -2811,10 +2853,8 @@ pub fn resolve_effective_mtls_mode<L: WorkloadLabels + ?Sized>(
                 Ordering::Greater => true,
                 Ordering::Less => false,
                 Ordering::Equal => {
-                    let candidate =
-                        peer_auth_mtls_restrictiveness(peer_auth_effective_mode(pa, port));
-                    let current =
-                        peer_auth_mtls_restrictiveness(peer_auth_effective_mode(current_pa, port));
+                    let candidate = peer_auth_mtls_restrictiveness(mode_for(pa));
+                    let current = peer_auth_mtls_restrictiveness(mode_for(current_pa));
                     match candidate.cmp(&current) {
                         Ordering::Less => true,
                         Ordering::Greater => false,
@@ -2832,7 +2872,7 @@ pub fn resolve_effective_mtls_mode<L: WorkloadLabels + ?Sized>(
     }
 
     match best {
-        Some((_, pa)) => peer_auth_effective_mode(pa, port),
+        Some((_, pa)) => mode_for(pa),
         None => MtlsMode::Permissive,
     }
 }

@@ -10406,16 +10406,12 @@ fn start_mesh_admin_listeners(
     Ok(handles)
 }
 
-/// Resolve the effective mTLS mode for the inbound TLS-terminating listener
-/// from the initial mesh slice. Falls back to `Permissive` when no slice or no
-/// PeerAuthentication policies are available.
-///
-/// Port selection follows the topology's TLS-terminating listener (see
-/// `listener_plan()`), so PeerAuthentication `port_overrides` keyed on the
-/// actual listener port are honoured for every topology, not just Sidecar.
+/// Resolve the workload-level mTLS fallback for the inbound TLS-terminating
+/// listener. App-port overrides are published separately in the per-port
+/// table; a mesh transport port must never select one as the listener fallback.
 fn resolve_inbound_mtls_mode(
     initial_slice: Option<&MeshSlice>,
-    runtime: &MeshRuntimeConfig,
+    _runtime: &MeshRuntimeConfig,
 ) -> config::MtlsMode {
     let Some(slice) = initial_slice else {
         return config::MtlsMode::Permissive;
@@ -10426,7 +10422,7 @@ fn resolve_inbound_mtls_mode(
     // rather than silently dropping a selector STRICT and falling back to
     // Permissive (a fail-open). Enforcement-identical to the plain resolver on a
     // non-ambiguous slice.
-    slice.resolve_inbound_mtls_mode_fail_closed(inbound_mtls_resolution_port(runtime))
+    slice.resolve_inbound_workload_mtls_mode_fail_closed()
 }
 
 /// Resolve every app-port-specific PeerAuthentication posture that may be
@@ -10448,22 +10444,6 @@ fn resolve_inbound_mtls_modes_by_port(
         .into_iter()
         .map(|port| (port, slice.resolve_inbound_mtls_mode_fail_closed(port)))
         .collect()
-}
-
-/// Pick the port used to resolve PeerAuthentication `port_overrides` for the
-/// inbound TLS-terminating listener of the current topology.
-fn inbound_mtls_resolution_port(runtime: &MeshRuntimeConfig) -> u16 {
-    match runtime.topology {
-        MeshTopology::Sidecar => runtime.inbound_listen_addr.port(),
-        MeshTopology::Ambient | MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint => {
-            runtime.hbone_listen_addr.port()
-        }
-        MeshTopology::EgressGateway => runtime.egress_listen_addr.port(),
-        // East-west gateways do SNI passthrough — no TLS termination, no port
-        // override surface. Use inbound for stability; the resolved mode is
-        // not consumed by any TLS listener in this topology.
-        MeshTopology::EastWestGateway => runtime.inbound_listen_addr.port(),
-    }
 }
 
 /// Reject `MtlsMode::Disable` on topologies whose inbound listener is
@@ -25692,25 +25672,6 @@ mod tests {
     }
 
     #[test]
-    fn inbound_mtls_resolution_port_picks_topology_correct_port() {
-        let sidecar = runtime_with_topology(MeshTopology::Sidecar);
-        assert_eq!(inbound_mtls_resolution_port(&sidecar), 15006);
-
-        let ambient = runtime_with_topology(MeshTopology::Ambient);
-        assert_eq!(inbound_mtls_resolution_port(&ambient), 15008);
-
-        let node_waypoint = runtime_with_topology(MeshTopology::NodeWaypoint);
-        assert_eq!(inbound_mtls_resolution_port(&node_waypoint), 15008);
-
-        let egress = runtime_with_topology(MeshTopology::EgressGateway);
-        assert_eq!(inbound_mtls_resolution_port(&egress), 15090);
-
-        // East-west has no TLS termination; pick a stable port for the call.
-        let east_west = runtime_with_topology(MeshTopology::EastWestGateway);
-        assert_eq!(inbound_mtls_resolution_port(&east_west), 15006);
-    }
-
-    #[test]
     fn inbound_mtls_modes_by_port_resolve_mixed_policy_independently() {
         let slice = slice_with_peer_auths(vec![config::PeerAuthentication {
             name: "mixed".to_string(),
@@ -25734,48 +25695,35 @@ mod tests {
     }
 
     #[test]
-    fn resolve_inbound_mtls_mode_honours_hbone_port_override_for_ambient() {
-        // Port override keyed on the HBONE port (15008). With the prior bug
-        // (always looking up 15006) this would have fallen through to the
-        // top-level Permissive mode.
-        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
-            15008,
-            config::MtlsMode::Strict,
-        )]);
-        let runtime = runtime_with_topology(MeshTopology::Ambient);
+    fn resolve_inbound_mtls_mode_excludes_mesh_transport_port_overrides() {
+        for (topology, transport_port) in [
+            (MeshTopology::Sidecar, 15006),
+            (MeshTopology::Ambient, 15008),
+            (MeshTopology::NodeWaypoint, 15008),
+            (MeshTopology::ServiceWaypoint, 15008),
+            (MeshTopology::EgressGateway, 15090),
+        ] {
+            let slice = slice_with_peer_auths(vec![config::PeerAuthentication {
+                name: "transport-port-collision".to_string(),
+                namespace: "default".to_string(),
+                scope: None,
+                selector: None,
+                mtls_mode: config::MtlsMode::Strict,
+                port_overrides: HashMap::from([(transport_port, config::MtlsMode::Permissive)]),
+            }]);
+            let runtime = runtime_with_topology(topology);
 
-        assert_eq!(
-            resolve_inbound_mtls_mode(Some(&slice), &runtime),
-            config::MtlsMode::Strict,
-        );
-    }
-
-    #[test]
-    fn resolve_inbound_mtls_mode_honours_egress_port_override_for_egress_gateway() {
-        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
-            15090,
-            config::MtlsMode::Strict,
-        )]);
-        let runtime = runtime_with_topology(MeshTopology::EgressGateway);
-
-        assert_eq!(
-            resolve_inbound_mtls_mode(Some(&slice), &runtime),
-            config::MtlsMode::Strict,
-        );
-    }
-
-    #[test]
-    fn resolve_inbound_mtls_mode_honours_inbound_port_override_for_sidecar() {
-        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
-            15006,
-            config::MtlsMode::Strict,
-        )]);
-        let runtime = runtime_with_topology(MeshTopology::Sidecar);
-
-        assert_eq!(
-            resolve_inbound_mtls_mode(Some(&slice), &runtime),
-            config::MtlsMode::Strict,
-        );
+            assert_eq!(
+                resolve_inbound_mtls_mode(Some(&slice), &runtime),
+                config::MtlsMode::Strict,
+                "{topology:?} transport port must not become the listener-wide app-port fallback",
+            );
+            assert_eq!(
+                resolve_inbound_mtls_modes_by_port(Some(&slice))[&transport_port],
+                config::MtlsMode::Permissive,
+                "the colliding key remains an exact app-port override",
+            );
+        }
     }
 
     #[test]
