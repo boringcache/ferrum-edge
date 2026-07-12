@@ -67,11 +67,15 @@ static PENDING_CAPTURE_FAILURES: LazyLock<DashMap<String, ()>> = LazyLock::new(D
 
 const CAPTURE_FAILURE_POD_IP_UPDATE: &str = "pod_ip_update";
 const CAPTURE_FAILURE_POD_IP_REMOVE: &str = "pod_ip_remove";
+const CAPTURE_FAILURE_POD_DETACH: &str = "pod_detach";
 const CAPTURE_FAILURE_NODE_PROBE_PORT_UPDATE: &str = "node_probe_port_update";
 const CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE: &str = "node_probe_port_remove";
+const CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE: &str = "include_ports_remove";
+const CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE: &str = "workload_identity_remove";
 const CAPTURE_FAILURE_UDP_READINESS: &str = "udp_readiness";
 const CAPTURE_FAILURE_DETAIL_POD_IP: &str = "pod_ip";
 const CAPTURE_FAILURE_DETAIL_POD_IP6: &str = "pod_ip6";
+const CAPTURE_FAILURE_DETAIL_POD_DETACH: &str = "pod_detach";
 const CAPTURE_FAILURE_DETAIL_NODE_PROBE_PORTS: &str = "node_probe_ports";
 const CAPTURE_FAILURE_DETAIL_UDP_READINESS: &str = "udp_readiness";
 
@@ -951,7 +955,7 @@ async fn run_with_backend(
             }
             _ = retry_interval.tick() => {
                 // Re-drive any pod whose transient enrollment failure has aged
-                // past the backoff window, and retry stale pod-IP map removals
+                // past the backoff window, and retry stale detach/map cleanup
                 // that would otherwise keep capture partially attached. Cheap
                 // no-ops when none are pending.
                 retry_backed_off_pod_enrollments(
@@ -960,6 +964,12 @@ async fn run_with_backend(
                     config,
                     metrics.as_ref(),
                     false,
+                );
+                retry_pending_pod_detaches(
+                    backend.as_mut(),
+                    &pod_states,
+                    config,
+                    metrics.as_ref(),
                 );
                 retry_pending_pod_ip_removals(
                     backend.as_mut(),
@@ -975,6 +985,13 @@ async fn run_with_backend(
                 retry_pending_node_probe_port_removals(
                     backend.as_mut(),
                     &pod_states,
+                    config,
+                    metrics.as_ref(),
+                );
+                retry_pending_cgroup_map_removals(
+                    backend.as_mut(),
+                    &pod_states,
+                    config,
                     metrics.as_ref(),
                 );
             }
@@ -2096,6 +2113,10 @@ struct FailedPodEnrollmentAttempt {
     /// expires. `Some` for every real failure recorded by `handle_pod_added`;
     /// the periodic retry loop skips records that lack a snapshot.
     snapshot: Option<RetryablePodEnrollment>,
+    /// Exact BPF keys that may have been written before enrollment failed.
+    /// Removal cannot reconstruct cgroup inode keys after the sandbox dies, so
+    /// retain the partial state until a genuine pod removal verifies cleanup.
+    cleanup_state: Option<PodAttachmentState>,
 }
 
 /// Prefix shared by every `FAILED_POD_ENROLLMENT_ATTEMPTS` key belonging to a
@@ -2344,6 +2365,24 @@ fn remember_failed_pod_enrollment(
             signature,
             last_attempt: Instant::now(),
             snapshot: Some(snapshot),
+            cleanup_state: None,
+        },
+    );
+}
+
+fn remember_failed_pod_enrollment_with_cleanup_state(
+    state_key: &str,
+    signature: PodEnrollmentAttemptSignature,
+    snapshot: RetryablePodEnrollment,
+    cleanup_state: &PodAttachmentState,
+) {
+    FAILED_POD_ENROLLMENT_ATTEMPTS.insert(
+        state_key.to_string(),
+        FailedPodEnrollmentAttempt {
+            signature,
+            last_attempt: Instant::now(),
+            snapshot: Some(snapshot),
+            cleanup_state: Some(cleanup_state.clone()),
         },
     );
 }
@@ -2462,9 +2501,33 @@ fn pending_pod_ip_removal_failures(
         .collect()
 }
 
+fn pending_pod_detach_failures(
+    pod_states: &DashMap<String, PodAttachmentState>,
+) -> Vec<(String, String, String)> {
+    if PENDING_CAPTURE_FAILURES.is_empty() {
+        return Vec::new();
+    }
+
+    let key_prefix = pod_state_key_prefix(pod_states);
+    PENDING_CAPTURE_FAILURES
+        .iter()
+        .filter_map(|entry| {
+            let failure = parse_pending_capture_failure_key(entry.key())?;
+            if !failure.state_key.starts_with(&key_prefix)
+                || failure.operation != CAPTURE_FAILURE_POD_DETACH
+                || failure.detail != CAPTURE_FAILURE_DETAIL_POD_DETACH
+            {
+                return None;
+            }
+            let pod_uid = failure.state_key.strip_prefix(&key_prefix)?.to_string();
+            Some((failure.key, failure.state_key, pod_uid))
+        })
+        .collect()
+}
+
 fn pending_node_probe_port_removal_failures(
     pod_states: &DashMap<String, PodAttachmentState>,
-) -> Vec<(String, std::net::IpAddr, u16)> {
+) -> Vec<(String, String, String, std::net::IpAddr, u16)> {
     if PENDING_CAPTURE_FAILURES.is_empty() {
         return Vec::new();
     }
@@ -2480,7 +2543,31 @@ fn pending_node_probe_port_removal_failures(
                 return None;
             }
             let (ip, port) = parse_node_probe_port_failure_detail(&failure.detail)?;
-            Some((failure.key, ip, port))
+            let pod_uid = failure.state_key.strip_prefix(&key_prefix)?.to_string();
+            Some((failure.key, failure.state_key, pod_uid, ip, port))
+        })
+        .collect()
+}
+
+fn pending_cgroup_map_removal_failures(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    operation: &str,
+) -> Vec<(String, String, String, u64)> {
+    if PENDING_CAPTURE_FAILURES.is_empty() {
+        return Vec::new();
+    }
+
+    let key_prefix = pod_state_key_prefix(pod_states);
+    PENDING_CAPTURE_FAILURES
+        .iter()
+        .filter_map(|entry| {
+            let failure = parse_pending_capture_failure_key(entry.key())?;
+            if !failure.state_key.starts_with(&key_prefix) || failure.operation != operation {
+                return None;
+            }
+            let pod_uid = failure.state_key.strip_prefix(&key_prefix)?.to_string();
+            let cgroup_id = failure.detail.parse().ok()?;
+            Some((failure.key, failure.state_key, pod_uid, cgroup_id))
         })
         .collect()
 }
@@ -2598,6 +2685,7 @@ fn retry_pending_node_probe_port_updates(
 fn retry_pending_node_probe_port_removals(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
 ) {
     let pending = pending_node_probe_port_removal_failures(pod_states);
@@ -2605,7 +2693,7 @@ fn retry_pending_node_probe_port_removals(
         return;
     }
 
-    for (failure_key, ip, port) in pending {
+    for (failure_key, state_key, pod_uid, ip, port) in pending {
         if let Some(owner_pod_uid) = pod_owning_probe_port_addr(pod_states, ip, port) {
             PENDING_CAPTURE_FAILURES.remove(&failure_key);
             debug!(
@@ -2614,6 +2702,7 @@ fn retry_pending_node_probe_port_removals(
                 port,
                 "Cleared pending node probe-port removal because another tracked pod owns the key"
             );
+            complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
             continue;
         }
 
@@ -2625,6 +2714,7 @@ fn retry_pending_node_probe_port_removals(
             Ok(()) => {
                 PENDING_CAPTURE_FAILURES.remove(&failure_key);
                 debug!(%ip, port, "Recovered pending node probe-port map removal failure");
+                complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
             }
             Err(e) => {
                 warn!(
@@ -2633,6 +2723,49 @@ fn retry_pending_node_probe_port_removals(
                     error = %e,
                     "Retrying pending node probe-port map removal failed; keeping capture state degraded"
                 );
+            }
+        }
+    }
+
+    clear_partial_capture_state_if_recovered(pod_states, metrics);
+}
+
+fn retry_pending_cgroup_map_removals(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+) {
+    for operation in [
+        CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE,
+        CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE,
+    ] {
+        for (failure_key, state_key, pod_uid, cgroup_id) in
+            pending_cgroup_map_removal_failures(pod_states, operation)
+        {
+            let result = if operation == CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE {
+                backend.remove_pod_include_ports(cgroup_id)
+            } else {
+                backend.remove_workload_identity(cgroup_id)
+            };
+            match result {
+                Ok(()) => {
+                    PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                    debug!(
+                        pod_uid,
+                        cgroup_id, operation, "Recovered pending cgroup map removal failure"
+                    );
+                    complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
+                }
+                Err(e) => {
+                    warn!(
+                        pod_uid,
+                        cgroup_id,
+                        operation,
+                        error = %e,
+                        "Retrying pending cgroup map removal failed; keeping capture state degraded"
+                    );
+                }
             }
         }
     }
@@ -2678,6 +2811,42 @@ fn retry_pending_pod_ip_removals(
                     %ip,
                     error = %e,
                     "Retrying pending pod IP map removal failed; keeping capture state degraded"
+                );
+            }
+        }
+    }
+
+    clear_partial_capture_state_if_recovered(pod_states, metrics);
+}
+
+fn retry_pending_pod_detaches(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+) {
+    let pending = pending_pod_detach_failures(pod_states);
+    if pending.is_empty() {
+        return;
+    }
+
+    for (failure_key, state_key, pod_uid) in pending {
+        // A same-UID pod that is live again may own newly-attached links. Do not
+        // let a stale removal retry detach the current enrollment.
+        if pod_states.contains_key(&pod_uid) {
+            continue;
+        }
+        match backend.detach_pod(&pod_uid) {
+            Ok(()) => {
+                PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                debug!(pod_uid, "Recovered pending pod BPF detach failure");
+                complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
+            }
+            Err(e) => {
+                warn!(
+                    pod_uid,
+                    error = %e,
+                    "Retrying pending pod BPF detach failed; keeping capture state degraded"
                 );
             }
         }
@@ -2832,6 +3001,36 @@ fn remove_udp_not_ready_ack(dir: &std::path::Path, pod_uid: &str) {
     }
 }
 
+/// Remove a live pod's `.udp-ack-required` marker only once it is old enough
+/// to be restart residue. The producer's close handshake persists the request
+/// BEFORE retracting `.udp-ready` (separate process), so a reconcile tick can
+/// observe (ready, request present) mid-close; deleting that fresh request
+/// would forfeit the durable restart-recovery insurance if the node-agent
+/// crashed before acking and the pod was removed during the outage. Residue
+/// left by a node-agent restart is by definition older than the orphan grace.
+fn remove_udp_ack_requirement_older_than(
+    dir: &std::path::Path,
+    pod_uid: &str,
+    min_age: std::time::Duration,
+) {
+    if pod_registry_uid_is_unsafe(pod_uid) {
+        return;
+    }
+    let path = dir.join(".udp-ack-required").join(pod_uid);
+    let old_enough = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+        .is_ok_and(|age| age >= min_age);
+    if !old_enough {
+        return;
+    }
+    if let Err(error) = std::fs::remove_file(&path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(pod_uid, %error, "Failed to remove stale Ambient UDP close request");
+    }
+}
+
 fn udp_gate_cleaned_proof_path(dir: &std::path::Path, pod_uid: &str) -> Option<std::path::PathBuf> {
     (!pod_registry_uid_is_unsafe(pod_uid)).then(|| dir.join(".udp-gate-cleaned").join(pod_uid))
 }
@@ -2872,17 +3071,22 @@ fn remove_udp_gate_cleaned_proof(dir: &std::path::Path, pod_uid: &str) -> bool {
     }
 }
 
-fn has_pending_pod_ip_removal_failure(state_key: &str) -> bool {
+fn has_pending_removal_blocking_failure(state_key: &str) -> bool {
     PENDING_CAPTURE_FAILURES.iter().any(|entry| {
         parse_pending_capture_failure_key(entry.key()).is_some_and(|failure| {
-            failure.state_key == state_key && failure.operation == CAPTURE_FAILURE_POD_IP_REMOVE
+            failure.state_key == state_key
+                && (failure.operation == CAPTURE_FAILURE_POD_IP_REMOVE
+                    || failure.operation == CAPTURE_FAILURE_POD_DETACH
+                    || failure.operation == CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE
+                    || failure.operation == CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE
+                    || failure.operation == CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE)
         })
     })
 }
 
-/// Complete a removed pod's durable UDP close handoff after the last pod-IP
-/// cleanup retry succeeds. Live-pod IP-update retries must never mint removal
-/// proof, and a dual-stack removal must wait for both map entries to recover.
+/// Complete a removed pod's durable UDP close handoff after all removal-blocking
+/// cleanup retries succeed. Live-pod retries must never mint removal proof, and
+/// detach plus every recorded partial map entry must all recover first.
 fn complete_removed_udp_close_handoff(
     pod_states: &DashMap<String, PodAttachmentState>,
     config: &NodeAgentConfig,
@@ -2892,7 +3096,7 @@ fn complete_removed_udp_close_handoff(
     if !udp_readiness_reconcile_enabled(config)
         || pod_states.contains_key(pod_uid)
         || has_failed_pod_enrollment_attempt(state_key)
-        || has_pending_pod_ip_removal_failure(state_key)
+        || has_pending_removal_blocking_failure(state_key)
     {
         return;
     }
@@ -2904,7 +3108,7 @@ fn complete_removed_udp_close_handoff(
     } else {
         warn!(
             pod_uid,
-            "Withholding Ambient UDP not-ready acknowledgement because durable cleaned-gate proof could not be persisted after pod-IP cleanup retry"
+            "Withholding Ambient UDP not-ready acknowledgement because durable cleaned-gate proof could not be persisted after removal cleanup retry"
         );
     }
 }
@@ -2948,6 +3152,9 @@ fn reconcile_removed_udp_close_acknowledgements(
         if has_failed_pod_enrollment_attempt(&pod_state_key(pod_states, &uid)) {
             continue;
         }
+        if dir.join(".udp-not-ready").join(&uid).is_file() {
+            continue;
+        }
         let gate_cleaned =
             udp_gate_cleaned_proof_path(dir, &uid).is_some_and(|path| path.is_file());
         if !gate_cleaned {
@@ -2983,7 +3190,10 @@ fn reap_orphaned_udp_not_ready_acks(
     // freshly-published pod-removal ack cannot be reaped before the producer
     // observes the registry removal and consumes it.
     let minimum_age = UDP_HANDSHAKE_ORPHAN_GRACE;
-    for marker_dir in [".udp-not-ready", ".udp-ack-required", ".udp-gate-cleaned"] {
+    // Drain verified handshakes proof+request first. The proof pass refreshes
+    // an extant ack once at the TTL boundary, preserving the ordinary grace
+    // for producer consumption without rewriting it on every reconcile tick.
+    for marker_dir in [".udp-gate-cleaned", ".udp-ack-required", ".udp-not-ready"] {
         reap_orphaned_udp_handshake_markers_older_than(
             dir,
             marker_dir,
@@ -3061,6 +3271,20 @@ fn reap_orphaned_udp_handshake_markers_older_than(
             .is_ok_and(|age| age >= retention);
         if !old_enough {
             continue;
+        }
+        if verified_handshake && matches!(marker_dir, ".udp-gate-cleaned" | ".udp-ack-required") {
+            let ack_path = dir.join(".udp-not-ready").join(&uid);
+            if ack_path.is_file()
+                && let Err(error) = std::fs::write(&ack_path, b"")
+            {
+                warn!(
+                    pod_uid = uid.as_str(),
+                    path = %ack_path.display(),
+                    %error,
+                    "Failed to refresh Ambient UDP acknowledgement for TTL drain"
+                );
+                continue;
+            }
         }
         if let Err(error) = std::fs::remove_file(entry.path())
             && error.kind() != std::io::ErrorKind::NotFound
@@ -3199,6 +3423,9 @@ fn reconcile_udp_capture_readiness_with_sync_state(
         // stale ack failed transiently, keep reconciling until it is gone rather
         // than letting producer teardown trust it while the BPF gate is open.
         if ready_uids.contains(uid) == ready && not_ready_ack_exists != ready {
+            if ready && let Some(dir) = &config.node_waypoint_pod_registry_dir {
+                remove_udp_ack_requirement_older_than(dir, uid, UDP_HANDSHAKE_ORPHAN_GRACE);
+            }
             continue;
         }
         if ready {
@@ -3226,6 +3453,7 @@ fn reconcile_udp_capture_readiness_with_sync_state(
                 ready_uids.insert(uid.clone());
                 if let Some(dir) = &config.node_waypoint_pod_registry_dir {
                     remove_udp_not_ready_ack(dir, uid);
+                    remove_udp_ack_requirement_older_than(dir, uid, UDP_HANDSHAKE_ORPHAN_GRACE);
                 }
             } else {
                 ready_uids.remove(uid);
@@ -3585,10 +3813,11 @@ fn handle_pod_added(
                     warn!(pod_uid, %ip, error = %e, "Failed to arm UDP enrollment guard");
                     metrics.record_attach_error();
                     cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
-                    remember_failed_pod_enrollment(
+                    remember_failed_pod_enrollment_with_cleanup_state(
                         &state_key,
                         attempt_signature,
                         enrollment_snapshot.clone(),
+                        &state,
                     );
                     return;
                 }
@@ -3598,10 +3827,11 @@ fn handle_pod_added(
                     warn!(pod_uid, %ip, error = %e, "Failed to arm IPv6 UDP enrollment guard");
                     metrics.record_attach_error();
                     cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
-                    remember_failed_pod_enrollment(
+                    remember_failed_pod_enrollment_with_cleanup_state(
                         &state_key,
                         attempt_signature,
                         enrollment_snapshot.clone(),
+                        &state,
                     );
                     return;
                 }
@@ -3615,10 +3845,11 @@ fn handle_pod_added(
                 );
                 metrics.record_attach_error();
                 cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
-                remember_failed_pod_enrollment(
+                remember_failed_pod_enrollment_with_cleanup_state(
                     &state_key,
                     attempt_signature,
                     enrollment_snapshot.clone(),
+                    &state,
                 );
                 return;
             };
@@ -3634,10 +3865,11 @@ fn handle_pod_added(
                     );
                     metrics.record_attach_error();
                     cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
-                    remember_failed_pod_enrollment(
+                    remember_failed_pod_enrollment_with_cleanup_state(
                         &state_key,
                         attempt_signature,
                         enrollment_snapshot.clone(),
+                        &state,
                     );
                     return;
                 }
@@ -3677,10 +3909,11 @@ fn handle_pod_added(
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IP map");
                     metrics.record_attach_error();
                     cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
-                    remember_failed_pod_enrollment(
+                    remember_failed_pod_enrollment_with_cleanup_state(
                         &state_key,
                         attempt_signature,
                         enrollment_snapshot.clone(),
+                        &state,
                     );
                     return;
                 }
@@ -3691,10 +3924,11 @@ fn handle_pod_added(
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IPv6 map");
                     metrics.record_attach_error();
                     cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
-                    remember_failed_pod_enrollment(
+                    remember_failed_pod_enrollment_with_cleanup_state(
                         &state_key,
                         attempt_signature,
                         enrollment_snapshot.clone(),
+                        &state,
                     );
                     return;
                 }
@@ -3703,10 +3937,11 @@ fn handle_pod_added(
                 warn!(pod_uid, error = %e, "Failed to update node probe-port maps");
                 metrics.record_attach_error();
                 cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
-                remember_failed_pod_enrollment(
+                remember_failed_pod_enrollment_with_cleanup_state(
                     &state_key,
                     attempt_signature,
                     enrollment_snapshot.clone(),
+                    &state,
                 );
                 return;
             }
@@ -3724,7 +3959,12 @@ fn handle_pod_added(
             );
         } else {
             cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
-            remember_failed_pod_enrollment(&state_key, attempt_signature, enrollment_snapshot);
+            remember_failed_pod_enrollment_with_cleanup_state(
+                &state_key,
+                attempt_signature,
+                enrollment_snapshot,
+                &state,
+            );
         }
     } else {
         warn!(
@@ -3738,6 +3978,16 @@ fn handle_pod_added(
 
     if state.attached {
         forget_failed_pod_enrollment(&state_key);
+        if forget_pending_capture_failure(
+            &state_key,
+            CAPTURE_FAILURE_POD_DETACH,
+            CAPTURE_FAILURE_DETAIL_POD_DETACH,
+        ) {
+            debug!(
+                pod_uid,
+                "Cleared superseded detach failure after same-UID pod re-enrollment"
+            );
+        }
         if let Some(ip) = pod_ip {
             forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
         }
@@ -4466,11 +4716,140 @@ fn describe_policy(policy: Option<&IncludePortsPolicy>) -> String {
     }
 }
 
+fn record_removed_pod_detach_result(
+    state_key: &str,
+    pod_uid: &str,
+    result: Result<(), String>,
+    metrics: &NodeAgentMetrics,
+) -> bool {
+    match result {
+        Ok(()) => {
+            forget_pending_capture_failure(
+                state_key,
+                CAPTURE_FAILURE_POD_DETACH,
+                CAPTURE_FAILURE_DETAIL_POD_DETACH,
+            );
+            true
+        }
+        Err(e) => {
+            warn!(pod_uid, error = %e, "Failed to detach BPF programs");
+            metrics.record_attach_error();
+            remember_pending_capture_failure(
+                state_key,
+                CAPTURE_FAILURE_POD_DETACH,
+                CAPTURE_FAILURE_DETAIL_POD_DETACH,
+            );
+            false
+        }
+    }
+}
+
+fn remove_failed_enrollment_cgroup_maps(
+    backend: &mut dyn EbpfBackend,
+    metrics: &NodeAgentMetrics,
+    state_key: &str,
+    pod_uid: &str,
+    state: &PodAttachmentState,
+) {
+    for cgroup_id in &state.include_ports_cgroup_ids {
+        let detail = cgroup_id.to_string();
+        match backend.remove_pod_include_ports(*cgroup_id) {
+            Ok(()) => {
+                forget_pending_capture_failure(
+                    state_key,
+                    CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE,
+                    &detail,
+                );
+            }
+            Err(e) => {
+                warn!(
+                    pod_uid,
+                    cgroup_id = *cgroup_id,
+                    error = %e,
+                    "Failed to remove failed-enrollment includeOutboundPorts entry"
+                );
+                metrics.record_attach_error();
+                remember_pending_capture_failure(
+                    state_key,
+                    CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE,
+                    &detail,
+                );
+            }
+        }
+    }
+    for cgroup_id in &state.workload_identity_cgroup_ids {
+        let detail = cgroup_id.to_string();
+        match backend.remove_workload_identity(*cgroup_id) {
+            Ok(()) => {
+                forget_pending_capture_failure(
+                    state_key,
+                    CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE,
+                    &detail,
+                );
+            }
+            Err(e) => {
+                warn!(
+                    pod_uid,
+                    cgroup_id = *cgroup_id,
+                    error = %e,
+                    "Failed to remove failed-enrollment workload-identity entry"
+                );
+                metrics.record_attach_error();
+                remember_pending_capture_failure(
+                    state_key,
+                    CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE,
+                    &detail,
+                );
+            }
+        }
+    }
+}
+
+fn verify_failed_enrollment_cleanup_on_removal(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+    state_key: &str,
+    pod_uid: &str,
+    state: &PodAttachmentState,
+) -> bool {
+    // The failed attempt reached the BPF mutation phase. Any subset of the
+    // cgroup/tc attaches may have succeeded, so a successful detach is required
+    // even though the pod never became tracked.
+    let mut cleanup_succeeded =
+        record_removed_pod_detach_result(state_key, pod_uid, backend.detach_pod(pod_uid), metrics);
+    cleanup_node_probe_ports(backend, pod_states, metrics, pod_uid, state);
+    if let Some(ip) = state.pod_ip {
+        remove_pod_ip_if_unowned(
+            backend,
+            pod_states,
+            metrics,
+            pod_uid,
+            ip,
+            "failed enrollment pod removed",
+        );
+    }
+    if let Some(ip) = state.pod_ip6 {
+        remove_pod_ip6_if_unowned(
+            backend,
+            pod_states,
+            metrics,
+            pod_uid,
+            ip,
+            "failed enrollment pod removed",
+        );
+    }
+    remove_failed_enrollment_cgroup_maps(backend, metrics, state_key, pod_uid, state);
+    cleanup_succeeded &= !has_pending_removal_blocking_failure(state_key);
+    cleanup_succeeded
+}
+
 /// Remove a tracked pod and clean up its eBPF enrollment state.
 ///
-/// When the registry-backed UDP handshake reconciler is active, successful tc
-/// detach plus pod-IP map cleanup is sufficient node-agent-owned evidence to
-/// persist the cleaned-gate proof and close acknowledgement. This includes
+/// When the registry-backed UDP handshake reconciler is active, successful BPF
+/// detach plus removal of every recorded gate-related map entry is sufficient
+/// node-agent-owned evidence to persist the cleaned-gate proof and close
+/// acknowledgement. This includes
 /// UDP-disabled Ambient cleanup after an enabled-to-disabled rollout: the
 /// disabled reconciler independently verifies the same closed pod-map posture,
 /// so removed pods must not lose their producer close handoff solely because
@@ -4484,7 +4863,11 @@ pub fn handle_pod_removed(
     pod_uid: &str,
 ) {
     let state_key = pod_state_key(pod_states, pod_uid);
-    forget_pod_enrollment_attempt(&state_key);
+    // Snapshot before forgetting: a failed attempt may have written partial
+    // BPF state without ever entering `pod_states`.
+    let failed_attempt = FAILED_POD_ENROLLMENT_ATTEMPTS
+        .get(&state_key)
+        .map(|attempt| attempt.value().clone());
     forget_pending_capture_failure(
         &state_key,
         CAPTURE_FAILURE_POD_IP_UPDATE,
@@ -4515,19 +4898,43 @@ pub fn handle_pod_removed(
 
     let removed = pod_states.remove(pod_uid);
     let Some((_, state)) = removed else {
-        // No tracked state means there is no verified BPF cleanup result to
-        // acknowledge. Withhold the UDP close ack so a surviving producer keeps
-        // its in-netns guard fail closed.
+        if let Some(failed_attempt) = failed_attempt
+            && udp_readiness_reconcile_enabled(config)
+        {
+            // `None` proves the attempt failed before the BPF mutation phase;
+            // `Some` retains every exact key that may have been applied. Use
+            // that evidence before lifting failed-enrollment suppression.
+            let cleanup_succeeded = failed_attempt.cleanup_state.as_ref().is_none_or(|state| {
+                verify_failed_enrollment_cleanup_on_removal(
+                    backend, pod_states, metrics, &state_key, pod_uid, state,
+                )
+            });
+            forget_pod_enrollment_attempt(&state_key);
+            // Pod events, retry ticks, and responder ticks share this select!
+            // task, so the responder cannot observe suppression lifted between
+            // the pending-failure writes above and this completion attempt.
+            if cleanup_succeeded {
+                complete_removed_udp_close_handoff(pod_states, config, &state_key, pod_uid);
+            } else {
+                warn!(
+                    pod_uid,
+                    "Withholding Ambient UDP not-ready acknowledgement because failed-enrollment BPF cleanup is incomplete"
+                );
+            }
+        } else {
+            forget_pod_enrollment_attempt(&state_key);
+        }
         clear_partial_capture_state_if_recovered(pod_states, metrics);
         return;
     };
 
+    forget_pod_enrollment_attempt(&state_key);
+
     let mut udp_gate_cleanup_succeeded = true;
     if state.attached {
-        if let Err(e) = backend.detach_pod(pod_uid) {
-            warn!(pod_uid, error = %e, "Failed to detach BPF programs");
-            udp_gate_cleanup_succeeded = false;
-        }
+        let detach_result = backend.detach_pod(pod_uid);
+        udp_gate_cleanup_succeeded &=
+            record_removed_pod_detach_result(&state_key, pod_uid, detach_result, metrics);
         cleanup_node_probe_ports(backend, pod_states, metrics, pod_uid, &state);
         if let Some(ip) = state.pod_ip {
             remove_pod_ip_if_unowned(backend, pod_states, metrics, pod_uid, ip, "pod removed");
@@ -4564,7 +4971,7 @@ pub fn handle_pod_removed(
         }
         metrics.pods_unenrolled.fetch_add(1, Ordering::Relaxed);
         info!(pod_uid, pod_name = %state.pod_name, "Pod unenrolled from eBPF capture");
-        udp_gate_cleanup_succeeded &= !has_pending_pod_ip_removal_failure(&state_key);
+        udp_gate_cleanup_succeeded &= !has_pending_removal_blocking_failure(&state_key);
     }
     if udp_readiness_reconcile_enabled(config) {
         if udp_gate_cleanup_succeeded {
@@ -6121,7 +6528,7 @@ mod tests {
                 ack.is_file(),
                 "recovered cleanup must publish an ack (udp_capture_enabled={udp_capture_enabled})"
             );
-            assert!(!has_pending_pod_ip_removal_failure(&state_key));
+            assert!(!has_pending_removal_blocking_failure(&state_key));
             assert_eq!(
                 metrics.snapshot().capture_state,
                 NODE_AGENT_CAPTURE_STATE_READY
@@ -6162,7 +6569,21 @@ mod tests {
             .unwrap();
         let metrics = NodeAgentMetrics::default();
 
-        remember_failed_pod_enrollment(
+        let failed_cleanup_state = PodAttachmentState {
+            pod_uid: pod_uid.to_string(),
+            pod_name: pod_uid.to_string(),
+            namespace: "default".to_string(),
+            pod_ip: Some(ip),
+            pod_ip6: None,
+            cgroup_path: Some("/cg/live-failed".to_string()),
+            veth_iface: Some("veth-live-failed".to_string()),
+            attached: false,
+            include_ports_cgroup_ids: Vec::new(),
+            include_ports_policy: None,
+            workload_identity_cgroup_ids: Vec::new(),
+            node_probe_ports: Vec::new(),
+        };
+        remember_failed_pod_enrollment_with_cleanup_state(
             &state_key,
             PodEnrollmentAttemptSignature {
                 namespace: "default".to_string(),
@@ -6187,13 +6608,13 @@ mod tests {
                 node_probe_ports: Vec::new(),
                 pod_pid: None,
             },
+            &failed_cleanup_state,
         );
         remember_pending_capture_failure(
             &state_key,
             CAPTURE_FAILURE_POD_IP_REMOVE,
             &ip.to_string(),
         );
-
         retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
         assert!(
@@ -6201,7 +6622,7 @@ mod tests {
             "the live pod's failed enrollment retry record must still gate UDP close handoff"
         );
         assert!(
-            !has_pending_pod_ip_removal_failure(&state_key),
+            !has_pending_removal_blocking_failure(&state_key),
             "the pre-enrollment pod-IP cleanup retry should still be cleared after recovery"
         );
         assert!(
@@ -6221,7 +6642,146 @@ mod tests {
             "pre-enrollment cleanup retry must not acknowledge UDP closure for a live failed pod"
         );
 
-        forget_failed_pod_enrollment(&state_key);
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, pod_uid);
+
+        assert!(!has_failed_pod_enrollment_attempt(&state_key));
+        assert!(
+            registry
+                .path()
+                .join(".udp-gate-cleaned")
+                .join(pod_uid)
+                .is_file(),
+            "genuine removal must persist proof after re-verifying failed-enrollment cleanup"
+        );
+        assert!(
+            registry
+                .path()
+                .join(".udp-not-ready")
+                .join(pod_uid)
+                .is_file(),
+            "genuine removal must complete the suppressed close handoff"
+        );
+    }
+
+    #[test]
+    fn failed_enrollment_removal_retries_cleanup_before_udp_close_handoff() {
+        let registry = tempfile::tempdir().unwrap();
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.udp_capture_enabled = true;
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let pod_states = DashMap::new();
+        let pod_uid = "pod-live-failed-remove-retry";
+        let state_key = pod_state_key(&pod_states, pod_uid);
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 14);
+        let metrics = NodeAgentMetrics::default();
+        let mut backend = MockEbpfBackend::default();
+        backend
+            .update_pod_ip(ip, &PodInfo::for_capture(15001, true, true))
+            .unwrap();
+        let failed_cleanup_state = PodAttachmentState {
+            pod_uid: pod_uid.to_string(),
+            pod_name: pod_uid.to_string(),
+            namespace: "default".to_string(),
+            pod_ip: Some(ip),
+            pod_ip6: None,
+            cgroup_path: Some("/cg/live-failed-remove-retry".to_string()),
+            veth_iface: Some("veth-live-failed-remove-retry".to_string()),
+            attached: false,
+            include_ports_cgroup_ids: Vec::new(),
+            include_ports_policy: None,
+            workload_identity_cgroup_ids: Vec::new(),
+            node_probe_ports: Vec::new(),
+        };
+        remember_failed_pod_enrollment_with_cleanup_state(
+            &state_key,
+            PodEnrollmentAttemptSignature {
+                namespace: "default".to_string(),
+                service_account: None,
+                pod_ip: Some(ip),
+                pod_source_ips: PodSourceIps::default(),
+                node_probe_ports: Vec::new(),
+                cgroup_path: failed_cleanup_state.cgroup_path.clone(),
+                veth_iface: failed_cleanup_state.veth_iface.clone(),
+                labels_fingerprint: 0,
+                annotations_fingerprint: 0,
+            },
+            RetryablePodEnrollment {
+                pod_uid: pod_uid.to_string(),
+                pod_name: pod_uid.to_string(),
+                namespace: "default".to_string(),
+                service_account: None,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                pod_ip: Some(ip.to_string()),
+                pod_source_ips: PodSourceIps::default(),
+                node_probe_ports: Vec::new(),
+                pod_pid: None,
+            },
+            &failed_cleanup_state,
+        );
+        remember_pending_capture_failure(
+            &state_key,
+            CAPTURE_FAILURE_POD_IP_REMOVE,
+            &ip.to_string(),
+        );
+        retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
+        assert!(!has_pending_removal_blocking_failure(&state_key));
+        assert!(
+            !registry
+                .path()
+                .join(".udp-gate-cleaned")
+                .join(pod_uid)
+                .exists()
+        );
+
+        backend.fail_remove_pod_ip = true;
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, pod_uid);
+
+        assert!(!has_failed_pod_enrollment_attempt(&state_key));
+        assert!(has_pending_removal_blocking_failure(&state_key));
+        assert!(
+            !registry
+                .path()
+                .join(".udp-gate-cleaned")
+                .join(pod_uid)
+                .exists()
+        );
+        assert!(
+            !registry
+                .path()
+                .join(".udp-not-ready")
+                .join(pod_uid)
+                .exists()
+        );
+
+        backend.fail_remove_pod_ip = false;
+        retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
+
+        assert!(!has_pending_removal_blocking_failure(&state_key));
+        assert!(
+            registry
+                .path()
+                .join(".udp-gate-cleaned")
+                .join(pod_uid)
+                .is_file()
+        );
+        assert!(
+            registry
+                .path()
+                .join(".udp-not-ready")
+                .join(pod_uid)
+                .is_file()
+        );
     }
 
     #[test]
@@ -6299,6 +6859,83 @@ mod tests {
         assert!(
             ack.is_file(),
             "the responder must acknowledge the durable request once the pod is genuinely removed"
+        );
+    }
+
+    #[test]
+    fn pod_ip_retry_waits_for_pending_detach_before_udp_handoff() {
+        let registry = tempfile::tempdir().unwrap();
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.udp_capture_enabled = true;
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let pod_states = DashMap::new();
+        let state_key = pod_state_key(&pod_states, "pod-udp");
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 13);
+        let metrics = NodeAgentMetrics::default();
+        let mut backend = MockEbpfBackend::default();
+        backend
+            .update_pod_ip(ip, &PodInfo::for_capture(15001, true, true))
+            .unwrap();
+        remember_pending_capture_failure(
+            &state_key,
+            CAPTURE_FAILURE_POD_IP_REMOVE,
+            &ip.to_string(),
+        );
+        assert!(!record_removed_pod_detach_result(
+            &state_key,
+            "pod-udp",
+            Err("injected detach failure".to_string()),
+            &metrics,
+        ));
+
+        retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
+
+        assert!(has_pending_removal_blocking_failure(&state_key));
+        assert!(
+            !registry
+                .path()
+                .join(".udp-gate-cleaned")
+                .join("pod-udp")
+                .exists(),
+            "pod-IP recovery must not mint proof while detach remains pending"
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED,
+            "a pending detach must keep the node honestly degraded"
+        );
+
+        retry_pending_pod_detaches(&mut backend, &pod_states, &config, &metrics);
+
+        assert!(!has_pending_removal_blocking_failure(&state_key));
+        assert_eq!(backend.detached_pods, vec!["pod-udp"]);
+        assert!(
+            registry
+                .path()
+                .join(".udp-gate-cleaned")
+                .join("pod-udp")
+                .is_file()
+        );
+        assert!(
+            registry
+                .path()
+                .join(".udp-not-ready")
+                .join("pod-udp")
+                .is_file()
+        );
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY
         );
     }
 
@@ -6389,7 +7026,7 @@ mod tests {
         let pod_states = DashMap::new();
 
         reconcile_removed_udp_close_acknowledgements(registry.path(), &pod_states, true);
-        for marker_dir in [".udp-not-ready", ".udp-ack-required", ".udp-gate-cleaned"] {
+        for marker_dir in [".udp-gate-cleaned", ".udp-ack-required", ".udp-not-ready"] {
             reap_orphaned_udp_handshake_markers_older_than(
                 registry.path(),
                 marker_dir,
@@ -6419,7 +7056,7 @@ mod tests {
 
         // A zero base age injects an already-expired verified retention without
         // sleeping or mutating filesystem timestamps.
-        for marker_dir in [".udp-not-ready", ".udp-ack-required", ".udp-gate-cleaned"] {
+        for marker_dir in [".udp-gate-cleaned", ".udp-ack-required", ".udp-not-ready"] {
             reap_orphaned_udp_handshake_markers_older_than(
                 registry.path(),
                 marker_dir,
@@ -6442,6 +7079,81 @@ mod tests {
                     .exists(),
             "the verified handoff must be reaped after its bounded retention expires"
         );
+    }
+
+    #[test]
+    fn existing_removed_pod_ack_is_not_rewritten() {
+        let registry = tempfile::tempdir().unwrap();
+        let required_dir = registry.path().join(".udp-ack-required");
+        let ack_dir = registry.path().join(".udp-not-ready");
+        std::fs::create_dir_all(&required_dir).unwrap();
+        std::fs::create_dir_all(&ack_dir).unwrap();
+        std::fs::write(required_dir.join("pod-gone"), b"").unwrap();
+        assert!(write_udp_gate_cleaned_proof(registry.path(), "pod-gone"));
+        let ack = ack_dir.join("pod-gone");
+        std::fs::write(&ack, b"").unwrap();
+        let modified_before = std::fs::metadata(&ack).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        reconcile_removed_udp_close_acknowledgements(registry.path(), &DashMap::new(), true);
+
+        assert_eq!(
+            std::fs::metadata(&ack).unwrap().modified().unwrap(),
+            modified_before,
+            "an existing ack must not consume responder budget or churn its mtime"
+        );
+    }
+
+    #[test]
+    fn verified_udp_handoff_drains_request_and_proof_before_ack_grace() {
+        let registry = tempfile::tempdir().unwrap();
+        let required = registry.path().join(".udp-ack-required").join("pod-gone");
+        let ack = registry.path().join(".udp-not-ready").join("pod-gone");
+        std::fs::create_dir_all(required.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(ack.parent().unwrap()).unwrap();
+        std::fs::write(&required, b"").unwrap();
+        std::fs::write(&ack, b"").unwrap();
+        assert!(write_udp_gate_cleaned_proof(registry.path(), "pod-gone"));
+        let pod_states = DashMap::new();
+
+        for marker_dir in [".udp-gate-cleaned", ".udp-ack-required"] {
+            reap_orphaned_udp_handshake_markers_older_than(
+                registry.path(),
+                marker_dir,
+                &pod_states,
+                true,
+                std::time::Duration::ZERO,
+            );
+        }
+
+        assert!(!required.exists());
+        assert!(
+            !registry
+                .path()
+                .join(".udp-gate-cleaned")
+                .join("pod-gone")
+                .exists()
+        );
+        reap_orphaned_udp_handshake_markers_older_than(
+            registry.path(),
+            ".udp-not-ready",
+            &pod_states,
+            true,
+            UDP_HANDSHAKE_ORPHAN_GRACE,
+        );
+        assert!(
+            ack.exists(),
+            "the TTL transition must refresh the ack for one final unverified grace"
+        );
+
+        reap_orphaned_udp_handshake_markers_older_than(
+            registry.path(),
+            ".udp-not-ready",
+            &pod_states,
+            true,
+            std::time::Duration::ZERO,
+        );
+        assert!(!ack.exists(), "the final ack grace must still converge");
     }
 
     #[test]
@@ -7017,6 +7729,13 @@ mod tests {
         backend.load_programs().unwrap();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let metrics = NodeAgentMetrics::default();
+        let state_key = pod_state_key(&pod_states, "pod-uid-1");
+        remember_pending_capture_failure(
+            &state_key,
+            CAPTURE_FAILURE_POD_DETACH,
+            CAPTURE_FAILURE_DETAIL_POD_DETACH,
+        );
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED);
         let cgroup_root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
         let config = NodeAgentConfig {
@@ -7057,6 +7776,12 @@ mod tests {
                 .contains_key(&std::net::Ipv4Addr::new(10, 0, 0, 5))
         );
         assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 1);
+        assert!(!has_pending_removal_blocking_failure(&state_key));
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY,
+            "successful same-UID re-enrollment must supersede a stale detach blocker"
+        );
     }
 
     #[test]
@@ -9380,6 +10105,27 @@ mod tests {
             "ready reconcile is idempotent"
         );
 
+        let required_dir = registry.path().join(".udp-ack-required");
+        std::fs::create_dir_all(&required_dir).unwrap();
+        std::fs::write(required_dir.join("pod-a"), b"stale-after-restart").unwrap();
+        reconcile_udp_capture_readiness(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &mut ready_uids,
+        );
+        assert!(
+            required_dir.join("pod-a").exists(),
+            "a fresh close request may be a producer mid-close (request persists before \
+             the ready marker retracts), so the residue sweep must not delete it"
+        );
+        remove_udp_ack_requirement_older_than(registry.path(), "pod-a", Duration::ZERO);
+        assert!(
+            !required_dir.join("pod-a").exists(),
+            "aged restart residue for a ready live pod is swept once past the orphan grace"
+        );
+
         let ack_dir = registry.path().join(".udp-not-ready");
         std::fs::create_dir_all(&ack_dir).unwrap();
         std::fs::write(ack_dir.join("pod-a"), b"stale").unwrap();
@@ -9436,6 +10182,18 @@ mod tests {
                 .join(".udp-not-ready")
                 .join("pod-a")
                 .is_file()
+        );
+        std::fs::write(required_dir.join("pod-a"), b"close-in-progress").unwrap();
+        reconcile_udp_capture_readiness(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &mut ready_uids,
+        );
+        assert!(
+            required_dir.join("pod-a").is_file(),
+            "a live pod without producer readiness may be mid-close, so its request must remain"
         );
     }
 
@@ -10385,7 +11143,7 @@ mod tests {
         );
 
         backend.fail_remove_node_probe_port = false;
-        retry_pending_node_probe_port_removals(&mut backend, &pod_states, &metrics);
+        retry_pending_node_probe_port_removals(&mut backend, &pod_states, &config, &metrics);
 
         assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
         assert!(
