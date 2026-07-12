@@ -673,19 +673,32 @@ async fn start_node_agent_admin_listeners(
         env_config.admin_max_connections_per_ip,
     ));
     let shutdown = shutdown_tx.subscribe();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
         info!(
             "Starting node_agent admin HTTP listener on {}",
             admin_http_addr
         );
-        if let Err(err) =
-            admin::start_admin_listener(admin_http_addr, admin_state, shutdown, admin_conn_limiter)
-                .await
+        if let Err(err) = admin::start_admin_listener_with_tls_and_signal(
+            admin_http_addr,
+            admin_state,
+            shutdown,
+            None,
+            Some(started_tx),
+            admin_conn_limiter,
+        )
+        .await
         {
             error!("Node agent admin HTTP listener error: {}", err);
         }
     });
     handles.push(handle);
+
+    crate::startup::wait_for_start_signals(
+        vec![("Node agent admin HTTP listener".to_string(), started_rx)],
+        Duration::from_secs(10),
+    )
+    .await?;
 
     Ok(handles)
 }
@@ -12186,6 +12199,36 @@ mod tests {
             .expect_err("invalid CIDR should fail before spawning");
 
         assert!(err.to_string().contains("FERRUM_ADMIN_ALLOWED_CIDRS"));
+    }
+
+    #[tokio::test]
+    async fn admin_listener_bind_failure_aborts_startup() {
+        let blocker = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve node-agent admin port");
+        let blocked_port = blocker.local_addr().expect("reserved address").port();
+        let env_config = EnvConfig {
+            node_agent_admin_enabled: true,
+            admin_http_port: blocked_port,
+            ..EnvConfig::default()
+        };
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let startup_ready = Arc::new(AtomicBool::new(false));
+
+        let err =
+            start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready.clone())
+                .await
+                .expect_err("occupied admin port must abort node-agent startup");
+
+        assert!(
+            err.to_string()
+                .contains("Node agent admin HTTP listener exited before completing startup"),
+            "unexpected startup error: {err}"
+        );
+        assert!(
+            !startup_ready.load(Ordering::Acquire),
+            "a failed admin bind must not report node-agent ready"
+        );
     }
 
     fn signals(bind_explicit: bool, cidrs: bool) -> AdminBindSignals {
