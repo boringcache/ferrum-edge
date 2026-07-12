@@ -2975,14 +2975,19 @@ fn reap_orphaned_udp_handshake_markers_older_than(
         let ack_required = dir.join(".udp-ack-required").join(&uid).is_file();
         let gate_cleaned =
             udp_gate_cleaned_proof_path(dir, &uid).is_some_and(|path| path.is_file());
-        // A verified durable handoff is live until the producer consumes its
-        // acknowledgement and removes `.udp-ack-required`. Preserve all three
-        // records regardless of age so restart recovery cannot publish an ack
-        // and reap it again in the same reconcile pass. An unverified orphan
-        // request still ages out under the existing bounded leak policy.
-        if (marker_dir == ".udp-ack-required" && gate_cleaned)
-            || (marker_dir != ".udp-ack-required" && ack_required)
-        {
+        // Only a VERIFIED durable handoff — a producer `.udp-ack-required`
+        // request paired with the node-agent-owned `.udp-gate-cleaned` proof —
+        // is live until the producer consumes its acknowledgement and removes
+        // `.udp-ack-required`. Preserve all three records of such a handshake
+        // regardless of age so restart recovery cannot publish an ack and reap
+        // it again in the same reconcile pass. An `.udp-ack-required` request
+        // WITHOUT proof is unverified: it is not evidence the host gate closed,
+        // so it must NOT preserve its companion `.udp-not-ready` ack. Both the
+        // unverified request and any orphaned companions still age out under the
+        // existing bounded leak policy, keeping inode growth bounded for
+        // departed pods.
+        let verified_handshake = ack_required && gate_cleaned;
+        if verified_handshake {
             continue;
         }
         let old_enough = entry
