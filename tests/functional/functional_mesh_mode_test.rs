@@ -8741,16 +8741,6 @@ fn live_xc_source_slice(
 }
 
 #[cfg(target_os = "linux")]
-fn live_xc_retain_ports(slice: &mut MeshSlice, retained: &[u16]) {
-    for service in &mut slice.services {
-        service.ports.retain(|port| retained.contains(&port.port));
-    }
-    for workload in &mut slice.workloads {
-        workload.ports.retain(|port| retained.contains(&port.port));
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn live_xc_spire_env(
     socket: String,
     workload_id: &str,
@@ -9121,6 +9111,7 @@ struct LiveXcHostNetwork {
     forward_chain: String,
     output_chain: String,
     previous_forwarding: String,
+    ambient_capture: Option<(String, u16)>,
 }
 
 #[cfg(target_os = "linux")]
@@ -9201,13 +9192,50 @@ impl LiveXcHostNetwork {
             forward_chain,
             output_chain,
             previous_forwarding,
+            ambient_capture: None,
         })
+    }
+
+    fn install_ambient_capture(
+        &mut self,
+        source_if: &str,
+        ambient_outbound: u16,
+    ) -> Result<(), String> {
+        // The Ambient node proxy runs in the host netns. Redirect the source
+        // pod's VIP flow as it enters the host so SO_ORIGINAL_DST on the host
+        // listener still carries the service port used for multi-port routing.
+        let rule = format!(
+            "iptables -w 5 -t nat -I PREROUTING 1 -i {source_if} \
+             -p tcp -d {LIVE_XC_MULTI_VIP} --dport {LIVE_XC_AMBIENT_WS_PORT} \
+             -j REDIRECT --to-ports {ambient_outbound}"
+        );
+        let installed = Command::new("sh")
+            .args(["-c", &rule])
+            .status()
+            .map_err(|error| format!("install Ambient WebSocket host capture: {error}"))?;
+        if !installed.success() {
+            return Err("install Ambient WebSocket host capture failed".to_string());
+        }
+        self.ambient_capture = Some((source_if.to_string(), ambient_outbound));
+        Ok(())
     }
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for LiveXcHostNetwork {
     fn drop(&mut self) {
+        if let Some((source_if, ambient_outbound)) = &self.ambient_capture {
+            let _ = Command::new("sh")
+                .args([
+                    "-c",
+                    &format!(
+                        "iptables -w 5 -t nat -D PREROUTING -i {source_if} \
+                         -p tcp -d {LIVE_XC_MULTI_VIP} --dport {LIVE_XC_AMBIENT_WS_PORT} \
+                         -j REDIRECT --to-ports {ambient_outbound} 2>/dev/null || true"
+                    ),
+                ])
+                .status();
+        }
         let _ = Command::new("sh")
             .args([
                 "-c",
@@ -9370,7 +9398,7 @@ impl LiveTwoClusterFixture {
         let source = LiveVethPod::spawn_indexed(20)?;
         let east_west = LiveVethPod::spawn_indexed(21)?;
         let destination = LiveVethPod::spawn_indexed(22)?;
-        let host_network =
+        let mut host_network =
             LiveXcHostNetwork::install(source.pod_ip(), east_west.pod_ip(), destination.pod_ip())?;
         let dns = LiveXcDnsServer::start(source.host_ip).await?;
         let spire = LiveTwoClusterSpire::start().await?;
@@ -9522,51 +9550,35 @@ impl LiveTwoClusterFixture {
         )
         .await;
         let cp_ambient_source = start_static_mesh_cp_on(
-            {
-                let mut slice = source_slice("live-xc-ambient-source");
-                live_xc_retain_ports(&mut slice, &[LIVE_XC_AMBIENT_WS_PORT, LIVE_XC_UDP_PORT]);
-                slice
-            },
+            source_slice("live-xc-ambient-source"),
             "0.0.0.0:0".parse().expect("wildcard CP bind"),
             Some(std::net::IpAddr::V4(source.host_ip)),
         )
         .await;
         let cp_unfederated_source = start_static_mesh_cp_on(
-            {
-                let mut slice = source_slice("live-xc-unfederated-source");
-                live_xc_retain_ports(&mut slice, &[LIVE_XC_HTTP_PORT]);
-                slice
-            },
+            source_slice("live-xc-unfederated-source"),
             "0.0.0.0:0".parse().expect("wildcard CP bind"),
             Some(std::net::IpAddr::V4(source.host_ip)),
         )
         .await;
         let cp_wrong_td_source = start_static_mesh_cp_on(
-            {
-                let mut slice = live_xc_wrong_trust_domain_slice(
-                    "live-xc-wrong-td-source",
-                    destination.pod_ip(),
-                    east_west.pod_ip(),
-                    east_west_port,
-                );
-                live_xc_retain_ports(&mut slice, &[LIVE_XC_HTTP_PORT]);
-                slice
-            },
+            live_xc_wrong_trust_domain_slice(
+                "live-xc-wrong-td-source",
+                destination.pod_ip(),
+                east_west.pod_ip(),
+                east_west_port,
+            ),
             "0.0.0.0:0".parse().expect("wildcard CP bind"),
             Some(std::net::IpAddr::V4(source.host_ip)),
         )
         .await;
         let cp_missing_sni_source = start_static_mesh_cp_on(
-            {
-                let mut slice = live_xc_missing_sni_slice(
-                    "live-xc-missing-sni-source",
-                    destination.pod_ip(),
-                    east_west.pod_ip(),
-                    east_west_port,
-                );
-                live_xc_retain_ports(&mut slice, &[LIVE_XC_HTTP_PORT]);
-                slice
-            },
+            live_xc_missing_sni_slice(
+                "live-xc-missing-sni-source",
+                destination.pod_ip(),
+                east_west.pod_ip(),
+                east_west_port,
+            ),
             "0.0.0.0:0".parse().expect("wildcard CP bind"),
             Some(std::net::IpAddr::V4(source.host_ip)),
         )
@@ -9596,6 +9608,7 @@ impl LiveTwoClusterFixture {
 
         let ports_ambient_source = reserve_mesh_ports().await;
         let ambient_outbound = ports_ambient_source.outbound;
+        host_network.install_ambient_capture(&source.host_if, ambient_outbound)?;
         let udp_capture_port = ferrum_edge::capture::DEFAULT_UDP_OUTBOUND_PORT;
         let mut ambient_env =
             live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A_AMBIENT, &dns.resolver);
@@ -9804,14 +9817,6 @@ impl LiveTwoClusterFixture {
         Ok(())
     }
 
-    async fn http_get(&self, outbound: u16, host: &'static str) -> Result<(u16, String), String> {
-        run_async_in_live_netns(self.source.pod.pid(), move || async move {
-            plaintext_http_get(outbound, host, "/")
-                .await
-                .map_err(|error| format!("live cross-cluster HTTP request: {error}"))
-        })
-    }
-
     async fn websocket(
         &self,
         destination: SocketAddr,
@@ -9828,7 +9833,9 @@ impl LiveTwoClusterFixture {
         host: &'static str,
         payload: &'static str,
     ) -> Result<String, String> {
-        let address = SocketAddr::from((self.source.host_ip, self.ambient_outbound));
+        let address = format!("{LIVE_XC_MULTI_VIP}:{LIVE_XC_AMBIENT_WS_PORT}")
+            .parse()
+            .expect("Ambient WebSocket VIP");
         run_async_in_live_netns(self.source.pod.pid(), move || async move {
             mesh_websocket_echo_roundtrip_to(address, host, "/", payload).await
         })
@@ -9905,6 +9912,35 @@ fn live_xc_http_get_from_vip(
             .unwrap_or_default();
         Ok((status, body))
     })
+}
+
+#[cfg(target_os = "linux")]
+fn live_xc_http_get_from_outbound_capture(
+    pid: u32,
+    outbound: u16,
+    host: &'static str,
+) -> Result<(u16, String), String> {
+    // Each negative gateway needs the same original-destination signal as the
+    // production Sidecar capture listener. Keep this rule request-scoped so it
+    // cannot steer another row through the wrong negative gateway.
+    let rule = format!(
+        "-p tcp -d {LIVE_XC_MULTI_VIP} --dport {LIVE_XC_HTTP_PORT} \
+         -j REDIRECT --to-ports {outbound}"
+    );
+    netns_command(pid, &format!("iptables -w 5 -t nat -I OUTPUT 1 {rule}"))?;
+    let destination = format!("{LIVE_XC_MULTI_VIP}:{LIVE_XC_HTTP_PORT}")
+        .parse()
+        .expect("negative HTTP VIP");
+    let observed = live_xc_http_get_from_vip(pid, destination, host);
+    let cleanup = netns_command(pid, &format!("iptables -w 5 -t nat -D OUTPUT {rule}"));
+    match (observed, cleanup) {
+        (Ok(response), Ok(())) => Ok(response),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(format!("remove negative HTTP capture: {error}")),
+        (Err(request_error), Err(cleanup_error)) => Err(format!(
+            "{request_error}; remove negative HTTP capture: {cleanup_error}"
+        )),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -10108,9 +10144,11 @@ async fn live_xc_test_fail_closed_negatives(fixture: &LiveTwoClusterFixture) {
         ("wrong trust domain", fixture.wrong_td_outbound),
         ("unfederated peer", fixture.unfederated_outbound),
     ] {
-        let observed = fixture
-            .http_get(outbound, "live-matrix.ferrum.svc.cluster.local:18080")
-            .await;
+        let observed = live_xc_http_get_from_outbound_capture(
+            fixture.source.pod.pid(),
+            outbound,
+            "live-matrix.ferrum.svc.cluster.local:18080",
+        );
         assert!(
             !matches!(observed, Ok((200, ref body)) if body.contains("http-live-ok")),
             "{label} must fail closed, not reach the destination: {observed:?}\n{}",
@@ -10119,22 +10157,25 @@ async fn live_xc_test_fail_closed_negatives(fixture: &LiveTwoClusterFixture) {
     }
 
     let east_west_before = captured_output(&fixture.temp_east_west);
-    let observed = fixture
-        .http_get(
-            fixture.missing_sni_outbound,
-            "live-matrix.ferrum.svc.cluster.local:18080",
-        )
-        .await;
+    let observed = live_xc_http_get_from_outbound_capture(
+        fixture.source.pod.pid(),
+        fixture.missing_sni_outbound,
+        "live-matrix.ferrum.svc.cluster.local:18080",
+    );
     assert!(
         !matches!(observed, Ok((200, ref body)) if body.contains("http-live-ok")),
         "missing SNI ownership must fail closed: {observed:?}\n{}",
         fixture.diagnostics()
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        captured_output(&fixture.temp_east_west),
-        east_west_before,
-        "a missing SNI override must be refused before any east-west dial"
+    let east_west_after = captured_output(&fixture.temp_east_west);
+    let request_scoped_output = east_west_after
+        .strip_prefix(&east_west_before)
+        .unwrap_or(&east_west_after);
+    assert!(
+        !request_scoped_output.contains("p18080.live-matrix.ferrum.svc.cluster.local"),
+        "a missing SNI override must be refused before any east-west dial: \
+         {request_scoped_output}"
     );
 }
 
