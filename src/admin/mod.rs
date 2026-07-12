@@ -2603,36 +2603,20 @@ struct LostApiSpec {
     proxy_id: String,
 }
 
-/// Upper bound on the number of `api_specs` identities enumerated for a rollback
-/// recovery report. Far above any realistic per-namespace spec count; keeps the
-/// snapshot query and the JSON response bounded. When a namespace somehow holds
-/// more specs than this, the report lists the first `CAP` and sets
-/// `api_specs_lost_truncated: true` alongside the authoritative total so the
-/// operator is never under-informed.
-///
-/// Exposed so the truncation-reporting integration test can seed exactly one
-/// spec over the cap without hard-coding the value.
-pub const RESTORE_SNAPSHOT_API_SPEC_CAP: u32 = 500;
-
 /// Snapshot of a namespace captured before a destructive restore so a failed
 /// import — or a failed clear — can be compensated back to the prior state on
 /// every database backend.
 struct RestoreSnapshot {
     /// Prior config resources (proxies/consumers/plugin_configs/upstreams).
     payload: RestorePayload,
-    /// Identities of `api_specs` present before deletion (up to
-    /// [`RESTORE_SNAPSHOT_API_SPEC_CAP`]). API specs are admin-only metadata that
-    /// live OUTSIDE `GatewayConfig`, so a config rollback cannot restore them.
+    /// Identities of every `api_specs` row present before deletion. API specs are
+    /// admin-only metadata outside `GatewayConfig`, so rollback cannot restore them.
     /// The captured identities are surfaced to the operator so they know exactly
     /// which specs to re-submit (and which restored resources to clear first)
     /// after recovery.
     api_specs: Vec<LostApiSpec>,
-    /// Authoritative count of `api_specs` in the namespace at snapshot time
-    /// (ignores the cap). Equal to `api_specs.len()` unless truncated.
+    /// Authoritative count of `api_specs` in the namespace at snapshot time.
     api_specs_total: usize,
-    /// `true` when more than [`RESTORE_SNAPSHOT_API_SPEC_CAP`] specs existed, so
-    /// `api_specs` holds only the first `CAP` of `api_specs_total`.
-    api_specs_truncated: bool,
 }
 
 /// Capture an authoritative snapshot of `namespace` for restore rollback.
@@ -2657,33 +2641,50 @@ async fn snapshot_namespace_for_rollback(
     let payload = restore_payload_from_config(config);
 
     // `api_specs` are not part of `GatewayConfig`, so capture their identities
-    // separately from the PRIMARY. `total` is the authoritative count regardless
-    // of the page cap, so the recovery report can be honest about truncation.
-    let listed = db
-        .list_api_specs_authoritative(
-            namespace,
-            &crate::config::db_backend::ApiSpecListFilter {
-                limit: RESTORE_SNAPSHOT_API_SPEC_CAP,
-                ..Default::default()
-            },
-        )
-        .await?;
-    let api_specs_total = usize::try_from(listed.total).unwrap_or(usize::MAX);
-    let api_specs: Vec<LostApiSpec> = listed
-        .items
-        .into_iter()
-        .map(|spec| LostApiSpec {
+    // separately from the PRIMARY. Page through the summary path so every tiny
+    // `(id, proxy_id)` identity is retained without hydrating spec documents.
+    const API_SPEC_IDENTITY_PAGE_SIZE: u32 = 200;
+    let mut api_specs = Vec::new();
+    let mut offset = 0_u32;
+    let mut api_specs_total = 0_usize;
+    loop {
+        let listed = db
+            .list_api_specs_authoritative(
+                namespace,
+                &crate::config::db_backend::ApiSpecListFilter {
+                    limit: API_SPEC_IDENTITY_PAGE_SIZE,
+                    offset,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if offset == 0 {
+            api_specs_total = usize::try_from(listed.total).unwrap_or(usize::MAX);
+        }
+        let page_len = listed.items.len();
+        api_specs.extend(listed.items.into_iter().map(|spec| LostApiSpec {
             id: spec.id,
             proxy_id: spec.proxy_id,
-        })
-        .collect();
-    let api_specs_truncated = api_specs_total > api_specs.len();
+        }));
+        if api_specs.len() >= api_specs_total {
+            break;
+        }
+        if page_len == 0 {
+            return Err(anyhow::anyhow!(
+                "API spec identity listing ended before its authoritative total"
+            ));
+        }
+        let page_len = u32::try_from(page_len)
+            .map_err(|_| anyhow::anyhow!("API spec identity page length exceeds u32"))?;
+        offset = offset
+            .checked_add(page_len)
+            .ok_or_else(|| anyhow::anyhow!("API spec identity pagination offset overflow"))?;
+    }
 
     Ok(RestoreSnapshot {
         payload,
         api_specs,
         api_specs_total,
-        api_specs_truncated,
     })
 }
 
@@ -2994,15 +2995,12 @@ async fn finish_failed_restore(
     // `POST /api-specs` would collide on route/name/id and must be preceded by
     // deleting the restored proxy (and its upstream/plugins).
     if snapshot.api_specs_total > 0 {
-        // `api_specs_not_restored` is the AUTHORITATIVE total, even when the
-        // listed detail is capped — never under-report how many specs the
-        // operator must re-submit.
+        // Preserve the authoritative total and every recovery identity.
         let total = snapshot.api_specs_total;
         warn!(
             namespace = %namespace,
             api_spec_count = total,
             api_specs_listed = snapshot.api_specs.len(),
-            api_specs_truncated = snapshot.api_specs_truncated,
             "Restore: rollback restored config resources but NOT api_specs; operator must re-submit affected API specs"
         );
         response["api_specs_not_restored"] = json!(total);
@@ -3013,17 +3011,9 @@ async fn finish_failed_restore(
                 .map(|spec| json!({ "id": spec.id, "proxy_id": spec.proxy_id }))
                 .collect::<Vec<_>>()
         );
-        response["api_specs_lost_truncated"] = json!(snapshot.api_specs_truncated);
-        let note = if snapshot.api_specs_truncated {
-            format!(
-                "{total} API spec(s) were removed and cannot be restored by rollback. Their proxy/upstream/plugin resources were reapplied as hand-managed (api_spec_id cleared), so re-submitting a spec via POST /api-specs first requires deleting the restored proxy (and its upstream/plugins) to avoid route/name/id collisions, then re-submitting the original spec document. Only the first {} affected specs are listed in api_specs_lost (api_specs_lost_truncated=true); use GET /api-specs to enumerate the rest.",
-                snapshot.api_specs.len()
-            )
-        } else {
-            format!(
-                "{total} API spec(s) were removed and cannot be restored by rollback. Their proxy/upstream/plugin resources were reapplied as hand-managed (api_spec_id cleared), so re-submitting a spec via POST /api-specs first requires deleting the restored proxy (and its upstream/plugins) to avoid route/name/id collisions, then re-submitting the original spec document. Affected specs are listed in api_specs_lost."
-            )
-        };
+        let note = format!(
+            "{total} API spec(s) were removed and cannot be restored by rollback. Their proxy/upstream/plugin resources were reapplied as hand-managed (api_spec_id cleared), so re-submitting a spec via POST /api-specs first requires deleting the restored proxy (and its upstream/plugins) to avoid route/name/id collisions, then re-submitting the original spec document. Affected specs are listed in api_specs_lost."
+        );
         response["api_specs_note"] = json!(note);
     }
 

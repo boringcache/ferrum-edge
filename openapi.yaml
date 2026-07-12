@@ -3205,8 +3205,8 @@ paths:
         deleting anything**, so a transiently-unreachable-yet-valid config is
         never wiped. `api_specs` are admin-only metadata outside the config and
         are NOT restored by rollback; a failed restore reports how many must be
-        re-submitted via `POST /api-specs` (with an authoritative total and a
-        truncation flag when the affected count exceeds the report cap).
+        re-submitted via `POST /api-specs` (with an authoritative total and every
+        affected spec's identity).
 
         Accepts the same JSON format produced by `GET /backup`. Resources are
         imported in dependency order (consumers & upstreams first, then proxies,
@@ -3290,14 +3290,13 @@ paths:
                     description: >-
                       Authoritative count of API specs present before the restore
                       that a config rollback cannot restore. Present only when the
-                      namespace carried specs. May exceed the number of entries in
-                      `api_specs_lost` when the listing is truncated — see
-                      `api_specs_lost_truncated`.
+                      namespace carried specs. Equal to the number of entries in
+                      `api_specs_lost`.
                   api_specs_lost:
                     type: array
                     description: >-
                       Identities of the API specs a config rollback could not
-                      restore, capped at 500 entries. Present only when
+                      restore. Every identity is preserved. Present only when
                       `api_specs_not_restored` is set. Each entry names the spec
                       and the proxy whose (now hand-managed) resources must be
                       cleared before re-submitting the spec via POST /api-specs.
@@ -3310,13 +3309,6 @@ paths:
                         proxy_id:
                           type: string
                           description: The proxy the spec owned (reapplied as a hand-managed resource).
-                  api_specs_lost_truncated:
-                    type: boolean
-                    description: >-
-                      `true` when more specs were removed than are listed in
-                      `api_specs_lost` (the total exceeded the 500-entry report
-                      cap). Use `GET /api-specs` to enumerate the rest. Present
-                      only when `api_specs_not_restored` is set.
                   api_specs_note:
                     type: string
                     description: >-

@@ -84,7 +84,7 @@ Both the config resources and the `api_specs` identities are read from the **pri
 
 ### API specs are not restored by rollback
 
-`api_specs` are admin-only metadata that live **outside** `GatewayConfig`, so the delete phase removes them but the config rollback cannot bring them back. When a failed restore rolls back a namespace that carried specs, the `500` response reports `api_specs_not_restored` (the **authoritative total**), `api_specs_lost` (the exact `id` + `proxy_id` of each dropped spec, capped at 500 entries), `api_specs_lost_truncated` (`true` when more specs were removed than are listed — use `GET /api-specs` to enumerate the rest), and `api_specs_note` (guidance).
+`api_specs` are admin-only metadata that live **outside** `GatewayConfig`, so the delete phase removes them but the config rollback cannot bring them back. When a failed restore rolls back a namespace that carried specs, the `500` response reports `api_specs_not_restored` (the **authoritative total**), `api_specs_lost` (the exact `id` + `proxy_id` of every dropped spec), and `api_specs_note` (guidance).
 
 Recovery is not a bare re-submit: rollback reapplies the spec-owned proxy/upstream/plugins as **hand-managed** resources (their `api_spec_id` is cleared), so a plain `POST /api-specs` for the same spec collides on route/name/id uniqueness. To reattach a spec, first delete the restored proxy (and its upstream/plugins) listed under `api_specs_lost`, then re-submit the original spec document via `POST /api-specs`. Successful restores are unaffected — they replace the namespace, including specs, from scratch.
 
@@ -185,7 +185,6 @@ If the delete or any resource type fails during import, the endpoint removes the
     { "id": "spec-1", "proxy_id": "orders-proxy" },
     { "id": "spec-2", "proxy_id": "billing-proxy" }
   ],
-  "api_specs_lost_truncated": false,
   "api_specs_note": "2 API spec(s) were removed and cannot be restored by rollback. Their proxy/upstream/plugin resources were reapplied as hand-managed (api_spec_id cleared), so re-submitting a spec via POST /api-specs first requires deleting the restored proxy (and its upstream/plugins) to avoid route/name/id collisions, then re-submitting the original spec document. Affected specs are listed in api_specs_lost."
 }
 ```
@@ -198,7 +197,7 @@ The `rollback` field reports the outcome:
 
 There is no `unavailable` outcome: when the prior config cannot be snapshotted for rollback, the restore **aborts before any delete** and returns `503` (not `500`) with an `error` explaining that the existing config was NOT deleted. This is the fail-safe path — the destructive delete never runs when a rollback point cannot be captured.
 
-`api_specs_not_restored` / `api_specs_lost` / `api_specs_lost_truncated` / `api_specs_note` appear only when the namespace carried API specs, which a config rollback cannot restore (see above). The payload is still validated before the snapshot and delete phases; validation failures return `400` and leave existing config untouched.
+`api_specs_not_restored` / `api_specs_lost` / `api_specs_note` appear only when the namespace carried API specs, which a config rollback cannot restore (see above). The payload is still validated before the snapshot and delete phases; validation failures return `400` and leave existing config untouched.
 
 #### Restore aborted — `503`
 

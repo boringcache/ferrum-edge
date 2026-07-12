@@ -2155,14 +2155,6 @@ async fn test_restore_reports_api_specs_not_restored_on_rollback() {
         "restore must report the api_specs it could not restore: {:?}",
         body
     );
-    // With a single spec (well under the cap), the report is complete, not
-    // truncated.
-    assert_eq!(
-        body["api_specs_lost_truncated"].as_bool(),
-        Some(false),
-        "a single spec must not be reported as truncated: {:?}",
-        body
-    );
     // The recovery report must name the exact spec + proxy so the operator can
     // clear the restored (now hand-managed) resource and re-submit the spec.
     let lost = body["api_specs_lost"]
@@ -2197,15 +2189,11 @@ async fn test_restore_reports_api_specs_not_restored_on_rollback() {
     );
 }
 
-/// When a namespace holds more `api_specs` than the recovery report's cap, the
-/// rollback response must be HONEST: `api_specs_not_restored` carries the
-/// authoritative total, `api_specs_lost` lists the first `CAP`, and
-/// `api_specs_lost_truncated` is `true`. The operator must never be told fewer
-/// specs were affected than actually were.
+/// A rollback response retains every API spec identity across listing pages so
+/// operators can recover specs beyond the first page after deletion.
 #[tokio::test]
-async fn test_restore_reports_api_specs_truncated_over_cap() {
-    let cap = ferrum_edge::admin::RESTORE_SNAPSHOT_API_SPEC_CAP as usize;
-    let total_specs = cap + 1;
+async fn test_restore_reports_all_api_specs_across_pages() {
+    let total_specs = 501;
 
     let tc = TestConfig::default();
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -2216,8 +2204,8 @@ async fn test_restore_reports_api_specs_truncated_over_cap() {
         .expect("Failed to connect to test database");
     let pool = db.pool();
 
-    // Seed one spec (and its owning proxy) more than the cap so the recovery
-    // report must truncate. Bundles go straight through the backend.
+    // Seed enough specs (and their owning proxies) to require multiple
+    // authoritative listing pages. Bundles go straight through the backend.
     for i in 0..total_specs {
         let proxy: Proxy = serde_json::from_value(json!({
             "id": format!("spec-proxy-{i}"),
@@ -2299,33 +2287,28 @@ async fn test_restore_reports_api_specs_truncated_over_cap() {
         "config rollback should complete: {:?}",
         body
     );
-    // Authoritative total is reported, not the capped listing length.
+    // The authoritative total and every identity are reported.
     assert_eq!(
         body["api_specs_not_restored"].as_u64(),
         Some(total_specs as u64),
-        "api_specs_not_restored must be the authoritative total (> cap): {:?}",
+        "api_specs_not_restored must be the authoritative total: {:?}",
         body["api_specs_not_restored"]
     );
-    assert_eq!(
-        body["api_specs_lost_truncated"].as_bool(),
-        Some(true),
-        "over-cap report must set api_specs_lost_truncated=true: {:?}",
-        body["api_specs_lost_truncated"]
-    );
+    assert!(body.get("api_specs_lost_truncated").is_none());
     let lost = body["api_specs_lost"]
         .as_array()
         .expect("api_specs_lost must be an array");
     assert_eq!(
         lost.len(),
-        cap,
-        "api_specs_lost must list exactly CAP identities when truncated: got {}",
+        total_specs,
+        "api_specs_lost must preserve every identity: got {}",
         lost.len()
     );
-    let note = body["api_specs_note"].as_str().unwrap_or_default();
     assert!(
-        note.contains("truncated") || note.contains("GET /api-specs"),
-        "truncated note must point the operator at the full enumeration: {:?}",
-        note
+        lost.iter()
+            .any(|spec| spec["id"] == "spec-500" && spec["proxy_id"] == "spec-proxy-500"),
+        "api_specs_lost must include identities beyond the first pages: {:?}",
+        lost.last()
     );
 }
 
