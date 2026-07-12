@@ -1091,10 +1091,14 @@ pub async fn handle_admin_request(
         let response_code = if !ready {
             // Distinguish "never became ready" (still starting up) from "was
             // ready, then a serving listener died after startup" (degraded).
-            health_status["status"] = json!(if !startup_ready {
-                "starting"
-            } else {
+            // `serving_degraded` is the authoritative signal: the flip helper
+            // sets it true AND best-effort clears `startup_ready`, so keying the
+            // status off `!startup_ready` would mislabel a post-start
+            // degradation as "starting". Use the sticky flag instead.
+            health_status["status"] = json!(if serving_degraded {
                 "unavailable"
+            } else {
+                "starting"
             });
             StatusCode::SERVICE_UNAVAILABLE
         } else {
