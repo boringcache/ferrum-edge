@@ -3204,9 +3204,9 @@ paths:
         database/connectivity failure — the restore **aborts with `503` before
         deleting anything**, so a transiently-unreachable-yet-valid config is
         never wiped. `api_specs` are admin-only metadata outside the config and
-        are NOT restored by rollback; a failed restore reports how many must be
-        re-submitted via `POST /api-specs` (with an authoritative total and every
-        affected spec's identity).
+        are NOT restored by rollback; a failed restore reports the authoritative
+        total number that must be re-submitted via `POST /api-specs` (list the
+        namespace's current specs with `GET /api-specs`).
 
         Accepts the same JSON format produced by `GET /backup`. Resources are
         imported in dependency order (consumers & upstreams first, then proxies,

@@ -4434,11 +4434,19 @@ async fn handle_restore(
         }
     };
 
+    // Capture the delete-atomicity classification BEFORE running the clear, so a
+    // failure is classified by the mode that actually executed it. The MongoDB
+    // `replica_set_configured` flag can be re-stored on reconnect/rediscovery,
+    // so re-reading `delete_all_resources_is_atomic()` after the failure could
+    // misclassify the clear against a topology that differs from the one that
+    // ran it.
+    let delete_is_atomic = db.delete_all_resources_is_atomic();
+
     // Phase 3: Delete all existing resources in the namespace (safe: payload is
     // validated and the prior state has been snapshotted from the primary above).
     if let Err(e) = db.delete_all_resources(namespace).await {
         error!("Restore: failed to delete existing resources: {}", e);
-        if db.delete_all_resources_is_atomic() {
+        if delete_is_atomic {
             // Atomic clear (SQL transaction, replica-set Mongo): a failure commits
             // NOTHING, so the prior config is fully intact. Do NOT roll back — a
             // second clear + re-import would be unnecessary and could delete
