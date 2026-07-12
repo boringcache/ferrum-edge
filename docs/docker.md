@@ -310,6 +310,12 @@ FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
 FERRUM_CP_DP_GRPC_JWT_SECRET=change-me-to-a-32-character-grpc-secret
 ```
 
+> **Note**: The prebuilt release image (`Dockerfile.release`) bakes
+> `FERRUM_LOG_LEVEL=warn` as its default so that startup operability warnings
+> (FD soft-cap floor, plaintext-admin guard, pending plugin migrations) are
+> visible out of the box. Override with `-e FERRUM_LOG_LEVEL=<level>` for
+> quieter (`error`) or more verbose (`info`/`debug`/`trace`) logging.
+
 ### Setting Variables in Docker
 
 **Via `-e` flag**:
