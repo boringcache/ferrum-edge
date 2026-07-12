@@ -894,12 +894,17 @@ mTLS modes:
 | `permissive` (default) | Accept both mTLS and plaintext. |
 | `disable` | Disable mTLS. Accept plaintext only. |
 
-`portLevelMtls` is enforced before the TLS handshake. The inbound accept loop
-reads the REDIRECT-captured connection's `SO_ORIGINAL_DST` once, uses its
-workload app/container port to resolve the winning policy (including the
-fail-secure same-tier tie-break), and selects the prebuilt per-port
-`rustls::ServerConfig`. Direct/non-redirected connections with no original
-destination use the listener-wide resolved mode as a compatibility fallback.
+`portLevelMtls` is enforced at the earliest point where the workload app port
+is known. For REDIRECT-captured connections, the inbound accept loop reads
+`SO_ORIGINAL_DST` once and selects the prebuilt per-port `rustls::ServerConfig`
+before the handshake. Direct mesh-transport dials have no original destination,
+so they initially use the listener-wide handshake config; after HTTP authority,
+HBONE CONNECT target, or an east-west per-port SNI route resolves the app port,
+Ferrum verifies that the connection's actual transport satisfies that port's
+effective mode. `STRICT` requires a verified peer certificate, `DISABLE`
+requires plaintext, and `PERMISSIVE` admits either. A mismatch is rejected
+before the plugin/backend path with a structured warning and a
+protocol-appropriate 403 response (including normalized gRPC rejection).
 
 The following policy requires a client certificate on port 8080 while allowing
 optional client authentication on port 8081:
@@ -932,7 +937,7 @@ The resulting `MeshClientAuth` is plumbed into the inbound TLS acceptor:
 
 **SPIFFE peer trust-domain verification**: when gateway SVID material is configured (all three of `FERRUM_GATEWAY_SVID_CERT_PATH` / `FERRUM_GATEWAY_SVID_KEY_PATH` / `FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH`), the inbound mTLS / HBONE listener verifies each peer certificate's chain **and** that the peer's SPIFFE URI-SAN trust domain matches the gateway SVID's local trust bundle or one of the slice's federated bundles. This closes the gap where a peer cert that merely chained to the configured client CA was admitted regardless of its SPIFFE trust domain. STRICT requires + validates a peer cert; PERMISSIVE still admits peers that present no cert but trust-domain-validates any cert that is offered (so PERMISSIVE records mTLS identity when present). Without gateway SVID material, the listener keeps the prior chain-only verification against `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`. In PERMISSIVE specifically, the listener requests a client certificate whenever **either** trust anchor exists (the SVID verifier is preferred, otherwise the operator client CA bundle) so an offered cert is verified and its identity recorded; only when **neither** anchor is configured does PERMISSIVE skip the certificate request entirely — and in that fully-degraded case Ferrum emits a single startup warning that inbound peer identity cannot be verified or recorded, rather than silently treating authenticated peers as anonymous. (The **EgressGateway** topology is the exception to PERMISSIVE-optional: there a present trust anchor escalates PERMISSIVE to `Required`, and a missing anchor fails the listener closed — see the EgressGateway requires-client-certificates note above.) The HBONE baggage `source.principal` trust-gate now rests on this verified peer identity. When `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, the lock-free SVID bundle slot is re-published on slice apply so federated trust-domain additions take effect without a listener restart; file-backed and CA-backed gateway SVID rotations also republish the inbound peer-verifier bundle from the newest local roots plus the last accepted federated overlay. Slice roots for the gateway SVID's own trust domain are additive with the freshly loaded SVID local roots, which lets the control plane stage same-trust-domain CA-root rotation without replacing the SVID source's current root set.
 
-Per-port TLS configs are built during startup (and during an opted-in live reload), then published as one atomic app-port table. The accept path performs no certificate parsing or policy resolution; it reads the original destination and loads the already-built config for that port. The topology disable guards remain in force for every entry, so a `DISABLE` override cannot bypass the Ambient/HBONE or EgressGateway mTLS-only constraints.
+Per-port TLS configs and their effective modes are built during startup (and during an opted-in live reload), then published as one atomic listener-fallback + app-port table. Captured connections select from that table before the handshake; direct connections consult the same pre-resolved mode table only after routing reveals the app port. No request-path policy resolution or certificate parsing is performed. The topology disable guards remain in force for every entry, so a `DISABLE` override cannot bypass the Ambient/HBONE or EgressGateway mTLS-only constraints.
 
 By default, the resolved mode is captured **once at startup** from the first valid slice. Subsequent `PeerAuthentication` changes pushed via the control plane update the in-memory slice and are honored by other plugin paths (e.g. `mesh_authz`, plugin chains), but the inbound TLS `ServerConfig` is not rebuilt.
 

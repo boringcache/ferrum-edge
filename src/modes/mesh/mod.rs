@@ -9749,8 +9749,9 @@ async fn serve_mesh_runtime(
     // By default inbound mTLS remains a startup-only decision (`inbound_mtls_mode`
     // and `validate_egress_gateway_mtls_config` resolved earlier, before the
     // CA-backend SVID source started). When the opt-in live reload flag is
-    // enabled, the mesh accept loops read `proxy_state.mesh_inbound_tls` on every
-    // accept and slice apply may atomically swap the inbound ServerConfig.
+    // enabled, the mesh accept loops read the authoritative
+    // `proxy_state.mesh_inbound_tls_policy` on every accept and slice apply may
+    // atomically swap the inbound fallback + per-port ServerConfigs/modes.
     //
     // The inbound server identity resolves from `proxy_state.gateway_svid_bundle`:
     // the CA-backend SVID source (started above) installs its issued SVID there,
@@ -9761,9 +9762,11 @@ async fn serve_mesh_runtime(
     let inbound_mtls_modes_by_port =
         resolve_inbound_mtls_modes_by_port(initial_applied_mesh_slice.as_deref());
     let initial_inbound_tls_snapshot = if env_config.mesh_peer_auth_live_reload_enabled {
-        let mut snapshot = mesh_inbound_tls_reload_snapshot(&env_config, inbound_mtls_mode)?;
-        snapshot.port_modes = inbound_mtls_modes_by_port.clone();
-        Some(snapshot)
+        Some(mesh_inbound_tls_reload_snapshot(
+            &env_config,
+            inbound_mtls_mode,
+            inbound_mtls_modes_by_port.clone(),
+        )?)
     } else {
         None
     };
@@ -9884,6 +9887,8 @@ async fn serve_mesh_runtime(
         .store(Arc::new(crate::proxy::MeshInboundTlsPolicy {
             default: frontend_tls.clone(),
             by_port: frontend_tls_by_port,
+            default_mode: inbound_mtls_mode,
+            modes_by_port: inbound_mtls_modes_by_port,
         }));
     proxy_state.mesh_inbound_spiffe_verifier_active.store(
         mesh_inbound_spiffe_verifier_active(
@@ -10085,7 +10090,8 @@ async fn serve_mesh_runtime(
             listener_tls_config_for_mtls_mode(&listener, frontend_tls.clone(), inbound_mtls_mode)
         };
         let listener_has_tls = if uses_mesh_inbound_tls {
-            proxy_state.mesh_inbound_tls.load().as_ref().is_some()
+            let policy = proxy_state.mesh_inbound_tls_policy.load();
+            policy.default.is_some() || policy.by_port.values().any(Option::is_some)
         } else {
             tls_config.is_some()
         };
@@ -11397,8 +11403,13 @@ fn mesh_inbound_spiffe_verifier(
 fn mesh_inbound_tls_reload_snapshot(
     env_config: &EnvConfig,
     mtls_mode: config::MtlsMode,
+    port_modes: std::collections::BTreeMap<u16, config::MtlsMode>,
 ) -> Result<MeshInboundTlsReloadSnapshot, anyhow::Error> {
-    let client_ca_bundle = if mtls_mode == config::MtlsMode::Disable {
+    let any_mode_needs_client_ca = mtls_mode != config::MtlsMode::Disable
+        || port_modes
+            .values()
+            .any(|mode| *mode != config::MtlsMode::Disable);
+    let client_ca_bundle = if !any_mode_needs_client_ca {
         None
     } else if let Some(path) = env_config.frontend_tls_client_ca_bundle_path.as_deref() {
         let source = CertSource::parse(path, MaterialKind::CaBundle);
@@ -11419,7 +11430,7 @@ fn mesh_inbound_tls_reload_snapshot(
     };
     Ok(MeshInboundTlsReloadSnapshot {
         mtls_mode,
-        port_modes: std::collections::BTreeMap::new(),
+        port_modes,
         client_ca_bundle,
     })
 }
@@ -12136,9 +12147,11 @@ fn plan_mesh_inbound_tls_reload_with_federation(
     // path does not re-derive `runtime.listener_plan()` on every slice apply.
     has_termination_listener: bool,
 ) -> Option<MeshInboundTlsReloadPlan> {
-    let mut next_snapshot = match mesh_inbound_tls_reload_snapshot(
+    let port_modes = resolve_inbound_mtls_modes_by_port(Some(slice));
+    let next_snapshot = match mesh_inbound_tls_reload_snapshot(
         &proxy_state.env_config,
         mtls_mode,
+        port_modes,
     ) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -12150,7 +12163,6 @@ fn plan_mesh_inbound_tls_reload_with_federation(
             return None;
         }
     };
-    next_snapshot.port_modes = resolve_inbound_mtls_modes_by_port(Some(slice));
     // Rebuild the SPIFFE inbound trust-bundle from the new slice's federated
     // bundles, but STAGE it rather than storing it into the live slot here.
     // Storing during planning would let a slice that is later rejected leave
@@ -12334,6 +12346,8 @@ async fn apply_mesh_inbound_tls_reload(
                 crate::proxy::MeshInboundTlsPolicy {
                     default: tls_config.clone(),
                     by_port: tls_by_port,
+                    default_mode: mtls_mode,
+                    modes_by_port: snapshot.port_modes.clone(),
                 },
             ));
             proxy_state.mesh_inbound_spiffe_verifier_active.store(
@@ -23008,8 +23022,12 @@ mod tests {
         let mesh_frontend_identity =
             load_mesh_frontend_server_identity(&env, &test_svid_slot_from_env(&env))
                 .expect("mesh frontend identity");
-        let initial_snapshot = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Disable)
-            .expect("initial snapshot");
+        let initial_snapshot = mesh_inbound_tls_reload_snapshot(
+            &env,
+            config::MtlsMode::Disable,
+            std::collections::BTreeMap::new(),
+        )
+        .expect("initial snapshot");
         let mesh_state = MeshRuntimeState::new();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let apply_task = start_mesh_slice_apply_task(
@@ -23091,8 +23109,12 @@ mod tests {
         let mesh_frontend_identity =
             load_mesh_frontend_server_identity(&env, &test_svid_slot_from_env(&env))
                 .expect("mesh frontend identity");
-        let initial_snapshot = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Disable)
-            .expect("initial snapshot");
+        let initial_snapshot = mesh_inbound_tls_reload_snapshot(
+            &env,
+            config::MtlsMode::Disable,
+            std::collections::BTreeMap::new(),
+        )
+        .expect("initial snapshot");
         let mesh_state = MeshRuntimeState::new();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let apply_task = start_mesh_slice_apply_task(
@@ -23204,8 +23226,12 @@ mod tests {
             ..EnvConfig::default()
         };
         let proxy_state = make_test_proxy_state_with_env(GatewayConfig::default(), env.clone());
-        let initial_snapshot = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Disable)
-            .expect("initial snapshot");
+        let initial_snapshot = mesh_inbound_tls_reload_snapshot(
+            &env,
+            config::MtlsMode::Disable,
+            std::collections::BTreeMap::new(),
+        )
+        .expect("initial snapshot");
         let mesh_state = MeshRuntimeState::new();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let apply_task = start_mesh_slice_apply_task(
@@ -25604,8 +25630,12 @@ mod tests {
             frontend_tls_client_ca_bundle_path: Some(ca_path.to_string_lossy().into_owned()),
             ..EnvConfig::default()
         };
-        let snapshot = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Strict)
-            .expect("snapshot reads CA bytes");
+        let snapshot = mesh_inbound_tls_reload_snapshot(
+            &env,
+            config::MtlsMode::Strict,
+            std::collections::BTreeMap::new(),
+        )
+        .expect("snapshot reads CA bytes");
         let tls_policy = TlsPolicy::from_env_config(&env).expect("tls policy");
         let mesh_frontend_identity =
             load_mesh_frontend_server_identity(&env, &test_svid_slot_from_env(&env))
@@ -25836,12 +25866,42 @@ mod tests {
             ..EnvConfig::default()
         };
 
-        let first = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Strict)
-            .expect("first snapshot");
+        let first = mesh_inbound_tls_reload_snapshot(
+            &env,
+            config::MtlsMode::Strict,
+            std::collections::BTreeMap::new(),
+        )
+        .expect("first snapshot");
         std::fs::write(&ca_path, b"second-ca").expect("write second CA");
-        let second = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Strict)
+        let second = mesh_inbound_tls_reload_snapshot(
+            &env,
+            config::MtlsMode::Strict,
+            std::collections::BTreeMap::new(),
+        )
+        .expect("second snapshot");
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn mesh_inbound_tls_reload_snapshot_tracks_ca_for_tls_port_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = dir.path().join("client-ca.pem");
+        std::fs::write(&ca_path, b"first-ca").expect("write first CA");
+        let env = EnvConfig {
+            frontend_tls_client_ca_bundle_path: Some(ca_path.to_string_lossy().to_string()),
+            ..EnvConfig::default()
+        };
+        let port_modes = std::collections::BTreeMap::from([(8080, config::MtlsMode::Strict)]);
+
+        let first =
+            mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Disable, port_modes.clone())
+                .expect("first snapshot");
+        std::fs::write(&ca_path, b"second-ca").expect("write second CA");
+        let second = mesh_inbound_tls_reload_snapshot(&env, config::MtlsMode::Disable, port_modes)
             .expect("second snapshot");
 
+        assert!(first.client_ca_bundle.is_some());
         assert_ne!(first, second);
     }
 

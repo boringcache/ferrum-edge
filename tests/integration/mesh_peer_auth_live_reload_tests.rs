@@ -143,9 +143,17 @@ async fn mesh_peer_auth_live_reload_listener_rejects_plaintext_after_strict_swap
         String::from_utf8_lossy(&plaintext_response)
     );
 
+    let strict_tls = strict_mesh_tls_config();
     state
         .mesh_inbound_tls
-        .store(Arc::new(Some(strict_mesh_tls_config())));
+        .store(Arc::new(Some(strict_tls.clone())));
+    state
+        .mesh_inbound_tls_policy
+        .store(Arc::new(ferrum_edge::proxy::MeshInboundTlsPolicy {
+            default: Some(strict_tls),
+            default_mode: ferrum_edge::modes::mesh::config::MtlsMode::Strict,
+            ..Default::default()
+        }));
 
     let rejected_response = send_plain_http(addr)
         .await

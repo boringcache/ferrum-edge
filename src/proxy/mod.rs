@@ -3445,12 +3445,14 @@ pub struct ProxyState {
     /// Serializes the cold-path gateway SVID writers:
     /// CP-delivered trust-bundle apply, CP trust clear, and file SVID reload.
     pub gateway_svid_update_lock: Arc<std::sync::Mutex<()>>,
-    /// Dynamic mesh inbound TLS config. Mesh mode updates this slot when
-    /// flag-gated PeerAuthentication live reload is enabled; ordinary HTTPS
-    /// listeners continue using their static startup TLS config.
+    /// Listener-wide compatibility view of the dynamic mesh inbound TLS config.
+    /// Mesh HTTP/HBONE accept loops use `mesh_inbound_tls_policy` as the single
+    /// authoritative source; this derived slot remains for shared stream TLS
+    /// publication/status compatibility and is written alongside that policy.
     pub mesh_inbound_tls: SharedMeshInboundTls,
-    /// Coherent listener-wide + per-app-port mesh inbound TLS snapshot selected
-    /// from `SO_ORIGINAL_DST` before the TLS handshake.
+    /// Authoritative coherent listener-wide + per-app-port mesh inbound TLS and
+    /// effective-mode snapshot. Captured traffic selects before the handshake;
+    /// direct traffic checks the resolved app-port mode after routing.
     pub mesh_inbound_tls_policy: SharedMeshInboundTlsPolicy,
     /// Whether the current mesh inbound TLS posture is actually terminating
     /// inbound TLS with a SPIFFE peer verifier. This is operator status, not a
@@ -3583,10 +3585,22 @@ fn clone_svid_bundle_slot(slot: &SharedSvidBundle) -> SharedSvidBundle {
 pub type SharedGatewayTrustBundles = Arc<ArcSwap<Option<RuntimeTrustBundleSet>>>;
 pub type SharedMeshInboundTls = Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>>;
 
-#[derive(Default)]
 pub struct MeshInboundTlsPolicy {
     pub default: Option<Arc<rustls::ServerConfig>>,
     pub by_port: HashMap<u16, Option<Arc<rustls::ServerConfig>>>,
+    pub default_mode: crate::modes::mesh::config::MtlsMode,
+    pub modes_by_port: std::collections::BTreeMap<u16, crate::modes::mesh::config::MtlsMode>,
+}
+
+impl Default for MeshInboundTlsPolicy {
+    fn default() -> Self {
+        Self {
+            default: None,
+            by_port: HashMap::new(),
+            default_mode: crate::modes::mesh::config::MtlsMode::Permissive,
+            modes_by_port: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 pub type SharedMeshInboundTlsPolicy = Arc<ArcSwap<MeshInboundTlsPolicy>>;
@@ -11402,7 +11416,7 @@ pub async fn start_proxy_listener_with_dynamic_tls_and_signal(
 }
 
 /// Start a proxy listener whose TLS config is loaded dynamically from
-/// `ProxyState::mesh_inbound_tls` on every accepted connection.
+/// `ProxyState::mesh_inbound_tls_policy` on every accepted connection.
 ///
 /// Mesh-mode mTLS / HBONE termination listeners use this when
 /// `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`. The mesh slice apply task
@@ -11438,9 +11452,10 @@ enum ListenerTlsSource {
         tls_config: Option<Arc<rustls::ServerConfig>>,
         record_mesh_mtls_metric: bool,
     },
-    /// Dynamic mesh inbound TLS loaded from `ProxyState::mesh_inbound_tls` on
-    /// every accept so PeerAuthentication changes can hot-swap future
-    /// handshakes without restarting the listener.
+    /// Dynamic mesh inbound TLS loaded from the authoritative
+    /// `ProxyState::mesh_inbound_tls_policy` on every accept so
+    /// PeerAuthentication changes can hot-swap future handshakes without
+    /// restarting the listener.
     MeshInbound,
     /// Dynamic frontend TLS loaded from a shared `ArcSwap` slot on every
     /// accept so a successful cert/key reload (opt-in via
@@ -11512,6 +11527,23 @@ fn select_mesh_inbound_tls_config<'a>(
     orig_dst
         .and_then(|dst| by_port.get(&dst.port()))
         .unwrap_or(default)
+}
+
+fn mesh_inbound_transport_satisfies_mode(
+    mode: crate::modes::mesh::config::MtlsMode,
+    is_tls: bool,
+    has_verified_peer_certificate: bool,
+) -> bool {
+    match mode {
+        crate::modes::mesh::config::MtlsMode::Strict => is_tls && has_verified_peer_certificate,
+        crate::modes::mesh::config::MtlsMode::Permissive => true,
+        crate::modes::mesh::config::MtlsMode::Disable => !is_tls,
+        // DestinationRule-only client modes are invalid on PeerAuthentication.
+        // Fail closed if malformed native config ever lets one reach this gate.
+        crate::modes::mesh::config::MtlsMode::Simple
+        | crate::modes::mesh::config::MtlsMode::Mutual
+        | crate::modes::mesh::config::MtlsMode::IstioMutual => false,
+    }
 }
 
 struct TlsConnectionMetadata {
@@ -14193,6 +14225,54 @@ async fn handle_proxy_request_inner(
             }
         }
     };
+
+    // Direct dials to mesh transport listeners do not carry a REDIRECT
+    // `SO_ORIGINAL_DST`, so the accept loop cannot select an app-port-specific
+    // TLS config before the handshake. Once routing has resolved the workload
+    // port (HTTP authority, HBONE CONNECT target, or the inner request behind an
+    // east-west per-port SNI route), enforce that port's effective
+    // PeerAuthentication mode against the transport that actually arrived.
+    // Captured connections keep their pre-handshake selection and skip this
+    // second check. A certificate present here has already passed the rustls
+    // verifier selected for the connection.
+    if ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+        && ctx.orig_dst.is_none()
+        && crate::modes::mesh::is_mesh_inbound_route_id(&proxy.id)
+    {
+        let resolved_app_port = ctx
+            .mesh_inbound_listener_authz_port
+            .unwrap_or(proxy.backend_port);
+        let policy = state.mesh_inbound_tls_policy.load();
+        let required_mode = policy
+            .modes_by_port
+            .get(&resolved_app_port)
+            .copied()
+            .unwrap_or(policy.default_mode);
+        if !mesh_inbound_transport_satisfies_mode(
+            required_mode,
+            is_tls,
+            ctx.tls_client_cert_der.is_some(),
+        ) {
+            warn!(
+                proxy_id = %proxy.id,
+                resolved_app_port,
+                ?required_mode,
+                transport_tls = is_tls,
+                verified_peer_certificate = ctx.tls_client_cert_der.is_some(),
+                client_ip = %ctx.client_ip,
+                "Rejecting direct mesh inbound request because its transport does not satisfy the resolved app-port PeerAuthentication mode"
+            );
+            state.request_count.fetch_add(1, Ordering::Relaxed);
+            let reject = normalize_reject_response(
+                StatusCode::FORBIDDEN,
+                br#"{"error":"Mesh inbound transport does not satisfy PeerAuthentication for the resolved application port"}"#,
+                &EMPTY_HEADERS,
+                request_uses_grpc_content_type,
+            );
+            record_status(&state, reject.http_status.as_u16());
+            return Ok(build_response_from_normalized_reject(reject));
+        }
+    }
 
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     debug!(proxy_id = %proxy.id, method = %method, path = %path, client_ip = %ctx.client_ip, "Request routed to proxy");
@@ -36450,6 +36530,47 @@ mod tests {
         assert!(std::ptr::eq(
             select_mesh_inbound_tls_config(&default, &by_port, None),
             &default
+        ));
+    }
+
+    #[test]
+    fn mesh_inbound_post_route_transport_gate_enforces_effective_mode() {
+        use crate::modes::mesh::config::MtlsMode;
+
+        assert!(!mesh_inbound_transport_satisfies_mode(
+            MtlsMode::Strict,
+            false,
+            false
+        ));
+        assert!(!mesh_inbound_transport_satisfies_mode(
+            MtlsMode::Strict,
+            true,
+            false
+        ));
+        assert!(mesh_inbound_transport_satisfies_mode(
+            MtlsMode::Strict,
+            true,
+            true
+        ));
+        assert!(mesh_inbound_transport_satisfies_mode(
+            MtlsMode::Permissive,
+            false,
+            false
+        ));
+        assert!(mesh_inbound_transport_satisfies_mode(
+            MtlsMode::Permissive,
+            true,
+            true
+        ));
+        assert!(mesh_inbound_transport_satisfies_mode(
+            MtlsMode::Disable,
+            false,
+            false
+        ));
+        assert!(!mesh_inbound_transport_satisfies_mode(
+            MtlsMode::Disable,
+            true,
+            true
         ));
     }
 
