@@ -2,7 +2,8 @@
 //!
 //! Verifies that `GET /backend-capabilities` and
 //! `POST /backend-capabilities/refresh` are permanently exposed under
-//! the standard admin JWT auth — no env-var gate, no mode special-case.
+//! the standard admin JWT auth. Refresh is an operational mutation, so
+//! read-only admin planes reject it while GET introspection remains available.
 //!
 //! These endpoints serve operator-facing protocol-classification
 //! introspection (see `docs/admin_api.md` and `openapi.yaml`). They run
@@ -379,6 +380,28 @@ async fn post_backend_capabilities_refresh_returns_200_with_valid_token() {
         body["status"].as_str(),
         Some("refreshed"),
         "expected refresh acknowledgement; body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn post_backend_capabilities_refresh_returns_403_in_read_only_mode() {
+    let tc = TestConfig::default();
+    let mut state = admin_state_with_capability_registry(create_test_jwt_manager(&tc));
+    state.read_only = true;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body) = admin_request_with_token(
+        reqwest::Method::POST,
+        &base_url,
+        "/backend-capabilities/refresh",
+        &token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(
+        body["error"].as_str(),
+        Some("Admin API is in read-only mode")
     );
 }
 
