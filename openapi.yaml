@@ -8447,7 +8447,7 @@ components:
                     description: The listen port that could not be bound or is deferred.
                   error:
                     type: string
-                    description: Human-readable reason (e.g. "port already in use", "Deferred: frontend_tls TCP listener requires a rustls ServerConfig").
+                    description: 'Human-readable reason (e.g. "port already in use", "Deferred: frontend_tls TCP listener requires a rustls ServerConfig").'
                   kind:
                     type: string
                     enum:
