@@ -607,8 +607,8 @@ fn peer_authentication_transport_port_collision_warning_is_listener_wide() {
             "portLevelMtls": { "15006": { "mode": "PERMISSIVE" } }
         }),
     );
-    let translation =
-        translate_k8s_objects(&[obj.clone()], options()).expect("translation should succeed");
+    let translation = translate_k8s_objects(std::slice::from_ref(&obj), options())
+        .expect("translation should succeed");
     let warning = translation
         .warnings
         .iter()
