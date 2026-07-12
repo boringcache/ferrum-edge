@@ -855,8 +855,10 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
 /// counts so operators can confirm Ferrum's view of an external service.
 ///
 /// A `protocol: UDP` port is ACCEPTED (it translates to `AppProtocol::Udp`) but
-/// its egress lane is INERT in F3 §3.3 stage 1: the EgressGateway materializer
-/// skips UDP ports (no UDP capture/egress datapath yet), so the resource would
+/// its EgressGateway egress lane is INERT: the EgressGateway materializer skips
+/// UDP ports because ServiceEntry/egress-external UDP is out of scope (east-west
+/// UDP capture/egress shipped in F3 §3.3, but external-UDP egress did not), so
+/// the resource would
 /// otherwise show as fully accepted in `kubectl describe` while no
 /// proxy/listener/upstream is produced. Surface that gap as a `deferred_fields`
 /// entry (keeping `FerrumAccepted=True` — it IS accepted/translated, just
@@ -898,9 +900,10 @@ fn service_entry_status(
         .map(|v| v.len())
         .unwrap_or(0);
 
-    // F3 §3.3 stage 1 accepts a `protocol: UDP` ServiceEntry (it translates to
+    // A `protocol: UDP` ServiceEntry is accepted (it translates to
     // `AppProtocol::Udp`) but the EgressGateway materializer skips UDP ports as
-    // inert (no UDP capture/egress datapath yet — see `build_egress_proxies_and_upstreams`
+    // inert (ServiceEntry/egress-external UDP is out of scope; east-west UDP
+    // capture/egress shipped in F3 §3.3 — see `build_egress_proxies_and_upstreams`
     // in `src/modes/mesh/mod.rs`, which keys its one-time deferral warning off
     // `AppProtocol::Udp`). Surface that gap as a deferred field so the resource
     // does not appear fully accepted while no proxy/listener/upstream is produced.
@@ -920,7 +923,8 @@ fn service_entry_status(
     if has_udp_port {
         deferred.push(
             "spec.ports[].protocol: UDP — egress materialization deferred \
-             (F3 §3.3 UDP capture/egress not yet implemented)",
+             (ServiceEntry/egress-external UDP is out of scope; east-west UDP \
+             capture/egress shipped in F3 §3.3)",
         );
     }
 
