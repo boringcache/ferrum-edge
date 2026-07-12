@@ -10471,8 +10471,15 @@ fn startup_inbound_mtls_mode(
 /// mode applies listener-wide. This is the runtime honest-surface for EVERY
 /// config source, complementing the K8s translator warning and the
 /// `status.ferrum.translation.deferred_fields` entry. Does NOT change resolution.
-fn warn_unenforced_peer_auth_port_overrides(slice: &MeshSlice, runtime: &MeshRuntimeConfig) {
+fn warn_unenforced_peer_auth_port_overrides(
+    slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+) -> bool {
+    if !runtime.has_inbound_tls_termination_listener() {
+        return false;
+    }
     let resolution_port = inbound_mtls_resolution_port(runtime);
+    let mut warned = false;
     for (policy, ports) in slice.unenforced_peer_auth_port_overrides() {
         let ports_list = ports
             .iter()
@@ -10496,7 +10503,9 @@ fn warn_unenforced_peer_auth_port_overrides(slice: &MeshSlice, runtime: &MeshRun
              {resolution_port}; {effective_mode_detail}. Per-app-port mTLS enforcement \
              (SO_ORIGINAL_DST demux) is tracked separately."
         );
+        warned = true;
     }
+    warned
 }
 
 fn live_reload_inbound_mtls_mode(
@@ -25616,6 +25625,20 @@ mod tests {
         // East-west has no TLS termination; pick a stable port for the call.
         let east_west = runtime_with_topology(MeshTopology::EastWestGateway);
         assert_eq!(inbound_mtls_resolution_port(&east_west), 15006);
+    }
+
+    #[test]
+    fn unenforced_override_warning_skips_east_west_passthrough() {
+        let runtime = runtime_with_topology(MeshTopology::EastWestGateway);
+        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
+            8080,
+            config::MtlsMode::Strict,
+        )]);
+
+        assert!(
+            !warn_unenforced_peer_auth_port_overrides(&slice, &runtime),
+            "SNI-passthrough topology must not emit an inbound mTLS enforcement warning"
+        );
     }
 
     #[test]

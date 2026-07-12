@@ -616,6 +616,15 @@ fn peer_authentication_transport_port_collision_warning_is_listener_wide() {
     assert!(warning.contains("override key equals that topology's transport port"));
     assert!(warning.contains("override's mode governs the whole listener"));
     assert!(warning.contains("NOT enforced per app port"));
+
+    let updates = plan_istio_status_updates(&[obj], options());
+    let deferred = updates[0].ferrum_detail.as_ref().unwrap()["translation"]["deferred_fields"]
+        .as_array()
+        .expect("deferred_fields array");
+    let deferred_text = deferred[0].as_str().expect("deferred field text");
+    assert!(deferred_text.contains("top-level mtls.mode governs the whole listener unless"));
+    assert!(deferred_text.contains("override key equals the transport port"));
+    assert!(deferred_text.contains("that override governs the whole listener"));
 }
 
 #[test]

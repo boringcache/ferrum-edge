@@ -697,8 +697,8 @@ impl MeshSlice {
     /// not just the K8s translator/status path. Full per-app-port enforcement is
     /// tracked as a separate architectural item.
     ///
-    /// Returns `(policy_name, sorted_unenforced_ports)` for each offending
-    /// applicable policy; empty when nothing is dropped.
+    /// Returns `(policy_namespace/name, sorted_unenforced_ports)` for each
+    /// offending applicable policy; empty when nothing is dropped.
     pub fn unenforced_peer_auth_port_overrides(&self) -> Vec<(String, Vec<u16>)> {
         let mut reported = Vec::new();
         for pa in &self.peer_authentications {
@@ -719,7 +719,7 @@ impl MeshSlice {
                 continue;
             }
             ports.sort_unstable();
-            reported.push((pa.name.clone(), ports));
+            reported.push((format!("{}/{}", pa.namespace, pa.name), ports));
         }
         reported
     }

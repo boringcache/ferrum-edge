@@ -531,9 +531,11 @@ fn peer_authentication_status(
             // inbound mesh listener terminates mTLS on a single transport port
             // and cannot vary STRICT/PERMISSIVE per app port without
             // SO_ORIGINAL_DST demux. The runtime applies the top-level mode to
-            // the whole listener, so the per-app-port intent is NOT enforced.
+            // the whole listener unless an override key equals the transport
+            // port, in which case that override applies listener-wide. Either
+            // way, the per-app-port intent is NOT enforced.
             // FerrumAccepted stays True (the policy is otherwise valid and its
-            // top-level mode is applied), but the gap MUST be visible so
+            // listener-wide mode is applied), but the gap MUST be visible so
             // FerrumAccepted=True no longer implies per-port enforcement. Keep
             // this in sync with the translator warning in
             // `src/config_sources/k8s/istio.rs`.
@@ -541,9 +543,10 @@ fn peer_authentication_status(
             if !port_overrides.is_empty() {
                 deferred.push(
                     "portLevelMtls (per-app-port mTLS not enforced: the inbound mesh listener \
-                     terminates mTLS on a single transport port and applies the top-level \
-                     mtls.mode to the whole listener; per-app-port enforcement via \
-                     SO_ORIGINAL_DST demux is tracked separately)",
+                     terminates mTLS on a single transport port; the top-level mtls.mode governs \
+                     the whole listener unless an override key equals the transport port, in \
+                     which case that override governs the whole listener; per-app-port \
+                     enforcement via SO_ORIGINAL_DST demux is tracked separately)",
                 );
             }
             let message = if deferred.is_empty() {

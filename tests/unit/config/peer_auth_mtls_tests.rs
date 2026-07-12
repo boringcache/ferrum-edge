@@ -170,7 +170,7 @@ fn app_port_overrides_reported_as_unenforced() {
 
     let reported = slice.unenforced_peer_auth_port_overrides();
     assert_eq!(reported.len(), 1);
-    assert_eq!(reported[0].0, "ns-strict");
+    assert_eq!(reported[0].0, "prod/ns-strict");
     // Sorted ascending, both app ports (neither matches the 15006 listener port).
     assert_eq!(reported[0].1, vec![8080, 9090]);
 
@@ -210,7 +210,7 @@ fn ambiguous_candidate_app_port_override_reported_as_unenforced() {
 
     assert_eq!(
         slice.unenforced_peer_auth_port_overrides(),
-        vec![("candidate-api".to_string(), vec![8080])]
+        vec![("prod/candidate-api".to_string(), vec![8080])]
     );
 }
 
@@ -246,13 +246,44 @@ fn app_port_collision_with_transport_port_is_reported() {
 
     assert_eq!(
         slice.unenforced_peer_auth_port_overrides(),
-        vec![("ns-listener-override".to_string(), vec![15006])],
+        vec![("prod/ns-listener-override".to_string(), vec![15006])],
         "the listener-wide effect does not satisfy per-app-port intent"
     );
 
     // Keep resolution behavior unchanged: the coincidental key still selects
     // STRICT for the whole transport listener.
     assert_eq!(slice.resolve_effective_mtls_mode(15006), MtlsMode::Strict);
+}
+
+#[test]
+fn unenforced_override_report_qualifies_duplicate_names_with_namespace() {
+    let mut first = peer_auth_with_scope(
+        "shared-name",
+        "istio-system",
+        PolicyScope::MeshWide,
+        MtlsMode::Strict,
+    );
+    first.port_overrides = HashMap::from([(8080, MtlsMode::Permissive)]);
+    let mut second = peer_auth_with_scope(
+        "shared-name",
+        "mesh-admin",
+        PolicyScope::MeshWide,
+        MtlsMode::Permissive,
+    );
+    second.port_overrides = HashMap::from([(9090, MtlsMode::Strict)]);
+    let slice = MeshSlice {
+        namespace: "prod".to_string(),
+        peer_authentications: vec![first, second],
+        ..MeshSlice::default()
+    };
+
+    assert_eq!(
+        slice.unenforced_peer_auth_port_overrides(),
+        vec![
+            ("istio-system/shared-name".to_string(), vec![8080]),
+            ("mesh-admin/shared-name".to_string(), vec![9090]),
+        ]
+    );
 }
 
 // ── Same-scope tie-breaking (fail-secure: more-restrictive mode wins) ─────
