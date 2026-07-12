@@ -109,10 +109,11 @@ EOF
     trust_domain="${2:?trust domain is required}"
     workload_id="${3:?workload SPIFFE ID is required}"
     peer_domain="${4:-}"
+    workload_uid="${5:-1337}"
     args=(entry create
       -parentID "spiffe://$trust_domain/spire/agent/netns-live"
       -spiffeID "$workload_id"
-      -selector unix:uid:1337)
+      -selector "unix:uid:$workload_uid")
     if [[ -n "$peer_domain" ]]; then
       args+=(-federatesWith "spiffe://$peer_domain")
     fi

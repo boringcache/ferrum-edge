@@ -373,7 +373,36 @@ fn spawn_mesh_gateway(temp: &TempDir, options: MeshGatewaySpawnOptions<'_>) -> C
     cmd.spawn().expect("spawn mesh gateway")
 }
 
+#[cfg(target_os = "linux")]
 fn spawn_mesh_gateway_in_netns(
+    temp: &TempDir,
+    options: MeshGatewaySpawnOptions<'_>,
+    netns_pid: u32,
+) -> Child {
+    spawn_mesh_gateway_in_netns_as_uid(temp, options, netns_pid, 1337)
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_mesh_gateway_in_netns_as_uid(
+    temp: &TempDir,
+    options: MeshGatewaySpawnOptions<'_>,
+    netns_pid: u32,
+    uid: u32,
+) -> Child {
+    let mut cmd = Command::new("nsenter");
+    cmd.arg(format!("--net=/proc/{netns_pid}/ns/net"))
+        .arg("--")
+        .arg("setpriv")
+        .arg(format!("--reuid={uid}"))
+        .arg(format!("--regid={uid}"))
+        .args(["--clear-groups", "--"])
+        .arg(binary_path());
+    configure_mesh_gateway_command(&mut cmd, temp, options);
+    cmd.spawn().expect("spawn mesh gateway inside pod netns")
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_mesh_gateway_in_netns_as_root(
     temp: &TempDir,
     options: MeshGatewaySpawnOptions<'_>,
     netns_pid: u32,
@@ -381,11 +410,10 @@ fn spawn_mesh_gateway_in_netns(
     let mut cmd = Command::new("nsenter");
     cmd.arg(format!("--net=/proc/{netns_pid}/ns/net"))
         .arg("--")
-        .arg("setpriv")
-        .args(["--reuid=1337", "--regid=1337", "--clear-groups", "--"])
         .arg(binary_path());
     configure_mesh_gateway_command(&mut cmd, temp, options);
-    cmd.spawn().expect("spawn mesh gateway inside pod netns")
+    cmd.spawn()
+        .expect("spawn privileged mesh gateway inside pod netns")
 }
 
 fn configure_mesh_gateway_command(
@@ -8277,6 +8305,8 @@ const LIVE_XC_TD_B: &str = "cluster-b.test";
 #[cfg(target_os = "linux")]
 const LIVE_XC_ID_A: &str = "spiffe://cluster-a.test/ns/ferrum/sa/client";
 #[cfg(target_os = "linux")]
+const LIVE_XC_ID_A_AMBIENT: &str = "spiffe://cluster-a.test/ns/ferrum/sa/ambient-client";
+#[cfg(target_os = "linux")]
 const LIVE_XC_ID_A_UNFEDERATED: &str = "spiffe://cluster-a.test/ns/ferrum/sa/unfederated-client";
 #[cfg(target_os = "linux")]
 const LIVE_XC_ID_B: &str = "spiffe://cluster-b.test/ns/ferrum/sa/destination";
@@ -8365,6 +8395,15 @@ impl LiveTwoClusterSpire {
             LIVE_XC_TD_A,
             LIVE_XC_ID_A,
             LIVE_XC_TD_B,
+            "1337",
+        ])?;
+        run_live_xc_spire(&[
+            "register",
+            &a_root,
+            LIVE_XC_TD_A,
+            LIVE_XC_ID_A_AMBIENT,
+            LIVE_XC_TD_B,
+            "0",
         ])?;
         run_live_xc_spire(&[
             "register",
@@ -8372,6 +8411,7 @@ impl LiveTwoClusterSpire {
             LIVE_XC_TD_A,
             LIVE_XC_ID_A_UNFEDERATED,
             "",
+            "1338",
         ])?;
         run_live_xc_spire(&[
             "register",
@@ -8379,6 +8419,7 @@ impl LiveTwoClusterSpire {
             LIVE_XC_TD_B,
             LIVE_XC_ID_B,
             LIVE_XC_TD_A,
+            "1337",
         ])?;
         let bundle_a_pem = std::fs::read_to_string(cluster_a.path().join("bundle.pem"))
             .map_err(|error| format!("read SPIRE A bundle: {error}"))?;
@@ -8612,7 +8653,7 @@ fn live_xc_source_slice(
         .iter()
         .map(|service| format!("{}.ferrum.svc.cluster.local", service.name))
         .collect();
-    let source_id = SpiffeId::new(LIVE_XC_ID_A).expect("live A SPIFFE id");
+    let source_id = SpiffeId::new(LIVE_XC_ID_A_AMBIENT).expect("live Ambient A SPIFFE id");
     let source_workload = Workload {
         spiffe_id: source_id,
         selector: WorkloadSelector::default(),
@@ -8966,7 +9007,10 @@ fn live_xc_missing_sni_slice(
     if let Some(multi_cluster) = &mut slice.multi_cluster
         && let Some(gateway) = multi_cluster.east_west_gateways.first_mut()
     {
-        gateway.sni_hosts.clear();
+        // Keep the gateway structurally valid while ensuring it owns no SNI
+        // acceptable for the requested service. Materialization therefore
+        // omits the cross-cluster target and the request is refused pre-dial.
+        gateway.sni_hosts = vec!["unrelated.ferrum.svc.cluster.local".to_string()];
     }
     slice
 }
@@ -9073,6 +9117,7 @@ fn live_xc_spawn_gateway(
     node_id: &'static str,
     topology: &'static str,
     netns_pid: u32,
+    run_uid: Option<u32>,
     mut env: Vec<(&'static str, String)>,
 ) -> LiveGatewayChild {
     env.push((
@@ -9087,19 +9132,20 @@ fn live_xc_spawn_gateway(
         "FERRUM_MESH_HBONE_LISTEN_ADDR",
         format!("0.0.0.0:{}", ports.hbone),
     ));
-    LiveGatewayChild::new(spawn_mesh_gateway_in_netns(
-        temp,
-        MeshGatewaySpawnOptions {
-            cp_addr,
-            ports,
-            node_id,
-            config_protocol: "native",
-            topology,
-            waypoint_name: None,
-            env_overrides: env,
-        },
-        netns_pid,
-    ))
+    let options = MeshGatewaySpawnOptions {
+        cp_addr,
+        ports,
+        node_id,
+        config_protocol: "native",
+        topology,
+        waypoint_name: None,
+        env_overrides: env,
+    };
+    let child = match run_uid {
+        Some(uid) => spawn_mesh_gateway_in_netns_as_uid(temp, options, netns_pid, uid),
+        None => spawn_mesh_gateway_in_netns_as_root(temp, options, netns_pid),
+    };
+    LiveGatewayChild::new(child)
 }
 
 #[cfg(target_os = "linux")]
@@ -9214,6 +9260,7 @@ impl LiveTwoClusterFixture {
             "live-xc-sidecar-destination",
             "sidecar",
             destination.pod.pid(),
+            Some(1337),
             live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B),
         );
         if !wait_for_tcp_port_in_netns(
@@ -9236,6 +9283,7 @@ impl LiveTwoClusterFixture {
             "live-xc-ambient-destination",
             "ambient",
             destination.pod.pid(),
+            Some(1337),
             live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B),
         );
         if !wait_for_tcp_port_in_netns(
@@ -9264,6 +9312,7 @@ impl LiveTwoClusterFixture {
             "live-xc-east-west",
             "east_west_gateway",
             east_west.pod.pid(),
+            Some(1337),
             live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B),
         );
         if !wait_for_tcp_port_in_netns(east_west.pod.pid(), east_west_port, STARTUP_TIMEOUT).await {
@@ -9338,13 +9387,14 @@ impl LiveTwoClusterFixture {
             "live-xc-sidecar-source",
             "sidecar",
             source.pod.pid(),
+            Some(1337),
             sidecar_env,
         );
 
         let ports_ambient_source = reserve_mesh_ports().await;
         let ambient_outbound = ports_ambient_source.outbound;
         let udp_capture_port = ferrum_edge::capture::DEFAULT_UDP_OUTBOUND_PORT;
-        let mut ambient_env = live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A);
+        let mut ambient_env = live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A_AMBIENT);
         ambient_env.extend([
             ("FERRUM_POOL_WARMUP_ENABLED", "true".to_string()),
             (
@@ -9362,6 +9412,7 @@ impl LiveTwoClusterFixture {
             "live-xc-ambient-source",
             "ambient",
             source.pod.pid(),
+            None,
             ambient_env,
         );
 
@@ -9374,6 +9425,7 @@ impl LiveTwoClusterFixture {
             "live-xc-unfederated-source",
             "sidecar",
             source.pod.pid(),
+            Some(1338),
             live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A_UNFEDERATED),
         );
 
@@ -9386,6 +9438,7 @@ impl LiveTwoClusterFixture {
             "live-xc-wrong-td-source",
             "sidecar",
             source.pod.pid(),
+            Some(1337),
             live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A),
         );
 
@@ -9398,6 +9451,7 @@ impl LiveTwoClusterFixture {
             "live-xc-missing-sni-source",
             "sidecar",
             source.pod.pid(),
+            Some(1337),
             live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A),
         );
 
@@ -9607,6 +9661,30 @@ fn live_xc_http_get_from_vip(
 }
 
 #[cfg(target_os = "linux")]
+fn live_xc_udp_round_trip(
+    pid: u32,
+    source_ip: std::net::Ipv4Addr,
+    destination: SocketAddr,
+    payload: &'static [u8],
+) -> Result<(Vec<u8>, SocketAddr), String> {
+    run_in_live_netns(pid, move || {
+        let socket = std::net::UdpSocket::bind(SocketAddr::from((source_ip, 0)))
+            .map_err(|error| format!("bind veth-backed UDP client: {error}"))?;
+        socket
+            .set_read_timeout(Some(Duration::from_secs(12)))
+            .map_err(|error| format!("set UDP client timeout: {error}"))?;
+        socket
+            .send_to(payload, destination)
+            .map_err(|error| format!("send UDP to {destination}: {error}"))?;
+        let mut buf = [0u8; 2048];
+        let (size, source) = socket
+            .recv_from(&mut buf)
+            .map_err(|error| format!("receive UDP reply: {error}"))?;
+        Ok((buf[..size].to_vec(), source))
+    })
+}
+
+#[cfg(target_os = "linux")]
 async fn live_xc_test_http(fixture: &LiveTwoClusterFixture) {
     let mut last = Err("HTTP row did not run".to_string());
     for _ in 0..20 {
@@ -9742,11 +9820,11 @@ async fn live_xc_test_udp(fixture: &mut LiveTwoClusterFixture) {
     let destination = format!("{LIVE_XC_UDP_VIP}:{LIVE_XC_UDP_PORT}")
         .parse()
         .expect("UDP VIP");
-    let (reply, source) = udp_round_trip_from_netns(
+    let (reply, source) = live_xc_udp_round_trip(
         fixture.source.pod.pid(),
+        fixture.source.pod_ip(),
         destination,
         b"live-two-cluster-udp-frame",
-        Duration::from_secs(12),
     )
     .unwrap_or_else(|error| {
         panic!(
