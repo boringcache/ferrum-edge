@@ -155,7 +155,10 @@ paths:
         complete it returns `200 OK` with `status` set to `"ok"` or
         `"degraded"` (DB disconnected / admin writes blocked / database
         incremental polling repeatedly rejecting the same delta while serving
-        last known-good config).
+        last known-good config). In CP/DP modes, if a supervised serving
+        listener later exits with an error, `/health` returns `503` with
+        `status: "unavailable"`, `ready: false` durably (sticky across a later
+        readiness restore).
       tags: [Health]
       security: []
       responses:
@@ -166,7 +169,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
         "503":
-          description: Gateway is still starting (status `starting`, `ready=false`)
+          description: Gateway not ready (status `starting` during startup, or `unavailable` after a CP/DP serving-listener failure); `ready=false`
           content:
             application/json:
               schema:
@@ -186,7 +189,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
         "503":
-          description: Gateway is still starting (status `starting`, `ready=false`)
+          description: Gateway not ready (status `starting` or `unavailable`, `ready=false`)
           content:
             application/json:
               schema:
@@ -8157,7 +8160,7 @@ components:
       properties:
         status:
           type: [string, "null"]
-          enum: [ok, degraded, starting]
+          enum: [ok, degraded, starting, unavailable]
           description: |
             Aggregate gateway health.
             `ok` — fully ready and healthy (200). Also returned for
@@ -8170,11 +8173,19 @@ components:
             `degraded`.
             `starting` — startup not yet complete (returned with 503 and
             `ready: false`).
+            `unavailable` — the gateway became ready but a serving listener
+            task later exited with an error (CP gRPC server, or a DP
+            proxy/admin listener). This is a sticky, monotonic degradation:
+            it stays set across a later readiness restore (returned with 503
+            and `ready: false`). Only CP and DP modes report it.
         ready:
           type: boolean
           description: |
-            `true` once the gateway has finished startup. While `false`, the
-            endpoint returns `503 Service Unavailable`.
+            `true` once the gateway has finished startup AND no supervised
+            serving listener has failed since. While `false`, the endpoint
+            returns `503 Service Unavailable`. In CP/DP modes a post-startup
+            serving-listener failure sets `ready: false` durably (sticky) even
+            though internal startup completed.
         admin_writes_enabled:
           type: boolean
           description: |
@@ -8408,30 +8419,51 @@ components:
             bind_failures_total:
               type: integer
               description: |
-                Number of stream-listener resources that failed to bind on the
-                most recent config reconcile. In DP mode these binds are
-                intentionally non-fatal (a bad CP-pushed config must not brick
-                the data plane), so this count surfaces the failures beyond the
-                warn log. `0` once every configured stream listener binds.
+                Number of configured stream-listener resources that are NOT
+                serving after the most recent config reconcile — hard bind
+                failures PLUS listeners deferred/degraded for a config reason
+                (e.g. a `frontend_tls` listener still waiting for TLS material).
+                In DP mode these binds are intentionally non-fatal (a bad
+                CP-pushed config must not brick the data plane), so this count
+                surfaces the non-serving listeners beyond the warn log. `0` once
+                every configured stream listener is serving. Each entry's `kind`
+                distinguishes a hard failure from a deferral.
             bind_failures:
               type: array
               description: |
-                Structured per-resource stream-listener bind failures from the
-                most recent reconcile. Empty once all stream listeners bind.
+                Structured per-resource stream-listener non-serving reasons from
+                the most recent reconcile, classified by `kind`. Empty once every
+                configured stream listener is serving.
               items:
                 type: object
-                required: [proxy_id, listen_port, error]
+                required: [proxy_id, listen_port, error, kind]
                 properties:
                   proxy_id:
                     type: string
-                    description: ID of the proxy whose stream listener failed to bind.
+                    description: ID of the proxy whose stream listener is not serving.
                   listen_port:
                     type: integer
                     format: uint16
-                    description: The listen port that could not be bound.
+                    description: The listen port that could not be bound or is deferred.
                   error:
                     type: string
-                    description: Human-readable bind failure reason (e.g. "port already in use").
+                    description: Human-readable reason (e.g. "port already in use", "Deferred: frontend_tls TCP listener requires a rustls ServerConfig").
+                  kind:
+                    type: string
+                    enum:
+                      - bind_failed
+                      - backend_tls_invalid
+                      - backend_tls_rotation_invalid
+                      - frontend_tls_deferred
+                      - frontend_dtls_deferred
+                      - frontend_dtls_build_failed
+                    description: |
+                      Classification of why the listener is not serving.
+                      `bind_failed`, `backend_tls_invalid`, and
+                      `backend_tls_rotation_invalid` are hard failures (the
+                      startup path treats these as fatal in file/database mode);
+                      the `frontend_*` variants are non-fatal deferrals/degradations
+                      that clear once TLS material is loaded or corrected.
 
     # ── Runtime metrics ─────────────────────────────────────────────
     RuntimeMetricsSnapshot:
