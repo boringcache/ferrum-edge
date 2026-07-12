@@ -8546,53 +8546,25 @@ fn live_xc_service(
 
 #[cfg(target_os = "linux")]
 fn live_xc_services(workload: &SpiffeId) -> Vec<MeshService> {
-    vec![
-        live_xc_service(
-            "http-live",
-            &[(LIVE_XC_HTTP_PORT, AppProtocol::Http, "http")],
-            workload,
-            Vec::new(),
-        ),
-        live_xc_service(
-            "grpc-live",
-            &[(LIVE_XC_GRPC_PORT, AppProtocol::Grpc, "grpc")],
-            workload,
-            Vec::new(),
-        ),
-        live_xc_service(
-            "sidecar-ws-live",
-            &[(LIVE_XC_SIDECAR_WS_PORT, AppProtocol::Http, "http")],
-            workload,
-            Vec::new(),
-        ),
-        live_xc_service(
-            "ambient-ws-live",
-            &[(LIVE_XC_AMBIENT_WS_PORT, AppProtocol::Http, "http")],
-            workload,
-            Vec::new(),
-        ),
-        live_xc_service(
-            "multi-live",
-            &[
-                (LIVE_XC_MULTI_A_PORT, AppProtocol::Http, "http-a"),
-                (LIVE_XC_MULTI_B_PORT, AppProtocol::Http, "http-b"),
-            ],
-            workload,
-            vec![LIVE_XC_MULTI_VIP.to_string()],
-        ),
-        live_xc_service(
-            "tcp-live",
-            &[(LIVE_XC_TCP_PORT, AppProtocol::Tcp, "tcp")],
-            workload,
-            vec![LIVE_XC_TCP_VIP.to_string()],
-        ),
-        live_xc_service(
-            "udp-live",
-            &[(LIVE_XC_UDP_PORT, AppProtocol::Udp, "udp")],
-            workload,
-            vec![LIVE_XC_UDP_VIP.to_string()],
-        ),
-    ]
+    vec![live_xc_service(
+        "live-matrix",
+        &[
+            (LIVE_XC_HTTP_PORT, AppProtocol::Http, "http"),
+            (LIVE_XC_GRPC_PORT, AppProtocol::Grpc, "grpc"),
+            (LIVE_XC_SIDECAR_WS_PORT, AppProtocol::Http, "sidecar-ws"),
+            (LIVE_XC_AMBIENT_WS_PORT, AppProtocol::Http, "ambient-ws"),
+            (LIVE_XC_MULTI_A_PORT, AppProtocol::Http, "multi-a"),
+            (LIVE_XC_MULTI_B_PORT, AppProtocol::Http, "multi-b"),
+            (LIVE_XC_TCP_PORT, AppProtocol::Tcp, "tcp"),
+            (LIVE_XC_UDP_PORT, AppProtocol::Udp, "udp"),
+        ],
+        workload,
+        vec![
+            LIVE_XC_MULTI_VIP.to_string(),
+            LIVE_XC_TCP_VIP.to_string(),
+            LIVE_XC_UDP_VIP.to_string(),
+        ],
+    )]
 }
 
 #[cfg(target_os = "linux")]
@@ -9739,7 +9711,7 @@ impl LiveTwoClusterFixture {
         run_async_in_live_netns(self.source.pod.pid(), move || async move {
             grpc_egress_request(
                 outbound,
-                "grpc-live.ferrum.svc.cluster.local",
+                "live-matrix.ferrum.svc.cluster.local:18081",
                 "/echo.Mesh/Call",
                 &framed,
             )
@@ -9835,7 +9807,7 @@ async fn live_xc_test_http(fixture: &LiveTwoClusterFixture) {
         last = fixture
             .http_get(
                 fixture.sidecar_outbound,
-                "http-live.ferrum.svc.cluster.local",
+                "live-matrix.ferrum.svc.cluster.local:18080",
             )
             .await;
         if matches!(&last, Ok((200, body)) if body.contains("http-live-ok")) {
@@ -9877,7 +9849,7 @@ async fn live_xc_test_sidecar_websocket(fixture: &LiveTwoClusterFixture) {
     let reply = fixture
         .websocket(
             fixture.sidecar_outbound,
-            "sidecar-ws-live.ferrum.svc.cluster.local",
+            "live-matrix.ferrum.svc.cluster.local:18082",
             "sidecar-live",
         )
         .await
@@ -9893,7 +9865,7 @@ async fn live_xc_test_sidecar_websocket(fixture: &LiveTwoClusterFixture) {
 #[cfg(target_os = "linux")]
 async fn live_xc_test_ambient_websocket(fixture: &LiveTwoClusterFixture) {
     let reply = fixture
-        .ambient_websocket("ambient-ws-live.ferrum.svc.cluster.local", "ambient-live")
+        .ambient_websocket("live-matrix.ferrum.svc.cluster.local:18083", "ambient-live")
         .await
         .unwrap_or_else(|error| {
             panic!(
@@ -9909,24 +9881,28 @@ fn live_xc_test_multi_port(fixture: &mut LiveTwoClusterFixture) {
     fixture
         .install_tcp_capture()
         .expect("install source production TCP capture");
-    for (port, expected) in [
-        (LIVE_XC_MULTI_A_PORT, "multi-a-ok"),
-        (LIVE_XC_MULTI_B_PORT, "multi-b-ok"),
+    for (port, expected, host) in [
+        (
+            LIVE_XC_MULTI_A_PORT,
+            "multi-a-ok",
+            "live-matrix.ferrum.svc.cluster.local:18084",
+        ),
+        (
+            LIVE_XC_MULTI_B_PORT,
+            "multi-b-ok",
+            "live-matrix.ferrum.svc.cluster.local:18085",
+        ),
     ] {
         let destination = format!("{LIVE_XC_MULTI_VIP}:{port}")
             .parse()
             .expect("multi-port VIP");
-        let (status, body) = live_xc_http_get_from_vip(
-            fixture.source.pod.pid(),
-            destination,
-            "multi-live.ferrum.svc.cluster.local",
-        )
-        .unwrap_or_else(|error| {
-            panic!(
-                "multi-port p{port} alias row failed: {error}\n{}",
-                fixture.diagnostics()
-            )
-        });
+        let (status, body) = live_xc_http_get_from_vip(fixture.source.pod.pid(), destination, host)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "multi-port p{port} alias row failed: {error}\n{}",
+                    fixture.diagnostics()
+                )
+            });
         assert_eq!(status, 200, "p{port} alias response: {body:?}");
         assert_eq!(body, expected, "p{port} routed to the wrong backend");
     }
@@ -9997,7 +9973,7 @@ async fn live_xc_test_fail_closed_negatives(fixture: &LiveTwoClusterFixture) {
         ("unfederated peer", fixture.unfederated_outbound),
     ] {
         let observed = fixture
-            .http_get(outbound, "http-live.ferrum.svc.cluster.local")
+            .http_get(outbound, "live-matrix.ferrum.svc.cluster.local:18080")
             .await;
         assert!(
             !matches!(observed, Ok((200, ref body)) if body.contains("http-live-ok")),
@@ -10010,7 +9986,7 @@ async fn live_xc_test_fail_closed_negatives(fixture: &LiveTwoClusterFixture) {
     let observed = fixture
         .http_get(
             fixture.missing_sni_outbound,
-            "http-live.ferrum.svc.cluster.local",
+            "live-matrix.ferrum.svc.cluster.local:18080",
         )
         .await;
     assert!(
