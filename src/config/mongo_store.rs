@@ -38,7 +38,8 @@
 mod inner {
     use crate::config::db_backend::{
         ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, DeleteAllResourcesError, DeleteMode,
-        IncrementalResult, PaginatedResult, SortOrder,
+        IncrementalResult, NamespaceResourceCounts, PaginatedResult, SnapshotDataIntegrityError,
+        SortOrder,
     };
     use crate::config::types::{
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
@@ -1868,6 +1869,36 @@ mod inner {
         Ok(mongodb::bson::from_document(doc)?)
     }
 
+    fn map_snapshot_document_error(
+        snapshot: bool,
+        resource_type: &'static str,
+        resource_id: Option<String>,
+        error: impl Into<anyhow::Error>,
+    ) -> anyhow::Error {
+        let error = error.into();
+        if snapshot {
+            anyhow::Error::new(SnapshotDataIntegrityError::new(
+                resource_type,
+                resource_id,
+                error,
+            ))
+        } else {
+            error
+        }
+    }
+
+    fn decode_loaded_document<T>(
+        doc: Document,
+        snapshot: bool,
+        resource_type: &'static str,
+        decode: fn(Document) -> Result<T, anyhow::Error>,
+    ) -> Result<T, anyhow::Error> {
+        let resource_id = doc.get_str("_id").ok().map(str::to_string);
+        decode(doc).map_err(|error| {
+            map_snapshot_document_error(snapshot, resource_type, resource_id, error)
+        })
+    }
+
     /// Convert an [`ApiSpec`] into a BSON `Document` for storage.
     ///
     /// `spec_content` (gzip bytes) serializes as BSON Binary. The document
@@ -2085,24 +2116,28 @@ mod inner {
                             .load_full_proxies_opt_session(
                                 namespace,
                                 Some((connection.as_ref(), &mut session)),
+                                false,
                             )
                             .await?;
                         let consumers = self
                             .load_full_consumers_opt_session(
                                 namespace,
                                 Some((connection.as_ref(), &mut session)),
+                                false,
                             )
                             .await?;
                         let plugin_configs = self
                             .load_full_plugin_configs_opt_session(
                                 namespace,
                                 Some((connection.as_ref(), &mut session)),
+                                false,
                             )
                             .await?;
                         let upstreams = self
                             .load_full_upstreams_opt_session(
                                 namespace,
                                 Some((connection.as_ref(), &mut session)),
+                                false,
                             )
                             .await?;
                         Ok::<_, anyhow::Error>((proxies, consumers, plugin_configs, upstreams))
@@ -2121,12 +2156,13 @@ mod inner {
                     }
                 } else {
                     (
-                        self.load_full_proxies_opt_session(namespace, None).await?,
-                        self.load_full_consumers_opt_session(namespace, None)
+                        self.load_full_proxies_opt_session(namespace, None, false)
                             .await?,
-                        self.load_full_plugin_configs_opt_session(namespace, None)
+                        self.load_full_consumers_opt_session(namespace, None, false)
                             .await?,
-                        self.load_full_upstreams_opt_session(namespace, None)
+                        self.load_full_plugin_configs_opt_session(namespace, None, false)
+                            .await?,
+                        self.load_full_upstreams_opt_session(namespace, None, false)
                             .await?,
                     )
                 };
@@ -2202,24 +2238,28 @@ mod inner {
                             .load_full_proxies_opt_session(
                                 namespace,
                                 Some((connection.as_ref(), &mut session)),
+                                true,
                             )
                             .await?;
                         let consumers = self
                             .load_full_consumers_opt_session(
                                 namespace,
                                 Some((connection.as_ref(), &mut session)),
+                                true,
                             )
                             .await?;
                         let plugin_configs = self
                             .load_full_plugin_configs_opt_session(
                                 namespace,
                                 Some((connection.as_ref(), &mut session)),
+                                true,
                             )
                             .await?;
                         let upstreams = self
                             .load_full_upstreams_opt_session(
                                 namespace,
                                 Some((connection.as_ref(), &mut session)),
+                                true,
                             )
                             .await?;
                         Ok::<_, anyhow::Error>((proxies, consumers, plugin_configs, upstreams))
@@ -2238,12 +2278,13 @@ mod inner {
                     }
                 } else {
                     (
-                        self.load_full_proxies_opt_session(namespace, None).await?,
-                        self.load_full_consumers_opt_session(namespace, None)
+                        self.load_full_proxies_opt_session(namespace, None, true)
                             .await?,
-                        self.load_full_plugin_configs_opt_session(namespace, None)
+                        self.load_full_consumers_opt_session(namespace, None, true)
                             .await?,
-                        self.load_full_upstreams_opt_session(namespace, None)
+                        self.load_full_plugin_configs_opt_session(namespace, None, true)
+                            .await?,
+                        self.load_full_upstreams_opt_session(namespace, None, true)
                             .await?,
                     )
                 };
@@ -2267,6 +2308,67 @@ mod inner {
             // runtime-derived field that is never stored.
             config.normalize_fields();
             Ok(config)
+        }
+
+        async fn count_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> Result<NamespaceResourceCounts, anyhow::Error> {
+            let filter = doc! { "namespace": namespace };
+            if self.replica_set_configured() {
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
+                session
+                    .start_transaction()
+                    .read_concern(ReadConcern::snapshot())
+                    .write_concern(WriteConcern::majority())
+                    .await?;
+                let counts = NamespaceResourceCounts {
+                    proxies: connection
+                        .db
+                        .collection::<Document>("proxies")
+                        .count_documents(filter.clone())
+                        .session(&mut session)
+                        .await?,
+                    consumers: connection
+                        .db
+                        .collection::<Document>("consumers")
+                        .count_documents(filter.clone())
+                        .session(&mut session)
+                        .await?,
+                    plugin_configs: connection
+                        .db
+                        .collection::<Document>("plugin_configs")
+                        .count_documents(filter.clone())
+                        .session(&mut session)
+                        .await?,
+                    upstreams: connection
+                        .db
+                        .collection::<Document>("upstreams")
+                        .count_documents(filter.clone())
+                        .session(&mut session)
+                        .await?,
+                    api_specs: connection
+                        .db
+                        .collection::<Document>("api_specs")
+                        .count_documents(filter)
+                        .session(&mut session)
+                        .await?,
+                };
+                session.commit_transaction().await?;
+                Ok(counts)
+            } else {
+                Ok(NamespaceResourceCounts {
+                    proxies: self.proxies().count_documents(filter.clone()).await?,
+                    consumers: self.consumers().count_documents(filter.clone()).await?,
+                    plugin_configs: self
+                        .plugin_configs()
+                        .count_documents(filter.clone())
+                        .await?,
+                    upstreams: self.upstreams().count_documents(filter.clone()).await?,
+                    api_specs: self.api_specs().count_documents(filter).await?,
+                })
+            }
         }
 
         async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error> {
@@ -4728,10 +4830,13 @@ mod inner {
                     )
                     .await
                     .map_err(|e| {
-                        delete_error(anyhow::anyhow!(
-                            "delete_all_resources transaction failed: {}",
-                            e
-                        ))
+                        let source =
+                            anyhow::anyhow!("delete_all_resources transaction failed: {}", e);
+                        if e.contains_label("UnknownTransactionCommitResult") {
+                            DeleteAllResourcesError::with_unknown_commit_result(mode, source)
+                        } else {
+                            delete_error(source)
+                        }
                     })?;
                 self.compact_config_changes_best_effort(namespace).await;
             } else {
@@ -6736,6 +6841,7 @@ mod inner {
             &self,
             namespace: &str,
             session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
+            snapshot: bool,
         ) -> Result<Vec<Proxy>, anyhow::Error> {
             let filter = doc! { "namespace": namespace };
             let mut proxies = Vec::new();
@@ -6744,8 +6850,10 @@ mod inner {
                 let proxies_collection: Collection<Document> = connection.db.collection("proxies");
                 let mut cursor = proxies_collection.find(filter).session(&mut *s).await?;
                 while cursor.advance(&mut *s).await? {
-                    let doc = cursor.deserialize_current()?;
-                    let mut proxy = doc_to_proxy(doc)?;
+                    let doc = cursor.deserialize_current().map_err(|error| {
+                        map_snapshot_document_error(snapshot, "proxy", None, error)
+                    })?;
+                    let mut proxy = decode_loaded_document(doc, snapshot, "proxy", doc_to_proxy)?;
                     proxy.api_spec_id = None;
                     proxies.push(proxy);
                 }
@@ -6753,8 +6861,10 @@ mod inner {
                 let proxies_collection = self.proxies();
                 let mut cursor = proxies_collection.find(filter).await?;
                 while cursor.advance().await? {
-                    let doc = cursor.deserialize_current()?;
-                    let mut proxy = doc_to_proxy(doc)?;
+                    let doc = cursor.deserialize_current().map_err(|error| {
+                        map_snapshot_document_error(snapshot, "proxy", None, error)
+                    })?;
+                    let mut proxy = decode_loaded_document(doc, snapshot, "proxy", doc_to_proxy)?;
                     proxy.api_spec_id = None;
                     proxies.push(proxy);
                 }
@@ -6767,6 +6877,7 @@ mod inner {
             &self,
             namespace: &str,
             session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
+            snapshot: bool,
         ) -> Result<Vec<Consumer>, anyhow::Error> {
             let filter = doc! { "namespace": namespace };
             let mut consumers = Vec::new();
@@ -6776,15 +6887,29 @@ mod inner {
                     connection.db.collection("consumers");
                 let mut cursor = consumers_collection.find(filter).session(&mut *s).await?;
                 while cursor.advance(&mut *s).await? {
-                    let doc = cursor.deserialize_current()?;
-                    consumers.push(doc_to_consumer(doc)?);
+                    let doc = cursor.deserialize_current().map_err(|error| {
+                        map_snapshot_document_error(snapshot, "consumer", None, error)
+                    })?;
+                    consumers.push(decode_loaded_document(
+                        doc,
+                        snapshot,
+                        "consumer",
+                        doc_to_consumer,
+                    )?);
                 }
             } else {
                 let consumers_collection = self.consumers();
                 let mut cursor = consumers_collection.find(filter).await?;
                 while cursor.advance().await? {
-                    let doc = cursor.deserialize_current()?;
-                    consumers.push(doc_to_consumer(doc)?);
+                    let doc = cursor.deserialize_current().map_err(|error| {
+                        map_snapshot_document_error(snapshot, "consumer", None, error)
+                    })?;
+                    consumers.push(decode_loaded_document(
+                        doc,
+                        snapshot,
+                        "consumer",
+                        doc_to_consumer,
+                    )?);
                 }
             }
 
@@ -6795,6 +6920,7 @@ mod inner {
             &self,
             namespace: &str,
             session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
+            snapshot: bool,
         ) -> Result<Vec<PluginConfig>, anyhow::Error> {
             let filter = doc! { "namespace": namespace };
             let mut plugin_configs = Vec::new();
@@ -6807,8 +6933,15 @@ mod inner {
                     .session(&mut *s)
                     .await?;
                 while cursor.advance(&mut *s).await? {
-                    let doc = cursor.deserialize_current()?;
-                    let mut plugin_config = doc_to_plugin_config(doc)?;
+                    let doc = cursor.deserialize_current().map_err(|error| {
+                        map_snapshot_document_error(snapshot, "plugin_config", None, error)
+                    })?;
+                    let mut plugin_config = decode_loaded_document(
+                        doc,
+                        snapshot,
+                        "plugin_config",
+                        doc_to_plugin_config,
+                    )?;
                     plugin_config.api_spec_id = None;
                     plugin_configs.push(plugin_config);
                 }
@@ -6816,8 +6949,15 @@ mod inner {
                 let plugin_configs_collection = self.plugin_configs();
                 let mut cursor = plugin_configs_collection.find(filter).await?;
                 while cursor.advance().await? {
-                    let doc = cursor.deserialize_current()?;
-                    let mut plugin_config = doc_to_plugin_config(doc)?;
+                    let doc = cursor.deserialize_current().map_err(|error| {
+                        map_snapshot_document_error(snapshot, "plugin_config", None, error)
+                    })?;
+                    let mut plugin_config = decode_loaded_document(
+                        doc,
+                        snapshot,
+                        "plugin_config",
+                        doc_to_plugin_config,
+                    )?;
                     plugin_config.api_spec_id = None;
                     plugin_configs.push(plugin_config);
                 }
@@ -6830,6 +6970,7 @@ mod inner {
             &self,
             namespace: &str,
             session: Option<(&MongoConnectionBundle, &mut ClientSession)>,
+            snapshot: bool,
         ) -> Result<Vec<Upstream>, anyhow::Error> {
             let filter = doc! { "namespace": namespace };
             let mut upstreams = Vec::new();
@@ -6839,8 +6980,11 @@ mod inner {
                     connection.db.collection("upstreams");
                 let mut cursor = upstreams_collection.find(filter).session(&mut *s).await?;
                 while cursor.advance(&mut *s).await? {
-                    let doc = cursor.deserialize_current()?;
-                    let mut upstream = doc_to_upstream(doc)?;
+                    let doc = cursor.deserialize_current().map_err(|error| {
+                        map_snapshot_document_error(snapshot, "upstream", None, error)
+                    })?;
+                    let mut upstream =
+                        decode_loaded_document(doc, snapshot, "upstream", doc_to_upstream)?;
                     upstream.api_spec_id = None;
                     upstreams.push(upstream);
                 }
@@ -6848,8 +6992,11 @@ mod inner {
                 let upstreams_collection = self.upstreams();
                 let mut cursor = upstreams_collection.find(filter).await?;
                 while cursor.advance().await? {
-                    let doc = cursor.deserialize_current()?;
-                    let mut upstream = doc_to_upstream(doc)?;
+                    let doc = cursor.deserialize_current().map_err(|error| {
+                        map_snapshot_document_error(snapshot, "upstream", None, error)
+                    })?;
+                    let mut upstream =
+                        decode_loaded_document(doc, snapshot, "upstream", doc_to_upstream)?;
                     upstream.api_spec_id = None;
                     upstreams.push(upstream);
                 }
