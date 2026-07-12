@@ -4710,18 +4710,22 @@ impl ProxyState {
         let mesh_inbound_tls = empty_mesh_inbound_tls_slot();
         let mesh_inbound_spiffe_verifier_active = Arc::new(AtomicBool::new(false));
         let mesh_outbound_enforcement = crate::modes::mesh::outbound_enforcement::empty_slot();
-        let hbone_pool = Arc::new(HboneConnectionPool::new_with_svid_generation(
-            global_pool_config.clone(),
-            dns_cache.clone(),
-            gateway_svid_bundle.clone(),
-            pool_shard_amount,
-            backend_svid_generation.clone(),
-        ));
-        let mesh_mtls_pool = Arc::new(
-            mesh_mtls_pool::MeshMtlsConnectionPool::new_with_svid_generation(
+        let hbone_pool = Arc::new(
+            HboneConnectionPool::new_with_svid_generation_and_shared_crls(
                 global_pool_config.clone(),
                 dns_cache.clone(),
                 gateway_svid_bundle.clone(),
+                shared_crls.clone(),
+                pool_shard_amount,
+                backend_svid_generation.clone(),
+            ),
+        );
+        let mesh_mtls_pool = Arc::new(
+            mesh_mtls_pool::MeshMtlsConnectionPool::new_with_svid_generation_and_shared_crls(
+                global_pool_config.clone(),
+                dns_cache.clone(),
+                gateway_svid_bundle.clone(),
+                shared_crls.clone(),
                 pool_shard_amount,
                 backend_svid_generation.clone(),
             ),
