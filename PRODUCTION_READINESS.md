@@ -37,13 +37,13 @@ Status values: `OPEN`, `IN-PROGRESS (PR #N / agent)`, `FIXED (PR #N)`, `TRACKED 
 | PR-006 | k8s controller | Stale "F3 §3.3 UDP not implemented" message (istio_status.rs:923) | Low (accuracy) | IN-PROGRESS (issue #2108) |
 | PR-007 | logging | Log schema not applied to WsDisconnectLogEntry; documented fallback | Low | TRACKED (#2110) |
 | PR-008 | CI | Main redness driven by flakes #2057/#2060 + port races | Medium (ops) | RESOLVED-MONITOR (fixes merged + #2103 hardening, flake issues closed 2026-07-10; monitor main through epic) |
-| PR-009 | release | release.yml lacked tag↔Cargo-version guard | Medium (ops) | IN-PROGRESS (PR #2109; orchestrator review done — guard gates all publish jobs) |
-| PR-010 | release | No CHANGELOG/policy | Medium (ops) | IN-PROGRESS (PR #2109) |
+| PR-009 | release | release.yml lacked tag↔Cargo-version guard | Medium (ops) | FIXED (PR #2109 merged 2026-07-12) |
+| PR-010 | release | No CHANGELOG/policy | Medium (ops) | FIXED (PR #2109 merged 2026-07-12) |
 | PR-011 | security | Admin JWT lacks optional `aud` validation | Low (hardening) | IN-PROGRESS (issue #2108) |
 | PR-012 | ops | Dockerfile.release FERRUM_LOG_LEVEL=error hides startup warns | Low | IN-PROGRESS (issue #2108) |
 | PR-013 | ops | No Helm chart for core gateway modes | Low | TRACKED (#2110) |
 | PR-014 | ops | Stress tests excluded from CI; no scheduled scaling guard | Low | TRACKED (#2110) |
-| PR-015 | docs | REFACTORING_PLAN.md stale (~400 PRs behind); WEBSOCKET.md missing tunnel-mode; admin_api.md LB list incomplete | Medium (stale root doc) | IN-PROGRESS (issue #2111, sol agent) |
+| PR-015 | docs | REFACTORING_PLAN.md stale (~400 PRs behind); WEBSOCKET.md missing tunnel-mode; admin_api.md LB list incomplete | Medium (stale root doc) | FIXED (PR #2112 merged 2026-07-12) |
 | PR-016 | docs | 11 documented feature deferrals (docs audit) — all accurately labeled, graceful behavior | Low | TRACKED (#2110; mesh retry re-screen already #2008) |
 
 Docs audit: ZERO overclaims across README/FEATURES/62 docs; configuration.md↔env_config.rs parity clean
