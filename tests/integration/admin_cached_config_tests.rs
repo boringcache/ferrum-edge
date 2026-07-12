@@ -2155,28 +2155,11 @@ async fn test_restore_reports_api_specs_not_restored_on_rollback() {
         "restore must report the api_specs it could not restore: {:?}",
         body
     );
-    // The recovery report must name the exact spec + proxy so the operator can
-    // clear the restored (now hand-managed) resource and re-submit the spec.
-    let lost = body["api_specs_lost"]
-        .as_array()
-        .expect("api_specs_lost must be an array");
-    assert_eq!(lost.len(), 1, "one spec was dropped: {:?}", body);
-    assert_eq!(
-        lost[0]["id"].as_str(),
-        Some("spec-1"),
-        "api_specs_lost must carry the dropped spec id: {:?}",
-        body
-    );
-    assert_eq!(
-        lost[0]["proxy_id"].as_str(),
-        Some("spec-proxy"),
-        "api_specs_lost must carry the owning proxy id: {:?}",
-        body
-    );
+    assert!(body.get("api_specs_lost").is_none());
     let note = body["api_specs_note"].as_str().unwrap_or_default();
     assert!(
-        note.contains("re-submit") && note.contains("deleting the restored proxy"),
-        "restore must give a usable recovery path (delete restored proxy, then re-submit): {:?}",
+        note.contains("POST /api-specs") && note.contains("GET /api-specs"),
+        "restore must give a usable re-submit and current-list recovery path: {:?}",
         body
     );
 
@@ -2189,10 +2172,10 @@ async fn test_restore_reports_api_specs_not_restored_on_rollback() {
     );
 }
 
-/// A rollback response retains every API spec identity across listing pages so
-/// operators can recover specs beyond the first page after deletion.
+/// A rollback response reports the authoritative API spec count even when the
+/// namespace contains more rows than the normal list page size.
 #[tokio::test]
-async fn test_restore_reports_all_api_specs_across_pages() {
+async fn test_restore_reports_authoritative_api_spec_count_beyond_page_size() {
     let total_specs = 501;
 
     let tc = TestConfig::default();
@@ -2204,8 +2187,8 @@ async fn test_restore_reports_all_api_specs_across_pages() {
         .expect("Failed to connect to test database");
     let pool = db.pool();
 
-    // Seed enough specs (and their owning proxies) to require multiple
-    // authoritative listing pages. Bundles go straight through the backend.
+    // Seed enough specs (and their owning proxies) to exceed the normal list
+    // page size. Bundles go straight through the backend.
     for i in 0..total_specs {
         let proxy: Proxy = serde_json::from_value(json!({
             "id": format!("spec-proxy-{i}"),
@@ -2287,29 +2270,16 @@ async fn test_restore_reports_all_api_specs_across_pages() {
         "config rollback should complete: {:?}",
         body
     );
-    // The authoritative total and every identity are reported.
+    // The authoritative total is reported without paginating identities.
     assert_eq!(
         body["api_specs_not_restored"].as_u64(),
         Some(total_specs as u64),
         "api_specs_not_restored must be the authoritative total: {:?}",
         body["api_specs_not_restored"]
     );
-    assert!(body.get("api_specs_lost_truncated").is_none());
-    let lost = body["api_specs_lost"]
-        .as_array()
-        .expect("api_specs_lost must be an array");
-    assert_eq!(
-        lost.len(),
-        total_specs,
-        "api_specs_lost must preserve every identity: got {}",
-        lost.len()
-    );
-    assert!(
-        lost.iter()
-            .any(|spec| spec["id"] == "spec-500" && spec["proxy_id"] == "spec-proxy-500"),
-        "api_specs_lost must include identities beyond the first pages: {:?}",
-        lost.last()
-    );
+    assert!(body.get("api_specs_lost").is_none());
+    let note = body["api_specs_note"].as_str().unwrap_or_default();
+    assert!(note.contains("POST /api-specs") && note.contains("GET /api-specs"));
 }
 
 /// When `delete_all_resources` fails on an ATOMIC backend (SQL runs the clear in

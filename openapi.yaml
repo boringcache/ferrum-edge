@@ -3290,31 +3290,13 @@ paths:
                     description: >-
                       Authoritative count of API specs present before the restore
                       that a config rollback cannot restore. Present only when the
-                      namespace carried specs. Equal to the number of entries in
-                      `api_specs_lost`.
-                  api_specs_lost:
-                    type: array
-                    description: >-
-                      Identities of the API specs a config rollback could not
-                      restore. Every identity is preserved. Present only when
-                      `api_specs_not_restored` is set. Each entry names the spec
-                      and the proxy whose (now hand-managed) resources must be
-                      cleared before re-submitting the spec via POST /api-specs.
-                    items:
-                      type: object
-                      properties:
-                        id:
-                          type: string
-                          description: The removed api_spec id.
-                        proxy_id:
-                          type: string
-                          description: The proxy the spec owned (reapplied as a hand-managed resource).
+                      namespace carried specs.
                   api_specs_note:
                     type: string
                     description: >-
                       Operator guidance to recover the affected API specs
-                      (delete the restored proxy/upstream/plugins, then re-submit
-                      the spec via POST /api-specs). Present only when
+                      (re-submit original documents via POST /api-specs and list
+                      current specs with GET /api-specs). Present only when
                       `api_specs_not_restored` is set.
         "400":
           $ref: "#/components/responses/BadRequest"

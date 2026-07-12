@@ -80,13 +80,13 @@ The recovery snapshot in step 2 is captured with a **non-validating raw load fro
 - **Invalid-but-present config still snapshots.** An already-invalid namespace (dangling references, conflicting listen_paths, invalid regex) — precisely what an operator runs restore to *repair* — loads its raw rows without the fatal validation pipeline, so the snapshot succeeds and rollback stays available throughout the repair. A restore that imports cleanly succeeds and repairs the namespace; if a later step fails, rollback reapplies the (still invalid) prior config.
 - **A genuine database failure aborts the restore.** If the snapshot cannot be taken at all — a real connectivity/timeout error rather than invalid content — the restore **aborts with `503` before deleting anything** and leaves the prior config untouched. This is fail-safe: a config that is valid but merely transiently unreachable is never wiped when we cannot capture a rollback point. Retry once the database is reachable.
 
-Both the config resources and the `api_specs` identities are read from the **primary**, never a lagging read replica, so the recovery report is authoritative.
+Both the config resources and the `api_specs` count are read from the **primary**, never a lagging read replica, so the recovery report is authoritative.
 
 ### API specs are not restored by rollback
 
-`api_specs` are admin-only metadata that live **outside** `GatewayConfig`, so the delete phase removes them but the config rollback cannot bring them back. When a failed restore rolls back a namespace that carried specs, the `500` response reports `api_specs_not_restored` (the **authoritative total**), `api_specs_lost` (the exact `id` + `proxy_id` of every dropped spec), and `api_specs_note` (guidance).
+`api_specs` are admin-only metadata that live **outside** `GatewayConfig` and the backup/restore payload. The delete phase removes them, and neither a successful restore nor config rollback recreates them. When a failed restore rolls back a namespace that carried specs, the `500` response reports `api_specs_not_restored` (the **authoritative total**) and `api_specs_note` (guidance).
 
-Recovery is not a bare re-submit: rollback reapplies the spec-owned proxy/upstream/plugins as **hand-managed** resources (their `api_spec_id` is cleared), so a plain `POST /api-specs` for the same spec collides on route/name/id uniqueness. To reattach a spec, first delete the restored proxy (and its upstream/plugins) listed under `api_specs_lost`, then re-submit the original spec document via `POST /api-specs`. Successful restores are unaffected — they replace the namespace, including specs, from scratch.
+After any restore, re-submit the original spec documents via `POST /api-specs`; use `GET /api-specs` to list specs currently stored in the namespace. On rollback, spec-owned proxy/upstream/plugins are reapplied as **hand-managed** resources (`api_spec_id` is cleared), so operators may first need to remove conflicting restored resources before re-submitting a spec.
 
 ### Safety Guard
 
@@ -181,11 +181,7 @@ If the delete or any resource type fails during import, the endpoint removes the
   ],
   "rollback": "completed",
   "api_specs_not_restored": 2,
-  "api_specs_lost": [
-    { "id": "spec-1", "proxy_id": "orders-proxy" },
-    { "id": "spec-2", "proxy_id": "billing-proxy" }
-  ],
-  "api_specs_note": "2 API spec(s) were removed and cannot be restored by rollback. Their proxy/upstream/plugin resources were reapplied as hand-managed (api_spec_id cleared), so re-submitting a spec via POST /api-specs first requires deleting the restored proxy (and its upstream/plugins) to avoid route/name/id collisions, then re-submitting the original spec document. Affected specs are listed in api_specs_lost."
+  "api_specs_note": "2 API spec(s) were removed and are not part of config restore or rollback. Re-submit the original documents via POST /api-specs; list specs currently stored in the namespace with GET /api-specs."
 }
 ```
 
@@ -197,7 +193,7 @@ The `rollback` field reports the outcome:
 
 There is no `unavailable` outcome: when the prior config cannot be snapshotted for rollback, the restore **aborts before any delete** and returns `503` (not `500`) with an `error` explaining that the existing config was NOT deleted. This is the fail-safe path — the destructive delete never runs when a rollback point cannot be captured.
 
-`api_specs_not_restored` / `api_specs_lost` / `api_specs_note` appear only when the namespace carried API specs, which a config rollback cannot restore (see above). The payload is still validated before the snapshot and delete phases; validation failures return `400` and leave existing config untouched.
+`api_specs_not_restored` / `api_specs_note` appear only when the namespace carried API specs, which config restore and rollback cannot recreate (see above). The payload is still validated before the snapshot and delete phases; validation failures return `400` and leave existing config untouched.
 
 #### Restore aborted — `503`
 
