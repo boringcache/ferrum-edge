@@ -3876,10 +3876,13 @@ impl GatewayConfig {
             }
         }
 
-        let mut seen_consumer_ids: HashSet<&str> = HashSet::new();
+        let mut seen_consumer_ids: HashSet<(&str, &str)> = HashSet::new();
         for consumer in &self.consumers {
-            if !seen_consumer_ids.insert(&consumer.id) {
-                errors.push(format!("Duplicate consumer ID '{}'", consumer.id));
+            if !seen_consumer_ids.insert((&consumer.namespace, &consumer.id)) {
+                errors.push(format!(
+                    "Duplicate consumer ID '{}' in namespace '{}'",
+                    consumer.id, consumer.namespace
+                ));
             }
         }
 

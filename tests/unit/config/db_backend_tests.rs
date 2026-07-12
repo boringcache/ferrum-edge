@@ -496,6 +496,30 @@ fn incremental_result_not_empty_with_removed_consumer() {
 }
 
 #[test]
+fn incremental_result_accepts_legacy_removed_consumer_ids() {
+    let result = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        sequence_cursor: 1,
+        poll_timestamp: Utc::now(),
+    };
+    let mut value = serde_json::to_value(result).unwrap();
+    value["removed_consumer_ids"] = serde_json::json!(["c1"]);
+
+    let decoded: IncrementalResult = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        decoded.removed_consumer_ids,
+        vec![NamespacedResourceId::new("", "c1")]
+    );
+}
+
+#[test]
 fn incremental_result_not_empty_with_removed_plugin_config() {
     let result = IncrementalResult {
         added_or_modified_proxies: vec![],

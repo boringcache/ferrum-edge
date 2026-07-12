@@ -2795,6 +2795,18 @@ fn test_validate_unique_resource_ids_duplicate_consumer() {
 }
 
 #[test]
+fn test_validate_unique_resource_ids_allows_consumer_id_in_different_namespaces() {
+    let mut config = empty_config();
+    let mut prod = make_consumer("c1", "alice");
+    prod.namespace = "prod".to_string();
+    let mut staging = make_consumer("c1", "bob");
+    staging.namespace = "staging".to_string();
+    config.consumers = vec![prod, staging];
+
+    assert!(config.validate_unique_resource_ids().is_ok());
+}
+
+#[test]
 fn test_validate_unique_resource_ids_same_id_different_types_ok() {
     // Same ID across different resource types is fine
     let mut config = empty_config();

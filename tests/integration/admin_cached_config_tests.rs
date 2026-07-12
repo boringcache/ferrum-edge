@@ -2078,7 +2078,7 @@ async fn test_restore_aborts_when_snapshot_cannot_be_loaded() {
             .await
             .expect("Failed to reconnect for verification");
     let survivor = verify_db
-        .get_proxy("restore-survivor")
+        .get_proxy("ferrum", "restore-survivor")
         .await
         .expect("verification query failed");
     assert!(
@@ -2086,7 +2086,7 @@ async fn test_restore_aborts_when_snapshot_cannot_be_loaded() {
         "the prior proxy must survive an aborted restore (no delete ran)"
     );
     let should_not_exist = verify_db
-        .get_proxy("restore-should-not-apply")
+        .get_proxy("ferrum", "restore-should-not-apply")
         .await
         .expect("verification query failed");
     assert!(

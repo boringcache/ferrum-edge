@@ -3174,6 +3174,8 @@ paths:
             type: string
             example: "proxies,upstreams"
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Full configuration backup
           headers:
@@ -3353,6 +3355,8 @@ paths:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Paginated proxy objects
           headers:
@@ -3420,6 +3424,8 @@ paths:
       summary: Get a proxy
       tags: [Proxies]
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Proxy object
           headers:
@@ -3504,6 +3510,8 @@ paths:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Paginated consumer objects
           headers:
@@ -3567,6 +3575,8 @@ paths:
       summary: Get a consumer
       tags: [Consumers]
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Consumer object
           headers:
@@ -3913,6 +3923,8 @@ paths:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Paginated plugin configurations
           headers:
@@ -3971,6 +3983,8 @@ paths:
       summary: Get a plugin configuration
       tags: [Plugins]
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Plugin configuration object
           headers:
@@ -4045,6 +4059,8 @@ paths:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Paginated upstream objects
           headers:
@@ -4103,6 +4119,8 @@ paths:
       summary: Get an upstream by ID
       tags: [Upstreams]
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Upstream object
           headers:
@@ -4296,6 +4314,8 @@ paths:
             type: string
           description: Namespace to operate in. Defaults to `FERRUM_NAMESPACE` when omitted.
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Paginated list of API spec summaries
           content:
@@ -4533,6 +4553,8 @@ paths:
             type: string
           description: ETag from a previous response. Returns 304 if the spec is unchanged.
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Spec document
           headers:
@@ -4777,6 +4799,8 @@ paths:
             type: string
           description: ETag from a previous response. Returns 304 if the spec is unchanged.
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Spec document for the given proxy
           headers:

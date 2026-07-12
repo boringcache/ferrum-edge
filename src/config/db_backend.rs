@@ -84,6 +84,32 @@ pub struct NamespacedResourceId {
     pub id: String,
 }
 
+fn deserialize_removed_consumer_ids<'de, D>(
+    deserializer: D,
+) -> Result<Vec<NamespacedResourceId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum WireId {
+        Namespaced(NamespacedResourceId),
+        Legacy(String),
+    }
+
+    <Vec<WireId> as serde::Deserialize>::deserialize(deserializer).map(|ids| {
+        ids.into_iter()
+            .map(|id| match id {
+                WireId::Namespaced(id) => id,
+                // Older CPs sent bare IDs and therefore applied removals
+                // globally. Preserve that behavior during a rolling upgrade;
+                // incremental_apply treats an empty namespace as a wildcard.
+                WireId::Legacy(id) => NamespacedResourceId::new("", id),
+            })
+            .collect()
+    })
+}
+
 impl NamespacedResourceId {
     pub fn new(namespace: impl Into<String>, id: impl Into<String>) -> Self {
         Self {
@@ -106,6 +132,7 @@ pub struct IncrementalResult {
     pub added_or_modified_proxies: Vec<Proxy>,
     pub removed_proxy_ids: Vec<String>,
     pub added_or_modified_consumers: Vec<Consumer>,
+    #[serde(default, deserialize_with = "deserialize_removed_consumer_ids")]
     pub removed_consumer_ids: Vec<NamespacedResourceId>,
     pub added_or_modified_plugin_configs: Vec<PluginConfig>,
     pub removed_plugin_config_ids: Vec<String>,

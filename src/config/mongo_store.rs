@@ -1175,9 +1175,9 @@ mod inner {
             resource_type: &str,
             resource_ids: &[&str],
             change_error: &anyhow::Error,
-        ) {
+        ) -> bool {
             if resource_ids.is_empty() {
-                return;
+                return true;
             }
 
             let mut deleted_count = 0_u64;
@@ -1203,7 +1203,7 @@ mod inner {
                             rollback_err,
                             change_error
                         );
-                        return;
+                        return false;
                     }
                 }
             }
@@ -1215,6 +1215,7 @@ mod inner {
                 resource_ids.len(),
                 change_error
             );
+            deleted_count == resource_ids.len() as u64
         }
 
         fn resource_ids_without_failed_insert_indices<'a>(
@@ -1258,32 +1259,41 @@ mod inner {
             resource_id: &str,
             previous_doc: Option<Document>,
             change_error: &anyhow::Error,
-        ) {
+        ) -> bool {
             let Some(previous_doc) = previous_doc else {
                 warn!(
                     "MongoDB standalone {} update for id '{}' failed to record config_changes, \
                      but no previous document was available to restore: {}",
                     resource_type, resource_id, change_error
                 );
-                return;
+                return false;
             };
             match self
                 .collection(collection_name)
                 .replace_one(doc! { "_id": resource_id }, previous_doc)
                 .await
             {
-                Ok(result) if result.matched_count > 0 => warn!(
-                    "Restored MongoDB standalone {} update for id '{}' after config_changes write failed: {}",
-                    resource_type, resource_id, change_error
-                ),
-                Ok(_) => warn!(
-                    "MongoDB standalone {} update for id '{}' failed to record config_changes, but rollback found no document to restore: {}",
-                    resource_type, resource_id, change_error
-                ),
-                Err(rollback_err) => warn!(
-                    "MongoDB standalone {} update for id '{}' failed to record config_changes and rollback failed: {}; original error: {}",
-                    resource_type, resource_id, rollback_err, change_error
-                ),
+                Ok(result) if result.matched_count > 0 => {
+                    warn!(
+                        "Restored MongoDB standalone {} update for id '{}' after config_changes write failed: {}",
+                        resource_type, resource_id, change_error
+                    );
+                    true
+                }
+                Ok(_) => {
+                    warn!(
+                        "MongoDB standalone {} update for id '{}' failed to record config_changes, but rollback found no document to restore: {}",
+                        resource_type, resource_id, change_error
+                    );
+                    false
+                }
+                Err(rollback_err) => {
+                    warn!(
+                        "MongoDB standalone {} update for id '{}' failed to record config_changes and rollback failed: {}; original error: {}",
+                        resource_type, resource_id, rollback_err, change_error
+                    );
+                    false
+                }
             }
         }
 
@@ -4231,20 +4241,23 @@ mod inner {
                     .record_config_change(&consumer.namespace, "consumer", &consumer.id, "upsert")
                     .await
                 {
-                    self.rollback_standalone_updated_document(
-                        "consumers",
-                        "consumer",
-                        &composite_id,
-                        Some(previous_doc),
-                        &err,
-                    )
-                    .await;
-                    self.release_consumer_identity_values_best_effort(
-                        &consumer.namespace,
-                        &consumer.id,
-                        &added,
-                    )
-                    .await;
+                    let rollback_confirmed = self
+                        .rollback_standalone_updated_document(
+                            "consumers",
+                            "consumer",
+                            &composite_id,
+                            Some(previous_doc),
+                            &err,
+                        )
+                        .await;
+                    if rollback_confirmed {
+                        self.release_consumer_identity_values_best_effort(
+                            &consumer.namespace,
+                            &consumer.id,
+                            &added,
+                        )
+                        .await;
+                    }
                     return Err(err);
                 }
                 // Removed values are released last so a change-record failure
@@ -5691,15 +5704,19 @@ mod inner {
                         let rollback_ids =
                             Self::rollback_ids_for_unordered_insert_error(&ids, &err);
                         let err = anyhow::Error::new(err);
-                        self.rollback_standalone_created_documents(
-                            "consumers",
-                            "consumer",
-                            &rollback_ids,
-                            &err,
-                        )
-                        .await;
-                        self.release_batch_consumer_identity_docs_best_effort(consumers)
-                            .await;
+                        let rollback_confirmed = !rollback_ids.is_empty()
+                            && self
+                                .rollback_standalone_created_documents(
+                                    "consumers",
+                                    "consumer",
+                                    &rollback_ids,
+                                    &err,
+                                )
+                                .await;
+                        if rollback_confirmed {
+                            self.release_batch_consumer_identity_docs_best_effort(consumers)
+                                .await;
+                        }
                         return Err(err);
                     }
                 };
@@ -5713,10 +5730,13 @@ mod inner {
                     })
                     .collect();
                 if let Err(err) = self.record_config_changes_batch(&changes).await {
-                    self.rollback_standalone_created_documents("consumers", "consumer", &ids, &err)
+                    let rollback_confirmed = self
+                        .rollback_standalone_created_documents("consumers", "consumer", &ids, &err)
                         .await;
-                    self.release_batch_consumer_identity_docs_best_effort(consumers)
-                        .await;
+                    if rollback_confirmed {
+                        self.release_batch_consumer_identity_docs_best_effort(consumers)
+                            .await;
+                    }
                     return Err(err);
                 }
                 Ok(result.inserted_ids.len())
