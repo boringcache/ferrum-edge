@@ -2896,11 +2896,30 @@ fn remove_udp_not_ready_ack(dir: &std::path::Path, pod_uid: &str) {
     }
 }
 
-fn remove_udp_ack_requirement(dir: &std::path::Path, pod_uid: &str) {
+/// Remove a live pod's `.udp-ack-required` marker only once it is old enough
+/// to be restart residue. The producer's close handshake persists the request
+/// BEFORE retracting `.udp-ready` (separate process), so a reconcile tick can
+/// observe (ready, request present) mid-close; deleting that fresh request
+/// would forfeit the durable restart-recovery insurance if the node-agent
+/// crashed before acking and the pod was removed during the outage. Residue
+/// left by a node-agent restart is by definition older than the orphan grace.
+fn remove_udp_ack_requirement_older_than(
+    dir: &std::path::Path,
+    pod_uid: &str,
+    min_age: std::time::Duration,
+) {
     if pod_registry_uid_is_unsafe(pod_uid) {
         return;
     }
-    if let Err(error) = std::fs::remove_file(dir.join(".udp-ack-required").join(pod_uid))
+    let path = dir.join(".udp-ack-required").join(pod_uid);
+    let old_enough = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+        .is_ok_and(|age| age >= min_age);
+    if !old_enough {
+        return;
+    }
+    if let Err(error) = std::fs::remove_file(&path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
         warn!(pod_uid, %error, "Failed to remove stale Ambient UDP close request");
@@ -3290,7 +3309,7 @@ fn reconcile_udp_capture_readiness_with_sync_state(
         // than letting producer teardown trust it while the BPF gate is open.
         if ready_uids.contains(uid) == ready && not_ready_ack_exists != ready {
             if ready && let Some(dir) = &config.node_waypoint_pod_registry_dir {
-                remove_udp_ack_requirement(dir, uid);
+                remove_udp_ack_requirement_older_than(dir, uid, UDP_HANDSHAKE_ORPHAN_GRACE);
             }
             continue;
         }
@@ -3319,7 +3338,7 @@ fn reconcile_udp_capture_readiness_with_sync_state(
                 ready_uids.insert(uid.clone());
                 if let Some(dir) = &config.node_waypoint_pod_registry_dir {
                     remove_udp_not_ready_ack(dir, uid);
-                    remove_udp_ack_requirement(dir, uid);
+                    remove_udp_ack_requirement_older_than(dir, uid, UDP_HANDSHAKE_ORPHAN_GRACE);
                 }
             } else {
                 ready_uids.remove(uid);
@@ -9521,8 +9540,14 @@ mod tests {
             &mut ready_uids,
         );
         assert!(
+            required_dir.join("pod-a").exists(),
+            "a fresh close request may be a producer mid-close (request persists before \
+             the ready marker retracts), so the residue sweep must not delete it"
+        );
+        remove_udp_ack_requirement_older_than(registry.path(), "pod-a", Duration::ZERO);
+        assert!(
             !required_dir.join("pod-a").exists(),
-            "a live pod with producer readiness and an open gate has no outstanding close request"
+            "aged restart residue for a ready live pod is swept once past the orphan grace"
         );
 
         let ack_dir = registry.path().join(".udp-not-ready");
