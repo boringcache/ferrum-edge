@@ -679,6 +679,8 @@ pub struct MockEbpfBackend {
     pub fail_update_node_probe_port6: bool,
     pub fail_remove_pod_ip: bool,
     pub fail_remove_node_probe_port: bool,
+    pub fail_remove_pod_include_ports: bool,
+    pub fail_remove_workload_identity: bool,
     pub fail_attach_sock_ops: bool,
     pub sock_ops_attached_cgroup_root: Option<String>,
     /// When non-zero, the next N `update_workload_identity` calls return an
@@ -865,6 +867,11 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn remove_pod_include_ports(&mut self, cgroup_id: u64) -> Result<(), String> {
+        if self.fail_remove_pod_include_ports {
+            return Err(format!(
+                "injected pod include ports remove failure for cgroup {cgroup_id}"
+            ));
+        }
         self.include_ports.remove(&cgroup_id);
         Ok(())
     }
@@ -887,6 +894,11 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn remove_workload_identity(&mut self, cgroup_id: u64) -> Result<(), String> {
+        if self.fail_remove_workload_identity {
+            return Err(format!(
+                "injected workload identity remove failure for cgroup {cgroup_id}"
+            ));
+        }
         self.workload_identities.remove(&cgroup_id);
         Ok(())
     }
