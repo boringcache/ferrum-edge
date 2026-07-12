@@ -61,12 +61,13 @@ EOF
     wait_for_socket "$root/server.sock" "SPIRE server"
     server_cli "$root" bundle show -format pem >"$root/bundle.pem"
 
-    agent_id="spiffe://$trust_domain/spire/agent/netns-live"
-    token="$(server_cli "$root" token generate -spiffeID "$agent_id" | awk '/Token:/ {print $2; exit}')"
+    token="$(server_cli "$root" token generate | awk '/Token:/ {print $2; exit}')"
     [[ -n "$token" ]] || {
       echo "SPIRE join token generation returned no token" >&2
       exit 1
     }
+    agent_id="spiffe://$trust_domain/spire/agent/join_token/$token"
+    printf '%s\n' "$agent_id" >"$root/agent.id"
 
     cat >"$root/agent.conf" <<EOF
 agent {
@@ -110,8 +111,13 @@ EOF
     workload_id="${3:?workload SPIFFE ID is required}"
     peer_domain="${4:-}"
     workload_uid="${5:-1337}"
+    agent_id="$(<"$root/agent.id")"
+    [[ "$agent_id" == "spiffe://$trust_domain/spire/agent/join_token/"* ]] || {
+      echo "SPIRE agent ID does not belong to trust domain $trust_domain: $agent_id" >&2
+      exit 1
+    }
     args=(entry create
-      -parentID "spiffe://$trust_domain/spire/agent/netns-live"
+      -parentID "$agent_id"
       -spiffeID "$workload_id"
       -selector "unix:uid:$workload_uid")
     if [[ -n "$peer_domain" ]]; then
