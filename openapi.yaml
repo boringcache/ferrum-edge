@@ -3203,10 +3203,10 @@ paths:
         The recovery snapshot uses a **non-validating raw load** from the
         primary, so an already-invalid-but-present namespace (the case an
         operator runs restore to *repair*) still snapshots and keeps rollback
-        available. If the snapshot cannot be taken at all — a genuine
-        database/connectivity failure — the restore **aborts with `503` before
-        deleting anything**, so a transiently-unreachable-yet-valid config is
-        never wiped. `api_specs` are admin-only metadata outside the config and
+        available. If the snapshot cannot be taken, restore aborts before any
+        delete: connectivity failures return `503`, while corrupt/undecodable
+        stored resources return `500` with `failure_class: data_integrity` and
+        a safe resource type/id when available. `api_specs` are admin-only metadata outside the config and
         are NOT restored by rollback; a failed restore reports the authoritative
         total number that must be re-submitted via `POST /api-specs` (list the
         namespace's current specs with `GET /api-specs`).
@@ -3257,7 +3257,10 @@ paths:
           description: >-
             Restore failed (import, delete, or preparation). The prior
             configuration was reapplied, or the response warns that the
-            best-effort rollback was incomplete.
+            best-effort rollback was incomplete. Also returned when a stored
+            row/document cannot be decoded for the pre-delete rollback snapshot;
+            that fail-safe response has `failure_class: data_integrity` and no
+            delete is attempted.
           content:
             application/json:
               schema:
@@ -3273,16 +3276,24 @@ paths:
                     description: Persistence or preparation errors that caused the restore to fail
                   rollback:
                     type: string
-                    enum: [completed, incomplete, not_needed]
+                    enum: [completed, incomplete, not_needed, unknown_outcome]
                     description: >-
                       Outcome of the best-effort rollback. `completed` — prior
                       config reapplied; `incomplete` — reapply failed (see
                       `rollback_errors`); `not_needed` — the clear failed
                       atomically (SQL / replica-set MongoDB), so nothing was
                       deleted and the prior config was retained without any
-                      compensating re-import. (There is no `unavailable`: a
-                      snapshot that cannot be taken aborts the restore with `503`
-                      BEFORE any delete — see the `503` response.)
+                      compensating re-import; `unknown_outcome` — an ambiguous
+                      MongoDB commit result could not be resolved by authoritative
+                      post-state counts, so manual recovery is required.
+                  failure_class:
+                    type: string
+                    enum: [data_integrity]
+                    description: >-
+                      Present on a pre-delete snapshot abort caused by a corrupt
+                      or otherwise undecodable stored resource. The existing
+                      configuration was not deleted. `restore_errors` identifies
+                      the resource type/id when safely available.
                   rollback_errors:
                     type: array
                     items:
@@ -3323,6 +3334,10 @@ paths:
                 properties:
                   error:
                     type: string
+                  failure_class:
+                    type: string
+                    enum: [connectivity]
+                    description: Distinguishes a retryable snapshot availability failure from stored-data corruption.
                   restore_errors:
                     type: array
                     items:

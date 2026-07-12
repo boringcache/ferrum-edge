@@ -2038,6 +2038,7 @@ async fn test_restore_aborts_when_snapshot_cannot_be_loaded() {
         "restore must abort with 503 when the prior config cannot be snapshotted: {:?}",
         body
     );
+    assert_eq!(body["failure_class"].as_str(), Some("connectivity"));
     assert!(
         body["error"]
             .as_str()
@@ -2073,6 +2074,75 @@ async fn test_restore_aborts_when_snapshot_cannot_be_loaded() {
         should_not_exist.is_none(),
         "the restore payload must NOT have been applied when the restore aborted"
     );
+}
+
+/// A persisted row that cannot be decoded is a data-integrity failure, not a
+/// transient database outage. Restore still fails closed before delete, but
+/// operators receive a distinct status/class and the safe resource identity.
+#[tokio::test]
+async fn test_restore_surfaces_corrupt_snapshot_row_as_data_integrity() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_restore_snapshot_corrupt.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+    let pool = db.pool();
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let seed = json!({
+        "proxies": [{
+            "id": "restore-corrupt-row",
+            "listen_path": "/survivor",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "Seed failed: {:?}", body);
+    sqlx::query("UPDATE proxies SET hosts = 'not-json' WHERE id = 'restore-corrupt-row'")
+        .execute(&pool)
+        .await
+        .expect("Failed to corrupt proxy row");
+
+    let restore_payload = json!({
+        "proxies": [{
+            "id": "restore-should-not-apply",
+            "listen_path": "/replacement",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+
+    assert_eq!(status, 500, "corrupt snapshot response: {:?}", body);
+    assert_eq!(body["failure_class"].as_str(), Some("data_integrity"));
+    let surfaced = body["restore_errors"][0].as_str().unwrap_or_default();
+    assert!(surfaced.contains("proxy") && surfaced.contains("restore-corrupt-row"));
+
+    let corrupt_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM proxies WHERE id = 'restore-corrupt-row'")
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to verify retained corrupt row");
+    let replacement_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM proxies WHERE id = 'restore-should-not-apply'")
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to verify replacement absence");
+    assert_eq!(
+        corrupt_count, 1,
+        "snapshot failure must not delete prior rows"
+    );
+    assert_eq!(replacement_count, 0, "restore import must not start");
 }
 
 /// `api_specs` are admin-only metadata outside `GatewayConfig`, so a config
