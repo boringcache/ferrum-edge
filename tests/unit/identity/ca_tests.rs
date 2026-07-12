@@ -161,6 +161,49 @@ async fn internal_ca_csr_svid_not_after_matches_leaf_cert() {
 }
 
 #[tokio::test]
+async fn internal_ca_rejects_csr_with_invalid_proof_of_possession() {
+    // A CSR whose self-signature does not match its embedded public key must be
+    // rejected: signing it would let an attacker who intercepted a victim's CSR
+    // swap in their own public key and obtain a valid SVID for the victim's
+    // identity. We simulate a tampered CSR by corrupting the trailing byte of
+    // the DER, which lands inside the PKCS#10 signature value — DER structure
+    // still parses, but proof-of-possession verification must fail.
+    let root = dev_root("td.internal-ca-pop-test");
+    let trust_domain = TrustDomain::new("td.internal-ca-pop-test").unwrap();
+    let cfg = internal::InternalCaConfig {
+        root_cert_pem: root.root_cert_pem,
+        root_key_pem: root.root_key_pem,
+        trust_domain: trust_domain.clone(),
+        bundle_refresh_hint_secs: Some(60),
+        default_svid_ttl_secs: 600,
+        max_svid_ttl_secs: 3600,
+    };
+    let ca = internal::InternalCa::new(cfg).expect("CA initialised");
+
+    let csr_key =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("CSR key generated");
+    let csr = rcgen::CertificateParams::default()
+        .serialize_request(&csr_key)
+        .expect("CSR generated");
+    let mut tampered = csr.der().as_ref().to_vec();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0xFF;
+
+    let id = SpiffeId::from_parts(&trust_domain, "ns/test/sa/csr").unwrap();
+    let result = ca
+        .issue_svid(IssuanceRequest::Csr {
+            csr_der: tampered,
+            spiffe_id: id,
+            ttl_secs: 600,
+        })
+        .await;
+    assert!(
+        matches!(result, Err(CaError::BadCsr(_))),
+        "tampered CSR must be rejected with BadCsr, got: {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn internal_ca_rejects_csr_outside_trust_domain() {
     let root = dev_root("td.scope-test");
     let trust_domain = TrustDomain::new("td.scope-test").unwrap();
