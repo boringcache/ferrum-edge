@@ -964,8 +964,7 @@ fn injected_shape_matches(
         return Ok(false);
     };
     let namespace = pod_namespace(pod, admission_namespace, config);
-    if !value_contains_expected_shape(sidecar, &sidecar_container(config, pod, namespace.as_str()))
-    {
+    if sidecar != &sidecar_container(config, pod, namespace.as_str()) {
         return Ok(false);
     }
 
@@ -975,10 +974,7 @@ fn injected_shape_matches(
     let Some(init) = named_container(pod, "/spec/initContainers", "ferrum-edge-init") else {
         return Ok(false);
     };
-    Ok(value_contains_expected_shape(
-        init,
-        &init_container(config, pod)?,
-    ))
+    Ok(init == &init_container(config, pod)?)
 }
 
 fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
@@ -1007,14 +1003,16 @@ fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
 }
 
 fn reject_reserved_name_conflicts(pod: &Value, config: &InjectorConfig) -> Result<(), String> {
-    if pod_has_ferrum_sidecar(pod) {
+    if named_container(pod, "/spec/containers", "ferrum-edge").is_some() {
         return Err(
             "pod spec already defines reserved container name ferrum-edge; refusing injection"
                 .to_string(),
         );
     }
 
-    if config.capture_mode == CaptureMode::Iptables && pod_has_ferrum_init_container(pod) {
+    if config.capture_mode == CaptureMode::Iptables
+        && named_container(pod, "/spec/initContainers", "ferrum-edge-init").is_some()
+    {
         return Err(
             "pod spec already defines reserved init container name ferrum-edge-init; refusing injection"
                 .to_string(),
@@ -1080,24 +1078,6 @@ fn named_container<'a>(pod: &'a Value, pointer: &str, name: &str) -> Option<&'a 
                 .iter()
                 .find(|container| container.get("name").and_then(Value::as_str) == Some(name))
         })
-}
-
-fn value_contains_expected_shape(actual: &Value, expected: &Value) -> bool {
-    match (actual, expected) {
-        (Value::Object(actual), Value::Object(expected)) => expected.iter().all(|(key, value)| {
-            actual
-                .get(key)
-                .is_some_and(|actual| value_contains_expected_shape(actual, value))
-        }),
-        (Value::Array(actual), Value::Array(expected)) => {
-            actual.len() == expected.len()
-                && actual
-                    .iter()
-                    .zip(expected)
-                    .all(|(actual, expected)| value_contains_expected_shape(actual, expected))
-        }
-        _ => actual == expected,
-    }
 }
 
 fn pod_namespace(
@@ -1678,6 +1658,38 @@ mod tests {
         let patch = build_sidecar_patch_for_namespace(&pod, &config, None)
             .expect("reinvocation should be accepted");
         assert!(patch.is_empty());
+    }
+
+    #[test]
+    fn patch_rejects_generated_sidecar_shape_with_extra_fields() {
+        let config = test_config(true, CaptureMode::Iptables);
+        let mut pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {"ferrum.io/injected": "true"}
+            },
+            "spec": {
+                "serviceAccountName": "default",
+                "containers": [{"name": "app", "image": "app:test"}],
+                "initContainers": []
+            }
+        });
+        let namespace = pod_namespace(&pod, None, &config);
+        let mut sidecar = sidecar_container(&config, &pod, &namespace);
+        sidecar["securityContext"]["privileged"] = Value::Bool(true);
+        let init = init_container(&config, &pod).expect("init container");
+        pod["spec"]["containers"]
+            .as_array_mut()
+            .unwrap()
+            .push(sidecar);
+        pod["spec"]["initContainers"]
+            .as_array_mut()
+            .unwrap()
+            .push(init);
+
+        let error = build_sidecar_patch_for_namespace(&pod, &config, None)
+            .expect_err("extra sidecar fields must not pass reinvocation validation");
+        assert!(error.contains("reserved container name ferrum-edge"));
     }
 
     #[test]

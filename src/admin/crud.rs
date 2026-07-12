@@ -2169,10 +2169,10 @@ fn config_update_target_was_not_found(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let message = cause.to_string();
         message.contains(" was not found in namespace '")
-            || message.starts_with("proxy '") && message.ends_with("' was not found")
-            || message.starts_with("consumer '") && message.ends_with("' was not found")
-            || message.starts_with("plugin config '") && message.ends_with("' was not found")
-            || message.starts_with("upstream '") && message.ends_with("' was not found")
+            || message.contains("proxy '") && message.ends_with("' was not found")
+            || message.contains("consumer '") && message.ends_with("' was not found")
+            || message.contains("plugin config '") && message.ends_with("' was not found")
+            || message.contains("upstream '") && message.ends_with("' was not found")
     })
 }
 

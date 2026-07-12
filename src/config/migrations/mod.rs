@@ -72,7 +72,7 @@ impl CustomPluginMigration {
         }
 
         self.sql_for_db(db_type).split(';').any(|statement| {
-            let normalized = statement
+            let normalized = strip_leading_sql_comments(statement)
                 .split_whitespace()
                 .map(str::to_ascii_uppercase)
                 .collect::<Vec<_>>()
@@ -87,6 +87,19 @@ impl CustomPluginMigration {
                     && normalized.contains(" CONCURRENTLY")
                 || normalized.starts_with("DROP INDEX") && normalized.contains(" CONCURRENTLY")
         })
+    }
+}
+
+fn strip_leading_sql_comments(mut sql: &str) -> &str {
+    loop {
+        sql = sql.trim_start();
+        if let Some(comment) = sql.strip_prefix("--") {
+            sql = comment.split_once('\n').map_or("", |(_, rest)| rest);
+        } else if let Some(comment) = sql.strip_prefix("/*") {
+            sql = comment.split_once("*/").map_or("", |(_, rest)| rest);
+        } else {
+            return sql;
+        }
     }
 }
 

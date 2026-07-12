@@ -1874,16 +1874,26 @@ pub async fn handle_admin_request(
             &json!({"error": "Not Found"}),
         )),
     };
-    if let (Ok(http_response), Some(db)) = (response.as_ref(), state.db.as_ref())
+    if state.admin_audit_enabled
+        && let (Ok(http_response), Some(db)) = (response.as_ref(), state.db.as_ref())
         && http_response.status().is_success()
+        && tls_mutation_audit_descriptor(&method, segments.as_slice(), None).is_some()
     {
-        let response_body = http_response
-            .body()
-            .clone()
-            .collect()
-            .await
-            .ok()
-            .and_then(|body| serde_json::from_slice::<Value>(&body.to_bytes()).ok());
+        let response_body = if method == Method::POST
+            && matches!(
+                segments.as_slice(),
+                ["admin", "tls", _] | ["admin", "tls", "acme", _]
+            ) {
+            http_response
+                .body()
+                .clone()
+                .collect()
+                .await
+                .ok()
+                .and_then(|body| serde_json::from_slice::<Value>(&body.to_bytes()).ok())
+        } else {
+            None
+        };
         if let Some((action, resource_type, resource_id)) =
             tls_mutation_audit_descriptor(&method, segments.as_slice(), response_body.as_ref())
         {
