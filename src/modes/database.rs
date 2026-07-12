@@ -1564,6 +1564,9 @@ pub async fn run(
         read_only: env_config.admin_read_only,
         admin_audit_enabled: env_config.admin_audit_enabled,
         startup_ready: Some(startup_ready.clone()),
+        // Database mode has no post-start listener supervision that flips
+        // readiness; readiness is governed by `startup_ready` alone.
+        serving_degraded: None,
         db_available: Some(db_available.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,

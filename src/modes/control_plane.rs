@@ -809,6 +809,12 @@ pub async fn run(
     // unreachable, causing the admin API to reject writes early and preserve
     // the cached config until the DB recovers.
     let startup_ready = Arc::new(AtomicBool::new(false));
+    // Sticky serving-degradation flag: set true (never unset) if the gRPC serve
+    // future exits with an error after startup. `/health` reports not-ready when
+    // this is set OR `startup_ready` is false, so a serve failure that lands
+    // between the gRPC start signal and the main task's `startup_ready.store(true)`
+    // below is not re-masked by that store.
+    let serving_degraded = Arc::new(AtomicBool::new(false));
     let db_available = Arc::new(AtomicBool::new(true));
 
     let reserved_ports = env_config.reserved_gateway_ports();
@@ -827,6 +833,7 @@ pub async fn run(
         read_only: env_config.admin_read_only,
         admin_audit_enabled: env_config.admin_audit_enabled,
         startup_ready: Some(startup_ready.clone()),
+        serving_degraded: Some(serving_degraded.clone()),
         db_available: Some(db_available.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
@@ -848,21 +855,33 @@ pub async fn run(
     // create_jwt_manager_from_env() a second time).
     let admin_state_for_https = admin_state.clone();
     let admin_shutdown = shutdown_tx.subscribe();
+    let mut startup_signals = Vec::new();
 
     // Admin HTTP listener (disabled when port is 0)
     let admin_http_handle = if env_config.admin_http_port != 0 {
         let admin_http_limiter = admin_conn_limiter.clone();
+        let (admin_http_started_tx, admin_http_started_rx) = tokio::sync::oneshot::channel();
+        startup_signals.push(("CP admin HTTP listener".to_string(), admin_http_started_rx));
+        let admin_http_startup_ready = startup_ready.clone();
+        let admin_http_serving_degraded = serving_degraded.clone();
         Some(tokio::spawn(async move {
             info!("Starting Admin HTTP listener on {}", admin_http_addr);
-            if let Err(e) = admin::start_admin_listener(
+            if let Err(e) = admin::start_admin_listener_with_tls_and_signal(
                 admin_http_addr,
                 admin_state,
                 admin_shutdown,
+                None,
+                Some(admin_http_started_tx),
                 admin_http_limiter,
             )
             .await
             {
-                error!("Admin HTTP listener error: {}", e);
+                crate::startup::flip_ready_off_on_listener_failure(
+                    &admin_http_startup_ready,
+                    &admin_http_serving_degraded,
+                    "CP admin HTTP listener",
+                    &e,
+                );
             }
         }))
     } else {
@@ -925,30 +944,44 @@ pub async fn run(
         }
         let admin_tls_slot = admin_reload_handles.slot.clone();
         let admin_https_limiter = admin_conn_limiter.clone();
+        let (admin_https_started_tx, admin_https_started_rx) = tokio::sync::oneshot::channel();
+        startup_signals.push((
+            "CP admin HTTPS listener".to_string(),
+            admin_https_started_rx,
+        ));
+        let admin_https_startup_ready = startup_ready.clone();
+        let admin_https_serving_degraded = serving_degraded.clone();
 
         Some(tokio::spawn(async move {
             info!("Starting Admin HTTPS listener on {}", admin_https_addr);
             let result = if let Some(slot) = admin_tls_slot {
-                admin::start_admin_listener_with_dynamic_tls(
+                admin::start_admin_listener_with_dynamic_tls_and_signal(
                     admin_https_addr,
                     admin_state_for_https,
                     admin_https_shutdown,
                     slot,
+                    Some(admin_https_started_tx),
                     admin_https_limiter,
                 )
                 .await
             } else {
-                admin::start_admin_listener_with_tls(
+                admin::start_admin_listener_with_tls_and_signal(
                     admin_https_addr,
                     admin_state_for_https,
                     admin_https_shutdown,
                     Some(admin_tls_config),
+                    Some(admin_https_started_tx),
                     admin_https_limiter,
                 )
                 .await
             };
             if let Err(e) = result {
-                error!("Admin HTTPS listener error: {}", e);
+                crate::startup::flip_ready_off_on_listener_failure(
+                    &admin_https_startup_ready,
+                    &admin_https_serving_degraded,
+                    "CP admin HTTPS listener",
+                    &e,
+                );
             }
         }))
     } else {
@@ -1040,9 +1073,12 @@ pub async fn run(
         let grpc_http2_max_local_error_reset_streams =
             env_config.server_http2_max_local_error_reset_streams;
         let (grpc_started_tx, grpc_started_rx) = tokio::sync::oneshot::channel();
+        startup_signals.push(("CP gRPC listener".to_string(), grpc_started_rx));
         let mut grpc_shutdown = shutdown_tx.subscribe();
         let grpc_accept_shutdown = grpc_shutdown.clone();
         let grpc_tls_handshake_timeout_seconds = env_config.frontend_tls_handshake_timeout_seconds;
+        let grpc_startup_ready = startup_ready.clone();
+        let grpc_serving_degraded = serving_degraded.clone();
         let handle = tokio::spawn(async move {
             let mut builder = Server::builder()
                 .max_concurrent_streams(Some(grpc_http2_max_concurrent_streams))
@@ -1085,15 +1121,21 @@ pub async fn run(
                     .await
             };
             if let Err(e) = result {
-                error!("gRPC server error: {}", e);
+                // The gRPC serve future exited with an error, so this CP can no
+                // longer distribute config to data planes. Flip readiness back
+                // to not-ready so `/health` stops reporting `ready` instead of
+                // leaving a live-but-non-serving control plane. The CP listener
+                // monitor also observes this task exiting and triggers graceful
+                // shutdown; flipping readiness first keeps the probe honest
+                // during the teardown window.
+                crate::startup::flip_ready_off_on_listener_failure(
+                    &grpc_startup_ready,
+                    &grpc_serving_degraded,
+                    "CP gRPC server",
+                    &e,
+                );
             }
         });
-
-        wait_for_start_signals(
-            vec![("CP gRPC listener".to_string(), grpc_started_rx)],
-            Duration::from_secs(10),
-        )
-        .await?;
 
         Some(handle)
     } else {
@@ -1103,9 +1145,13 @@ pub async fn run(
         drop(xds_server);
         None
     };
+    wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
     // Mark CP as ready — same rationale as database mode: the initial
     // `load_full_config()` proved DB connectivity and loaded a complete config.
     // The polling loop handles ongoing incremental updates, not initial readiness.
+    // If the gRPC serve future already errored (racing this store), the sticky
+    // `serving_degraded` flag was set and keeps `/health` not-ready regardless of
+    // this `store(true)`.
     startup_ready.store(true, Ordering::Release);
     info!("Control plane startup complete; /health now reports ready");
 

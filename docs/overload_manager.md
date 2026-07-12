@@ -66,7 +66,9 @@ FERRUM_OVERLOAD_LOOP_CRITICAL_US=500000       # reject connections (500ms)
   "port_exhaustion_events": 0,
   "stream_listeners": {
     "dtls_demux_sessions_total": 0,
-    "dtls_demux_sessions": []
+    "dtls_demux_sessions": [],
+    "bind_failures_total": 0,
+    "bind_failures": []
   },
   "pressure": {
     "file_descriptors": {
@@ -122,6 +124,60 @@ so treat it as operational telemetry rather than an admission-control source.
 Mitigation knobs:
 - `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` bounds how long a peer can hold DTLS demux state before completing the handshake.
 - `FERRUM_UDP_MAX_SESSIONS` caps total UDP/DTLS sessions per proxy, including DTLS peers still in handshake.
+
+## Stream-Listener Bind Failures
+
+The `/overload.stream_listeners.bind_failures` array and its
+`bind_failures_total` count report stream-listener (TCP/UDP/DTLS) resources that
+are **not serving** after the most recent config reconcile — hard bind failures
+**plus** listeners deferred or degraded for a config reason. A listener-task
+failure that occurs asynchronously after reconcile is appended immediately. Each
+entry carries a `kind` that classifies why; shared SNI listeners emit one entry
+for every affected proxy ID:
+
+```json
+"stream_listeners": {
+  "dtls_demux_sessions_total": 0,
+  "dtls_demux_sessions": [],
+  "bind_failures_total": 2,
+  "bind_failures": [
+    { "proxy_id": "tcp-echo", "listen_port": 9100, "error": "Port 9100 is already in use on 0.0.0.0: Address already in use (os error 98)", "kind": "bind_failed" },
+    { "proxy_id": "udp-dtls", "listen_port": 8853, "error": "Deferred: frontend_tls UDP listener requires DTLS cert/key material (not yet loaded)", "kind": "frontend_dtls_deferred" }
+  ]
+}
+```
+
+`kind` values:
+
+| `kind` | Serving impact | Meaning |
+| --- | --- | --- |
+| `bind_failed` | Hard failure | The socket bind/probe failed (e.g. the port is already in use). |
+| `backend_tls_invalid` | Hard failure | Backend TLS config validation failed while starting a new TCP+TLS listener; the listener was not installed. |
+| `backend_tls_rotation_invalid` | Hard failure | In-place backend TLS material rotated to invalid content; the **previous** listener was kept running rather than closing the port. |
+| `frontend_tls_deferred` | Deferral | A `frontend_tls` TCP listener is waiting for its rustls `ServerConfig` to be loaded. Clears once TLS material arrives. |
+| `frontend_dtls_deferred` | Deferral | A `frontend_tls` UDP/DTLS listener is waiting for DTLS cert/key material. Clears once material arrives. |
+| `frontend_dtls_build_failed` | Degradation | A `frontend_tls` UDP/DTLS listener could not build its DTLS config from the configured material; retried on the next reconcile. |
+
+Hard failures (`bind_failed`, `backend_tls_invalid`, `backend_tls_rotation_invalid`)
+are fatal at startup in `database`/`file` mode. A `frontend_*_deferred` entry is
+not itself returned as a hard bind failure by reconciliation: in DP/runtime
+reconciliation the listener can wait non-fatally for material, and loading the
+material re-triggers reconciliation. During initial serving-mode startup,
+however, the deferred listener remains in the desired set and the startup wait
+does not complete until it binds; missing material can therefore still make
+`database`, `file`, or `mesh` startup time out. An actual frontend TLS/DTLS
+socket bind failure remains a hard `bind_failed` failure (and is fatal during
+`database`/`file` startup).
+
+In **data-plane (DP) mode** these binds are intentionally **non-fatal**: the DP
+does not own its config (it comes from the control plane), so a single
+unbindable CP-pushed stream proxy must not prevent the DP from starting or brick
+the other listeners. Only the affected listener is skipped; it is retried on the
+next reconcile. Before, a skip was only warn-logged; this structured surface lets
+operators alert on `bind_failures_total > 0` and see exactly which proxy/port is
+not serving (and why, via `kind`) without scraping logs. The list reflects the
+latest reconcile plus any subsequent asynchronous listener-task failure, so a
+resource that starts serving on a later reconcile clears its entry.
 - Overload critical mode rejects new DTLS demux state before per-peer channels/tasks are allocated.
 
 ## Platform Support
