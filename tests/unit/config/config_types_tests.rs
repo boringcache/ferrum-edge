@@ -1619,6 +1619,82 @@ fn test_unique_consumer_identities_own_custom_id_matches_own_id() {
     assert!(config.validate_unique_consumer_identities().is_ok());
 }
 
+// ---- Consumer identity quarantine (issue #2121 fail-closed full load) ----
+
+#[test]
+fn test_quarantine_colliding_consumers_keeps_first_loaded() {
+    // c2's custom_id collides with c1's username: c1 (loaded first) wins,
+    // c2 is quarantined so ConsumerIndex never warn-and-overwrites.
+    let c1 = make_consumer("c1", "alice");
+    let mut c2 = make_consumer("c2", "bob");
+    c2.custom_id = Some("alice".into());
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+
+    let messages = config.quarantine_colliding_consumer_identities();
+
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].contains("Quarantined consumer 'c2'"));
+    assert!(messages[0].contains("custom_id 'alice'"));
+    assert_eq!(config.consumers.len(), 1);
+    assert_eq!(config.consumers[0].id, "c1");
+}
+
+#[test]
+fn test_quarantine_no_collisions_is_noop() {
+    let c1 = make_consumer("c1", "alice");
+    let c2 = make_consumer("c2", "bob");
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+
+    assert!(config.quarantine_colliding_consumer_identities().is_empty());
+    assert_eq!(config.consumers.len(), 2);
+}
+
+#[test]
+fn test_quarantine_allows_self_collision() {
+    // A consumer whose own custom_id equals its own username/id is valid.
+    let mut c1 = make_consumer("alice-id", "alice");
+    c1.custom_id = Some("alice".into());
+    let mut config = empty_config();
+    config.consumers = vec![c1];
+
+    assert!(config.quarantine_colliding_consumer_identities().is_empty());
+    assert_eq!(config.consumers.len(), 1);
+}
+
+#[test]
+fn test_quarantine_removed_consumer_does_not_claim_identities() {
+    // c2 collides with c1 and is quarantined; c3 reuses c2's *other* identity
+    // value — which must remain claimable because c2 was removed.
+    let c1 = make_consumer("c1", "alice");
+    let mut c2 = make_consumer("c2", "bob");
+    c2.custom_id = Some("alice".into());
+    let c3 = make_consumer("c3", "bob");
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2, c3];
+
+    let messages = config.quarantine_colliding_consumer_identities();
+
+    assert_eq!(messages.len(), 1);
+    assert_eq!(config.consumers.len(), 2);
+    assert!(config.consumers.iter().any(|c| c.id == "c3"));
+}
+
+#[test]
+fn test_quarantine_id_vs_username_collision() {
+    let c1 = make_consumer("alice-id", "alice");
+    let c2 = make_consumer("c2", "alice-id");
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+
+    let messages = config.quarantine_colliding_consumer_identities();
+
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].contains("Quarantined consumer 'c2'"));
+    assert_eq!(config.consumers.len(), 1);
+}
+
 // ---- Upstream name uniqueness tests ----
 
 #[test]

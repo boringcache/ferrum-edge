@@ -109,6 +109,7 @@ fn make_admin_state(db: DatabaseStore, max_spec_mib: usize) -> AdminState {
         mode: "database".to_string(),
         read_only: false,
         admin_audit_enabled: false,
+        admin_require_namespace_claim: false,
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
@@ -914,7 +915,10 @@ async fn delete_removes_spec_and_proxy() {
     assert_eq!(get_status, reqwest::StatusCode::NOT_FOUND);
 
     // Proxy is gone too (via DB cascade)
-    let proxy_row = store.get_proxy(&proxy_id).await.expect("get_proxy failed");
+    let proxy_row = store
+        .get_proxy("ferrum", &proxy_id)
+        .await
+        .expect("get_proxy failed");
     assert!(
         proxy_row.is_none(),
         "proxy should be deleted after spec delete"
@@ -1774,7 +1778,11 @@ async fn put_with_unchanged_resources_does_not_bump_proxy_updated_at() {
     let spec_id = post_resp["id"].as_str().expect("id").to_string();
 
     // Read proxy.updated_at before PUT.
-    let proxy_before = db_arc.get_proxy(&proxy_id).await.unwrap().unwrap();
+    let proxy_before = db_arc
+        .get_proxy("ferrum", &proxy_id)
+        .await
+        .unwrap()
+        .unwrap();
     let before_ts = proxy_before.updated_at;
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1786,7 +1794,11 @@ async fn put_with_unchanged_resources_does_not_bump_proxy_updated_at() {
     assert_eq!(put_status, reqwest::StatusCode::OK, "PUT: {put_resp}");
 
     // proxy.updated_at must NOT have advanced.
-    let proxy_after = db_arc.get_proxy(&proxy_id).await.unwrap().unwrap();
+    let proxy_after = db_arc
+        .get_proxy("ferrum", &proxy_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         proxy_after.updated_at.timestamp(),
         before_ts.timestamp(),
@@ -2118,7 +2130,7 @@ async fn put_idless_upstream_reuses_spec_owned_upstream_after_proxy_drift() {
         .await
         .expect("create hand upstream");
     let mut drifted_proxy = store
-        .get_proxy(&proxy_id)
+        .get_proxy("ferrum", &proxy_id)
         .await
         .expect("get proxy")
         .expect("proxy exists");
@@ -2154,7 +2166,7 @@ async fn put_idless_upstream_reuses_spec_owned_upstream_after_proxy_drift() {
     );
 
     let proxy_after = store
-        .get_proxy(&proxy_id)
+        .get_proxy("ferrum", &proxy_id)
         .await
         .expect("get proxy after PUT")
         .expect("proxy after PUT");
@@ -2291,7 +2303,7 @@ async fn put_with_empty_ids_reuses_existing_proxy_id() {
 
     // The proxy must still exist in the DB under the original id.
     let proxy = store
-        .get_proxy(&stored_proxy_id)
+        .get_proxy("ferrum", &stored_proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must still exist after idempotent PUT");
@@ -2337,7 +2349,7 @@ async fn put_with_empty_plugin_ids_reuses_by_name() {
 
     // Capture proxy.updated_at before the PUT.
     let proxy_before = store
-        .get_proxy(&proxy_id)
+        .get_proxy("ferrum", &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must exist after POST");
@@ -2358,7 +2370,7 @@ async fn put_with_empty_plugin_ids_reuses_by_name() {
 
     // Resource hash short-circuit: proxy.updated_at must NOT advance.
     let proxy_after = store
-        .get_proxy(&proxy_id)
+        .get_proxy("ferrum", &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must still exist after PUT");
@@ -2428,7 +2440,7 @@ async fn put_with_renamed_plugin_gets_new_id() {
 
     // Proxy must still exist and its id must be unchanged.
     let proxy_after = store
-        .get_proxy(&proxy_id)
+        .get_proxy("ferrum", &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must still exist");
@@ -2502,7 +2514,7 @@ async fn put_with_explicit_plugin_id_overrides_match() {
 
     // The plugin with explicit_id must now exist.
     let plugin = store
-        .get_plugin_config(&explicit_id)
+        .get_plugin_config("ferrum", &explicit_id)
         .await
         .expect("get_plugin_config failed")
         .expect("explicit plugin must exist after PUT");
@@ -2751,15 +2763,18 @@ async fn post_proxy_plugin_association_to_other_namespace_returns_422() {
         "association to another namespace's plugin must return 422; body: {body}"
     );
     let failures = body["failures"].as_array().expect("failures array");
+    // Plugin-config reads are namespace-predicated (issue #2122 DB-M1): the
+    // other-namespace plugin reports as missing in the spec's namespace, so
+    // the rejection no longer discloses which namespace owns it.
     assert!(
         failures
             .iter()
             .any(|f| f["resource_type"] == "proxy_plugin_association"
                 && f["errors"].as_array().is_some_and(|a| a.iter().any(|e| e
                     .as_str()
-                    .is_some_and(|s| s.contains(&shared_plugin_id)
-                        && s.contains(other_namespace)
-                        && s.contains("ferrum"))))),
+                    .is_some_and(
+                        |s| s.contains(&shared_plugin_id) && s.contains("does not exist")
+                    )))),
         "must include the cross-namespace association rejection in failures: {body}"
     );
 }
@@ -2935,7 +2950,7 @@ async fn put_keeps_manually_added_proxy_group_plugin_association() {
     use ferrum_edge::config::types::PluginAssociation;
     let proxy_with_manual_assoc = {
         let mut p = store
-            .get_proxy(&proxy_id)
+            .get_proxy("ferrum", &proxy_id)
             .await
             .expect("get_proxy")
             .expect("proxy exists");
@@ -2977,7 +2992,7 @@ async fn put_keeps_manually_added_proxy_group_plugin_association() {
 
     // The proxy-group plugin must still be associated with the proxy.
     let proxy_after = store
-        .get_proxy(&proxy_id)
+        .get_proxy("ferrum", &proxy_id)
         .await
         .expect("get_proxy after PUT")
         .expect("proxy must still exist");
@@ -3513,7 +3528,7 @@ async fn put_with_two_id_less_same_name_plugins_identical_configs_is_idempotent(
     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
 
     let proxy_before = store
-        .get_proxy(&proxy_id)
+        .get_proxy("ferrum", &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must exist");
@@ -3530,7 +3545,7 @@ async fn put_with_two_id_less_same_name_plugins_identical_configs_is_idempotent(
     );
 
     let proxy_after = store
-        .get_proxy(&proxy_id)
+        .get_proxy("ferrum", &proxy_id)
         .await
         .expect("get_proxy after PUT")
         .expect("proxy must still exist");
@@ -4041,7 +4056,7 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
     let spec_id = post_body["id"].as_str().unwrap().to_string();
 
     let proxy_after_post = store
-        .get_proxy(&proxy_id)
+        .get_proxy("ferrum", &proxy_id)
         .await
         .expect("get_proxy")
         .expect("proxy must exist after POST");
@@ -4080,7 +4095,7 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
     );
 
     let proxy_after_put = store
-        .get_proxy(&proxy_id)
+        .get_proxy("ferrum", &proxy_id)
         .await
         .expect("get_proxy after PUT")
         .expect("proxy must still exist");

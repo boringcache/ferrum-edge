@@ -146,6 +146,13 @@ pub struct AdminState {
     pub read_only: bool,
     /// Enables database-backed audit events for successful admin mutations.
     pub admin_audit_enabled: bool,
+    /// When `true` (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`), namespace-scoped
+    /// admin routes require the admin JWT to carry an `ns` claim authorizing
+    /// the `X-Ferrum-Namespace` value (mirrors the CP↔DP gRPC plane's
+    /// `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM`). Default `false`: the namespace
+    /// header stays a routing selector and any valid admin JWT may address
+    /// any namespace, matching pre-existing behavior.
+    pub admin_require_namespace_claim: bool,
     /// Startup readiness flag — flipped once by the mode after the initial config
     /// is loaded, all caches are built, DNS/pools are warmed, and every listener
     /// (proxy, admin, stream) is bound and accepting connections.
@@ -866,6 +873,71 @@ fn extract_namespace(headers: &hyper::HeaderMap) -> Result<String, Response<Full
     Ok(ns.to_string())
 }
 
+/// Whether an admin route operates on namespace-scoped resources selected via
+/// `X-Ferrum-Namespace`. Used by the opt-in per-namespace `ns`-claim gate
+/// (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`); global admin surfaces (TLS
+/// management, `/cluster`, `/namespaces`, metrics, backend capabilities, mesh
+/// introspection, `/plugins` type listing) are exempt because the namespace
+/// header does not select a tenant there.
+fn is_namespace_scoped_route(segments: &[&str]) -> bool {
+    match segments.first().copied() {
+        Some(
+            "proxies" | "consumers" | "upstreams" | "api-specs" | "batch" | "backup" | "restore"
+            | "audit",
+        ) => true,
+        // `GET /plugins` lists available plugin *types* (global metadata);
+        // `/plugins/config[...]` is the namespace-scoped PluginConfig CRUD.
+        Some("plugins") => segments.len() > 1,
+        _ => false,
+    }
+}
+
+/// Enforce the admin JWT `ns` claim against the requested namespace. Returns
+/// `Some(403)` when the token does not authorize `namespace`; `None` when
+/// authorized. Claim shapes are identical to the CP↔DP gRPC plane (single
+/// string or array of strings); a token without an `ns` claim is rejected
+/// outright when enforcement is on — tenancy intent must be explicit.
+fn enforce_namespace_claim(
+    auth: &AuditActor,
+    namespace: &str,
+    path: &str,
+) -> Option<Response<Full<Bytes>>> {
+    if auth.allowed_namespaces.is_present() {
+        if auth.allowed_namespaces.allows(namespace) {
+            return None;
+        }
+        warn!(
+            audit.event = "admin_namespace_authz",
+            actor = %auth.sub,
+            namespace = %namespace,
+            path = %path,
+            result = "denied",
+            "Admin request rejected: JWT `ns` claim does not authorize the requested namespace"
+        );
+        return Some(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": format!(
+                "JWT `ns` claim does not authorize namespace '{}'; the bearer may only \
+                 address the namespaces listed in its token",
+                namespace
+            )}),
+        ));
+    }
+    warn!(
+        audit.event = "admin_namespace_authz",
+        actor = %auth.sub,
+        namespace = %namespace,
+        path = %path,
+        result = "denied",
+        "Admin request rejected: FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true but the JWT has no `ns` claim"
+    );
+    Some(json_response(
+        StatusCode::FORBIDDEN,
+        &json!({"error": "FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true on this instance: the admin \
+             JWT must include an `ns` claim (string or array) listing the namespaces it may manage"}),
+    ))
+}
+
 /// Whether the caller may see the detailed observability views (`/metrics`
 /// scrape body, full `/health`, full `/overload`). Granted on any of: a valid
 /// admin JWT, a matching metrics bearer token, or an allowlisted source IP.
@@ -1234,6 +1306,20 @@ pub async fn handle_admin_request(
     // content-type inspection, binary blob).  Dispatch them BEFORE the
     // shared body-read below so we don't consume `req` prematurely.
     let segments_peek: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+
+    // Per-namespace tenancy enforcement on the REST admin plane (issue #2120,
+    // option B). Opt-in via FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM; mirrors the
+    // CP↔DP gRPC `ns` claim so a staging-scoped operator token cannot address
+    // prod by swapping X-Ferrum-Namespace. Applies only to namespace-scoped
+    // resource routes — global admin surfaces (TLS management, /cluster,
+    // /namespaces, metrics, mesh introspection) are not tenant-selected.
+    if state.admin_require_namespace_claim
+        && is_namespace_scoped_route(segments_peek.as_slice())
+        && let Some(resp) = enforce_namespace_claim(&auth, &namespace, &path)
+    {
+        drop(req.into_body());
+        return Ok(resp);
+    }
     match (method.clone(), segments_peek.as_slice()) {
         (Method::POST, ["api-specs"]) => {
             if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
@@ -2474,9 +2560,9 @@ async fn load_consumer_in_namespace(
     consumer_id: &str,
     namespace: &str,
 ) -> Result<Consumer, Box<Response<Full<Bytes>>>> {
-    match db.get_consumer(consumer_id).await {
-        Ok(Some(consumer)) if consumer.namespace == namespace => Ok(consumer),
-        Ok(Some(_)) | Ok(None) => Err(Box::new(consumer_not_found_response())),
+    match db.get_consumer(namespace, consumer_id).await {
+        Ok(Some(consumer)) => Ok(consumer),
+        Ok(None) => Err(Box::new(consumer_not_found_response())),
         Err(e) => Err(Box::new(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &db_error_response(&e),
@@ -2534,8 +2620,13 @@ async fn persist_consumer_update(
 ) -> Response<Full<Bytes>> {
     consumer.updated_at = Utc::now();
     match db.update_consumer(&consumer).await {
-        Ok(_) if success_status == StatusCode::NO_CONTENT => empty_response(StatusCode::NO_CONTENT),
-        Ok(_) => {
+        // The consumer vanished between the namespace-scoped load and the
+        // write (concurrent delete) — not-found, not a phantom success.
+        Ok(false) => consumer_not_found_response(),
+        Ok(true) if success_status == StatusCode::NO_CONTENT => {
+            empty_response(StatusCode::NO_CONTENT)
+        }
+        Ok(true) => {
             let body = crud::consumer_response_body(&consumer);
             json_response(success_status, &body)
         }
@@ -2633,10 +2724,7 @@ async fn validate_batch_route_override_conflicts(
         let pc = if let Some(pc) = batch_plugin_configs.get(*id) {
             Some((*pc).clone())
         } else {
-            match db.get_plugin_config(id).await? {
-                Some(pc) if pc.namespace == namespace => Some(pc),
-                _ => None,
-            }
+            db.get_plugin_config(namespace, id).await?
         };
         if let Some(pc) = pc
             && pc.enabled
@@ -2724,9 +2812,8 @@ async fn validate_batch_route_override_conflicts(
             let resolved = if let Some(u) = batch_upstreams.get(override_uid) {
                 Some((*u).clone())
             } else {
-                match db.get_upstream(override_uid).await {
-                    Ok(Some(u)) if u.namespace == namespace => Some(u),
-                    Ok(_) => None,
+                match db.get_upstream(namespace, override_uid).await {
+                    Ok(u) => u,
                     Err(e) => return Err(e),
                 }
             };
@@ -3635,19 +3722,14 @@ async fn handle_batch_create(
             match db.check_upstream_exists(upstream_id, namespace).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    // Distinguish "missing" from "wrong namespace" so the
-                    // operator's diagnostic points at the real problem.
-                    let message = match db.get_upstream(upstream_id).await {
-                        Ok(Some(other)) => format!(
-                            "Proxy '{}' references upstream_id '{}' from namespace '{}' (proxy is in namespace '{}'); cross-namespace references are forbidden",
-                            proxy.id, upstream_id, other.namespace, namespace
-                        ),
-                        _ => format!(
-                            "Proxy '{}' references non-existent upstream_id '{}'",
-                            proxy.id, upstream_id
-                        ),
-                    };
-                    validation_errors.push(message);
+                    // Upstream reads are namespace-predicated (issue #2122
+                    // DB-M1): an upstream in another namespace reports as
+                    // missing, so cross-namespace references are rejected
+                    // without disclosing other tenants' resources.
+                    validation_errors.push(format!(
+                        "Proxy '{}' references upstream_id '{}' that does not exist in namespace '{}'",
+                        proxy.id, upstream_id, namespace
+                    ));
                 }
                 Err(err) => validation_errors.push(format!(
                     "Proxy '{}' upstream reference check failed: {}",
@@ -3665,12 +3747,12 @@ async fn handle_batch_create(
                     .as_ref()
                     .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name))
             } else {
-                match db.get_upstream(upstream_id).await {
-                    Ok(Some(upstream)) if upstream.namespace == namespace => upstream
+                match db.get_upstream(namespace, upstream_id).await {
+                    Ok(Some(upstream)) => upstream
                         .subsets
                         .as_ref()
                         .is_some_and(|subsets| subsets.iter().any(|s| s.name == subset_name)),
-                    Ok(Some(_)) | Ok(None) => false,
+                    Ok(None) => false,
                     Err(err) => {
                         validation_errors.push(format!(
                             "Proxy '{}' upstream subset reference check failed: {}",
@@ -3700,9 +3782,8 @@ async fn handle_batch_create(
             let resolved_upstream = if let Some(upstream) = batch_upstreams.get(upstream_id) {
                 Some((*upstream).clone())
             } else {
-                match db.get_upstream(upstream_id).await {
-                    Ok(Some(upstream)) if upstream.namespace == namespace => Some(upstream),
-                    Ok(_) => None,
+                match db.get_upstream(namespace, upstream_id).await {
+                    Ok(upstream) => upstream,
                     Err(err) => {
                         validation_errors.push(format!(
                             "Proxy '{}' upstream mesh-transport check failed: {}",
@@ -3819,20 +3900,14 @@ async fn handle_batch_create(
             match db.check_proxy_exists(proxy_id, namespace).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    // Distinguish "missing" from "wrong namespace" — the
-                    // referenced proxy may exist in another namespace, in
-                    // which case the operator must move or recreate it.
-                    let message = match db.get_proxy(proxy_id).await {
-                        Ok(Some(other)) => format!(
-                            "PluginConfig '{}' references proxy_id '{}' from namespace '{}' (plugin_config is in namespace '{}'); cross-namespace references are forbidden",
-                            plugin_config.id, proxy_id, other.namespace, namespace
-                        ),
-                        _ => format!(
-                            "PluginConfig '{}' references non-existent proxy_id '{}'",
-                            plugin_config.id, proxy_id
-                        ),
-                    };
-                    validation_errors.push(message);
+                    // Proxy reads are namespace-predicated (issue #2122
+                    // DB-M1): a proxy in another namespace reports as
+                    // missing, so cross-namespace references are rejected
+                    // without disclosing other tenants' resources.
+                    validation_errors.push(format!(
+                        "PluginConfig '{}' references proxy_id '{}' that does not exist in namespace '{}'",
+                        plugin_config.id, proxy_id, namespace
+                    ));
                 }
                 Err(err) => validation_errors.push(format!(
                     "PluginConfig '{}' proxy reference check failed: {}",
@@ -4771,6 +4846,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn namespace_scoped_routes_cover_tenant_resources_only() {
+        // Tenant-scoped: subject to FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM.
+        for segs in [
+            vec!["proxies"],
+            vec!["proxies", "p1"],
+            vec!["consumers"],
+            vec!["consumers", "c1", "credentials", "keyauth"],
+            vec!["upstreams", "u1"],
+            vec!["plugins", "config"],
+            vec!["plugins", "config", "pc1"],
+            vec!["api-specs"],
+            vec!["api-specs", "s1"],
+            vec!["batch"],
+            vec!["backup"],
+            vec!["restore"],
+            vec!["audit"],
+        ] {
+            assert!(
+                is_namespace_scoped_route(&segs),
+                "/{} should be namespace-scoped",
+                segs.join("/")
+            );
+        }
+
+        // Global admin surfaces: never gated on the ns claim.
+        for segs in [
+            vec!["plugins"], // plugin *type* listing — global metadata
+            vec!["namespaces"],
+            vec!["cluster"],
+            vec!["backend-capabilities"],
+            vec!["metrics", "runtime"],
+            vec!["admin", "tls", "inventory"],
+            vec!["admin", "metrics"],
+            vec!["mesh", "service-graph"],
+            vec!["health"],
+            vec!["overload"],
+        ] {
+            assert!(
+                !is_namespace_scoped_route(&segs),
+                "/{} should NOT be namespace-scoped",
+                segs.join("/")
+            );
+        }
+    }
+
+    #[test]
+    fn enforce_namespace_claim_rejects_missing_and_unlisted_namespaces() {
+        use crate::grpc::auth::AllowedNamespaces;
+
+        let actor = |allowed: AllowedNamespaces| AuditActor {
+            sub: "tester".to_string(),
+            role: AdminRole::Admin,
+            allowed_namespaces: allowed,
+        };
+
+        // No claim → denied when enforcement is on.
+        let denied =
+            enforce_namespace_claim(&actor(AllowedNamespaces::empty()), "prod", "/proxies");
+        assert_eq!(
+            denied.map(|resp| resp.status()),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        // Claimed namespace → allowed; unlisted → denied.
+        let mut set = std::collections::HashSet::new();
+        set.insert("staging".to_string());
+        let scoped = AllowedNamespaces(Some(set));
+        assert!(enforce_namespace_claim(&actor(scoped.clone()), "staging", "/proxies").is_none());
+        let denied = enforce_namespace_claim(&actor(scoped), "prod", "/proxies");
+        assert_eq!(
+            denied.map(|resp| resp.status()),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        // Present-but-empty claim (operator assigned no namespaces) denies all.
+        let empty_set = AllowedNamespaces(Some(std::collections::HashSet::new()));
+        let denied = enforce_namespace_claim(&actor(empty_set), "ferrum", "/proxies");
+        assert_eq!(
+            denied.map(|resp| resp.status()),
+            Some(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
     fn unpaginated_response_returns_all_items() {
         let uri: hyper::Uri = "/proxies".parse().unwrap();
         let pagination = parse_pagination(&uri);
@@ -4910,10 +5069,12 @@ mod tests {
         let operator = AuditActor {
             sub: "operator".to_string(),
             role: AdminRole::Operator,
+            allowed_namespaces: crate::grpc::auth::AllowedNamespaces::empty(),
         };
         let admin = AuditActor {
             sub: "admin".to_string(),
             role: AdminRole::Admin,
+            allowed_namespaces: crate::grpc::auth::AllowedNamespaces::empty(),
         };
         for (method, route) in admin_only {
             let required = tls_route_required_role(&method, &route);

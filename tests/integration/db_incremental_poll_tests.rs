@@ -194,7 +194,7 @@ async fn incremental_poll_uses_durable_sequence_for_create_update_delete() {
     assert!(updated.sequence_cursor > created.sequence_cursor);
 
     store
-        .delete_upstream("sequence-upstream")
+        .delete_upstream("ferrum", "sequence-upstream")
         .await
         .expect("upstream delete must succeed");
     let deleted = store

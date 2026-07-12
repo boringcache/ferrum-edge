@@ -637,6 +637,7 @@ async fn start_node_agent_admin_listeners(
         mode: "node_agent".to_string(),
         read_only: true,
         admin_audit_enabled: env_config.admin_audit_enabled,
+        admin_require_namespace_claim: env_config.admin_require_namespace_claim,
         startup_ready: Some(startup_ready),
         db_available: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,

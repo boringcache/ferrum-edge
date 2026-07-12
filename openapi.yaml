@@ -37,6 +37,14 @@ info:
     namespace-filtered unless their operation explicitly declares the namespace
     header. Discover all known resource namespaces via `GET /namespaces`.
 
+    When the gateway is started with `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`,
+    namespace-scoped resource endpoints additionally require the admin JWT to
+    carry an `ns` claim (a single string or an array of strings, the same claim
+    shapes as the CP/DP gRPC plane) that includes the requested
+    `X-Ferrum-Namespace` value; requests outside the claimed namespaces are
+    rejected with `403 Forbidden`. With the flag unset (default), any valid
+    admin JWT may address any namespace.
+
     ## Caching and read-only mode
 
     When the primary database is unavailable, read endpoints transparently fall
@@ -3387,6 +3395,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "409":
           description: Conflict — `listen_path` already exists on another proxy, or stream proxy `listen_port` conflicts with another proxy, a gateway reserved port, or is not available on the host
           content:
@@ -3528,6 +3538,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -3930,6 +3942,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
