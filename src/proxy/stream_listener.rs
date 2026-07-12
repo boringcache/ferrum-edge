@@ -304,8 +304,9 @@ pub struct StreamListenerOverloadSnapshot {
     /// entry's `kind` distinguishes a hard failure from a deferral.
     pub bind_failures_total: usize,
     /// Structured per-resource stream-listener non-serving reasons from the most
-    /// recent `reconcile()`, classified by [`StreamBindFailure::kind`]. Empty
-    /// once every configured stream listener is serving.
+    /// recent `reconcile()` plus durable asynchronous listener-task failures,
+    /// classified by [`StreamBindFailure::kind`]. Empty once every configured
+    /// stream listener is serving.
     pub bind_failures: Vec<StreamBindFailure>,
 }
 
@@ -411,6 +412,33 @@ fn append_bind_failure(
     });
 }
 
+fn remove_bind_failures(
+    snapshot: &arc_swap::ArcSwap<Vec<StreamBindFailure>>,
+    proxy_ids: &[String],
+) {
+    snapshot.rcu(|current| {
+        Arc::new(
+            current
+                .iter()
+                .filter(|failure| !proxy_ids.contains(&failure.proxy_id))
+                .cloned()
+                .collect(),
+        )
+    });
+}
+
+fn merge_bind_failures(base: &mut Vec<StreamBindFailure>, additional: &[StreamBindFailure]) {
+    for failure in additional {
+        if let Some(existing) = base.iter_mut().find(|existing| {
+            existing.proxy_id == failure.proxy_id && existing.listen_port == failure.listen_port
+        }) {
+            *existing = failure.clone();
+        } else {
+            base.push(failure.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod bind_failure_snapshot_tests {
     use super::*;
@@ -445,6 +473,27 @@ mod bind_failure_snapshot_tests {
             StreamListenerDegradation::BindFailed
         ));
     }
+
+    #[test]
+    fn async_listener_failure_survives_later_reconcile_snapshot() {
+        let async_failures = arc_swap::ArcSwap::from_pointee(Vec::new());
+        let failure = StreamBindFailure {
+            proxy_id: "async-bind".to_string(),
+            listen_port: 9443,
+            error: "TCP stream listener task failed: accept loop exited".to_string(),
+            kind: StreamListenerDegradation::BindFailed,
+        };
+        append_bind_failure(&async_failures, failure);
+
+        // A later unrelated reconcile rebuilds its base degradations from the
+        // current cycle. Durable asynchronous failures must be merged back in.
+        let mut later_reconcile = Vec::new();
+        merge_bind_failures(&mut later_reconcile, &async_failures.load_full());
+
+        assert_eq!(later_reconcile.len(), 1);
+        assert_eq!(later_reconcile[0].proxy_id, "async-bind");
+        assert_eq!(later_reconcile[0].listen_port, 9443);
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -474,12 +523,16 @@ pub struct StreamListenerManager {
     dtls_metrics: arc_swap::ArcSwap<Vec<DtlsDemuxMetricEntry>>,
     stream_backend_metrics: arc_swap::ArcSwap<Vec<StreamBackendMetricEntry>>,
     /// Structured snapshot of the most recent `reconcile()`'s stream-listener
-    /// bind failures plus asynchronous listener-task failures after publication.
+    /// bind failures plus durable asynchronous listener-task failures.
     /// Published at the end of every reconcile (startup and runtime/CP-pushed),
     /// lock-free via `ArcSwap`, and surfaced in the admin `/overload` response.
     /// In DP mode these binds are non-fatal, so this is the operator-facing
     /// counterpart to the per-failure warn log.
     bind_failures: Arc<arc_swap::ArcSwap<Vec<StreamBindFailure>>>,
+    /// Listener-task failures persist independently of reconcile snapshots so
+    /// a later reconcile cannot erase a failure reported by an older task.
+    /// Entries clear when the proxy is removed or a replacement is spawned.
+    async_bind_failures: Arc<arc_swap::ArcSwap<Vec<StreamBindFailure>>>,
     bind_addr: IpAddr,
     config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     dns_cache: DnsCache,
@@ -782,6 +835,7 @@ impl StreamListenerManager {
             dtls_metrics: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
             stream_backend_metrics: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
             bind_failures: Arc::new(arc_swap::ArcSwap::new(Arc::new(Vec::new()))),
+            async_bind_failures: Arc::new(arc_swap::ArcSwap::new(Arc::new(Vec::new()))),
             bind_addr,
             config,
             dns_cache,
@@ -1180,6 +1234,21 @@ impl StreamListenerManager {
             }
         }
 
+        // Drop durable task failures only when their configured proxy has
+        // disappeared. Failures for still-desired proxies survive unrelated
+        // reconciles until the listener is actually rebound below.
+        let desired_proxy_ids: std::collections::HashSet<&str> =
+            desired.keys().map(String::as_str).collect();
+        self.async_bind_failures.rcu(|current| {
+            Arc::new(
+                current
+                    .iter()
+                    .filter(|failure| desired_proxy_ids.contains(failure.proxy_id.as_str()))
+                    .cloned()
+                    .collect(),
+            )
+        });
+
         // Stop listeners for removed proxies or changed config
         let mut to_remove = Vec::new();
         for (key, handle) in listeners.iter() {
@@ -1430,6 +1499,8 @@ impl StreamListenerManager {
             }
 
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let rebound_proxy_ids = sni_ids.clone().unwrap_or_else(|| vec![proxy_id.clone()]);
+            remove_bind_failures(&self.async_bind_failures, &rebound_proxy_ids);
             let proxy_id_owned = proxy_id.clone();
             let config = self.config.clone();
             let dns_cache = self.dns_cache.clone();
@@ -1511,6 +1582,7 @@ impl StreamListenerManager {
                 let global_shutdown_for_listener = global_shutdown.clone();
                 let mesh_outbound_enforcement = self.mesh_outbound_enforcement.clone();
                 let bind_failures = Arc::clone(&self.bind_failures);
+                let async_bind_failures = Arc::clone(&self.async_bind_failures);
                 let async_failure_tx = async_failure_tx.clone();
                 let failure_proxy_ids = sni_ids
                     .clone()
@@ -1574,6 +1646,7 @@ impl StreamListenerManager {
                                 error: msg.clone(),
                                 kind: StreamListenerDegradation::BindFailed,
                             };
+                            append_bind_failure(&async_bind_failures, failure.clone());
                             append_bind_failure(&bind_failures, failure.clone());
                             let _ = async_failure_tx.send(failure);
                         }
@@ -1648,6 +1721,7 @@ impl StreamListenerManager {
                     .clone();
                 let trusted_proxies = self.trusted_proxies.clone();
                 let bind_failures = Arc::clone(&self.bind_failures);
+                let async_bind_failures = Arc::clone(&self.async_bind_failures);
                 let async_failure_tx = async_failure_tx.clone();
                 let failure_proxy_ids = sni_ids
                     .clone()
@@ -1704,6 +1778,7 @@ impl StreamListenerManager {
                                 error: msg.clone(),
                                 kind: StreamListenerDegradation::BindFailed,
                             };
+                            append_bind_failure(&async_bind_failures, failure.clone());
                             append_bind_failure(&bind_failures, failure.clone());
                             let _ = async_failure_tx.send(failure);
                         }
@@ -1802,6 +1877,7 @@ impl StreamListenerManager {
         // starts serving on a later reconcile clears its entry). Empty Vec
         // allocation is cheap and only happens on the cold reconcile path,
         // never per connection.
+        merge_bind_failures(&mut degraded, &self.async_bind_failures.load_full());
         self.bind_failures.store(Arc::new(degraded));
         drop(async_failure_tx);
         while let Ok(failure) = async_failure_rx.try_recv() {

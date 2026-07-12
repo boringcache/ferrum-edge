@@ -159,10 +159,15 @@ for every affected proxy ID:
 | `frontend_dtls_build_failed` | Degradation | A `frontend_tls` UDP/DTLS listener could not build its DTLS config from the configured material; retried on the next reconcile. |
 
 Hard failures (`bind_failed`, `backend_tls_invalid`, `backend_tls_rotation_invalid`)
-are also fatal at startup in `database`/`file` mode; the `frontend_*` deferrals
-are always non-fatal (a listener merely waiting on TLS material never fails
-startup, and clears itself once material is loaded — loading TLS material
-re-triggers a reconcile).
+are fatal at startup in `database`/`file` mode. A `frontend_*_deferred` entry is
+not itself returned as a hard bind failure by reconciliation: in DP/runtime
+reconciliation the listener can wait non-fatally for material, and loading the
+material re-triggers reconciliation. During initial serving-mode startup,
+however, the deferred listener remains in the desired set and the startup wait
+does not complete until it binds; missing material can therefore still make
+`database`, `file`, or `mesh` startup time out. An actual frontend TLS/DTLS
+socket bind failure remains a hard `bind_failed` failure (and is fatal during
+`database`/`file` startup).
 
 In **data-plane (DP) mode** these binds are intentionally **non-fatal**: the DP
 does not own its config (it comes from the control plane), so a single
