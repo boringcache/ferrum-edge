@@ -1283,6 +1283,78 @@ impl DatabaseStore {
         Ok(config)
     }
 
+    /// Load a namespace's raw resources for a rollback snapshot WITHOUT the
+    /// fatal validation chain that `load_full_config` runs.
+    ///
+    /// Reads from the PRIMARY pool (`self.pool()`), never the read replica, so a
+    /// rollback snapshot is authoritative. Runs only `normalize_fields()` (parity
+    /// with admission — idempotent, infallible), NOT the regex/listen-path/
+    /// upstream-reference/etc. validators. That is deliberate: restore is the
+    /// tool an operator uses to *repair* an invalid-but-present config, so such a
+    /// config must still snapshot (rollback stays available during the repair).
+    /// Only a genuine DB/connectivity error (or unparseable rows) makes this
+    /// fail, which is exactly the case where the caller must abort rather than
+    /// wipe a config it cannot restore.
+    pub async fn load_namespace_snapshot(
+        &self,
+        namespace: &str,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        let start = Instant::now();
+        let loaded_at = Utc::now();
+        // Authoritative read: the primary pool, not `admin_read_pool()`.
+        let mut tx = self.pool().begin().await?;
+        self.configure_full_load_snapshot(&mut tx).await?;
+
+        let proxies = self.load_proxies_tx(namespace, &mut tx).await?;
+        let consumers = self.load_consumers_tx(namespace, &mut tx).await?;
+        let plugin_configs = self.load_plugin_configs_tx(namespace, &mut tx).await?;
+        let upstreams = self.load_upstreams_tx(namespace, &mut tx).await?;
+        tx.commit().await?;
+
+        let mut config = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            proxies,
+            consumers,
+            plugin_configs,
+            upstreams,
+            loaded_at,
+            known_namespaces: Vec::new(),
+            ..Default::default()
+        };
+
+        // Normalize like admission (hostnames/etc.) but run NO fatal validators:
+        // an invalid-but-present prior config must still snapshot so restore can
+        // repair it while retaining rollback capability.
+        ValidationPipeline::new(&mut config)
+            .normalize_fields()
+            .run()?;
+
+        // Match `load_full_config`: strip the api_spec ownership tag. A rollback
+        // re-applies these resources as hand-managed; the `api_specs` rows are
+        // captured separately by the caller.
+        strip_api_spec_id_from_runtime_config(&mut config);
+
+        self.check_slow_query("load_namespace_snapshot", start);
+        Ok(config)
+    }
+
+    /// List ApiSpecs from the authoritative primary pool (never the read
+    /// replica). Used to enumerate the specs a destructive restore is about to
+    /// remove so the rollback recovery report cannot omit a spec that has not
+    /// yet replicated.
+    pub async fn list_api_specs_authoritative(
+        &self,
+        namespace: &str,
+        filter: &crate::config::db_backend::ApiSpecListFilter,
+    ) -> Result<
+        crate::config::db_backend::PaginatedResult<crate::config::types::ApiSpec>,
+        anyhow::Error,
+    > {
+        let primary_pool = self.pool();
+        self.list_api_specs_from_admin_read(namespace, filter, &primary_pool)
+            .await
+    }
+
     async fn configure_full_load_snapshot(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
@@ -6494,6 +6566,13 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::load_full_config(self, namespace).await
     }
 
+    async fn load_namespace_snapshot(
+        &self,
+        namespace: &str,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        DatabaseStore::load_namespace_snapshot(self, namespace).await
+    }
+
     async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error> {
         DatabaseStore::latest_change_sequence(self, namespace).await
     }
@@ -6849,6 +6928,17 @@ impl DatabaseBackend for DatabaseStore {
         anyhow::Error,
     > {
         DatabaseStore::list_api_specs(self, namespace, filter).await
+    }
+
+    async fn list_api_specs_authoritative(
+        &self,
+        namespace: &str,
+        filter: &crate::config::db_backend::ApiSpecListFilter,
+    ) -> Result<
+        crate::config::db_backend::PaginatedResult<crate::config::types::ApiSpec>,
+        anyhow::Error,
+    > {
+        DatabaseStore::list_api_specs_authoritative(self, namespace, filter).await
     }
 
     async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {

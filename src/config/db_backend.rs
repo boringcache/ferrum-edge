@@ -213,6 +213,29 @@ pub trait DatabaseBackend: Send + Sync {
     /// Load the full gateway configuration from the database.
     async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error>;
 
+    /// Load a namespace's resources for a rollback snapshot WITHOUT running the
+    /// semantic validation pipeline that [`load_full_config`](Self::load_full_config)
+    /// applies.
+    ///
+    /// Restore captures the prior state with this before its destructive clear.
+    /// A rollback snapshot only needs the current rows in order to restore them,
+    /// not validation — so an *invalid-but-present* config (exactly what an
+    /// operator runs restore to *repair*) is still captured, keeping rollback
+    /// available during the repair. A genuine connectivity/timeout failure, by
+    /// contrast, surfaces as `Err`, letting the caller ABORT the destructive
+    /// restore instead of wiping a config that was merely transiently
+    /// unreachable.
+    ///
+    /// Reads MUST come from the authoritative primary — a rollback snapshot must
+    /// never be built from a possibly-stale read replica. `api_spec_id` ownership
+    /// tags are cleared (mirroring `load_full_config`): a rollback re-applies the
+    /// config resources as hand-managed, and the `api_specs` rows themselves are
+    /// captured separately by the caller.
+    async fn load_namespace_snapshot(
+        &self,
+        namespace: &str,
+    ) -> Result<GatewayConfig, anyhow::Error>;
+
     // -----------------------------------------------------------------------
     // Incremental polling
     // -----------------------------------------------------------------------
@@ -572,6 +595,22 @@ pub trait DatabaseBackend: Send + Sync {
         namespace: &str,
         filter: &ApiSpecListFilter,
     ) -> Result<PaginatedResult<ApiSpec>, anyhow::Error>;
+
+    /// List ApiSpecs using the authoritative primary read path.
+    ///
+    /// Mirrors [`list_namespaces_authoritative`](Self::list_namespaces_authoritative):
+    /// [`list_api_specs`](Self::list_api_specs) may serve from a read replica that
+    /// can lag, but a restore rollback snapshot must enumerate the specs it is
+    /// about to destroy from the primary so the recovery report cannot silently
+    /// omit a spec that only exists on the primary yet. The default delegates to
+    /// `list_api_specs` for backends without a replica split (e.g. MongoDB).
+    async fn list_api_specs_authoritative(
+        &self,
+        namespace: &str,
+        filter: &ApiSpecListFilter,
+    ) -> Result<PaginatedResult<ApiSpec>, anyhow::Error> {
+        self.list_api_specs(namespace, filter).await
+    }
 
     /// Delete an ApiSpec and all resources it owns.
     ///

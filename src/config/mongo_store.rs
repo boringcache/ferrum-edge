@@ -2177,6 +2177,104 @@ mod inner {
             Ok(config)
         }
 
+        async fn load_namespace_snapshot(
+            &self,
+            namespace: &str,
+        ) -> Result<GatewayConfig, anyhow::Error> {
+            // Rollback snapshot: load the current rows WITHOUT the fatal
+            // `validate_listen_path_encodings` guard that `load_full_config`
+            // applies. Restore uses this to repair an invalid-but-present
+            // namespace, so such a config must still snapshot; only a genuine
+            // MongoDB error surfaces as `Err`, letting the caller abort the
+            // destructive clear instead of wiping an unrecoverable-but-intact
+            // config. The `_opt_session` helpers already clear `api_spec_id`
+            // (parity with `load_full_config`). A replica-set deployment reads
+            // the snapshot inside a majority/snapshot transaction; standalone
+            // reads directly from the primary.
+            let start = std::time::Instant::now();
+            let loaded_at = Utc::now();
+            let (proxies, consumers, plugin_configs, upstreams) =
+                if self.replica_set_configured.load(Ordering::Acquire) {
+                    let connection = self.connection();
+                    let mut session = connection.client.start_session().await?;
+                    session
+                        .start_transaction()
+                        .read_concern(ReadConcern::snapshot())
+                        .write_concern(WriteConcern::majority())
+                        .await?;
+
+                    let loaded = async {
+                        let proxies = self
+                            .load_full_proxies_opt_session(
+                                namespace,
+                                Some((connection.as_ref(), &mut session)),
+                            )
+                            .await?;
+                        let consumers = self
+                            .load_full_consumers_opt_session(
+                                namespace,
+                                Some((connection.as_ref(), &mut session)),
+                            )
+                            .await?;
+                        let plugin_configs = self
+                            .load_full_plugin_configs_opt_session(
+                                namespace,
+                                Some((connection.as_ref(), &mut session)),
+                            )
+                            .await?;
+                        let upstreams = self
+                            .load_full_upstreams_opt_session(
+                                namespace,
+                                Some((connection.as_ref(), &mut session)),
+                            )
+                            .await?;
+                        Ok::<_, anyhow::Error>((proxies, consumers, plugin_configs, upstreams))
+                    }
+                    .await;
+
+                    match loaded {
+                        Ok(resources) => {
+                            session.commit_transaction().await?;
+                            resources
+                        }
+                        Err(error) => {
+                            let _ = session.abort_transaction().await;
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    (
+                        self.load_full_proxies_opt_session(namespace, None).await?,
+                        self.load_full_consumers_opt_session(namespace, None)
+                            .await?,
+                        self.load_full_plugin_configs_opt_session(namespace, None)
+                            .await?,
+                        self.load_full_upstreams_opt_session(namespace, None)
+                            .await?,
+                    )
+                };
+
+            self.check_slow_query("load_namespace_snapshot", start);
+
+            let mut config = GatewayConfig {
+                version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+                proxies,
+                consumers,
+                plugin_configs,
+                upstreams,
+                loaded_at,
+                known_namespaces: Vec::new(),
+                ..Default::default()
+            };
+            // Normalize like admission (parity with the SQL snapshot loader and
+            // idempotent — rows were normalized when written). Deliberately skip
+            // both the fatal validators and `resolve_upstream_tls`: the snapshot
+            // exists only to be re-persisted on rollback, and `resolved_tls` is a
+            // runtime-derived field that is never stored.
+            config.normalize_fields();
+            Ok(config)
+        }
+
         async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error> {
             let doc = self
                 .config_changes()
