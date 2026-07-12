@@ -2591,6 +2591,72 @@ fn restore_payload_from_config(config: GatewayConfig) -> RestorePayload {
     }
 }
 
+/// Best-effort snapshot of a namespace captured before a destructive restore so
+/// a failed import — or a failed clear — can be compensated back to the prior
+/// state on every database backend.
+struct RestoreSnapshot {
+    /// Prior config resources (proxies/consumers/plugin_configs/upstreams).
+    payload: RestorePayload,
+    /// Number of `api_specs` rows present before deletion. API specs are
+    /// admin-only metadata that live OUTSIDE `GatewayConfig`, so a config
+    /// rollback cannot restore them. A non-zero count is surfaced to the
+    /// operator so they can re-submit the affected specs after recovery.
+    api_spec_count: usize,
+}
+
+/// Capture a best-effort snapshot of `namespace` for restore rollback.
+///
+/// Returns `None` when the existing config cannot be loaded — for example when
+/// it is already invalid or otherwise unloadable, which is exactly the case an
+/// operator runs restore to *repair*. In that situation rollback is unavailable
+/// but the restore must still proceed, so a snapshot failure never aborts the
+/// operation; it only downgrades the recovery guarantee.
+async fn snapshot_namespace_for_rollback(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+) -> Option<RestoreSnapshot> {
+    let payload = match db.load_full_config(namespace).await {
+        Ok(config) => restore_payload_from_config(config),
+        Err(error) => {
+            warn!(
+                namespace = %namespace,
+                error = %error,
+                "Restore: prior config could not be snapshotted; proceeding without rollback capability"
+            );
+            return None;
+        }
+    };
+
+    // `api_specs` are not part of `GatewayConfig`, so count them separately for
+    // rollback bookkeeping. This is best-effort: a count failure must not
+    // disable rollback of the config resources we already captured.
+    let api_spec_count = match db
+        .list_api_specs(
+            namespace,
+            &crate::config::db_backend::ApiSpecListFilter {
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(result) => usize::try_from(result.total).unwrap_or(0),
+        Err(error) => {
+            warn!(
+                namespace = %namespace,
+                error = %error,
+                "Restore: failed to count existing api_specs for rollback bookkeeping; assuming none"
+            );
+            0
+        }
+    };
+
+    Some(RestoreSnapshot {
+        payload,
+        api_spec_count,
+    })
+}
+
 #[derive(Default)]
 struct PersistCounts {
     proxies: usize,
@@ -2831,6 +2897,91 @@ async fn rollback_failed_restore(
     } else {
         Err(errors)
     }
+}
+
+/// Finalize a failed restore. Attempts a best-effort rollback to the pre-restore
+/// snapshot (when one was captured), records the audit event, and builds the
+/// operator-facing `500` response. Shared by the delete-failure and
+/// import-failure paths so both roll back identically.
+async fn finish_failed_restore(
+    state: &AdminState,
+    db: Arc<dyn DatabaseBackend>,
+    actor: &AuditActor,
+    namespace: &str,
+    restore_errors: Vec<String>,
+    snapshot: &Option<RestoreSnapshot>,
+) -> Response<Full<Bytes>> {
+    // Attempt rollback only when we hold a snapshot of the prior state.
+    let (rollback_status, rollback_errors) = match snapshot {
+        None => ("unavailable", None),
+        Some(snapshot) => {
+            match rollback_failed_restore(db.as_ref(), namespace, &snapshot.payload).await {
+                Ok(()) => ("completed", None),
+                Err(errors) => {
+                    error!(
+                        "Restore: rollback failed for namespace '{}': {}",
+                        namespace,
+                        errors.join("; ")
+                    );
+                    ("incomplete", Some(errors))
+                }
+            }
+        }
+    };
+
+    let event = audit::AuditEvent::new(
+        actor,
+        "restore",
+        "gateway_config",
+        namespace,
+        namespace,
+        audit::update_diff(
+            json!({"replaced_namespace": namespace}),
+            json!({"rollback": rollback_status}),
+        ),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+        log_audit_enqueue_failure(&error);
+    }
+
+    let error_message = match rollback_status {
+        "completed" => "Restore failed; restore rolled back and prior config retained",
+        "incomplete" => {
+            "Restore failed and rollback of prior config was incomplete; manual recovery required"
+        }
+        // "unavailable"
+        _ => "Restore failed and prior config could not be auto-restored; manual recovery required",
+    };
+
+    let mut response = json!({
+        "error": error_message,
+        "restore_errors": restore_errors,
+        "rollback": rollback_status,
+    });
+    if let Some(rollback_errors) = rollback_errors {
+        response["rollback_errors"] = json!(rollback_errors);
+    }
+
+    // A config rollback restores proxies/consumers/plugin_configs/upstreams but
+    // NOT `api_specs` (admin-only metadata outside `GatewayConfig`). When the
+    // prior namespace carried specs, tell the operator how many they must
+    // re-submit. Only meaningful when a snapshot was actually captured.
+    if let Some(snapshot) = snapshot
+        && snapshot.api_spec_count > 0
+    {
+        warn!(
+            namespace = %namespace,
+            api_spec_count = snapshot.api_spec_count,
+            "Restore: rollback restored config resources but NOT api_specs; operator must re-submit affected API specs"
+        );
+        response["api_specs_not_restored"] = json!(snapshot.api_spec_count);
+        response["api_specs_note"] = json!(format!(
+            "{} API spec(s) were removed and cannot be restored by rollback; re-submit them via POST /api-specs",
+            snapshot.api_spec_count
+        ));
+    }
+
+    json_response(StatusCode::INTERNAL_SERVER_ERROR, &response)
 }
 
 /// Allowed credential types for consumer authentication plugins.
@@ -4235,28 +4386,28 @@ async fn handle_restore(
     }
 
     // Snapshot the namespace before deletion so a failure in any independently
-    // committed import chunk can be compensated on every database backend.
-    let snapshot = match db.load_full_config(namespace).await {
-        Ok(config) => restore_payload_from_config(config),
-        Err(error) => {
-            error!("Restore: failed to snapshot existing config: {}", error);
-            return Ok(json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &json!({
-                    "error": "Failed to snapshot existing config; restore was not started and prior config retained",
-                }),
-            ));
-        }
-    };
+    // committed import chunk (or a partial clear) can be compensated on every
+    // database backend. Best-effort: if the existing config cannot be loaded
+    // (e.g. it is already invalid — exactly what restore is used to repair), we
+    // proceed WITHOUT rollback capability rather than blocking the repair.
+    let snapshot = snapshot_namespace_for_rollback(db.as_ref(), namespace).await;
 
     // Phase 3: Delete all existing resources in the namespace (safe: payload is validated and
-    // the prior state has been snapshotted).
+    // the prior state has been snapshotted best-effort above).
     if let Err(e) = db.delete_all_resources(namespace).await {
         error!("Restore: failed to delete existing resources: {}", e);
-        return Ok(json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({"error": format!("Failed to clear existing config: {}", e)}),
-        ));
+        // A partial clear (standalone Mongo deletes collections one-by-one) can
+        // leave the namespace in a mixed state, so attempt the same best-effort
+        // rollback the import-failure path uses.
+        return Ok(finish_failed_restore(
+            state,
+            db.clone(),
+            actor,
+            namespace,
+            vec![format!("failed to clear existing config: {}", e)],
+            &snapshot,
+        )
+        .await);
     }
 
     info!("Restore: cleared existing config, beginning import");
@@ -4286,51 +4437,9 @@ async fn handle_restore(
             namespace,
             errors.join("; ")
         );
-        let rollback_result = rollback_failed_restore(db.as_ref(), namespace, &snapshot).await;
-        let rollback_status = if rollback_result.is_ok() {
-            "completed"
-        } else {
-            "incomplete"
-        };
-        let event = audit::AuditEvent::new(
-            actor,
-            "restore",
-            "gateway_config",
-            namespace,
-            namespace,
-            audit::update_diff(
-                json!({"replaced_namespace": namespace}),
-                json!({"rollback": rollback_status}),
-            ),
+        return Ok(
+            finish_failed_restore(state, db.clone(), actor, namespace, errors, &snapshot).await,
         );
-        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-            log_audit_enqueue_failure(&error);
-        }
-
-        return match rollback_result {
-            Ok(()) => Ok(json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &json!({
-                    "error": "Restore failed; restore rolled back and prior config retained",
-                    "restore_errors": errors,
-                }),
-            )),
-            Err(rollback_errors) => {
-                error!(
-                    "Restore: rollback failed for namespace '{}': {}",
-                    namespace,
-                    rollback_errors.join("; ")
-                );
-                Ok(json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &json!({
-                        "error": "Restore failed and rollback of prior config was incomplete; manual recovery required",
-                        "restore_errors": errors,
-                        "rollback_errors": rollback_errors,
-                    }),
-                ))
-            }
-        };
     }
 
     let event = audit::AuditEvent::new(
