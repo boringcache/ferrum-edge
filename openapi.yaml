@@ -15621,7 +15621,7 @@ components:
             emit_metadata:
               type: boolean
               default: true
-              description: Emit a2a.* request and response metadata for downstream logging, tracing, authz, and chargeback plugins. When true (default), detected non-streaming A2A HTTP responses are buffered so response metadata (a2a.task_id, a2a.context_id, a2a.task_state, a2a.error) can be extracted; SSE and gRPC responses are never buffered. The buffer is bounded by the global FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES limit, not max_payload_size. Set false together with discovery.rewrite_agent_card_urls=false to keep responses fully streaming; request detection and method policy still apply.
+              description: Emit a2a.* request and response metadata for downstream logging, tracing, authz, and chargeback plugins. When true (default), detected non-streaming A2A HTTP responses are buffered so response metadata (a2a.task_id, a2a.context_id, a2a.task_state, a2a.error) can be extracted; SSE and gRPC responses are never buffered. Detected 2xx SSE streams are observed without buffering and write a2a.stream_events plus any observed a2a.task_id, a2a.context_id, and a2a.task_state into transaction metadata at stream termination, where key-based metadata redaction applies. The buffer is bounded by the global FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES limit, not max_payload_size. Set false together with discovery.rewrite_agent_card_urls=false to keep responses fully streaming; request detection and method policy still apply.
             log_payloads:
               type: boolean
               default: false
