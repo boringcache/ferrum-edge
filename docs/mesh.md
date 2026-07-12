@@ -797,10 +797,12 @@ server SVIDs. Revocation failures are fail-closed even when the peer SVID is
 otherwise trusted and unexpired. With no CRLs configured, revocation checking
 is skipped and handshake behavior is unchanged.
 
-The CRL file follows Ferrum's static TLS-material model: it is loaded once at
-startup and changing it requires a gateway restart or rolling redeploy. SVID
-certificate rotation and configured live trust-bundle/peer-auth reload paths do
-not reload the CRL set.
+The CRL set follows the same lifecycle as Ferrum's other rustls backend pools.
+When backend TLS live reload is enabled, `reload_backend_tls_material` reloads
+the CRL file and new mesh outbound connections use the refreshed set; existing
+connections retain the verifier created for their handshake. Otherwise the CRL
+set remains static until gateway restart. SVID certificate rotation and
+trust-bundle/peer-auth reload paths do not independently reload the CRL set.
 
 ### HBONE Protocol
 

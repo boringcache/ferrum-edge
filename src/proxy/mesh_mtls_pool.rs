@@ -394,7 +394,7 @@ pub struct MeshMtlsConnectionPool {
     entries: DashMap<String, Vec<MeshMtlsPoolEntry>>,
     creation_locks: DashMap<String, Arc<Mutex<()>>>,
     gateway_svid: SharedSvidBundle,
-    crls: crate::tls::CrlList,
+    crls: crate::tls::SharedCrlList,
     svid_identity_cache: ArcSwap<Option<MeshMtlsSvidIdentityCache>>,
     /// Shared backend SVID generation counter (same `Arc` the HTTP/H2/gRPC/H3
     /// pools stamp into their `|svidg=` key fields). Mesh mTLS keys embed the
@@ -460,6 +460,24 @@ impl MeshMtlsConnectionPool {
         dns_cache: DnsCache,
         gateway_svid: SharedSvidBundle,
         crls: crate::tls::CrlList,
+        shard_amount: usize,
+        backend_svid_generation: BackendSvidGeneration,
+    ) -> Self {
+        Self::new_with_svid_generation_and_shared_crls(
+            pool_config,
+            dns_cache,
+            gateway_svid,
+            crate::tls::shared_crl_list(crls),
+            shard_amount,
+            backend_svid_generation,
+        )
+    }
+
+    pub fn new_with_svid_generation_and_shared_crls(
+        pool_config: PoolConfig,
+        dns_cache: DnsCache,
+        gateway_svid: SharedSvidBundle,
+        crls: crate::tls::SharedCrlList,
         shard_amount: usize,
         backend_svid_generation: BackendSvidGeneration,
     ) -> Self {
@@ -1329,12 +1347,13 @@ impl MeshMtlsConnectionPool {
         //   bundle — a federated cert from a DIFFERENT trust domain is rejected.
         //   No pod identity is pinned (the gateway LB-picks the workload). NOT
         //   unverified, and NOT any-federated.
+        let crls = self.crls.load_full();
         let tls_config = build_spiffe_outbound_config(
             self.gateway_svid.clone(),
             expected_peer.cloned(),
             expected_trust_domain.cloned(),
             vec![b"h2".to_vec()],
-            self.crls.clone(),
+            crls,
         )?;
         let connector = TlsConnector::from(tls_config);
         // SNI: the destination service FQDN for a cross-cluster east-west dial

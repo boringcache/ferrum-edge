@@ -256,7 +256,7 @@ pub struct HboneConnectionPool {
     entries: DashMap<String, Vec<HbonePoolEntry>>,
     creation_locks: DashMap<String, Arc<Mutex<()>>>,
     gateway_svid: SharedSvidBundle,
-    crls: crate::tls::CrlList,
+    crls: crate::tls::SharedCrlList,
     svid_identity_cache: ArcSwap<Option<HboneSvidIdentityCache>>,
     /// Shared backend SVID generation counter (same `Arc` the HTTP/H2/gRPC/H3
     /// pools stamp into their `|svidg=` key fields). HBONE keys embed the SVID
@@ -335,6 +335,24 @@ impl HboneConnectionPool {
         dns_cache: DnsCache,
         gateway_svid: SharedSvidBundle,
         crls: crate::tls::CrlList,
+        shard_amount: usize,
+        backend_svid_generation: BackendSvidGeneration,
+    ) -> Self {
+        Self::new_with_svid_generation_and_shared_crls(
+            pool_config,
+            dns_cache,
+            gateway_svid,
+            crate::tls::shared_crl_list(crls),
+            shard_amount,
+            backend_svid_generation,
+        )
+    }
+
+    pub fn new_with_svid_generation_and_shared_crls(
+        pool_config: PoolConfig,
+        dns_cache: DnsCache,
+        gateway_svid: SharedSvidBundle,
+        crls: crate::tls::SharedCrlList,
         shard_amount: usize,
         backend_svid_generation: BackendSvidGeneration,
     ) -> Self {
@@ -1475,7 +1493,7 @@ impl Unpin for H2ConnectTunnel {}
 pub(crate) async fn dial_h2_connect_sender(
     dns_cache: &DnsCache,
     gateway_svid: &SharedSvidBundle,
-    crls: &crate::tls::CrlList,
+    crls: &crate::tls::SharedCrlList,
     proxy: &Proxy,
     target_host: &str,
     dial_port: u16,
@@ -1551,12 +1569,13 @@ pub(crate) async fn dial_h2_connect_sender(
     // `sni_override = Some(service FQDN)`). For the in-cluster callers both
     // `expected_trust_domain` and `sni_override` are `None` so behavior is
     // unchanged.
+    let crls = crls.load_full();
     let tls_config = build_spiffe_outbound_config(
         gateway_svid.clone(),
         expected_peer.cloned(),
         expected_trust_domain.cloned(),
         vec![b"h2".to_vec()],
-        crls.clone(),
+        crls,
     )?;
     let connector = TlsConnector::from(tls_config);
     // SNI = the `sni_override` when present (cross-cluster: the destination
