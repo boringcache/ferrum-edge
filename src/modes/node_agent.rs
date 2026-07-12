@@ -2366,33 +2366,108 @@ fn recently_failed_pod_enrollment(
     true
 }
 
+#[cfg(test)]
 fn remember_failed_pod_enrollment(
     state_key: &str,
     signature: PodEnrollmentAttemptSignature,
     snapshot: RetryablePodEnrollment,
 ) {
-    // A later pre-mutation failure (for example, the terminating pod's cgroup
-    // becoming unresolvable) must not discard exact BPF keys retained by an
-    // earlier partial enrollment. Genuine removal still has to clean those
-    // keys before it can authorize the durable UDP close handoff.
-    let cleanup_state = FAILED_POD_ENROLLMENT_ATTEMPTS
+    let prior_cleanup_state = FAILED_POD_ENROLLMENT_ATTEMPTS
         .get(state_key)
         .and_then(|attempt| attempt.cleanup_state.clone());
+    remember_failed_pod_enrollment_preserving_cleanup(
+        state_key,
+        signature,
+        snapshot,
+        prior_cleanup_state.as_ref(),
+    );
+}
+
+fn remember_failed_pod_enrollment_preserving_cleanup(
+    state_key: &str,
+    signature: PodEnrollmentAttemptSignature,
+    snapshot: RetryablePodEnrollment,
+    prior_cleanup_state: Option<&PodAttachmentState>,
+) {
     FAILED_POD_ENROLLMENT_ATTEMPTS.insert(
         state_key.to_string(),
         FailedPodEnrollmentAttempt {
             signature,
             last_attempt: Instant::now(),
             snapshot: Some(snapshot),
-            cleanup_state,
+            cleanup_state: prior_cleanup_state.cloned(),
         },
     );
 }
 
+#[cfg(test)]
 fn remember_failed_pod_enrollment_with_cleanup_state(
     state_key: &str,
     signature: PodEnrollmentAttemptSignature,
     snapshot: RetryablePodEnrollment,
+    cleanup_state: &PodAttachmentState,
+) {
+    let prior_cleanup_state = FAILED_POD_ENROLLMENT_ATTEMPTS
+        .get(state_key)
+        .and_then(|attempt| attempt.cleanup_state.clone());
+    remember_failed_pod_enrollment_with_merged_cleanup_state(
+        state_key,
+        signature,
+        snapshot,
+        prior_cleanup_state.as_ref(),
+        cleanup_state,
+    );
+}
+
+fn extend_unique_cgroup_ids(target: &mut Vec<u64>, source: &[u64]) {
+    for cgroup_id in source {
+        if !target.contains(cgroup_id) {
+            target.push(*cgroup_id);
+        }
+    }
+}
+
+fn merge_failed_enrollment_cleanup_state(
+    prior: Option<&PodAttachmentState>,
+    current: &PodAttachmentState,
+) -> PodAttachmentState {
+    let Some(prior) = prior else {
+        return current.clone();
+    };
+    let mut merged = current.clone();
+    extend_unique_cgroup_ids(
+        &mut merged.include_ports_cgroup_ids,
+        &prior.include_ports_cgroup_ids,
+    );
+    extend_unique_cgroup_ids(
+        &mut merged.workload_identity_cgroup_ids,
+        &prior.workload_identity_cgroup_ids,
+    );
+    for port in &prior.node_probe_ports {
+        if !merged.node_probe_ports.contains(port) {
+            merged.node_probe_ports.push(*port);
+        }
+    }
+    merged.pod_ip = merged.pod_ip.or(prior.pod_ip);
+    merged.pod_ip6 = merged.pod_ip6.or(prior.pod_ip6);
+    if merged.cgroup_path.is_none() {
+        merged.cgroup_path.clone_from(&prior.cgroup_path);
+    }
+    if merged.veth_iface.is_none() {
+        merged.veth_iface.clone_from(&prior.veth_iface);
+    }
+    if merged.include_ports_policy.is_none() {
+        merged.include_ports_policy = prior.include_ports_policy;
+    }
+    merged.attached |= prior.attached;
+    merged
+}
+
+fn remember_failed_pod_enrollment_with_merged_cleanup_state(
+    state_key: &str,
+    signature: PodEnrollmentAttemptSignature,
+    snapshot: RetryablePodEnrollment,
+    prior_cleanup_state: Option<&PodAttachmentState>,
     cleanup_state: &PodAttachmentState,
 ) {
     FAILED_POD_ENROLLMENT_ATTEMPTS.insert(
@@ -2401,7 +2476,10 @@ fn remember_failed_pod_enrollment_with_cleanup_state(
             signature,
             last_attempt: Instant::now(),
             snapshot: Some(snapshot),
-            cleanup_state: Some(cleanup_state.clone()),
+            cleanup_state: Some(merge_failed_enrollment_cleanup_state(
+                prior_cleanup_state,
+                cleanup_state,
+            )),
         },
     );
 }
@@ -2431,13 +2509,13 @@ fn forget_pod_enrollment_attempt(state_key: &str) {
 ///
 /// This helper closes that gap. It collects the eligible `(state_key,
 /// snapshot)` pairs *first* (an owned `Vec`) so we never mutate
-/// `FAILED_POD_ENROLLMENT_ATTEMPTS` while iterating it, drops each stale record,
-/// then replays it via `handle_pod_added`. Dropping the record first is exactly
-/// what `recently_failed_pod_enrollment` does once the window has elapsed (clear
-/// then proceed), so the re-drive isn't suppressed by its own backoff entry. On
-/// repeated failure `handle_pod_added` re-remembers with a fresh `last_attempt`,
-/// so the pod keeps retrying roughly every `POD_ENROLLMENT_RETRY_BACKOFF` until
-/// it enrolls, is removed, or no longer matches enrollment criteria — strictly
+/// `FAILED_POD_ENROLLMENT_ATTEMPTS` while iterating it, then replays each
+/// snapshot through the backoff-bypassing entry point. That entry point captures
+/// retained cleanup evidence before removing the stale attempt, so a repeated
+/// pre-mutation failure cannot erase keys written by an earlier partial attempt.
+/// On repeated failure it re-remembers with a fresh `last_attempt`, so the pod
+/// keeps retrying roughly every `POD_ENROLLMENT_RETRY_BACKOFF` until it enrolls,
+/// is removed, or no longer matches enrollment criteria — strictly
 /// better-bounded than the pre-#1733 every-Apply churn.
 ///
 /// `force` bypasses the elapsed-time gate; production passes `false`. Tests pass
@@ -2477,14 +2555,7 @@ fn retry_backed_off_pod_enrollments(
         })
         .collect();
 
-    for (state_key, snapshot) in due {
-        // Drop the stale record before replaying. In production this is what
-        // `recently_failed_pod_enrollment` would do once the window elapsed
-        // (clear, then proceed); doing it here lets the re-drive proceed even
-        // under a forced (test) retry whose `last_attempt` is still fresh. If
-        // the re-drive fails again, `handle_pod_added` re-remembers with a fresh
-        // `last_attempt`; if it succeeds, the record stays cleared.
-        forget_failed_pod_enrollment(&state_key);
+    for (_state_key, snapshot) in due {
         let event = snapshot.as_event();
         debug!(
             pod_uid = event.pod_uid,
@@ -2492,7 +2563,7 @@ fn retry_backed_off_pod_enrollments(
             namespace = event.namespace,
             "Re-driving backed-off pod enrollment after retry window"
         );
-        handle_pod_added(backend, pod_states, config, metrics, &event);
+        handle_pod_added_after_backoff(backend, pod_states, config, metrics, &event);
     }
 }
 
@@ -2762,6 +2833,29 @@ fn retry_pending_cgroup_map_removals(
         for (failure_key, state_key, pod_uid, cgroup_id) in
             pending_cgroup_map_removal_failures(pod_states, operation)
         {
+            let live_owner = pod_states.iter().find_map(|entry| {
+                let owns_key = if operation == CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE {
+                    entry.value().include_ports_cgroup_ids.contains(&cgroup_id)
+                } else {
+                    entry
+                        .value()
+                        .workload_identity_cgroup_ids
+                        .contains(&cgroup_id)
+                };
+                owns_key.then(|| entry.key().clone())
+            });
+            if let Some(owner_pod_uid) = live_owner {
+                PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                debug!(
+                    pod_uid,
+                    owner_pod_uid,
+                    cgroup_id,
+                    operation,
+                    "Cleared stale cgroup map removal because a tracked pod owns the key"
+                );
+                complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
+                continue;
+            }
             let result = if operation == CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE {
                 backend.remove_pod_include_ports(cgroup_id)
             } else {
@@ -3534,8 +3628,37 @@ fn handle_pod_added(
     metrics: &NodeAgentMetrics,
     event: &PodEvent<'_>,
 ) {
+    handle_pod_added_inner(backend, pod_states, config, metrics, event, false);
+}
+
+fn handle_pod_added_after_backoff(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    event: &PodEvent<'_>,
+) {
+    handle_pod_added_inner(backend, pod_states, config, metrics, event, true);
+}
+
+fn handle_pod_added_inner(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    event: &PodEvent<'_>,
+    bypass_retry_backoff: bool,
+) {
     let (pod_uid, pod_name, namespace) = (event.pod_uid, event.pod_name, event.namespace);
     let state_key = pod_state_key(pod_states, pod_uid);
+    // Capture cleanup evidence before any elapsed/forced backoff replay forgets
+    // the old attempt. Every failure below must carry it forward: a pre-BPF
+    // failure preserves it unchanged, while a later BPF failure unions the
+    // exact cgroup keys from both attempts. Genuine removal is the only path
+    // allowed to consume this evidence without a successful enrollment.
+    let prior_cleanup_state = FAILED_POD_ENROLLMENT_ATTEMPTS
+        .get(&state_key)
+        .and_then(|attempt| attempt.cleanup_state.clone());
     let decision = pod_watcher::evaluate_enrollment(
         event.labels,
         event.annotations,
@@ -3712,12 +3835,15 @@ fn handle_pod_added(
 
     let attempt_signature =
         pod_enrollment_attempt_signature(event, pod_ip, &cgroup_path, &veth_iface);
-    if recently_failed_pod_enrollment(&state_key, &attempt_signature) {
+    if !bypass_retry_backoff && recently_failed_pod_enrollment(&state_key, &attempt_signature) {
         debug!(
             pod_uid,
             pod_name, namespace, "Skipping repeated pod enrollment attempt during retry backoff"
         );
         return;
+    }
+    if bypass_retry_backoff {
+        forget_failed_pod_enrollment(&state_key);
     }
 
     // Owned event snapshot stored alongside the failed-enrollment record so the
@@ -3735,7 +3861,12 @@ fn handle_pod_added(
             "Ambient UDP enrollment has no pod source IP yet; deferring until the readiness guard can be keyed"
         );
         metrics.record_attach_error();
-        remember_failed_pod_enrollment(&state_key, attempt_signature, enrollment_snapshot);
+        remember_failed_pod_enrollment_preserving_cleanup(
+            &state_key,
+            attempt_signature,
+            enrollment_snapshot,
+            prior_cleanup_state.as_ref(),
+        );
         return;
     }
 
@@ -3763,7 +3894,12 @@ fn handle_pod_added(
     {
         if !remove_pod_ready_marker(dir, pod_uid) {
             metrics.record_attach_error();
-            remember_failed_pod_enrollment(&state_key, attempt_signature, enrollment_snapshot);
+            remember_failed_pod_enrollment_preserving_cleanup(
+                &state_key,
+                attempt_signature,
+                enrollment_snapshot,
+                prior_cleanup_state.as_ref(),
+            );
             return;
         }
         // A live pod can leave and later re-enter mesh enrollment with the same
@@ -3772,7 +3908,12 @@ fn handle_pod_added(
         // enrollment opens the host gate again.
         if !remove_udp_gate_cleaned_proof(dir, pod_uid) {
             metrics.record_attach_error();
-            remember_failed_pod_enrollment(&state_key, attempt_signature, enrollment_snapshot);
+            remember_failed_pod_enrollment_preserving_cleanup(
+                &state_key,
+                attempt_signature,
+                enrollment_snapshot,
+                prior_cleanup_state.as_ref(),
+            );
             return;
         }
     }
@@ -3838,10 +3979,11 @@ fn handle_pod_added(
                     warn!(pod_uid, %ip, error = %e, "Failed to arm UDP enrollment guard");
                     metrics.record_attach_error();
                     cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
-                    remember_failed_pod_enrollment_with_cleanup_state(
+                    remember_failed_pod_enrollment_with_merged_cleanup_state(
                         &state_key,
                         attempt_signature,
                         enrollment_snapshot.clone(),
+                        prior_cleanup_state.as_ref(),
                         &state,
                     );
                     return;
@@ -3852,10 +3994,11 @@ fn handle_pod_added(
                     warn!(pod_uid, %ip, error = %e, "Failed to arm IPv6 UDP enrollment guard");
                     metrics.record_attach_error();
                     cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
-                    remember_failed_pod_enrollment_with_cleanup_state(
+                    remember_failed_pod_enrollment_with_merged_cleanup_state(
                         &state_key,
                         attempt_signature,
                         enrollment_snapshot.clone(),
+                        prior_cleanup_state.as_ref(),
                         &state,
                     );
                     return;
@@ -3870,10 +4013,11 @@ fn handle_pod_added(
                 );
                 metrics.record_attach_error();
                 cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
-                remember_failed_pod_enrollment_with_cleanup_state(
+                remember_failed_pod_enrollment_with_merged_cleanup_state(
                     &state_key,
                     attempt_signature,
                     enrollment_snapshot.clone(),
+                    prior_cleanup_state.as_ref(),
                     &state,
                 );
                 return;
@@ -3890,10 +4034,11 @@ fn handle_pod_added(
                     );
                     metrics.record_attach_error();
                     cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
-                    remember_failed_pod_enrollment_with_cleanup_state(
+                    remember_failed_pod_enrollment_with_merged_cleanup_state(
                         &state_key,
                         attempt_signature,
                         enrollment_snapshot.clone(),
+                        prior_cleanup_state.as_ref(),
                         &state,
                     );
                     return;
@@ -3934,10 +4079,11 @@ fn handle_pod_added(
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IP map");
                     metrics.record_attach_error();
                     cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
-                    remember_failed_pod_enrollment_with_cleanup_state(
+                    remember_failed_pod_enrollment_with_merged_cleanup_state(
                         &state_key,
                         attempt_signature,
                         enrollment_snapshot.clone(),
+                        prior_cleanup_state.as_ref(),
                         &state,
                     );
                     return;
@@ -3949,10 +4095,11 @@ fn handle_pod_added(
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IPv6 map");
                     metrics.record_attach_error();
                     cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
-                    remember_failed_pod_enrollment_with_cleanup_state(
+                    remember_failed_pod_enrollment_with_merged_cleanup_state(
                         &state_key,
                         attempt_signature,
                         enrollment_snapshot.clone(),
+                        prior_cleanup_state.as_ref(),
                         &state,
                     );
                     return;
@@ -3962,10 +4109,11 @@ fn handle_pod_added(
                 warn!(pod_uid, error = %e, "Failed to update node probe-port maps");
                 metrics.record_attach_error();
                 cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
-                remember_failed_pod_enrollment_with_cleanup_state(
+                remember_failed_pod_enrollment_with_merged_cleanup_state(
                     &state_key,
                     attempt_signature,
                     enrollment_snapshot.clone(),
+                    prior_cleanup_state.as_ref(),
                     &state,
                 );
                 return;
@@ -3984,10 +4132,11 @@ fn handle_pod_added(
             );
         } else {
             cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
-            remember_failed_pod_enrollment_with_cleanup_state(
+            remember_failed_pod_enrollment_with_merged_cleanup_state(
                 &state_key,
                 attempt_signature,
                 enrollment_snapshot,
+                prior_cleanup_state.as_ref(),
                 &state,
             );
         }
@@ -3997,7 +4146,12 @@ fn handle_pod_added(
             pod_name, "Could not resolve cgroup path, skipping attachment"
         );
         metrics.record_attach_error();
-        remember_failed_pod_enrollment(&state_key, attempt_signature, enrollment_snapshot);
+        remember_failed_pod_enrollment_preserving_cleanup(
+            &state_key,
+            attempt_signature,
+            enrollment_snapshot,
+            prior_cleanup_state.as_ref(),
+        );
         return;
     }
 
@@ -4769,7 +4923,7 @@ fn record_removed_pod_detach_result(
     }
 }
 
-fn remove_failed_enrollment_cgroup_maps(
+fn remove_pod_cgroup_maps_recording_failures(
     backend: &mut dyn EbpfBackend,
     metrics: &NodeAgentMetrics,
     state_key: &str,
@@ -4791,7 +4945,7 @@ fn remove_failed_enrollment_cgroup_maps(
                     pod_uid,
                     cgroup_id = *cgroup_id,
                     error = %e,
-                    "Failed to remove failed-enrollment includeOutboundPorts entry"
+                    "Failed to remove pod includeOutboundPorts entry"
                 );
                 metrics.record_attach_error();
                 remember_pending_capture_failure(
@@ -4817,7 +4971,7 @@ fn remove_failed_enrollment_cgroup_maps(
                     pod_uid,
                     cgroup_id = *cgroup_id,
                     error = %e,
-                    "Failed to remove failed-enrollment workload-identity entry"
+                    "Failed to remove pod workload-identity entry"
                 );
                 metrics.record_attach_error();
                 remember_pending_capture_failure(
@@ -4864,7 +5018,7 @@ fn verify_failed_enrollment_cleanup_on_removal(
             "failed enrollment pod removed",
         );
     }
-    remove_failed_enrollment_cgroup_maps(backend, metrics, state_key, pod_uid, state);
+    remove_pod_cgroup_maps_recording_failures(backend, metrics, state_key, pod_uid, state);
     cleanup_succeeded &= !has_pending_removal_blocking_failure(state_key);
     cleanup_succeeded
 }
@@ -4967,33 +5121,10 @@ pub fn handle_pod_removed(
         if let Some(ip) = state.pod_ip6 {
             remove_pod_ip6_if_unowned(backend, pod_states, metrics, pod_uid, ip, "pod removed");
         }
-        // Pair with `apply_include_outbound_ports` — only annotated pods ever
-        // carried entries. Use the stashed cgroup ids (pod inode + descendant
-        // container-cgroup inodes) so we don't re-stat a possibly torn-down
-        // cgroup tree. Tolerates ENOENT per entry.
-        for cgroup_id in &state.include_ports_cgroup_ids {
-            if let Err(e) = backend.remove_pod_include_ports(*cgroup_id) {
-                warn!(
-                    pod_uid,
-                    cgroup_id = *cgroup_id,
-                    error = %e,
-                    "Failed to remove pod includeOutboundPorts entry from BPF map"
-                );
-            }
-        }
-        // GAP-1b: pair with `apply_workload_identity`. Use the stashed cgroup
-        // ids (pod inode + descendant container-cgroup inodes) so we don't
-        // re-stat a possibly torn-down cgroup tree. Tolerates ENOENT per entry.
-        for cgroup_id in &state.workload_identity_cgroup_ids {
-            if let Err(e) = backend.remove_workload_identity(*cgroup_id) {
-                warn!(
-                    pod_uid,
-                    cgroup_id = *cgroup_id,
-                    error = %e,
-                    "Failed to remove pod workload-identity entry from BPF map"
-                );
-            }
-        }
+        // Pair with the enrollment writes using the stashed pod + descendant
+        // cgroup inode keys. Failures are removal blockers just like detach and
+        // pod-IP failures: retries must clear them before proof/ack is minted.
+        remove_pod_cgroup_maps_recording_failures(backend, metrics, &state_key, pod_uid, &state);
         metrics.pods_unenrolled.fetch_add(1, Ordering::Relaxed);
         info!(pod_uid, pod_name = %state.pod_name, "Pod unenrolled from eBPF capture");
         udp_gate_cleanup_succeeded &= !has_pending_removal_blocking_failure(&state_key);
@@ -6603,12 +6734,25 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
-    fn plain_failed_enrollment_preserves_prior_cleanup_state() {
+    fn backed_off_enrollment_replay_preserves_and_merges_prior_cleanup_state() {
         let pod_states = DashMap::new();
         let pod_uid = "pod-cleanup-state-merge";
         let state_key = pod_state_key(&pod_states, pod_uid);
         let ip = std::net::Ipv4Addr::new(10, 0, 0, 21);
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
         let cleanup_state = PodAttachmentState {
             pod_uid: pod_uid.to_string(),
             pod_name: pod_uid.to_string(),
@@ -6623,27 +6767,54 @@ mod tests {
             workload_identity_cgroup_ids: vec![42],
             node_probe_ports: vec![15021],
         };
+        let mut retryable = test_retryable_enrollment(pod_uid, ip);
+        retryable.labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        retryable.annotations = HashMap::from([(
+            "ferrum.io/includeOutboundPorts".to_string(),
+            "8080".to_string(),
+        )]);
         remember_failed_pod_enrollment_with_cleanup_state(
             &state_key,
             test_failed_enrollment_signature(ip, Some("/cg/first-attempt")),
-            test_retryable_enrollment(pod_uid, ip),
+            retryable,
             &cleanup_state,
         );
 
-        // A changed signature bypasses the same-attempt backoff gate and can
-        // reach the plain remember path when a terminating pod's cgroup is no
-        // longer resolvable.
-        remember_failed_pod_enrollment(
-            &state_key,
-            test_failed_enrollment_signature(ip, None),
-            test_retryable_enrollment(pod_uid, ip),
-        );
+        let metrics = NodeAgentMetrics::default();
+        let mut backend = MockEbpfBackend::default();
+        retry_backed_off_pod_enrollments(&mut backend, &pod_states, &config, &metrics, true);
+
+        {
+            let remembered = FAILED_POD_ENROLLMENT_ATTEMPTS.get(&state_key).unwrap();
+            let remembered_cleanup = remembered.cleanup_state.as_ref().unwrap();
+            assert_eq!(remembered_cleanup.include_ports_cgroup_ids, vec![41]);
+            assert_eq!(remembered_cleanup.workload_identity_cgroup_ids, vec![42]);
+            assert_eq!(remembered_cleanup.node_probe_ports, vec![15021]);
+        }
+
+        // A later replay reaches a different cgroup's BPF maps before failing.
+        // Both attempts' exact cgroup keys must remain cleanup evidence.
+        std::fs::create_dir_all(
+            cgroup_root
+                .path()
+                .join("kubepods/podpod-cleanup-state-merge"),
+        )
+        .unwrap();
+        let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth-test");
+        backend.fail_attach_tc = true;
+        retry_backed_off_pod_enrollments(&mut backend, &pod_states, &config, &metrics, true);
 
         let remembered = FAILED_POD_ENROLLMENT_ATTEMPTS.get(&state_key).unwrap();
         let remembered_cleanup = remembered.cleanup_state.as_ref().unwrap();
-        assert_eq!(remembered_cleanup.include_ports_cgroup_ids, vec![41]);
-        assert_eq!(remembered_cleanup.workload_identity_cgroup_ids, vec![42]);
-        assert_eq!(remembered_cleanup.node_probe_ports, vec![15021]);
+        assert!(remembered_cleanup.include_ports_cgroup_ids.contains(&41));
+        assert!(remembered_cleanup.include_ports_cgroup_ids.len() > 1);
+        assert!(
+            remembered_cleanup
+                .workload_identity_cgroup_ids
+                .contains(&42)
+        );
+        assert!(remembered_cleanup.workload_identity_cgroup_ids.len() > 1);
+        assert!(remembered_cleanup.node_probe_ports.contains(&15021));
         drop(remembered);
         forget_failed_pod_enrollment(&state_key);
     }
@@ -6980,6 +7151,192 @@ mod tests {
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_READY
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cgroup_map_removal_retries_preserve_same_uid_reenrollment() {
+        let pod_uid = "123e4567-e89b-12d3-a456-426614174000";
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let cgroup_path = cgroup_root.path().join(format!("kubepods/pod{pod_uid}"));
+        std::fs::create_dir_all(&cgroup_path).unwrap();
+        let cgroup_ids = cgroup::collect_cgroup_tree_inodes(&cgroup_path);
+        assert!(!cgroup_ids.is_empty());
+
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        let pod_states = DashMap::new();
+        let state_key = pod_state_key(&pod_states, pod_uid);
+        let cleanup_state = PodAttachmentState {
+            pod_uid: pod_uid.to_string(),
+            pod_name: pod_uid.to_string(),
+            namespace: "default".to_string(),
+            pod_ip: None,
+            pod_ip6: None,
+            cgroup_path: Some(cgroup_path.to_string_lossy().to_string()),
+            veth_iface: Some("veth-test".to_string()),
+            attached: false,
+            include_ports_cgroup_ids: cgroup_ids.clone(),
+            include_ports_policy: Some(IncludePortsPolicy::all()),
+            workload_identity_cgroup_ids: cgroup_ids.clone(),
+            node_probe_ports: Vec::new(),
+        };
+        remember_failed_pod_enrollment_with_cleanup_state(
+            &state_key,
+            test_failed_enrollment_signature(
+                std::net::Ipv4Addr::new(10, 0, 0, 31),
+                cleanup_state.cgroup_path.as_deref(),
+            ),
+            test_retryable_enrollment(pod_uid, std::net::Ipv4Addr::new(10, 0, 0, 31)),
+            &cleanup_state,
+        );
+        let mut backend = MockEbpfBackend {
+            fail_remove_pod_include_ports: true,
+            fail_remove_workload_identity: true,
+            ..MockEbpfBackend::default()
+        };
+        for cgroup_id in &cgroup_ids {
+            backend
+                .update_pod_include_ports(*cgroup_id, &IncludePortsPolicy::all())
+                .unwrap();
+            backend
+                .update_workload_identity(*cgroup_id, &crate::ebpf::WorkloadIdentity::unknown())
+                .unwrap();
+        }
+        let metrics = NodeAgentMetrics::default();
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, pod_uid);
+        assert!(has_pending_removal_blocking_failure(&state_key));
+
+        backend.fail_remove_pod_include_ports = false;
+        backend.fail_remove_workload_identity = false;
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations = HashMap::from([(
+            "ferrum.io/includeOutboundPorts".to_string(),
+            "8080".to_string(),
+        )]);
+        let event = PodEvent {
+            pod_uid,
+            pod_name: "reenrolled-pod",
+            namespace: "default",
+            service_account: None,
+            labels: &labels,
+            annotations: &annotations,
+            pod_ip_str: Some("10.0.0.31"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.31")),
+            node_probe_ports: Vec::new(),
+            pod_pid: None,
+            veth_iface_override: Some("veth-test"),
+        };
+        handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+        assert!(pod_states.contains_key(pod_uid));
+
+        retry_pending_cgroup_map_removals(&mut backend, &pod_states, &config, &metrics);
+
+        assert!(!has_pending_removal_blocking_failure(&state_key));
+        for cgroup_id in &cgroup_ids {
+            assert!(backend.include_ports.contains_key(cgroup_id));
+            assert!(backend.workload_identities.contains_key(cgroup_id));
+        }
+        forget_pending_capture_failures_for_pod(&state_key);
+    }
+
+    #[test]
+    fn tracked_cgroup_map_removal_failures_block_udp_handoff_until_retry() {
+        let registry = tempfile::tempdir().unwrap();
+        let pod_uid = "tracked-cgroup-map-remove-retry";
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.udp_capture_enabled = true;
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let pod_states = DashMap::new();
+        pod_states.insert(
+            pod_uid.to_string(),
+            PodAttachmentState {
+                pod_uid: pod_uid.to_string(),
+                pod_name: pod_uid.to_string(),
+                namespace: "default".to_string(),
+                pod_ip: None,
+                pod_ip6: None,
+                cgroup_path: Some("/cg/tracked-remove-retry".to_string()),
+                veth_iface: Some("veth-test".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: vec![71],
+                include_ports_policy: Some(IncludePortsPolicy::all()),
+                workload_identity_cgroup_ids: vec![72],
+                node_probe_ports: Vec::new(),
+            },
+        );
+        let state_key = pod_state_key(&pod_states, pod_uid);
+        let mut backend = MockEbpfBackend {
+            fail_remove_pod_include_ports: true,
+            fail_remove_workload_identity: true,
+            ..MockEbpfBackend::default()
+        };
+        backend
+            .update_pod_include_ports(71, &IncludePortsPolicy::all())
+            .unwrap();
+        backend
+            .update_workload_identity(72, &crate::ebpf::WorkloadIdentity::unknown())
+            .unwrap();
+        let metrics = NodeAgentMetrics::default();
+
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, pod_uid);
+
+        assert!(has_pending_removal_blocking_failure(&state_key));
+        assert!(
+            !registry
+                .path()
+                .join(".udp-gate-cleaned")
+                .join(pod_uid)
+                .exists()
+        );
+        assert!(
+            !registry
+                .path()
+                .join(".udp-not-ready")
+                .join(pod_uid)
+                .exists()
+        );
+
+        backend.fail_remove_pod_include_ports = false;
+        backend.fail_remove_workload_identity = false;
+        retry_pending_cgroup_map_removals(&mut backend, &pod_states, &config, &metrics);
+
+        assert!(!has_pending_removal_blocking_failure(&state_key));
+        assert!(!backend.include_ports.contains_key(&71));
+        assert!(!backend.workload_identities.contains_key(&72));
+        assert!(
+            registry
+                .path()
+                .join(".udp-gate-cleaned")
+                .join(pod_uid)
+                .is_file()
+        );
+        assert!(
+            registry
+                .path()
+                .join(".udp-not-ready")
+                .join(pod_uid)
+                .is_file()
         );
     }
 
