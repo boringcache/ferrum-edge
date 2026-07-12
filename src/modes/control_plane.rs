@@ -453,6 +453,82 @@ fn reject_invalid_cp_full_snapshot(config: &GatewayConfig) -> Result<(), anyhow:
     )
 }
 
+/// Run the rejecting runtime validators with the same namespace boundaries as
+/// CP full loads. The CP keeps a merged snapshot in memory, but configuration
+/// uniqueness is defined per namespace.
+fn collect_rejecting_cp_incremental_errors(
+    config: &GatewayConfig,
+    namespaces: &[String],
+) -> Vec<String> {
+    let mut validation_namespaces = namespaces.to_vec();
+    validation_namespaces.extend(namespaces_referenced_by_config(config));
+    let validation_namespaces = normalize_namespace_list(&validation_namespaces);
+    if validation_namespaces.len() <= 1 {
+        return collect_rejecting_runtime_config_errors(config);
+    }
+
+    let mut errors = Vec::new();
+    for namespace in validation_namespaces {
+        let namespace_config = CpGrpcServer::filter_config_to_namespace(config, &namespace);
+        errors.extend(
+            collect_rejecting_runtime_config_errors(&namespace_config)
+                .into_iter()
+                .map(|error| format!("namespace '{namespace}': {error}")),
+        );
+    }
+    errors
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CpRejectedDeltaDecision {
+    consecutive: u64,
+    should_escalate: bool,
+}
+
+/// Tracks repeated CP delta rejections so validator asymmetries cannot wedge
+/// distribution indefinitely. Sequence maps identify the effective batch:
+/// when new durable changes arrive, at least one namespace cursor changes and
+/// the rejection count restarts.
+struct CpRejectedDeltaTracker {
+    rejected_sequences: Option<HashMap<String, u64>>,
+    consecutive: u64,
+    full_reload_threshold: u64,
+}
+
+impl CpRejectedDeltaTracker {
+    fn new(full_reload_threshold: u64) -> Self {
+        Self {
+            rejected_sequences: None,
+            consecutive: 0,
+            full_reload_threshold: full_reload_threshold.max(1),
+        }
+    }
+
+    fn record_rejection(
+        &mut self,
+        next_sequences: &HashMap<String, u64>,
+    ) -> CpRejectedDeltaDecision {
+        if self.rejected_sequences.as_ref() == Some(next_sequences) {
+            self.consecutive = self.consecutive.saturating_add(1);
+        } else {
+            self.rejected_sequences = Some(next_sequences.clone());
+            self.consecutive = 1;
+        }
+
+        CpRejectedDeltaDecision {
+            consecutive: self.consecutive,
+            should_escalate: self.consecutive >= self.full_reload_threshold
+                && (self.consecutive - self.full_reload_threshold)
+                    .is_multiple_of(self.full_reload_threshold),
+        }
+    }
+
+    fn record_accepted(&mut self) {
+        self.rejected_sequences = None;
+        self.consecutive = 0;
+    }
+}
+
 /// Partition an `IncrementalResult` by `namespace`, returning a delta for
 /// each namespace that has at least one changed or removed resource.
 ///
@@ -1313,6 +1389,7 @@ pub async fn run(
     let dp_registry_poll = dp_registry.clone();
     let poll_cert_expiry_warning_days = env_config.tls_cert_expiry_warning_days;
     let poll_backend_allow_ips = env_config.backend_allow_ips.clone();
+    let rejected_delta_full_reload_threshold = env_config.db_rejected_delta_full_reload_threshold;
     let mesh_registry_poll = mesh_registry.clone();
     let poll_scope = cp_scope.clone();
     let poll_broadcasts = broadcasts.clone();
@@ -1329,6 +1406,8 @@ pub async fn run(
         let mut force_full_reload = false;
         let mut last_polled_namespaces = initial_polled_namespaces;
         let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
+        let mut rejected_delta_tracker =
+            CpRejectedDeltaTracker::new(rejected_delta_full_reload_threshold);
 
         let mut last_change_sequences = initial_change_sequences;
 
@@ -1406,6 +1485,7 @@ pub async fn run(
                                 config_poll.store(new_config_arc.clone());
                                 last_polled_namespaces = nslist.clone();
                                 force_full_reload = false;
+                                rejected_delta_tracker.record_accepted();
                                 db_available_poll.store(true, Ordering::Relaxed);
 
                                 // Per-namespace fan-out. For `Single` this
@@ -1473,6 +1553,7 @@ pub async fn run(
                                 last_polled_namespaces = nslist.clone();
                                 if result.is_empty() {
                                     last_change_sequences = next_change_sequences;
+                                    rejected_delta_tracker.record_accepted();
                                     continue;
                                 }
                                 let poll_ts = result.poll_timestamp;
@@ -1505,16 +1586,63 @@ pub async fn run(
                                 // Rejecting validators — collect all failures so
                                 // operators see every reason in a single poll cycle.
                                 let validation_errors =
-                                    collect_rejecting_runtime_config_errors(&new_config);
+                                    collect_rejecting_cp_incremental_errors(&new_config, &nslist);
                                 if !validation_errors.is_empty() {
                                     for msg in &validation_errors {
                                         error!("CP incremental config rejected: {}", msg);
                                     }
-                                    warn!(
-                                        "Incremental config update rejected by validation; \
-                                         leaving the sequence cursor unchanged so the next poll \
-                                         retries the same rows"
-                                    );
+                                    let decision = rejected_delta_tracker
+                                        .record_rejection(&next_change_sequences);
+                                    if decision.should_escalate {
+                                        error!(
+                                            consecutive_identical_rejections = decision.consecutive,
+                                            "Repeated CP delta rejection reached threshold; attempting authoritative full reload"
+                                        );
+                                        match load_full_config_multi_with_sequence(
+                                            db_poll.as_ref(),
+                                            &nslist,
+                                        )
+                                        .await
+                                        {
+                                            Ok((full_config, sequences)) => {
+                                                last_change_sequences = sequences;
+                                                last_polled_namespaces = nslist.clone();
+                                                let full_config_arc = Arc::new(full_config.clone());
+                                                config_poll.store(full_config_arc.clone());
+                                                for ns in &nslist {
+                                                    CpGrpcServer::broadcast_namespace_update(
+                                                        poll_broadcasts.as_ref(),
+                                                        ns,
+                                                        &full_config,
+                                                        &dp_registry_poll,
+                                                        &poll_scope,
+                                                    );
+                                                }
+                                                MeshGrpcServer::broadcast_full_with_registry(
+                                                    &mesh_update_tx,
+                                                    full_config_arc,
+                                                    &mesh_registry_poll,
+                                                );
+                                                rejected_delta_tracker.record_accepted();
+                                                db_available_poll
+                                                    .store(true, Ordering::Relaxed);
+                                                info!(
+                                                    "Rejected CP delta recovered by authoritative full reload and full-snapshot broadcast"
+                                                );
+                                            }
+                                            Err(error) => {
+                                                warn!(
+                                                    "Authoritative full reload failed after repeated CP delta rejection; keeping the last accepted cursors and cached config: {}",
+                                                    error
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        warn!(
+                                            consecutive_identical_rejections = decision.consecutive,
+                                            "Incremental CP config update rejected by validation; leaving sequence cursors unchanged so the next poll retries the same rows"
+                                        );
+                                    }
                                     continue;
                                 }
 
@@ -1569,6 +1697,7 @@ pub async fn run(
                                     version
                                 );
                                 last_change_sequences = next_change_sequences;
+                                rejected_delta_tracker.record_accepted();
                             }
                             Err(e) => {
                                 warn!(
@@ -1581,6 +1710,7 @@ pub async fn run(
                                         db_available_poll.store(true, Ordering::Relaxed);
                                         last_polled_namespaces = nslist.clone();
                                         last_change_sequences = sequences;
+                                        rejected_delta_tracker.record_accepted();
                                         let new_config_arc = Arc::new(new_config.clone());
                                         config_poll.store(new_config_arc.clone());
                                         for ns in &nslist {
@@ -1605,6 +1735,7 @@ pub async fn run(
                                                         db_available_poll.store(true, Ordering::Relaxed);
                                                         last_polled_namespaces = nslist.clone();
                                                         last_change_sequences = sequences;
+                                                        rejected_delta_tracker.record_accepted();
                                                         let new_config_arc = Arc::new(new_config.clone());
                                                         config_poll.store(new_config_arc.clone());
                                                         for ns in &nslist {
@@ -2004,6 +2135,68 @@ mod tests {
 
         prepare_cp_full_snapshot(config)
             .expect_err("same-namespace stream listen-port conflicts must be rejected");
+    }
+
+    #[test]
+    fn cp_incremental_validation_allows_same_stream_port_across_namespaces() {
+        let mut config = GatewayConfig {
+            proxies: vec![make_stream_proxy("tcp-a", "tenant-a", 15432)],
+            ..Default::default()
+        };
+        let mut delta = empty_incremental();
+        delta.added_or_modified_proxies = vec![make_stream_proxy("tcp-b", "tenant-b", 15432)];
+        apply_incremental_to_config(&mut config, delta);
+
+        let errors = collect_rejecting_cp_incremental_errors(
+            &config,
+            &["tenant-a".to_string(), "tenant-b".to_string()],
+        );
+
+        assert!(
+            errors.is_empty(),
+            "cross-namespace stream ports must validate independently: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn cp_incremental_validation_rejects_same_stream_port_in_one_namespace() {
+        let config = GatewayConfig {
+            proxies: vec![
+                make_stream_proxy("tcp-a", "tenant-a", 15432),
+                make_stream_proxy("tcp-b", "tenant-a", 15432),
+            ],
+            ..Default::default()
+        };
+
+        let errors = collect_rejecting_cp_incremental_errors(
+            &config,
+            &["tenant-a".to_string(), "tenant-b".to_string()],
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("Duplicate listen_port 15432")),
+            "same-namespace conflict must still be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn cp_rejected_delta_escalates_and_resets_after_full_reload_recovery() {
+        let mut tracker = CpRejectedDeltaTracker::new(3);
+        let sequences = HashMap::from([("tenant-a".to_string(), 10), ("tenant-b".to_string(), 20)]);
+
+        assert!(!tracker.record_rejection(&sequences).should_escalate);
+        assert!(!tracker.record_rejection(&sequences).should_escalate);
+        let escalation = tracker.record_rejection(&sequences);
+        assert!(escalation.should_escalate);
+        assert_eq!(escalation.consecutive, 3);
+
+        // The poll loop calls this after an accepted authoritative full reload.
+        tracker.record_accepted();
+        let after_recovery = tracker.record_rejection(&sequences);
+        assert!(!after_recovery.should_escalate);
+        assert_eq!(after_recovery.consecutive, 1);
     }
 
     #[test]
