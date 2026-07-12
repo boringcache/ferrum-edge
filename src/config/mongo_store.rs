@@ -1175,12 +1175,12 @@ mod inner {
             resource_type: &str,
             resource_ids: &[&str],
             change_error: &anyhow::Error,
-        ) -> bool {
+        ) -> HashSet<String> {
             if resource_ids.is_empty() {
-                return true;
+                return HashSet::new();
             }
 
-            let mut deleted_count = 0_u64;
+            let mut confirmed_absent = HashSet::with_capacity(resource_ids.len());
             for chunk in resource_ids.chunks(500) {
                 let id_values: Vec<Bson> = chunk
                     .iter()
@@ -1192,30 +1192,40 @@ mod inner {
                     .await
                 {
                     Ok(result) => {
-                        deleted_count += result.deleted_count;
+                        // A successful delete_many confirms that every ID in
+                        // this chunk is absent when the operation completes,
+                        // including IDs that were already absent.
+                        confirmed_absent
+                            .extend(chunk.iter().map(|resource_id| (*resource_id).to_string()));
+                        debug!(
+                            "MongoDB standalone {} batch rollback deleted {} documents from a {}-ID chunk",
+                            resource_type,
+                            result.deleted_count,
+                            chunk.len()
+                        );
                     }
                     Err(rollback_err) => {
                         warn!(
-                            "MongoDB standalone {} batch create failed to record config_changes and rollback failed after deleting {} of {} inserted documents: {}; original error: {}",
+                            "MongoDB standalone {} batch create failed to record config_changes and rollback failed after confirming {} of {} inserted documents absent: {}; original error: {}",
                             resource_type,
-                            deleted_count,
+                            confirmed_absent.len(),
                             resource_ids.len(),
                             rollback_err,
                             change_error
                         );
-                        return false;
+                        return confirmed_absent;
                     }
                 }
             }
 
             warn!(
-                "Rolled back MongoDB standalone {} batch create after config_changes write failed; deleted {} of {} inserted documents: {}",
+                "Rolled back MongoDB standalone {} batch create after config_changes write failed; confirmed {} of {} inserted documents absent: {}",
                 resource_type,
-                deleted_count,
+                confirmed_absent.len(),
                 resource_ids.len(),
                 change_error
             );
-            deleted_count == resource_ids.len() as u64
+            confirmed_absent
         }
 
         fn resource_ids_without_failed_insert_indices<'a>(
@@ -1955,20 +1965,26 @@ mod inner {
             }
         }
 
-        /// Best-effort compensation for `batch_create_consumers` failure paths
-        /// that run AFTER the identity reservations fully committed: release
-        /// every identity reservation owned by the batch's consumers.
-        /// (Reaching those paths implies no batch identity value pre-existed —
-        /// the earlier ordered reservation insert would have duplicate-keyed —
-        /// so the full release cannot touch a foreign reservation.)
-        async fn release_batch_consumer_identity_docs_best_effort(&self, consumers: &[Consumer]) {
+        /// Release reservations only for consumer documents whose compensating
+        /// delete was confirmed. Reservations for documents in a failed or
+        /// unverified rollback chunk remain held so later writes cannot claim
+        /// identities that may still belong to a persisted consumer.
+        async fn release_confirmed_batch_consumer_identity_docs_best_effort(
+            &self,
+            consumers: &[Consumer],
+            confirmed_absent_doc_ids: &HashSet<String>,
+        ) {
             for consumer in consumers {
-                self.release_consumer_identity_values_best_effort(
-                    &consumer.namespace,
-                    &consumer.id,
-                    &consumer_identity_values(consumer),
-                )
-                .await;
+                if confirmed_absent_doc_ids
+                    .contains(&consumer_doc_id(&consumer.namespace, &consumer.id))
+                {
+                    self.release_consumer_identity_values_best_effort(
+                        &consumer.namespace,
+                        &consumer.id,
+                        &consumer_identity_values(consumer),
+                    )
+                    .await;
+                }
             }
         }
 
@@ -5704,19 +5720,19 @@ mod inner {
                         let rollback_ids =
                             Self::rollback_ids_for_unordered_insert_error(&ids, &err);
                         let err = anyhow::Error::new(err);
-                        let rollback_confirmed = !rollback_ids.is_empty()
-                            && self
-                                .rollback_standalone_created_documents(
-                                    "consumers",
-                                    "consumer",
-                                    &rollback_ids,
-                                    &err,
-                                )
-                                .await;
-                        if rollback_confirmed {
-                            self.release_batch_consumer_identity_docs_best_effort(consumers)
-                                .await;
-                        }
+                        let confirmed_absent = self
+                            .rollback_standalone_created_documents(
+                                "consumers",
+                                "consumer",
+                                &rollback_ids,
+                                &err,
+                            )
+                            .await;
+                        self.release_confirmed_batch_consumer_identity_docs_best_effort(
+                            consumers,
+                            &confirmed_absent,
+                        )
+                        .await;
                         return Err(err);
                     }
                 };
@@ -5730,13 +5746,14 @@ mod inner {
                     })
                     .collect();
                 if let Err(err) = self.record_config_changes_batch(&changes).await {
-                    let rollback_confirmed = self
+                    let confirmed_absent = self
                         .rollback_standalone_created_documents("consumers", "consumer", &ids, &err)
                         .await;
-                    if rollback_confirmed {
-                        self.release_batch_consumer_identity_docs_best_effort(consumers)
-                            .await;
-                    }
+                    self.release_confirmed_batch_consumer_identity_docs_best_effort(
+                        consumers,
+                        &confirmed_absent,
+                    )
+                    .await;
                     return Err(err);
                 }
                 Ok(result.inserted_ids.len())

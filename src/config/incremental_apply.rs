@@ -49,7 +49,6 @@ fn apply_incremental_resources(config: &mut GatewayConfig, result: IncrementalRe
         .retain(|proxy| !removed_proxies.contains(proxy.id.as_str()));
     config.consumers.retain(|consumer| {
         !removed_consumers.contains(&(consumer.namespace.as_str(), consumer.id.as_str()))
-            && !removed_consumers.contains(&("", consumer.id.as_str()))
     });
     config
         .plugin_configs

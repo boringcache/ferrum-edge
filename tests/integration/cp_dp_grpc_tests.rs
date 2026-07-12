@@ -2260,8 +2260,8 @@ async fn test_dp_applies_delta_then_full_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_dp_ignores_malformed_delta() {
-    // Verify that a malformed delta doesn't corrupt existing config.
+async fn test_dp_keeps_last_good_config_after_legacy_delta_shape() {
+    // Verify that an unsupported legacy delta shape doesn't corrupt existing config.
     let cp_config = create_test_config(2);
     let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
 
@@ -2293,10 +2293,26 @@ async fn test_dp_ignores_malformed_delta() {
     .await;
     assert!(received.is_ok());
 
-    // Send malformed delta (invalid JSON for update_type=1)
+    // Legacy CPs sent removed consumer IDs as bare strings. Mixed-version
+    // CP/DP fleets are unsupported during build-out, so this valid JSON must
+    // fail the current namespaced delta schema safely.
+    let mut legacy_delta = serde_json::to_value(IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        sequence_cursor: 0,
+        poll_timestamp: Utc::now(),
+    })
+    .unwrap();
+    legacy_delta["removed_consumer_ids"] = serde_json::json!(["consumer-legacy"]);
     let malformed = ferrum_edge::grpc::proto::ConfigUpdate {
         update_type: 1, // DELTA
-        config_json: "{not valid delta json!!!}".to_string(),
+        config_json: serde_json::to_string(&legacy_delta).unwrap(),
         version: "bad".to_string(),
         timestamp: Utc::now().timestamp(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
@@ -2309,7 +2325,7 @@ async fn test_dp_ignores_malformed_delta() {
     assert_eq!(
         proxy_state.config.load().proxies.len(),
         2,
-        "Config should remain unchanged after malformed delta"
+        "Config should remain unchanged after unsupported legacy delta"
     );
 
     // Send a valid delta to prove client is still alive

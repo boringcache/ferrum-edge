@@ -496,7 +496,7 @@ fn incremental_result_not_empty_with_removed_consumer() {
 }
 
 #[test]
-fn incremental_result_accepts_legacy_removed_consumer_ids() {
+fn incremental_result_rejects_legacy_removed_consumer_ids() {
     let result = IncrementalResult {
         added_or_modified_proxies: vec![],
         removed_proxy_ids: vec![],
@@ -512,11 +512,7 @@ fn incremental_result_accepts_legacy_removed_consumer_ids() {
     let mut value = serde_json::to_value(result).unwrap();
     value["removed_consumer_ids"] = serde_json::json!(["c1"]);
 
-    let decoded: IncrementalResult = serde_json::from_value(value).unwrap();
-    assert_eq!(
-        decoded.removed_consumer_ids,
-        vec![NamespacedResourceId::new("", "c1")]
-    );
+    assert!(serde_json::from_value::<IncrementalResult>(value).is_err());
 }
 
 #[test]

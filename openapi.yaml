@@ -4967,13 +4967,13 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     Forbidden:
-      description: Authenticated token lacks the required admin role
+      description: Authenticated token lacks the required admin role or its namespace claim does not authorize the selected namespace
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
     ReadOnly:
-      description: Admin API is in read-only mode or the token role cannot perform this mutation
+      description: Admin API is in read-only mode, the token role cannot perform this mutation, or its namespace claim does not authorize the selected namespace
       content:
         application/json:
           schema:
