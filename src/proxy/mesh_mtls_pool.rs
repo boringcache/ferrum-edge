@@ -813,7 +813,7 @@ impl MeshMtlsConnectionPool {
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
-            &self.crls,
+            self.crls.load_full(),
             proxy,
             dial_host,
             mtls_port,
@@ -919,7 +919,7 @@ impl MeshMtlsConnectionPool {
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
-            &self.crls,
+            self.crls.load_full(),
             proxy,
             dial_host,
             mtls_port,
@@ -1021,7 +1021,7 @@ impl MeshMtlsConnectionPool {
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
-            &self.crls,
+            self.crls.load_full(),
             proxy,
             dial_host,
             mtls_port,
@@ -1103,10 +1103,12 @@ impl MeshMtlsConnectionPool {
             addr: format!("{target_host}:{mtls_port}"),
             timeout_ms: proxy.backend_connect_timeout_ms,
         })?;
-        // Snapshot the SVID slot before dialing: the SPIFFE TLS resolver and
-        // verifier read the slot at HANDSHAKE time, so "slot unchanged across
-        // the dial" proves the session was built from exactly this material.
+        // Snapshot the SVID and CRL slots before dialing: the SPIFFE TLS
+        // resolver/verifier use these snapshots for the handshake, so an
+        // unchanged slot across the dial proves the session was built from the
+        // material that is still current when it is pooled.
         let svid_slot_before_dial = self.gateway_svid.load_full();
+        let crls_before_dial = self.crls.load_full();
         // Resolve the DR `connectionPool.tcp.tcpKeepalive` per-port override for
         // the destination's APP port (`app_port`), NOT the transport
         // `mtls_port` (always `:15006`). Falls back to the global pool
@@ -1127,6 +1129,7 @@ impl MeshMtlsConnectionPool {
                 sni_override,
                 pool_config,
                 keepalive_override,
+                crls_before_dial.clone(),
             ),
         )
         .await
@@ -1150,30 +1153,32 @@ impl MeshMtlsConnectionPool {
                 });
             }
         };
-        // An SVID rotation drain may have fired while this dial was in
+        // An SVID rotation or CRL reload drain may have fired while this dial was in
         // flight: pooling the sender under a retired-fingerprint key would
         // resurrect it AFTER its one-shot drain already ran, leaving an
         // old-identity session alive until idle pruning (forever with
         // `idle_timeout_seconds=0`). Serve the triggering request on the
         // connection, but only pool it while (a) the slot is unchanged across
         // the dial — catches same-leaf trust-bundle rotations the fingerprint
-        // cannot see — and (b) the key's fingerprint is still the current one
+        // cannot see — (b) the CRL slot is unchanged across the dial, and (c)
+        // the key's fingerprint is still the current one
         // — catches rotations between key construction and the slot snapshot.
         // Pre-drain inserts under a retired-but-undrained key are also
         // skipped, which merely costs those stragglers pooling during the
         // drain window.
         let svid_slot_unchanged =
             Arc::ptr_eq(&svid_slot_before_dial, &self.gateway_svid.load_full());
+        let crls_unchanged = Arc::ptr_eq(&crls_before_dial, &self.crls.load_full());
         let key_fingerprint_is_current = self
             .current_svid_fingerprint_cached()
             .ok()
             .is_some_and(|current| mesh_mtls_key_svid_fingerprint(key) == Some(current.as_ref()));
-        if !svid_slot_unchanged || !key_fingerprint_is_current {
+        if !svid_slot_unchanged || !crls_unchanged || !key_fingerprint_is_current {
             debug!(
                 target_host,
                 mtls_port,
                 expected_peer = expected_peer_display(expected_peer),
-                "Sidecar SVID-mTLS connection completed under a rotated SVID; serving without pooling"
+                "Sidecar SVID-mTLS connection completed under rotated TLS material; serving without pooling"
             );
             return Ok(sender);
         }
@@ -1285,6 +1290,7 @@ impl MeshMtlsConnectionPool {
         sni_override: Option<&str>,
         pool_config: &PoolConfig,
         keepalive_override: Option<&crate::config::types::TcpKeepaliveCfg>,
+        crls: crate::tls::CrlList,
     ) -> Result<MeshMtlsSender, HbonePoolError> {
         let resolved_ip = self
             .dns_cache
@@ -1347,7 +1353,6 @@ impl MeshMtlsConnectionPool {
         //   bundle — a federated cert from a DIFFERENT trust domain is rejected.
         //   No pod identity is pinned (the gateway LB-picks the workload). NOT
         //   unverified, and NOT any-federated.
-        let crls = self.crls.load_full();
         let tls_config = build_spiffe_outbound_config(
             self.gateway_svid.clone(),
             expected_peer.cloned(),

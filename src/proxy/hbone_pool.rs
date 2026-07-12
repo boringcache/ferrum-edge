@@ -782,7 +782,7 @@ impl HboneConnectionPool {
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
-            &self.crls,
+            self.crls.load_full(),
             proxy,
             dial_host,
             hbone_port,
@@ -871,7 +871,7 @@ impl HboneConnectionPool {
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
-            &self.crls,
+            self.crls.load_full(),
             proxy,
             dial_host,
             hbone_port,
@@ -1075,10 +1075,12 @@ impl HboneConnectionPool {
                 });
             }
         };
-        // Snapshot the SVID slot before dialing: the SPIFFE TLS resolver and
-        // verifier read the slot at HANDSHAKE time, so "slot unchanged across
-        // the dial" proves the session was built from exactly this material.
+        // Snapshot the SVID and CRL slots before dialing: the SPIFFE TLS
+        // resolver/verifier use these snapshots for the handshake, so an
+        // unchanged slot across the dial proves the session was built from the
+        // material that is still current when it is pooled.
         let svid_slot_before_dial = self.gateway_svid.load_full();
+        let crls_before_dial = self.crls.load_full();
         // Resolve the DR `connectionPool.tcp.tcpKeepalive` per-port override for
         // the destination's APP port (`target_port`), NOT the transport
         // `hbone_port` (always `:15008`). Falls back to the global pool
@@ -1100,6 +1102,7 @@ impl HboneConnectionPool {
                 pool_config,
                 keepalive_override,
                 connect_timeout_override,
+                crls_before_dial.clone(),
             ),
         )
         .await
@@ -1126,31 +1129,33 @@ impl HboneConnectionPool {
                 });
             }
         };
-        // An SVID rotation drain may have fired while this dial was in
+        // An SVID rotation or CRL reload drain may have fired while this dial was in
         // flight: pooling the sender under a retired-fingerprint key would
         // resurrect it AFTER its one-shot drain already ran, leaving an
         // old-identity session alive until idle pruning (forever with
         // `idle_timeout_seconds=0`). Serve the triggering request on the
         // connection, but only pool it while (a) the slot is unchanged across
         // the dial — catches same-leaf trust-bundle rotations the fingerprint
-        // cannot see — and (b) the key's fingerprint is still the current one
+        // cannot see — (b) the CRL slot is unchanged across the dial, and (c)
+        // the key's fingerprint is still the current one
         // — catches rotations between key construction and the slot snapshot.
         // Pre-drain inserts under a retired-but-undrained key are also
         // skipped, which merely costs those stragglers pooling during the
         // drain window.
         let svid_slot_unchanged =
             Arc::ptr_eq(&svid_slot_before_dial, &self.gateway_svid.load_full());
+        let crls_unchanged = Arc::ptr_eq(&crls_before_dial, &self.crls.load_full());
         let key_fingerprint_is_current = self
             .current_svid_identity_cached()
             .ok()
             .is_some_and(|(_, current)| hbone_key_svid_fingerprint(key) == Some(current.as_ref()));
-        if !svid_slot_unchanged || !key_fingerprint_is_current {
+        if !svid_slot_unchanged || !crls_unchanged || !key_fingerprint_is_current {
             debug!(
                 dial_host,
                 app_host,
                 app_port,
                 hbone_port,
-                "HBONE HTTP/2 connection completed under a rotated SVID; serving without pooling"
+                "HBONE HTTP/2 connection completed under rotated TLS material; serving without pooling"
             );
             return Ok(sender);
         }
@@ -1299,6 +1304,7 @@ impl HboneConnectionPool {
         pool_config: &PoolConfig,
         keepalive_override: Option<&crate::config::types::TcpKeepaliveCfg>,
         connect_timeout_override: Option<Duration>,
+        crls: crate::tls::CrlList,
     ) -> Result<SendRequest<Bytes>, HbonePoolError> {
         // The raw-`h2` dial over SVID-mTLS is the transport primitive shared
         // with the Sidecar mesh-mTLS raw-TCP egress path; only the dial port
@@ -1308,7 +1314,7 @@ impl HboneConnectionPool {
         dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
-            &self.crls,
+            crls,
             proxy,
             target_host,
             hbone_port,
@@ -1493,7 +1499,7 @@ impl Unpin for H2ConnectTunnel {}
 pub(crate) async fn dial_h2_connect_sender(
     dns_cache: &DnsCache,
     gateway_svid: &SharedSvidBundle,
-    crls: &crate::tls::SharedCrlList,
+    crls: crate::tls::CrlList,
     proxy: &Proxy,
     target_host: &str,
     dial_port: u16,
@@ -1569,7 +1575,6 @@ pub(crate) async fn dial_h2_connect_sender(
     // `sni_override = Some(service FQDN)`). For the in-cluster callers both
     // `expected_trust_domain` and `sni_override` are `None` so behavior is
     // unchanged.
-    let crls = crls.load_full();
     let tls_config = build_spiffe_outbound_config(
         gateway_svid.clone(),
         expected_peer.cloned(),
