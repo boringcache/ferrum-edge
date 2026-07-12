@@ -346,6 +346,7 @@ where
     ) {
         Ok(permits) => Ok(Ok(permits)),
         Err(rejection) => {
+            let mut rejection = rejection;
             // Release any reserved CB HALF_OPEN probe BEFORE writing the reject:
             // the writes below use `await?`, so an H3 client closing mid-write
             // returns early. The callers release only on the `Err(outcome)` arm,
@@ -360,10 +361,11 @@ where
                 drop(slot.take());
             }
             let mut headers = rejection.headers;
-            crate::proxy::apply_after_proxy_hooks_to_rejection(
+            crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
                 plugins,
                 ctx,
-                rejection.status_code,
+                &mut rejection.status_code,
+                &mut rejection.body,
                 &mut headers,
             )
             .await;
@@ -4317,15 +4319,16 @@ async fn apply_buffered_plain_plugin_reject(
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Vec<u8>,
 ) {
-    let Some(reject) = crate::proxy::plugin_result_into_reject_parts(reject) else {
+    let Some(mut reject) = crate::proxy::plugin_result_into_reject_parts(reject) else {
         warn!("buffered plain reject helper received a non-reject plugin result");
         return;
     };
     let mut headers = reject.headers;
-    crate::proxy::apply_after_proxy_hooks_to_rejection(
+    crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
         plugins,
         ctx,
-        reject.status_code,
+        &mut reject.status_code,
+        &mut reject.body,
         &mut headers,
     )
     .await;
@@ -4349,15 +4352,16 @@ async fn apply_buffered_grpc_plugin_reject(
     response_body: &mut Vec<u8>,
     response_trailers: &mut HashMap<String, String>,
 ) {
-    let Some(reject) = crate::proxy::plugin_result_into_reject_parts(reject) else {
+    let Some(mut reject) = crate::proxy::plugin_result_into_reject_parts(reject) else {
         warn!("buffered gRPC reject helper received a non-reject plugin result");
         return;
     };
     let mut headers = reject.headers;
-    crate::proxy::apply_after_proxy_hooks_to_rejection(
+    crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
         plugins,
         ctx,
-        reject.status_code,
+        &mut reject.status_code,
+        &mut reject.body,
         &mut headers,
     )
     .await;
@@ -5113,7 +5117,7 @@ where
         backend_start,
         bytes_sent,
     } = accounting;
-    let Some(parts) = crate::proxy::plugin_result_into_reject_parts(reject) else {
+    let Some(mut parts) = crate::proxy::plugin_result_into_reject_parts(reject) else {
         warn!("final body reject helper received a non-reject plugin result");
         return if matches!(flavor, HttpFlavor::Grpc) {
             write_grpc_error(
@@ -5135,15 +5139,16 @@ where
             .await
         };
     };
-    let http_status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_REQUEST);
     let mut headers = parts.headers;
-    crate::proxy::apply_after_proxy_hooks_to_rejection(
+    crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
         plugins,
         ctx,
-        http_status.as_u16(),
+        &mut parts.status_code,
+        &mut parts.body,
         &mut headers,
     )
     .await;
+    let http_status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_REQUEST);
     let normalized = crate::proxy::normalize_reject_response(
         http_status,
         &parts.body,
@@ -5292,7 +5297,7 @@ async fn write_final_grpc_body_reject_send<S>(
 where
     S: SendStream<Bytes>,
 {
-    let Some(parts) = crate::proxy::plugin_result_into_reject_parts(reject) else {
+    let Some(mut parts) = crate::proxy::plugin_result_into_reject_parts(reject) else {
         warn!("final body reject helper received a non-reject plugin result");
         return write_grpc_error_send(
             stream,
@@ -5303,15 +5308,16 @@ where
         )
         .await;
     };
-    let http_status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_REQUEST);
     let mut headers = parts.headers;
-    crate::proxy::apply_after_proxy_hooks_to_rejection(
+    crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
         plugins,
         ctx,
-        http_status.as_u16(),
+        &mut parts.status_code,
+        &mut parts.body,
         &mut headers,
     )
     .await;
+    let http_status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_REQUEST);
     let normalized = normalize_h3_grpc_reject(http_status, &parts.body, &headers);
     apply_h3_grpc_reject_metadata(ctx, &normalized);
     write_normalized_grpc_reject_send(stream, &normalized, backend_start, bytes_sent).await

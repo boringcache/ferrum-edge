@@ -39,10 +39,9 @@ use crate::proxy::headers::{
     strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
-    ProxyState, apply_after_proxy_hooks_to_rejection, apply_plugin_rejection_response,
-    apply_reject_after_proxy_and_synthetic_body_hooks, log_rejected_request,
-    log_rejected_request_with_path, plugin_result_into_reject_parts, run_after_proxy_hooks,
-    run_authentication_phase,
+    ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
+    log_rejected_request, log_rejected_request_with_path, plugin_result_into_reject_parts,
+    run_after_proxy_hooks, run_authentication_phase,
 };
 use crate::tls::{CrlList, TlsPolicy};
 
@@ -2038,15 +2037,65 @@ async fn handle_h3_request(
         ) {
             Ok(result) => result,
             Err(()) => {
-                record_request(&state, 503);
+                let phase_start = std::time::Instant::now();
+                let mut reject_status = 503;
+                let mut reject_body =
+                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#
+                        .to_vec();
                 let mut rej_headers = HashMap::new();
-                apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, 503, &mut rej_headers)
-                    .await;
+                crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
+                    &plugins,
+                    &mut ctx,
+                    &mut reject_status,
+                    &mut reject_body,
+                    &mut rej_headers,
+                )
+                .await;
+                let reject_status =
+                    StatusCode::from_u16(reject_status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+                let log_status_code = h3_reject_log_status_and_metadata(
+                    &mut ctx,
+                    http_flavor,
+                    reject_status,
+                    &reject_body,
+                    &rej_headers,
+                );
+                if capabilities
+                    .has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK)
+                {
+                    let normalized = crate::proxy::normalize_reject_response(
+                        reject_status,
+                        &reject_body,
+                        &rej_headers,
+                        matches!(http_flavor, HttpFlavor::Grpc),
+                    );
+                    for plugin in plugins.iter() {
+                        plugin
+                            .on_response_committed(
+                                &mut ctx,
+                                normalized.http_status.as_u16(),
+                                &normalized.headers,
+                                &normalized.body,
+                            )
+                            .await;
+                    }
+                }
+                plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                record_request(&state, log_status_code);
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    log_status_code,
+                    start_time,
+                    "circuit_breaker",
+                    plugin_execution_ns,
+                )
+                .await;
                 send_h3_reject_flavor_aware(
                     &mut stream,
                     http_flavor,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                    reject_status,
+                    &reject_body,
                     &rej_headers,
                 )
                 .await?;
@@ -2174,7 +2223,7 @@ async fn handle_h3_request(
                     cb_target_key.as_deref(),
                     cb_is_half_open_probe,
                 );
-                let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
                     record_request(&state, 500);
                     send_h3_reject_flavor_aware(
                         &mut stream,
@@ -2187,10 +2236,11 @@ async fn handle_h3_request(
                     return Ok(());
                 };
                 let mut headers = reject.headers;
-                apply_after_proxy_hooks_to_rejection(
+                crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
                     &plugins,
                     &mut ctx,
-                    reject.status_code,
+                    &mut reject.status_code,
+                    &mut reject.body,
                     &mut headers,
                 )
                 .await;
@@ -3857,7 +3907,7 @@ async fn handle_h3_request(
                 cb_target_key.as_deref(),
                 cb_is_half_open_probe,
             );
-            let Some(reject) = plugin_result_into_reject_parts(reject) else {
+            let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
                 tracing::error!("Plugin result could not be converted to rejection parts");
                 record_request(&state, 500);
                 send_h3_reject_response(
@@ -3870,10 +3920,11 @@ async fn handle_h3_request(
                 return Ok(());
             };
             let mut headers = reject.headers;
-            apply_after_proxy_hooks_to_rejection(
+            crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
                 &plugins,
                 &mut ctx,
-                reject.status_code,
+                &mut reject.status_code,
+                &mut reject.body,
                 &mut headers,
             )
             .await;
@@ -4873,6 +4924,7 @@ async fn run_h3_backend_admission_or_send_reject(
     ) {
         Ok(permits) => Ok(Ok(permits)),
         Err(rejection) => {
+            let mut rejection = rejection;
             // Release any reserved circuit-breaker HALF_OPEN probe BEFORE writing
             // the reject body: the write below propagates errors with `?`, so if
             // the H3 client resets mid-write this returns early. The caller frees
@@ -4885,8 +4937,14 @@ async fn run_h3_backend_admission_or_send_reject(
                 cb_is_half_open_probe,
             );
             let mut headers = rejection.headers;
-            apply_after_proxy_hooks_to_rejection(plugins, ctx, rejection.status_code, &mut headers)
-                .await;
+            crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
+                plugins,
+                ctx,
+                &mut rejection.status_code,
+                &mut rejection.body,
+                &mut headers,
+            )
+            .await;
             let http_status = StatusCode::from_u16(rejection.status_code)
                 .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
             let log_status_code = h3_reject_log_status_and_metadata(

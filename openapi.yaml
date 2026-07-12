@@ -14246,12 +14246,12 @@ components:
               type: string
               enum: [drop, reject]
               default: drop
-              description: "drop: silently drop when the queue is full (never block). reject: fail the request 503 when a buffered-response record cannot be enqueued (fail-closed audit)."
+              description: "drop: silently drop when the queue is full (never block). reject: fail selected buffered or streaming audit records with 503 before response commit when a queue slot cannot be reserved. Streaming admission honors sampling plus configured error/guardrail overrides."
             on_sink_error:
               type: string
               enum: [warn, reject]
               default: warn
-              description: "warn: log and drop on permanent sink failure. reject: fail buffered-response requests 503 while the sink is unhealthy. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
+              description: "warn: log and drop on permanent sink failure. reject: fail selected buffered or streaming audit records with 503 before response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
         privacy:
           type: object
           properties:
