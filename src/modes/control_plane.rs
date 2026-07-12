@@ -1019,6 +1019,7 @@ pub async fn run(
         let mut grpc_shutdown = shutdown_tx.subscribe();
         let grpc_accept_shutdown = grpc_shutdown.clone();
         let grpc_tls_handshake_timeout_seconds = env_config.frontend_tls_handshake_timeout_seconds;
+        let grpc_startup_ready = startup_ready.clone();
         let handle = tokio::spawn(async move {
             let mut builder = Server::builder()
                 .max_concurrent_streams(Some(grpc_http2_max_concurrent_streams))
@@ -1061,7 +1062,18 @@ pub async fn run(
                     .await
             };
             if let Err(e) = result {
-                error!("gRPC server error: {}", e);
+                // The gRPC serve future exited with an error, so this CP can no
+                // longer distribute config to data planes. Flip readiness back
+                // to not-ready so `/health` stops reporting `ready` instead of
+                // leaving a live-but-non-serving control plane. The CP listener
+                // monitor also observes this task exiting and triggers graceful
+                // shutdown; flipping readiness first keeps the probe honest
+                // during the teardown window.
+                crate::startup::flip_ready_off_on_listener_failure(
+                    &grpc_startup_ready,
+                    "CP gRPC server",
+                    &e,
+                );
             }
         });
 
