@@ -2051,6 +2051,13 @@ mod inner {
             false
         }
 
+        fn delete_all_resources_is_atomic(&self) -> bool {
+            // `delete_all_resources` runs in a transaction only when a replica set
+            // is configured; standalone MongoDB deletes collections one-by-one and
+            // can leave a partially-cleared namespace on a mid-clear failure.
+            self.replica_set_configured()
+        }
+
         fn set_slow_query_threshold(&mut self, threshold_ms: Option<u64>) {
             self.slow_query_threshold_ms = threshold_ms;
         }

@@ -414,6 +414,25 @@ pub trait DatabaseBackend: Send + Sync {
     async fn batch_create_upstreams(&self, upstreams: &[Upstream]) -> Result<usize, anyhow::Error>;
     async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error>;
 
+    /// Returns `true` when [`delete_all_resources`](Self::delete_all_resources)
+    /// clears the namespace atomically (all-or-nothing).
+    ///
+    /// SQL backends run the clear inside a single transaction, so a failure
+    /// commits nothing and leaves the prior config fully intact. A replica-set
+    /// MongoDB deployment likewise runs it in a transaction. Standalone MongoDB
+    /// has no multi-document transactions, so it deletes collections one-by-one
+    /// and a mid-clear failure can leave a partially-cleared namespace.
+    ///
+    /// Callers that compensate a failed clear use this to decide whether a
+    /// rollback is even warranted: an atomic-clear failure is non-destructive,
+    /// so re-running the clear + re-import would be unnecessary work that could
+    /// delete admin-only `api_specs` or duplicate resources if the original
+    /// error was transient. Defaults to `true` (SQL backends); MongoDB overrides
+    /// it based on whether a replica set is configured.
+    fn delete_all_resources_is_atomic(&self) -> bool {
+        true
+    }
+
     // -----------------------------------------------------------------------
     // Connection lifecycle (called from polling loops)
     // -----------------------------------------------------------------------
