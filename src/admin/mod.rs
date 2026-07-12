@@ -961,7 +961,12 @@ fn observability_detail_allowed(
     auth_header: Option<&str>,
     client_ip: &std::net::IpAddr,
 ) -> bool {
-    state.jwt_manager.verify_request(auth_header).is_ok()
+    state
+        .jwt_manager
+        .verify_request(auth_header)
+        .ok()
+        .and_then(|token_data| AuditActor::from_claims(&token_data.claims).ok())
+        .is_some()
         || state.metrics_auth.token_matches(auth_header)
         || state.metrics_auth.ip_allowed(client_ip)
 }

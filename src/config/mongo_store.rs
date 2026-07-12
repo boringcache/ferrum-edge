@@ -1830,6 +1830,22 @@ mod inner {
             })
         }
 
+        /// Standalone updates mutate a document that already owned its old
+        /// route. After replacement, any overlapping route owned by another
+        /// proxy makes the update yield and restore its previous document.
+        /// This differs from create-vs-create ordering: an existing proxy's
+        /// original `created_at` must not let a later route mutation displace
+        /// a concurrently admitted create.
+        fn standalone_route_update_has_conflict(
+            my_id: &str,
+            my_hosts: &[String],
+            candidates: &[RouteBucketCandidate],
+        ) -> bool {
+            candidates.iter().any(|other| {
+                other.id != my_id && crate::config::types::hosts_overlap(my_hosts, &other.hosts)
+            })
+        }
+
         // -------------------------------------------------------------------
         // Consumer identity index maintenance
         // -------------------------------------------------------------------
@@ -1882,23 +1898,19 @@ mod inner {
         /// For an ORDERED `insert_many` failure, the number of leading
         /// documents that were actually inserted (everything before the first
         /// reported write-error index; later documents were never attempted).
-        /// Non-write failures (e.g. connection errors) fall back to treating
-        /// every document as potentially inserted.
-        fn ordered_insert_inserted_prefix_len(
-            doc_count: usize,
-            err: &mongodb::error::Error,
-        ) -> usize {
+        /// Unknown failures, including InsertMany errors without a reported
+        /// write-error index, return `None`: cleanup cannot safely attribute
+        /// any reservation to this attempt and must retain all of them.
+        fn ordered_insert_inserted_prefix_len(err: &mongodb::error::Error) -> Option<usize> {
             let mongodb::error::ErrorKind::InsertMany(insert_error) = err.kind.as_ref() else {
-                return doc_count;
+                return None;
             };
             insert_error
                 .write_errors
-                .as_deref()
-                .unwrap_or(&[])
+                .as_deref()?
                 .iter()
                 .map(|write_error| write_error.index)
                 .min()
-                .unwrap_or(doc_count)
         }
 
         /// Standalone reserve-first: insert the identity reservations BEFORE
@@ -1923,13 +1935,21 @@ mod inner {
                 .insert_many(consumer_identity_index_docs(namespace, consumer_id, values))
                 .await
             {
-                let inserted = Self::ordered_insert_inserted_prefix_len(values.len(), &err);
-                self.release_consumer_identity_values_best_effort(
-                    namespace,
-                    consumer_id,
-                    &values[..inserted],
-                )
-                .await;
+                if let Some(inserted) = Self::ordered_insert_inserted_prefix_len(&err) {
+                    self.release_consumer_identity_values_best_effort(
+                        namespace,
+                        consumer_id,
+                        &values[..inserted],
+                    )
+                    .await;
+                } else {
+                    warn!(
+                        "Retaining MongoDB consumer identity reservations for '{}' in namespace \
+                         '{}' because the failed ordered insert did not report a verifiable \
+                         write-error index",
+                        consumer_id, namespace
+                    );
+                }
                 return Err(err.into());
             }
             Ok(())
@@ -3446,14 +3466,15 @@ mod inner {
                 self.check_slow_query("update_proxy", start);
                 return Ok(false);
             }
-            // Post-write route reconciliation with deterministic loser-yield;
-            // the losing writer restores the previous document (see
-            // `standalone_route_writer_should_yield` for the residual window).
+            // Post-write route reconciliation: unlike two creates, an update
+            // always yields to any conflicting route owner and restores its
+            // previous document. The pre-existing proxy's original
+            // `created_at` must not make its route mutation win.
             if !guard_params.is_stream {
                 let candidates = self
                     .listen_path_bucket_candidates(&proxy.namespace, proxy.listen_path.as_deref())
                     .await?;
-                if Self::standalone_route_writer_should_yield(&proxy.id, &proxy.hosts, &candidates)
+                if Self::standalone_route_update_has_conflict(&proxy.id, &proxy.hosts, &candidates)
                 {
                     if let Err(err) = self
                         .proxies()
@@ -4971,6 +4992,23 @@ mod inner {
                         (self, id.to_string(), namespace.to_string()),
                         |s, (this, id, namespace)| {
                             Box::pin(async move {
+                                // Avoid creating a guard for a missing target.
+                                // This read is inside the transaction so the
+                                // following guard write still serializes with
+                                // concurrent proxy admissions/deletes.
+                                if this
+                                    .upstreams()
+                                    .find_one(doc! {
+                                        "_id": id.as_str(),
+                                        "namespace": namespace.as_str(),
+                                    })
+                                    .projection(doc! { "_id": 1 })
+                                    .session(&mut *s)
+                                    .await?
+                                    .is_none()
+                                {
+                                    return Ok(false);
+                                }
                                 // Write the same guard doc that proxy
                                 // create/update transactions write when they
                                 // reference this upstream, so a concurrent
@@ -5701,10 +5739,15 @@ mod inner {
                     .insert_many(identity_docs.clone())
                     .await
                 {
-                    let inserted =
-                        Self::ordered_insert_inserted_prefix_len(identity_docs.len(), &err);
-                    self.release_consumer_identity_docs_best_effort(&identity_docs[..inserted])
-                        .await;
+                    if let Some(inserted) = Self::ordered_insert_inserted_prefix_len(&err) {
+                        self.release_consumer_identity_docs_best_effort(&identity_docs[..inserted])
+                            .await;
+                    } else {
+                        warn!(
+                            "Retaining MongoDB batch consumer identity reservations because the \
+                             failed ordered insert did not report a verifiable write-error index"
+                        );
+                    }
                     return Err(err.into());
                 }
                 // Composite `_id`s ("{namespace}:{id}") for document-level
@@ -9758,6 +9801,46 @@ mod inner {
                 store.db_type_str, "mongodb",
                 "db_type_str intentionally remains the backend name and must not \
                  be the replica-set source of truth"
+            );
+        }
+
+        #[test]
+        fn standalone_route_update_yields_to_any_conflicting_owner() {
+            let candidates = vec![
+                RouteBucketCandidate {
+                    id: "existing-update".to_string(),
+                    hosts: vec!["example.com".to_string()],
+                    created_at: "2025-01-01T00:00:00Z".to_string(),
+                },
+                RouteBucketCandidate {
+                    id: "concurrent-create".to_string(),
+                    hosts: vec!["example.com".to_string()],
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                },
+            ];
+
+            assert!(MongoStore::standalone_route_update_has_conflict(
+                "existing-update",
+                &["example.com".to_string()],
+                &candidates,
+            ));
+            assert!(
+                !MongoStore::standalone_route_writer_should_yield(
+                    "existing-update",
+                    &["example.com".to_string()],
+                    &candidates,
+                ),
+                "the update regression must not reuse create-vs-create created_at ordering",
+            );
+        }
+
+        #[test]
+        fn unknown_ordered_identity_insert_state_has_no_cleanup_prefix() {
+            let error = mongodb::error::Error::custom("unknown insert state");
+            assert_eq!(
+                MongoStore::ordered_insert_inserted_prefix_len(&error),
+                None,
+                "non-InsertMany failures must retain reservations whose ownership is unknown",
             );
         }
 
