@@ -2352,6 +2352,10 @@ fn forget_failed_pod_enrollment(state_key: &str) {
     FAILED_POD_ENROLLMENT_ATTEMPTS.remove(state_key);
 }
 
+fn has_failed_pod_enrollment_attempt(state_key: &str) -> bool {
+    FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(state_key)
+}
+
 fn forget_pod_enrollment_attempt(state_key: &str) {
     FAILED_POD_ENROLLMENT_ATTEMPTS.remove(state_key);
 }
@@ -2887,6 +2891,7 @@ fn complete_removed_udp_close_handoff(
 ) {
     if !udp_readiness_reconcile_enabled(config)
         || pod_states.contains_key(pod_uid)
+        || has_failed_pod_enrollment_attempt(state_key)
         || has_pending_pod_ip_removal_failure(state_key)
     {
         return;
@@ -6123,6 +6128,94 @@ mod tests {
                 "durable request must receive a replacement ack after retry recovery (udp_capture_enabled={udp_capture_enabled})"
             );
         }
+    }
+
+    #[test]
+    fn pod_ip_removal_retry_withholds_udp_close_handoff_for_failed_live_enrollment() {
+        let registry = tempfile::tempdir().unwrap();
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.udp_capture_enabled = true;
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let pod_states = DashMap::new();
+        let pod_uid = "pod-live-failed";
+        let state_key = pod_state_key(&pod_states, pod_uid);
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 12);
+        let mut backend = MockEbpfBackend::default();
+        backend
+            .update_pod_ip(ip, &PodInfo::for_capture(15001, true, true))
+            .unwrap();
+        let metrics = NodeAgentMetrics::default();
+
+        remember_failed_pod_enrollment(
+            &state_key,
+            PodEnrollmentAttemptSignature {
+                namespace: "default".to_string(),
+                service_account: None,
+                pod_ip: Some(ip),
+                pod_source_ips: PodSourceIps::default(),
+                node_probe_ports: Vec::new(),
+                cgroup_path: Some("/cg/live-failed".to_string()),
+                veth_iface: Some("veth-live-failed".to_string()),
+                labels_fingerprint: 0,
+                annotations_fingerprint: 0,
+            },
+            RetryablePodEnrollment {
+                pod_uid: pod_uid.to_string(),
+                pod_name: pod_uid.to_string(),
+                namespace: "default".to_string(),
+                service_account: None,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                pod_ip: Some(ip.to_string()),
+                pod_source_ips: PodSourceIps::default(),
+                node_probe_ports: Vec::new(),
+                pod_pid: None,
+            },
+        );
+        remember_pending_capture_failure(
+            &state_key,
+            CAPTURE_FAILURE_POD_IP_REMOVE,
+            &ip.to_string(),
+        );
+
+        retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
+
+        assert!(
+            has_failed_pod_enrollment_attempt(&state_key),
+            "the live pod's failed enrollment retry record must still gate UDP close handoff"
+        );
+        assert!(
+            !has_pending_pod_ip_removal_failure(&state_key),
+            "the pre-enrollment pod-IP cleanup retry should still be cleared after recovery"
+        );
+        assert!(
+            !registry
+                .path()
+                .join(".udp-gate-cleaned")
+                .join(pod_uid)
+                .exists(),
+            "pre-enrollment cleanup retry must not mint removed-pod cleanup proof"
+        );
+        assert!(
+            !registry
+                .path()
+                .join(".udp-not-ready")
+                .join(pod_uid)
+                .exists(),
+            "pre-enrollment cleanup retry must not acknowledge UDP closure for a live failed pod"
+        );
+
+        forget_failed_pod_enrollment(&state_key);
     }
 
     #[test]
