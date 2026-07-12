@@ -6,23 +6,17 @@ Cap: ≤6 active subagents (≈3 sol + 3 Opus). CI is the gate; no local builds/
 
 | Slot | Agent | Task | State |
 |------|-------|------|-------|
-| S1 | sol (medium) | Issue #2104 → PR #2105 opened; codex round 1 triggered | awaiting codex/CI (orchestrator watching) |
-| O1 | opus discovery | Deferral-marker triage audit — DONE: 0 high / 1 med (outbound CRL asymmetry) / 6 low | complete |
-| O2 | opus discovery | Docs-truth audit — DONE: 0 overclaims, 3 stale, 11 tracked deferrals | complete |
-| S4 | sol (medium) | Issue #2111 → PR #2112; orchestrator review done (approved; tunnel-mode doc verified vs code) | awaiting codex/CI |
-| O3 | opus discovery | Security audit — DONE: 0 crit/high/med, 2 low | complete |
-| O4 | opus discovery | Ops/CI/release audit — DONE: 0 high, 3 med, 5 low | complete |
-
-| S2 | sol (high) | Issue #2106 → PR #2113; orchestrator review done (approved) | awaiting codex/CI |
-| S3 | sol (medium) | Issue #2107 → PR #2109; orchestrator review done (approved) | awaiting codex/CI |
-| O5 | opus impl | Issue #2108: hardening sweep (CSR guard, JWT aud, stale msg, log level) | running |
+| S2 | sol (high) | PR #2113 round 3: CRL reload-race pooling guards + unknown-revocation doc narrowing (round-1 SharedCrlList fix + orchestrator compile fix f2d921d landed) | running |
+| O5 | opus impl | Issue #2108 → PR #2114; codex P2 rebutted-with-fix by orchestrator (strict aud default kept, docs corrected, pinning test a1bc9fbb); round 2 triggered | awaiting codex/CI |
 
 ## Queue
 
-- Await docs-truth audit (O2) → triage into ledger, spawn fixes.
-- PR #2105: await codex verdict + CI; merge when clean+green+reviewed.
-- Decide disposition for PR-008 (CI flakes — likely TRACKED via #2057/#2060 + monitor), PR-004/005/013/014 (file tracking issues).
+- Merge #2113 and #2114 when codex clean + CI green.
+- Final pass: re-verify launch gates, main CI health post-merges, close ledger.
 
 ## Done
 
-(none yet)
+- Discovery audits complete (4/4): deferrals, docs-truth, security, ops. Issues #2106–#2108, #2110–#2111 filed.
+- PR #2105 merged (issue #2104 — live XC gate firewall proof).
+- PR #2109 merged (issue #2107 — release tag↔version guard + CHANGELOG policy).
+- PR #2112 merged (issue #2111 — REFACTORING_PLAN retired, WEBSOCKET.md tunnel mode, admin_api.md LB list).
