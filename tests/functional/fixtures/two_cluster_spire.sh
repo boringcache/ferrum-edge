@@ -124,6 +124,21 @@ EOF
       args+=(-federatesWith "spiffe://$peer_domain")
     fi
     server_cli "$root" "${args[@]}"
+    for _ in $(seq 1 30); do
+      if setpriv \
+        "--reuid=$workload_uid" \
+        "--regid=$workload_uid" \
+        --clear-groups \
+        -- spire-agent api fetch x509 \
+          -socketPath "$root/agent.sock" \
+          -timeout 1s \
+          -silent >/dev/null 2>&1; then
+        exit 0
+      fi
+      sleep 1
+    done
+    echo "SPIRE workload entry did not become available for $workload_id (uid $workload_uid)" >&2
+    exit 1
     ;;
 
   stop)
