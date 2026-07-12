@@ -35,7 +35,11 @@
 {{- $ambientUdpCaptureEnabled = has (lower (trim (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED")))) (list "true" "1") -}}
 {{- end -}}
 {{- $ambientUdpProducer := and (eq $ambientTopology "ambient") $ambientUdpCaptureEnabled -}}
-{{- $ambientUdpLifecycle := and (eq $ambientTopology "ambient") .Values.nodeAgent.enabled (eq (lower (toString .Values.nodeAgent.captureMode)) "ebpf") -}}
+{{- /* Keep registry/cleanup wiring active for every Ambient node-agent pair,
+       even when captureMode=iptables. The node-agent must then hit the Rust
+       fail-closed gate instead of silently omitting the eBPF pod watcher that
+       disabled cleanup requires. */ -}}
+{{- $ambientUdpLifecycle := and (eq $ambientTopology "ambient") .Values.nodeAgent.enabled -}}
 {{- /* Ambient UDP capture requires the node-agent publisher: it publishes the
        pod uid->cgroup registry the producer consumes (mirrors the NodeWaypoint
        validations). Without it the producer polls an empty hostPath forever and

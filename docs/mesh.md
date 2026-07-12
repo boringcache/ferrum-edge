@@ -2375,12 +2375,16 @@ iptables fallback: that fallback cannot publish the registry, so proceeding
 would strand fail-closed pod-netns guards. Existing Ambient fleets relying on
 the fallback must move workloads to eBPF-capable nodes before upgrading.
 
-The Helm chart provisions every `ambient` + eBPF deployment for this lifecycle,
-including when UDP capture is currently off. The node-agent/proxy pair therefore
-uses the tools-capable `-ebpf` image, shares the pod-registry hostPath, and grants
-the setns/`NET_ADMIN` capabilities needed for stale pod-netns cleanup. This is a
-deliberate security-footprint increase that makes a later enabled-to-disabled
-rollout repairable without another chart shape change.
+The Helm chart provisions every `ambient` deployment with an enabled node-agent
+for this lifecycle, including when UDP capture is currently off and even when
+`nodeAgent.captureMode=iptables`. Both DaemonSets receive the shared registry and
+`FERRUM_MESH_TOPOLOGY=ambient`, so an iptables fallback reaches the node-agent's
+fail-closed startup check instead of silently bypassing cleanup. In the supported
+eBPF configuration, the node-agent/proxy pair uses the tools-capable `-ebpf`
+image, shares the pod-registry hostPath, and grants the setns/`NET_ADMIN`
+capabilities needed for stale pod-netns cleanup. This is a deliberate
+security-footprint increase that makes a later enabled-to-disabled rollout
+repairable without another chart shape change.
 
 Every node-agent restart re-derives enrollment from the live Kubernetes pod
 list. During that relist it removes existing `.udp-ready` markers and closes the

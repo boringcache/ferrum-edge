@@ -63,10 +63,11 @@
 {{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED" -}}
 {{- $ambientUdpCaptureEnabled = has (lower (trim (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED")))) (list "true" "1") -}}
 {{- end -}}
-{{- /* Keep this lifecycle predicate in lock-step with ambient-daemonset.yaml:
-       without the eBPF pod watcher there is no registry producer, so rendering
-       the node-agent side alone would make Rust refuse startup. */ -}}
-{{- $ambientUdpLifecycle := and .Values.ambient.enabled (eq $ambientTopology "ambient") .Values.nodeAgent.enabled (eq (lower (toString .Values.nodeAgent.captureMode)) "ebpf") -}}
+{{- /* Keep this lifecycle predicate in lock-step with ambient-daemonset.yaml.
+       Render the registry and topology even for captureMode=iptables so the
+       node-agent reaches its Rust fail-closed gate instead of silently starting
+       a fallback that cannot publish the pod registry. */ -}}
+{{- $ambientUdpLifecycle := and .Values.ambient.enabled (eq $ambientTopology "ambient") .Values.nodeAgent.enabled -}}
 {{- $ambientUdpProducer := and $ambientUdpLifecycle $ambientUdpCaptureEnabled -}}
 {{- $nodeAgentPublishesRegistry := or $nodeWaypointRegistryEnabled $ambientUdpLifecycle -}}
 {{- $nodeAgentManagedEnv := list
