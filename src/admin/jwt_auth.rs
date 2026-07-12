@@ -99,9 +99,14 @@ impl AdminClaims {
 pub struct JwtConfig {
     pub secret: String,
     pub issuer: String,
-    /// Optional required `aud` (audience) claim. When `Some`, verification
-    /// requires the token to carry an `aud` claim that matches this value;
-    /// when `None`, audience is not validated (default, unchanged behavior).
+    /// Optional expected `aud` (audience) claim. When `Some`, verification
+    /// requires the token to carry an `aud` claim that matches this value.
+    /// When `None` (default), no audience is acceptable: tokens WITHOUT an
+    /// `aud` claim are accepted, but tokens that DO carry `aud` are rejected
+    /// (RFC 7519 §4.1.3 — a processor that does not identify itself with a
+    /// value in `aud` MUST reject the JWT; jsonwebtoken's `validate_aud`
+    /// default implements this). This is the pre-existing behavior and blocks
+    /// cross-service token replay when a signing secret is reused.
     pub audience: Option<String>,
     pub max_ttl_seconds: u64,
     pub algorithm: Algorithm,
@@ -159,8 +164,15 @@ impl JwtManager {
         // audience, the token MUST carry a matching `aud` claim: `set_audience`
         // rejects a *mismatching* claim, and adding `aud` to
         // `required_spec_claims` makes its *presence* mandatory (so a token that
-        // simply omits `aud` is also rejected). When unset, audience is left
-        // unchecked — behavior is unchanged from before this option existed.
+        // simply omits `aud` is also rejected). When unset, we deliberately
+        // KEEP jsonwebtoken's strict `validate_aud = true` default: tokens
+        // without `aud` pass, but a token carrying `aud` is rejected because no
+        // acceptable audience is configured (RFC 7519 §4.1.3). Do NOT set
+        // `validate_aud = false` here — that would let a token minted for a
+        // different service (aud=X) authenticate against the admin API whenever
+        // the HS256 secret is shared, silently weakening the fail-closed
+        // posture. Operators whose IdP always stamps `aud` must set
+        // FERRUM_ADMIN_JWT_AUDIENCE to that value.
         if let Some(audience) = &self.config.audience {
             validation.set_audience(&[audience]);
             validation.required_spec_claims.insert("aud".to_string());

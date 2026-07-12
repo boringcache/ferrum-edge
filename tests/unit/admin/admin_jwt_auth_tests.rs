@@ -504,3 +504,23 @@ fn test_audience_unset_does_not_require_aud() {
         .verify_token(&token)
         .expect("with no audience configured, a token without aud must be accepted");
 }
+
+#[test]
+fn test_audience_unset_rejects_aud_bearing_token() {
+    // Default (audience: None): jsonwebtoken's strict `validate_aud = true`
+    // default is deliberately kept. A token that CARRIES an `aud` claim is
+    // rejected because no acceptable audience is configured (RFC 7519 §4.1.3).
+    // This blocks cross-service token replay under HS256 secret reuse; it is
+    // the pre-existing behavior, pinned here so it is never loosened silently.
+    // Operators whose minter stamps `aud` must set FERRUM_ADMIN_JWT_AUDIENCE.
+    let manager = JwtManager::new(config_with_audience(None));
+    let token = encode_json_claims(
+        admin_claims_json(Some("some-other-service")),
+        "test-secret",
+        Algorithm::HS256,
+    );
+    assert!(
+        manager.verify_token(&token).is_err(),
+        "with no audience configured, a token carrying aud must be rejected (strict RFC 7519 handling)"
+    );
+}
