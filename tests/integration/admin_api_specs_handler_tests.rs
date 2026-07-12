@@ -50,6 +50,7 @@ fn make_jwt_manager() -> JwtManager {
     JwtManager::new(JwtConfig {
         secret: JWT_SECRET.to_string(),
         issuer: JWT_ISSUER.to_string(),
+        audience: None,
         max_ttl_seconds: 3600,
         algorithm: jsonwebtoken::Algorithm::HS256,
     })

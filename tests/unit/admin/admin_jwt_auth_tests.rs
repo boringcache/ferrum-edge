@@ -9,6 +9,7 @@ fn test_jwt_config() -> JwtConfig {
     JwtConfig {
         secret: "test-secret".to_string(),
         issuer: "test-issuer".to_string(),
+        audience: None,
         max_ttl_seconds: 3600,
         algorithm: Algorithm::HS256,
     }
@@ -215,6 +216,7 @@ fn test_jwt_invalid_issuer() {
     let config1 = JwtConfig {
         secret: "test-secret".to_string(),
         issuer: "issuer-1".to_string(),
+        audience: None,
         max_ttl_seconds: 3600,
         algorithm: Algorithm::HS256,
     };
@@ -222,6 +224,7 @@ fn test_jwt_invalid_issuer() {
     let config2 = JwtConfig {
         secret: "test-secret".to_string(),
         issuer: "issuer-2".to_string(),
+        audience: None,
         max_ttl_seconds: 3600,
         algorithm: Algorithm::HS256,
     };
@@ -255,6 +258,7 @@ fn test_jwt_expired_token() {
     let config = JwtConfig {
         secret: "test-secret".to_string(),
         issuer: "test-issuer".to_string(),
+        audience: None,
         max_ttl_seconds: 3600,
         algorithm: Algorithm::HS256,
     };
@@ -287,6 +291,7 @@ fn test_jwt_negative_ttl_rejected() {
     let config = JwtConfig {
         secret: "test-secret".to_string(),
         issuer: "test-issuer".to_string(),
+        audience: None,
         max_ttl_seconds: 3600,
         algorithm: Algorithm::HS256,
     };
@@ -322,6 +327,7 @@ fn test_jwt_zero_ttl_rejected() {
     let config = JwtConfig {
         secret: "test-secret".to_string(),
         issuer: "test-issuer".to_string(),
+        audience: None,
         max_ttl_seconds: 3600,
         algorithm: Algorithm::HS256,
     };
@@ -357,6 +363,7 @@ fn test_jwt_valid_ttl_within_max() {
     let config = JwtConfig {
         secret: "test-secret".to_string(),
         issuer: "test-issuer".to_string(),
+        audience: None,
         max_ttl_seconds: 7200,
         algorithm: Algorithm::HS256,
     };
@@ -390,6 +397,7 @@ fn test_jwt_ttl_exceeds_max_rejected() {
     let config = JwtConfig {
         secret: "test-secret".to_string(),
         issuer: "test-issuer".to_string(),
+        audience: None,
         max_ttl_seconds: 1800, // 30 min max
         algorithm: Algorithm::HS256,
     };
@@ -415,5 +423,104 @@ fn test_jwt_ttl_exceeds_max_rejected() {
     assert!(
         result.is_err(),
         "Token with TTL exceeding max_ttl_seconds should be rejected"
+    );
+}
+
+// ── Optional audience (`aud`) enforcement ─────────────────────────────
+
+fn config_with_audience(audience: Option<&str>) -> JwtConfig {
+    JwtConfig {
+        secret: "test-secret".to_string(),
+        issuer: "test-issuer".to_string(),
+        audience: audience.map(str::to_string),
+        max_ttl_seconds: 3600,
+        algorithm: Algorithm::HS256,
+    }
+}
+
+fn admin_claims_json(aud: Option<&str>) -> serde_json::Value {
+    let now = Utc::now();
+    let mut claims = json!({
+        "iss": "test-issuer",
+        "sub": "admin-user",
+        "iat": now.timestamp(),
+        "nbf": now.timestamp(),
+        "exp": (now + Duration::seconds(1800)).timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string(),
+        "role": "admin",
+    });
+    if let Some(aud) = aud {
+        claims["aud"] = json!(aud);
+    }
+    claims
+}
+
+#[test]
+fn test_audience_match_is_accepted() {
+    let manager = JwtManager::new(config_with_audience(Some("ferrum-admin")));
+    let token = encode_json_claims(
+        admin_claims_json(Some("ferrum-admin")),
+        "test-secret",
+        Algorithm::HS256,
+    );
+    let token_data = manager
+        .verify_token(&token)
+        .expect("token with matching aud must be accepted");
+    assert_eq!(token_data.claims.sub, "admin-user");
+}
+
+#[test]
+fn test_audience_mismatch_is_rejected() {
+    let manager = JwtManager::new(config_with_audience(Some("ferrum-admin")));
+    let token = encode_json_claims(
+        admin_claims_json(Some("some-other-service")),
+        "test-secret",
+        Algorithm::HS256,
+    );
+    assert!(
+        manager.verify_token(&token).is_err(),
+        "token whose aud does not match the configured audience must be rejected"
+    );
+}
+
+#[test]
+fn test_audience_required_when_configured_rejects_missing_aud() {
+    let manager = JwtManager::new(config_with_audience(Some("ferrum-admin")));
+    let token = encode_json_claims(admin_claims_json(None), "test-secret", Algorithm::HS256);
+    assert!(
+        manager.verify_token(&token).is_err(),
+        "when an audience is configured, a token that omits aud must be rejected"
+    );
+}
+
+#[test]
+fn test_audience_unset_does_not_require_aud() {
+    // Default (audience: None): behavior is unchanged — a token that carries no
+    // aud claim is accepted, so operators who never configure an audience are
+    // unaffected.
+    let manager = JwtManager::new(config_with_audience(None));
+    let token = encode_json_claims(admin_claims_json(None), "test-secret", Algorithm::HS256);
+    manager
+        .verify_token(&token)
+        .expect("with no audience configured, a token without aud must be accepted");
+}
+
+#[test]
+fn test_audience_unset_rejects_aud_bearing_token() {
+    // Default (audience: None): jsonwebtoken's strict `validate_aud = true`
+    // default is deliberately kept. A token that CARRIES an `aud` claim is
+    // rejected because no acceptable audience is configured (RFC 7519 §4.1.3).
+    // This blocks cross-service token replay under HS256 secret reuse; it is
+    // the pre-existing behavior, pinned here so it is never loosened silently.
+    // Operators whose minter stamps `aud` must set FERRUM_ADMIN_JWT_AUDIENCE.
+    let manager = JwtManager::new(config_with_audience(None));
+    let token = encode_json_claims(
+        admin_claims_json(Some("some-other-service")),
+        "test-secret",
+        Algorithm::HS256,
+    );
+    assert!(
+        manager.verify_token(&token).is_err(),
+        "with no audience configured, a token carrying aud must be rejected (strict RFC 7519 handling)"
     );
 }

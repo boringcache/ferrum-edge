@@ -49,6 +49,26 @@ All other headers (including `authorization`, `cookie`, `sec-websocket-protocol`
 - **Max message size**: 64 MiB per WebSocket message (a message can span multiple frames)
 - **Upgrade flood protection**: WebSocket requests go through the normal plugin pipeline before upgrade, so `rate_limiting` and `ip_restriction` can throttle abusive upgrade bursts
 
+## Tunnel Mode
+
+`FERRUM_WEBSOCKET_TUNNEL_MODE` defaults to `false`. When enabled for an
+HTTP/1.1 or HTTP/2 WebSocket session with no frame-level plugins, Ferrum Edge
+bypasses WebSocket frame parsing after the upgrade and relays bytes with raw
+bidirectional TCP copy. This improves throughput for large payloads, but frame
+inspection, per-frame size limits, and frame counters are unavailable. Attach a
+frame-level plugin or leave tunnel mode disabled when those features are
+required.
+
+Tunnel takeover preserves any backend bytes read together with the
+`101 Switching Protocols` response and forwards them before starting the raw
+relay. This is important for server-push protocols: discarding the WebSocket
+codec's buffered bytes during takeover would lose an initial frame coalesced
+with the upgrade response.
+
+Tunnel mode does not apply to HTTP/3 WebSockets. QUIC has no underlying raw TCP
+stream to copy, so H3 sessions always use frame parsing and retain frame-level
+plugin behavior even when `FERRUM_WEBSOCKET_TUNNEL_MODE=true`.
+
 ## URL Routing
 
 WebSocket backend URLs are built using the same path logic as HTTP proxying:

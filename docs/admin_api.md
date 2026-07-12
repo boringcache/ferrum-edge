@@ -24,7 +24,7 @@ Most endpoints require a valid HS256 JWT in the `Authorization: Bearer <token>` 
 
 The whole admin listener can additionally be restricted at the TCP layer with `FERRUM_ADMIN_ALLOWED_CIDRS`.
 
-Admin JWTs must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER` (default `ferrum-edge`), `exp - iat` must not exceed `FERRUM_ADMIN_JWT_MAX_TTL` (default `3600` seconds), and `nbf`/`exp` are validated.
+Admin JWTs must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER` (default `ferrum-edge`), `exp - iat` must not exceed `FERRUM_ADMIN_JWT_MAX_TTL` (default `3600` seconds), and `nbf`/`exp` are validated. When `FERRUM_ADMIN_JWT_AUDIENCE` is set, tokens must also carry a matching `aud` claim. When unset (default), tokens without an `aud` claim are accepted, but tokens that carry `aud` are rejected per RFC 7519 §4.1.3 (no acceptable audience is configured) — if your token minter stamps `aud`, set `FERRUM_ADMIN_JWT_AUDIENCE` to that value.
 
 | Role | Access |
 | --- | --- |
@@ -406,7 +406,7 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" \
 curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams/{upstream_id}
 ```
 
-Supported algorithms: `round_robin`, `weighted_round_robin`, `least_connections`, `least_latency`, `consistent_hashing`, `random`.
+Supported algorithms: `round_robin`, `weighted_round_robin`, `least_connections`, `least_latency`, `consistent_hashing`, `random`, `passthrough`.
 
 To use an upstream with a proxy, set the proxy's `upstream_id` field. When set, the upstream's targets override the proxy's `backend_host`/`backend_port`. Each target may also specify an optional `path` field which overrides the proxy's `backend_path` when that target is selected.
 

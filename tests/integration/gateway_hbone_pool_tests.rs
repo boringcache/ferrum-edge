@@ -11,12 +11,14 @@ use ferrum_edge::proxy::hbone_pool::{HBONE_TARGET_TAG, HboneConnectionPool, Hbon
 use ferrum_edge::tls::spiffe::build_spiffe_inbound_config;
 use http::{Response, StatusCode};
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+    BasicConstraints, CertificateParams, CertificateRevocationListParams, DistinguishedName,
+    DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    PKCS_ECDSA_P256_SHA256, RevocationReason, RevokedCertParams, SerialNumber,
 };
+use rustls::pki_types::CertificateRevocationListDer;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -36,6 +38,15 @@ fn synthetic_root(td: &TrustDomain) -> (Vec<u8>, String, String) {
 }
 
 fn issue_svid(spiffe_id: &SpiffeId, root_pem: &str, root_key_pem: &str) -> (Vec<u8>, Vec<u8>) {
+    issue_svid_with_serial(spiffe_id, root_pem, root_key_pem, None)
+}
+
+fn issue_svid_with_serial(
+    spiffe_id: &SpiffeId,
+    root_pem: &str,
+    root_key_pem: &str,
+    serial: Option<SerialNumber>,
+) -> (Vec<u8>, Vec<u8>) {
     let issuer_key = KeyPair::from_pem(root_key_pem).expect("issuer key");
     let issuer = Issuer::from_ca_cert_pem(root_pem, issuer_key).expect("issuer");
     let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf key");
@@ -45,6 +56,7 @@ fn issue_svid(spiffe_id: &SpiffeId, root_pem: &str, root_key_pem: &str) -> (Vec<
     params
         .subject_alt_names
         .push(spiffe_id_to_san(spiffe_id).expect("spiffe san"));
+    params.serial_number = serial;
     params.is_ca = IsCa::ExplicitNoCa;
     params.key_usages = vec![
         KeyUsagePurpose::DigitalSignature,
@@ -60,6 +72,39 @@ fn issue_svid(spiffe_id: &SpiffeId, root_pem: &str, root_key_pem: &str) -> (Vec<
 
     let cert = params.signed_by(&leaf_key, &issuer).expect("leaf cert");
     (cert.der().to_vec(), leaf_key.serialize_der())
+}
+
+fn crl_revoking(
+    root_pem: &str,
+    root_key_pem: &str,
+    serial_number: SerialNumber,
+) -> ferrum_edge::tls::CrlList {
+    let issuer_key = KeyPair::from_pem(root_key_pem).expect("issuer key");
+    let issuer = Issuer::from_ca_cert_pem(root_pem, issuer_key).expect("issuer");
+    let now = time::OffsetDateTime::now_utc();
+    let params = CertificateRevocationListParams {
+        this_update: now,
+        next_update: now + time::Duration::days(30),
+        crl_number: SerialNumber::from(1_u64),
+        issuing_distribution_point: None,
+        revoked_certs: vec![RevokedCertParams {
+            serial_number,
+            revocation_time: now,
+            reason_code: Some(RevocationReason::KeyCompromise),
+            invalidity_date: None,
+        }],
+        key_identifier_method: rcgen::KeyIdMethod::Sha256,
+    };
+    let pem = params
+        .signed_by(&issuer)
+        .expect("sign crl")
+        .pem()
+        .expect("crl pem");
+    let crls: Vec<CertificateRevocationListDer<'static>> =
+        rustls_pemfile::crls(&mut pem.as_bytes())
+            .collect::<Result<_, _>>()
+            .expect("parse crl");
+    Arc::new(crls)
 }
 
 fn bundle_for(id: SpiffeId, leaf_der: Vec<u8>, key_der: Vec<u8>, root_der: Vec<u8>) -> SvidBundle {
@@ -387,6 +432,102 @@ async fn hbone_pool_opens_spiffe_mtls_connect_and_injects_asserted_source_baggag
 
     assert_eq!(&echoed, b"mesh-hello");
     assert_eq!(baggage_rx.await.expect("baggage"), workload_id.as_str());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hbone_outbound_spiffe_dial_enforces_crl_revocation() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let td = TrustDomain::new("cluster.local").unwrap();
+    let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
+    let gateway_id = SpiffeId::from_parts(&td, "ns/edge/sa/gateway").unwrap();
+    let accepted_id = SpiffeId::from_parts(&td, "ns/default/sa/accepted").unwrap();
+    let revoked_id = SpiffeId::from_parts(&td, "ns/default/sa/revoked").unwrap();
+    let revoked_serial = SerialNumber::from(42_u64);
+    let accepted_serial = SerialNumber::from(43_u64);
+
+    let (gateway_leaf, gateway_key) = issue_svid(&gateway_id, &root_pem, &root_key_pem);
+    let (accepted_leaf, accepted_key) = issue_svid_with_serial(
+        &accepted_id,
+        &root_pem,
+        &root_key_pem,
+        Some(accepted_serial),
+    );
+    let (revoked_leaf, revoked_key) = issue_svid_with_serial(
+        &revoked_id,
+        &root_pem,
+        &root_key_pem,
+        Some(revoked_serial.clone()),
+    );
+    let gateway_slot = svid_slot(bundle_for(
+        gateway_id,
+        gateway_leaf,
+        gateway_key,
+        root_der.clone(),
+    ));
+    let accepted_slot = svid_slot(bundle_for(
+        accepted_id.clone(),
+        accepted_leaf,
+        accepted_key,
+        root_der.clone(),
+    ));
+    let revoked_slot = svid_slot(bundle_for(
+        revoked_id.clone(),
+        revoked_leaf,
+        revoked_key,
+        root_der,
+    ));
+    let crls = crl_revoking(&root_pem, &root_key_pem, revoked_serial);
+    let (accepted_addr, _accepted_baggage) = start_hbone_echo_server(accepted_slot).await;
+    let (revoked_addr, _revoked_baggage) = start_hbone_echo_server(revoked_slot).await;
+    let proxy = proxy_for_test();
+
+    let accepted_pool = HboneConnectionPool::new_with_svid_generation_and_crls(
+        PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        gateway_slot.clone(),
+        crls.clone(),
+        4,
+        Arc::new(AtomicU64::new(0)),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        accepted_pool.warmup_connection_via(
+            &proxy,
+            "127.0.0.1",
+            "127.0.0.1",
+            8080,
+            8080,
+            accepted_addr.port(),
+            Some(&accepted_id),
+        ),
+    )
+    .await
+    .expect("unrevoked outbound dial should complete promptly")
+    .expect("unrevoked outbound peer SVID should be accepted");
+
+    let revoked_pool = HboneConnectionPool::new_with_svid_generation_and_crls(
+        PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        gateway_slot,
+        crls,
+        4,
+        Arc::new(AtomicU64::new(0)),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        revoked_pool.warmup_connection_via(
+            &proxy,
+            "127.0.0.1",
+            "127.0.0.1",
+            8080,
+            8080,
+            revoked_addr.port(),
+            Some(&revoked_id),
+        ),
+    )
+    .await
+    .expect("revoked outbound dial should fail promptly")
+    .expect_err("revoked-but-unexpired outbound peer SVID must be rejected");
 }
 
 /// Regression for PR #1400: a connection that is only ever served by the

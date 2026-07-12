@@ -788,6 +788,25 @@ operator runbook covering trust-domain choice, registration entries, single-
 and multi-cluster topologies, SVID rotation cadence, alert wiring, and failure
 recovery.
 
+#### Certificate revocation
+
+When `FERRUM_TLS_CRL_FILE_PATH` is configured, Ferrum applies that CRL set
+symmetrically to mesh SPIFFE peer verification: inbound mTLS/HBONE handshakes
+reject revoked client SVIDs, and outbound/backend mesh dials reject revoked
+server SVIDs. A peer listed in an applicable configured CRL is rejected
+fail-closed even when its SVID is otherwise trusted and unexpired. If the
+bundle has no CRL from the peer certificate's issuing CA, its revocation status
+is undeterminable and Ferrum accepts it, matching the shared inbound mesh CRL
+model. With no CRLs configured, revocation checking is skipped and handshake
+behavior is unchanged.
+
+The CRL set follows the same lifecycle as Ferrum's other rustls backend pools.
+When backend TLS live reload is enabled, `reload_backend_tls_material` reloads
+the CRL file and new mesh outbound connections use the refreshed set; existing
+connections retain the verifier created for their handshake. Otherwise the CRL
+set remains static until gateway restart. SVID certificate rotation and
+trust-bundle/peer-auth reload paths do not independently reload the CRL set.
+
 ### HBONE Protocol
 
 HBONE (HTTP-Based Overlay Network Environment) is HTTP/2 CONNECT over mTLS, used by the ambient topology on port 15008.

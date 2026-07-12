@@ -9158,9 +9158,7 @@ impl LiveXcHostNetwork {
              iptables -w 5 -t filter -A {forward_chain} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; \
              iptables -w 5 -t filter -A {forward_chain} -j RETURN; \
              iptables -w 5 -t filter -A {output_chain} -p tcp -d {dest_ip} \
-               -m conntrack --ctstate NEW -m multiport \
-               --dports {LIVE_XC_HTTP_PORT},{LIVE_XC_GRPC_PORT},{LIVE_XC_SIDECAR_WS_PORT},{LIVE_XC_AMBIENT_WS_PORT},{LIVE_XC_MULTI_A_PORT},{LIVE_XC_MULTI_B_PORT},{LIVE_XC_TCP_PORT} \
-               -j REJECT; \
+               -m conntrack --ctstate NEW -j REJECT; \
              iptables -w 5 -t filter -A {output_chain} -p udp -d {dest_ip} \
                --dport {LIVE_XC_UDP_PORT} -j REJECT; \
              iptables -w 5 -t filter -A {output_chain} -j RETURN"
@@ -9383,6 +9381,8 @@ struct LiveTwoClusterFixture {
     temp_east_west: TempDir,
     temp_sidecar_destination: TempDir,
     temp_ambient_destination: TempDir,
+    sidecar_destination_inbound: u16,
+    ambient_destination_hbone: u16,
     sidecar_inbound: u16,
     sidecar_outbound: u16,
     ambient_outbound: u16,
@@ -9765,6 +9765,8 @@ impl LiveTwoClusterFixture {
             temp_east_west,
             temp_sidecar_destination,
             temp_ambient_destination,
+            sidecar_destination_inbound,
+            ambient_destination_hbone,
             sidecar_inbound,
             sidecar_outbound,
             ambient_outbound,
@@ -10226,6 +10228,16 @@ async fn functional_mesh_live_two_cluster_cross_cluster_protocol_matrix() {
         !std::net::TcpStream::connect_timeout(&destination, Duration::from_secs(1)).is_ok(),
         "the host-network Ambient gateway can reach the destination pod directly; fixture isolation is invalid"
     );
+    for (gateway, port) in [
+        ("Sidecar", fixture.sidecar_destination_inbound),
+        ("Ambient", fixture.ambient_destination_hbone),
+    ] {
+        let destination = SocketAddr::from((fixture.destination.pod_ip(), port));
+        assert!(
+            !std::net::TcpStream::connect_timeout(&destination, Duration::from_secs(1)).is_ok(),
+            "the host can reach the destination {gateway} gateway inbound port {port}; fixture isolation is invalid"
+        );
+    }
 
     eprintln!("LIVE_XC_STAGE ambient_ws:start");
     live_xc_test_ambient_websocket(&fixture).await;
