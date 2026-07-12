@@ -8420,9 +8420,10 @@ components:
               type: integer
               description: |
                 Number of configured stream-listener resources that are NOT
-                serving after the most recent config reconcile — hard bind
-                failures PLUS listeners deferred/degraded for a config reason
-                (e.g. a `frontend_tls` listener still waiting for TLS material).
+                serving after the most recent config reconcile or a subsequent
+                asynchronous listener-task failure — hard bind failures PLUS
+                listeners deferred/degraded for a config reason (e.g. a
+                `frontend_tls` listener still waiting for TLS material).
                 In DP mode these binds are intentionally non-fatal (a bad
                 CP-pushed config must not brick the data plane), so this count
                 surfaces the non-serving listeners beyond the warn log. `0` once
@@ -8432,8 +8433,10 @@ components:
               type: array
               description: |
                 Structured per-resource stream-listener non-serving reasons from
-                the most recent reconcile, classified by `kind`. Empty once every
-                configured stream listener is serving.
+                the most recent reconcile plus subsequent asynchronous listener-task
+                failures, classified by `kind`. Shared SNI listener failures emit one
+                entry per affected proxy ID. Empty once every configured stream
+                listener is serving.
               items:
                 type: object
                 required: [proxy_id, listen_port, error, kind]

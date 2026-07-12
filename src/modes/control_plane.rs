@@ -831,21 +831,33 @@ pub async fn run(
     // create_jwt_manager_from_env() a second time).
     let admin_state_for_https = admin_state.clone();
     let admin_shutdown = shutdown_tx.subscribe();
+    let mut startup_signals = Vec::new();
 
     // Admin HTTP listener (disabled when port is 0)
     let admin_http_handle = if env_config.admin_http_port != 0 {
         let admin_http_limiter = admin_conn_limiter.clone();
+        let (admin_http_started_tx, admin_http_started_rx) = tokio::sync::oneshot::channel();
+        startup_signals.push(("CP admin HTTP listener".to_string(), admin_http_started_rx));
+        let admin_http_startup_ready = startup_ready.clone();
+        let admin_http_serving_degraded = serving_degraded.clone();
         Some(tokio::spawn(async move {
             info!("Starting Admin HTTP listener on {}", admin_http_addr);
-            if let Err(e) = admin::start_admin_listener(
+            if let Err(e) = admin::start_admin_listener_with_tls_and_signal(
                 admin_http_addr,
                 admin_state,
                 admin_shutdown,
+                None,
+                Some(admin_http_started_tx),
                 admin_http_limiter,
             )
             .await
             {
-                error!("Admin HTTP listener error: {}", e);
+                crate::startup::flip_ready_off_on_listener_failure(
+                    &admin_http_startup_ready,
+                    &admin_http_serving_degraded,
+                    "CP admin HTTP listener",
+                    &e,
+                );
             }
         }))
     } else {
@@ -908,30 +920,44 @@ pub async fn run(
         }
         let admin_tls_slot = admin_reload_handles.slot.clone();
         let admin_https_limiter = admin_conn_limiter.clone();
+        let (admin_https_started_tx, admin_https_started_rx) = tokio::sync::oneshot::channel();
+        startup_signals.push((
+            "CP admin HTTPS listener".to_string(),
+            admin_https_started_rx,
+        ));
+        let admin_https_startup_ready = startup_ready.clone();
+        let admin_https_serving_degraded = serving_degraded.clone();
 
         Some(tokio::spawn(async move {
             info!("Starting Admin HTTPS listener on {}", admin_https_addr);
             let result = if let Some(slot) = admin_tls_slot {
-                admin::start_admin_listener_with_dynamic_tls(
+                admin::start_admin_listener_with_dynamic_tls_and_signal(
                     admin_https_addr,
                     admin_state_for_https,
                     admin_https_shutdown,
                     slot,
+                    Some(admin_https_started_tx),
                     admin_https_limiter,
                 )
                 .await
             } else {
-                admin::start_admin_listener_with_tls(
+                admin::start_admin_listener_with_tls_and_signal(
                     admin_https_addr,
                     admin_state_for_https,
                     admin_https_shutdown,
                     Some(admin_tls_config),
+                    Some(admin_https_started_tx),
                     admin_https_limiter,
                 )
                 .await
             };
             if let Err(e) = result {
-                error!("Admin HTTPS listener error: {}", e);
+                crate::startup::flip_ready_off_on_listener_failure(
+                    &admin_https_startup_ready,
+                    &admin_https_serving_degraded,
+                    "CP admin HTTPS listener",
+                    &e,
+                );
             }
         }))
     } else {
@@ -1023,6 +1049,7 @@ pub async fn run(
         let grpc_http2_max_local_error_reset_streams =
             env_config.server_http2_max_local_error_reset_streams;
         let (grpc_started_tx, grpc_started_rx) = tokio::sync::oneshot::channel();
+        startup_signals.push(("CP gRPC listener".to_string(), grpc_started_rx));
         let mut grpc_shutdown = shutdown_tx.subscribe();
         let grpc_accept_shutdown = grpc_shutdown.clone();
         let grpc_tls_handshake_timeout_seconds = env_config.frontend_tls_handshake_timeout_seconds;
@@ -1086,12 +1113,6 @@ pub async fn run(
             }
         });
 
-        wait_for_start_signals(
-            vec![("CP gRPC listener".to_string(), grpc_started_rx)],
-            Duration::from_secs(10),
-        )
-        .await?;
-
         Some(handle)
     } else {
         info!("CP gRPC listen port is 0 — gRPC listener disabled");
@@ -1100,6 +1121,7 @@ pub async fn run(
         drop(xds_server);
         None
     };
+    wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
     // Mark CP as ready — same rationale as database mode: the initial
     // `load_full_config()` proved DB connectivity and loaded a complete config.
     // The polling loop handles ongoing incremental updates, not initial readiness.

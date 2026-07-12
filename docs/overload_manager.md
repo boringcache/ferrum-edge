@@ -130,8 +130,10 @@ Mitigation knobs:
 The `/overload.stream_listeners.bind_failures` array and its
 `bind_failures_total` count report stream-listener (TCP/UDP/DTLS) resources that
 are **not serving** after the most recent config reconcile — hard bind failures
-**plus** listeners deferred or degraded for a config reason. Each entry carries a
-`kind` that classifies why:
+**plus** listeners deferred or degraded for a config reason. A listener-task
+failure that occurs asynchronously after reconcile is appended immediately. Each
+entry carries a `kind` that classifies why; shared SNI listeners emit one entry
+for every affected proxy ID:
 
 ```json
 "stream_listeners": {
@@ -168,9 +170,9 @@ unbindable CP-pushed stream proxy must not prevent the DP from starting or brick
 the other listeners. Only the affected listener is skipped; it is retried on the
 next reconcile. Before, a skip was only warn-logged; this structured surface lets
 operators alert on `bind_failures_total > 0` and see exactly which proxy/port is
-not serving (and why, via `kind`) without scraping logs. The list always reflects
-the latest reconcile, so a resource that starts serving on a later reconcile
-clears its entry.
+not serving (and why, via `kind`) without scraping logs. The list reflects the
+latest reconcile plus any subsequent asynchronous listener-task failure, so a
+resource that starts serving on a later reconcile clears its entry.
 - Overload critical mode rejects new DTLS demux state before per-peer channels/tasks are allocated.
 
 ## Platform Support

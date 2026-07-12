@@ -385,6 +385,45 @@ async fn test_bind_failure_surfaced_in_overload_snapshot() {
     assert!(cleared.bind_failures.is_empty());
 }
 
+#[tokio::test]
+async fn test_shared_sni_bind_failure_reports_every_proxy() {
+    let blocker = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind blocker");
+    let blocked_port = blocker.local_addr().unwrap().port();
+
+    let mut first = create_stream_proxy("sni-api", BackendScheme::Tcp, blocked_port);
+    first.passthrough = true;
+    first.hosts = vec!["api.example.com".to_string()];
+    let mut second = create_stream_proxy("sni-db", BackendScheme::Tcp, blocked_port);
+    second.passthrough = true;
+    second.hosts = vec!["db.example.com".to_string()];
+    let config = GatewayConfig {
+        proxies: vec![first, second],
+        ..empty_config()
+    };
+    let manager = create_manager(config);
+
+    let failures = manager.reconcile().await;
+    assert_eq!(failures.len(), 2, "both shared-SNI proxies are affected");
+
+    let snapshot = manager.overload_snapshot();
+    assert_eq!(snapshot.bind_failures_total, 2);
+    let mut proxy_ids: Vec<&str> = snapshot
+        .bind_failures
+        .iter()
+        .map(|failure| failure.proxy_id.as_str())
+        .collect();
+    proxy_ids.sort_unstable();
+    assert_eq!(proxy_ids, vec!["sni-api", "sni-db"]);
+    assert!(snapshot.bind_failures.iter().all(|failure| {
+        failure.listen_port == blocked_port
+            && matches!(failure.kind, StreamListenerDegradation::BindFailed)
+    }));
+
+    drop(blocker);
+}
+
 /// PR #2128 (finding 3): a configured stream listener that is skipped for a
 /// config reason — here a `frontend_tls` TCP proxy whose rustls `ServerConfig`
 /// has not been loaded, so the listener defers — must be reflected in the

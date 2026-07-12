@@ -165,3 +165,26 @@ fn test_serving_degraded_is_sticky_across_readiness_restore() {
         "serving_degraded must keep /health not-ready across a startup_ready restore"
     );
 }
+
+#[test]
+fn test_cp_admin_serve_failure_flips_effective_readiness() {
+    // CP admin HTTP and HTTPS task closures use this same sticky failure path
+    // after their bind-start signal. Even if CP's main task subsequently marks
+    // startup complete, a failed admin serve future must remain not-ready.
+    let ready = AtomicBool::new(true);
+    let degraded = AtomicBool::new(false);
+
+    flip_ready_off_on_listener_failure(
+        &ready,
+        &degraded,
+        "CP admin HTTPS listener",
+        &"serve future exited",
+    );
+    ready.store(true, Ordering::Release);
+
+    assert!(degraded.load(Ordering::Acquire));
+    assert!(
+        !(ready.load(Ordering::Acquire) && !degraded.load(Ordering::Acquire)),
+        "CP admin serve failure must remain visible after startup-ready is restored"
+    );
+}
