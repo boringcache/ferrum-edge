@@ -2,9 +2,8 @@
 //!
 //! This module consolidates the subprocess-harness, echo-server, and config-builder
 //! patterns that were previously copy-pasted across 19+ functional test files. It is
-//! intentionally additive: it introduces new abstractions alongside the existing
-//! per-test harnesses, which are migrated incrementally in later PRs (see
-//! `REFACTORING_PLAN.md` Phase 0).
+//! intentionally additive: it introduces shared abstractions alongside the
+//! existing per-test harnesses, which can migrate incrementally.
 //!
 //! # Modules
 //!
