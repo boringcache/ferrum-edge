@@ -10458,8 +10458,39 @@ fn startup_inbound_mtls_mode(
     runtime: &MeshRuntimeConfig,
 ) -> Result<config::MtlsMode, anyhow::Error> {
     let resolved = resolve_inbound_mtls_mode(initial_slice, runtime);
+    if let Some(slice) = initial_slice {
+        warn_unenforced_peer_auth_port_overrides(slice, runtime);
+    }
     validate_inbound_mtls_mode_for_topology(runtime, resolved)?;
     Ok(resolved)
+}
+
+/// Emit a structured startup warning for applicable PeerAuthentication
+/// `port_overrides` (Istio `portLevelMtls`) keyed on ports the inbound listener
+/// does not terminate on — they are silently non-enforced today (the whole
+/// listener resolves against the top-level mode; per-app-port enforcement needs
+/// SO_ORIGINAL_DST demux, tracked separately). This is the runtime honest-surface
+/// for EVERY config source, complementing the K8s translator warning and the
+/// `status.ferrum.translation.deferred_fields` entry. Does NOT change resolution.
+fn warn_unenforced_peer_auth_port_overrides(slice: &MeshSlice, runtime: &MeshRuntimeConfig) {
+    let resolution_port = inbound_mtls_resolution_port(runtime);
+    for (policy, ports) in slice.unenforced_peer_auth_port_overrides(resolution_port) {
+        let ports_list = ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        warn!(
+            policy = %policy,
+            topology = ?runtime.topology,
+            resolution_port,
+            unenforced_ports = %ports_list,
+            "mesh PeerAuthentication: portLevelMtls overrides (ports: {ports_list}) are NOT \
+             enforced per app port; the inbound listener terminates mTLS on transport port \
+             {resolution_port} and applies only the policy's top-level mtls mode to the whole \
+             listener. Per-app-port mTLS enforcement (SO_ORIGINAL_DST demux) is tracked separately."
+        );
+    }
 }
 
 fn live_reload_inbound_mtls_mode(

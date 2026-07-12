@@ -53,6 +53,30 @@ pub(super) fn translate(
         }
         "PeerAuthentication" => {
             let peer_auth = peer_authentication(&acc.options, object)?;
+            // Istio `spec.portLevelMtls` keys are workload APP/container ports
+            // (e.g. 8080, 8081). The inbound mesh listener terminates mTLS on a
+            // single TRANSPORT port (Sidecar 15006 / Ambient 15008 / Egress
+            // 15090), and one `rustls::ServerConfig` per listener cannot vary
+            // STRICT/PERMISSIVE per app port without pre-handshake
+            // SO_ORIGINAL_DST demux. The runtime therefore resolves the whole
+            // listener against the policy's TOP-LEVEL `mtls.mode` and drops the
+            // app-port overrides. Surface that gap instead of silently
+            // discarding it (the status writer additionally records it in
+            // `status.ferrum.translation.deferred_fields`); full per-app-port
+            // enforcement is tracked as a separate architectural item.
+            if !peer_auth.port_overrides.is_empty() {
+                let mut ports: Vec<u16> = peer_auth.port_overrides.keys().copied().collect();
+                ports.sort_unstable();
+                let ports_list = ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                acc.warnings.push(format!(
+                    "PeerAuthentication {}/{}: portLevelMtls entries (ports: {ports_list}) are parsed and validated but NOT enforced per app port; the inbound mesh listener terminates mTLS on a single transport port and applies only the top-level mtls.mode ({:?}) to the whole listener. Per-app-port mTLS requires SO_ORIGINAL_DST demux and is tracked separately. Surfaced in status.ferrum.translation.deferred_fields.",
+                    peer_auth.namespace, peer_auth.name, peer_auth.mtls_mode
+                ));
+            }
             acc.mesh.peer_authentications.push(peer_auth);
             Ok(true)
         }

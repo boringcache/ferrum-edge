@@ -681,6 +681,46 @@ impl MeshSlice {
         effective
     }
 
+    /// Applicable PeerAuthentications carrying `port_overrides` (Istio
+    /// `portLevelMtls`) keyed on ports OTHER than `resolution_port` — the single
+    /// transport port the inbound listener actually terminates mTLS on.
+    ///
+    /// Those overrides are NOT enforced today: one `rustls::ServerConfig` per
+    /// listener cannot vary STRICT/PERMISSIVE per app port without pre-handshake
+    /// SO_ORIGINAL_DST demux, so [`Self::resolve_effective_mtls_mode`] resolves
+    /// the whole listener against each policy's top-level `mtls_mode` and drops
+    /// the app-port keys. This does NOT change that resolution — it only reports
+    /// the dropped intent so startup can surface it (fail-open / fail-closed
+    /// visibility) for EVERY config source (native `MeshSubscribe`, xDS, file),
+    /// not just the K8s translator/status path. Full per-app-port enforcement is
+    /// tracked as a separate architectural item.
+    ///
+    /// Returns `(policy_name, sorted_unenforced_ports)` for each offending
+    /// applicable policy; empty when nothing is dropped.
+    pub fn unenforced_peer_auth_port_overrides(
+        &self,
+        resolution_port: u16,
+    ) -> Vec<(String, Vec<u16>)> {
+        let mut reported = Vec::new();
+        for pa in &self.peer_authentications {
+            if !peer_auth_applies_to_workload(pa, &self.namespace, &self.labels) {
+                continue;
+            }
+            let mut ports: Vec<u16> = pa
+                .port_overrides
+                .keys()
+                .copied()
+                .filter(|port| *port != resolution_port)
+                .collect();
+            if ports.is_empty() {
+                continue;
+            }
+            ports.sort_unstable();
+            reported.push((pa.name.clone(), ports));
+        }
+        reported
+    }
+
     /// Returns the most-specific applicable [`MeshProxyConfig`] for this slice's
     /// workload, or `None` when no `ProxyConfig` applies.
     ///

@@ -527,14 +527,42 @@ fn peer_authentication_status(
             } else {
                 resolved_mode.as_str()
             };
-            let message = format!(
-                "Ferrum accepted this PeerAuthentication (scope: {scope}; resolved mTLS mode: {effective_mode})"
-            );
+            // `portLevelMtls` is imported verbatim (app-port keyed) but the
+            // inbound mesh listener terminates mTLS on a single transport port
+            // and cannot vary STRICT/PERMISSIVE per app port without
+            // SO_ORIGINAL_DST demux. The runtime applies the top-level mode to
+            // the whole listener, so the per-app-port intent is NOT enforced.
+            // FerrumAccepted stays True (the policy is otherwise valid and its
+            // top-level mode is applied), but the gap MUST be visible so
+            // FerrumAccepted=True no longer implies per-port enforcement. Keep
+            // this in sync with the translator warning in
+            // `src/config_sources/k8s/istio.rs`.
+            let mut deferred: Vec<&'static str> = Vec::new();
+            if !port_overrides.is_empty() {
+                deferred.push(
+                    "portLevelMtls (per-app-port mTLS not enforced: the inbound mesh listener \
+                     terminates mTLS on a single transport port and applies the top-level \
+                     mtls.mode to the whole listener; per-app-port enforcement via \
+                     SO_ORIGINAL_DST demux is tracked separately)",
+                );
+            }
+            let message = if deferred.is_empty() {
+                format!(
+                    "Ferrum accepted this PeerAuthentication (scope: {scope}; resolved mTLS mode: {effective_mode})"
+                )
+            } else {
+                format!(
+                    "Ferrum accepted this PeerAuthentication (scope: {scope}; resolved mTLS mode: \
+                     {effective_mode}); deferred fields: {}",
+                    deferred.join(", ")
+                )
+            };
             let detail = json!({
                 "translation": {
                     "scope": scope,
                     "configured_mtls_mode": resolved_mode,
                     "port_level_overrides": port_overrides,
+                    "deferred_fields": deferred,
                 }
             });
             (true, "Accepted", message, Some(detail))
