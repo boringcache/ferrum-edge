@@ -9105,7 +9105,7 @@ fn live_xc_spawn_gateway(
 #[cfg(target_os = "linux")]
 struct LiveTwoClusterFixture {
     source: LiveVethPod,
-    east_west: LiveVethPod,
+    _east_west: LiveVethPod,
     destination: LiveVethPod,
     _host_network: LiveXcHostNetwork,
     _spire: LiveTwoClusterSpire,
@@ -9142,7 +9142,6 @@ struct LiveTwoClusterFixture {
     unfederated_outbound: u16,
     wrong_td_outbound: u16,
     missing_sni_outbound: u16,
-    udp_capture_port: u16,
     tcp_capture_installed: bool,
 }
 
@@ -9434,7 +9433,7 @@ impl LiveTwoClusterFixture {
 
         Ok(Self {
             source,
-            east_west,
+            _east_west: east_west,
             destination,
             _host_network: host_network,
             _spire: spire,
@@ -9471,7 +9470,6 @@ impl LiveTwoClusterFixture {
             unfederated_outbound,
             wrong_td_outbound,
             missing_sni_outbound,
-            udp_capture_port,
             tcp_capture_installed: false,
         })
     }
