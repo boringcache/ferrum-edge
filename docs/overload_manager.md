@@ -129,29 +129,48 @@ Mitigation knobs:
 
 The `/overload.stream_listeners.bind_failures` array and its
 `bind_failures_total` count report stream-listener (TCP/UDP/DTLS) resources that
-failed to bind on the most recent config reconcile:
+are **not serving** after the most recent config reconcile — hard bind failures
+**plus** listeners deferred or degraded for a config reason. Each entry carries a
+`kind` that classifies why:
 
 ```json
 "stream_listeners": {
   "dtls_demux_sessions_total": 0,
   "dtls_demux_sessions": [],
-  "bind_failures_total": 1,
+  "bind_failures_total": 2,
   "bind_failures": [
-    { "proxy_id": "tcp-echo", "listen_port": 9100, "error": "port 9100 already in use" }
+    { "proxy_id": "tcp-echo", "listen_port": 9100, "error": "Port 9100 is already in use on 0.0.0.0: Address already in use (os error 98)", "kind": "bind_failed" },
+    { "proxy_id": "udp-dtls", "listen_port": 8853, "error": "Deferred: frontend_tls UDP listener requires DTLS cert/key material (not yet loaded)", "kind": "frontend_dtls_deferred" }
   ]
 }
 ```
 
+`kind` values:
+
+| `kind` | Serving impact | Meaning |
+| --- | --- | --- |
+| `bind_failed` | Hard failure | The socket bind/probe failed (e.g. the port is already in use). |
+| `backend_tls_invalid` | Hard failure | Backend TLS config validation failed while starting a new TCP+TLS listener; the listener was not installed. |
+| `backend_tls_rotation_invalid` | Hard failure | In-place backend TLS material rotated to invalid content; the **previous** listener was kept running rather than closing the port. |
+| `frontend_tls_deferred` | Deferral | A `frontend_tls` TCP listener is waiting for its rustls `ServerConfig` to be loaded. Clears once TLS material arrives. |
+| `frontend_dtls_deferred` | Deferral | A `frontend_tls` UDP/DTLS listener is waiting for DTLS cert/key material. Clears once material arrives. |
+| `frontend_dtls_build_failed` | Degradation | A `frontend_tls` UDP/DTLS listener could not build its DTLS config from the configured material; retried on the next reconcile. |
+
+Hard failures (`bind_failed`, `backend_tls_invalid`, `backend_tls_rotation_invalid`)
+are also fatal at startup in `database`/`file` mode; the `frontend_*` deferrals
+are always non-fatal (a listener merely waiting on TLS material never fails
+startup, and clears itself once material is loaded — loading TLS material
+re-triggers a reconcile).
+
 In **data-plane (DP) mode** these binds are intentionally **non-fatal**: the DP
 does not own its config (it comes from the control plane), so a single
 unbindable CP-pushed stream proxy must not prevent the DP from starting or brick
-the other listeners. Only the conflicting listener is skipped; it is retried on
-the next reconcile. Before, a skipped bind was only warn-logged; this structured
-surface lets operators alert on `bind_failures_total > 0` and see exactly which
-proxy/port could not bind without scraping logs. The list always reflects the
-latest reconcile, so a resource that binds cleanly on a later reconcile clears
-its entry. In `database`/`file` mode a startup stream-bind conflict is fatal, so
-this list is primarily a DP diagnostic.
+the other listeners. Only the affected listener is skipped; it is retried on the
+next reconcile. Before, a skip was only warn-logged; this structured surface lets
+operators alert on `bind_failures_total > 0` and see exactly which proxy/port is
+not serving (and why, via `kind`) without scraping logs. The list always reflects
+the latest reconcile, so a resource that starts serving on a later reconcile
+clears its entry.
 - Overload critical mode rejects new DTLS demux state before per-peer channels/tasks are allocated.
 
 ## Platform Support

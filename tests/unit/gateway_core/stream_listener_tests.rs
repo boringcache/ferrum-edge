@@ -13,7 +13,7 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::load_balancer::LoadBalancerCache;
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
-use ferrum_edge::proxy::stream_listener::StreamListenerManager;
+use ferrum_edge::proxy::stream_listener::{StreamListenerDegradation, StreamListenerManager};
 use ferrum_edge::request_epoch::RequestEpochStore;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -357,6 +357,14 @@ async fn test_bind_failure_surfaced_in_overload_snapshot() {
         "bind failure error should mention port in use: {}",
         snapshot.bind_failures[0].error
     );
+    assert!(
+        matches!(
+            snapshot.bind_failures[0].kind,
+            StreamListenerDegradation::BindFailed
+        ),
+        "port-in-use must be classified as BindFailed, got {:?}",
+        snapshot.bind_failures[0].kind
+    );
 
     // The direct getter mirrors the overload snapshot.
     let direct = manager.stream_bind_failures();
@@ -375,6 +383,56 @@ async fn test_bind_failure_surfaced_in_overload_snapshot() {
     let cleared = manager.overload_snapshot();
     assert_eq!(cleared.bind_failures_total, 0);
     assert!(cleared.bind_failures.is_empty());
+}
+
+/// PR #2128 (finding 3): a configured stream listener that is skipped for a
+/// config reason — here a `frontend_tls` TCP proxy whose rustls `ServerConfig`
+/// has not been loaded, so the listener defers — must be reflected in the
+/// `/overload` snapshot with an honest count and a classifying `kind`, even
+/// though it is NOT a hard bind failure and is therefore not returned to the
+/// startup path. Regression guard: a skip that never pushed to the snapshot
+/// used to show `bind_failures_total == 0`.
+#[tokio::test]
+async fn test_config_skip_surfaced_in_overload_snapshot() {
+    let port = ephemeral_port().await;
+    let mut proxy = create_stream_proxy("tcp-tls-deferred", BackendScheme::Tcp, port);
+    // frontend_tls with no ServerConfig loaded on the manager (created with
+    // `None` frontend TLS) forces the deferral skip path.
+    proxy.frontend_tls = true;
+
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    let manager = create_manager(config);
+
+    // A deferred (non-hard) skip must NOT be returned as a startup bind failure —
+    // the startup path would otherwise treat a listener merely waiting on TLS
+    // material as fatal.
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "deferred config-skip must not be returned to the startup path: {:?}",
+        failures
+    );
+
+    // ...but it MUST be visible in the /overload snapshot with an honest count.
+    let snapshot = manager.overload_snapshot();
+    assert_eq!(
+        snapshot.bind_failures_total, 1,
+        "config-skip must be counted, not hidden as bind_failures_total=0"
+    );
+    assert_eq!(snapshot.bind_failures.len(), 1);
+    assert_eq!(snapshot.bind_failures[0].proxy_id, "tcp-tls-deferred");
+    assert_eq!(snapshot.bind_failures[0].listen_port, port);
+    assert!(
+        matches!(
+            snapshot.bind_failures[0].kind,
+            StreamListenerDegradation::FrontendTlsDeferred
+        ),
+        "deferred frontend TLS listener must be classified as FrontendTlsDeferred, got {:?}",
+        snapshot.bind_failures[0].kind
+    );
 }
 
 #[tokio::test]

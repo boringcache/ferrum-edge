@@ -294,28 +294,78 @@ impl BackendTlsMaterialReloadKey {
 pub struct StreamListenerOverloadSnapshot {
     pub dtls_demux_sessions_total: u64,
     pub dtls_demux_sessions: Vec<DtlsDemuxSessionSnapshot>,
-    /// Number of stream-listener resources that failed to bind on the most
-    /// recent `reconcile()`. In DP mode these binds are intentionally
-    /// non-fatal (a bad CP-pushed config must not brick the data plane), so
-    /// this count plus [`Self::bind_failures`] give operators structured
-    /// visibility beyond the warn log.
+    /// Number of configured stream-listener resources that are not serving
+    /// after the most recent `reconcile()` — hard bind failures PLUS listeners
+    /// deferred/degraded for a config reason (e.g. waiting on frontend TLS
+    /// material). In DP mode these binds are intentionally non-fatal (a bad
+    /// CP-pushed config must not brick the data plane), so this count plus
+    /// [`Self::bind_failures`] give operators structured visibility beyond the
+    /// warn log. `0` once every configured stream listener is serving. Each
+    /// entry's `kind` distinguishes a hard failure from a deferral.
     pub bind_failures_total: usize,
-    /// Structured per-resource stream-listener bind failures from the most
-    /// recent `reconcile()`. Empty once every configured stream listener binds
-    /// successfully.
+    /// Structured per-resource stream-listener non-serving reasons from the most
+    /// recent `reconcile()`, classified by [`StreamBindFailure::kind`]. Empty
+    /// once every configured stream listener is serving.
     pub bind_failures: Vec<StreamBindFailure>,
 }
 
-/// A single stream-listener (TCP/UDP/DTLS) that failed to bind during the most
+/// Why a configured stream listener is not serving after the most recent
+/// [`StreamListenerManager::reconcile`]. Serialized in the `/overload`
+/// `stream_listeners.bind_failures[].kind` field so operators can tell a hard
+/// bind failure apart from a listener merely deferred while it waits on
+/// frontend TLS material.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamListenerDegradation {
+    /// The socket bind/probe failed (e.g. the port is already in use). Counts
+    /// as a hard bind failure returned to the startup path.
+    BindFailed,
+    /// Backend TLS config validation failed while starting a new TCP+TLS
+    /// listener, so the listener was not installed. Hard bind failure.
+    BackendTlsInvalid,
+    /// In-place backend TLS material rotated to invalid content; the previous
+    /// listener was kept running rather than tearing down the port. Hard bind
+    /// failure (surfaced so the failed rotation is visible).
+    BackendTlsRotationInvalid,
+    /// A `frontend_tls` TCP listener is deferred because the rustls
+    /// `ServerConfig` has not been loaded yet. Non-fatal: the listener starts
+    /// once TLS material arrives (which itself re-triggers reconcile).
+    FrontendTlsDeferred,
+    /// A `frontend_tls` UDP/DTLS listener is deferred because the DTLS cert/key
+    /// material has not been loaded yet. Non-fatal, same lifecycle as
+    /// [`Self::FrontendTlsDeferred`].
+    FrontendDtlsDeferred,
+    /// A `frontend_tls` UDP/DTLS listener could not build its DTLS
+    /// `ServerConfig` from the configured material, so it was skipped. Non-fatal
+    /// at reconcile (retried), but reported so the misconfiguration is visible.
+    FrontendDtlsBuildFailed,
+}
+
+impl StreamListenerDegradation {
+    /// Whether this degradation is a hard bind failure that the startup path
+    /// treats as fatal (file/database mode) or warn-logs (DP/runtime reconcile).
+    /// Deferred/skip reasons return `false` so a listener merely waiting on TLS
+    /// material never fails startup.
+    fn is_hard_bind_failure(self) -> bool {
+        matches!(
+            self,
+            Self::BindFailed | Self::BackendTlsInvalid | Self::BackendTlsRotationInvalid
+        )
+    }
+}
+
+/// A single stream-listener (TCP/UDP/DTLS) that is not serving after the most
 /// recent [`StreamListenerManager::reconcile`]. Surfaced in the admin
-/// `/overload` response under `stream_listeners.bind_failures` so a non-fatal
-/// bind failure (e.g. a port conflict on a CP-pushed proxy in DP mode) is
-/// observable rather than only warn-logged.
+/// `/overload` response under `stream_listeners.bind_failures` so a non-serving
+/// listener — a hard bind failure (e.g. a port conflict on a CP-pushed proxy in
+/// DP mode) OR a listener deferred/degraded for a config reason — is observable
+/// rather than only warn-logged. The `kind` field classifies which.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StreamBindFailure {
     pub proxy_id: String,
     pub listen_port: u16,
     pub error: String,
+    pub kind: StreamListenerDegradation,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -902,7 +952,13 @@ impl StreamListenerManager {
     /// that failed to start due to port binding errors. An empty vec means all
     /// listeners started successfully.
     pub async fn reconcile(&self) -> Vec<(String, u16, String)> {
-        let mut bind_failures = Vec::new();
+        // Every configured stream listener that is not serving after this
+        // reconcile — hard bind failures AND deferred/degraded skips — is
+        // accumulated here and published to the `/overload` snapshot. The
+        // startup path's hard-failure list is derived from this at the end
+        // (deferred skips are excluded from the return value so a listener
+        // merely waiting on TLS material never fails startup).
+        let mut degraded: Vec<StreamBindFailure> = Vec::new();
         let current_config = self.config.load();
         // Fingerprint the active CRL list once per reconcile: it is folded
         // into every TCP+TLS reload key so a CRL rotation (published via
@@ -1049,7 +1105,7 @@ impl StreamListenerManager {
             // reconcile would see no drift and never restart the dead
             // listener. Treat a finished task as drifted: drop the handle and
             // let the start loop below re-validate and re-bind. Failures
-            // surface in `bind_failures` and are retried on the next
+            // surface in the `degraded` snapshot and are retried on the next
             // reconcile; this never crashes reconcile.
             if handle.join_handle.is_finished() {
                 warn!(
@@ -1148,11 +1204,12 @@ impl StreamListenerManager {
                         "Backend TLS material rotated to invalid content; keeping the previous stream listener running: {}",
                         msg
                     );
-                    bind_failures.push((
-                        proxy_id.clone(),
-                        *port,
-                        format!("{} (kept previous listener running)", msg),
-                    ));
+                    degraded.push(StreamBindFailure {
+                        proxy_id: proxy_id.clone(),
+                        listen_port: *port,
+                        error: format!("{} (kept previous listener running)", msg),
+                        kind: StreamListenerDegradation::BackendTlsRotationInvalid,
+                    });
                     continue;
                 }
             }
@@ -1201,6 +1258,15 @@ impl StreamListenerManager {
                             port = port,
                             "Deferring UDP listener start: frontend_tls requires DTLS cert/key"
                         );
+                        degraded.push(StreamBindFailure {
+                            proxy_id: proxy_id.clone(),
+                            listen_port: *port,
+                            error:
+                                "Deferred: frontend_tls UDP listener requires DTLS cert/key material \
+                                 (not yet loaded)"
+                                    .to_string(),
+                            kind: StreamListenerDegradation::FrontendDtlsDeferred,
+                        });
                         continue;
                     }
                 } else if self.frontend_tls_config.load().is_none() {
@@ -1209,6 +1275,15 @@ impl StreamListenerManager {
                         port = port,
                         "Deferring TCP listener start: frontend_tls requires TLS config"
                     );
+                    degraded.push(StreamBindFailure {
+                        proxy_id: proxy_id.clone(),
+                        listen_port: *port,
+                        error:
+                            "Deferred: frontend_tls TCP listener requires a rustls ServerConfig \
+                             (not yet loaded)"
+                                .to_string(),
+                        kind: StreamListenerDegradation::FrontendTlsDeferred,
+                    });
                     continue;
                 }
             }
@@ -1226,7 +1301,12 @@ impl StreamListenerManager {
                     "Stream listener backend TLS validation failed: {}",
                     msg
                 );
-                bind_failures.push((proxy_id.clone(), *port, msg));
+                degraded.push(StreamBindFailure {
+                    proxy_id: proxy_id.clone(),
+                    listen_port: *port,
+                    error: msg,
+                    kind: StreamListenerDegradation::BackendTlsInvalid,
+                });
                 continue;
             }
 
@@ -1252,7 +1332,12 @@ impl StreamListenerManager {
                     "Stream listener bind failed: {}",
                     msg
                 );
-                bind_failures.push((proxy_id.clone(), port_val, msg));
+                degraded.push(StreamBindFailure {
+                    proxy_id: proxy_id.clone(),
+                    listen_port: port_val,
+                    error: msg,
+                    kind: StreamListenerDegradation::BindFailed,
+                });
                 continue;
             }
 
@@ -1289,12 +1374,29 @@ impl StreamListenerManager {
                                         proxy_id = %proxy_id,
                                         "Failed to build frontend DTLS config: {}", e
                                     );
+                                    degraded.push(StreamBindFailure {
+                                        proxy_id: proxy_id.clone(),
+                                        listen_port: *port,
+                                        error: format!(
+                                            "Failed to build frontend DTLS config: {}",
+                                            e
+                                        ),
+                                        kind: StreamListenerDegradation::FrontendDtlsBuildFailed,
+                                    });
                                     continue;
                                 }
                             }
                         }
                         None => {
                             // Should not happen — guarded above, but be safe
+                            degraded.push(StreamBindFailure {
+                                proxy_id: proxy_id.clone(),
+                                listen_port: *port,
+                                error: "Deferred: frontend DTLS material unavailable at listener \
+                                        spawn"
+                                    .to_string(),
+                                kind: StreamListenerDegradation::FrontendDtlsDeferred,
+                            });
                             continue;
                         }
                     }
@@ -1562,21 +1664,25 @@ impl StreamListenerManager {
         self.stream_backend_metrics
             .store(Arc::new(stream_backend_entries));
 
-        // Publish a structured snapshot of this reconcile's bind failures for
-        // the admin `/overload` surface. Overwrites the previous snapshot so it
-        // always reflects the latest reconcile (a resource that binds cleanly on
-        // a later reconcile clears its entry). Empty Vec allocation is cheap and
-        // only happens on the cold reconcile path, never per connection.
-        self.bind_failures.store(Arc::new(
-            bind_failures
-                .iter()
-                .map(|(proxy_id, port, err)| StreamBindFailure {
-                    proxy_id: proxy_id.clone(),
-                    listen_port: *port,
-                    error: err.clone(),
-                })
-                .collect(),
-        ));
+        // Derive the hard bind-failure list returned to callers from the
+        // degraded set. Only hard failures (port bind, backend TLS validation,
+        // failed in-place rotation) are returned — deferred/skip reasons are
+        // published to `/overload` but kept out of the return value so the
+        // startup path (fatal in file/db mode) never trips on a listener that
+        // is merely waiting for TLS material to arrive.
+        let bind_failures: Vec<(String, u16, String)> = degraded
+            .iter()
+            .filter(|d| d.kind.is_hard_bind_failure())
+            .map(|d| (d.proxy_id.clone(), d.listen_port, d.error.clone()))
+            .collect();
+
+        // Publish a structured snapshot of this reconcile's non-serving stream
+        // listeners for the admin `/overload` surface. Overwrites the previous
+        // snapshot so it always reflects the latest reconcile (a resource that
+        // starts serving on a later reconcile clears its entry). Empty Vec
+        // allocation is cheap and only happens on the cold reconcile path,
+        // never per connection.
+        self.bind_failures.store(Arc::new(degraded));
 
         bind_failures
     }
@@ -1640,7 +1746,9 @@ impl StreamListenerManager {
             });
         }
 
-        let bind_failures = self.bind_failures.load_full();
+        // Read through the public getter so it stays wired into the binary's
+        // `/overload` response path (this is the sole non-test caller).
+        let bind_failures = self.stream_bind_failures();
         StreamListenerOverloadSnapshot {
             dtls_demux_sessions_total,
             dtls_demux_sessions,
@@ -1649,9 +1757,11 @@ impl StreamListenerManager {
         }
     }
 
-    /// Structured snapshot of the most recent `reconcile()`'s stream-listener
-    /// bind failures. Lock-free `ArcSwap` load; used by the admin `/overload`
-    /// surface and tests. Empty once every configured stream listener binds.
+    /// Structured snapshot of the most recent `reconcile()`'s non-serving
+    /// stream listeners (hard bind failures plus deferred/degraded skips,
+    /// classified by [`StreamBindFailure::kind`]). Lock-free `ArcSwap` load;
+    /// consumed by [`Self::overload_snapshot`] (the admin `/overload` surface)
+    /// and by tests. Empty once every configured stream listener is serving.
     pub fn stream_bind_failures(&self) -> Arc<Vec<StreamBindFailure>> {
         self.bind_failures.load_full()
     }
