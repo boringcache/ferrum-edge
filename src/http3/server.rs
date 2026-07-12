@@ -2148,7 +2148,14 @@ async fn handle_h3_request(
                         cb_is_half_open_probe,
                     );
                     drop(preacquired_backend_admission.take_if_acquired());
-                    record_request(&state, 413);
+                    let metric_status = h3_reject_log_status_and_metadata(
+                        &mut ctx,
+                        http_flavor,
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        br#"{"error":"Request body exceeds maximum size"}"#,
+                        &HashMap::new(),
+                    );
+                    record_request(&state, metric_status);
                     send_h3_error_flavor_aware(
                         &mut stream,
                         http_flavor,
@@ -2668,7 +2675,14 @@ async fn handle_h3_request(
                     {
                         Ok(true) => {}
                         Ok(false) => {
-                            record_request(&state, 413);
+                            let metric_status = h3_reject_log_status_and_metadata(
+                                &mut ctx,
+                                http_flavor,
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                br#"{"error":"Request body exceeds maximum size"}"#,
+                                &HashMap::new(),
+                            );
+                            record_request(&state, metric_status);
                             crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                                 &state,
                                 &proxy,
@@ -3823,7 +3837,14 @@ async fn handle_h3_request(
                     cb_target_key.as_deref(),
                     cb_is_half_open_probe,
                 );
-                record_request(&state, 413);
+                let metric_status = h3_reject_log_status_and_metadata(
+                    &mut ctx,
+                    http_flavor,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    br#"{"error":"Request body exceeds maximum size"}"#,
+                    &HashMap::new(),
+                );
+                record_request(&state, metric_status);
                 send_h3_error_flavor_aware(
                     &mut stream,
                     http_flavor,

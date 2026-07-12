@@ -5843,7 +5843,15 @@ components:
           format: uint64
           minimum: 0
           default: 30000
-          description: Backend read timeout in milliseconds. For HTTP/gRPC proxies, this is the response timeout. For TCP proxies, this is a per-direction inactivity timeout on the backend read path. 0 = disabled.
+          description: >-
+            Backend read timeout in milliseconds (default 30000). For HTTP/gRPC
+            proxies it bounds backend response reads and is also the total,
+            not idle, deadline for any client request upload that Ferrum must
+            buffer before backend dispatch. A buffered upload that exceeds the
+            deadline is rejected with HTTP 408 or gRPC DEADLINE_EXCEEDED;
+            streaming pass-through uploads are unaffected. For TCP proxies,
+            this is a per-direction inactivity timeout on the backend read
+            path. 0 disables these bounds.
         backend_write_timeout_ms:
           type: integer
           format: uint64
