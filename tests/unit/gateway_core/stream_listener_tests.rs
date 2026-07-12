@@ -835,20 +835,31 @@ async fn test_reconcile_defers_udp_without_dtls_config() {
 
 #[tokio::test]
 async fn test_shutdown_all_releases_ports() {
-    let port = ephemeral_port().await;
-    let config = GatewayConfig {
-        proxies: vec![create_stream_proxy(
-            "tcp-shutdown",
-            BackendScheme::Tcp,
-            port,
-        )],
-        ..empty_config()
-    };
+    let mut last_failures = Vec::new();
+    let mut started = None;
+    for _ in 0..3 {
+        let port = ephemeral_port().await;
+        let config = GatewayConfig {
+            proxies: vec![create_stream_proxy(
+                "tcp-shutdown",
+                BackendScheme::Tcp,
+                port,
+            )],
+            ..empty_config()
+        };
 
-    let manager = create_manager(config);
-
-    let failures = manager.reconcile().await;
-    assert!(failures.is_empty());
+        let manager = create_manager(config);
+        let failures = manager.reconcile().await;
+        if failures.is_empty() {
+            started = Some((manager, port));
+            break;
+        }
+        last_failures = failures;
+        manager.shutdown_all().await;
+    }
+    let (manager, port) = started.unwrap_or_else(|| {
+        panic!("TCP listener did not start after 3 fresh-port attempts: {last_failures:?}")
+    });
 
     // Wait for listener to start
     tokio::time::sleep(Duration::from_millis(200)).await;
