@@ -2942,6 +2942,12 @@ fn reconcile_removed_udp_close_acknowledgements(
         if pod_registry_uid_is_unsafe(&uid) || pod_states.contains_key(&uid) {
             continue;
         }
+        // Failed enrollments are live pods even though they have no
+        // `pod_states` entry. A stale proof surviving re-enrollment cleanup
+        // must not authorize their producer to drop its fail-closed guard.
+        if has_failed_pod_enrollment_attempt(&pod_state_key(pod_states, &uid)) {
+            continue;
+        }
         let gate_cleaned =
             udp_gate_cleaned_proof_path(dir, &uid).is_some_and(|path| path.is_file());
         if !gate_cleaned {
@@ -6216,6 +6222,84 @@ mod tests {
         );
 
         forget_failed_pod_enrollment(&state_key);
+    }
+
+    #[test]
+    fn removed_udp_ack_responder_withholds_stale_proof_for_failed_live_enrollment() {
+        let registry = tempfile::tempdir().unwrap();
+        let required_dir = registry.path().join(".udp-ack-required");
+        std::fs::create_dir_all(&required_dir).unwrap();
+        let pod_uid = "pod-live-failed";
+        std::fs::write(required_dir.join(pod_uid), b"").unwrap();
+        assert!(write_udp_gate_cleaned_proof(registry.path(), pod_uid));
+
+        let pod_states = DashMap::new();
+        let state_key = pod_state_key(&pod_states, pod_uid);
+        remember_failed_pod_enrollment(
+            &state_key,
+            PodEnrollmentAttemptSignature {
+                namespace: "default".to_string(),
+                service_account: None,
+                pod_ip: Some(std::net::Ipv4Addr::new(10, 0, 0, 13)),
+                pod_source_ips: PodSourceIps::default(),
+                node_probe_ports: Vec::new(),
+                cgroup_path: Some("/cg/live-failed".to_string()),
+                veth_iface: Some("veth-live-failed".to_string()),
+                labels_fingerprint: 0,
+                annotations_fingerprint: 0,
+            },
+            RetryablePodEnrollment {
+                pod_uid: pod_uid.to_string(),
+                pod_name: pod_uid.to_string(),
+                namespace: "default".to_string(),
+                service_account: None,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                pod_ip: Some("10.0.0.13".to_string()),
+                pod_source_ips: PodSourceIps::default(),
+                node_probe_ports: Vec::new(),
+                pod_pid: None,
+            },
+        );
+
+        reconcile_removed_udp_close_acknowledgements(registry.path(), &pod_states, true);
+
+        let ack = registry.path().join(".udp-not-ready").join(pod_uid);
+        assert!(
+            !ack.exists(),
+            "stale cleanup proof must not authorize an ack for a live pod with failed enrollment"
+        );
+
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.udp_capture_enabled = true;
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        handle_pod_removed(
+            &mut MockEbpfBackend::default(),
+            &pod_states,
+            &config,
+            &NodeAgentMetrics::default(),
+            pod_uid,
+        );
+        assert!(
+            !has_failed_pod_enrollment_attempt(&state_key),
+            "pod removal must forget the failed enrollment attempt"
+        );
+
+        reconcile_removed_udp_close_acknowledgements(registry.path(), &pod_states, true);
+        assert!(
+            ack.is_file(),
+            "the responder must acknowledge the durable request once the pod is genuinely removed"
+        );
     }
 
     #[test]
