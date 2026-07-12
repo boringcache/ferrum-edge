@@ -2626,16 +2626,8 @@ async fn snapshot_namespace_for_rollback(
     // authoritative count from the PRIMARY: recovery requires the original
     // documents to be re-submitted, and enumerating identities with OFFSET
     // pagination adds no recovery value while introducing ordering hazards.
-    let listed = db
-        .list_api_specs_authoritative(
-            namespace,
-            &crate::config::db_backend::ApiSpecListFilter {
-                limit: 1,
-                ..Default::default()
-            },
-        )
-        .await?;
-    let api_specs_total = usize::try_from(listed.total).unwrap_or(usize::MAX);
+    let api_specs_total =
+        usize::try_from(db.count_api_specs(namespace).await?).unwrap_or(usize::MAX);
 
     Ok(RestoreSnapshot {
         payload,
@@ -4434,19 +4426,11 @@ async fn handle_restore(
         }
     };
 
-    // Capture the delete-atomicity classification BEFORE running the clear, so a
-    // failure is classified by the mode that actually executed it. The MongoDB
-    // `replica_set_configured` flag can be re-stored on reconnect/rediscovery,
-    // so re-reading `delete_all_resources_is_atomic()` after the failure could
-    // misclassify the clear against a topology that differs from the one that
-    // ran it.
-    let delete_is_atomic = db.delete_all_resources_is_atomic();
-
     // Phase 3: Delete all existing resources in the namespace (safe: payload is
     // validated and the prior state has been snapshotted from the primary above).
     if let Err(e) = db.delete_all_resources(namespace).await {
         error!("Restore: failed to delete existing resources: {}", e);
-        if delete_is_atomic {
+        if e.mode().is_atomic() {
             // Atomic clear (SQL transaction, replica-set Mongo): a failure commits
             // NOTHING, so the prior config is fully intact. Do NOT roll back — a
             // second clear + re-import would be unnecessary and could delete

@@ -150,6 +150,48 @@ pub struct DbPoolStatsInner {
     pub active: u32,
 }
 
+/// Atomicity mode used by a namespace-wide resource clear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteMode {
+    Atomic,
+    NonAtomic,
+}
+
+impl DeleteMode {
+    pub fn is_atomic(self) -> bool {
+        matches!(self, Self::Atomic)
+    }
+}
+
+/// A failed namespace clear, coupled to the exact mode that executed it.
+#[derive(Debug)]
+pub struct DeleteAllResourcesError {
+    mode: DeleteMode,
+    source: anyhow::Error,
+}
+
+impl DeleteAllResourcesError {
+    pub fn new(mode: DeleteMode, source: anyhow::Error) -> Self {
+        Self { mode, source }
+    }
+
+    pub fn mode(&self) -> DeleteMode {
+        self.mode
+    }
+}
+
+impl std::fmt::Display for DeleteAllResourcesError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for DeleteAllResourcesError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Unified database backend trait.
 ///
 /// This trait defines all operations needed by the admin API, operating modes,
@@ -435,10 +477,7 @@ pub trait DatabaseBackend: Send + Sync {
         configs: &[PluginConfig],
     ) -> Result<usize, anyhow::Error>;
     async fn batch_create_upstreams(&self, upstreams: &[Upstream]) -> Result<usize, anyhow::Error>;
-    async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error>;
-
-    /// Returns `true` when [`delete_all_resources`](Self::delete_all_resources)
-    /// clears the namespace atomically (all-or-nothing).
+    /// Clear all resources in a namespace and report the mode that actually ran.
     ///
     /// SQL backends run the clear inside a single transaction, so a failure
     /// commits nothing and leaves the prior config fully intact. A replica-set
@@ -446,15 +485,13 @@ pub trait DatabaseBackend: Send + Sync {
     /// has no multi-document transactions, so it deletes collections one-by-one
     /// and a mid-clear failure can leave a partially-cleared namespace.
     ///
-    /// Callers that compensate a failed clear use this to decide whether a
-    /// rollback is even warranted: an atomic-clear failure is non-destructive,
-    /// so re-running the clear + re-import would be unnecessary work that could
-    /// delete admin-only `api_specs` or duplicate resources if the original
-    /// error was transient. Defaults to `true` (SQL backends); MongoDB overrides
-    /// it based on whether a replica set is configured.
-    fn delete_all_resources_is_atomic(&self) -> bool {
-        true
-    }
+    /// Failures carry the same mode captured by the operation before it starts,
+    /// so a MongoDB reconnect cannot make the caller classify the clear against
+    /// a different topology than the one whose branch actually executed.
+    async fn delete_all_resources(
+        &self,
+        namespace: &str,
+    ) -> Result<DeleteMode, DeleteAllResourcesError>;
 
     // -----------------------------------------------------------------------
     // Connection lifecycle (called from polling loops)
@@ -611,6 +648,11 @@ pub trait DatabaseBackend: Send + Sync {
     ) -> Result<PaginatedResult<ApiSpec>, anyhow::Error> {
         self.list_api_specs(namespace, filter).await
     }
+
+    /// Count ApiSpecs in a namespace using the authoritative primary read path.
+    ///
+    /// This count-only operation must not fetch or deserialize item metadata.
+    async fn count_api_specs(&self, namespace: &str) -> Result<u64, anyhow::Error>;
 
     /// Delete an ApiSpec and all resources it owns.
     ///

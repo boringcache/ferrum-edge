@@ -2115,6 +2115,14 @@ async fn test_restore_reports_api_specs_not_restored_on_rollback() {
         .await
         .expect("Failed to seed api_spec bundle");
 
+    // Corrupt summary metadata that the item-listing path must deserialize.
+    // Restore only needs the authoritative count, so this admin-only row must
+    // not block the raw config snapshot or the repair operation.
+    sqlx::query("UPDATE api_specs SET spec_format = 'corrupt' WHERE id = 'spec-1'")
+        .execute(&pool)
+        .await
+        .expect("Failed to corrupt api_spec summary metadata");
+
     let state = db_admin_state(&tc, db, None);
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);

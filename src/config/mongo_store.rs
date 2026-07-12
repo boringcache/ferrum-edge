@@ -37,8 +37,8 @@
 #[allow(dead_code)] // MongoStore is wired up in mode dispatch (database.rs, control_plane.rs)
 mod inner {
     use crate::config::db_backend::{
-        ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult, PaginatedResult,
-        SortOrder,
+        ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, DeleteAllResourcesError, DeleteMode,
+        IncrementalResult, PaginatedResult, SortOrder,
     };
     use crate::config::types::{
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
@@ -2049,13 +2049,6 @@ mod inner {
         fn has_read_replica(&self) -> bool {
             // MongoDB driver handles read preference internally via connection string
             false
-        }
-
-        fn delete_all_resources_is_atomic(&self) -> bool {
-            // `delete_all_resources` runs in a transaction only when a replica set
-            // is configured; standalone MongoDB deletes collections one-by-one and
-            // can leave a partially-cleared namespace on a mid-clear failure.
-            self.replica_set_configured()
         }
 
         fn set_slow_query_threshold(&mut self, threshold_ms: Option<u64>) {
@@ -4608,11 +4601,28 @@ mod inner {
             }
         }
 
-        async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error> {
+        async fn delete_all_resources(
+            &self,
+            namespace: &str,
+        ) -> Result<DeleteMode, DeleteAllResourcesError> {
+            // Capture the topology-dependent mode exactly once. This same value
+            // selects the implementation branch and is returned on success or
+            // carried by an error, so a concurrent reconnect cannot make the
+            // caller classify a different mode than the one that actually ran.
+            let mode = if self.replica_set_configured() {
+                DeleteMode::Atomic
+            } else {
+                DeleteMode::NonAtomic
+            };
+            let delete_error = |source: anyhow::Error| DeleteAllResourcesError::new(mode, source);
             let ns_filter = doc! { "namespace": namespace };
-            if self.replica_set_configured() {
+            if mode.is_atomic() {
                 let connection = self.connection();
-                let mut session = connection.client.start_session().await?;
+                let mut session = connection
+                    .client
+                    .start_session()
+                    .await
+                    .map_err(|error| delete_error(error.into()))?;
                 session
                     .start_transaction()
                     .and_run(
@@ -4717,48 +4727,74 @@ mod inner {
                     )
                     .await
                     .map_err(|e| {
-                        anyhow::anyhow!("delete_all_resources transaction failed: {}", e)
+                        delete_error(anyhow::anyhow!(
+                            "delete_all_resources transaction failed: {}",
+                            e
+                        ))
                     })?;
                 self.compact_config_changes_best_effort(namespace).await;
             } else {
                 let proxy_ids = self
                     .load_collection_ids_filtered("proxies", ns_filter.clone())
-                    .await?;
+                    .await
+                    .map_err(&delete_error)?;
                 let consumer_ids = self
                     .load_collection_ids_filtered("consumers", ns_filter.clone())
-                    .await?;
+                    .await
+                    .map_err(&delete_error)?;
                 let plugin_config_ids = self
                     .load_collection_ids_filtered("plugin_configs", ns_filter.clone())
-                    .await?;
+                    .await
+                    .map_err(&delete_error)?;
                 let upstream_ids = self
                     .load_collection_ids_filtered("upstreams", ns_filter.clone())
-                    .await?;
-                self.plugin_configs().delete_many(ns_filter.clone()).await?;
-                self.proxies().delete_many(ns_filter.clone()).await?;
-                self.consumers().delete_many(ns_filter.clone()).await?;
-                self.upstreams().delete_many(ns_filter.clone()).await?;
+                    .await
+                    .map_err(&delete_error)?;
+                self.plugin_configs()
+                    .delete_many(ns_filter.clone())
+                    .await
+                    .map_err(|error| delete_error(error.into()))?;
+                self.proxies()
+                    .delete_many(ns_filter.clone())
+                    .await
+                    .map_err(|error| delete_error(error.into()))?;
+                self.consumers()
+                    .delete_many(ns_filter.clone())
+                    .await
+                    .map_err(|error| delete_error(error.into()))?;
+                self.upstreams()
+                    .delete_many(ns_filter.clone())
+                    .await
+                    .map_err(|error| delete_error(error.into()))?;
                 // Clear api_specs so restore doesn't leave orphaned spec metadata
                 // pointing to proxies that no longer exist.
-                self.api_specs().delete_many(ns_filter).await?;
+                self.api_specs()
+                    .delete_many(ns_filter)
+                    .await
+                    .map_err(|error| delete_error(error.into()))?;
                 for id in proxy_ids {
                     self.record_config_change(namespace, "proxy", &id, "delete")
-                        .await?;
+                        .await
+                        .map_err(&delete_error)?;
                 }
                 for id in consumer_ids {
                     self.record_config_change(namespace, "consumer", &id, "delete")
-                        .await?;
+                        .await
+                        .map_err(&delete_error)?;
                 }
                 for id in plugin_config_ids {
                     self.record_config_change(namespace, "plugin_config", &id, "delete")
-                        .await?;
+                        .await
+                        .map_err(&delete_error)?;
                 }
                 for id in upstream_ids {
                     self.record_config_change(namespace, "upstream", &id, "delete")
-                        .await?;
+                        .await
+                        .map_err(&delete_error)?;
                 }
             }
             info!("All MongoDB resources deleted (namespace='{}')", namespace);
-            Ok(())
+            Ok(mode)
         }
 
         // -------------------------------------------------------------------
@@ -6193,6 +6229,18 @@ mod inner {
                 items: specs,
                 total,
             })
+        }
+
+        async fn count_api_specs(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+            let start = std::time::Instant::now();
+            // MongoStore forces primary reads, so this count is authoritative.
+            // count_documents does not fetch or deserialize matching items.
+            let count = self
+                .api_specs()
+                .count_documents(doc! { "namespace": namespace })
+                .await?;
+            self.check_slow_query("count_api_specs", start);
+            Ok(count)
         }
 
         async fn list_spec_owned_plugin_configs(

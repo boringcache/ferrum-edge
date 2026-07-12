@@ -1355,6 +1355,19 @@ impl DatabaseStore {
             .await
     }
 
+    /// Count ApiSpecs from the authoritative primary pool without hydrating rows.
+    pub async fn count_api_specs(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+        let start = Instant::now();
+        let primary_pool = self.pool();
+        let row = sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM api_specs WHERE namespace = ?"))
+            .bind(namespace)
+            .fetch_one(&primary_pool)
+            .await?;
+        let count: i64 = row.try_get("cnt")?;
+        self.check_slow_query("count_api_specs", start);
+        u64::try_from(count).map_err(|_| anyhow::anyhow!("api_specs count cannot be negative"))
+    }
+
     async fn configure_full_load_snapshot(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
@@ -6830,8 +6843,18 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::batch_create_upstreams(self, upstreams).await
     }
 
-    async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error> {
-        DatabaseStore::delete_all_resources(self, namespace).await
+    async fn delete_all_resources(
+        &self,
+        namespace: &str,
+    ) -> Result<
+        crate::config::db_backend::DeleteMode,
+        crate::config::db_backend::DeleteAllResourcesError,
+    > {
+        let mode = crate::config::db_backend::DeleteMode::Atomic;
+        DatabaseStore::delete_all_resources(self, namespace)
+            .await
+            .map(|()| mode)
+            .map_err(|error| crate::config::db_backend::DeleteAllResourcesError::new(mode, error))
     }
 
     async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error> {
@@ -6939,6 +6962,10 @@ impl DatabaseBackend for DatabaseStore {
         anyhow::Error,
     > {
         DatabaseStore::list_api_specs_authoritative(self, namespace, filter).await
+    }
+
+    async fn count_api_specs(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+        DatabaseStore::count_api_specs(self, namespace).await
     }
 
     async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
