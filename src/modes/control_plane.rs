@@ -34,6 +34,7 @@ use crate::config::db_backend::{self, DatabaseBackend, IncrementalResult};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot as apply_incremental_to_config;
 use crate::config::types::GatewayConfig;
+use crate::config::validation_pipeline::collect_rejecting_runtime_config_errors;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::cp_server::{CpGrpcServer, CpScope};
 use crate::grpc::mesh_registry::{
@@ -391,15 +392,16 @@ async fn load_full_config_multi(
 ) -> Result<GatewayConfig, anyhow::Error> {
     if namespaces.len() <= 1 {
         let ns = namespaces.first().map(|s| s.as_str()).unwrap_or("ferrum");
-        return db.load_full_config(ns).await;
+        let config = db.load_full_config(ns).await?;
+        return prepare_cp_full_snapshot(config);
     }
 
     // First namespace seeds the loaded_at / version / trust_bundles fields,
     // then we extend with the remaining namespaces' resource vectors.
     let first = namespaces.first().expect("namespaces is non-empty");
-    let mut combined = db.load_full_config(first).await?;
+    let mut combined = prepare_cp_full_snapshot(db.load_full_config(first).await?)?;
     for ns in namespaces.iter().skip(1) {
-        let mut next = db.load_full_config(ns).await?;
+        let mut next = prepare_cp_full_snapshot(db.load_full_config(ns).await?)?;
         combined.proxies.append(&mut next.proxies);
         combined.consumers.append(&mut next.consumers);
         combined.plugin_configs.append(&mut next.plugin_configs);
@@ -427,6 +429,28 @@ async fn load_full_config_multi_with_sequence(
     }
     let config = load_full_config_multi(db, namespaces).await?;
     Ok((config, sequences))
+}
+
+fn prepare_cp_full_snapshot(mut config: GatewayConfig) -> Result<GatewayConfig, anyhow::Error> {
+    config.normalize_fields();
+    config.resolve_upstream_tls();
+    reject_invalid_cp_full_snapshot(&config)?;
+    Ok(config)
+}
+
+fn reject_invalid_cp_full_snapshot(config: &GatewayConfig) -> Result<(), anyhow::Error> {
+    let validation_errors = collect_rejecting_runtime_config_errors(config);
+    if validation_errors.is_empty() {
+        return Ok(());
+    }
+
+    for message in &validation_errors {
+        error!("CP full config rejected: {}", message);
+    }
+    anyhow::bail!(
+        "CP full configuration validation failed: {} rejecting error(s) found",
+        validation_errors.len()
+    )
 }
 
 /// Partition an `IncrementalResult` by `namespace`, returning a delta for
@@ -1434,32 +1458,8 @@ pub async fn run(
 
                                 // Rejecting validators — collect all failures so
                                 // operators see every reason in a single poll cycle.
-                                let mut validation_errors: Vec<String> = Vec::new();
-                                if let Err(errs) = new_config.validate_regex_listen_paths() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) = new_config.validate_listen_path_encodings() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) = new_config.validate_unique_listen_paths() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) = new_config.validate_stream_proxies() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) = new_config.validate_upstream_references() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) = new_config.validate_plugin_references() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) =
-                                    crate::proxy::validate_mesh_route_dispatch_upstream_references(
-                                        &new_config,
-                                    )
-                                {
-                                    validation_errors.extend(errs);
-                                }
+                                let validation_errors =
+                                    collect_rejecting_runtime_config_errors(&new_config);
                                 if !validation_errors.is_empty() {
                                     for msg in &validation_errors {
                                         error!("CP incremental config rejected: {}", msg);
@@ -1901,6 +1901,63 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn cp_full_snapshot_rejects_dangling_upstream_reference() {
+        let mut proxy = make_proxy("dangling-upstream");
+        proxy.upstream_id = Some("missing-upstream".to_string());
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            ..Default::default()
+        };
+
+        let error = reject_invalid_cp_full_snapshot(&config)
+            .expect_err("CP full snapshot must reject a dangling upstream reference");
+
+        assert!(
+            error
+                .to_string()
+                .contains("CP full configuration validation failed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn make_stream_proxy(id: &str, namespace: &str, listen_port: u16) -> Proxy {
+        let mut proxy = make_proxy(id);
+        proxy.namespace = namespace.to_string();
+        proxy.backend_scheme = Some(BackendScheme::Tcp);
+        proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
+        proxy.listen_path = None;
+        proxy.listen_port = Some(listen_port);
+        proxy
+    }
+
+    #[test]
+    fn cp_full_snapshot_allows_same_stream_port_in_different_namespaces() {
+        for (id, namespace) in [("tcp-a", "tenant-a"), ("tcp-b", "tenant-b")] {
+            let config = GatewayConfig {
+                proxies: vec![make_stream_proxy(id, namespace, 15432)],
+                ..Default::default()
+            };
+
+            prepare_cp_full_snapshot(config)
+                .expect("each namespace slice must validate independently");
+        }
+    }
+
+    #[test]
+    fn cp_full_snapshot_rejects_same_stream_port_in_one_namespace() {
+        let config = GatewayConfig {
+            proxies: vec![
+                make_stream_proxy("tcp-a", "tenant-a", 15432),
+                make_stream_proxy("tcp-b", "tenant-a", 15432),
+            ],
+            ..Default::default()
+        };
+
+        prepare_cp_full_snapshot(config)
+            .expect_err("same-namespace stream listen-port conflicts must be rejected");
     }
 
     #[test]

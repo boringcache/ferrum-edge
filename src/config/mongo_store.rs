@@ -2152,6 +2152,7 @@ mod inner {
                 known_namespaces: Vec::new(),
                 ..Default::default()
             };
+            config.normalize_fields();
             config.resolve_upstream_tls();
 
             // Defense in depth — Mongo `load_full_config` does not run the

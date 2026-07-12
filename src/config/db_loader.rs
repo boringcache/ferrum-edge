@@ -26,7 +26,9 @@ use crate::config::types::{
     HealthCheckConfig, LoadBalancerAlgorithm, PluginAssociation, PluginConfig, PluginScope, Proxy,
     ResponseBodyMode, RetryConfig, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
-use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
+use crate::config::validation_pipeline::{
+    ValidationAction, ValidationPipeline, collect_rejecting_runtime_config_errors,
+};
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
@@ -1246,26 +1248,22 @@ impl DatabaseStore {
                 ValidationAction::Warn,
             )
             .validate_hosts(ValidationAction::Warn)
-            .validate_regex_listen_paths(ValidationAction::FatalStatic(
-                "Database has invalid regex listen_path(s)",
-            ))
-            .validate_listen_path_encodings(ValidationAction::FatalStatic(
-                "Database has listen_path(s) containing encoded slashes",
-            ))
-            .validate_unique_listen_paths(ValidationAction::FatalStatic(
-                "Database has conflicting host+listen_path combinations",
-            ))
-            .validate_stream_proxies(ValidationAction::FatalCount(
-                "Database configuration validation failed: {} stream proxy error(s) found",
-            ))
+            .run()?;
+
+        let validation_errors = collect_rejecting_runtime_config_errors(&config);
+        if !validation_errors.is_empty() {
+            for message in &validation_errors {
+                tracing::error!("Database config rejected — {}", message);
+            }
+            anyhow::bail!(
+                "Database configuration validation failed: {} rejecting error(s) found",
+                validation_errors.len()
+            );
+        }
+
+        ValidationPipeline::new(&mut config)
             .validate_unique_consumer_identities(ValidationAction::Warn)
             .validate_unique_consumer_credentials(ValidationAction::Warn)
-            .validate_upstream_references(ValidationAction::FatalStatic(
-                "Database has invalid upstream reference(s)",
-            ))
-            .validate_mesh_route_dispatch_references(ValidationAction::FatalStatic(
-                "Database has invalid mesh_route_dispatch upstream reference(s)",
-            ))
             .validate_plugin_configs(&self.backend_allow_ips, ValidationAction::Warn)
             .validate_plugin_file_dependencies(ValidationAction::Warn)
             .run()?;
