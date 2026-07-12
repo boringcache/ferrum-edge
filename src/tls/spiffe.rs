@@ -1361,7 +1361,12 @@ mod tests {
 
         // Scoped to B: the C-domain server cert must be REJECTED even though C is
         // federated. expected_peer = None (trust-domain-only, like cross-cluster).
-        let scoped_b = SpiffeServerCertVerifier::new(slot.clone(), None, Some(td_b.clone()));
+        let scoped_b = SpiffeServerCertVerifier::new(
+            slot.clone(),
+            None,
+            Some(td_b.clone()),
+            Arc::new(Vec::new()),
+        );
         let err = rustls::client::danger::ServerCertVerifier::verify_server_cert(
             &scoped_b,
             &CertificateDer::from(server_leaf.clone()),
@@ -1378,7 +1383,8 @@ mod tests {
         );
 
         // Scoped to C (the cert's actual domain): ACCEPTED.
-        let scoped_c = SpiffeServerCertVerifier::new(slot.clone(), None, Some(td_c));
+        let scoped_c =
+            SpiffeServerCertVerifier::new(slot.clone(), None, Some(td_c), Arc::new(Vec::new()));
         rustls::client::danger::ServerCertVerifier::verify_server_cert(
             &scoped_c,
             &CertificateDer::from(server_leaf.clone()),
@@ -1391,7 +1397,7 @@ mod tests {
 
         // No scope (any-federated, both None): the same C cert ACCEPTED — proves
         // the rejection above is the scope and not some other chain failure.
-        let unscoped = SpiffeServerCertVerifier::new(slot, None, None);
+        let unscoped = SpiffeServerCertVerifier::new(slot, None, None, Arc::new(Vec::new()));
         rustls::client::danger::ServerCertVerifier::verify_server_cert(
             &unscoped,
             &CertificateDer::from(server_leaf),
