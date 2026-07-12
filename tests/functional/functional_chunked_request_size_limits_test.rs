@@ -19,11 +19,30 @@ struct ChunkedRequestHarness {
 
 impl ChunkedRequestHarness {
     async fn new(max_request_bytes: &str) -> Self {
+        let mut last_error = None;
+        for attempt in 1..=3 {
+            match Self::try_new(max_request_bytes).await {
+                Ok(harness) => return harness,
+                Err(error) => {
+                    eprintln!("chunked request harness attempt {attempt}/3 failed: {error}");
+                    last_error = Some(error);
+                }
+            }
+        }
+        panic!(
+            "chunked request harness did not start after 3 fresh-port attempts: {}",
+            last_error.unwrap_or_else(|| "no startup error recorded".to_string())
+        );
+    }
+
+    async fn try_new(max_request_bytes: &str) -> Result<Self, String> {
         let backend_listener = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("bind backend");
-        let backend_port = backend_listener.local_addr().expect("backend addr").port();
-        let backend_task = tokio::spawn(run_body_len_backend(backend_listener));
+            .map_err(|error| format!("bind backend: {error}"))?;
+        let backend_port = backend_listener
+            .local_addr()
+            .map_err(|error| format!("backend addr: {error}"))?
+            .port();
 
         let gateway = TestGateway::builder()
             .mode_file(build_config(backend_port))
@@ -32,17 +51,27 @@ impl ChunkedRequestHarness {
             .capture_output()
             .spawn()
             .await
-            .expect("start gateway");
-        gateway
-            .wait_for_proxy_port(Duration::from_secs(10))
-            .await
-            .expect("proxy port ready");
-
-        Self {
+            .map_err(|error| format!("start gateway: {error}"))?;
+        let backend_task = tokio::spawn(run_body_len_backend(backend_listener));
+        let harness = Self {
             proxy_port: gateway.proxy_port,
             _gateway: gateway,
             backend_task,
+        };
+        if let Err(error) = harness
+            ._gateway
+            .wait_for_proxy_port(Duration::from_secs(10))
+            .await
+        {
+            let output = harness
+                ._gateway
+                .read_combined_captured_output()
+                .unwrap_or_else(|read_error| format!("<failed to read output: {read_error}>"));
+            return Err(format!(
+                "proxy port ready: {error}\n--- captured gateway output ---\n{output}"
+            ));
         }
+        Ok(harness)
     }
 }
 
