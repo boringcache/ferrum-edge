@@ -6800,7 +6800,8 @@ mod tests {
         std::fs::create_dir_all(
             cgroup_root
                 .path()
-                .join("kubepods/podpod-cleanup-state-merge"),
+                .join("kubepods")
+                .join(format!("pod{pod_uid}")),
         )
         .unwrap();
         let _veth_guard = crate::ebpf::veth::tests::TestOverrideGuard::new("veth-test");
