@@ -10479,6 +10479,13 @@ fn warn_unenforced_peer_auth_port_overrides(slice: &MeshSlice, runtime: &MeshRun
             .map(u16::to_string)
             .collect::<Vec<_>>()
             .join(", ");
+        let effective_mode_detail = if ports.contains(&resolution_port) {
+            format!(
+                "the override keyed on transport port {resolution_port} determines the mode for the whole listener, not only that app port"
+            )
+        } else {
+            "none of these keys matches the transport port, so the policy's top-level mtls mode determines the mode for the whole listener".to_string()
+        };
         warn!(
             policy = %policy,
             topology = ?runtime.topology,
@@ -10486,8 +10493,8 @@ fn warn_unenforced_peer_auth_port_overrides(slice: &MeshSlice, runtime: &MeshRun
             unenforced_ports = %ports_list,
             "mesh PeerAuthentication: portLevelMtls overrides (ports: {ports_list}) are NOT \
              enforced per app port; the inbound listener terminates mTLS on transport port \
-             {resolution_port} and applies only the policy's top-level mtls mode to the whole \
-             listener. Per-app-port mTLS enforcement (SO_ORIGINAL_DST demux) is tracked separately."
+             {resolution_port}; {effective_mode_detail}. Per-app-port mTLS enforcement \
+             (SO_ORIGINAL_DST demux) is tracked separately."
         );
     }
 }

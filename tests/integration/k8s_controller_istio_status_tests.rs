@@ -597,6 +597,28 @@ fn peer_authentication_port_level_mtls_emits_translator_warning() {
 }
 
 #[test]
+fn peer_authentication_transport_port_collision_warning_is_listener_wide() {
+    let obj = object(
+        "security.istio.io/v1",
+        "PeerAuthentication",
+        "transport-collision",
+        json!({
+            "mtls": { "mode": "STRICT" },
+            "portLevelMtls": { "15006": { "mode": "PERMISSIVE" } }
+        }),
+    );
+    let translation = translate_k8s_objects(&[obj], options()).expect("translation should succeed");
+    let warning = translation
+        .warnings
+        .iter()
+        .find(|warning| warning.contains("portLevelMtls"))
+        .expect("portLevelMtls warning");
+    assert!(warning.contains("override key equals that topology's transport port"));
+    assert!(warning.contains("override's mode governs the whole listener"));
+    assert!(warning.contains("NOT enforced per app port"));
+}
+
+#[test]
 fn root_namespace_peer_authentication_resolves_to_mesh_wide_scope() {
     let mut obj = object(
         "security.istio.io/v1",

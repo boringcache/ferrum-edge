@@ -689,9 +689,10 @@ impl MeshSlice {
     /// Those overrides are NOT enforced today: one `rustls::ServerConfig` per
     /// listener cannot vary STRICT/PERMISSIVE per app port without pre-handshake
     /// SO_ORIGINAL_DST demux, so [`Self::resolve_effective_mtls_mode`] resolves
-    /// the whole listener against each policy's top-level `mtls_mode` and drops
-    /// the app-port keys. This does NOT change that resolution — it only reports
-    /// the dropped intent so startup can surface it (fail-open / fail-closed
+    /// one mode for the whole listener. Normally the top-level `mtls_mode` wins;
+    /// when a key equals the transport resolution port, that override wins
+    /// listener-wide rather than per app port. This does NOT change that
+    /// resolution — it only reports the dropped intent so startup can surface it (fail-open / fail-closed
     /// visibility) for EVERY config source (native `MeshSubscribe`, xDS, file),
     /// not just the K8s translator/status path. Full per-app-port enforcement is
     /// tracked as a separate architectural item.

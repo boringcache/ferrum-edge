@@ -900,15 +900,18 @@ mTLS modes:
 > port (Sidecar `15006` / Ambient `15008` / EgressGateway `15090`). A single
 > `rustls::ServerConfig` per listener cannot vary STRICT/PERMISSIVE per app port
 > without pre-handshake `SO_ORIGINAL_DST` demux, so the runtime resolves the
-> **whole listener against the policy's top-level `mtls_mode`** and the app-port
-> overrides are dropped. This is surfaced — not silently discarded: the K8s
-> translator emits a warning, and the Istio CRD status records a
+> **one mode for the whole listener**. Normally that is the policy's top-level
+> `mtls_mode`; if an override key numerically equals the topology's transport
+> port, that override instead determines the whole listener's mode. It still is
+> not enforced only for the intended app port. This is surfaced — not silently
+> discarded: the K8s translator emits a warning, and the Istio CRD status records a
 > `status.ferrum.translation.deferred_fields` entry, so `FerrumAccepted=True`
 > does **not** imply per-port enforcement. **This means a top-level `permissive`
 > with `{8080: strict}` still accepts plaintext on `8080` (fail-open), and a
 > top-level `strict` with `{8081: permissive}` still rejects plaintext on `8081`
-> (fail-closed).** Set the workload's top-level `mtls_mode` to the posture you
-> need for the whole listener. Full per-app-port enforcement is tracked as a
+> (fail-closed).** Unless an override key collides with the transport port, set
+> the workload's top-level `mtls_mode` to the posture you need for the whole
+> listener. Full per-app-port enforcement is tracked as a
 > separate architectural item.
 
 The following `portLevelMtls` example is **accepted but its per-port intent is

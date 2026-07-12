@@ -58,10 +58,11 @@ pub(super) fn translate(
             // single TRANSPORT port (Sidecar 15006 / Ambient 15008 / Egress
             // 15090), and one `rustls::ServerConfig` per listener cannot vary
             // STRICT/PERMISSIVE per app port without pre-handshake
-            // SO_ORIGINAL_DST demux. The runtime therefore resolves the whole
-            // listener against the policy's TOP-LEVEL `mtls.mode` and drops the
-            // app-port overrides. Surface that gap instead of silently
-            // discarding it (the status writer additionally records it in
+            // SO_ORIGINAL_DST demux. The runtime therefore resolves one mode
+            // for the whole listener: normally the policy's top-level mode,
+            // but an app-port key that numerically equals the topology's
+            // transport port wins listener-wide. Surface that gap instead of
+            // silently discarding it (the status writer additionally records it in
             // `status.ferrum.translation.deferred_fields`); full per-app-port
             // enforcement is tracked as a separate architectural item.
             if !peer_auth.port_overrides.is_empty() {
@@ -73,7 +74,7 @@ pub(super) fn translate(
                     .collect::<Vec<_>>()
                     .join(", ");
                 acc.warnings.push(format!(
-                    "PeerAuthentication {}/{}: portLevelMtls entries (ports: {ports_list}) are parsed and validated but NOT enforced per app port; the inbound mesh listener terminates mTLS on a single transport port and applies only the top-level mtls.mode ({:?}) to the whole listener. Per-app-port mTLS requires SO_ORIGINAL_DST demux and is tracked separately. Surfaced in status.ferrum.translation.deferred_fields.",
+                    "PeerAuthentication {}/{}: portLevelMtls entries (ports: {ports_list}) are parsed and validated but NOT enforced per app port; the inbound mesh listener resolves one mode for the whole transport listener. The top-level mtls.mode ({:?}) governs unless an override key equals that topology's transport port, in which case that override's mode governs the whole listener rather than only the app port. Per-app-port mTLS requires SO_ORIGINAL_DST demux and is tracked separately. Surfaced in status.ferrum.translation.deferred_fields.",
                     peer_auth.namespace, peer_auth.name, peer_auth.mtls_mode
                 ));
             }
