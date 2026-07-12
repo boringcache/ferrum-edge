@@ -341,6 +341,12 @@ pub async fn run(
     // after startup — otherwise a dead proxy/admin listener would leave the
     // process reporting `ready` on `/health` while silently not serving.
     let startup_ready = Arc::new(AtomicBool::new(false));
+    // Sticky serving-degradation flag: set true (never unset) if any serving
+    // listener task exits with an error after startup. The DP client re-stores
+    // `startup_ready = true` on every CP-reconnect snapshot, which would re-mask
+    // a listener death; because `serving_degraded` is monotonic, `/health` stays
+    // not-ready across those reconnect stores once a listener has failed.
+    let serving_degraded = Arc::new(AtomicBool::new(false));
 
     if let (Some(listener_slot), Some(operator_slot), Some(mut operator_revision_rx)) = (
         proxy_frontend_tls_slot.clone(),
@@ -391,6 +397,7 @@ pub async fn run(
         let http_shutdown = shutdown_tx.subscribe();
         let (http_started_tx, http_started_rx) = tokio::sync::oneshot::channel();
         let http_startup_ready = startup_ready.clone();
+        let http_serving_degraded = serving_degraded.clone();
         let http_handle = tokio::spawn(async move {
             info!("Starting HTTP proxy listener on {}", http_addr);
             if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
@@ -404,6 +411,7 @@ pub async fn run(
             {
                 crate::startup::flip_ready_off_on_listener_failure(
                     &http_startup_ready,
+                    &http_serving_degraded,
                     "HTTP proxy listener",
                     &e,
                 );
@@ -425,6 +433,7 @@ pub async fn run(
         let https_shutdown = shutdown_tx.subscribe();
         let (https_started_tx, https_started_rx) = tokio::sync::oneshot::channel();
         let https_startup_ready = startup_ready.clone();
+        let https_serving_degraded = serving_degraded.clone();
         let https_handle = tokio::spawn(async move {
             info!("Starting HTTPS proxy listener on {}", https_addr);
             if let Err(e) = proxy::start_proxy_listener_with_dynamic_tls_and_signal(
@@ -438,6 +447,7 @@ pub async fn run(
             {
                 crate::startup::flip_ready_off_on_listener_failure(
                     &https_startup_ready,
+                    &https_serving_degraded,
                     "HTTPS proxy listener",
                     &e,
                 );
@@ -474,6 +484,7 @@ pub async fn run(
                 }
             });
             let h3_startup_ready = startup_ready.clone();
+            let h3_serving_degraded = serving_degraded.clone();
             let h3_handle = tokio::spawn(async move {
                 info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
                 if let Err(e) = crate::http3::server::start_http3_listener_with_signal(
@@ -494,6 +505,7 @@ pub async fn run(
                 {
                     crate::startup::flip_ready_off_on_listener_failure(
                         &h3_startup_ready,
+                        &h3_serving_degraded,
                         "HTTP/3 proxy listener",
                         &e,
                     );
@@ -539,6 +551,7 @@ pub async fn run(
         read_only: true, // DP admin API is always read-only
         admin_audit_enabled: env_config.admin_audit_enabled,
         startup_ready: Some(startup_ready.clone()),
+        serving_degraded: Some(serving_degraded.clone()),
         db_available: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
@@ -566,6 +579,7 @@ pub async fn run(
         let admin_http_limiter = admin_conn_limiter.clone();
         let (admin_http_started_tx, admin_http_started_rx) = tokio::sync::oneshot::channel();
         let admin_http_startup_ready = startup_ready.clone();
+        let admin_http_serving_degraded = serving_degraded.clone();
         let admin_http_handle = tokio::spawn(async move {
             info!("Starting Admin HTTP listener on {}", admin_http_addr);
             // The admin listener is one of the DP's own operational inputs (its
@@ -586,6 +600,7 @@ pub async fn run(
             {
                 crate::startup::flip_ready_off_on_listener_failure(
                     &admin_http_startup_ready,
+                    &admin_http_serving_degraded,
                     "Admin HTTP listener",
                     &e,
                 );
@@ -654,6 +669,7 @@ pub async fn run(
         let admin_https_limiter = admin_conn_limiter.clone();
         let (admin_https_started_tx, admin_https_started_rx) = tokio::sync::oneshot::channel();
         let admin_https_startup_ready = startup_ready.clone();
+        let admin_https_serving_degraded = serving_degraded.clone();
 
         let admin_https_handle = tokio::spawn(async move {
             info!("Starting Admin HTTPS listener on {}", admin_https_addr);
@@ -684,6 +700,7 @@ pub async fn run(
             if let Err(e) = result {
                 crate::startup::flip_ready_off_on_listener_failure(
                     &admin_https_startup_ready,
+                    &admin_https_serving_degraded,
                     "Admin HTTPS listener",
                     &e,
                 );

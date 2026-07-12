@@ -785,6 +785,12 @@ pub async fn run(
     // unreachable, causing the admin API to reject writes early and preserve
     // the cached config until the DB recovers.
     let startup_ready = Arc::new(AtomicBool::new(false));
+    // Sticky serving-degradation flag: set true (never unset) if the gRPC serve
+    // future exits with an error after startup. `/health` reports not-ready when
+    // this is set OR `startup_ready` is false, so a serve failure that lands
+    // between the gRPC start signal and the main task's `startup_ready.store(true)`
+    // below is not re-masked by that store.
+    let serving_degraded = Arc::new(AtomicBool::new(false));
     let db_available = Arc::new(AtomicBool::new(true));
 
     let reserved_ports = env_config.reserved_gateway_ports();
@@ -803,6 +809,7 @@ pub async fn run(
         read_only: env_config.admin_read_only,
         admin_audit_enabled: env_config.admin_audit_enabled,
         startup_ready: Some(startup_ready.clone()),
+        serving_degraded: Some(serving_degraded.clone()),
         db_available: Some(db_available.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
@@ -1020,6 +1027,7 @@ pub async fn run(
         let grpc_accept_shutdown = grpc_shutdown.clone();
         let grpc_tls_handshake_timeout_seconds = env_config.frontend_tls_handshake_timeout_seconds;
         let grpc_startup_ready = startup_ready.clone();
+        let grpc_serving_degraded = serving_degraded.clone();
         let handle = tokio::spawn(async move {
             let mut builder = Server::builder()
                 .max_concurrent_streams(Some(grpc_http2_max_concurrent_streams))
@@ -1071,6 +1079,7 @@ pub async fn run(
                 // during the teardown window.
                 crate::startup::flip_ready_off_on_listener_failure(
                     &grpc_startup_ready,
+                    &grpc_serving_degraded,
                     "CP gRPC server",
                     &e,
                 );
@@ -1094,6 +1103,9 @@ pub async fn run(
     // Mark CP as ready — same rationale as database mode: the initial
     // `load_full_config()` proved DB connectivity and loaded a complete config.
     // The polling loop handles ongoing incremental updates, not initial readiness.
+    // If the gRPC serve future already errored (racing this store), the sticky
+    // `serving_degraded` flag was set and keeps `/health` not-ready regardless of
+    // this `store(true)`.
     startup_ready.store(true, Ordering::Release);
     info!("Control plane startup complete; /health now reports ready");
 

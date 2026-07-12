@@ -111,10 +111,20 @@ fn test_flip_ready_off_on_listener_failure_sets_not_ready() {
     // the shared readiness flag back to not-ready so `/health` stops reporting
     // `ready` while the surface is silently dead (issue #2117).
     let ready = AtomicBool::new(true);
-    flip_ready_off_on_listener_failure(&ready, "HTTP proxy listener", &"accept loop failed");
+    let degraded = AtomicBool::new(false);
+    flip_ready_off_on_listener_failure(
+        &ready,
+        &degraded,
+        "HTTP proxy listener",
+        &"accept loop failed",
+    );
     assert!(
         !ready.load(Ordering::Acquire),
         "readiness flag should be flipped to false after a listener serve failure"
+    );
+    assert!(
+        degraded.load(Ordering::Acquire),
+        "serving_degraded flag should be set after a listener serve failure"
     );
 }
 
@@ -124,6 +134,34 @@ fn test_flip_ready_off_on_listener_failure_is_idempotent_when_already_not_ready(
     // driven toward not-ready on this path), so multiple failing listeners
     // cannot resurrect readiness.
     let ready = AtomicBool::new(false);
-    flip_ready_off_on_listener_failure(&ready, "Admin HTTPS listener", &"bind failed");
+    let degraded = AtomicBool::new(false);
+    flip_ready_off_on_listener_failure(&ready, &degraded, "Admin HTTPS listener", &"bind failed");
     assert!(!ready.load(Ordering::Acquire));
+    assert!(degraded.load(Ordering::Acquire));
+}
+
+#[test]
+fn test_serving_degraded_is_sticky_across_readiness_restore() {
+    // The core of the PR #2128 durability fix: after a serve failure sets the
+    // sticky `serving_degraded` flag, a later `startup_ready.store(true)` — as
+    // performed by the CP main task after the gRPC start signal, or by the DP
+    // client on every CP-reconnect snapshot — must NOT clear it. `/health`
+    // computes readiness as `startup_ready && !serving_degraded`, so the flip
+    // stays durable even though `startup_ready` was clobbered back to `true`.
+    let ready = AtomicBool::new(true);
+    let degraded = AtomicBool::new(false);
+
+    flip_ready_off_on_listener_failure(&ready, &degraded, "CP gRPC server", &"serve future exited");
+    assert!(!ready.load(Ordering::Acquire));
+    assert!(degraded.load(Ordering::Acquire));
+
+    // Simulate the later main-task / reconnect readiness restore.
+    ready.store(true, Ordering::Release);
+
+    // startup_ready was restored, but the sticky flag keeps readiness false.
+    let effective_ready = ready.load(Ordering::Acquire) && !degraded.load(Ordering::Acquire);
+    assert!(
+        !effective_ready,
+        "serving_degraded must keep /health not-ready across a startup_ready restore"
+    );
 }

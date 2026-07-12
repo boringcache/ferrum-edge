@@ -67,6 +67,8 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/health
 
 Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. The detailed diagnostics (DB type/pool stats, cached-config proxy/consumer counts, `database_polling` degradation, mesh state) require an admin JWT, `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS` source IP. In database mode the authenticated response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` (also visible unauthenticated) while the gateway keeps serving the last known-good config.
 
+In **CP and DP modes**, if a supervised serving-listener task exits with an error *after* the gateway became ready (the CP gRPC server, or a DP proxy/admin HTTP/HTTPS/H3 listener), `/health` returns 503 with `status: "unavailable"` and `ready: false`. This is a **sticky** signal: it is set once and never cleared, so it survives a later readiness restore (the CP main task's one-time `ready` store, or a DP re-store on every CP-reconnect snapshot). The process does not silently keep reporting `ready` while a serving surface is dead.
+
 **Recommended split:** point liveness at `/live` and readiness at `/health`; route detailed diagnostics scraping through an authenticated path.
 
 ## TLS Inventory
