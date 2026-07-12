@@ -3590,6 +3590,11 @@ pub struct MeshInboundTlsPolicy {
     pub by_port: HashMap<u16, Option<Arc<rustls::ServerConfig>>>,
     pub default_mode: crate::modes::mesh::config::MtlsMode,
     pub modes_by_port: std::collections::BTreeMap<u16, crate::modes::mesh::config::MtlsMode>,
+    /// Translate a captured Sidecar ingress[] listener port to its
+    /// defaultEndpoint backend app port before selecting PeerAuthentication.
+    /// Ordinary captured inbound routes need no entry because their original
+    /// destination already is the app/container port.
+    pub app_port_by_orig_dst_port: std::collections::BTreeMap<u16, u16>,
 }
 
 impl Default for MeshInboundTlsPolicy {
@@ -3599,6 +3604,7 @@ impl Default for MeshInboundTlsPolicy {
             by_port: HashMap::new(),
             default_mode: crate::modes::mesh::config::MtlsMode::Permissive,
             modes_by_port: std::collections::BTreeMap::new(),
+            app_port_by_orig_dst_port: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -11546,14 +11552,23 @@ fn select_mesh_inbound_tls(
     orig_dst: Option<SocketAddr>,
 ) -> ListenerTlsSelection {
     if let Some(dst) = orig_dst {
+        let app_port = policy
+            .app_port_by_orig_dst_port
+            .get(&dst.port())
+            .copied()
+            .unwrap_or_else(|| dst.port());
         let mode = policy
             .modes_by_port
-            .get(&dst.port())
+            .get(&app_port)
             .copied()
             .unwrap_or(policy.default_mode);
         return ListenerTlsSelection {
-            tls_config: select_mesh_inbound_tls_config(&policy.default, &policy.by_port, Some(dst))
-                .clone(),
+            tls_config: select_mesh_inbound_tls_config(
+                &policy.default,
+                &policy.by_port,
+                Some(app_port),
+            )
+            .clone(),
             accepts_plaintext: mtls_mode_accepts_plaintext(mode),
         };
     }
@@ -11619,26 +11634,32 @@ fn select_mesh_inbound_tls(
 
 fn first_byte_is_tls_client_hello(first_byte: u8) -> bool {
     // A TLS connection begins with a handshake record containing ClientHello.
-    // Treating any other byte as plaintext cannot weaken enforcement: the
-    // post-route gate rejects plaintext for STRICT ports.
+    // This intentionally remains a one-byte discriminator only for HTTP-family
+    // inbound traffic: a plaintext HTTP request cannot validly begin with 0x16,
+    // and the post-route gate rejects plaintext for STRICT ports. Captured
+    // stream-family routes bypass this classifier entirely so application TLS
+    // and binary protocols are relayed byte-for-byte under PERMISSIVE.
     first_byte == 0x16
 }
 
 fn mesh_inbound_selection_uses_tls(
     has_tls_config: bool,
     accepts_plaintext: bool,
+    stream_family_passthrough: bool,
     first_byte: u8,
 ) -> bool {
-    has_tls_config && (!accepts_plaintext || first_byte_is_tls_client_hello(first_byte))
+    has_tls_config
+        && (!accepts_plaintext
+            || (!stream_family_passthrough && first_byte_is_tls_client_hello(first_byte)))
 }
 
 fn select_mesh_inbound_tls_config<'a>(
     default: &'a Option<Arc<rustls::ServerConfig>>,
     by_port: &'a HashMap<u16, Option<Arc<rustls::ServerConfig>>>,
-    orig_dst: Option<SocketAddr>,
+    app_port: Option<u16>,
 ) -> &'a Option<Arc<rustls::ServerConfig>> {
-    orig_dst
-        .and_then(|dst| by_port.get(&dst.port()))
+    app_port
+        .and_then(|port| by_port.get(&port))
         .unwrap_or(default)
 }
 
@@ -12112,50 +12133,71 @@ async fn run_accept_loop(
                                 accepts_plaintext,
                             } = tls_selection;
                             if tls_config.is_some() && accepts_plaintext {
-                                let mut first_byte = [0_u8; 1];
-                                let peek = stream.peek(&mut first_byte);
-                                let peek_result = if state
-                                    .env_config
-                                    .frontend_tls_handshake_timeout_seconds
-                                    > 0
-                                {
-                                    match tokio::time::timeout(
-                                        std::time::Duration::from_secs(
-                                            state
-                                                .env_config
-                                                .frontend_tls_handshake_timeout_seconds,
-                                        ),
-                                        peek,
-                                    )
-                                    .await
-                                    {
-                                        Ok(result) => result,
-                                        Err(_) => Err(std::io::Error::from(
-                                            std::io::ErrorKind::TimedOut,
-                                        )),
-                                    }
+                                // A captured stream-family port is an L4
+                                // passthrough surface. In PERMISSIVE mode every
+                                // byte sequence, including an application-level
+                                // TLS ClientHello beginning with 0x16, belongs to
+                                // the backend protocol and must not be consumed
+                                // by the mesh HTTP TLS terminator.
+                                let stream_family_passthrough = mesh_direction
+                                    == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+                                    && orig_dst.is_some_and(|dst| {
+                                        state
+                                            .request_epoch
+                                            .load()
+                                            .route_table
+                                            .mesh_tcp_inbound_entry(dst)
+                                            .is_some()
+                                    });
+                                if stream_family_passthrough {
+                                    tls_config = None;
                                 } else {
-                                    peek.await
-                                };
-                                match peek_result {
-                                    Ok(0) => return,
-                                    Ok(_)
-                                        if !mesh_inbound_selection_uses_tls(
-                                            tls_config.is_some(),
-                                            accepts_plaintext,
-                                            first_byte[0],
-                                        ) =>
+                                    let mut first_byte = [0_u8; 1];
+                                    let peek = stream.peek(&mut first_byte);
+                                    let peek_result = if state
+                                        .env_config
+                                        .frontend_tls_handshake_timeout_seconds
+                                        > 0
                                     {
-                                        tls_config = None;
-                                    }
-                                    Ok(_) => {}
-                                    Err(error) => {
-                                        debug!(
-                                            remote_addr = %remote_addr.ip(),
-                                            %error,
-                                            "Unable to classify dual-posture mesh inbound connection"
-                                        );
-                                        return;
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_secs(
+                                                state
+                                                    .env_config
+                                                    .frontend_tls_handshake_timeout_seconds,
+                                            ),
+                                            peek,
+                                        )
+                                        .await
+                                        {
+                                            Ok(result) => result,
+                                            Err(_) => Err(std::io::Error::from(
+                                                std::io::ErrorKind::TimedOut,
+                                            )),
+                                        }
+                                    } else {
+                                        peek.await
+                                    };
+                                    match peek_result {
+                                        Ok(0) => return,
+                                        Ok(_)
+                                            if !mesh_inbound_selection_uses_tls(
+                                                tls_config.is_some(),
+                                                accepts_plaintext,
+                                                false,
+                                                first_byte[0],
+                                            ) =>
+                                        {
+                                            tls_config = None;
+                                        }
+                                        Ok(_) => {}
+                                        Err(error) => {
+                                            debug!(
+                                                remote_addr = %remote_addr.ip(),
+                                                %error,
+                                                "Unable to classify dual-posture mesh inbound connection"
+                                            );
+                                            return;
+                                        }
                                     }
                                 }
                             }
@@ -36694,18 +36736,10 @@ mod tests {
     fn mesh_inbound_tls_selection_uses_original_app_port_then_fallback() {
         let default = None;
         let by_port = HashMap::from([(8080, None), (9090, None)]);
-        let selected_8080 = select_mesh_inbound_tls_config(
-            &default,
-            &by_port,
-            Some("10.0.0.8:8080".parse().expect("socket addr")),
-        );
+        let selected_8080 = select_mesh_inbound_tls_config(&default, &by_port, Some(8080));
         assert!(std::ptr::eq(selected_8080, &by_port[&8080]));
 
-        let selected_unknown = select_mesh_inbound_tls_config(
-            &default,
-            &by_port,
-            Some("10.0.0.8:7070".parse().expect("socket addr")),
-        );
+        let selected_unknown = select_mesh_inbound_tls_config(&default, &by_port, Some(7070));
         assert!(std::ptr::eq(selected_unknown, &default));
         assert!(std::ptr::eq(
             select_mesh_inbound_tls_config(&default, &by_port, None),
@@ -36725,12 +36759,14 @@ mod tests {
                 by_port: HashMap::from([(8080, Some(Arc::clone(&tls)))]),
                 default_mode: MtlsMode::Disable,
                 modes_by_port: std::collections::BTreeMap::from([(8080, MtlsMode::Strict)]),
+                app_port_by_orig_dst_port: std::collections::BTreeMap::new(),
             },
             MeshInboundTlsPolicy {
                 default: Some(Arc::clone(&tls)),
                 by_port: HashMap::from([(8081, None)]),
                 default_mode: MtlsMode::Strict,
                 modes_by_port: std::collections::BTreeMap::from([(8081, MtlsMode::Disable)]),
+                app_port_by_orig_dst_port: std::collections::BTreeMap::new(),
             },
         ] {
             let selected = select_mesh_inbound_tls(&policy, None);
@@ -36745,11 +36781,13 @@ mod tests {
             assert!(mesh_inbound_selection_uses_tls(
                 selected.tls_config.is_some(),
                 selected.accepts_plaintext,
+                false,
                 0x16
             ));
             assert!(!mesh_inbound_selection_uses_tls(
                 selected.tls_config.is_some(),
                 selected.accepts_plaintext,
+                false,
                 b'G'
             ));
         }
@@ -36779,6 +36817,7 @@ mod tests {
             by_port: HashMap::from([(6379, Some(tls))]),
             default_mode: MtlsMode::Strict,
             modes_by_port: std::collections::BTreeMap::from([(6379, MtlsMode::Permissive)]),
+            app_port_by_orig_dst_port: std::collections::BTreeMap::new(),
         };
         let selected =
             select_mesh_inbound_tls(&policy, Some("10.0.0.8:6379".parse().expect("socket addr")));
@@ -36792,10 +36831,40 @@ mod tests {
             !mesh_inbound_selection_uses_tls(
                 selected.tls_config.is_some(),
                 selected.accepts_plaintext,
+                true,
                 b'*'
             ),
             "a plaintext Redis request must select the no-TLS stream relay path"
         );
+        assert!(
+            !mesh_inbound_selection_uses_tls(
+                selected.tls_config.is_some(),
+                selected.accepts_plaintext,
+                true,
+                0x16
+            ),
+            "application TLS on a PERMISSIVE stream port must remain L4 passthrough"
+        );
+    }
+
+    #[test]
+    fn captured_ingress_tls_selection_maps_listener_to_backend_app_port() {
+        use crate::modes::mesh::config::MtlsMode;
+
+        let strict_tls = crate::tls::temporary_disabled_listener_tls_config()
+            .expect("temporary TLS config for selection test");
+        let policy = MeshInboundTlsPolicy {
+            default: None,
+            by_port: HashMap::from([(8080, Some(Arc::clone(&strict_tls)))]),
+            default_mode: MtlsMode::Permissive,
+            modes_by_port: std::collections::BTreeMap::from([(8080, MtlsMode::Strict)]),
+            app_port_by_orig_dst_port: std::collections::BTreeMap::from([(8443, 8080)]),
+        };
+
+        let selected =
+            select_mesh_inbound_tls(&policy, Some("10.0.0.8:8443".parse().expect("socket addr")));
+        assert!(selected.tls_config.is_some());
+        assert!(!selected.accepts_plaintext);
     }
 
     #[test]

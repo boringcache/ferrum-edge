@@ -9761,12 +9761,16 @@ async fn serve_mesh_runtime(
         load_mesh_frontend_server_identity(&env_config, &proxy_state.gateway_svid_bundle)?;
     let inbound_mtls_modes_by_port =
         resolve_inbound_mtls_modes_by_port(initial_applied_mesh_slice.as_deref());
+    let inbound_app_port_by_orig_dst_port =
+        resolve_inbound_app_ports_by_orig_dst_port(initial_applied_mesh_slice.as_deref());
     let initial_inbound_tls_snapshot = if env_config.mesh_peer_auth_live_reload_enabled {
-        Some(mesh_inbound_tls_reload_snapshot(
+        let mut snapshot = mesh_inbound_tls_reload_snapshot(
             &env_config,
             inbound_mtls_mode,
             inbound_mtls_modes_by_port.clone(),
-        )?)
+        )?;
+        snapshot.app_port_by_orig_dst_port = inbound_app_port_by_orig_dst_port.clone();
+        Some(snapshot)
     } else {
         None
     };
@@ -9889,6 +9893,7 @@ async fn serve_mesh_runtime(
             by_port: frontend_tls_by_port,
             default_mode: inbound_mtls_mode,
             modes_by_port: inbound_mtls_modes_by_port,
+            app_port_by_orig_dst_port: inbound_app_port_by_orig_dst_port,
         }));
     proxy_state.mesh_inbound_spiffe_verifier_active.store(
         mesh_inbound_spiffe_verifier_active(
@@ -10446,6 +10451,38 @@ fn resolve_inbound_mtls_modes_by_port(
         .collect()
 }
 
+/// Build the pre-handshake port-domain translation for captured Sidecar
+/// ingress[] traffic. SO_ORIGINAL_DST carries the declared listener port, while
+/// PeerAuthentication.portLevelMtls is keyed by the defaultEndpoint backend app
+/// port. Ordinary captured inbound routes already carry the app port and need
+/// no alias.
+fn resolve_inbound_app_ports_by_orig_dst_port(
+    slice: Option<&MeshSlice>,
+) -> std::collections::BTreeMap<u16, u16> {
+    let Some(slice) = slice else {
+        return std::collections::BTreeMap::new();
+    };
+    let mut aliases = std::collections::BTreeMap::new();
+    for listener in &slice.local_ingress_listeners {
+        // Match the ingress materializer's carried-value boundary checks. A
+        // malformed listener that cannot become a route must not influence the
+        // TLS policy table.
+        if !listener.endpoint_is_valid()
+            || listener.owner_namespace.is_empty()
+            || listener.owner_service.is_empty()
+        {
+            continue;
+        }
+        // Native Sidecar resolution already deduplicates by listener port and
+        // keeps the first entry. Preserve that deterministic behavior for a
+        // defensive carried-slice duplicate as well.
+        aliases
+            .entry(listener.port)
+            .or_insert(listener.endpoint_port);
+    }
+    aliases
+}
+
 /// Reject `MtlsMode::Disable` on topologies whose inbound listener is
 /// fundamentally mTLS-only:
 ///
@@ -10552,6 +10589,7 @@ impl fmt::Debug for MeshInboundClientCaBundle {
 struct MeshInboundTlsReloadSnapshot {
     mtls_mode: config::MtlsMode,
     port_modes: std::collections::BTreeMap<u16, config::MtlsMode>,
+    app_port_by_orig_dst_port: std::collections::BTreeMap<u16, u16>,
     client_ca_bundle: Option<MeshInboundClientCaBundle>,
 }
 
@@ -11411,6 +11449,7 @@ fn mesh_inbound_tls_reload_snapshot(
     Ok(MeshInboundTlsReloadSnapshot {
         mtls_mode,
         port_modes,
+        app_port_by_orig_dst_port: std::collections::BTreeMap::new(),
         client_ca_bundle,
     })
 }
@@ -12128,7 +12167,7 @@ fn plan_mesh_inbound_tls_reload_with_federation(
     has_termination_listener: bool,
 ) -> Option<MeshInboundTlsReloadPlan> {
     let port_modes = resolve_inbound_mtls_modes_by_port(Some(slice));
-    let next_snapshot = match mesh_inbound_tls_reload_snapshot(
+    let mut next_snapshot = match mesh_inbound_tls_reload_snapshot(
         &proxy_state.env_config,
         mtls_mode,
         port_modes,
@@ -12143,6 +12182,8 @@ fn plan_mesh_inbound_tls_reload_with_federation(
             return None;
         }
     };
+    next_snapshot.app_port_by_orig_dst_port =
+        resolve_inbound_app_ports_by_orig_dst_port(Some(slice));
     // Rebuild the SPIFFE inbound trust-bundle from the new slice's federated
     // bundles, but STAGE it rather than storing it into the live slot here.
     // Storing during planning would let a slice that is later rejected leave
@@ -12328,6 +12369,7 @@ async fn apply_mesh_inbound_tls_reload(
                     by_port: tls_by_port,
                     default_mode: mtls_mode,
                     modes_by_port: snapshot.port_modes.clone(),
+                    app_port_by_orig_dst_port: snapshot.app_port_by_orig_dst_port.clone(),
                 },
             ));
             proxy_state.mesh_inbound_spiffe_verifier_active.store(
@@ -23028,10 +23070,7 @@ mod tests {
 
         mesh_state.install_slice(MeshSlice {
             version: "strict".to_string(),
-            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
-                15006,
-                config::MtlsMode::Strict,
-            )])
+            ..slice_with_peer_auths(vec![peer_auth_with_workload_mode(config::MtlsMode::Strict)])
         });
         wait_for_mesh_inbound_tls(&proxy_state, true).await;
         let strict_tls_slot = proxy_state.mesh_inbound_tls.load_full();
@@ -23039,10 +23078,7 @@ mod tests {
         mesh_state.install_slice(MeshSlice {
             version: "strict-label-only".to_string(),
             labels: [("app".to_string(), "same-peer-auth".to_string())].into(),
-            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
-                15006,
-                config::MtlsMode::Strict,
-            )])
+            ..slice_with_peer_auths(vec![peer_auth_with_workload_mode(config::MtlsMode::Strict)])
         });
         wait_for_mesh_authz_label(&proxy_state, "app", "same-peer-auth").await;
         let unchanged_tls_slot = proxy_state.mesh_inbound_tls.load_full();
@@ -23053,8 +23089,7 @@ mod tests {
 
         mesh_state.install_slice(MeshSlice {
             version: "disable".to_string(),
-            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
-                15006,
+            ..slice_with_peer_auths(vec![peer_auth_with_workload_mode(
                 config::MtlsMode::Disable,
             )])
         });
@@ -23127,10 +23162,7 @@ mod tests {
         // ServerConfig into BOTH the HBONE slot AND the stream-listener slot.
         mesh_state.install_slice(MeshSlice {
             version: "strict-stream".to_string(),
-            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
-                15006,
-                config::MtlsMode::Strict,
-            )])
+            ..slice_with_peer_auths(vec![peer_auth_with_workload_mode(config::MtlsMode::Strict)])
         });
         wait_for_mesh_inbound_tls(&proxy_state, true).await;
 
@@ -23166,8 +23198,7 @@ mod tests {
         // Disable PeerAuth: both slots must clear.
         mesh_state.install_slice(MeshSlice {
             version: "disable-stream".to_string(),
-            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
-                15006,
+            ..slice_with_peer_auths(vec![peer_auth_with_workload_mode(
                 config::MtlsMode::Disable,
             )])
         });
@@ -25663,6 +25694,17 @@ mod tests {
         }
     }
 
+    fn peer_auth_with_workload_mode(mode: config::MtlsMode) -> config::PeerAuthentication {
+        config::PeerAuthentication {
+            name: "ns-policy".to_string(),
+            namespace: "default".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: mode,
+            port_overrides: HashMap::new(),
+        }
+    }
+
     fn slice_with_peer_auths(peer_auths: Vec<config::PeerAuthentication>) -> MeshSlice {
         MeshSlice {
             namespace: "default".to_string(),
@@ -25691,6 +25733,22 @@ mod tests {
                 (8080, config::MtlsMode::Strict),
                 (9090, config::MtlsMode::Permissive),
             ])
+        );
+    }
+
+    #[test]
+    fn ingress_original_destination_maps_to_backend_app_port() {
+        let mut listener = ingress_listener(8443, "127.0.0.1", 8080);
+        listener.owner_namespace = "default".to_string();
+        listener.owner_service = "api".to_string();
+        let slice = MeshSlice {
+            local_ingress_listeners: vec![listener],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            resolve_inbound_app_ports_by_orig_dst_port(Some(&slice)),
+            std::collections::BTreeMap::from([(8443, 8080)])
         );
     }
 
@@ -25765,8 +25823,7 @@ mod tests {
     #[test]
     fn startup_inbound_mtls_mode_rejects_invalid_initial_disable() {
         let runtime = runtime_with_topology(MeshTopology::Ambient);
-        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
-            15008,
+        let slice = slice_with_peer_auths(vec![peer_auth_with_workload_mode(
             config::MtlsMode::Disable,
         )]);
 
@@ -25779,10 +25836,8 @@ mod tests {
     #[test]
     fn startup_inbound_mtls_mode_accepts_valid_initial_mode() {
         let runtime = runtime_with_topology(MeshTopology::Ambient);
-        let slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
-            15008,
-            config::MtlsMode::Strict,
-        )]);
+        let slice =
+            slice_with_peer_auths(vec![peer_auth_with_workload_mode(config::MtlsMode::Strict)]);
 
         let mode = startup_inbound_mtls_mode(Some(&slice), &runtime)
             .expect("strict mode should be accepted at startup");
