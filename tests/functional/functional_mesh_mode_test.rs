@@ -3197,14 +3197,26 @@ async fn grpc_egress_request(
     path: &str,
     framed_body: &[u8],
 ) -> Result<GrpcEgressResponse, Box<dyn std::error::Error + Send + Sync>> {
-    use hyper::client::conn::http2;
-
-    let stream = tokio::time::timeout(
-        Duration::from_secs(5),
-        TcpStream::connect(("127.0.0.1", port)),
+    grpc_egress_request_to(
+        SocketAddr::from(([127, 0, 0, 1], port)),
+        authority,
+        path,
+        framed_body,
     )
     .await
-    .map_err(|_| "connect timed out")??;
+}
+
+async fn grpc_egress_request_to(
+    address: SocketAddr,
+    authority: &str,
+    path: &str,
+    framed_body: &[u8],
+) -> Result<GrpcEgressResponse, Box<dyn std::error::Error + Send + Sync>> {
+    use hyper::client::conn::http2;
+
+    let stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(address))
+        .await
+        .map_err(|_| "connect timed out")??;
     let _ = stream.set_nodelay(true);
     let io = TokioIo::new(stream);
     let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io).await?;
@@ -7316,10 +7328,23 @@ impl LivePodNetns {
     }
 
     fn publish(&self, registry_dir: &std::path::Path, pod_uid: &str) -> Result<PathBuf, String> {
+        self.publish_with_identity(registry_dir, pod_uid, None)
+    }
+
+    fn publish_with_identity(
+        &self,
+        registry_dir: &std::path::Path,
+        pod_uid: &str,
+        spiffe_id: Option<&str>,
+    ) -> Result<PathBuf, String> {
         std::fs::create_dir_all(registry_dir)
             .map_err(|error| format!("create pod registry: {error}"))?;
         let path = registry_dir.join(pod_uid);
-        std::fs::write(&path, format!("{}\n", self.cgroup_dir.path().display()))
+        let mut contents = format!("{}\n", self.cgroup_dir.path().display());
+        if let Some(spiffe_id) = spiffe_id {
+            contents.push_str(&format!("spiffe_id={spiffe_id}\n"));
+        }
+        std::fs::write(&path, contents)
             .map_err(|error| format!("publish pod registry entry: {error}"))?;
         Ok(path)
     }
@@ -8334,6 +8359,8 @@ const LIVE_XC_ID_A_AMBIENT: &str = "spiffe://cluster-a.test/ns/ferrum/sa/ambient
 const LIVE_XC_ID_A_UNFEDERATED: &str = "spiffe://cluster-a.test/ns/ferrum/sa/unfederated-client";
 #[cfg(target_os = "linux")]
 const LIVE_XC_ID_B: &str = "spiffe://cluster-b.test/ns/ferrum/sa/destination";
+#[cfg(target_os = "linux")]
+const LIVE_XC_SOURCE_POD_UID: &str = "11111111-2222-4333-8444-555555555555";
 
 #[cfg(target_os = "linux")]
 const LIVE_XC_HTTP_PORT: u16 = 18080;
@@ -8391,6 +8418,23 @@ struct LiveTwoClusterSpire {
 }
 
 #[cfg(target_os = "linux")]
+struct LiveXcSpireSetupGuard {
+    roots: Vec<String>,
+    armed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LiveXcSpireSetupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            for root in &self.roots {
+                let _ = run_live_xc_spire(&["stop", root]);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl LiveTwoClusterSpire {
     async fn start() -> Result<Self, String> {
         let cluster_a = TempDir::new().map_err(|error| format!("SPIRE A tempdir: {error}"))?;
@@ -8406,12 +8450,11 @@ impl LiveTwoClusterSpire {
         let a_root = cluster_a.path().display().to_string();
         let b_root = cluster_b.path().display().to_string();
         run_live_xc_spire(&["start", &a_root, LIVE_XC_TD_A, &port_a.to_string()])?;
-        if let Err(error) =
-            run_live_xc_spire(&["start", &b_root, LIVE_XC_TD_B, &port_b.to_string()])
-        {
-            let _ = run_live_xc_spire(&["stop", &a_root]);
-            return Err(error);
-        }
+        let mut setup_guard = LiveXcSpireSetupGuard {
+            roots: vec![a_root.clone(), b_root.clone()],
+            armed: true,
+        };
+        run_live_xc_spire(&["start", &b_root, LIVE_XC_TD_B, &port_b.to_string()])?;
         run_live_xc_spire(&["federate", &a_root, LIVE_XC_TD_A, &b_root, LIVE_XC_TD_B])?;
         run_live_xc_spire(&[
             "register",
@@ -8449,6 +8492,7 @@ impl LiveTwoClusterSpire {
             .map_err(|error| format!("read SPIRE A bundle: {error}"))?;
         let bundle_b_pem = std::fs::read_to_string(cluster_b.path().join("bundle.pem"))
             .map_err(|error| format!("read SPIRE B bundle: {error}"))?;
+        setup_guard.armed = false;
         Ok(Self {
             cluster_a,
             cluster_b,
@@ -8663,7 +8707,7 @@ fn live_xc_source_slice(
         weight: None,
         locality: None,
         service_account: Some("client".to_string()),
-        pod_uid: Some("live-xc-source".to_string()),
+        pod_uid: Some(LIVE_XC_SOURCE_POD_UID.to_string()),
         node_waypoint: None,
         remote_provenance: false,
     };
@@ -8693,6 +8737,16 @@ fn live_xc_source_slice(
         // the same slice and therefore cannot inherit peer trust from config.
         trust_bundles: None,
         ..MeshSlice::default()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn live_xc_retain_ports(slice: &mut MeshSlice, retained: &[u16]) {
+    for service in &mut slice.services {
+        service.ports.retain(|port| retained.contains(&port.port));
+    }
+    for workload in &mut slice.workloads {
+        workload.ports.retain(|port| retained.contains(&port.port));
     }
 }
 
@@ -9064,7 +9118,9 @@ fn live_xc_missing_sni_slice(
 
 #[cfg(target_os = "linux")]
 struct LiveXcHostNetwork {
-    chain: String,
+    forward_chain: String,
+    output_chain: String,
+    previous_forwarding: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -9074,6 +9130,19 @@ impl LiveXcHostNetwork {
         east_west_ip: std::net::Ipv4Addr,
         dest_ip: std::net::Ipv4Addr,
     ) -> Result<Self, String> {
+        let previous_forwarding = Command::new("sysctl")
+            .args(["-n", "net.ipv4.ip_forward"])
+            .output()
+            .map_err(|error| format!("read host IPv4 forwarding: {error}"))?;
+        if !previous_forwarding.status.success() {
+            return Err(format!(
+                "read host IPv4 forwarding failed: {}",
+                String::from_utf8_lossy(&previous_forwarding.stderr)
+            ));
+        }
+        let previous_forwarding = String::from_utf8_lossy(&previous_forwarding.stdout)
+            .trim()
+            .to_string();
         let forwarding = Command::new("sysctl")
             .args(["-w", "net.ipv4.ip_forward=1"])
             .output()
@@ -9084,24 +9153,50 @@ impl LiveXcHostNetwork {
                 String::from_utf8_lossy(&forwarding.stderr)
             ));
         }
-        let chain = format!("FXC{:x}", std::process::id());
+        let forward_chain = format!("FXC{:x}", std::process::id());
+        let output_chain = format!("FXO{:x}", std::process::id());
         let script = format!(
             "set -e; \
-             iptables -w 5 -t filter -N {chain}; \
-             iptables -w 5 -t filter -I FORWARD 1 -j {chain}; \
-             iptables -w 5 -t filter -A {chain} -s {source_ip} -d {dest_ip} -j REJECT; \
-             iptables -w 5 -t filter -A {chain} -s {source_ip} -d {east_west_ip} -j ACCEPT; \
-             iptables -w 5 -t filter -A {chain} -s {east_west_ip} -d {dest_ip} -j ACCEPT; \
-             iptables -w 5 -t filter -A {chain} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; \
-             iptables -w 5 -t filter -A {chain} -j RETURN"
+             iptables -w 5 -t filter -N {forward_chain}; \
+             iptables -w 5 -t filter -N {output_chain}; \
+             iptables -w 5 -t filter -I FORWARD 1 -j {forward_chain}; \
+             iptables -w 5 -t filter -I OUTPUT 1 -j {output_chain}; \
+             iptables -w 5 -t filter -A {forward_chain} -s {source_ip} -d {dest_ip} -j REJECT; \
+             iptables -w 5 -t filter -A {forward_chain} -s {source_ip} -d {east_west_ip} -j ACCEPT; \
+             iptables -w 5 -t filter -A {forward_chain} -s {east_west_ip} -d {dest_ip} -j ACCEPT; \
+             iptables -w 5 -t filter -A {forward_chain} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; \
+             iptables -w 5 -t filter -A {forward_chain} -j RETURN; \
+             iptables -w 5 -t filter -A {output_chain} -d {dest_ip} -j REJECT; \
+             iptables -w 5 -t filter -A {output_chain} -j RETURN"
         );
-        Command::new("sh")
+        let installed = Command::new("sh")
             .args(["-c", &script])
             .status()
-            .map_err(|error| format!("install live cross-cluster host firewall: {error}"))?
-            .success()
-            .then_some(Self { chain })
-            .ok_or_else(|| "install live cross-cluster host firewall failed".to_string())
+            .map_err(|error| format!("install live cross-cluster host firewall: {error}"))?;
+        if !installed.success() {
+            let _ = Command::new("sh")
+                .args([
+                    "-c",
+                    &format!(
+                        "iptables -w 5 -t filter -D FORWARD -j {forward_chain} 2>/dev/null || true; \
+                         iptables -w 5 -t filter -D OUTPUT -j {output_chain} 2>/dev/null || true; \
+                         iptables -w 5 -t filter -F {forward_chain} 2>/dev/null || true; \
+                         iptables -w 5 -t filter -F {output_chain} 2>/dev/null || true; \
+                         iptables -w 5 -t filter -X {forward_chain} 2>/dev/null || true; \
+                         iptables -w 5 -t filter -X {output_chain} 2>/dev/null || true"
+                    ),
+                ])
+                .status();
+            let _ = Command::new("sysctl")
+                .args(["-w", &format!("net.ipv4.ip_forward={previous_forwarding}")])
+                .status();
+            return Err("install live cross-cluster host firewall failed".to_string());
+        }
+        Ok(Self {
+            forward_chain,
+            output_chain,
+            previous_forwarding,
+        })
     }
 }
 
@@ -9113,10 +9208,19 @@ impl Drop for LiveXcHostNetwork {
                 "-c",
                 &format!(
                     "iptables -w 5 -t filter -D FORWARD -j {0} 2>/dev/null || true; \
+                     iptables -w 5 -t filter -D OUTPUT -j {1} 2>/dev/null || true; \
                      iptables -w 5 -t filter -F {0} 2>/dev/null || true; \
-                     iptables -w 5 -t filter -X {0} 2>/dev/null || true",
-                    self.chain
+                     iptables -w 5 -t filter -F {1} 2>/dev/null || true; \
+                     iptables -w 5 -t filter -X {0} 2>/dev/null || true; \
+                     iptables -w 5 -t filter -X {1} 2>/dev/null || true",
+                    self.forward_chain, self.output_chain
                 ),
+            ])
+            .status();
+        let _ = Command::new("sysctl")
+            .args([
+                "-w",
+                &format!("net.ipv4.ip_forward={}", self.previous_forwarding),
             ])
             .status();
     }
@@ -9267,7 +9371,11 @@ impl LiveTwoClusterFixture {
         let spire = LiveTwoClusterSpire::start().await?;
         let backends = LiveXcBackends::start(destination.pod.pid())?;
         let registry = TempDir::new().map_err(|error| format!("live registry tempdir: {error}"))?;
-        let registry_entry = source.pod.publish(registry.path(), "live-xc-source")?;
+        let registry_entry = source.pod.publish_with_identity(
+            registry.path(),
+            LIVE_XC_SOURCE_POD_UID,
+            Some(LIVE_XC_ID_A_AMBIENT),
+        )?;
 
         let temp_sidecar_source = TempDir::new().map_err(|e| format!("source tempdir: {e}"))?;
         let temp_ambient_source = TempDir::new().map_err(|e| format!("ambient tempdir: {e}"))?;
@@ -9409,35 +9517,54 @@ impl LiveTwoClusterFixture {
         )
         .await;
         let cp_ambient_source = start_static_mesh_cp_on(
-            source_slice("live-xc-ambient-source"),
+            {
+                let mut slice = source_slice("live-xc-ambient-source");
+                live_xc_retain_ports(
+                    &mut slice,
+                    &[LIVE_XC_AMBIENT_WS_PORT, LIVE_XC_UDP_PORT],
+                );
+                slice
+            },
             "0.0.0.0:0".parse().expect("wildcard CP bind"),
             Some(std::net::IpAddr::V4(source.host_ip)),
         )
         .await;
         let cp_unfederated_source = start_static_mesh_cp_on(
-            source_slice("live-xc-unfederated-source"),
+            {
+                let mut slice = source_slice("live-xc-unfederated-source");
+                live_xc_retain_ports(&mut slice, &[LIVE_XC_HTTP_PORT]);
+                slice
+            },
             "0.0.0.0:0".parse().expect("wildcard CP bind"),
             Some(std::net::IpAddr::V4(source.host_ip)),
         )
         .await;
         let cp_wrong_td_source = start_static_mesh_cp_on(
-            live_xc_wrong_trust_domain_slice(
-                "live-xc-wrong-td-source",
-                destination.pod_ip(),
-                east_west.pod_ip(),
-                east_west_port,
-            ),
+            {
+                let mut slice = live_xc_wrong_trust_domain_slice(
+                    "live-xc-wrong-td-source",
+                    destination.pod_ip(),
+                    east_west.pod_ip(),
+                    east_west_port,
+                );
+                live_xc_retain_ports(&mut slice, &[LIVE_XC_HTTP_PORT]);
+                slice
+            },
             "0.0.0.0:0".parse().expect("wildcard CP bind"),
             Some(std::net::IpAddr::V4(source.host_ip)),
         )
         .await;
         let cp_missing_sni_source = start_static_mesh_cp_on(
-            live_xc_missing_sni_slice(
-                "live-xc-missing-sni-source",
-                destination.pod_ip(),
-                east_west.pod_ip(),
-                east_west_port,
-            ),
+            {
+                let mut slice = live_xc_missing_sni_slice(
+                    "live-xc-missing-sni-source",
+                    destination.pod_ip(),
+                    east_west.pod_ip(),
+                    east_west_port,
+                );
+                live_xc_retain_ports(&mut slice, &[LIVE_XC_HTTP_PORT]);
+                slice
+            },
             "0.0.0.0:0".parse().expect("wildcard CP bind"),
             Some(std::net::IpAddr::V4(source.host_ip)),
         )
@@ -9685,12 +9812,12 @@ impl LiveTwoClusterFixture {
 
     async fn websocket(
         &self,
-        outbound: u16,
+        destination: SocketAddr,
         host: &'static str,
         payload: &'static str,
     ) -> Result<String, String> {
         run_async_in_live_netns(self.source.pod.pid(), move || async move {
-            mesh_websocket_echo_roundtrip(outbound, host, payload).await
+            mesh_websocket_echo_roundtrip_to(destination, host, "/", payload).await
         })
     }
 
@@ -9707,10 +9834,12 @@ impl LiveTwoClusterFixture {
 
     async fn grpc(&self) -> Result<GrpcEgressResponse, String> {
         let framed = grpc_framed_payload(b"live-two-cluster-grpc");
-        let outbound = self.sidecar_outbound;
+        let destination = format!("{LIVE_XC_MULTI_VIP}:{LIVE_XC_GRPC_PORT}")
+            .parse()
+            .expect("gRPC VIP");
         run_async_in_live_netns(self.source.pod.pid(), move || async move {
-            grpc_egress_request(
-                outbound,
+            grpc_egress_request_to(
+                destination,
                 "live-matrix.ferrum.svc.cluster.local:18081",
                 "/echo.Mesh/Call",
                 &framed,
@@ -9803,13 +9932,15 @@ fn live_xc_udp_round_trip(
 #[cfg(target_os = "linux")]
 async fn live_xc_test_http(fixture: &LiveTwoClusterFixture) {
     let mut last = Err("HTTP row did not run".to_string());
+    let destination = format!("{LIVE_XC_MULTI_VIP}:{LIVE_XC_HTTP_PORT}")
+        .parse()
+        .expect("HTTP VIP");
     for _ in 0..20 {
-        last = fixture
-            .http_get(
-                fixture.sidecar_outbound,
-                "live-matrix.ferrum.svc.cluster.local:18080",
-            )
-            .await;
+        last = live_xc_http_get_from_vip(
+            fixture.source.pod.pid(),
+            destination,
+            "live-matrix.ferrum.svc.cluster.local:18080",
+        );
         if matches!(&last, Ok((200, body)) if body.contains("http-live-ok")) {
             return;
         }
@@ -9846,9 +9977,12 @@ async fn live_xc_test_grpc(fixture: &LiveTwoClusterFixture) {
 
 #[cfg(target_os = "linux")]
 async fn live_xc_test_sidecar_websocket(fixture: &LiveTwoClusterFixture) {
+    let destination = format!("{LIVE_XC_MULTI_VIP}:{LIVE_XC_SIDECAR_WS_PORT}")
+        .parse()
+        .expect("sidecar WebSocket VIP");
     let reply = fixture
         .websocket(
-            fixture.sidecar_outbound,
+            destination,
             "live-matrix.ferrum.svc.cluster.local:18082",
             "sidecar-live",
         )
@@ -10044,7 +10178,24 @@ async fn functional_mesh_live_two_cluster_cross_cluster_protocol_matrix() {
         !direct,
         "source cluster A can reach the destination pod directly; fixture isolation is invalid"
     );
+    let destination = SocketAddr::from((fixture.destination.pod_ip(), LIVE_XC_HTTP_PORT));
+    assert!(
+        !std::net::TcpStream::connect_timeout(&destination, Duration::from_secs(1)).is_ok(),
+        "the host-network Ambient gateway can reach the destination pod directly; fixture isolation is invalid"
+    );
 
+    eprintln!("LIVE_XC_STAGE ambient_ws:start");
+    live_xc_test_ambient_websocket(&fixture).await;
+    eprintln!("LIVE_XC_STAGE ambient_ws:ok");
+    eprintln!("LIVE_XC_STAGE udp:start");
+    live_xc_test_udp(&mut fixture).await;
+    eprintln!("LIVE_XC_STAGE udp:ok");
+    eprintln!("LIVE_XC_STAGE negatives:start");
+    live_xc_test_fail_closed_negatives(&fixture).await;
+    eprintln!("LIVE_XC_STAGE negatives:ok");
+    fixture
+        .install_tcp_capture()
+        .expect("install source production TCP capture");
     eprintln!("LIVE_XC_STAGE http:start");
     live_xc_test_http(&fixture).await;
     eprintln!("LIVE_XC_STAGE http:ok");
@@ -10054,21 +10205,12 @@ async fn functional_mesh_live_two_cluster_cross_cluster_protocol_matrix() {
     eprintln!("LIVE_XC_STAGE sidecar_ws:start");
     live_xc_test_sidecar_websocket(&fixture).await;
     eprintln!("LIVE_XC_STAGE sidecar_ws:ok");
-    eprintln!("LIVE_XC_STAGE ambient_ws:start");
-    live_xc_test_ambient_websocket(&fixture).await;
-    eprintln!("LIVE_XC_STAGE ambient_ws:ok");
-    eprintln!("LIVE_XC_STAGE negatives:start");
-    live_xc_test_fail_closed_negatives(&fixture).await;
-    eprintln!("LIVE_XC_STAGE negatives:ok");
     eprintln!("LIVE_XC_STAGE multi_port:start");
     live_xc_test_multi_port(&mut fixture);
     eprintln!("LIVE_XC_STAGE multi_port:ok");
     eprintln!("LIVE_XC_STAGE raw_tcp:start");
     live_xc_test_raw_tcp(&mut fixture);
     eprintln!("LIVE_XC_STAGE raw_tcp:ok");
-    eprintln!("LIVE_XC_STAGE udp:start");
-    live_xc_test_udp(&mut fixture).await;
-    eprintln!("LIVE_XC_STAGE udp:ok");
 
     eprintln!("LIVE_XC_STAGE shutdown:start");
     fixture.shutdown().await;
