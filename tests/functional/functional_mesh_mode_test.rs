@@ -9934,8 +9934,8 @@ fn live_xc_http_get_from_outbound_capture(
     let observed = live_xc_http_get_from_vip(pid, destination, host);
     let cleanup = netns_command(pid, &format!("iptables -w 5 -t nat -D OUTPUT {rule}"));
     match (observed, cleanup) {
-        (Ok(response), Ok(())) => Ok(response),
-        (Err(error), Ok(())) => Err(error),
+        (Ok(response), Ok(_)) => Ok(response),
+        (Err(error), Ok(_)) => Err(error),
         (Ok(_), Err(error)) => Err(format!("remove negative HTTP capture: {error}")),
         (Err(request_error), Err(cleanup_error)) => Err(format!(
             "{request_error}; remove negative HTTP capture: {cleanup_error}"
