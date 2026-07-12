@@ -2055,12 +2055,28 @@ async fn test_restore_reports_api_specs_not_restored_on_rollback() {
         "restore must report the api_specs it could not restore: {:?}",
         body
     );
+    // The recovery report must name the exact spec + proxy so the operator can
+    // clear the restored (now hand-managed) resource and re-submit the spec.
+    let lost = body["api_specs_lost"]
+        .as_array()
+        .expect("api_specs_lost must be an array");
+    assert_eq!(lost.len(), 1, "one spec was dropped: {:?}", body);
+    assert_eq!(
+        lost[0]["id"].as_str(),
+        Some("spec-1"),
+        "api_specs_lost must carry the dropped spec id: {:?}",
+        body
+    );
+    assert_eq!(
+        lost[0]["proxy_id"].as_str(),
+        Some("spec-proxy"),
+        "api_specs_lost must carry the owning proxy id: {:?}",
+        body
+    );
+    let note = body["api_specs_note"].as_str().unwrap_or_default();
     assert!(
-        body["api_specs_note"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("re-submit"),
-        "restore must instruct the operator to re-submit specs: {:?}",
+        note.contains("re-submit") && note.contains("deleting the restored proxy"),
+        "restore must give a usable recovery path (delete restored proxy, then re-submit): {:?}",
         body
     );
 
@@ -2073,11 +2089,14 @@ async fn test_restore_reports_api_specs_not_restored_on_rollback() {
     );
 }
 
-/// When `delete_all_resources` itself fails (partial clear on non-atomic
-/// backends), restore must still attempt the best-effort rollback and report
-/// honestly when it could not complete.
+/// When `delete_all_resources` fails on an ATOMIC backend (SQL runs the clear in
+/// one transaction), nothing was deleted, so the prior config is fully intact.
+/// Restore must return `500` with `rollback: "not_needed"` and retain the prior
+/// config WITHOUT invoking a second delete/import — a compensating re-clear would
+/// be unnecessary and could delete `api_specs` or duplicate resources on a
+/// transient error.
 #[tokio::test]
-async fn test_restore_rolls_back_after_delete_failure() {
+async fn test_restore_atomic_delete_failure_retains_prior_config() {
     let tc = TestConfig::default();
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test_restore_delete_fail.db");
@@ -2103,7 +2122,8 @@ async fn test_restore_rolls_back_after_delete_failure() {
     let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
     assert_eq!(status, 201, "Seed failed: {:?}", body);
 
-    // Make the delete phase (and thus the rollback's re-clear) fail.
+    // Make the delete phase fail. On SQLite the clear is one transaction, so the
+    // whole clear rolls back and the prior config is untouched.
     sqlx::query(
         "CREATE TRIGGER fail_restore_delete BEFORE DELETE ON proxies \
          WHEN OLD.id = 'restore-keep' \
@@ -2127,25 +2147,25 @@ async fn test_restore_rolls_back_after_delete_failure() {
         admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
 
     assert_eq!(status, 500, "Failed restore response: {:?}", body);
-    // The delete failed and the rollback's re-clear also failed, so rollback is
-    // incomplete and the response must be honest about manual recovery.
+    // Atomic clear failure => no rollback attempted; prior config retained.
     assert_eq!(
         body["rollback"].as_str(),
-        Some("incomplete"),
-        "delete + re-clear both fail, so rollback is incomplete: {:?}",
+        Some("not_needed"),
+        "atomic delete failure must not trigger a rollback re-import: {:?}",
+        body
+    );
+    // A second delete/import was NOT invoked, so there are no rollback errors.
+    assert!(
+        body["rollback_errors"].is_null(),
+        "atomic delete failure must not run a compensating clear (no rollback_errors): {:?}",
         body
     );
     assert!(
         body["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("manual recovery"),
-        "response must flag manual recovery: {:?}",
-        body
-    );
-    assert!(
-        body["rollback_errors"].is_array(),
-        "incomplete rollback must include rollback_errors: {:?}",
+            .contains("prior config was retained"),
+        "response must confirm the prior config was retained: {:?}",
         body
     );
 
@@ -2154,7 +2174,15 @@ async fn test_restore_rolls_back_after_delete_failure() {
     assert_eq!(
         status,
         reqwest::StatusCode::OK,
-        "the prior proxy must survive a failed delete"
+        "the prior proxy must survive a failed atomic delete"
+    );
+    // The restore payload's proxy must NOT have been imported — the import phase
+    // never ran because the clear failed and returned early.
+    let (status, _, _) = admin_get(&base_url, "/proxies/restore-new", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "no import must occur when the atomic clear fails"
     );
 }
 
