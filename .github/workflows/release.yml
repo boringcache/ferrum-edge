@@ -13,8 +13,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  validate-release-version:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+
+      - name: Require tag to match Cargo package version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          cargo_version="$(sed -nE '/^\[package\]$/,/^\[/{s/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p;}' Cargo.toml)"
+          if [ -z "$cargo_version" ]; then
+            echo "::error file=Cargo.toml,title=Missing package version::Could not extract [package] version from Cargo.toml"
+            exit 1
+          fi
+
+          expected_tag="v${cargo_version}"
+          if [ "$expected_tag" != "$TAG_NAME" ]; then
+            echo "::error file=Cargo.toml,title=Release version mismatch::Release tag '${TAG_NAME}' must match Cargo.toml package version '${cargo_version}' (expected tag '${expected_tag}')"
+            exit 1
+          fi
+
+          echo "Release tag ${TAG_NAME} matches Cargo.toml package version ${cargo_version}"
+
   validate-release-sha:
     name: Validate release SHA
+    needs: validate-release-version
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:

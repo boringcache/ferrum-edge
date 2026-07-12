@@ -75,7 +75,8 @@ Push to main
 
 ```
 Push tag v* (e.g., v0.2.0)
-    └─► Validate tag target has successful CI and Coverage runs for the exact SHA
+    └─► Validate tag matches the Cargo.toml package version
+            └─► Validate tag target has successful CI and Coverage runs for the exact SHA
             └─► Five target release builds (matrix: linux-x86_64 / linux-aarch64 /
                 macos-x86_64 / macos-aarch64 / windows-x86_64)
                     └─► Push versioned Docker images to Docker Hub and GHCR
@@ -255,9 +256,11 @@ On pushes to `main`, the `latest-release` job and the per-architecture Linux Doc
 ## Release Pipeline (release.yml)
 
 The Release pipeline creates official releases when a version tag is pushed. It
-first resolves the tag to its target commit and waits for successful `CI` and
-`Coverage` workflow runs for that exact SHA before any release binary or image
-job starts.
+first verifies that the tag is exactly `v` followed by the `[package]` version
+from `Cargo.toml`. It then resolves the tag to its target commit and waits for
+successful `CI` and `Coverage` workflow runs for that exact SHA before any
+release binary or image job starts. A version mismatch fails immediately, and
+every build and publishing job depends transitively on this guard.
 
 Release runs use `concurrency.group: release-${{ github.ref }}` with `cancel-in-progress: false`, so a versioned release is never canceled by a later tag push.
 
@@ -270,6 +273,15 @@ Push a tag matching the pattern `v*`:
 git tag v0.2.0
 git push origin v0.2.0
 ```
+
+### Validate Release Version Job
+
+**Runs**: `ubuntu-latest`
+
+Extracts the `[package]` version from `Cargo.toml` and requires
+`GITHUB_REF_NAME` to equal `v${CARGO_VERSION}`. A mismatch produces a clear
+workflow error and stops the release before CI polling, builds, registry pushes,
+or GitHub Release creation. The guard adds no secrets or elevated permissions.
 
 ### Validate Release SHA Job
 
@@ -383,9 +395,15 @@ version = "<version>"
 ```
 
 **Release Process**:
-1. Update `Cargo.toml` version to the intended release version before tagging
-2. Tag: `git tag v<version>` (matching the new version)
-3. Release: GitHub Actions automatically builds and publishes
+1. Record notable changes in `CHANGELOG.md` under `Unreleased`
+2. Update `Cargo.toml` version to the intended release version before tagging
+3. Tag: `git tag v<version>` (matching the new version exactly)
+4. Release: GitHub Actions automatically builds and publishes
+
+During active build-out, any breaking change to configuration shapes,
+environment variables, schema, defaults, or other user-facing behavior must add
+an `Unreleased` changelog entry in the same pull request. Release preparation
+moves those entries under the new version heading.
 
 ### Version Numbering
 
@@ -410,6 +428,9 @@ git tag v0.2.0   # matches Cargo.toml version = "0.2.0"
 # Incorrect (won't trigger release)
 git tag 0.2.0
 git tag release-0.2.0
+
+# Incorrect (workflow fails because Cargo.toml still says 0.2.0)
+git tag v0.3.0
 ```
 
 ## Creating a New Release
@@ -417,6 +438,7 @@ git tag release-0.2.0
 ### Prerequisites
 
 - Modify `Cargo.toml` with new version
+- Move the relevant `CHANGELOG.md` entries from `Unreleased` to the new version heading
 - Successful `CI` and `Coverage` workflow runs for the exact commit that will be tagged
 - GitHub repo with Actions enabled
 - Write permission to repository
@@ -458,6 +480,7 @@ git push origin v0.2.0
 
 - GitHub Actions detects tag matching `v*`
 - Release pipeline starts automatically
+- The tag is checked against the `Cargo.toml` package version before any publishing work
 - The tag target SHA is validated against successful CI and Coverage runs before publishing starts
 - Binaries built for all platforms
 - Release created with checksums

@@ -8,6 +8,7 @@ Thank you for your interest in contributing to Ferrum Edge! This document provid
 - [Getting Started](#getting-started)
 - [Development Environment](#development-environment)
 - [Making Changes](#making-changes)
+- [Changelog Policy](#changelog-policy)
 - [Testing](#testing)
 - [Pull Request Process](#pull-request-process)
 - [Commit Message Guidelines](#commit-message-guidelines)
@@ -111,6 +112,14 @@ For significant features, please open an issue first to discuss the design:
 
 For new plugins, see [CUSTOM_PLUGINS.md](CUSTOM_PLUGINS.md) for the plugin development guide.
 
+## Changelog Policy
+
+Ferrum Edge is in active build-out, so breaking changes are permitted without
+legacy compatibility shims. Any breaking change to configuration shapes,
+environment variables, schema, defaults, or other user-facing behavior **must**
+add an entry under the appropriate heading in `CHANGELOG.md`'s `Unreleased`
+section in the same pull request.
+
 ## Testing
 
 ### Running Tests
@@ -210,7 +219,7 @@ Closes #123
 - Update `docs/` for feature changes
 - Add doc comments to public APIs (`///`)
 - Update `README.md` for major features
-- Keep `CHANGELOG.md` updated if maintained
+- Follow the [changelog policy](#changelog-policy)
 
 ## Questions?
 
