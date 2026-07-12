@@ -29,8 +29,8 @@ Status values: `OPEN`, `IN-PROGRESS (PR #N / agent)`, `FIXED (PR #N)`, `TRACKED 
 
 | ID | Area | Finding | Severity | Status |
 |----|------|---------|----------|--------|
-| PR-001 | mesh live gate | Issue #2104: Ambient row east-west traversal not firewall-proven | Medium (test integrity) | IN-PROGRESS (PR #2105; orchestrator review done — on-spec; awaiting codex + CI) |
-| PR-002 | mesh TLS | Outbound mesh SPIFFE verification skips CRL revocation (src/tls/spiffe.rs:441-445); inbound-only asymmetry, undocumented | Medium (security) | IN-PROGRESS (issue #2106, sol-high agent) |
+| PR-001 | mesh live gate | Issue #2104: Ambient row east-west traversal not firewall-proven | Medium (test integrity) | FIXED (PR #2105 merged 2026-07-12; codex clean, CI green) |
+| PR-002 | mesh TLS | Outbound mesh SPIFFE verification skips CRL revocation (src/tls/spiffe.rs:441-445); inbound-only asymmetry, undocumented | Medium (security) | IN-PROGRESS (PR #2113; codex P2 confirmed: mesh pools must consume SharedCrlList live-reload slot, not startup snapshot — fix round dispatched) |
 | PR-003 | identity CA | InternalCa CSR path lacks PoP; UDS-only-safe today (internal.rs:267-285) | Low (hardening) | IN-PROGRESS (issue #2108, opus agent) |
 | PR-004 | identity | SPIFFE Workload API JWT-SVID unimplemented; X.509 complete | Low | TRACKED (#2110) |
 | PR-005 | k8s controller | Merge-Patch status writes (SSA TODO, TOCTOU); naming-convention proxy-id reconstruction | Low | TRACKED (#2110) |
