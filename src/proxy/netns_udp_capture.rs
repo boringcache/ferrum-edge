@@ -943,10 +943,10 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                     .as_ref()
                     .is_none_or(|dir| request_udp_gate_close(dir, &active.pod_uids));
                 if !close_requested {
-                warn!(
-                    netns_inode = netns,
-                    "Ambient UDP shutdown could not persist its close handshake; retaining the fail-closed guard"
-                );
+                    warn!(
+                        netns_inode = netns,
+                        "Ambient UDP shutdown could not persist its close handshake; retaining the fail-closed guard"
+                    );
                 }
                 (netns, active, close_requested)
             })

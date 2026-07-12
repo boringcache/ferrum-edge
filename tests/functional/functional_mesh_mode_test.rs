@@ -7835,10 +7835,11 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
         "unroutable UDP must not reach the destination echo"
     );
 
-    // Pod deletion: removing the registry entry starts the fail-closed shutdown
-    // handshake. Mirror the node-agent by waiting for the producer's durable ack
-    // requirement before publishing the closed-gate acknowledgement; only then
-    // may the producer remove its retained guard and every remaining rule/route.
+    // Pod deletion: this netns producer test intentionally runs no node-agent.
+    // Simulate that separate process only after observing the producer's durable
+    // ack requirement. Node-agent unit coverage exercises the real responder,
+    // including verified removal, refusal, and restart recovery; only then may
+    // the producer remove its retained guard and every remaining rule/route.
     std::fs::remove_file(&registry_entry).expect("delete UDP pod registry entry");
     let ack_required = registry.path().join(".udp-ack-required").join(POD_UID);
     let ack_deadline = Instant::now() + Duration::from_secs(5);

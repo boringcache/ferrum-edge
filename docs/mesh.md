@@ -2011,7 +2011,12 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   readiness and waits for the
   node-agent's `.udp-not-ready/<pod_uid>` acknowledgement that the BPF gate closed;
   if the acknowledgement is unavailable, stop retains the in-netns DROP guard
-  instead of reopening plaintext. The privileged `netns-capture-live` gate
+  instead of reopening plaintext. Successful pod removal also persists a
+  node-agent-owned `.udp-gate-cleaned/<pod_uid>` proof. A periodic responder in
+  both enabled and disabled reconciliation uses that proof to answer a later
+  durable `.udp-ack-required` request after the UID has left live pod state,
+  including after node-agent restart; a request without verified cleanup proof
+  is never acknowledged. The privileged `netns-capture-live` gate
   verifies the real manager/backend source producer, including its transparent
   bind, full HBONE round trip, return-source spoofing, no-route fail-closed
   behavior, capture-disabled absence, idempotent reconcile, pod-deletion cleanup,
@@ -2019,8 +2024,8 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   failure after the portable first-install fix above. The producer tears down
   only its own rules on pod removal / config change /
   shutdown. Its stop signal is also threaded into every per-session tunnel task;
-  producer close removes the session senders, waits up to two seconds for those
-  tasks, then aborts any stragglers before the pod-netns reply factory and stable
+  producer close signals every session task and awaits `JoinSet::shutdown()`,
+  which aborts and joins the tasks before the pod-netns reply factory and stable
   netns handle are released. Per-producer loops observe only the manager's stop
   signal, so global shutdown cannot race ahead of the manager's marker retraction
   and retain-guard decision. Graceful shutdown AWAITS the per-netns teardown.
@@ -2354,6 +2359,30 @@ nodeAgent:
 ```
 
 Required Linux capabilities: `CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON` (kernel >= 5.8), `CAP_SYS_ADMIN` for kernel-backcompat on 5.7.x and for every `node_waypoint` deployment's pod-netns `setns()`/veth discovery. Required volume mounts: `/sys/fs/bpf` (bpffs), `/sys/fs/cgroup` (cgroup v2, read-only). Required host access: `hostNetwork: true`, `hostPID: true`. See [`docs/node_agent_security.md`](node_agent_security.md) for the full security posture, including seccomp / AppArmor profiles and the kernel API each capability grants.
+
+### Ambient UDP upgrade notes
+
+Ambient topology now keeps the per-pod registry and stale-rule cleanup lifecycle
+active even when UDP capture is disabled. Consequently, an Ambient node without
+eBPF support refuses node-agent startup instead of entering the former host
+iptables fallback: that fallback cannot publish the registry, so proceeding
+would strand fail-closed pod-netns guards. Existing Ambient fleets relying on
+the fallback must move workloads to eBPF-capable nodes before upgrading.
+
+The Helm chart provisions every `ambient` + eBPF deployment for this lifecycle,
+including when UDP capture is currently off. The node-agent/proxy pair therefore
+uses the tools-capable `-ebpf` image, shares the pod-registry hostPath, and grants
+the setns/`NET_ADMIN` capabilities needed for stale pod-netns cleanup. This is a
+deliberate security-footprint increase that makes a later enabled-to-disabled
+rollout repairable without another chart shape change.
+
+Every node-agent restart re-derives enrollment from the live Kubernetes pod
+list. During that relist it removes existing `.udp-ready` markers and closes the
+host-veth UDP gate; producers rewrite readiness on their next registry poll
+(at most two seconds) and the node-agent reopens the gate on its next readiness
+reconcile (at most 250 ms). Budget roughly 2.5 seconds of fail-closed UDP
+unavailability per node-agent restart; traffic is dropped during the interval,
+not allowed to bypass capture.
 
 ### Metrics
 

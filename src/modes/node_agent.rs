@@ -311,7 +311,14 @@ impl NodeAgentConfig {
         let mesh_topology =
             resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").unwrap_or_else(|| "sidecar".to_string());
         let ambient_topology = mesh_topology.trim().eq_ignore_ascii_case("ambient");
-        let ambient_udp_producer = capture_config.udp_capture_enabled && ambient_topology;
+        let udp_capture_requested = capture_config.udp_capture_enabled;
+        if udp_capture_requested && !ambient_topology {
+            warn!(
+                mesh_topology = mesh_topology.trim(),
+                "FERRUM_MESH_CAPTURE_UDP_ENABLED=true requires FERRUM_MESH_TOPOLOGY=ambient; the Ambient UDP readiness guard is disabled and registry publication remains topology-dependent"
+            );
+        }
+        let ambient_udp_producer = udp_capture_requested && ambient_topology;
         // The node-agent readiness guard is meaningful only when the Ambient
         // mesh runtime starts `NetnsUdpCaptureManager`. Other topologies keep
         // their documented unsupported/pass-through posture.
@@ -2806,6 +2813,93 @@ fn remove_udp_not_ready_ack(dir: &std::path::Path, pod_uid: &str) {
     }
 }
 
+fn udp_gate_cleaned_proof_path(dir: &std::path::Path, pod_uid: &str) -> Option<std::path::PathBuf> {
+    (!pod_registry_uid_is_unsafe(pod_uid)).then(|| dir.join(".udp-gate-cleaned").join(pod_uid))
+}
+
+/// Persist node-agent-owned evidence that pod removal completed both classifier
+/// detach and pod-IP map cleanup. The close-ack responder accepts an absent UID
+/// only with this proof; `.udp-ack-required` alone is proxy-authored and is not
+/// evidence that the host gate is closed.
+fn write_udp_gate_cleaned_proof(dir: &std::path::Path, pod_uid: &str) -> bool {
+    let Some(path) = udp_gate_cleaned_proof_path(dir, pod_uid) else {
+        return false;
+    };
+    let Some(proof_dir) = path.parent() else {
+        return false;
+    };
+    if let Err(error) = std::fs::create_dir_all(proof_dir) {
+        warn!(pod_uid, %error, "Failed to create Ambient UDP cleaned-gate proof dir");
+        return false;
+    }
+    if let Err(error) = std::fs::write(&path, b"") {
+        warn!(pod_uid, path = %path.display(), %error, "Failed to persist Ambient UDP cleaned-gate proof");
+        return false;
+    }
+    true
+}
+
+fn remove_udp_gate_cleaned_proof(dir: &std::path::Path, pod_uid: &str) -> bool {
+    let Some(path) = udp_gate_cleaned_proof_path(dir, pod_uid) else {
+        return false;
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            warn!(pod_uid, path = %path.display(), %error, "Failed to remove Ambient UDP cleaned-gate proof");
+            false
+        }
+    }
+}
+
+/// Answer durable producer close requests for pods that have already left
+/// `pod_states`. A node-agent restart loses the in-memory removal result, so the
+/// node-agent-owned cleaned-gate proof is the authority. Initial pod sync must
+/// complete first: until then an absent UID may simply not have been relisted.
+fn reconcile_removed_udp_close_acknowledgements(
+    dir: &std::path::Path,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    initial_pod_sync_complete: bool,
+) {
+    if !initial_pod_sync_complete {
+        return;
+    }
+    const MAX_ACKS_PER_PASS: usize = 256;
+    let required_dir = dir.join(".udp-ack-required");
+    let entries = match std::fs::read_dir(&required_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            warn!(path = %required_dir.display(), %error, "Failed to scan Ambient UDP close requests");
+            return;
+        }
+    };
+    let mut answered = 0usize;
+    for entry in entries.flatten() {
+        if answered >= MAX_ACKS_PER_PASS {
+            break;
+        }
+        let Ok(uid) = entry.file_name().into_string() else {
+            continue;
+        };
+        if pod_registry_uid_is_unsafe(&uid) || pod_states.contains_key(&uid) {
+            continue;
+        }
+        let gate_cleaned =
+            udp_gate_cleaned_proof_path(dir, &uid).is_some_and(|path| path.is_file());
+        if !gate_cleaned {
+            debug!(
+                pod_uid = uid.as_str(),
+                "Withholding Ambient UDP close acknowledgement for unknown pod without verified cleaned-gate proof"
+            );
+            continue;
+        }
+        write_udp_not_ready_ack(dir, &uid);
+        answered += 1;
+    }
+}
+
 /// Reap orphaned UDP handshake markers whose pod is no longer tracked.
 ///
 /// Kubernetes pod UIDs are unique per pod lifetime, so an enroll→remove cycle
@@ -2813,9 +2907,10 @@ fn remove_udp_not_ready_ack(dir: &std::path::Path, pod_uid: &str) {
 /// times out can leave `.udp-ack-required/<uid>` after the registry entry is
 /// gone. Left unswept these files accumulate one inode per pod ever seen on the
 /// node. The grace below gives the proxy time to consume a late acknowledgement;
-/// after that, markers for a UID absent from `pod_states` cannot participate in
-/// another handoff and are safe to remove. The scan is bounded per directory per
-/// call so a large backlog drains over several reconcile ticks.
+/// after that, inactive marker sets are safe to remove. A verified handoff with
+/// an outstanding ack requirement is preserved until the producer consumes it.
+/// The scan is bounded per directory per call so a large backlog drains over
+/// several reconcile ticks.
 fn reap_orphaned_udp_not_ready_acks(
     dir: &std::path::Path,
     pod_states: &DashMap<String, PodAttachmentState>,
@@ -2825,7 +2920,7 @@ fn reap_orphaned_udp_not_ready_acks(
     // freshly-published pod-removal ack cannot be reaped before the producer
     // observes the registry removal and consumes it.
     let minimum_age = std::time::Duration::from_secs(30);
-    for marker_dir in [".udp-not-ready", ".udp-ack-required"] {
+    for marker_dir in [".udp-not-ready", ".udp-ack-required", ".udp-gate-cleaned"] {
         reap_orphaned_udp_handshake_markers_older_than(
             dir,
             marker_dir,
@@ -2875,6 +2970,19 @@ fn reap_orphaned_udp_handshake_markers_older_than(
             continue;
         };
         if pod_registry_uid_is_unsafe(&uid) || pod_states.contains_key(&uid) {
+            continue;
+        }
+        let ack_required = dir.join(".udp-ack-required").join(&uid).is_file();
+        let gate_cleaned =
+            udp_gate_cleaned_proof_path(dir, &uid).is_some_and(|path| path.is_file());
+        // A verified durable handoff is live until the producer consumes its
+        // acknowledgement and removes `.udp-ack-required`. Preserve all three
+        // records regardless of age so restart recovery cannot publish an ack
+        // and reap it again in the same reconcile pass. An unverified orphan
+        // request still ages out under the existing bounded leak policy.
+        if (marker_dir == ".udp-ack-required" && gate_cleaned)
+            || (marker_dir != ".udp-ack-required" && ack_required)
+        {
             continue;
         }
         let old_enough = entry
@@ -2987,6 +3095,11 @@ fn reconcile_udp_capture_readiness_with_sync_state(
             }
         }
         if let Some(dir) = &config.node_waypoint_pod_registry_dir {
+            reconcile_removed_udp_close_acknowledgements(
+                dir,
+                pod_states,
+                initial_pod_sync_complete,
+            );
             reap_orphaned_udp_not_ready_acks(dir, pod_states, initial_pod_sync_complete);
         }
         clear_partial_capture_state_if_recovered(pod_states, metrics);
@@ -3071,6 +3184,7 @@ fn reconcile_udp_capture_readiness_with_sync_state(
     // Bounded sweep of not-ready acks for pods that have fully left the node so
     // the `.udp-not-ready/` dir does not grow one inode per pod ever enrolled.
     if let Some(dir) = &config.node_waypoint_pod_registry_dir {
+        reconcile_removed_udp_close_acknowledgements(dir, pod_states, initial_pod_sync_complete);
         reap_orphaned_udp_not_ready_acks(dir, pod_states, initial_pod_sync_complete);
     }
     clear_partial_capture_state_if_recovered(pod_states, metrics);
@@ -3324,6 +3438,15 @@ fn handle_pod_added(
         && let Some(dir) = &config.node_waypoint_pod_registry_dir
     {
         remove_pod_ready_marker(dir, pod_uid);
+        // A live pod can leave and later re-enter mesh enrollment with the same
+        // Kubernetes UID. It must not inherit the prior removal's durable proof,
+        // which would let an old proxy request authorize teardown after this
+        // enrollment opens the host gate again.
+        if !remove_udp_gate_cleaned_proof(dir, pod_uid) {
+            metrics.record_attach_error();
+            remember_failed_pod_enrollment(&state_key, attempt_signature, enrollment_snapshot);
+            return;
+        }
     }
 
     if let Some(ref cgroup) = cgroup_path {
@@ -4366,7 +4489,14 @@ pub fn handle_pod_removed(
     if config.capture_config.udp_capture_enabled {
         if udp_gate_cleanup_succeeded {
             if let Some(dir) = &config.node_waypoint_pod_registry_dir {
-                write_udp_not_ready_ack(dir, pod_uid);
+                if write_udp_gate_cleaned_proof(dir, pod_uid) {
+                    write_udp_not_ready_ack(dir, pod_uid);
+                } else {
+                    warn!(
+                        pod_uid,
+                        "Withholding Ambient UDP not-ready acknowledgement because durable cleaned-gate proof could not be persisted"
+                    );
+                }
             }
         } else {
             warn!(
@@ -5871,6 +6001,21 @@ mod tests {
 
         handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-udp");
 
+        let required_dir = registry.path().join(".udp-ack-required");
+        std::fs::create_dir_all(&required_dir).unwrap();
+        std::fs::write(required_dir.join("pod-udp"), b"").unwrap();
+        reconcile_removed_udp_close_acknowledgements(registry.path(), &pod_states, true);
+
+        for marker_dir in [".udp-not-ready", ".udp-ack-required", ".udp-gate-cleaned"] {
+            reap_orphaned_udp_handshake_markers_older_than(
+                registry.path(),
+                marker_dir,
+                &pod_states,
+                true,
+                std::time::Duration::ZERO,
+            );
+        }
+
         assert!(
             !registry
                 .path()
@@ -5879,11 +6024,122 @@ mod tests {
                 .exists(),
             "failed BPF gate cleanup must not authorize producer teardown"
         );
+        assert!(
+            !registry
+                .path()
+                .join(".udp-gate-cleaned")
+                .join("pod-udp")
+                .exists(),
+            "failed cleanup must not leave durable proof that could authorize a later ack"
+        );
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
         );
         forget_pending_capture_failures_for_pod(&state_key);
+    }
+
+    #[test]
+    fn removed_pod_close_request_republishes_ack_after_verified_cleanup() {
+        let registry = tempfile::tempdir().unwrap();
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.udp_capture_enabled = true;
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let ip = std::net::Ipv4Addr::new(10, 0, 0, 12);
+        let pod_states = DashMap::new();
+        pod_states.insert(
+            "pod-udp".to_string(),
+            PodAttachmentState {
+                pod_uid: "pod-udp".to_string(),
+                pod_name: "pod-udp".to_string(),
+                namespace: "default".to_string(),
+                pod_ip: Some(ip),
+                pod_ip6: None,
+                cgroup_path: Some("/cg/udp".to_string()),
+                veth_iface: Some("veth-udp".to_string()),
+                attached: true,
+                include_ports_cgroup_ids: Vec::new(),
+                include_ports_policy: None,
+                workload_identity_cgroup_ids: Vec::new(),
+                node_probe_ports: Vec::new(),
+            },
+        );
+        let mut backend = MockEbpfBackend::default();
+        backend
+            .update_pod_ip(ip, &PodInfo::for_capture(15001, true, true))
+            .unwrap();
+        let metrics = NodeAgentMetrics::default();
+
+        handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-udp");
+
+        let ack = registry.path().join(".udp-not-ready").join("pod-udp");
+        assert!(ack.is_file());
+        std::fs::remove_file(&ack).unwrap();
+        let required_dir = registry.path().join(".udp-ack-required");
+        std::fs::create_dir_all(&required_dir).unwrap();
+        std::fs::write(required_dir.join("pod-udp"), b"").unwrap();
+
+        reconcile_udp_capture_readiness(
+            &mut backend,
+            &pod_states,
+            &config,
+            &metrics,
+            &mut HashSet::new(),
+        );
+
+        assert!(
+            ack.is_file(),
+            "the producer's fresh request must receive a replacement ack after verified removal"
+        );
+    }
+
+    #[test]
+    fn restart_recovers_removed_pod_ack_from_durable_cleaned_gate_proof() {
+        let registry = tempfile::tempdir().unwrap();
+        let required_dir = registry.path().join(".udp-ack-required");
+        std::fs::create_dir_all(&required_dir).unwrap();
+        std::fs::write(required_dir.join("pod-gone"), b"").unwrap();
+        assert!(write_udp_gate_cleaned_proof(registry.path(), "pod-gone"));
+        let pod_states = DashMap::new();
+
+        reconcile_removed_udp_close_acknowledgements(registry.path(), &pod_states, true);
+        for marker_dir in [".udp-not-ready", ".udp-ack-required", ".udp-gate-cleaned"] {
+            reap_orphaned_udp_handshake_markers_older_than(
+                registry.path(),
+                marker_dir,
+                &pod_states,
+                true,
+                std::time::Duration::ZERO,
+            );
+        }
+
+        assert!(
+            registry
+                .path()
+                .join(".udp-not-ready")
+                .join("pod-gone")
+                .is_file(),
+            "a restarted node-agent must answer the durable request from its verified cleanup proof"
+        );
+        assert!(
+            required_dir.join("pod-gone").is_file()
+                && registry
+                    .path()
+                    .join(".udp-gate-cleaned")
+                    .join("pod-gone")
+                    .is_file(),
+            "the live verified handoff must survive orphan reaping until the producer consumes it"
+        );
     }
 
     #[test]
