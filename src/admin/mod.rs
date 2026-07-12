@@ -2581,6 +2581,16 @@ fn hash_payload_consumers(consumers: &mut [Consumer], errors: &mut Vec<String>) 
     }
 }
 
+fn restore_payload_from_config(config: GatewayConfig) -> RestorePayload {
+    RestorePayload {
+        version: config.version,
+        proxies: config.proxies,
+        consumers: config.consumers,
+        plugin_configs: config.plugin_configs,
+        upstreams: config.upstreams,
+    }
+}
+
 #[derive(Default)]
 struct PersistCounts {
     proxies: usize,
@@ -2801,6 +2811,26 @@ async fn persist_payload_resources(
     }
 
     (counts, errors)
+}
+
+async fn rollback_failed_restore(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    snapshot: &RestorePayload,
+) -> Result<(), Vec<String>> {
+    if let Err(error) = db.delete_all_resources(namespace).await {
+        return Err(vec![format!(
+            "failed to clear partially imported config: {}",
+            error
+        )]);
+    }
+
+    let (_, errors) = persist_payload_resources(db, snapshot, false).await;
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 /// Allowed credential types for consumer authentication plugins.
@@ -4188,7 +4218,39 @@ async fn handle_restore(
         }
     }
 
-    // Phase 3: Delete all existing resources in the namespace (safe: payload is validated)
+    // Complete all fallible payload preparation before changing durable state.
+    let mut payload = payload;
+    let mut preparation_errors = Vec::new();
+    normalize_restore_payload_timestamps(&mut payload, Utc::now());
+    apply_payload_namespace(&mut payload, namespace);
+    hash_payload_consumers(&mut payload.consumers, &mut preparation_errors);
+    if !preparation_errors.is_empty() {
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({
+                "error": "Restore preparation failed; existing config was not changed and prior config retained",
+                "restore_errors": preparation_errors,
+            }),
+        ));
+    }
+
+    // Snapshot the namespace before deletion so a failure in any independently
+    // committed import chunk can be compensated on every database backend.
+    let snapshot = match db.load_full_config(namespace).await {
+        Ok(config) => restore_payload_from_config(config),
+        Err(error) => {
+            error!("Restore: failed to snapshot existing config: {}", error);
+            return Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({
+                    "error": "Failed to snapshot existing config; restore was not started and prior config retained",
+                }),
+            ));
+        }
+    };
+
+    // Phase 3: Delete all existing resources in the namespace (safe: payload is validated and
+    // the prior state has been snapshotted).
     if let Err(e) = db.delete_all_resources(namespace).await {
         error!("Restore: failed to delete existing resources: {}", e);
         return Ok(json_response(
@@ -4202,21 +4264,14 @@ async fn handle_restore(
     // Phase 3: Import resources in dependency order.
     // Each batch_create_* method internally chunks into 1,000-record
     // transactions to keep WAL/redo size bounded.
-    let mut payload = payload;
-    let mut errors = Vec::new();
-    normalize_restore_payload_timestamps(&mut payload, Utc::now());
-    apply_payload_namespace(&mut payload, namespace);
-    hash_payload_consumers(&mut payload.consumers, &mut errors);
-    let (created, mut persist_errors) =
-        persist_payload_resources(db.as_ref(), &payload, false).await;
-    errors.append(&mut persist_errors);
+    let (created, errors) = persist_payload_resources(db.as_ref(), &payload, false).await;
 
     info!(
         "Restore: imported {} proxies, {} consumers, {} plugin_configs, {} upstreams",
         created.proxies, created.consumers, created.plugin_configs, created.upstreams
     );
 
-    let mut response = json!({
+    let response = json!({
         "restored": {
             "proxies": created.proxies,
             "consumers": created.consumers,
@@ -4226,10 +4281,17 @@ async fn handle_restore(
     });
 
     if !errors.is_empty() {
-        response["errors"] = json!(errors);
-        // Restore always wipes the namespace before re-inserting (Phase 3 above),
-        // so even a zero-success-count restore must produce an audit row — the
-        // namespace state has already changed regardless of which inserts failed.
+        error!(
+            "Restore: import failed; rolling back namespace '{}': {}",
+            namespace,
+            errors.join("; ")
+        );
+        let rollback_result = rollback_failed_restore(db.as_ref(), namespace, &snapshot).await;
+        let rollback_status = if rollback_result.is_ok() {
+            "completed"
+        } else {
+            "incomplete"
+        };
         let event = audit::AuditEvent::new(
             actor,
             "restore",
@@ -4238,13 +4300,37 @@ async fn handle_restore(
             namespace,
             audit::update_diff(
                 json!({"replaced_namespace": namespace}),
-                response["restored"].clone(),
+                json!({"rollback": rollback_status}),
             ),
         );
         if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
             log_audit_enqueue_failure(&error);
         }
-        return Ok(json_response(StatusCode::MULTI_STATUS, &response));
+
+        return match rollback_result {
+            Ok(()) => Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({
+                    "error": "Restore failed; restore rolled back and prior config retained",
+                    "restore_errors": errors,
+                }),
+            )),
+            Err(rollback_errors) => {
+                error!(
+                    "Restore: rollback failed for namespace '{}': {}",
+                    namespace,
+                    rollback_errors.join("; ")
+                );
+                Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({
+                        "error": "Restore failed and rollback of prior config was incomplete; manual recovery required",
+                        "restore_errors": errors,
+                        "rollback_errors": rollback_errors,
+                    }),
+                ))
+            }
+        };
     }
 
     let event = audit::AuditEvent::new(

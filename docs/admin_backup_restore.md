@@ -68,8 +68,10 @@ cat ferrum-backup.json | jq '.counts'
 Replaces the entire gateway configuration with the provided backup payload. This is a **destructive operation**, but the payload is validated before any data is deleted:
 
 1. **Validates** the payload for internal consistency (config version compatibility, resource ID uniqueness, consumer identity/credential uniqueness, regex listen_path compilation and length limits, listen_path+hosts uniqueness, stream proxy configuration including response_body_mode, upstream references). If validation fails, the request returns `400` with detailed errors and **existing config is NOT deleted**.
-2. **Deletes** all existing proxies, consumers, plugin configs, upstreams, and junction table entries
-3. **Imports** the provided resources in dependency order
+2. **Snapshots** the current namespace configuration for recovery
+3. **Deletes** all existing proxies, consumers, plugin configs, upstreams, and junction table entries
+4. **Imports** the provided resources in dependency order
+5. **Rolls back** to the snapshot if any import persistence step fails
 
 ### Safety Guard
 
@@ -154,23 +156,18 @@ curl -s -X POST "$TARGET/restore?confirm=true" \
 
 ### Error Handling
 
-If some resource types fail during import while others succeed, the endpoint returns `207 Multi-Status`:
+If any resource type fails during import, the endpoint removes the partial import, reapplies the pre-restore snapshot, and returns `500 Internal Server Error`:
 
 ```json
 {
-  "restored": {
-    "proxies": 42,
-    "consumers": 0,
-    "plugin_configs": 85,
-    "upstreams": 12
-  },
-  "errors": [
+  "error": "Restore failed; restore rolled back and prior config retained",
+  "restore_errors": [
     "consumers: unique constraint violation on username"
   ]
 }
 ```
 
-**Important**: The payload is validated before the delete phase. If validation fails, existing config is preserved and a `400` response is returned with details. However, if validation passes but the import phase partially fails (e.g., database error during insert), you may end up with fewer resources than before. Use `GET /backup` first to create a safety snapshot.
+The rollback is best-effort because it uses the same database backend that reported the import failure. If rollback itself fails, the `500` response says that rollback was incomplete, includes `rollback_errors`, and instructs the operator to perform manual recovery. The payload is still validated before the snapshot and delete phases; validation failures return `400` and leave existing config untouched.
 
 ## Restore vs. Batch
 
@@ -198,7 +195,7 @@ Restore requires a database and will return `503 Service Unavailable` in file/DP
 
 ## Recommended Practices
 
-1. **Always backup before restore**: Run `GET /backup` and save the output before running `POST /restore`.
+1. **Keep external backups**: Restore takes an automatic recovery snapshot, but periodic external backups remain necessary for database-wide outages and disaster recovery.
 2. **Validate backup integrity**: Check the `counts` field matches expectations before restoring.
 3. **Use batch for incremental changes**: If you only need to add resources without wiping existing ones, use `POST /batch` instead.
 4. **Automate periodic backups**: Schedule `GET /backup` via cron for disaster recovery snapshots.

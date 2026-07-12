@@ -421,20 +421,20 @@ curl -H "Authorization: Bearer $TOKEN" \
 curl -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9000/backup?resources=proxies,upstreams" > partial-backup.json
 
-# Restore from backup (destructive — replaces all existing config)
+# Restore from backup (replaces config after taking a recovery snapshot)
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d @ferrum-backup.json \
   "http://localhost:9000/restore?confirm=true"
 ```
 
-The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Database inserts are chunked into 1,000-record transactions for large-scale imports.
+The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Before replacement, restore snapshots the current namespace. Database inserts are chunked into 1,000-record transactions for large-scale imports; if any insert fails, Ferrum clears the partial import, reapplies the snapshot, and returns `500 Internal Server Error` confirming that the prior config was retained. If that best-effort rollback also encounters a persistence failure, the `500` response warns that rollback was incomplete and manual recovery is required.
 
 See [admin_backup_restore.md](admin_backup_restore.md) for details.
 
 ## Audit Log
 
-When `FERRUM_ADMIN_AUDIT_ENABLED=true`, successful admin mutations enqueue a database-backed audit event before the mutation response is returned. The response waits only for bounded queue enqueue, not durable database persistence. Audit persistence is best-effort after the mutation commits: if enqueue or persistence fails, Ferrum logs the failure and still returns the mutation result so operators do not retry an already-applied write. Partial `POST /batch` and `POST /restore` mutations that return `207 Multi-Status` emit an audit event when at least one resource was changed. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, and a JSON `diff` object with redacted consumer credentials.
+When `FERRUM_ADMIN_AUDIT_ENABLED=true`, successful admin mutations enqueue a database-backed audit event before the mutation response is returned. The response waits only for bounded queue enqueue, not durable database persistence. Audit persistence is best-effort after the mutation commits: if enqueue or persistence fails, Ferrum logs the failure and still returns the mutation result so operators do not retry an already-applied write. Partial `POST /batch` mutations that return `207 Multi-Status` emit an audit event when at least one resource was changed. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, and a JSON `diff` object with redacted consumer credentials.
 
 `GET /audit` requires an `admin` role token and supports `actor`, `action`, `resource_type`, `resource_id`, `start`, `end`, `limit`, and `offset` query parameters.
 

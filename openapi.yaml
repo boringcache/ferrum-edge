@@ -3191,9 +3191,11 @@ paths:
       operationId: restoreConfig
       summary: Replace all configuration from a backup
       description: |
-        **Destructive operation** — deletes ALL existing resources and imports
-        the provided configuration. Requires `?confirm=true` query parameter
-        to prevent accidental invocation.
+        **Replacement operation** — snapshots the current namespace, deletes
+        all existing resources, and imports the provided configuration. If any
+        import persistence step fails, Ferrum clears the partial import and
+        reapplies the snapshot. Requires `?confirm=true` query parameter to
+        prevent accidental invocation.
 
         Accepts the same JSON format produced by `GET /backup`. Resources are
         imported in dependency order (consumers & upstreams first, then proxies,
@@ -3237,19 +3239,26 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RestoreResponse"
-        "207":
-          description: Partial success — some resource types failed during import
+        "500":
+          description: Import failed. The prior configuration was reapplied, or the response warns that the best-effort rollback was incomplete.
           content:
             application/json:
               schema:
-                allOf:
-                  - $ref: "#/components/schemas/RestoreResponse"
-                  - type: object
-                    properties:
-                      errors:
-                        type: array
-                        items:
-                          type: string
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                  restore_errors:
+                    type: array
+                    items:
+                      type: string
+                    description: Persistence or preparation errors that caused the restore to fail
+                  rollback_errors:
+                    type: array
+                    items:
+                      type: string
+                    description: Present only when reapplying the prior configuration was incomplete
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -9161,12 +9170,6 @@ components:
             upstreams:
               type: integer
               description: Number of upstreams restored
-        errors:
-          type: array
-          items:
-            type: string
-          description: Present only on 207 Multi-Status; lists per-type error messages
-
     # ── Shared: Transaction-Log Schema Customization ──────────────────
     # Shape of the `schema:` block (and the entries inside
     # `transaction_log_schema.schemas`). See docs/log_schema.md for the

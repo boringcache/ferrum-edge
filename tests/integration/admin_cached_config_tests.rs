@@ -1801,6 +1801,84 @@ async fn test_restore_rejects_invalid_plugin_config_before_delete() {
 }
 
 #[tokio::test]
+async fn test_restore_rolls_back_prior_config_after_mid_import_failure() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_restore_rollback.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+    let pool = db.pool();
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let seed = json!({
+        "proxies": [{
+            "id": "restore-keep",
+            "listen_path": "/keep",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "Seed failed: {:?}", body);
+
+    sqlx::query(
+        "CREATE TRIGGER fail_restore_proxy BEFORE INSERT ON proxies \
+         WHEN NEW.id = 'restore-fail' \
+         BEGIN SELECT RAISE(FAIL, 'injected restore persistence failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to install restore fault-injection trigger");
+
+    let restore_payload = json!({
+        "consumers": [{
+            "id": "restore-partial-consumer",
+            "username": "partial-user",
+            "credentials": {}
+        }],
+        "proxies": [{
+            "id": "restore-fail",
+            "listen_path": "/new",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+
+    assert_eq!(status, 500, "Failed restore response: {:?}", body);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("prior config retained"),
+        "rollback response must confirm retention: {:?}",
+        body
+    );
+
+    let (status, _, _) = admin_get(&base_url, "/proxies/restore-keep", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "the prior known-good proxy must survive a failed restore"
+    );
+    let (status, _, _) = admin_get(&base_url, "/consumers/restore-partial-consumer", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "resources committed before the injected failure must be removed"
+    );
+}
+
+#[tokio::test]
 async fn test_restore_replaces_all_config() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;
