@@ -8738,7 +8738,7 @@ struct LiveXcDnsServer {
 #[cfg(target_os = "linux")]
 impl LiveXcDnsServer {
     async fn start(advertised_ip: std::net::Ipv4Addr) -> Result<Self, String> {
-        let socket = UdpSocket::bind("0.0.0.0:0")
+        let socket = UdpSocket::bind(SocketAddr::from((advertised_ip, 0)))
             .await
             .map_err(|error| format!("bind live fixture DNS responder: {error}"))?;
         let port = socket
