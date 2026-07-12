@@ -79,6 +79,19 @@ mod inner {
     const CHANGE_LOG_BATCH_LIMIT: i64 = 10_000;
     const CHANGE_LOG_RETAIN_PER_NAMESPACE: u64 = 100_000;
 
+    fn require_matched_update(
+        result: mongodb::results::UpdateResult,
+        resource_type: &str,
+        id: &str,
+    ) -> Result<(), mongodb::error::Error> {
+        if result.matched_count == 0 {
+            return Err(mongodb::error::Error::custom(format!(
+                "{resource_type} '{id}' was not found"
+            )));
+        }
+        Ok(())
+    }
+
     #[derive(Clone, Copy)]
     struct ConfigChangeWrite<'a> {
         namespace: &'a str,
@@ -400,8 +413,8 @@ mod inner {
                     "MongoDB connected without a replica set (FERRUM_MONGO_REPLICA_SET is unset). \
                      Multi-document writes (proxy delete/update, api_spec submit/replace) will \
                      fall back to compensating rollback instead of transactions, leaving a small \
-                     window where partial failure can orphan documents until the polling cycle \
-                     cleans them. Configure FERRUM_MONGO_REPLICA_SET to enable transactions."
+                     window where partial failure may require operator reconciliation. Configure \
+                     FERRUM_MONGO_REPLICA_SET to enable transactions."
                 );
             }
 
@@ -2468,10 +2481,12 @@ mod inner {
                                     })?;
                                     doc.insert("api_spec_id", sid);
                                 }
-                                this.proxies()
+                                let result = this
+                                    .proxies()
                                     .replace_one(mongodb::bson::doc! { "_id": *id }, doc)
                                     .session(&mut *s)
                                     .await?;
+                                require_matched_update(result, "proxy", id)?;
                                 let orphaned = this
                                     .cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut *s))
                                     .await
@@ -2512,9 +2527,11 @@ mod inner {
                     })?;
                     doc.insert("api_spec_id", sid);
                 }
-                self.proxies()
+                let result = self
+                    .proxies()
                     .replace_one(doc! { "_id": &proxy.id }, doc)
                     .await?;
+                require_matched_update(result, "proxy", &proxy.id)?;
                 if let Err(err) = self
                     .record_config_change(&proxy.namespace, "proxy", &proxy.id, "upsert")
                     .await
@@ -3069,10 +3086,12 @@ mod inner {
                         (self, doc, consumer.namespace.clone(), consumer.id.clone()),
                         |s, (this, doc, namespace, id)| {
                             Box::pin(async move {
-                                this.consumers()
+                                let result = this
+                                    .consumers()
                                     .replace_one(doc! { "_id": id.as_str() }, doc.clone())
                                     .session(&mut *s)
                                     .await?;
+                                require_matched_update(result, "consumer", id)?;
                                 this.record_config_change_in_session(
                                     &mut *s,
                                     namespace.as_str(),
@@ -3094,9 +3113,11 @@ mod inner {
                     .consumers()
                     .find_one(doc! { "_id": &consumer.id })
                     .await?;
-                self.consumers()
+                let result = self
+                    .consumers()
                     .replace_one(doc! { "_id": &consumer.id }, doc)
                     .await?;
+                require_matched_update(result, "consumer", &consumer.id)?;
                 if let Err(err) = self
                     .record_config_change(&consumer.namespace, "consumer", &consumer.id, "upsert")
                     .await
@@ -3331,10 +3352,12 @@ mod inner {
                         (self, doc, pc.namespace.clone(), pc.id.clone(), proxy_id),
                         |s, (this, doc, namespace, id, proxy_id)| {
                             Box::pin(async move {
-                                this.plugin_configs()
+                                let result = this
+                                    .plugin_configs()
                                     .replace_one(doc! { "_id": id.as_str() }, doc.clone())
                                     .session(&mut *s)
                                     .await?;
+                                require_matched_update(result, "plugin config", id)?;
                                 this.record_config_change_in_session(
                                     &mut *s,
                                     namespace.as_str(),
@@ -3363,9 +3386,11 @@ mod inner {
                     })?;
                 self.compact_config_changes_best_effort(&pc.namespace).await;
             } else {
-                self.plugin_configs()
+                let result = self
+                    .plugin_configs()
                     .replace_one(doc! { "_id": &pc.id }, doc)
                     .await?;
+                require_matched_update(result, "plugin config", &pc.id)?;
                 let change_result: Result<(), anyhow::Error> = async {
                     self.record_config_change(&pc.namespace, "plugin_config", &pc.id, "upsert")
                         .await?;
@@ -3629,10 +3654,12 @@ mod inner {
                         (self, doc, upstream.namespace.clone(), upstream.id.clone()),
                         |s, (this, doc, namespace, id)| {
                             Box::pin(async move {
-                                this.upstreams()
+                                let result = this
+                                    .upstreams()
                                     .replace_one(doc! { "_id": id.as_str() }, doc.clone())
                                     .session(&mut *s)
                                     .await?;
+                                require_matched_update(result, "upstream", id)?;
                                 this.record_config_change_in_session(
                                     &mut *s,
                                     namespace.as_str(),
@@ -3650,9 +3677,11 @@ mod inner {
                 self.compact_config_changes_best_effort(&upstream.namespace)
                     .await;
             } else {
-                self.upstreams()
+                let result = self
+                    .upstreams()
                     .replace_one(doc! { "_id": &upstream.id }, doc)
                     .await?;
+                require_matched_update(result, "upstream", &upstream.id)?;
                 if let Err(err) = self
                     .record_config_change(&upstream.namespace, "upstream", &upstream.id, "upsert")
                     .await

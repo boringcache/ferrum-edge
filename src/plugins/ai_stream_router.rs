@@ -123,7 +123,7 @@ impl ProviderType {
 }
 
 /// How a provider API key is injected into the forwarded request.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum ProviderAuth {
     /// `Authorization: Bearer <api_key>`
     Bearer { api_key: String },

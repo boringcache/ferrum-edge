@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
@@ -601,6 +602,7 @@ pub async fn run(
         .map_err(|e| anyhow::anyhow!("invalid injector configuration: {e}"))?;
     let tls_acceptor = build_tls_acceptor(&env_config, &config)?;
     let max_connections = env_config.max_connections;
+    let shutdown_drain_seconds = env_config.shutdown_drain_seconds;
     let config = Arc::new(config);
     let connection_limiter = if max_connections > 0 {
         Some(Arc::new(Semaphore::new(max_connections)))
@@ -624,6 +626,7 @@ pub async fn run(
     let mut shutdown_rx = shutdown_tx.subscribe();
     let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
     let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
+    let mut connections = JoinSet::new();
 
     loop {
         tokio::select! {
@@ -648,7 +651,7 @@ pub async fn run(
                             }
                             None => None,
                         };
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             let _connection_permit = connection_permit;
                             if let Some(acceptor) = tls_acceptor {
                                 match tls::accept_with_optional_timeout(
@@ -695,7 +698,32 @@ pub async fn run(
             }
             _ = shutdown_rx.changed() => {
                 info!("Injector admission webhook shutting down");
+                let drain = async {
+                    while connections.join_next().await.is_some() {}
+                };
+                if tokio::time::timeout(
+                    std::time::Duration::from_secs(shutdown_drain_seconds),
+                    drain,
+                )
+                .await
+                .is_err()
+                {
+                    warn!(
+                        shutdown_drain_seconds,
+                        remaining_connections = connections.len(),
+                        "Injector shutdown drain timed out; aborting remaining connections"
+                    );
+                    connections.abort_all();
+                    while connections.join_next().await.is_some() {}
+                }
                 return Ok(());
+            }
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result
+                    && !error.is_cancelled()
+                {
+                    warn!(%error, "Injector connection task failed");
+                }
             }
         }
     }
@@ -886,6 +914,10 @@ fn build_sidecar_patch_for_namespace(
         return Ok(Vec::new());
     }
 
+    if already_injected(pod, config) {
+        return Ok(Vec::new());
+    }
+
     reject_reserved_name_conflicts(pod, config)?;
 
     let mut patch = Vec::new();
@@ -921,6 +953,13 @@ fn build_sidecar_patch_for_namespace(
     }
 
     Ok(patch)
+}
+
+fn already_injected(pod: &Value, config: &InjectorConfig) -> bool {
+    let marked_injected = value_is_true(pod.pointer("/metadata/annotations/ferrum.io~1injected"));
+    marked_injected
+        && pod_has_ferrum_sidecar(pod)
+        && (config.capture_mode != CaptureMode::Iptables || pod_has_ferrum_init_container(pod))
 }
 
 fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
@@ -1582,6 +1621,32 @@ mod tests {
         )
         .expect_err("reserved name conflict should be rejected");
         assert!(err.contains("reserved container name ferrum-edge"));
+    }
+
+    #[test]
+    fn patch_is_idempotent_for_an_already_injected_pod() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {"ferrum.io/injected": "true"}
+            },
+            "spec": {
+                "containers": [
+                    {"name": "app", "image": "app:test"},
+                    {"name": "ferrum-edge", "image": "ferrum-edge:latest"}
+                ],
+                "initContainers": [
+                    {"name": "ferrum-edge-init", "image": "ferrum-edge:latest"}
+                ]
+            }
+        });
+        let patch = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Iptables),
+            None,
+        )
+        .expect("reinvocation should be accepted");
+        assert!(patch.is_empty());
     }
 
     #[test]

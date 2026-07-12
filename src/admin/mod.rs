@@ -1336,7 +1336,8 @@ pub async fn handle_admin_request(
         return Ok(resp);
     }
 
-    match (method, segments.as_slice()) {
+    let tls_audit = tls_mutation_audit_descriptor(&method, segments.as_slice());
+    let response = match (method, segments.as_slice()) {
         // Proxies CRUD
         (Method::GET, ["proxies"]) => {
             crud::handle_list::<Proxy>(&state, &pagination, auth.role, &namespace).await
@@ -1873,7 +1874,71 @@ pub async fn handle_admin_request(
             StatusCode::NOT_FOUND,
             &json!({"error": "Not Found"}),
         )),
+    };
+    if let (Some((action, resource_type, resource_id)), Ok(http_response), Some(db)) =
+        (tls_audit, response.as_ref(), state.db.as_ref())
+        && http_response.status().is_success()
+    {
+        let event = audit::AuditEvent::new(
+            &auth,
+            action,
+            resource_type,
+            resource_id,
+            &namespace,
+            json!({"path": path}),
+        );
+        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+            log_audit_enqueue_failure(&error);
+        }
     }
+    response
+}
+
+fn tls_mutation_audit_descriptor(
+    method: &Method,
+    segments: &[&str],
+) -> Option<(&'static str, &'static str, String)> {
+    if !matches!(segments, ["admin", "tls", ..])
+        || !matches!(*method, Method::POST | Method::PUT | Method::DELETE)
+        || matches!(segments, ["admin", "tls", "validate"])
+    {
+        return None;
+    }
+    let action = match *method {
+        Method::POST => "create",
+        Method::PUT => "update",
+        Method::DELETE => "delete",
+        _ => return None,
+    };
+    let resource_type = match segments.get(2).copied() {
+        Some("certificates") => "tls_certificate",
+        Some("private-keys") => "tls_private_key",
+        Some("ca-bundles") => "tls_ca_bundle",
+        Some("crls") => "tls_crl",
+        Some("ocsp-responses") => "tls_ocsp_response",
+        Some("jwks") => "tls_jwks",
+        Some("acme") => "tls_acme",
+        Some("rotate") => "tls_rotation",
+        _ => "tls_material",
+    };
+    let resource_id = segments
+        .last()
+        .copied()
+        .filter(|value| {
+            !matches!(
+                *value,
+                "certificates"
+                    | "private-keys"
+                    | "ca-bundles"
+                    | "crls"
+                    | "ocsp-responses"
+                    | "jwks"
+                    | "acme"
+            )
+        })
+        .unwrap_or("new")
+        .to_string();
+    Some((action, resource_type, resource_id))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2324,6 +2389,9 @@ async fn handle_mesh_egress_scope_test(
     state: &AdminState,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if let Some(response) = state.check_write_allowed() {
+        return Ok(response);
+    }
     if state.proxy_state.as_ref().is_none() {
         return Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4637,6 +4705,9 @@ async fn handle_backend_capabilities_get(
 async fn handle_backend_capabilities_refresh(
     state: &AdminState,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if let Some(response) = state.check_write_allowed() {
+        return Ok(response);
+    }
     let proxy_state = match &state.proxy_state {
         Some(ps) => ps,
         None => {

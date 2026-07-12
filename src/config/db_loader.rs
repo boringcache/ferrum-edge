@@ -1740,7 +1740,7 @@ impl DatabaseStore {
 
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
-        sqlx::query(
+        let result = sqlx::query(
             &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&proxy.name)
@@ -1795,6 +1795,13 @@ impl DatabaseStore {
         .bind(&proxy.namespace)
         .execute(&mut *tx)
         .await?;
+        if result.rows_affected() == 0 {
+            anyhow::bail!(
+                "proxy '{}' was not found in namespace '{}'",
+                proxy.id,
+                proxy.namespace
+            );
+        }
 
         // Update plugin associations: remove old, insert new
         sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE proxy_id = ?"))
@@ -2160,7 +2167,7 @@ impl DatabaseStore {
         let mut tx = self.pool().begin().await?;
         self.delete_consumer_credential_index_tx(&mut tx, &consumer.id)
             .await?;
-        sqlx::query(&self.q(
+        let result = sqlx::query(&self.q(
             "UPDATE consumers SET username=?, custom_id=?, credentials=?, acl_groups=?, updated_at=? WHERE id=? AND namespace=?",
         ))
         .bind(&consumer.username)
@@ -2172,6 +2179,13 @@ impl DatabaseStore {
         .bind(&consumer.namespace)
         .execute(&mut *tx)
         .await?;
+        if result.rows_affected() == 0 {
+            anyhow::bail!(
+                "consumer '{}' was not found in namespace '{}'",
+                consumer.id,
+                consumer.namespace
+            );
+        }
         self.insert_consumer_credential_index_tx(&mut tx, consumer)
             .await?;
         self.record_config_change_tx(
@@ -2288,7 +2302,7 @@ impl DatabaseStore {
             PluginScope::Global => "global",
         };
         let mut tx = self.pool().begin().await?;
-        sqlx::query(
+        let result = sqlx::query(
             &self.q("UPDATE plugin_configs SET plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&pc.plugin_name)
@@ -2302,6 +2316,13 @@ impl DatabaseStore {
         .bind(&pc.namespace)
         .execute(&mut *tx)
         .await?;
+        if result.rows_affected() == 0 {
+            anyhow::bail!(
+                "plugin config '{}' was not found in namespace '{}'",
+                pc.id,
+                pc.namespace
+            );
+        }
         self.record_config_change_tx(&mut tx, &pc.namespace, "plugin_config", &pc.id, "upsert")
             .await?;
         if pc.scope == PluginScope::Proxy
@@ -2872,7 +2893,7 @@ impl DatabaseStore {
         let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(upstream)?;
 
         let mut tx = self.pool().begin().await?;
-        sqlx::query(
+        let result = sqlx::query(
             &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, subsets=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, backend_tls_sni=?, backend_tls_san_allow_list=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&upstream.name)
@@ -2894,6 +2915,13 @@ impl DatabaseStore {
         .bind(&upstream.namespace)
         .execute(&mut *tx)
         .await?;
+        if result.rows_affected() == 0 {
+            anyhow::bail!(
+                "upstream '{}' was not found in namespace '{}'",
+                upstream.id,
+                upstream.namespace
+            );
+        }
         self.record_config_change_tx(
             &mut tx,
             &upstream.namespace,

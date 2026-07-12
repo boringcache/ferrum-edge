@@ -442,12 +442,13 @@ impl MigrationRunner {
 
                 // Execute each statement separated by semicolons, supporting
                 // multi-statement migrations (e.g., CREATE TABLE + CREATE INDEX).
+                let mut tx = self.pool.begin().await?;
                 for statement in sql.split(';') {
                     let trimmed = statement.trim();
                     if trimmed.is_empty() {
                         continue;
                     }
-                    sqlx::query(trimmed).execute(&self.pool).await?;
+                    sqlx::query(trimmed).execute(&mut *tx).await?;
                 }
 
                 let elapsed_ms = start.elapsed().as_millis() as i64;
@@ -461,8 +462,9 @@ impl MigrationRunner {
                     .bind(&now)
                     .bind(migration.checksum)
                     .bind(elapsed_ms as i32)
-                    .execute(&self.pool)
+                    .execute(&mut *tx)
                     .await?;
+                tx.commit().await?;
 
                 let record = PluginMigrationRecord {
                     plugin_name: plugin_name.to_string(),

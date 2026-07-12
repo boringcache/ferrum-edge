@@ -10806,8 +10806,8 @@ components:
           description: Require an exp claim; expiration is always validated when present
         require_nbf:
           type: boolean
-          default: true
-          description: Require an nbf claim and validate it
+          default: false
+          description: Require an nbf claim; when present, nbf is always validated
         leeway_secs:
           type: integer
           format: uint64
