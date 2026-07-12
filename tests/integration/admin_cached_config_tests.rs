@@ -1878,6 +1878,286 @@ async fn test_restore_rolls_back_prior_config_after_mid_import_failure() {
     );
 }
 
+/// Restore must remain usable to REPAIR a namespace whose existing config is
+/// already invalid/unloadable. The recovery snapshot is best-effort: if the
+/// prior config cannot be loaded (here: a corrupt regex listen_path that
+/// `load_full_config` rejects), restore proceeds WITHOUT rollback capability
+/// instead of aborting. Guards the cross-PR interaction with the stricter
+/// `load_full_config` validation.
+#[tokio::test]
+async fn test_restore_repairs_namespace_with_unloadable_prior_config() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_restore_repair.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+    let pool = db.pool();
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let seed = json!({
+        "proxies": [{
+            "id": "restore-corrupt",
+            "listen_path": "/keep",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "Seed failed: {:?}", body);
+
+    // Corrupt the existing config directly so `load_full_config` (the snapshot
+    // source) rejects it: an unbalanced character class is an invalid regex
+    // listen_path, which the loader treats as fatal. Admin validation would
+    // never accept this, so we inject it below the API.
+    sqlx::query("UPDATE proxies SET listen_path = '~[unclosed' WHERE id = 'restore-corrupt'")
+        .execute(&pool)
+        .await
+        .expect("Failed to corrupt existing proxy listen_path");
+
+    // A valid replacement payload — restore should repair the namespace.
+    let restore_payload = json!({
+        "proxies": [{
+            "id": "restore-repaired",
+            "listen_path": "/repaired",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+
+    assert_eq!(
+        status, 200,
+        "restore must repair a namespace whose prior config could not be snapshotted: {:?}",
+        body
+    );
+
+    // The corrupt proxy is gone and the repaired proxy is present.
+    let (status, _, _) = admin_get(&base_url, "/proxies/restore-corrupt", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "the unloadable prior proxy must be replaced"
+    );
+    let (status, _, _) = admin_get(&base_url, "/proxies/restore-repaired", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "the restored proxy must be present after a repair restore"
+    );
+}
+
+/// `api_specs` are admin-only metadata outside `GatewayConfig`, so a config
+/// rollback cannot restore them. A failed restore that rolls back must surface
+/// how many specs the operator has to re-submit rather than silently dropping
+/// them.
+#[tokio::test]
+async fn test_restore_reports_api_specs_not_restored_on_rollback() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_restore_apispec.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+    let pool = db.pool();
+
+    // Seed a proxy + its owning api_spec directly through the backend so the
+    // namespace carries admin-only metadata before the restore.
+    let proxy: Proxy = serde_json::from_value(json!({
+        "id": "spec-proxy",
+        "namespace": "ferrum",
+        "backend_host": "backend.example.com",
+        "backend_port": 443,
+        "listen_path": "/spec-proxy"
+    }))
+    .expect("proxy deserialization failed");
+    let bundle = ferrum_edge::ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let content = b"minimal owned spec";
+    let spec = ferrum_edge::config::types::ApiSpec {
+        id: "spec-1".to_string(),
+        namespace: "ferrum".to_string(),
+        proxy_id: "spec-proxy".to_string(),
+        spec_version: "3.1.0".to_string(),
+        spec_format: ferrum_edge::config::types::SpecFormat::Json,
+        spec_content: ferrum_edge::admin::spec_codec::compress_gzip(content)
+            .expect("compress failed"),
+        content_encoding: "gzip".to_string(),
+        uncompressed_size: content.len() as u64,
+        content_hash: ferrum_edge::admin::spec_codec::sha256_hex(content),
+        title: Some("Test API".to_string()),
+        info_version: Some("1.0.0".to_string()),
+        description: None,
+        contact_name: None,
+        contact_email: None,
+        license_name: None,
+        license_identifier: None,
+        tags: vec![],
+        server_urls: vec![],
+        operation_count: 0,
+        resource_hash: String::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    db.submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("Failed to seed api_spec bundle");
+
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Force the import phase to fail so the restore rolls back.
+    sqlx::query(
+        "CREATE TRIGGER fail_restore_apispec BEFORE INSERT ON proxies \
+         WHEN NEW.id = 'restore-fail' \
+         BEGIN SELECT RAISE(FAIL, 'injected restore persistence failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to install restore fault-injection trigger");
+
+    let restore_payload = json!({
+        "proxies": [{
+            "id": "restore-fail",
+            "listen_path": "/new",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+
+    assert_eq!(status, 500, "Failed restore response: {:?}", body);
+    assert_eq!(
+        body["rollback"].as_str(),
+        Some("completed"),
+        "config rollback should complete: {:?}",
+        body
+    );
+    assert_eq!(
+        body["api_specs_not_restored"].as_u64(),
+        Some(1),
+        "restore must report the api_specs it could not restore: {:?}",
+        body
+    );
+    assert!(
+        body["api_specs_note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("re-submit"),
+        "restore must instruct the operator to re-submit specs: {:?}",
+        body
+    );
+
+    // The config resource itself was restored by rollback.
+    let (status, _, _) = admin_get(&base_url, "/proxies/spec-proxy", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "the spec-owned proxy must survive rollback as a plain resource"
+    );
+}
+
+/// When `delete_all_resources` itself fails (partial clear on non-atomic
+/// backends), restore must still attempt the best-effort rollback and report
+/// honestly when it could not complete.
+#[tokio::test]
+async fn test_restore_rolls_back_after_delete_failure() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_restore_delete_fail.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+    let pool = db.pool();
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let seed = json!({
+        "proxies": [{
+            "id": "restore-keep",
+            "listen_path": "/keep",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "Seed failed: {:?}", body);
+
+    // Make the delete phase (and thus the rollback's re-clear) fail.
+    sqlx::query(
+        "CREATE TRIGGER fail_restore_delete BEFORE DELETE ON proxies \
+         WHEN OLD.id = 'restore-keep' \
+         BEGIN SELECT RAISE(FAIL, 'injected delete failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to install delete fault-injection trigger");
+
+    let restore_payload = json!({
+        "proxies": [{
+            "id": "restore-new",
+            "listen_path": "/new",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+
+    assert_eq!(status, 500, "Failed restore response: {:?}", body);
+    // The delete failed and the rollback's re-clear also failed, so rollback is
+    // incomplete and the response must be honest about manual recovery.
+    assert_eq!(
+        body["rollback"].as_str(),
+        Some("incomplete"),
+        "delete + re-clear both fail, so rollback is incomplete: {:?}",
+        body
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("manual recovery"),
+        "response must flag manual recovery: {:?}",
+        body
+    );
+    assert!(
+        body["rollback_errors"].is_array(),
+        "incomplete rollback must include rollback_errors: {:?}",
+        body
+    );
+
+    // The prior proxy survived because the delete transaction rolled back.
+    let (status, _, _) = admin_get(&base_url, "/proxies/restore-keep", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "the prior proxy must survive a failed delete"
+    );
+}
+
 #[tokio::test]
 async fn test_restore_replaces_all_config() {
     let tc = TestConfig::default();
