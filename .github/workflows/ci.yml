@@ -2696,24 +2696,24 @@ jobs:
         run: |
           set -euo pipefail
           BIN="${{ steps.build_test_bin.outputs.functional_test_bin }}"
+          output_file="$RUNNER_TEMP/two-cluster-live-output.log"
           set +e
-          output="$(sudo -E \
+          sudo -E \
             "FERRUM_LIVE_TESTS_REQUIRED=1" \
             "FERRUM_SKIP_GATEWAY_BUILD=1" \
             timeout --signal=KILL 600s \
             "$BIN" functional_mesh_live_two_cluster_cross_cluster_protocol_matrix \
-              --ignored --nocapture --test-threads=1 2>&1)"
-          status=$?
+              --ignored --nocapture --test-threads=1 2>&1 | tee "$output_file"
+          status=${PIPESTATUS[0]}
           set -e
-          printf '%s\n' "$output"
           if [ "$status" -ne 0 ]; then
             exit "$status"
           fi
-          if grep -q '^SKIP:' <<<"$output"; then
+          if grep -q '^SKIP:' "$output_file"; then
             echo "::error::two-cluster live test skipped under required CI mode"
             exit 1
           fi
-          if ! grep -Eq '^test result: ok\. 1 passed; 0 failed;' <<<"$output"; then
+          if ! grep -Eq '^test result: ok\. 1 passed; 0 failed;' "$output_file"; then
             echo "::error::expected exactly one shared two-cluster live gate to pass"
             exit 1
           fi

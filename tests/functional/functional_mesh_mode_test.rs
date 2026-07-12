@@ -7160,7 +7160,18 @@ impl LiveGatewayChild {
 
     fn stop(&mut self) {
         if let Some(mut child) = self.0.take() {
-            kill_child(&mut child);
+            let pid = child.id();
+            let _ = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+            for _ in 0..50 {
+                if child.try_wait().is_ok_and(|status| status.is_some()) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 
@@ -9110,16 +9121,28 @@ fn live_xc_install_destination_capture(
 }
 
 #[cfg(target_os = "linux")]
-fn live_xc_spawn_gateway(
-    temp: &TempDir,
-    cp_addr: SocketAddr,
-    ports: MeshPorts,
+struct LiveXcGatewaySpawnOptions {
     node_id: &'static str,
     topology: &'static str,
     netns_pid: u32,
     run_uid: Option<u32>,
-    mut env: Vec<(&'static str, String)>,
+    env: Vec<(&'static str, String)>,
+}
+
+#[cfg(target_os = "linux")]
+fn live_xc_spawn_gateway(
+    temp: &TempDir,
+    cp_addr: SocketAddr,
+    ports: MeshPorts,
+    spawn: LiveXcGatewaySpawnOptions,
 ) -> LiveGatewayChild {
+    let LiveXcGatewaySpawnOptions {
+        node_id,
+        topology,
+        netns_pid,
+        run_uid,
+        mut env,
+    } = spawn;
     env.push((
         "FERRUM_MESH_INBOUND_LISTEN_ADDR",
         format!("0.0.0.0:{}", ports.inbound),
@@ -9257,11 +9280,13 @@ impl LiveTwoClusterFixture {
             &temp_sidecar_destination,
             cp_sidecar_destination.addr,
             ports_sidecar_destination,
-            "live-xc-sidecar-destination",
-            "sidecar",
-            destination.pod.pid(),
-            Some(1337),
-            live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B),
+            LiveXcGatewaySpawnOptions {
+                node_id: "live-xc-sidecar-destination",
+                topology: "sidecar",
+                netns_pid: destination.pod.pid(),
+                run_uid: Some(1337),
+                env: live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B),
+            },
         );
         if !wait_for_tcp_port_in_netns(
             destination.pod.pid(),
@@ -9280,11 +9305,13 @@ impl LiveTwoClusterFixture {
             &temp_ambient_destination,
             cp_ambient_destination.addr,
             ports_ambient_destination,
-            "live-xc-ambient-destination",
-            "ambient",
-            destination.pod.pid(),
-            Some(1337),
-            live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B),
+            LiveXcGatewaySpawnOptions {
+                node_id: "live-xc-ambient-destination",
+                topology: "ambient",
+                netns_pid: destination.pod.pid(),
+                run_uid: Some(1337),
+                env: live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B),
+            },
         );
         if !wait_for_tcp_port_in_netns(
             destination.pod.pid(),
@@ -9309,11 +9336,13 @@ impl LiveTwoClusterFixture {
             &temp_east_west,
             cp_east_west.addr,
             ports_east_west,
-            "live-xc-east-west",
-            "east_west_gateway",
-            east_west.pod.pid(),
-            Some(1337),
-            live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B),
+            LiveXcGatewaySpawnOptions {
+                node_id: "live-xc-east-west",
+                topology: "east_west_gateway",
+                netns_pid: east_west.pod.pid(),
+                run_uid: Some(1337),
+                env: live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B),
+            },
         );
         if !wait_for_tcp_port_in_netns(east_west.pod.pid(), east_west_port, STARTUP_TIMEOUT).await {
             return Err(format!(
@@ -9384,11 +9413,13 @@ impl LiveTwoClusterFixture {
             &temp_sidecar_source,
             cp_sidecar_source.addr,
             ports_sidecar_source,
-            "live-xc-sidecar-source",
-            "sidecar",
-            source.pod.pid(),
-            Some(1337),
-            sidecar_env,
+            LiveXcGatewaySpawnOptions {
+                node_id: "live-xc-sidecar-source",
+                topology: "sidecar",
+                netns_pid: source.pod.pid(),
+                run_uid: Some(1337),
+                env: sidecar_env,
+            },
         );
 
         let ports_ambient_source = reserve_mesh_ports().await;
@@ -9409,11 +9440,13 @@ impl LiveTwoClusterFixture {
             &temp_ambient_source,
             cp_ambient_source.addr,
             ports_ambient_source,
-            "live-xc-ambient-source",
-            "ambient",
-            source.pod.pid(),
-            None,
-            ambient_env,
+            LiveXcGatewaySpawnOptions {
+                node_id: "live-xc-ambient-source",
+                topology: "ambient",
+                netns_pid: source.pod.pid(),
+                run_uid: None,
+                env: ambient_env,
+            },
         );
 
         let ports_unfederated = reserve_mesh_ports().await;
@@ -9422,11 +9455,13 @@ impl LiveTwoClusterFixture {
             &temp_unfederated_source,
             cp_unfederated_source.addr,
             ports_unfederated,
-            "live-xc-unfederated-source",
-            "sidecar",
-            source.pod.pid(),
-            Some(1338),
-            live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A_UNFEDERATED),
+            LiveXcGatewaySpawnOptions {
+                node_id: "live-xc-unfederated-source",
+                topology: "sidecar",
+                netns_pid: source.pod.pid(),
+                run_uid: Some(1338),
+                env: live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A_UNFEDERATED),
+            },
         );
 
         let ports_wrong_td = reserve_mesh_ports().await;
@@ -9435,11 +9470,13 @@ impl LiveTwoClusterFixture {
             &temp_wrong_td_source,
             cp_wrong_td_source.addr,
             ports_wrong_td,
-            "live-xc-wrong-td-source",
-            "sidecar",
-            source.pod.pid(),
-            Some(1337),
-            live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A),
+            LiveXcGatewaySpawnOptions {
+                node_id: "live-xc-wrong-td-source",
+                topology: "sidecar",
+                netns_pid: source.pod.pid(),
+                run_uid: Some(1337),
+                env: live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A),
+            },
         );
 
         let ports_missing_sni = reserve_mesh_ports().await;
@@ -9448,11 +9485,13 @@ impl LiveTwoClusterFixture {
             &temp_missing_sni_source,
             cp_missing_sni_source.addr,
             ports_missing_sni,
-            "live-xc-missing-sni-source",
-            "sidecar",
-            source.pod.pid(),
-            Some(1337),
-            live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A),
+            LiveXcGatewaySpawnOptions {
+                node_id: "live-xc-missing-sni-source",
+                topology: "sidecar",
+                netns_pid: source.pod.pid(),
+                run_uid: Some(1337),
+                env: live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A),
+            },
         );
 
         for (label, port, temp) in [
@@ -9911,9 +9950,11 @@ async fn functional_mesh_live_two_cluster_cross_cluster_protocol_matrix() {
         }
     }
     ensure_gateway_built().expect("build gateway for live two-cluster test");
+    eprintln!("LIVE_XC_STAGE fixture:start");
     let mut fixture = LiveTwoClusterFixture::start()
         .await
         .unwrap_or_else(|error| panic!("start live two-cluster fixture: {error}"));
+    eprintln!("LIVE_XC_STAGE fixture:ready");
 
     let direct = run_in_live_netns(fixture.source.pod.pid(), {
         let destination = SocketAddr::from((fixture.destination.pod_ip(), LIVE_XC_HTTP_PORT));
@@ -9927,14 +9968,32 @@ async fn functional_mesh_live_two_cluster_cross_cluster_protocol_matrix() {
         "source cluster A can reach the destination pod directly; fixture isolation is invalid"
     );
 
+    eprintln!("LIVE_XC_STAGE http:start");
     live_xc_test_http(&fixture).await;
+    eprintln!("LIVE_XC_STAGE http:ok");
+    eprintln!("LIVE_XC_STAGE grpc:start");
     live_xc_test_grpc(&fixture).await;
+    eprintln!("LIVE_XC_STAGE grpc:ok");
+    eprintln!("LIVE_XC_STAGE sidecar_ws:start");
     live_xc_test_sidecar_websocket(&fixture).await;
+    eprintln!("LIVE_XC_STAGE sidecar_ws:ok");
+    eprintln!("LIVE_XC_STAGE ambient_ws:start");
     live_xc_test_ambient_websocket(&fixture).await;
+    eprintln!("LIVE_XC_STAGE ambient_ws:ok");
+    eprintln!("LIVE_XC_STAGE negatives:start");
     live_xc_test_fail_closed_negatives(&fixture).await;
+    eprintln!("LIVE_XC_STAGE negatives:ok");
+    eprintln!("LIVE_XC_STAGE multi_port:start");
     live_xc_test_multi_port(&mut fixture);
+    eprintln!("LIVE_XC_STAGE multi_port:ok");
+    eprintln!("LIVE_XC_STAGE raw_tcp:start");
     live_xc_test_raw_tcp(&mut fixture);
+    eprintln!("LIVE_XC_STAGE raw_tcp:ok");
+    eprintln!("LIVE_XC_STAGE udp:start");
     live_xc_test_udp(&mut fixture).await;
+    eprintln!("LIVE_XC_STAGE udp:ok");
 
+    eprintln!("LIVE_XC_STAGE shutdown:start");
     fixture.shutdown().await;
+    eprintln!("LIVE_XC_STAGE shutdown:ok");
 }
