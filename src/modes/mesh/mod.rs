@@ -9591,9 +9591,11 @@ async fn serve_mesh_runtime(
         &shutdown_tx,
         proxy_state.clone(),
         mesh_state.clone(),
-        startup_ready.clone(),
-        serving_degraded.clone(),
-        serving_listener_failures.clone(),
+        MeshServingSignals {
+            startup_ready: startup_ready.clone(),
+            serving_degraded: serving_degraded.clone(),
+            listener_failures: serving_listener_failures.clone(),
+        },
         &tls_policy,
         &crls,
     )?;
@@ -10242,17 +10244,29 @@ struct MeshAdminListeners {
     startup_signals: Vec<(String, tokio::sync::oneshot::Receiver<()>)>,
 }
 
+/// Shared readiness/degradation handles threaded from `serve_mesh_runtime`
+/// into the admin listeners so post-startup listener failures flip the same
+/// sticky serving state the traffic listeners use.
+struct MeshServingSignals {
+    startup_ready: Arc<AtomicBool>,
+    serving_degraded: Arc<AtomicBool>,
+    listener_failures: Arc<crate::startup::ServingListenerFailures>,
+}
+
 fn start_mesh_admin_listeners(
     env_config: &EnvConfig,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     proxy_state: ProxyState,
     mesh_state: MeshRuntimeState,
-    startup_ready: Arc<AtomicBool>,
-    serving_degraded: Arc<AtomicBool>,
-    serving_listener_failures: Arc<crate::startup::ServingListenerFailures>,
+    serving_signals: MeshServingSignals,
     tls_policy: &TlsPolicy,
     crls: &tls::CrlList,
 ) -> Result<MeshAdminListeners, anyhow::Error> {
+    let MeshServingSignals {
+        startup_ready,
+        serving_degraded,
+        listener_failures: serving_listener_failures,
+    } = serving_signals;
     let admin_allowed_cidrs = Arc::new(
         crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
             .map_err(|err| anyhow::anyhow!("Invalid FERRUM_ADMIN_ALLOWED_CIDRS: {err}"))?,
