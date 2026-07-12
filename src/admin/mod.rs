@@ -1336,7 +1336,7 @@ pub async fn handle_admin_request(
         return Ok(resp);
     }
 
-    let response = match (method, segments.as_slice()) {
+    let response = match (method.clone(), segments.as_slice()) {
         // Proxies CRUD
         (Method::GET, ["proxies"]) => {
             crud::handle_list::<Proxy>(&state, &pagination, auth.role, &namespace).await
@@ -1919,15 +1919,18 @@ fn tls_mutation_audit_descriptor(
     response_body: Option<&Value>,
 ) -> Option<(&'static str, &'static str, String)> {
     if !matches!(segments, ["admin", "tls", ..])
-        || !matches!(*method, Method::POST | Method::PUT | Method::DELETE)
+        || (method != Method::POST && method != Method::PUT && method != Method::DELETE)
         || matches!(segments, ["admin", "tls", "validate"])
     {
         return None;
     }
-    let action = match *method {
-        Method::POST => "create",
-        Method::PUT => "update",
-        Method::DELETE => "delete",
+    let action = match segments {
+        ["admin", "tls", "acme", "orders", _, "finalize"] if method == Method::POST => "finalize",
+        ["admin", "tls", "acme", "renew", _] if method == Method::POST => "renew",
+        ["admin", "tls", "rotate", _] if method == Method::POST => "rotate",
+        _ if method == Method::POST => "create",
+        _ if method == Method::PUT => "update",
+        _ if method == Method::DELETE => "delete",
         _ => return None,
     };
     let resource_type = match segments.get(2).copied() {

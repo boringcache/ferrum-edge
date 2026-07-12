@@ -3091,7 +3091,7 @@ mod inner {
                                     .replace_one(doc! { "_id": id.as_str() }, doc.clone())
                                     .session(&mut *s)
                                     .await?;
-                                require_matched_update(result, "consumer", id)?;
+                                require_matched_update(result, "consumer", id.as_str())?;
                                 this.record_config_change_in_session(
                                     &mut *s,
                                     namespace.as_str(),
@@ -3357,7 +3357,7 @@ mod inner {
                                     .replace_one(doc! { "_id": id.as_str() }, doc.clone())
                                     .session(&mut *s)
                                     .await?;
-                                require_matched_update(result, "plugin config", id)?;
+                                require_matched_update(result, "plugin config", id.as_str())?;
                                 this.record_config_change_in_session(
                                     &mut *s,
                                     namespace.as_str(),
@@ -3659,7 +3659,7 @@ mod inner {
                                     .replace_one(doc! { "_id": id.as_str() }, doc.clone())
                                     .session(&mut *s)
                                     .await?;
-                                require_matched_update(result, "upstream", id)?;
+                                require_matched_update(result, "upstream", id.as_str())?;
                                 this.record_config_change_in_session(
                                     &mut *s,
                                     namespace.as_str(),

@@ -407,6 +407,9 @@ pub(crate) fn consumer_response_body(consumer: &Consumer) -> Value {
 }
 
 pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response<Full<Bytes>> {
+    if config_update_target_was_not_found(error) {
+        return not_found_response::<Consumer>();
+    }
     let message = error.to_string();
     let status = if super::is_unique_constraint_violation(&message) {
         StatusCode::CONFLICT
