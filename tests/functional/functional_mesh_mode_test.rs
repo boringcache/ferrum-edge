@@ -9166,7 +9166,12 @@ impl LiveXcHostNetwork {
              iptables -w 5 -t filter -A {forward_chain} -s {east_west_ip} -d {dest_ip} -j ACCEPT; \
              iptables -w 5 -t filter -A {forward_chain} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; \
              iptables -w 5 -t filter -A {forward_chain} -j RETURN; \
-             iptables -w 5 -t filter -A {output_chain} -d {dest_ip} -j REJECT; \
+             iptables -w 5 -t filter -A {output_chain} -p tcp -d {dest_ip} \
+               -m conntrack --ctstate NEW -m multiport \
+               --dports {LIVE_XC_HTTP_PORT},{LIVE_XC_GRPC_PORT},{LIVE_XC_SIDECAR_WS_PORT},{LIVE_XC_AMBIENT_WS_PORT},{LIVE_XC_MULTI_A_PORT},{LIVE_XC_MULTI_B_PORT},{LIVE_XC_TCP_PORT} \
+               -j REJECT; \
+             iptables -w 5 -t filter -A {output_chain} -p udp -d {dest_ip} \
+               --dport {LIVE_XC_UDP_PORT} -j REJECT; \
              iptables -w 5 -t filter -A {output_chain} -j RETURN"
         );
         let installed = Command::new("sh")
