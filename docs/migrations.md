@@ -202,6 +202,17 @@ sql: r#"
 "#,
 ```
 
+By default, all statements in one custom-plugin migration and its tracking-row
+insert execute in a single transaction. PostgreSQL statements that must run at
+top level are detected automatically, including `CREATE INDEX CONCURRENTLY`,
+`DROP INDEX CONCURRENTLY`, concurrent `REINDEX`, `VACUUM`, database creation or
+deletion, and `ALTER SYSTEM`. For those migrations, Ferrum executes every
+statement first and records `_ferrum_plugin_migrations` only after all
+statements succeed. A failed statement therefore never creates a tracking row;
+because PostgreSQL cannot roll back this class of DDL as one unit, authors
+should keep these migrations idempotent and use one top-level operation per
+migration where practical.
+
 ### Checksum Validation
 
 Like core migrations, checksums are validated on each run. If a plugin migration's checksum differs from what was recorded when it was applied, a warning is logged. This helps detect unintended modifications to already-applied migrations.

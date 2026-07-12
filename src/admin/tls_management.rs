@@ -1288,9 +1288,6 @@ pub(super) async fn handle_rotate(
     state: &AdminState,
     surface: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(response) = state.check_write_allowed() {
-        return Ok(response);
-    }
     match requested_surfaces(surface) {
         Ok(RotateTarget::All) => {
             let accepted = crate::tls::source::subscription::request_all_material_set_reloads();

@@ -84,6 +84,10 @@ Exact `/metrics` also refreshes this inventory at scrape time and emits `ferrum_
 
 TLS inventory, event listing, inline validation, and forced reload endpoints require an `operator` or `admin` token. Endpoints that create, replace, delete, import, finalize, or renew persisted TLS/ACME material require an `admin` token because they can alter private keys, certificate chains, trust bundles, revocation data, JWKS records, or ACME account-backed state.
 
+Forced reload is an operational action rather than a persisted configuration
+mutation, so `POST /admin/tls/rotate/{surface}` remains available in file, DP,
+and mesh modes when authenticated with an `operator` or `admin` JWT.
+
 ## TLS Events
 
 List recent source watcher rotations and failures:
@@ -826,6 +830,10 @@ Use cases:
 
 Force an immediate, synchronous classification pass over every HTTP-family backend in the current config. Blocks until every probe completes (bounded by `FERRUM_POOL_WARMUP_CONCURRENCY` parallelism + per-probe timeout).
 
+This operational recovery endpoint is available in every proxy-serving mode,
+including read-only file, DP, and mesh admin states. It does not persist a
+configuration or database mutation and still requires a valid admin JWT.
+
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:9000/backend-capabilities/refresh
 ```
@@ -1050,6 +1058,9 @@ Returns `503 Service Unavailable` when proxy state is not yet available, `404 No
 ### `POST /mesh/egress-scope/test`
 
 Dry-runs a candidate destination against the current scope. Accepts a JSON object with `host` (required) and `port` (optional). Returns whether the destination is admitted by the resolved scope. Never mutates slice state.
+
+Because this is a non-mutating diagnostic, it remains available in read-only
+mesh and DP admin states with the standard admin JWT authentication.
 
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" \

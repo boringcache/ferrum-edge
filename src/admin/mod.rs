@@ -1336,7 +1336,6 @@ pub async fn handle_admin_request(
         return Ok(resp);
     }
 
-    let tls_audit = tls_mutation_audit_descriptor(&method, segments.as_slice());
     let response = match (method, segments.as_slice()) {
         // Proxies CRUD
         (Method::GET, ["proxies"]) => {
@@ -1875,20 +1874,30 @@ pub async fn handle_admin_request(
             &json!({"error": "Not Found"}),
         )),
     };
-    if let (Some((action, resource_type, resource_id)), Ok(http_response), Some(db)) =
-        (tls_audit, response.as_ref(), state.db.as_ref())
+    if let (Ok(http_response), Some(db)) = (response.as_ref(), state.db.as_ref())
         && http_response.status().is_success()
     {
-        let event = audit::AuditEvent::new(
-            &auth,
-            action,
-            resource_type,
-            resource_id,
-            &namespace,
-            json!({"path": path}),
-        );
-        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-            log_audit_enqueue_failure(&error);
+        let response_body = http_response
+            .body()
+            .clone()
+            .collect()
+            .await
+            .ok()
+            .and_then(|body| serde_json::from_slice::<Value>(&body.to_bytes()).ok());
+        if let Some((action, resource_type, resource_id)) =
+            tls_mutation_audit_descriptor(&method, segments.as_slice(), response_body.as_ref())
+        {
+            let event = audit::AuditEvent::new(
+                &auth,
+                action,
+                resource_type,
+                resource_id,
+                &namespace,
+                json!({"path": path}),
+            );
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+                log_audit_enqueue_failure(&error);
+            }
         }
     }
     response
@@ -1897,6 +1906,7 @@ pub async fn handle_admin_request(
 fn tls_mutation_audit_descriptor(
     method: &Method,
     segments: &[&str],
+    response_body: Option<&Value>,
 ) -> Option<(&'static str, &'static str, String)> {
     if !matches!(segments, ["admin", "tls", ..])
         || !matches!(*method, Method::POST | Method::PUT | Method::DELETE)
@@ -1921,23 +1931,18 @@ fn tls_mutation_audit_descriptor(
         Some("rotate") => "tls_rotation",
         _ => "tls_material",
     };
-    let resource_id = segments
-        .last()
-        .copied()
-        .filter(|value| {
-            !matches!(
-                *value,
-                "certificates"
-                    | "private-keys"
-                    | "ca-bundles"
-                    | "crls"
-                    | "ocsp-responses"
-                    | "jwks"
-                    | "acme"
-            )
-        })
-        .unwrap_or("new")
-        .to_string();
+    let resource_id = match segments {
+        ["admin", "tls", "acme", "orders", id, "finalize"] => (*id).to_string(),
+        ["admin", "tls", "acme", "renew", certificate_id] => (*certificate_id).to_string(),
+        ["admin", "tls", "rotate", surface] => (*surface).to_string(),
+        ["admin", "tls", _, id] | ["admin", "tls", "acme", _, id] => (*id).to_string(),
+        ["admin", "tls", _] | ["admin", "tls", "acme", _] => response_body
+            .and_then(|body| body.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("new")
+            .to_string(),
+        _ => segments.last().copied().unwrap_or("new").to_string(),
+    };
     Some((action, resource_type, resource_id))
 }
 
@@ -2389,9 +2394,6 @@ async fn handle_mesh_egress_scope_test(
     state: &AdminState,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(response) = state.check_write_allowed() {
-        return Ok(response);
-    }
     if state.proxy_state.as_ref().is_none() {
         return Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4705,9 +4707,6 @@ async fn handle_backend_capabilities_get(
 async fn handle_backend_capabilities_refresh(
     state: &AdminState,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(response) = state.check_write_allowed() {
-        return Ok(response);
-    }
     let proxy_state = match &state.proxy_state {
         Some(ps) => ps,
         None => {
@@ -5006,6 +5005,26 @@ mod tests {
                 route.join("/")
             );
         }
+    }
+
+    #[test]
+    fn tls_audit_descriptor_uses_acted_on_and_created_resource_ids() {
+        let created = json!({"id": "generated-order"});
+        let (_, _, create_id) = tls_mutation_audit_descriptor(
+            &Method::POST,
+            &["admin", "tls", "acme", "orders"],
+            Some(&created),
+        )
+        .expect("ACME order create should be audited");
+        assert_eq!(create_id, "generated-order");
+
+        let (_, _, finalize_id) = tls_mutation_audit_descriptor(
+            &Method::POST,
+            &["admin", "tls", "acme", "orders", "edge-order", "finalize"],
+            None,
+        )
+        .expect("ACME order finalize should be audited");
+        assert_eq!(finalize_id, "edge-order");
     }
 
     #[test]

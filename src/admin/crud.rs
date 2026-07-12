@@ -2165,6 +2165,17 @@ fn not_found_response<R: AdminResource>() -> Response<Full<Bytes>> {
     )
 }
 
+fn config_update_target_was_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains(" was not found in namespace '")
+            || message.starts_with("proxy '") && message.ends_with("' was not found")
+            || message.starts_with("consumer '") && message.ends_with("' was not found")
+            || message.starts_with("plugin config '") && message.ends_with("' was not found")
+            || message.starts_with("upstream '") && message.ends_with("' was not found")
+    })
+}
+
 async fn handle_write<R: AdminResource>(
     state: &AdminState,
     actor: &AuditActor,
@@ -2216,6 +2227,10 @@ async fn handle_write<R: AdminResource>(
             }
         },
     };
+
+    if matches!(action, WriteAction::Update { .. }) && existing.is_none() {
+        return Ok(not_found_response::<R>());
+    }
 
     match action {
         WriteAction::Create => {
@@ -2318,6 +2333,11 @@ async fn handle_write<R: AdminResource>(
         WriteAction::Update { .. } => R::db_update(db, &resource).await,
     };
     if let Err(error) = persist_result {
+        if matches!(action, WriteAction::Update { .. })
+            && config_update_target_was_not_found(&error)
+        {
+            return Ok(not_found_response::<R>());
+        }
         return Ok(R::map_persist_db_error(&error, action));
     }
 

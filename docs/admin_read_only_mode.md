@@ -4,7 +4,7 @@ The Ferrum Edge Admin API supports a configurable read-only mode that provides a
 
 ## Overview
 
-The Admin Read-Only Mode allows you to restrict write operations (POST, PUT, DELETE) on the Admin API while still allowing read operations (GET) for monitoring and health checks. This feature is particularly useful in production environments where you want to prevent accidental configuration changes.
+The Admin Read-Only Mode restricts persisted configuration and database mutations while still allowing reads and authenticated operational actions. This feature is particularly useful in production environments where you want to prevent accidental configuration changes without disabling recovery and diagnostic controls.
 
 ## Behavior
 
@@ -17,8 +17,8 @@ All GET endpoints continue to work normally in read-only mode:
 - `GET /plugin-configs` - List all plugin configurations
 - `GET /plugin-configs/{id}` - Get specific plugin configuration
 
-### Write Operations (Blocked in Read-Only Mode)
-All write operations are blocked and return `403 Forbidden`:
+### Configuration Mutations (Blocked in Read-Only Mode)
+Configuration and database mutations are blocked and return `403 Forbidden`:
 - `POST /proxies` - Create new proxy
 - `PUT /proxies/{id}` - Update existing proxy
 - `DELETE /proxies/{id}` - Delete proxy
@@ -28,6 +28,11 @@ All write operations are blocked and return `403 Forbidden`:
 - `POST /plugin-configs` - Create new plugin configuration
 - `PUT /plugin-configs/{id}` - Update existing plugin configuration
 - `DELETE /plugin-configs/{id}` - Delete plugin configuration
+
+Operational POST endpoints that do not persist configuration remain available
+with their normal JWT and role checks. These include
+`POST /mesh/egress-scope/test`, `POST /backend-capabilities/refresh`, and
+`POST /admin/tls/rotate/{surface}`.
 
 ### Error Response
 
