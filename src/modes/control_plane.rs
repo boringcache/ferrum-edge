@@ -34,6 +34,7 @@ use crate::config::db_backend::{self, DatabaseBackend, IncrementalResult};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot as apply_incremental_to_config;
 use crate::config::types::GatewayConfig;
+use crate::config::validation_pipeline::collect_rejecting_runtime_config_errors;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::cp_server::{CpGrpcServer, CpScope};
 use crate::grpc::mesh_registry::{
@@ -391,15 +392,16 @@ async fn load_full_config_multi(
 ) -> Result<GatewayConfig, anyhow::Error> {
     if namespaces.len() <= 1 {
         let ns = namespaces.first().map(|s| s.as_str()).unwrap_or("ferrum");
-        return db.load_full_config(ns).await;
+        let config = db.load_full_config(ns).await?;
+        return prepare_cp_full_snapshot(config);
     }
 
     // First namespace seeds the loaded_at / version / trust_bundles fields,
     // then we extend with the remaining namespaces' resource vectors.
     let first = namespaces.first().expect("namespaces is non-empty");
-    let mut combined = db.load_full_config(first).await?;
+    let mut combined = prepare_cp_full_snapshot(db.load_full_config(first).await?)?;
     for ns in namespaces.iter().skip(1) {
-        let mut next = db.load_full_config(ns).await?;
+        let mut next = prepare_cp_full_snapshot(db.load_full_config(ns).await?)?;
         combined.proxies.append(&mut next.proxies);
         combined.consumers.append(&mut next.consumers);
         combined.plugin_configs.append(&mut next.plugin_configs);
@@ -429,16 +431,39 @@ async fn load_full_config_multi_with_sequence(
     Ok((config, sequences))
 }
 
+fn prepare_cp_full_snapshot(mut config: GatewayConfig) -> Result<GatewayConfig, anyhow::Error> {
+    config.normalize_fields();
+    config.resolve_upstream_tls();
+    reject_invalid_cp_full_snapshot(&config)?;
+    Ok(config)
+}
+
+fn reject_invalid_cp_full_snapshot(config: &GatewayConfig) -> Result<(), anyhow::Error> {
+    let validation_errors = collect_rejecting_runtime_config_errors(config);
+    if validation_errors.is_empty() {
+        return Ok(());
+    }
+
+    for message in &validation_errors {
+        error!("CP full config rejected: {}", message);
+    }
+    anyhow::bail!(
+        "CP full configuration validation failed: {} rejecting error(s) found",
+        validation_errors.len()
+    )
+}
+
 /// Partition an `IncrementalResult` by `namespace`, returning a delta for
 /// each namespace that has at least one changed or removed resource.
 ///
 /// Resources are matched by their `namespace` field; removed IDs are
-/// partitioned via a `(id → namespace)` lookup built from the CP's current
-/// accepted config so deletions reach the right per-namespace channel.
+/// partitioned via lookups built from the CP's current accepted config so
+/// deletions reach the right per-namespace channel. Consumer lookup keys are
+/// `(namespace, id)` because consumer IDs are namespace-local.
 fn partition_incremental_by_namespace(
     result: IncrementalResult,
     proxy_ns: &std::collections::HashMap<String, String>,
-    consumer_ns: &std::collections::HashMap<String, String>,
+    consumer_ns: &std::collections::HashMap<(String, String), String>,
     plugin_config_ns: &std::collections::HashMap<String, String>,
     upstream_ns: &std::collections::HashMap<String, String>,
 ) -> std::collections::HashMap<String, IncrementalResult> {
@@ -498,13 +523,13 @@ fn partition_incremental_by_namespace(
                 .push(id);
         }
     }
-    for id in result.removed_consumer_ids {
-        if let Some(ns) = consumer_ns.get(&id) {
+    for key in result.removed_consumer_ids {
+        if let Some(ns) = consumer_ns.get(&(key.namespace.clone(), key.id.clone())) {
             buckets
                 .entry(ns.clone())
                 .or_insert_with(|| make_empty(poll_timestamp))
                 .removed_consumer_ids
-                .push(id);
+                .push(key);
         }
     }
     for id in result.removed_plugin_config_ids {
@@ -529,16 +554,17 @@ fn partition_incremental_by_namespace(
     buckets
 }
 
-/// Build an `(id → namespace)` lookup from a full config snapshot. Used by
+/// Build resource-key-to-namespace lookups from a full config snapshot. Used by
 /// the multi-namespace incremental path so removal IDs (which don't carry
-/// their own namespace) can still be routed to the right per-namespace
-/// broadcast channel.
+/// their own namespace, except consumers) can still be routed to the right
+/// per-namespace broadcast channel. Consumer keys include namespace because
+/// consumer ids are only unique within a namespace.
 #[allow(clippy::type_complexity)]
 fn build_namespace_lookups(
     config: &GatewayConfig,
 ) -> (
     std::collections::HashMap<String, String>,
-    std::collections::HashMap<String, String>,
+    std::collections::HashMap<(String, String), String>,
     std::collections::HashMap<String, String>,
     std::collections::HashMap<String, String>,
 ) {
@@ -550,7 +576,7 @@ fn build_namespace_lookups(
     let consumer_ns = config
         .consumers
         .iter()
-        .map(|c| (c.id.clone(), c.namespace.clone()))
+        .map(|c| ((c.namespace.clone(), c.id.clone()), c.namespace.clone()))
         .collect();
     let plugin_config_ns = config
         .plugin_configs
@@ -785,6 +811,12 @@ pub async fn run(
     // unreachable, causing the admin API to reject writes early and preserve
     // the cached config until the DB recovers.
     let startup_ready = Arc::new(AtomicBool::new(false));
+    // Sticky serving-degradation flag: set true (never unset) if the gRPC serve
+    // future exits with an error after startup. `/health` reports not-ready when
+    // this is set OR `startup_ready` is false, so a serve failure that lands
+    // between the gRPC start signal and the main task's `startup_ready.store(true)`
+    // below is not re-masked by that store.
+    let serving_degraded = Arc::new(AtomicBool::new(false));
     let db_available = Arc::new(AtomicBool::new(true));
 
     let reserved_ports = env_config.reserved_gateway_ports();
@@ -804,6 +836,7 @@ pub async fn run(
         admin_audit_enabled: env_config.admin_audit_enabled,
         admin_require_namespace_claim: env_config.admin_require_namespace_claim,
         startup_ready: Some(startup_ready.clone()),
+        serving_degraded: Some(serving_degraded.clone()),
         db_available: Some(db_available.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
@@ -825,21 +858,33 @@ pub async fn run(
     // create_jwt_manager_from_env() a second time).
     let admin_state_for_https = admin_state.clone();
     let admin_shutdown = shutdown_tx.subscribe();
+    let mut startup_signals = Vec::new();
 
     // Admin HTTP listener (disabled when port is 0)
     let admin_http_handle = if env_config.admin_http_port != 0 {
         let admin_http_limiter = admin_conn_limiter.clone();
+        let (admin_http_started_tx, admin_http_started_rx) = tokio::sync::oneshot::channel();
+        startup_signals.push(("CP admin HTTP listener".to_string(), admin_http_started_rx));
+        let admin_http_startup_ready = startup_ready.clone();
+        let admin_http_serving_degraded = serving_degraded.clone();
         Some(tokio::spawn(async move {
             info!("Starting Admin HTTP listener on {}", admin_http_addr);
-            if let Err(e) = admin::start_admin_listener(
+            if let Err(e) = admin::start_admin_listener_with_tls_and_signal(
                 admin_http_addr,
                 admin_state,
                 admin_shutdown,
+                None,
+                Some(admin_http_started_tx),
                 admin_http_limiter,
             )
             .await
             {
-                error!("Admin HTTP listener error: {}", e);
+                crate::startup::flip_ready_off_on_listener_failure(
+                    &admin_http_startup_ready,
+                    &admin_http_serving_degraded,
+                    "CP admin HTTP listener",
+                    &e,
+                );
             }
         }))
     } else {
@@ -902,30 +947,44 @@ pub async fn run(
         }
         let admin_tls_slot = admin_reload_handles.slot.clone();
         let admin_https_limiter = admin_conn_limiter.clone();
+        let (admin_https_started_tx, admin_https_started_rx) = tokio::sync::oneshot::channel();
+        startup_signals.push((
+            "CP admin HTTPS listener".to_string(),
+            admin_https_started_rx,
+        ));
+        let admin_https_startup_ready = startup_ready.clone();
+        let admin_https_serving_degraded = serving_degraded.clone();
 
         Some(tokio::spawn(async move {
             info!("Starting Admin HTTPS listener on {}", admin_https_addr);
             let result = if let Some(slot) = admin_tls_slot {
-                admin::start_admin_listener_with_dynamic_tls(
+                admin::start_admin_listener_with_dynamic_tls_and_signal(
                     admin_https_addr,
                     admin_state_for_https,
                     admin_https_shutdown,
                     slot,
+                    Some(admin_https_started_tx),
                     admin_https_limiter,
                 )
                 .await
             } else {
-                admin::start_admin_listener_with_tls(
+                admin::start_admin_listener_with_tls_and_signal(
                     admin_https_addr,
                     admin_state_for_https,
                     admin_https_shutdown,
                     Some(admin_tls_config),
+                    Some(admin_https_started_tx),
                     admin_https_limiter,
                 )
                 .await
             };
             if let Err(e) = result {
-                error!("Admin HTTPS listener error: {}", e);
+                crate::startup::flip_ready_off_on_listener_failure(
+                    &admin_https_startup_ready,
+                    &admin_https_serving_degraded,
+                    "CP admin HTTPS listener",
+                    &e,
+                );
             }
         }))
     } else {
@@ -1017,9 +1076,12 @@ pub async fn run(
         let grpc_http2_max_local_error_reset_streams =
             env_config.server_http2_max_local_error_reset_streams;
         let (grpc_started_tx, grpc_started_rx) = tokio::sync::oneshot::channel();
+        startup_signals.push(("CP gRPC listener".to_string(), grpc_started_rx));
         let mut grpc_shutdown = shutdown_tx.subscribe();
         let grpc_accept_shutdown = grpc_shutdown.clone();
         let grpc_tls_handshake_timeout_seconds = env_config.frontend_tls_handshake_timeout_seconds;
+        let grpc_startup_ready = startup_ready.clone();
+        let grpc_serving_degraded = serving_degraded.clone();
         let handle = tokio::spawn(async move {
             let mut builder = Server::builder()
                 .max_concurrent_streams(Some(grpc_http2_max_concurrent_streams))
@@ -1062,15 +1124,21 @@ pub async fn run(
                     .await
             };
             if let Err(e) = result {
-                error!("gRPC server error: {}", e);
+                // The gRPC serve future exited with an error, so this CP can no
+                // longer distribute config to data planes. Flip readiness back
+                // to not-ready so `/health` stops reporting `ready` instead of
+                // leaving a live-but-non-serving control plane. The CP listener
+                // monitor also observes this task exiting and triggers graceful
+                // shutdown; flipping readiness first keeps the probe honest
+                // during the teardown window.
+                crate::startup::flip_ready_off_on_listener_failure(
+                    &grpc_startup_ready,
+                    &grpc_serving_degraded,
+                    "CP gRPC server",
+                    &e,
+                );
             }
         });
-
-        wait_for_start_signals(
-            vec![("CP gRPC listener".to_string(), grpc_started_rx)],
-            Duration::from_secs(10),
-        )
-        .await?;
 
         Some(handle)
     } else {
@@ -1080,9 +1148,13 @@ pub async fn run(
         drop(xds_server);
         None
     };
+    wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
     // Mark CP as ready — same rationale as database mode: the initial
     // `load_full_config()` proved DB connectivity and loaded a complete config.
     // The polling loop handles ongoing incremental updates, not initial readiness.
+    // If the gRPC serve future already errored (racing this store), the sticky
+    // `serving_degraded` flag was set and keeps `/health` not-ready regardless of
+    // this `store(true)`.
     startup_ready.store(true, Ordering::Release);
     info!("Control plane startup complete; /health now reports ready");
 
@@ -1435,32 +1507,8 @@ pub async fn run(
 
                                 // Rejecting validators — collect all failures so
                                 // operators see every reason in a single poll cycle.
-                                let mut validation_errors: Vec<String> = Vec::new();
-                                if let Err(errs) = new_config.validate_regex_listen_paths() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) = new_config.validate_listen_path_encodings() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) = new_config.validate_unique_listen_paths() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) = new_config.validate_stream_proxies() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) = new_config.validate_upstream_references() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) = new_config.validate_plugin_references() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) =
-                                    crate::proxy::validate_mesh_route_dispatch_upstream_references(
-                                        &new_config,
-                                    )
-                                {
-                                    validation_errors.extend(errs);
-                                }
+                                let validation_errors =
+                                    collect_rejecting_runtime_config_errors(&new_config);
                                 if !validation_errors.is_empty() {
                                     for msg in &validation_errors {
                                         error!("CP incremental config rejected: {}", msg);
@@ -1807,7 +1855,7 @@ fn log_cp_listener_monitor_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::db_backend::IncrementalResult;
+    use crate::config::db_backend::{IncrementalResult, NamespacedResourceId};
     use crate::config::types::*;
     use chrono::Utc;
     use std::time::Instant;
@@ -1905,6 +1953,63 @@ mod tests {
     }
 
     #[test]
+    fn cp_full_snapshot_rejects_dangling_upstream_reference() {
+        let mut proxy = make_proxy("dangling-upstream");
+        proxy.upstream_id = Some("missing-upstream".to_string());
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            ..Default::default()
+        };
+
+        let error = reject_invalid_cp_full_snapshot(&config)
+            .expect_err("CP full snapshot must reject a dangling upstream reference");
+
+        assert!(
+            error
+                .to_string()
+                .contains("CP full configuration validation failed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn make_stream_proxy(id: &str, namespace: &str, listen_port: u16) -> Proxy {
+        let mut proxy = make_proxy(id);
+        proxy.namespace = namespace.to_string();
+        proxy.backend_scheme = Some(BackendScheme::Tcp);
+        proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
+        proxy.listen_path = None;
+        proxy.listen_port = Some(listen_port);
+        proxy
+    }
+
+    #[test]
+    fn cp_full_snapshot_allows_same_stream_port_in_different_namespaces() {
+        for (id, namespace) in [("tcp-a", "tenant-a"), ("tcp-b", "tenant-b")] {
+            let config = GatewayConfig {
+                proxies: vec![make_stream_proxy(id, namespace, 15432)],
+                ..Default::default()
+            };
+
+            prepare_cp_full_snapshot(config)
+                .expect("each namespace slice must validate independently");
+        }
+    }
+
+    #[test]
+    fn cp_full_snapshot_rejects_same_stream_port_in_one_namespace() {
+        let config = GatewayConfig {
+            proxies: vec![
+                make_stream_proxy("tcp-a", "tenant-a", 15432),
+                make_stream_proxy("tcp-b", "tenant-a", 15432),
+            ],
+            ..Default::default()
+        };
+
+        prepare_cp_full_snapshot(config)
+            .expect_err("same-namespace stream listen-port conflicts must be rejected");
+    }
+
+    #[test]
     fn merge_discovered_namespaces_retains_current_snapshot_namespaces() {
         let merged = merge_discovered_namespaces(
             vec!["tenant-a".to_string()],
@@ -1958,6 +2063,39 @@ mod tests {
             .get("tenant-a")
             .expect("removed proxy should be routed to its previous namespace");
         assert_eq!(tenant_delta.removed_proxy_ids, vec!["p1"]);
+    }
+
+    #[test]
+    fn partition_incremental_routes_duplicate_consumer_ids_by_namespace() {
+        let mut prod = make_consumer("c1");
+        prod.namespace = "prod".to_string();
+        let mut staging = make_consumer("c1");
+        staging.namespace = "staging".to_string();
+        let current = GatewayConfig {
+            consumers: vec![prod, staging],
+            ..Default::default()
+        };
+        let (proxy_ns, consumer_ns, plugin_config_ns, upstream_ns) =
+            build_namespace_lookups(&current);
+        let mut result = empty_incremental();
+        result.removed_consumer_ids = vec![NamespacedResourceId::new("staging", "c1")];
+
+        let partitions = partition_incremental_by_namespace(
+            result,
+            &proxy_ns,
+            &consumer_ns,
+            &plugin_config_ns,
+            &upstream_ns,
+        );
+
+        assert!(!partitions.contains_key("prod"));
+        assert_eq!(
+            partitions
+                .get("staging")
+                .expect("staging delete must retain its namespace")
+                .removed_consumer_ids,
+            vec![NamespacedResourceId::new("staging", "c1")]
+        );
     }
 
     // ── upsert_by_id ───────────────────────────────────────────────────
@@ -2061,7 +2199,7 @@ mod tests {
         let mut inc = empty_incremental();
         inc.removed_proxy_ids = vec!["remove".to_string()];
         inc.added_or_modified_proxies = vec![make_proxy("added")];
-        inc.removed_consumer_ids = vec!["c1".to_string()];
+        inc.removed_consumer_ids = vec![NamespacedResourceId::new("ferrum", "c1")];
         inc.added_or_modified_consumers = vec![make_consumer("c2")];
         apply_incremental_to_config(&mut config, inc);
 
@@ -2071,6 +2209,45 @@ mod tests {
         assert!(!config.proxies.iter().any(|p| p.id == "remove"));
         assert_eq!(config.consumers.len(), 1);
         assert_eq!(config.consumers[0].id, "c2");
+    }
+
+    #[test]
+    fn apply_incremental_keys_consumers_by_namespace_and_id() {
+        let mut prod = make_consumer("c1");
+        prod.namespace = "prod".to_string();
+        let mut staging = make_consumer("c1");
+        staging.namespace = "staging".to_string();
+        let mut updated_staging = staging.clone();
+        updated_staging.username = "updated-staging".to_string();
+        let mut config = GatewayConfig {
+            consumers: vec![prod, staging],
+            ..Default::default()
+        };
+        let mut inc = empty_incremental();
+        inc.removed_consumer_ids = vec![NamespacedResourceId::new("staging", "c1")];
+        inc.added_or_modified_consumers = vec![updated_staging];
+
+        apply_incremental_to_config(&mut config, inc);
+
+        assert_eq!(config.consumers.len(), 2);
+        assert_eq!(
+            config
+                .consumers
+                .iter()
+                .find(|consumer| consumer.namespace == "prod")
+                .expect("prod consumer must remain")
+                .username,
+            "user_c1"
+        );
+        assert_eq!(
+            config
+                .consumers
+                .iter()
+                .find(|consumer| consumer.namespace == "staging")
+                .expect("staging consumer must be updated")
+                .username,
+            "updated-staging"
+        );
     }
 
     // Regression: prior to this fix, CP mode used `tokio::select!` over the

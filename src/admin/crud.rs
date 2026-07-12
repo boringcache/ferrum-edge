@@ -1835,11 +1835,15 @@ impl AdminResource for Proxy {
         error: &anyhow::Error,
         _action: WriteAction<'_>,
     ) -> Response<Full<Bytes>> {
-        if error.to_string().contains(PROXY_ROUTE_CONFLICT_ERROR) {
+        let message = error.to_string();
+        if message.contains(PROXY_ROUTE_CONFLICT_ERROR) {
             return super::json_response(
                 StatusCode::CONFLICT,
                 &json!({"error": PROXY_ROUTE_CONFLICT_ERROR}),
             );
+        }
+        if super::is_unique_constraint_violation(&message) {
+            return super::json_response(StatusCode::CONFLICT, &json!({ "error": message }));
         }
 
         super::json_response(

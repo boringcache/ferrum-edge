@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use chrono::{Duration, Utc};
 
-use ferrum_edge::config::db_loader::IncrementalResult;
+use ferrum_edge::config::db_loader::{IncrementalResult, NamespacedResourceId};
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
     PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
@@ -422,7 +422,7 @@ async fn apply_incremental_mixed_resource_mutations_are_atomic() {
         added_or_modified_proxies: vec![p1, p3],
         removed_proxy_ids: vec!["p2".to_string()],
         added_or_modified_consumers: vec![c1],
-        removed_consumer_ids: vec!["c2".to_string()],
+        removed_consumer_ids: vec![NamespacedResourceId::new("ferrum", "c2")],
         added_or_modified_plugin_configs: vec![pc1],
         removed_plugin_config_ids: vec!["pc2".to_string()],
         added_or_modified_upstreams: vec![u1],
@@ -461,6 +461,48 @@ async fn apply_incremental_mixed_resource_mutations_are_atomic() {
     assert_eq!(cfg.upstreams[0].id, "u1");
     assert_eq!(cfg.upstreams[0].targets[0].host, "new.example.test");
     assert_eq!(cfg.upstreams[0].targets[0].port, 9090);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_incremental_consumer_keys_include_namespace() {
+    let mut prod = test_consumer("c1", "prod-user");
+    prod.namespace = "prod".to_string();
+    let mut staging = test_consumer("c1", "staging-user");
+    staging.namespace = "staging".to_string();
+    let state = proxy_state_with_config(GatewayConfig {
+        consumers: vec![prod, staging],
+        ..GatewayConfig::default()
+    });
+    let mut updated_staging = test_consumer("c1", "updated-staging-user");
+    updated_staging.namespace = "staging".to_string();
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![updated_staging],
+        removed_consumer_ids: vec![NamespacedResourceId::new("staging", "c1")],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        sequence_cursor: 1,
+        poll_timestamp: Utc::now(),
+    };
+
+    assert_eq!(
+        state.apply_incremental(delta).await,
+        ConfigApplyOutcome::Applied
+    );
+    let config = state.config.load();
+    assert_eq!(config.consumers.len(), 2);
+    assert!(
+        config
+            .consumers
+            .iter()
+            .any(|consumer| consumer.namespace == "prod" && consumer.username == "prod-user")
+    );
+    assert!(config.consumers.iter().any(|consumer| {
+        consumer.namespace == "staging" && consumer.username == "updated-staging-user"
+    }));
 }
 
 /// Two proxies sharing a non-regex `listen_path` violate

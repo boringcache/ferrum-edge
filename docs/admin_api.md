@@ -78,6 +78,8 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/health
 
 Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. The detailed diagnostics (DB type/pool stats, cached-config proxy/consumer counts, `database_polling` degradation, mesh state) require an admin JWT, `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS` source IP. In database mode the authenticated response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` (also visible unauthenticated) while the gateway keeps serving the last known-good config.
 
+In **CP and DP modes**, if a supervised serving-listener task exits with an error *after* the gateway became ready (the CP gRPC server, or a DP proxy/admin HTTP/HTTPS/H3 listener), `/health` returns 503 with `status: "unavailable"` and `ready: false`. This is a **sticky** signal: it is set once and never cleared, so it survives a later readiness restore (the CP main task's one-time `ready` store, or a DP re-store on every CP-reconnect snapshot). The process does not silently keep reporting `ready` while a serving surface is dead.
+
 **Recommended split:** point liveness at `/live` and readiness at `/health`; route detailed diagnostics scraping through an authenticated path.
 
 ## TLS Inventory
@@ -434,20 +436,20 @@ curl -H "Authorization: Bearer $TOKEN" \
 curl -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9000/backup?resources=proxies,upstreams" > partial-backup.json
 
-# Restore from backup (destructive — replaces all existing config)
+# Restore from backup (replaces config after taking a recovery snapshot)
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d @ferrum-backup.json \
   "http://localhost:9000/restore?confirm=true"
 ```
 
-The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Database inserts are chunked into 1,000-record transactions for large-scale imports.
+The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Before replacement, restore snapshots the current namespace with a non-validating raw load from the primary, so an already-invalid-but-present config still snapshots and keeps rollback available while it is repaired. If that snapshot cannot be taken at all — a genuine database/connectivity failure — restore **aborts with `503` before deleting anything** and leaves the prior config intact (retry once the database is reachable). Database inserts are chunked into 1,000-record transactions for large-scale imports; if the delete or any insert fails, Ferrum clears the partial state, reapplies the snapshot, and returns `500 Internal Server Error` with a `rollback` field (`completed` / `incomplete` / `not_needed`). `not_needed` means the clear failed atomically (SQL / replica-set MongoDB), so nothing was deleted and the prior config was retained without any re-import. API specs are admin-only metadata outside the backup/restore payload: a successful restore deletes them, and a config rollback cannot recreate them. Re-submit original documents via `POST /api-specs`; use `GET /api-specs` to list specs currently stored in the namespace. Failed restores report the authoritative affected count in `api_specs_not_restored`.
 
 See [admin_backup_restore.md](admin_backup_restore.md) for details.
 
 ## Audit Log
 
-When `FERRUM_ADMIN_AUDIT_ENABLED=true`, successful admin mutations enqueue a database-backed audit event before the mutation response is returned. The response waits only for bounded queue enqueue, not durable database persistence. Audit persistence is best-effort after the mutation commits: if enqueue or persistence fails, Ferrum logs the failure and still returns the mutation result so operators do not retry an already-applied write. Partial `POST /batch` and `POST /restore` mutations that return `207 Multi-Status` emit an audit event when at least one resource was changed. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, and a JSON `diff` object with redacted consumer credentials.
+When `FERRUM_ADMIN_AUDIT_ENABLED=true`, successful admin mutations enqueue a database-backed audit event before the mutation response is returned. The response waits only for bounded queue enqueue, not durable database persistence. Audit persistence is best-effort after the mutation commits: if enqueue or persistence fails, Ferrum logs the failure and still returns the mutation result so operators do not retry an already-applied write. Partial `POST /batch` mutations that return `207 Multi-Status` emit an audit event when at least one resource was changed. Restore attempts that reach the delete/import phase emit an event; failed attempts record whether rollback completed or was incomplete. Each event includes an ID, timestamp, actor (`sub` claim), action, resource type, resource ID, namespace, and a JSON `diff` object with redacted consumer credentials.
 
 `GET /audit` requires an `admin` role token and supports `actor`, `action`, `resource_type`, `resource_id`, `start`, `end`, `limit`, and `offset` query parameters.
 

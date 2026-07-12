@@ -40,8 +40,9 @@
 #[allow(dead_code)] // MongoStore is wired up in mode dispatch (database.rs, control_plane.rs)
 mod inner {
     use crate::config::db_backend::{
-        ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult,
-        PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SortOrder,
+        ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, DeleteAllResourcesError, DeleteMode,
+        IncrementalResult, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
+        SortOrder,
     };
     use crate::config::db_loader::proxy_route_key_hash;
     use crate::config::types::{
@@ -1138,24 +1139,33 @@ mod inner {
             resource_type: &str,
             resource_id: &str,
             change_error: &anyhow::Error,
-        ) {
+        ) -> bool {
             match self
                 .collection(collection_name)
                 .delete_one(doc! { "_id": resource_id })
                 .await
             {
-                Ok(result) if result.deleted_count > 0 => warn!(
-                    "Rolled back MongoDB standalone {} create for id '{}' in namespace '{}' after config_changes write failed: {}",
-                    resource_type, resource_id, namespace, change_error
-                ),
-                Ok(_) => warn!(
-                    "MongoDB standalone {} create for id '{}' in namespace '{}' failed to record config_changes, but rollback found no inserted document: {}",
-                    resource_type, resource_id, namespace, change_error
-                ),
-                Err(rollback_err) => warn!(
-                    "MongoDB standalone {} create for id '{}' in namespace '{}' failed to record config_changes and rollback failed: {}; original error: {}",
-                    resource_type, resource_id, namespace, rollback_err, change_error
-                ),
+                Ok(result) if result.deleted_count > 0 => {
+                    warn!(
+                        "Rolled back MongoDB standalone {} create for id '{}' in namespace '{}' after config_changes write failed: {}",
+                        resource_type, resource_id, namespace, change_error
+                    );
+                    true
+                }
+                Ok(_) => {
+                    warn!(
+                        "MongoDB standalone {} create for id '{}' in namespace '{}' failed to record config_changes, but rollback confirmed no inserted document remains: {}",
+                        resource_type, resource_id, namespace, change_error
+                    );
+                    true
+                }
+                Err(rollback_err) => {
+                    warn!(
+                        "MongoDB standalone {} create for id '{}' in namespace '{}' failed to record config_changes and rollback failed: {}; original error: {}",
+                        resource_type, resource_id, namespace, rollback_err, change_error
+                    );
+                    false
+                }
             }
         }
 
@@ -2753,6 +2763,7 @@ mod inner {
                 known_namespaces: Vec::new(),
                 ..Default::default()
             };
+            config.normalize_fields();
             config.resolve_upstream_tls();
 
             // Fail-closed consumer identity collisions (issue #2121): Mongo
@@ -2778,6 +2789,104 @@ mod inner {
                 anyhow::bail!("MongoDB has listen_path(s) containing encoded slashes");
             }
 
+            Ok(config)
+        }
+
+        async fn load_namespace_snapshot(
+            &self,
+            namespace: &str,
+        ) -> Result<GatewayConfig, anyhow::Error> {
+            // Rollback snapshot: load the current rows WITHOUT the fatal
+            // `validate_listen_path_encodings` guard that `load_full_config`
+            // applies. Restore uses this to repair an invalid-but-present
+            // namespace, so such a config must still snapshot; only a genuine
+            // MongoDB error surfaces as `Err`, letting the caller abort the
+            // destructive clear instead of wiping an unrecoverable-but-intact
+            // config. The `_opt_session` helpers already clear `api_spec_id`
+            // (parity with `load_full_config`). A replica-set deployment reads
+            // the snapshot inside a majority/snapshot transaction; standalone
+            // reads directly from the primary.
+            let start = std::time::Instant::now();
+            let loaded_at = Utc::now();
+            let (proxies, consumers, plugin_configs, upstreams) =
+                if self.replica_set_configured.load(Ordering::Acquire) {
+                    let connection = self.connection();
+                    let mut session = connection.client.start_session().await?;
+                    session
+                        .start_transaction()
+                        .read_concern(ReadConcern::snapshot())
+                        .write_concern(WriteConcern::majority())
+                        .await?;
+
+                    let loaded = async {
+                        let proxies = self
+                            .load_full_proxies_opt_session(
+                                namespace,
+                                Some((connection.as_ref(), &mut session)),
+                            )
+                            .await?;
+                        let consumers = self
+                            .load_full_consumers_opt_session(
+                                namespace,
+                                Some((connection.as_ref(), &mut session)),
+                            )
+                            .await?;
+                        let plugin_configs = self
+                            .load_full_plugin_configs_opt_session(
+                                namespace,
+                                Some((connection.as_ref(), &mut session)),
+                            )
+                            .await?;
+                        let upstreams = self
+                            .load_full_upstreams_opt_session(
+                                namespace,
+                                Some((connection.as_ref(), &mut session)),
+                            )
+                            .await?;
+                        Ok::<_, anyhow::Error>((proxies, consumers, plugin_configs, upstreams))
+                    }
+                    .await;
+
+                    match loaded {
+                        Ok(resources) => {
+                            session.commit_transaction().await?;
+                            resources
+                        }
+                        Err(error) => {
+                            let _ = session.abort_transaction().await;
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    (
+                        self.load_full_proxies_opt_session(namespace, None).await?,
+                        self.load_full_consumers_opt_session(namespace, None)
+                            .await?,
+                        self.load_full_plugin_configs_opt_session(namespace, None)
+                            .await?,
+                        self.load_full_upstreams_opt_session(namespace, None)
+                            .await?,
+                    )
+                };
+
+            self.check_slow_query("load_namespace_snapshot", start);
+
+            let mut config = GatewayConfig {
+                version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+                proxies,
+                consumers,
+                plugin_configs,
+                upstreams,
+                loaded_at,
+                known_namespaces: Vec::new(),
+                ..Default::default()
+            };
+            // Normalize like admission (parity with the SQL snapshot loader and
+            // idempotent — rows were normalized when written). Deliberately skip
+            // both the fatal validators and `resolve_upstream_tls`: the snapshot
+            // exists only to be re-persisted on rollback, and `resolved_tls` is a
+            // runtime-derived field that is never stored.
+            config.normalize_fields();
             Ok(config)
         }
 
@@ -2936,6 +3045,10 @@ mod inner {
                     .filter(|id| !loaded_consumer_ids.contains(*id))
                     .cloned(),
             );
+            let removed_consumer_ids = removed_consumer_ids
+                .into_iter()
+                .map(|id| NamespacedResourceId::new(namespace, id))
+                .collect();
 
             let mut added_or_modified_plugin_configs = Vec::new();
             for doc in self
@@ -3158,6 +3271,21 @@ mod inner {
                         (self, &proxy.id, doc, proxy.namespace.clone(), guard_params),
                         |s, (this, id, doc, namespace, guard_params)| {
                             Box::pin(async move {
+                                // Establish target existence before admission
+                                // guards so a concurrent delete surfaces as a
+                                // no-match update, not a route conflict.
+                                if this
+                                    .proxies()
+                                    .find_one(doc! {
+                                        "_id": *id,
+                                        "namespace": namespace.as_str(),
+                                    })
+                                    .session(&mut *s)
+                                    .await?
+                                    .is_none()
+                                {
+                                    return Ok((false, Vec::<(String, String)>::new()));
+                                }
                                 // Route-bucket lock + uniqueness re-check +
                                 // upstream reference guard, all in-session so
                                 // concurrent admissions serialize (DB-H1/DB-H4).
@@ -3923,20 +4051,28 @@ mod inner {
                     .record_config_change(&consumer.namespace, "consumer", &consumer.id, "upsert")
                     .await
                 {
-                    self.rollback_standalone_created_document(
-                        "consumers",
-                        &consumer.namespace,
-                        "consumer",
-                        &consumer_doc_id(&consumer.namespace, &consumer.id),
-                        &err,
-                    )
-                    .await;
-                    self.release_consumer_identity_values_best_effort(
-                        &consumer.namespace,
-                        &consumer.id,
-                        &identity_values,
-                    )
-                    .await;
+                    let rollback_confirmed = self
+                        .rollback_standalone_created_document(
+                            "consumers",
+                            &consumer.namespace,
+                            "consumer",
+                            &consumer_doc_id(&consumer.namespace, &consumer.id),
+                            &err,
+                        )
+                        .await;
+                    if rollback_confirmed {
+                        self.release_consumer_identity_values_best_effort(
+                            &consumer.namespace,
+                            &consumer.id,
+                            &identity_values,
+                        )
+                        .await;
+                    } else {
+                        warn!(
+                            "Retaining MongoDB consumer identity reservations for '{}' in namespace '{}' because create rollback could not be verified",
+                            consumer.id, consumer.namespace
+                        );
+                    }
                     return Err(err);
                 }
             }
@@ -5773,11 +5909,28 @@ mod inner {
             }
         }
 
-        async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error> {
+        async fn delete_all_resources(
+            &self,
+            namespace: &str,
+        ) -> Result<DeleteMode, DeleteAllResourcesError> {
+            // Capture the topology-dependent mode exactly once. This same value
+            // selects the implementation branch and is returned on success or
+            // carried by an error, so a concurrent reconnect cannot make the
+            // caller classify a different mode than the one that actually ran.
+            let mode = if self.replica_set_configured() {
+                DeleteMode::Atomic
+            } else {
+                DeleteMode::NonAtomic
+            };
+            let delete_error = |source: anyhow::Error| DeleteAllResourcesError::new(mode, source);
             let ns_filter = doc! { "namespace": namespace };
-            if self.replica_set_configured() {
+            if mode.is_atomic() {
                 let connection = self.connection();
-                let mut session = connection.client.start_session().await?;
+                let mut session = connection
+                    .client
+                    .start_session()
+                    .await
+                    .map_err(|error| delete_error(error.into()))?;
                 session
                     .start_transaction()
                     .and_run(
@@ -5891,55 +6044,82 @@ mod inner {
                     )
                     .await
                     .map_err(|e| {
-                        anyhow::anyhow!("delete_all_resources transaction failed: {}", e)
+                        delete_error(anyhow::anyhow!(
+                            "delete_all_resources transaction failed: {}",
+                            e
+                        ))
                     })?;
                 self.compact_config_changes_best_effort(namespace).await;
             } else {
                 let proxy_ids = self
                     .load_collection_ids_filtered("proxies", ns_filter.clone())
-                    .await?;
+                    .await
+                    .map_err(&delete_error)?;
                 // Plain `id` field — consumer `_id` is the composite
                 // "{namespace}:{id}" and change-log records carry plain ids.
                 let consumer_ids = self
                     .load_consumer_plain_ids_filtered(ns_filter.clone())
-                    .await?;
+                    .await
+                    .map_err(&delete_error)?;
                 let plugin_config_ids = self
                     .load_collection_ids_filtered("plugin_configs", ns_filter.clone())
-                    .await?;
+                    .await
+                    .map_err(&delete_error)?;
                 let upstream_ids = self
                     .load_collection_ids_filtered("upstreams", ns_filter.clone())
-                    .await?;
-                self.plugin_configs().delete_many(ns_filter.clone()).await?;
-                self.proxies().delete_many(ns_filter.clone()).await?;
-                self.consumers().delete_many(ns_filter.clone()).await?;
+                    .await
+                    .map_err(&delete_error)?;
+                self.plugin_configs()
+                    .delete_many(ns_filter.clone())
+                    .await
+                    .map_err(|error| delete_error(error.into()))?;
+                self.proxies()
+                    .delete_many(ns_filter.clone())
+                    .await
+                    .map_err(|error| delete_error(error.into()))?;
+                self.consumers()
+                    .delete_many(ns_filter.clone())
+                    .await
+                    .map_err(|error| delete_error(error.into()))?;
                 // Namespace wipe releases every consumer identity reservation
                 // in the namespace.
                 self.consumer_identity_index()
                     .delete_many(ns_filter.clone())
-                    .await?;
-                self.upstreams().delete_many(ns_filter.clone()).await?;
+                    .await
+                    .map_err(|error| delete_error(error.into()))?;
+                self.upstreams()
+                    .delete_many(ns_filter.clone())
+                    .await
+                    .map_err(|error| delete_error(error.into()))?;
                 // Clear api_specs so restore doesn't leave orphaned spec metadata
                 // pointing to proxies that no longer exist.
-                self.api_specs().delete_many(ns_filter).await?;
+                self.api_specs()
+                    .delete_many(ns_filter)
+                    .await
+                    .map_err(|error| delete_error(error.into()))?;
                 for id in proxy_ids {
                     self.record_config_change(namespace, "proxy", &id, "delete")
-                        .await?;
+                        .await
+                        .map_err(&delete_error)?;
                 }
                 for id in consumer_ids {
                     self.record_config_change(namespace, "consumer", &id, "delete")
-                        .await?;
+                        .await
+                        .map_err(&delete_error)?;
                 }
                 for id in plugin_config_ids {
                     self.record_config_change(namespace, "plugin_config", &id, "delete")
-                        .await?;
+                        .await
+                        .map_err(&delete_error)?;
                 }
                 for id in upstream_ids {
                     self.record_config_change(namespace, "upstream", &id, "delete")
-                        .await?;
+                        .await
+                        .map_err(&delete_error)?;
                 }
             }
             info!("All MongoDB resources deleted (namespace='{}')", namespace);
-            Ok(())
+            Ok(mode)
         }
 
         // -------------------------------------------------------------------
@@ -7407,6 +7587,18 @@ mod inner {
             })
         }
 
+        async fn count_api_specs(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+            let start = std::time::Instant::now();
+            // MongoStore forces primary reads, so this count is authoritative.
+            // count_documents does not fetch or deserialize matching items.
+            let count = self
+                .api_specs()
+                .count_documents(doc! { "namespace": namespace })
+                .await?;
+            self.check_slow_query("count_api_specs", start);
+            Ok(count)
+        }
+
         async fn list_spec_owned_plugin_configs(
             &self,
             namespace: &str,
@@ -7937,14 +8129,21 @@ mod inner {
             if let Some((connection, s)) = session {
                 let consumers_collection: Collection<Document> =
                     connection.db.collection("consumers");
-                let mut cursor = consumers_collection.find(filter).session(&mut *s).await?;
+                let mut cursor = consumers_collection
+                    .find(filter)
+                    .sort(doc! { "id": 1 })
+                    .session(&mut *s)
+                    .await?;
                 while cursor.advance(&mut *s).await? {
                     let doc = cursor.deserialize_current()?;
                     consumers.push(doc_to_consumer(doc)?);
                 }
             } else {
                 let consumers_collection = self.consumers();
-                let mut cursor = consumers_collection.find(filter).await?;
+                let mut cursor = consumers_collection
+                    .find(filter)
+                    .sort(doc! { "id": 1 })
+                    .await?;
                 while cursor.advance().await? {
                     let doc = cursor.deserialize_current()?;
                     consumers.push(doc_to_consumer(doc)?);

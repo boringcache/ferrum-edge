@@ -68,8 +68,25 @@ cat ferrum-backup.json | jq '.counts'
 Replaces the entire gateway configuration with the provided backup payload. This is a **destructive operation**, but the payload is validated before any data is deleted:
 
 1. **Validates** the payload for internal consistency (config version compatibility, resource ID uniqueness, consumer identity/credential uniqueness, regex listen_path compilation and length limits, listen_path+hosts uniqueness, stream proxy configuration including response_body_mode, upstream references). If validation fails, the request returns `400` with detailed errors and **existing config is NOT deleted**.
-2. **Deletes** all existing proxies, consumers, plugin configs, upstreams, and junction table entries
-3. **Imports** the provided resources in dependency order
+2. **Snapshots** the current namespace configuration for recovery (fail-safe — see below)
+3. **Deletes** all existing proxies, consumers, plugin configs, upstreams, and junction table entries
+4. **Imports** the provided resources in dependency order
+5. **Rolls back** to the snapshot if the delete or any import persistence step fails
+
+### Recovery snapshot is authoritative and fail-safe
+
+The recovery snapshot in step 2 is captured with a **non-validating raw load from the primary** (`load_namespace_snapshot`), *not* the validating `load_full_config`. That distinction matters two ways:
+
+- **Invalid-but-present config still snapshots.** An already-invalid namespace (dangling references, conflicting listen_paths, invalid regex) — precisely what an operator runs restore to *repair* — loads its raw rows without the fatal validation pipeline, so the snapshot succeeds and rollback stays available throughout the repair. A restore that imports cleanly succeeds and repairs the namespace; if a later step fails, rollback reapplies the (still invalid) prior config.
+- **A genuine database failure aborts the restore.** If the snapshot cannot be taken at all — a real connectivity/timeout error rather than invalid content — the restore **aborts with `503` before deleting anything** and leaves the prior config untouched. This is fail-safe: a config that is valid but merely transiently unreachable is never wiped when we cannot capture a rollback point. Retry once the database is reachable.
+
+Both the config resources and the `api_specs` count are read from the **primary**, never a lagging read replica, so the recovery report is authoritative.
+
+### API specs are not restored by rollback
+
+`api_specs` are admin-only metadata that live **outside** `GatewayConfig` and the backup/restore payload. The delete phase removes them, and neither a successful restore nor config rollback recreates them. When a failed restore rolls back a namespace that carried specs, the `500` response reports `api_specs_not_restored` (the **authoritative total**) and `api_specs_note` (guidance).
+
+After any restore, re-submit the original spec documents via `POST /api-specs`; use `GET /api-specs` to list specs currently stored in the namespace. On rollback, spec-owned proxy/upstream/plugins are reapplied as **hand-managed** resources (`api_spec_id` is cleared), so operators may first need to remove conflicting restored resources before re-submitting a spec.
 
 ### Safety Guard
 
@@ -154,23 +171,40 @@ curl -s -X POST "$TARGET/restore?confirm=true" \
 
 ### Error Handling
 
-If some resource types fail during import while others succeed, the endpoint returns `207 Multi-Status`:
+If the delete or any resource type fails during import, the endpoint removes the partial state, reapplies the pre-restore snapshot, and returns `500 Internal Server Error`:
 
 ```json
 {
-  "restored": {
-    "proxies": 42,
-    "consumers": 0,
-    "plugin_configs": 85,
-    "upstreams": 12
-  },
-  "errors": [
+  "error": "Restore failed; restore rolled back and prior config retained",
+  "restore_errors": [
     "consumers: unique constraint violation on username"
-  ]
+  ],
+  "rollback": "completed",
+  "api_specs_not_restored": 2,
+  "api_specs_note": "2 API spec(s) were removed and are not part of config restore or rollback. Re-submit the original documents via POST /api-specs; list specs currently stored in the namespace with GET /api-specs."
 }
 ```
 
-**Important**: The payload is validated before the delete phase. If validation fails, existing config is preserved and a `400` response is returned with details. However, if validation passes but the import phase partially fails (e.g., database error during insert), you may end up with fewer resources than before. Use `GET /backup` first to create a safety snapshot.
+The `rollback` field reports the outcome:
+
+- `completed` — the prior config was reapplied and retained.
+- `incomplete` — reapplying the prior config failed; the response includes `rollback_errors` and instructs the operator to perform manual recovery. The rollback is best-effort because it uses the same database backend that reported the failure.
+- `not_needed` — the **clear itself failed atomically** (SQL runs it in one transaction; replica-set MongoDB in a multi-document transaction). Nothing was deleted, so the prior config — including its `api_specs` — is fully intact and no compensating re-import runs. Only standalone (non-replica-set) MongoDB, whose clear deletes collections one-by-one, can leave a partial state and take the `completed`/`incomplete` path on a delete failure.
+
+There is no `unavailable` outcome: when the prior config cannot be snapshotted for rollback, the restore **aborts before any delete** and returns `503` (not `500`) with an `error` explaining that the existing config was NOT deleted. This is the fail-safe path — the destructive delete never runs when a rollback point cannot be captured.
+
+`api_specs_not_restored` / `api_specs_note` appear only when the namespace carried API specs, which config restore and rollback cannot recreate (see above). The payload is still validated before the snapshot and delete phases; validation failures return `400` and leave existing config untouched.
+
+#### Restore aborted — `503`
+
+```json
+{
+  "error": "Restore aborted: the prior configuration could not be snapshotted for rollback (database unavailable). Existing config was NOT deleted; retry once the database is reachable.",
+  "restore_errors": [
+    "failed to snapshot prior config for rollback: pool timed out while waiting for an open connection"
+  ]
+}
+```
 
 ## Restore vs. Batch
 
@@ -198,7 +232,7 @@ Restore requires a database and will return `503 Service Unavailable` in file/DP
 
 ## Recommended Practices
 
-1. **Always backup before restore**: Run `GET /backup` and save the output before running `POST /restore`.
+1. **Keep external backups**: Restore takes an automatic recovery snapshot, but periodic external backups remain necessary for database-wide outages and disaster recovery.
 2. **Validate backup integrity**: Check the `counts` field matches expectations before restoring.
 3. **Use batch for incremental changes**: If you only need to add resources without wiping existing ones, use `POST /batch` instead.
 4. **Automate periodic backups**: Schedule `GET /backup` via cron for disaster recovery snapshots.

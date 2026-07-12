@@ -14,7 +14,7 @@ use tokio::time::timeout;
 use tonic::transport::server::ServerTlsConfig;
 use tonic::transport::{Certificate, Identity, Server};
 
-use ferrum_edge::config::db_loader::IncrementalResult;
+use ferrum_edge::config::db_loader::{IncrementalResult, NamespacedResourceId};
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, DispatchKind, GatewayConfig, LoadBalancerAlgorithm, Proxy,
     Upstream, UpstreamTarget,
@@ -2355,7 +2355,7 @@ async fn test_incremental_result_serde_roundtrip() {
         ],
         removed_proxy_ids: vec!["proxy-old".to_string()],
         added_or_modified_consumers: vec![],
-        removed_consumer_ids: vec!["consumer-gone".to_string()],
+        removed_consumer_ids: vec![NamespacedResourceId::new("ferrum", "consumer-gone")],
         added_or_modified_plugin_configs: vec![],
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
@@ -2372,7 +2372,10 @@ async fn test_incremental_result_serde_roundtrip() {
     assert_eq!(deserialized.added_or_modified_proxies[0].id, "proxy-a");
     assert_eq!(deserialized.added_or_modified_proxies[1].id, "proxy-b");
     assert_eq!(deserialized.removed_proxy_ids, vec!["proxy-old"]);
-    assert_eq!(deserialized.removed_consumer_ids, vec!["consumer-gone"]);
+    assert_eq!(
+        deserialized.removed_consumer_ids,
+        vec![NamespacedResourceId::new("ferrum", "consumer-gone")]
+    );
     assert_eq!(deserialized.removed_upstream_ids, vec!["upstream-x"]);
     assert!(deserialized.added_or_modified_consumers.is_empty());
     assert!(deserialized.added_or_modified_plugin_configs.is_empty());
@@ -3058,7 +3061,7 @@ async fn test_dp_applies_delta_removing_consumer() {
         added_or_modified_proxies: vec![],
         removed_proxy_ids: vec![],
         added_or_modified_consumers: vec![],
-        removed_consumer_ids: vec!["c1".to_string()],
+        removed_consumer_ids: vec![NamespacedResourceId::new("ferrum", "c1")],
         added_or_modified_plugin_configs: vec![],
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
@@ -3217,7 +3220,7 @@ async fn test_dp_applies_delta_with_all_entity_types() {
         added_or_modified_proxies: vec![create_test_proxy("p2", "/new")],
         removed_proxy_ids: vec![],
         added_or_modified_consumers: vec![],
-        removed_consumer_ids: vec!["c1".to_string()],
+        removed_consumer_ids: vec![NamespacedResourceId::new("ferrum", "c1")],
         added_or_modified_plugin_configs: vec![],
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![modified_upstream],

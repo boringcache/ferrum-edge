@@ -771,6 +771,12 @@ async fn list_api_specs_namespace_scoped_and_paginated() {
         .items;
     assert_eq!(all_b.len(), 1, "ns_b must have 1 spec");
 
+    // The authoritative count-only path is namespace scoped and does not need
+    // to fetch or deserialize any API spec summary rows.
+    assert_eq!(store.count_api_specs(ns_a).await.unwrap(), 3);
+    assert_eq!(store.count_api_specs(ns_b).await.unwrap(), 1);
+    assert_eq!(store.count_api_specs("missing").await.unwrap(), 0);
+
     // ns_b spec must not appear in ns_a results.
     let b_id = &all_b[0].id;
     assert!(

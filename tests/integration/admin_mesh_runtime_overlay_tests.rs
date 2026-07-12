@@ -107,6 +107,7 @@ fn build_admin_state(jwt: JwtManager, mesh_runtime_state: Option<MeshRuntimeStat
         admin_audit_enabled: false,
         admin_require_namespace_claim: false,
         startup_ready: None,
+        serving_degraded: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,

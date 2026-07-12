@@ -3330,9 +3330,9 @@ impl GatewayConfig {
     /// consumer, instead of letting `ConsumerIndex` warn-and-overwrite one
     /// identity mapping (which mis-routes JWKS/JWT authentication).
     ///
-    /// First-loaded consumer wins (load order is deterministic: keyset
-    /// pagination by id). Self-collisions (a consumer whose own custom_id
-    /// equals its own id/username) are allowed, matching
+    /// First-loaded consumer wins. Callers must load consumers in a stable
+    /// order (the SQL and Mongo full loaders sort by id). Self-collisions (a
+    /// consumer whose own custom_id equals its own id/username) are allowed, matching
     /// [`Self::validate_unique_consumer_identities`].
     ///
     /// Returns one human-readable message per quarantined consumer; callers

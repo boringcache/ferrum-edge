@@ -77,10 +77,26 @@ impl Default for ApiSpecListFilter {
     }
 }
 
+/// Namespace-qualified key for resources whose IDs are not globally unique.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct NamespacedResourceId {
+    pub namespace: String,
+    pub id: String,
+}
+
+impl NamespacedResourceId {
+    pub fn new(namespace: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            id: id.into(),
+        }
+    }
+}
+
 /// Result of an incremental config poll.
 ///
 /// Contains only resources referenced by durable change-log records newer than
-/// the caller's sequence cursor, plus IDs of resources that were deleted. The
+/// the caller's sequence cursor, plus keys of resources that were deleted. The
 /// polling loop advances `sequence_cursor` only after the delta validates and
 /// applies, so rejected deltas are retried from the same durable point.
 ///
@@ -90,7 +106,7 @@ pub struct IncrementalResult {
     pub added_or_modified_proxies: Vec<Proxy>,
     pub removed_proxy_ids: Vec<String>,
     pub added_or_modified_consumers: Vec<Consumer>,
-    pub removed_consumer_ids: Vec<String>,
+    pub removed_consumer_ids: Vec<NamespacedResourceId>,
     pub added_or_modified_plugin_configs: Vec<PluginConfig>,
     pub removed_plugin_config_ids: Vec<String>,
     pub added_or_modified_upstreams: Vec<Upstream>,
@@ -148,6 +164,48 @@ pub struct DbPoolStatsInner {
     pub size: u32,
     pub idle: u32,
     pub active: u32,
+}
+
+/// Atomicity mode used by a namespace-wide resource clear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteMode {
+    Atomic,
+    NonAtomic,
+}
+
+impl DeleteMode {
+    pub fn is_atomic(self) -> bool {
+        matches!(self, Self::Atomic)
+    }
+}
+
+/// A failed namespace clear, coupled to the exact mode that executed it.
+#[derive(Debug)]
+pub struct DeleteAllResourcesError {
+    mode: DeleteMode,
+    source: anyhow::Error,
+}
+
+impl DeleteAllResourcesError {
+    pub fn new(mode: DeleteMode, source: anyhow::Error) -> Self {
+        Self { mode, source }
+    }
+
+    pub fn mode(&self) -> DeleteMode {
+        self.mode
+    }
+}
+
+impl std::fmt::Display for DeleteAllResourcesError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for DeleteAllResourcesError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
 }
 
 /// Unified database backend trait.
@@ -212,6 +270,29 @@ pub trait DatabaseBackend: Send + Sync {
 
     /// Load the full gateway configuration from the database.
     async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error>;
+
+    /// Load a namespace's resources for a rollback snapshot WITHOUT running the
+    /// semantic validation pipeline that [`load_full_config`](Self::load_full_config)
+    /// applies.
+    ///
+    /// Restore captures the prior state with this before its destructive clear.
+    /// A rollback snapshot only needs the current rows in order to restore them,
+    /// not validation — so an *invalid-but-present* config (exactly what an
+    /// operator runs restore to *repair*) is still captured, keeping rollback
+    /// available during the repair. A genuine connectivity/timeout failure, by
+    /// contrast, surfaces as `Err`, letting the caller ABORT the destructive
+    /// restore instead of wiping a config that was merely transiently
+    /// unreachable.
+    ///
+    /// Reads MUST come from the authoritative primary — a rollback snapshot must
+    /// never be built from a possibly-stale read replica. `api_spec_id` ownership
+    /// tags are cleared (mirroring `load_full_config`): a rollback re-applies the
+    /// config resources as hand-managed, and the `api_specs` rows themselves are
+    /// captured separately by the caller.
+    async fn load_namespace_snapshot(
+        &self,
+        namespace: &str,
+    ) -> Result<GatewayConfig, anyhow::Error>;
 
     // -----------------------------------------------------------------------
     // Incremental polling
@@ -440,7 +521,21 @@ pub trait DatabaseBackend: Send + Sync {
         configs: &[PluginConfig],
     ) -> Result<usize, anyhow::Error>;
     async fn batch_create_upstreams(&self, upstreams: &[Upstream]) -> Result<usize, anyhow::Error>;
-    async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error>;
+    /// Clear all resources in a namespace and report the mode that actually ran.
+    ///
+    /// SQL backends run the clear inside a single transaction, so a failure
+    /// commits nothing and leaves the prior config fully intact. A replica-set
+    /// MongoDB deployment likewise runs it in a transaction. Standalone MongoDB
+    /// has no multi-document transactions, so it deletes collections one-by-one
+    /// and a mid-clear failure can leave a partially-cleared namespace.
+    ///
+    /// Failures carry the same mode captured by the operation before it starts,
+    /// so a MongoDB reconnect cannot make the caller classify the clear against
+    /// a different topology than the one whose branch actually executed.
+    async fn delete_all_resources(
+        &self,
+        namespace: &str,
+    ) -> Result<DeleteMode, DeleteAllResourcesError>;
 
     // -----------------------------------------------------------------------
     // Connection lifecycle (called from polling loops)
@@ -581,6 +676,27 @@ pub trait DatabaseBackend: Send + Sync {
         namespace: &str,
         filter: &ApiSpecListFilter,
     ) -> Result<PaginatedResult<ApiSpec>, anyhow::Error>;
+
+    /// List ApiSpecs using the authoritative primary read path.
+    ///
+    /// Mirrors [`list_namespaces_authoritative`](Self::list_namespaces_authoritative):
+    /// [`list_api_specs`](Self::list_api_specs) may serve from a read replica that
+    /// can lag, but a restore rollback snapshot must enumerate the specs it is
+    /// about to destroy from the primary so the recovery report cannot silently
+    /// omit a spec that only exists on the primary yet. The default delegates to
+    /// `list_api_specs` for backends without a replica split (e.g. MongoDB).
+    async fn list_api_specs_authoritative(
+        &self,
+        namespace: &str,
+        filter: &ApiSpecListFilter,
+    ) -> Result<PaginatedResult<ApiSpec>, anyhow::Error> {
+        self.list_api_specs(namespace, filter).await
+    }
+
+    /// Count ApiSpecs in a namespace using the authoritative primary read path.
+    ///
+    /// This count-only operation must not fetch or deserialize item metadata.
+    async fn count_api_specs(&self, namespace: &str) -> Result<u64, anyhow::Error>;
 
     /// Delete an ApiSpec and all resources it owns.
     ///

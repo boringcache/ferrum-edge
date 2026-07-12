@@ -26,7 +26,9 @@ use crate::config::types::{
     HealthCheckConfig, LoadBalancerAlgorithm, PluginAssociation, PluginConfig, PluginScope, Proxy,
     ResponseBodyMode, RetryConfig, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
-use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
+use crate::config::validation_pipeline::{
+    ValidationAction, ValidationPipeline, collect_rejecting_runtime_config_errors,
+};
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
@@ -43,7 +45,7 @@ use tracing::{debug, error, info, warn};
 // Re-export trait types so existing `use crate::config::db_loader::{IncrementalResult, ...}` works.
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
-    ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult,
+    ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult, NamespacedResourceId,
     PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SortOrder, extract_db_hostname, redact_url,
 };
 
@@ -1330,25 +1332,22 @@ impl DatabaseStore {
                 ValidationAction::Warn,
             )
             .validate_hosts(ValidationAction::Warn)
-            .validate_regex_listen_paths(ValidationAction::FatalStatic(
-                "Database has invalid regex listen_path(s)",
-            ))
-            .validate_listen_path_encodings(ValidationAction::FatalStatic(
-                "Database has listen_path(s) containing encoded slashes",
-            ))
-            .validate_unique_listen_paths(ValidationAction::FatalStatic(
-                "Database has conflicting host+listen_path combinations",
-            ))
-            .validate_stream_proxies(ValidationAction::FatalCount(
-                "Database configuration validation failed: {} stream proxy error(s) found",
-            ))
+            .run()?;
+
+        let validation_errors = collect_rejecting_runtime_config_errors(&config);
+        if !validation_errors.is_empty() {
+            for message in &validation_errors {
+                tracing::error!("Database config rejected — {}", message);
+            }
+            anyhow::bail!(
+                "Database configuration validation failed: {} rejecting error(s) found",
+                validation_errors.len()
+            );
+        }
+
+        ValidationPipeline::new(&mut config)
+            .validate_unique_consumer_identities(ValidationAction::Warn)
             .validate_unique_consumer_credentials(ValidationAction::Warn)
-            .validate_upstream_references(ValidationAction::FatalStatic(
-                "Database has invalid upstream reference(s)",
-            ))
-            .validate_mesh_route_dispatch_references(ValidationAction::FatalStatic(
-                "Database has invalid mesh_route_dispatch upstream reference(s)",
-            ))
             .validate_plugin_configs(&self.backend_allow_ips, ValidationAction::Warn)
             .validate_plugin_file_dependencies(ValidationAction::Warn)
             .run()?;
@@ -1364,6 +1363,91 @@ impl DatabaseStore {
 
         self.check_slow_query("load_full_config", start);
         Ok(config)
+    }
+
+    /// Load a namespace's raw resources for a rollback snapshot WITHOUT the
+    /// fatal validation chain that `load_full_config` runs.
+    ///
+    /// Reads from the PRIMARY pool (`self.pool()`), never the read replica, so a
+    /// rollback snapshot is authoritative. Runs only `normalize_fields()` (parity
+    /// with admission — idempotent, infallible), NOT the regex/listen-path/
+    /// upstream-reference/etc. validators. That is deliberate: restore is the
+    /// tool an operator uses to *repair* an invalid-but-present config, so such a
+    /// config must still snapshot (rollback stays available during the repair).
+    /// Only a genuine DB/connectivity error (or unparseable rows) makes this
+    /// fail, which is exactly the case where the caller must abort rather than
+    /// wipe a config it cannot restore.
+    pub async fn load_namespace_snapshot(
+        &self,
+        namespace: &str,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        let start = Instant::now();
+        let loaded_at = Utc::now();
+        // Authoritative read: the primary pool, not `admin_read_pool()`.
+        let mut tx = self.pool().begin().await?;
+        self.configure_full_load_snapshot(&mut tx).await?;
+
+        let proxies = self.load_proxies_tx(namespace, &mut tx).await?;
+        let consumers = self.load_consumers_tx(namespace, &mut tx).await?;
+        let plugin_configs = self.load_plugin_configs_tx(namespace, &mut tx).await?;
+        let upstreams = self.load_upstreams_tx(namespace, &mut tx).await?;
+        tx.commit().await?;
+
+        let mut config = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            proxies,
+            consumers,
+            plugin_configs,
+            upstreams,
+            loaded_at,
+            known_namespaces: Vec::new(),
+            ..Default::default()
+        };
+
+        // Normalize like admission (hostnames/etc.) but run NO fatal validators:
+        // an invalid-but-present prior config must still snapshot so restore can
+        // repair it while retaining rollback capability.
+        ValidationPipeline::new(&mut config)
+            .normalize_fields()
+            .run()?;
+
+        // Match `load_full_config`: strip the api_spec ownership tag. A rollback
+        // re-applies these resources as hand-managed; the `api_specs` rows are
+        // captured separately by the caller.
+        strip_api_spec_id_from_runtime_config(&mut config);
+
+        self.check_slow_query("load_namespace_snapshot", start);
+        Ok(config)
+    }
+
+    /// List ApiSpecs from the authoritative primary pool (never the read
+    /// replica). Used to enumerate the specs a destructive restore is about to
+    /// remove so the rollback recovery report cannot omit a spec that has not
+    /// yet replicated.
+    pub async fn list_api_specs_authoritative(
+        &self,
+        namespace: &str,
+        filter: &crate::config::db_backend::ApiSpecListFilter,
+    ) -> Result<
+        crate::config::db_backend::PaginatedResult<crate::config::types::ApiSpec>,
+        anyhow::Error,
+    > {
+        let primary_pool = self.pool();
+        self.list_api_specs_from_admin_read(namespace, filter, &primary_pool)
+            .await
+    }
+
+    /// Count ApiSpecs from the authoritative primary pool without hydrating rows.
+    pub async fn count_api_specs(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+        let start = Instant::now();
+        let primary_pool = self.pool();
+        let row = sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM api_specs WHERE namespace = ?"))
+            .bind(namespace)
+            .fetch_one(&primary_pool)
+            .await?;
+        let count: i64 = row.try_get("cnt")?;
+        self.check_slow_query("count_api_specs", start);
+        u64::try_from(count).map_err(|_| anyhow::anyhow!("api_specs count cannot be negative"))
     }
 
     async fn configure_full_load_snapshot(
@@ -3729,6 +3813,10 @@ impl DatabaseStore {
                 .filter(|id| !loaded_consumer_ids.contains(*id))
                 .cloned(),
         );
+        let removed_consumer_ids = removed_consumer_ids
+            .into_iter()
+            .map(|id| NamespacedResourceId::new(namespace, id))
+            .collect();
 
         let mut added_or_modified_plugin_configs = self
             .load_plugin_configs_by_ids(namespace, &plugin_config_upserts)
@@ -6717,6 +6805,13 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::load_full_config(self, namespace).await
     }
 
+    async fn load_namespace_snapshot(
+        &self,
+        namespace: &str,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        DatabaseStore::load_namespace_snapshot(self, namespace).await
+    }
+
     async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error> {
         DatabaseStore::latest_change_sequence(self, namespace).await
     }
@@ -6994,8 +7089,18 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::batch_create_upstreams(self, upstreams).await
     }
 
-    async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error> {
-        DatabaseStore::delete_all_resources(self, namespace).await
+    async fn delete_all_resources(
+        &self,
+        namespace: &str,
+    ) -> Result<
+        crate::config::db_backend::DeleteMode,
+        crate::config::db_backend::DeleteAllResourcesError,
+    > {
+        let mode = crate::config::db_backend::DeleteMode::Atomic;
+        DatabaseStore::delete_all_resources(self, namespace)
+            .await
+            .map(|()| mode)
+            .map_err(|error| crate::config::db_backend::DeleteAllResourcesError::new(mode, error))
     }
 
     async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error> {
@@ -7092,6 +7197,21 @@ impl DatabaseBackend for DatabaseStore {
         anyhow::Error,
     > {
         DatabaseStore::list_api_specs(self, namespace, filter).await
+    }
+
+    async fn list_api_specs_authoritative(
+        &self,
+        namespace: &str,
+        filter: &crate::config::db_backend::ApiSpecListFilter,
+    ) -> Result<
+        crate::config::db_backend::PaginatedResult<crate::config::types::ApiSpec>,
+        anyhow::Error,
+    > {
+        DatabaseStore::list_api_specs_authoritative(self, namespace, filter).await
+    }
+
+    async fn count_api_specs(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+        DatabaseStore::count_api_specs(self, namespace).await
     }
 
     async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {

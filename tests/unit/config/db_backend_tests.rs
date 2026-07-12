@@ -1,6 +1,6 @@
 use chrono::Utc;
 use ferrum_edge::config::db_backend::{
-    IncrementalResult, extract_db_hostname, extract_known_ids, redact_url,
+    IncrementalResult, NamespacedResourceId, extract_db_hostname, extract_known_ids, redact_url,
 };
 use ferrum_edge::config::types::GatewayConfig;
 use std::collections::HashMap;
@@ -484,7 +484,7 @@ fn incremental_result_not_empty_with_removed_consumer() {
         added_or_modified_proxies: vec![],
         removed_proxy_ids: vec![],
         added_or_modified_consumers: vec![],
-        removed_consumer_ids: vec!["c1".to_string()],
+        removed_consumer_ids: vec![NamespacedResourceId::new("ferrum", "c1")],
         added_or_modified_plugin_configs: vec![],
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],

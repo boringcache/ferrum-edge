@@ -82,6 +82,7 @@ fn admin_state_with_audit(db: DatabaseStore, admin_audit_enabled: bool) -> Admin
         admin_audit_enabled,
         admin_require_namespace_claim: false,
         startup_ready: None,
+        serving_degraded: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,

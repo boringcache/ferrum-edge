@@ -13,7 +13,7 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::load_balancer::LoadBalancerCache;
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
-use ferrum_edge::proxy::stream_listener::StreamListenerManager;
+use ferrum_edge::proxy::stream_listener::{StreamListenerDegradation, StreamListenerManager};
 use ferrum_edge::request_epoch::RequestEpochStore;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -308,6 +308,170 @@ async fn test_reconcile_detects_port_conflict() {
 
     // Keep blocker alive until end of test
     drop(blocker);
+}
+
+/// Issue #2117: a non-fatal stream-listener bind failure must be surfaced as
+/// structured state (count + per-resource list) on the admin `/overload`
+/// surface, not only warn-logged. Verifies the failure is recorded and that a
+/// later clean reconcile clears it (the snapshot reflects the latest reconcile).
+#[tokio::test]
+async fn test_bind_failure_surfaced_in_overload_snapshot() {
+    // Occupy a port so the reconcile below cannot bind it.
+    let blocker = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind blocker");
+    let blocked_port = blocker.local_addr().unwrap().port();
+
+    let config = GatewayConfig {
+        proxies: vec![create_stream_proxy(
+            "tcp-conflict",
+            BackendScheme::Tcp,
+            blocked_port,
+        )],
+        ..empty_config()
+    };
+    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+    let manager = create_manager_with_config_arc(config_arc.clone(), &config);
+
+    // Before any reconcile the snapshot is empty.
+    let before = manager.overload_snapshot();
+    assert_eq!(before.bind_failures_total, 0);
+    assert!(before.bind_failures.is_empty());
+
+    let failures = manager.reconcile().await;
+    assert_eq!(
+        failures.len(),
+        1,
+        "expected one bind failure: {:?}",
+        failures
+    );
+
+    // The failure must now be visible in the structured `/overload` snapshot.
+    let snapshot = manager.overload_snapshot();
+    assert_eq!(snapshot.bind_failures_total, 1);
+    assert_eq!(snapshot.bind_failures.len(), 1);
+    assert_eq!(snapshot.bind_failures[0].proxy_id, "tcp-conflict");
+    assert_eq!(snapshot.bind_failures[0].listen_port, blocked_port);
+    assert!(
+        snapshot.bind_failures[0].error.contains("already in use"),
+        "bind failure error should mention port in use: {}",
+        snapshot.bind_failures[0].error
+    );
+    assert!(
+        matches!(
+            snapshot.bind_failures[0].kind,
+            StreamListenerDegradation::BindFailed
+        ),
+        "port-in-use must be classified as BindFailed, got {:?}",
+        snapshot.bind_failures[0].kind
+    );
+
+    // The direct getter mirrors the overload snapshot.
+    let direct = manager.stream_bind_failures();
+    assert_eq!(direct.len(), 1);
+    assert_eq!(direct[0].proxy_id, "tcp-conflict");
+
+    // Free the port and reconcile with an empty config: the stale failure must
+    // clear, proving the snapshot tracks the most recent reconcile.
+    drop(blocker);
+    config_arc.store(Arc::new(empty_config()));
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "expected no failures after clearing conflict"
+    );
+    let cleared = manager.overload_snapshot();
+    assert_eq!(cleared.bind_failures_total, 0);
+    assert!(cleared.bind_failures.is_empty());
+}
+
+#[tokio::test]
+async fn test_shared_sni_bind_failure_reports_every_proxy() {
+    let blocker = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind blocker");
+    let blocked_port = blocker.local_addr().unwrap().port();
+
+    let mut first = create_stream_proxy("sni-api", BackendScheme::Tcp, blocked_port);
+    first.passthrough = true;
+    first.hosts = vec!["api.example.com".to_string()];
+    let mut second = create_stream_proxy("sni-db", BackendScheme::Tcp, blocked_port);
+    second.passthrough = true;
+    second.hosts = vec!["db.example.com".to_string()];
+    let config = GatewayConfig {
+        proxies: vec![first, second],
+        ..empty_config()
+    };
+    let manager = create_manager(config);
+
+    let failures = manager.reconcile().await;
+    assert_eq!(failures.len(), 2, "both shared-SNI proxies are affected");
+
+    let snapshot = manager.overload_snapshot();
+    assert_eq!(snapshot.bind_failures_total, 2);
+    let mut proxy_ids: Vec<&str> = snapshot
+        .bind_failures
+        .iter()
+        .map(|failure| failure.proxy_id.as_str())
+        .collect();
+    proxy_ids.sort_unstable();
+    assert_eq!(proxy_ids, vec!["sni-api", "sni-db"]);
+    assert!(snapshot.bind_failures.iter().all(|failure| {
+        failure.listen_port == blocked_port
+            && matches!(failure.kind, StreamListenerDegradation::BindFailed)
+    }));
+
+    drop(blocker);
+}
+
+/// PR #2128 (finding 3): a configured stream listener that is skipped for a
+/// config reason — here a `frontend_tls` TCP proxy whose rustls `ServerConfig`
+/// has not been loaded, so the listener defers — must be reflected in the
+/// `/overload` snapshot with an honest count and a classifying `kind`, even
+/// though it is NOT a hard bind failure and is therefore not returned to the
+/// startup path. Regression guard: a skip that never pushed to the snapshot
+/// used to show `bind_failures_total == 0`.
+#[tokio::test]
+async fn test_config_skip_surfaced_in_overload_snapshot() {
+    let port = ephemeral_port().await;
+    let mut proxy = create_stream_proxy("tcp-tls-deferred", BackendScheme::Tcp, port);
+    // frontend_tls with no ServerConfig loaded on the manager (created with
+    // `None` frontend TLS) forces the deferral skip path.
+    proxy.frontend_tls = true;
+
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        ..empty_config()
+    };
+    let manager = create_manager(config);
+
+    // A deferred (non-hard) skip must NOT be returned as a startup bind failure —
+    // the startup path would otherwise treat a listener merely waiting on TLS
+    // material as fatal.
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "deferred config-skip must not be returned to the startup path: {:?}",
+        failures
+    );
+
+    // ...but it MUST be visible in the /overload snapshot with an honest count.
+    let snapshot = manager.overload_snapshot();
+    assert_eq!(
+        snapshot.bind_failures_total, 1,
+        "config-skip must be counted, not hidden as bind_failures_total=0"
+    );
+    assert_eq!(snapshot.bind_failures.len(), 1);
+    assert_eq!(snapshot.bind_failures[0].proxy_id, "tcp-tls-deferred");
+    assert_eq!(snapshot.bind_failures[0].listen_port, port);
+    assert!(
+        matches!(
+            snapshot.bind_failures[0].kind,
+            StreamListenerDegradation::FrontendTlsDeferred
+        ),
+        "deferred frontend TLS listener must be classified as FrontendTlsDeferred, got {:?}",
+        snapshot.bind_failures[0].kind
+    );
 }
 
 #[tokio::test]

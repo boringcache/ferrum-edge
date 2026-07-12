@@ -894,7 +894,29 @@ mTLS modes:
 | `permissive` (default) | Accept both mTLS and plaintext. |
 | `disable` | Disable mTLS. Accept plaintext only. |
 
-Per-port overrides allow mixed-mode operation on the same workload:
+> **Per-app-port mTLS (`portLevelMtls`) is NOT currently enforced.** Istio
+> `spec.portLevelMtls` keys are workload **app/container** ports (e.g. `8080`,
+> `8081`), but the inbound mesh listener terminates mTLS on a single **transport**
+> port (Sidecar `15006` / Ambient `15008` / EgressGateway `15090`). A single
+> `rustls::ServerConfig` per listener cannot vary STRICT/PERMISSIVE per app port
+> without pre-handshake `SO_ORIGINAL_DST` demux, so the runtime resolves the
+> **one mode for the whole listener**. Normally that is the policy's top-level
+> `mtls_mode`; if an override key numerically equals the topology's transport
+> port, that override instead determines the whole listener's mode. It still is
+> not enforced only for the intended app port. This is surfaced — not silently
+> discarded: the K8s translator emits a warning, and the Istio CRD status records a
+> `status.ferrum.translation.deferred_fields` entry, so `FerrumAccepted=True`
+> does **not** imply per-port enforcement. **This means a top-level `permissive`
+> with `{8080: strict}` still accepts plaintext on `8080` (fail-open), and a
+> top-level `strict` with `{8081: permissive}` still rejects plaintext on `8081`
+> (fail-closed).** Unless an override key collides with the transport port, set
+> the workload's top-level `mtls_mode` to the posture you need for the whole
+> listener. Full per-app-port enforcement is tracked as a
+> separate architectural item.
+
+The following `portLevelMtls` example is **accepted but its per-port intent is
+deferred** — the whole listener follows the top-level `strict` mode, and the
+`8081: permissive` override is reported in status but not applied:
 
 ```yaml
 name: "mixed-mode"
@@ -904,14 +926,14 @@ selector:
     app: my-service
 mtls_mode: strict
 port_overrides:
-  8081: permissive   # Health check port accepts plaintext
+  8081: permissive   # DEFERRED: app-port override not enforced; whole listener stays strict
 ```
 
 Selector-less `PeerAuthentication` applies to all workloads in its namespace (or mesh-wide if namespace-scoped).
 
 ### Resolution and listener wiring
 
-The effective mTLS mode for the inbound TLS-terminating listener is resolved at startup from the initial mesh slice via `resolve_effective_mtls_mode()`. Scope precedence (highest wins): `WorkloadSelector` > `Namespace` > `MeshWide`. Among same-tier matches the tie is resolved **fail-secure**: the more-restrictive effective mode for the port wins (`Strict` > `Permissive` > `Disable`). This is both deterministic (so the posture cannot flap across pods or reconciles) and a genuine trust boundary — because the winner is decided by mode rather than by the policy's namespace string or name, a tenant-controlled policy cannot downgrade inbound mTLS below a trusted same-tier policy by choosing a low-sorting namespace or policy name, and a customized `FERRUM_K8S_ISTIO_ROOT_NAMESPACE` that sorts after tenant namespaces is equally safe. Two conflicting same-tier `PeerAuthentication`s are still an operator misconfiguration; only when their effective modes are identical does the resolver fall back to the value-neutral `(namespace, name)` ordering to pick a canonical winner (this differs from the sibling `ProxyConfig` resolver, which has no security posture to protect and tiebreaks by `name`). Port-level overrides within a policy are applied before this comparison, so the fail-secure choice reflects the mode each policy actually yields for the port. Port-level overrides within the winning policy then take precedence over its top-level `mtls_mode`.
+The effective mTLS mode for the inbound TLS-terminating listener is resolved at startup from the initial mesh slice via `resolve_effective_mtls_mode()`. Scope precedence (highest wins): `WorkloadSelector` > `Namespace` > `MeshWide`. Among same-tier matches the tie is resolved **fail-secure**: the more-restrictive effective mode for the port wins (`Strict` > `Permissive` > `Disable`). This is both deterministic (so the posture cannot flap across pods or reconciles) and a genuine trust boundary — because the winner is decided by mode rather than by the policy's namespace string or name, a tenant-controlled policy cannot downgrade inbound mTLS below a trusted same-tier policy by choosing a low-sorting namespace or policy name, and a customized `FERRUM_K8S_ISTIO_ROOT_NAMESPACE` that sorts after tenant namespaces is equally safe. Two conflicting same-tier `PeerAuthentication`s are still an operator misconfiguration; only when their effective modes are identical does the resolver fall back to the value-neutral `(namespace, name)` ordering to pick a canonical winner (this differs from the sibling `ProxyConfig` resolver, which has no security posture to protect and tiebreaks by `name`). Port-level overrides within a policy are applied before this comparison, so the fail-secure choice reflects the mode each policy actually yields for the port. Port-level overrides within the winning policy then take precedence over its top-level `mtls_mode` — but only when keyed on the transport resolution port; Istio `portLevelMtls` app-port keys never match and are deferred, so in that (common) case the comparison and the wired listener both use the policy's top-level mode (see the per-app-port box above and the resolution-port table below).
 
 The resulting `MeshClientAuth` is plumbed into the inbound TLS acceptor:
 
@@ -923,9 +945,9 @@ The resulting `MeshClientAuth` is plumbed into the inbound TLS acceptor:
 
 **SPIFFE peer trust-domain verification**: when gateway SVID material is configured (all three of `FERRUM_GATEWAY_SVID_CERT_PATH` / `FERRUM_GATEWAY_SVID_KEY_PATH` / `FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH`), the inbound mTLS / HBONE listener verifies each peer certificate's chain **and** that the peer's SPIFFE URI-SAN trust domain matches the gateway SVID's local trust bundle or one of the slice's federated bundles. This closes the gap where a peer cert that merely chained to the configured client CA was admitted regardless of its SPIFFE trust domain. STRICT requires + validates a peer cert; PERMISSIVE still admits peers that present no cert but trust-domain-validates any cert that is offered (so PERMISSIVE records mTLS identity when present). Without gateway SVID material, the listener keeps the prior chain-only verification against `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`. In PERMISSIVE specifically, the listener requests a client certificate whenever **either** trust anchor exists (the SVID verifier is preferred, otherwise the operator client CA bundle) so an offered cert is verified and its identity recorded; only when **neither** anchor is configured does PERMISSIVE skip the certificate request entirely — and in that fully-degraded case Ferrum emits a single startup warning that inbound peer identity cannot be verified or recorded, rather than silently treating authenticated peers as anonymous. (The **EgressGateway** topology is the exception to PERMISSIVE-optional: there a present trust anchor escalates PERMISSIVE to `Required`, and a missing anchor fails the listener closed — see the EgressGateway requires-client-certificates note above.) The HBONE baggage `source.principal` trust-gate now rests on this verified peer identity. When `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, the lock-free SVID bundle slot is re-published on slice apply so federated trust-domain additions take effect without a listener restart; file-backed and CA-backed gateway SVID rotations also republish the inbound peer-verifier bundle from the newest local roots plus the last accepted federated overlay. Slice roots for the gateway SVID's own trust domain are additive with the freshly loaded SVID local roots, which lets the control plane stage same-trust-domain CA-root rotation without replacing the SVID source's current root set.
 
-The port used for `port_overrides` lookup follows the topology's TLS-terminating listener (see `MeshRuntimeConfig::listener_plan()`):
+The port used for `port_overrides` lookup is the single **transport** port the topology's TLS-terminating listener binds (see `MeshRuntimeConfig::listener_plan()`) — **not** the workload's app/container port. An override is honored **only** when its key equals this transport port; Istio `portLevelMtls` entries are keyed on app ports (`8080`, `8081`, …), so they never match the resolution port and are **deferred, not enforced** (see the box above). The "override key example" column below therefore shows the transport-port key that would take effect, which is an internal/native-config surface — the Istio operator-facing `portLevelMtls` field cannot produce it:
 
-| Topology | Resolution port (default) | Override key example |
+| Topology | Resolution port (default) | Transport-port override key that takes effect |
 |---|---|---|
 | `Sidecar` | `inbound_listen_addr` (15006) | `port_overrides: {15006: strict}` |
 | `Ambient` | `hbone_listen_addr` (15008) | `port_overrides: {15008: strict}` |
@@ -933,6 +955,8 @@ The port used for `port_overrides` lookup follows the topology's TLS-terminating
 | `ServiceWaypoint` | `hbone_listen_addr` (15008) | `port_overrides: {15008: strict}` |
 | `EgressGateway` | `egress_listen_addr` (15090) | `port_overrides: {15090: strict}` |
 | `EastWestGateway` | n/a (SNI passthrough, no termination) | — |
+
+At startup Ferrum emits a structured `warn!` for every applicable PeerAuthentication carrying `port_overrides` keyed on a port other than the transport resolution port, across all config sources (native `MeshSubscribe`, xDS, file), so the deferred intent is visible even where no Istio CRD status is written.
 
 By default, the resolved mode is captured **once at startup** from the first valid slice. Subsequent `PeerAuthentication` changes pushed via the control plane update the in-memory slice and are honored by other plugin paths (e.g. `mesh_authz`, plugin chains), but the inbound TLS `ServerConfig` is not rebuilt.
 
