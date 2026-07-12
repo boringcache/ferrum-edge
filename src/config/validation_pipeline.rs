@@ -6,7 +6,6 @@ pub(crate) enum ValidationAction<'a> {
     Collect,
     Warn,
     FatalCount(&'a str),
-    FatalStatic(&'a str),
 }
 
 enum ValidationStep<'a> {
@@ -249,7 +248,7 @@ impl<'a> ValidationPipeline<'a> {
     /// Execute each validation step in insertion order.
     ///
     /// `Collect` steps append into the returned vector until a fatal action
-    /// (`FatalCount` or `FatalStatic`) fires. At that point the pipeline bails
+    /// (`FatalCount`) fires. At that point the pipeline bails
     /// immediately and any previously collected warnings/errors are discarded in
     /// favor of the fatal summary, matching the original call-site behavior.
     pub(crate) fn run(self) -> Result<Vec<String>, anyhow::Error> {
@@ -420,12 +419,6 @@ fn handle_validation_errors(
             let summary = template.replacen("{}", &errors.len().to_string(), 1);
             anyhow::bail!(summary);
         }
-        ValidationAction::FatalStatic(summary) => {
-            for message in &errors {
-                error!("{}", message);
-            }
-            anyhow::bail!(summary.to_string());
-        }
     }
 }
 
@@ -480,21 +473,6 @@ mod tests {
     }
 
     #[test]
-    fn fatal_static_action_returns_verbatim_summary() {
-        let mut collected = Vec::new();
-
-        let err = handle_validation_errors(
-            ValidationAction::FatalStatic("Static summary"),
-            vec!["a".to_string()],
-            &mut collected,
-        )
-        .unwrap_err();
-
-        assert_eq!(err.to_string(), "Static summary");
-        assert!(collected.is_empty());
-    }
-
-    #[test]
     fn empty_error_list_is_a_noop_for_all_actions() {
         let mut collected = vec!["existing".to_string()];
 
@@ -506,13 +484,6 @@ mod tests {
             &mut collected,
         )
         .unwrap();
-        handle_validation_errors(
-            ValidationAction::FatalStatic("unused"),
-            Vec::new(),
-            &mut collected,
-        )
-        .unwrap();
-
         assert_eq!(collected, vec!["existing"]);
     }
 

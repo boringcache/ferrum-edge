@@ -392,15 +392,16 @@ async fn load_full_config_multi(
 ) -> Result<GatewayConfig, anyhow::Error> {
     if namespaces.len() <= 1 {
         let ns = namespaces.first().map(|s| s.as_str()).unwrap_or("ferrum");
-        return db.load_full_config(ns).await;
+        let config = db.load_full_config(ns).await?;
+        return prepare_cp_full_snapshot(config);
     }
 
     // First namespace seeds the loaded_at / version / trust_bundles fields,
     // then we extend with the remaining namespaces' resource vectors.
     let first = namespaces.first().expect("namespaces is non-empty");
-    let mut combined = db.load_full_config(first).await?;
+    let mut combined = prepare_cp_full_snapshot(db.load_full_config(first).await?)?;
     for ns in namespaces.iter().skip(1) {
-        let mut next = db.load_full_config(ns).await?;
+        let mut next = prepare_cp_full_snapshot(db.load_full_config(ns).await?)?;
         combined.proxies.append(&mut next.proxies);
         combined.consumers.append(&mut next.consumers);
         combined.plugin_configs.append(&mut next.plugin_configs);
@@ -426,11 +427,15 @@ async fn load_full_config_multi_with_sequence(
     for ns in namespaces {
         sequences.insert(ns.clone(), db.latest_change_sequence(ns).await?);
     }
-    let mut config = load_full_config_multi(db, namespaces).await?;
+    let config = load_full_config_multi(db, namespaces).await?;
+    Ok((config, sequences))
+}
+
+fn prepare_cp_full_snapshot(mut config: GatewayConfig) -> Result<GatewayConfig, anyhow::Error> {
     config.normalize_fields();
     config.resolve_upstream_tls();
     reject_invalid_cp_full_snapshot(&config)?;
-    Ok((config, sequences))
+    Ok(config)
 }
 
 fn reject_invalid_cp_full_snapshot(config: &GatewayConfig) -> Result<(), anyhow::Error> {
@@ -1916,6 +1921,43 @@ mod tests {
                 .contains("CP full configuration validation failed"),
             "unexpected error: {error}"
         );
+    }
+
+    fn make_stream_proxy(id: &str, namespace: &str, listen_port: u16) -> Proxy {
+        let mut proxy = make_proxy(id);
+        proxy.namespace = namespace.to_string();
+        proxy.backend_scheme = Some(BackendScheme::Tcp);
+        proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
+        proxy.listen_path = None;
+        proxy.listen_port = Some(listen_port);
+        proxy
+    }
+
+    #[test]
+    fn cp_full_snapshot_allows_same_stream_port_in_different_namespaces() {
+        for (id, namespace) in [("tcp-a", "tenant-a"), ("tcp-b", "tenant-b")] {
+            let config = GatewayConfig {
+                proxies: vec![make_stream_proxy(id, namespace, 15432)],
+                ..Default::default()
+            };
+
+            prepare_cp_full_snapshot(config)
+                .expect("each namespace slice must validate independently");
+        }
+    }
+
+    #[test]
+    fn cp_full_snapshot_rejects_same_stream_port_in_one_namespace() {
+        let config = GatewayConfig {
+            proxies: vec![
+                make_stream_proxy("tcp-a", "tenant-a", 15432),
+                make_stream_proxy("tcp-b", "tenant-a", 15432),
+            ],
+            ..Default::default()
+        };
+
+        prepare_cp_full_snapshot(config)
+            .expect_err("same-namespace stream listen-port conflicts must be rejected");
     }
 
     #[test]
