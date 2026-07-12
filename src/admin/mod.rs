@@ -2581,6 +2581,60 @@ fn hash_payload_consumers(consumers: &mut [Consumer], errors: &mut Vec<String>) 
     }
 }
 
+fn restore_payload_from_config(config: GatewayConfig) -> RestorePayload {
+    RestorePayload {
+        version: config.version,
+        proxies: config.proxies,
+        consumers: config.consumers,
+        plugin_configs: config.plugin_configs,
+        upstreams: config.upstreams,
+    }
+}
+
+/// Snapshot of a namespace captured before a destructive restore so a failed
+/// import — or a failed clear — can be compensated back to the prior state on
+/// every database backend.
+struct RestoreSnapshot {
+    /// Prior config resources (proxies/consumers/plugin_configs/upstreams).
+    payload: RestorePayload,
+    /// Authoritative count of `api_specs` in the namespace at snapshot time.
+    api_specs_total: usize,
+}
+
+/// Capture an authoritative snapshot of `namespace` for restore rollback.
+///
+/// Returns `Err` ONLY when the prior state cannot be read from the primary due
+/// to a genuine database/connectivity failure. It does NOT fail on an
+/// invalid-but-present config: the snapshot loads raw rows without the fatal
+/// validation pipeline (see [`DatabaseBackend::load_namespace_snapshot`]), so a
+/// namespace an operator runs restore to *repair* still snapshots and keeps
+/// rollback available. The caller treats an `Err` here as fail-safe: it aborts
+/// the destructive restore rather than wiping a config it cannot roll back to.
+///
+/// Both the config resources and the `api_specs` count are read from the
+/// PRIMARY (never a lagging read replica) so the recovery report is authoritative.
+async fn snapshot_namespace_for_rollback(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+) -> Result<RestoreSnapshot, anyhow::Error> {
+    // Non-validating raw load from the primary. Invalid-but-present config still
+    // snapshots; a real DB error propagates so the caller aborts.
+    let config = db.load_namespace_snapshot(namespace).await?;
+    let payload = restore_payload_from_config(config);
+
+    // `api_specs` are not part of `GatewayConfig`. Capture only their
+    // authoritative count from the PRIMARY: recovery requires the original
+    // documents to be re-submitted, and enumerating identities with OFFSET
+    // pagination adds no recovery value while introducing ordering hazards.
+    let api_specs_total =
+        usize::try_from(db.count_api_specs(namespace).await?).unwrap_or(usize::MAX);
+
+    Ok(RestoreSnapshot {
+        payload,
+        api_specs_total,
+    })
+}
+
 #[derive(Default)]
 struct PersistCounts {
     proxies: usize,
@@ -2801,6 +2855,145 @@ async fn persist_payload_resources(
     }
 
     (counts, errors)
+}
+
+async fn rollback_failed_restore(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    snapshot: &RestorePayload,
+) -> Result<(), Vec<String>> {
+    if let Err(error) = db.delete_all_resources(namespace).await {
+        return Err(vec![format!(
+            "failed to clear partially imported config: {}",
+            error
+        )]);
+    }
+
+    let (_, errors) = persist_payload_resources(db, snapshot, false).await;
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Finalize a failed restore. Attempts a best-effort rollback to the pre-restore
+/// snapshot, records the audit event, and builds the operator-facing `500`
+/// response. Shared by the delete-failure and import-failure paths so both roll
+/// back identically. The caller always holds a snapshot here — restore aborts
+/// with `503` before touching durable state when one cannot be captured — so
+/// there is no "rollback unavailable" branch.
+async fn finish_failed_restore(
+    state: &AdminState,
+    db: Arc<dyn DatabaseBackend>,
+    actor: &AuditActor,
+    namespace: &str,
+    restore_errors: Vec<String>,
+    snapshot: &RestoreSnapshot,
+) -> Response<Full<Bytes>> {
+    let (rollback_status, rollback_errors) =
+        match rollback_failed_restore(db.as_ref(), namespace, &snapshot.payload).await {
+            Ok(()) => ("completed", None),
+            Err(errors) => {
+                error!(
+                    "Restore: rollback failed for namespace '{}': {}",
+                    namespace,
+                    errors.join("; ")
+                );
+                ("incomplete", Some(errors))
+            }
+        };
+
+    let event = audit::AuditEvent::new(
+        actor,
+        "restore",
+        "gateway_config",
+        namespace,
+        namespace,
+        audit::update_diff(
+            json!({"replaced_namespace": namespace}),
+            json!({"rollback": rollback_status}),
+        ),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+        log_audit_enqueue_failure(&error);
+    }
+
+    let error_message = match rollback_status {
+        "completed" => "Restore failed; restore rolled back and prior config retained",
+        // "incomplete"
+        _ => "Restore failed and rollback of prior config was incomplete; manual recovery required",
+    };
+
+    let mut response = json!({
+        "error": error_message,
+        "restore_errors": restore_errors,
+        "rollback": rollback_status,
+    });
+    if let Some(rollback_errors) = rollback_errors {
+        response["rollback_errors"] = json!(rollback_errors);
+    }
+
+    // A config rollback restores proxies/consumers/plugin_configs/upstreams but
+    // NOT `api_specs` (admin-only metadata outside `GatewayConfig`). When the
+    // prior namespace carried specs, give the operator a genuinely usable
+    // recovery path: report the authoritative number removed and direct the
+    // operator to list the currently stored specs and re-submit the originals.
+    if snapshot.api_specs_total > 0 {
+        // Preserve the authoritative affected count.
+        let total = snapshot.api_specs_total;
+        warn!(
+            namespace = %namespace,
+            api_spec_count = total,
+            "Restore: rollback restored config resources but NOT api_specs; operator must re-submit affected API specs"
+        );
+        response["api_specs_not_restored"] = json!(total);
+        let note = format!(
+            "{total} API spec(s) were removed and are not part of config restore or rollback. Re-submit the original documents via POST /api-specs; list specs currently stored in the namespace with GET /api-specs."
+        );
+        response["api_specs_note"] = json!(note);
+    }
+
+    json_response(StatusCode::INTERNAL_SERVER_ERROR, &response)
+}
+
+/// Finalize a restore whose atomic clear (`delete_all_resources`) failed. On an
+/// atomic backend (SQL transaction, replica-set MongoDB) a clear failure commits
+/// NOTHING, so the prior config — including `api_specs` — is fully intact. No
+/// rollback is needed or safe here: re-running the clear could delete admin-only
+/// `api_specs` or duplicate resources if the original error was transient. This
+/// records the audit event and returns a `500` stating the prior config was
+/// retained, without any compensating delete/import.
+async fn finish_atomic_delete_failure(
+    state: &AdminState,
+    db: Arc<dyn DatabaseBackend>,
+    actor: &AuditActor,
+    namespace: &str,
+    delete_error: String,
+) -> Response<Full<Bytes>> {
+    let event = audit::AuditEvent::new(
+        actor,
+        "restore",
+        "gateway_config",
+        namespace,
+        namespace,
+        audit::update_diff(
+            json!({"replaced_namespace": namespace}),
+            json!({"rollback": "not_needed"}),
+        ),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+        log_audit_enqueue_failure(&error);
+    }
+
+    json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &json!({
+            "error": "Restore failed while clearing existing config; the clear is atomic, so the prior config was retained",
+            "restore_errors": [format!("failed to clear existing config: {}", delete_error)],
+            "rollback": "not_needed",
+        }),
+    )
 }
 
 /// Allowed credential types for consumer authentication plugins.
@@ -4188,13 +4381,82 @@ async fn handle_restore(
         }
     }
 
-    // Phase 3: Delete all existing resources in the namespace (safe: payload is validated)
-    if let Err(e) = db.delete_all_resources(namespace).await {
-        error!("Restore: failed to delete existing resources: {}", e);
+    // Complete all fallible payload preparation before changing durable state.
+    let mut payload = payload;
+    let mut preparation_errors = Vec::new();
+    normalize_restore_payload_timestamps(&mut payload, Utc::now());
+    apply_payload_namespace(&mut payload, namespace);
+    hash_payload_consumers(&mut payload.consumers, &mut preparation_errors);
+    if !preparation_errors.is_empty() {
         return Ok(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({"error": format!("Failed to clear existing config: {}", e)}),
+            &json!({
+                "error": "Restore preparation failed; existing config was not changed and prior config retained",
+                "restore_errors": preparation_errors,
+            }),
         ));
+    }
+
+    // Snapshot the namespace before deletion so a failure in any independently
+    // committed import chunk (or a partial clear) can be compensated on every
+    // database backend. The snapshot loads RAW rows from the primary without the
+    // fatal validation pipeline, so an invalid-but-present config (exactly what
+    // restore is used to repair) still snapshots and keeps rollback available.
+    //
+    // Fail-safe: if the snapshot cannot be taken at all, that means a genuine
+    // database/connectivity failure — NOT an unloadable-but-present config. We
+    // must NOT proceed to delete, or a transiently-unreachable-yet-valid config
+    // would be wiped with no way to roll back. Abort with 503 and leave the
+    // prior config untouched.
+    let snapshot = match snapshot_namespace_for_rollback(db.as_ref(), namespace).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            error!(
+                namespace = %namespace,
+                error = %error,
+                "Restore: aborting — prior config could not be snapshotted for rollback; existing config NOT deleted"
+            );
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": "Restore aborted: the prior configuration could not be snapshotted for rollback (database unavailable). Existing config was NOT deleted; retry once the database is reachable.",
+                    "restore_errors": [format!("failed to snapshot prior config for rollback: {}", error)],
+                }),
+            ));
+        }
+    };
+
+    // Phase 3: Delete all existing resources in the namespace (safe: payload is
+    // validated and the prior state has been snapshotted from the primary above).
+    if let Err(e) = db.delete_all_resources(namespace).await {
+        error!("Restore: failed to delete existing resources: {}", e);
+        if e.mode().is_atomic() {
+            // Atomic clear (SQL transaction, replica-set Mongo): a failure commits
+            // NOTHING, so the prior config is fully intact. Do NOT roll back — a
+            // second clear + re-import would be unnecessary and could delete
+            // admin-only `api_specs` or duplicate resources if the error was
+            // transient. Return 500 and retain the prior config as-is.
+            return Ok(finish_atomic_delete_failure(
+                state,
+                db.clone(),
+                actor,
+                namespace,
+                e.to_string(),
+            )
+            .await);
+        }
+        // Non-atomic clear (standalone Mongo deletes collections one-by-one) can
+        // leave the namespace in a mixed state, so attempt the same best-effort
+        // rollback the import-failure path uses.
+        return Ok(finish_failed_restore(
+            state,
+            db.clone(),
+            actor,
+            namespace,
+            vec![format!("failed to clear existing config: {}", e)],
+            &snapshot,
+        )
+        .await);
     }
 
     info!("Restore: cleared existing config, beginning import");
@@ -4202,21 +4464,14 @@ async fn handle_restore(
     // Phase 3: Import resources in dependency order.
     // Each batch_create_* method internally chunks into 1,000-record
     // transactions to keep WAL/redo size bounded.
-    let mut payload = payload;
-    let mut errors = Vec::new();
-    normalize_restore_payload_timestamps(&mut payload, Utc::now());
-    apply_payload_namespace(&mut payload, namespace);
-    hash_payload_consumers(&mut payload.consumers, &mut errors);
-    let (created, mut persist_errors) =
-        persist_payload_resources(db.as_ref(), &payload, false).await;
-    errors.append(&mut persist_errors);
+    let (created, errors) = persist_payload_resources(db.as_ref(), &payload, false).await;
 
     info!(
         "Restore: imported {} proxies, {} consumers, {} plugin_configs, {} upstreams",
         created.proxies, created.consumers, created.plugin_configs, created.upstreams
     );
 
-    let mut response = json!({
+    let response = json!({
         "restored": {
             "proxies": created.proxies,
             "consumers": created.consumers,
@@ -4226,25 +4481,14 @@ async fn handle_restore(
     });
 
     if !errors.is_empty() {
-        response["errors"] = json!(errors);
-        // Restore always wipes the namespace before re-inserting (Phase 3 above),
-        // so even a zero-success-count restore must produce an audit row — the
-        // namespace state has already changed regardless of which inserts failed.
-        let event = audit::AuditEvent::new(
-            actor,
-            "restore",
-            "gateway_config",
+        error!(
+            "Restore: import failed; rolling back namespace '{}': {}",
             namespace,
-            namespace,
-            audit::update_diff(
-                json!({"replaced_namespace": namespace}),
-                response["restored"].clone(),
-            ),
+            errors.join("; ")
         );
-        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-            log_audit_enqueue_failure(&error);
-        }
-        return Ok(json_response(StatusCode::MULTI_STATUS, &response));
+        return Ok(
+            finish_failed_restore(state, db.clone(), actor, namespace, errors, &snapshot).await,
+        );
     }
 
     let event = audit::AuditEvent::new(

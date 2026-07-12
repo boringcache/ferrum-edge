@@ -3191,9 +3191,22 @@ paths:
       operationId: restoreConfig
       summary: Replace all configuration from a backup
       description: |
-        **Destructive operation** — deletes ALL existing resources and imports
-        the provided configuration. Requires `?confirm=true` query parameter
-        to prevent accidental invocation.
+        **Replacement operation** — snapshots the current namespace, deletes
+        all existing resources, and imports the provided configuration. If any
+        import (or the delete) step fails, Ferrum clears the partial state and
+        reapplies the snapshot. Requires `?confirm=true` query parameter to
+        prevent accidental invocation.
+
+        The recovery snapshot uses a **non-validating raw load** from the
+        primary, so an already-invalid-but-present namespace (the case an
+        operator runs restore to *repair*) still snapshots and keeps rollback
+        available. If the snapshot cannot be taken at all — a genuine
+        database/connectivity failure — the restore **aborts with `503` before
+        deleting anything**, so a transiently-unreachable-yet-valid config is
+        never wiped. `api_specs` are admin-only metadata outside the config and
+        are NOT restored by rollback; a failed restore reports the authoritative
+        total number that must be re-submitted via `POST /api-specs` (list the
+        namespace's current specs with `GET /api-specs`).
 
         Accepts the same JSON format produced by `GET /backup`. Resources are
         imported in dependency order (consumers & upstreams first, then proxies,
@@ -3237,19 +3250,54 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RestoreResponse"
-        "207":
-          description: Partial success — some resource types failed during import
+        "500":
+          description: >-
+            Restore failed (import, delete, or preparation). The prior
+            configuration was reapplied, or the response warns that the
+            best-effort rollback was incomplete.
           content:
             application/json:
               schema:
-                allOf:
-                  - $ref: "#/components/schemas/RestoreResponse"
-                  - type: object
-                    properties:
-                      errors:
-                        type: array
-                        items:
-                          type: string
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                  restore_errors:
+                    type: array
+                    items:
+                      type: string
+                    description: Persistence or preparation errors that caused the restore to fail
+                  rollback:
+                    type: string
+                    enum: [completed, incomplete, not_needed]
+                    description: >-
+                      Outcome of the best-effort rollback. `completed` — prior
+                      config reapplied; `incomplete` — reapply failed (see
+                      `rollback_errors`); `not_needed` — the clear failed
+                      atomically (SQL / replica-set MongoDB), so nothing was
+                      deleted and the prior config was retained without any
+                      compensating re-import. (There is no `unavailable`: a
+                      snapshot that cannot be taken aborts the restore with `503`
+                      BEFORE any delete — see the `503` response.)
+                  rollback_errors:
+                    type: array
+                    items:
+                      type: string
+                    description: Present only when reapplying the prior configuration was incomplete
+                  api_specs_not_restored:
+                    type: integer
+                    description: >-
+                      Authoritative count of API specs present before the restore
+                      that a config rollback cannot restore. Present only when the
+                      namespace carried specs.
+                  api_specs_note:
+                    type: string
+                    description: >-
+                      Operator guidance to recover the affected API specs
+                      (re-submit original documents via POST /api-specs and list
+                      current specs with GET /api-specs). Present only when
+                      `api_specs_not_restored` is set.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -3259,7 +3307,24 @@ paths:
         "413":
           description: Request body too large (default max 100 MiB, configurable via FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB)
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          description: >-
+            Restore aborted because the prior configuration could not be
+            snapshotted for rollback (database/connectivity failure). Existing
+            config was NOT deleted; retry once the database is reachable. Also
+            returned when the admin API is otherwise unavailable.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                  restore_errors:
+                    type: array
+                    items:
+                      type: string
+                    description: The snapshot/connectivity error that caused the abort
 
   # ── Proxies ─────────────────────────────────────────────────────────
   /proxies:
@@ -9161,12 +9226,6 @@ components:
             upstreams:
               type: integer
               description: Number of upstreams restored
-        errors:
-          type: array
-          items:
-            type: string
-          description: Present only on 207 Multi-Status; lists per-type error messages
-
     # ── Shared: Transaction-Log Schema Customization ──────────────────
     # Shape of the `schema:` block (and the entries inside
     # `transaction_log_schema.schemas`). See docs/log_schema.md for the
