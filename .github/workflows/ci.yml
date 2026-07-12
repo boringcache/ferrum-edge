@@ -2096,6 +2096,7 @@ jobs:
       - build-ebpf-userspace
       - ebpf-live
       - netns-capture-live
+      - two-cluster-mesh-live
       - performance-regression
       - build-binaries
     runs-on: ubuntu-latest
@@ -2172,6 +2173,7 @@ jobs:
           add_row "eBPF userspace loader" "${{ needs.build-ebpf-userspace.result }}"
           add_row "eBPF live-kernel" "${{ needs.ebpf-live.result }}"
           add_row "Netns capture live" "${{ needs.netns-capture-live.result }}"
+          add_row "Two-cluster mesh live" "${{ needs.two-cluster-mesh-live.result }}"
           add_row "Performance regression" "${{ needs.performance-regression.result }}"
           add_row "Cross-platform binaries" "${{ needs.build-binaries.result }}"
 
@@ -2204,6 +2206,7 @@ jobs:
           require_success "eBPF userspace loader" "${{ needs.build-ebpf-userspace.result }}"
           require_live_gate "eBPF live-kernel" "${{ needs.ebpf-live.result }}"
           require_live_gate "Netns capture live" "${{ needs.netns-capture-live.result }}"
+          require_live_gate "Two-cluster mesh live" "${{ needs.two-cluster-mesh-live.result }}"
           require_success "Performance regression" "${{ needs.performance-regression.result }}"
           require_success "Cross-platform binaries" "${{ needs.build-binaries.result }}"
 
@@ -2284,6 +2287,7 @@ jobs:
               src/router_cache.rs|src/socket_opts.rs|\
               src/service_discovery/*|src/service_discovery/**|\
               tests/functional/functional_mesh_mode_test.rs|\
+              tests/functional/fixtures/*|tests/functional/fixtures/**|\
               tests/k8s/lib/*|tests/k8s/lib/**|tests/k8s/node_waypoint_ebpf_live/*|tests/k8s/node_waypoint_ebpf_live/**|\
               tests/*capture*|tests/*ebpf*|tests/*netns*|tests/*node_waypoint*)
                 changed=true
@@ -2621,6 +2625,96 @@ jobs:
           fi
           if ! grep -Eq '^test result: ok\. 2 passed; 0 failed;' <<<"$output"; then
             echo "::error::expected exactly 2 full source-capture live tests to pass"
+            exit 1
+          fi
+        env:
+          RUST_BACKTRACE: 1
+
+  two-cluster-mesh-live:
+    name: Two-Cluster Mesh Live Datapath
+    needs: detect-ebpf-live-changes
+    # Shares the mesh/netns-sensitive path detector with the source-capture
+    # lane. The gate is intentionally separate because it downloads two real
+    # SPIRE control planes and runs the full cross-cluster protocol matrix.
+    if: (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && needs.detect-ebpf-live-changes.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-two-cluster-mesh-live"
+
+      - name: Install pinned SPIRE server and agent
+        env:
+          SPIRE_VERSION: 1.12.4
+        run: |
+          set -euo pipefail
+          archive="spire-${SPIRE_VERSION}-linux-amd64-musl.tar.gz"
+          checksum="spire-${SPIRE_VERSION}-linux-amd64-musl_sha256sum.txt"
+          base="https://github.com/spiffe/spire/releases/download/v${SPIRE_VERSION}"
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "$base/$archive"
+          curl -fsSLO "$base/$checksum"
+          sha256sum --check "$checksum"
+          tar -xzf "$archive"
+          sudo install -m 0755 "spire-${SPIRE_VERSION}/bin/spire-server" /usr/local/bin/spire-server
+          sudo install -m 0755 "spire-${SPIRE_VERSION}/bin/spire-agent" /usr/local/bin/spire-agent
+          spire-server -version
+          spire-agent -version
+
+      - name: Build and locate two-cluster functional test binary
+        id: build_test_bin
+        run: |
+          set -euo pipefail
+          cargo build --bin ferrum-edge
+          mapfile -t bins < <(
+            cargo test --test functional_tests --no-run --message-format=json-render-diagnostics \
+              | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null and (.target.kind | index("test"))) | .executable'
+          )
+          if [ "${#bins[@]}" -ne 1 ]; then
+            printf 'Expected exactly one functional test binary, found %s:\n' "${#bins[@]}" >&2
+            printf '%s\n' "${bins[@]}" >&2
+            exit 1
+          fi
+          echo "functional_test_bin=${bins[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Preflight two-cluster netns prerequisites
+        run: |
+          set -euo pipefail
+          sudo -n true
+          for bin in unshare nsenter setpriv timeout ip iptables iptables-save sysctl spire-server spire-agent; do
+            command -v "$bin" >/dev/null 2>&1 || {
+              echo "::error::$bin is required for the strict two-cluster live gate"
+              exit 1
+            }
+          done
+          sudo unshare --net sh -c 'ip link set lo up; iptables -t nat -L >/dev/null'
+
+      - name: Run real two-cluster cross-cluster protocol matrix as root
+        run: |
+          set -euo pipefail
+          BIN="${{ steps.build_test_bin.outputs.functional_test_bin }}"
+          set +e
+          output="$(sudo -E \
+            "FERRUM_LIVE_TESTS_REQUIRED=1" \
+            "FERRUM_SKIP_GATEWAY_BUILD=1" \
+            timeout --signal=KILL 600s \
+            "$BIN" functional_mesh_live_two_cluster_cross_cluster_protocol_matrix \
+              --ignored --nocapture --test-threads=1 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          if grep -q '^SKIP:' <<<"$output"; then
+            echo "::error::two-cluster live test skipped under required CI mode"
+            exit 1
+          fi
+          if ! grep -Eq '^test result: ok\. 1 passed; 0 failed;' <<<"$output"; then
+            echo "::error::expected exactly one shared two-cluster live gate to pass"
             exit 1
           fi
         env:

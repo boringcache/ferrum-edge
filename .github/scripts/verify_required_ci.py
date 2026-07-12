@@ -38,6 +38,7 @@ REQUIRED_JOBS = {
     "build-ebpf-userspace",
     "ebpf-live",
     "netns-capture-live",
+    "two-cluster-mesh-live",
     "performance-regression",
     "build-binaries",
 }
