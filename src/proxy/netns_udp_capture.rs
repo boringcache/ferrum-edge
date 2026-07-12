@@ -37,12 +37,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use super::netns_capture::{PodCaptureSource, PodCaptureTarget};
+
+const RETAINED_GUARD_NETNS_MISSING_GRACE: Duration = Duration::from_secs(10 * 60);
 
 /// Handle to one pod netns's active UDP capture (its rules + socket + loop).
 /// Closing it signals the capture loop to stop; the production backend's loop
@@ -296,6 +298,10 @@ struct PendingAckUdpGuard {
     handle: RetainedUdpGuard,
     target: PodCaptureTarget,
     pod_uids: HashSet<String>,
+    /// First cgroup/proc lookup miss after close. Lookup failures are commonly
+    /// transient during removal, so retain late-ack ownership for the durable
+    /// handshake window before allowing dead-netns bookkeeping to retire.
+    unresolved_since: Option<Instant>,
 }
 
 fn capture_is_still_justified(
@@ -507,54 +513,37 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             .all(|uid| udp_ready_marker_path(&ack_dir, uid).is_some_and(|marker| marker.is_file()))
     }
 
-    async fn reconcile_pending_ack_guards(&mut self, registry_uids: &HashSet<String>) {
-        // A same-UID re-entry transfers ownership to the normal reopen path. Its
-        // pre-open teardown reaps retained state after awaiting the old producer
-        // task, so this late-ack path must neither mint an ack nor race cleanup.
-        let reopened: Vec<u64> = self
-            .pending_ack_guards
-            .iter()
-            .filter(|(_, pending)| {
-                pending
-                    .pod_uids
-                    .iter()
-                    .any(|uid| registry_uids.contains(uid))
-            })
-            .map(|(netns, _)| *netns)
-            .collect();
-        for netns in reopened {
-            if let Some(pending) = self.pending_ack_guards.remove(&netns) {
-                pending.handle.disarm();
-            }
-        }
-
-        // Once the representative cgroup no longer resolves to this inode, the
-        // old netns has died or moved. Dropping the stable cleanup owner lets a
-        // dead namespace retire instead of accumulating manager state forever;
-        // any still-present guard remains fail-closed until that namespace dies.
-        let retired: Vec<u64> = self
+    async fn reconcile_pending_ack_guards(
+        &mut self,
+        registry_uids: &HashSet<String>,
+        desired_netns: &HashSet<u64>,
+    ) {
+        // A same-UID re-entry or any desired reuse of this inode transfers
+        // eventual ownership to the normal open path. Keep the stable cleanup
+        // handle until that path either opens successfully or returns a new
+        // guarded owner; an open failure must leave this owner available.
+        let blocked: HashSet<u64> = self
             .pending_ack_guards
             .iter()
             .filter(|(netns, pending)| {
-                self.backend.netns_key(&pending.target).ok() != Some(**netns)
+                desired_netns.contains(netns)
+                    || pending
+                        .pod_uids
+                        .iter()
+                        .any(|uid| registry_uids.contains(uid))
             })
             .map(|(netns, _)| *netns)
             .collect();
-        for netns in retired {
-            if let Some(pending) = self.pending_ack_guards.remove(&netns) {
-                pending.handle.disarm();
-                debug!(
-                    netns_inode = netns,
-                    "Retired late-ack tracking after the closed Ambient UDP netns disappeared"
-                );
-            }
-        }
 
+        // Give a verified late acknowledgement its cleanup opportunity before
+        // considering cgroup/proc disappearance. Removal commonly erases that
+        // lookup path before the node-agent publishes the acknowledgement.
         let acknowledged: Vec<u64> = self
             .pending_ack_guards
             .iter()
             .filter(|(netns, pending)| {
-                self.udp_not_ready_acknowledged(&pending.pod_uids)
+                !blocked.contains(netns)
+                    && self.udp_not_ready_acknowledged(&pending.pod_uids)
                     && self
                         .pending_teardowns
                         .get(netns)
@@ -595,6 +584,59 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                     netns_inode = netns,
                     "Consumed late Ambient UDP close acknowledgement and removed retained guard"
                 );
+            }
+        }
+
+        // Bound entries whose original namespace is gone. A proven inode change
+        // retires immediately. A missing cgroup/proc lookup receives the same
+        // ten-minute window as the durable verified handshake, preserving late
+        // acks across ordinary removal races without pinning dead netns forever.
+        let now = Instant::now();
+        let mut retired = Vec::new();
+        for (netns, pending) in &mut self.pending_ack_guards {
+            if blocked.contains(netns) {
+                pending.unresolved_since = None;
+                continue;
+            }
+            match self.backend.netns_key(&pending.target) {
+                Ok(resolved) if resolved == *netns => pending.unresolved_since = None,
+                Ok(_) => retired.push(*netns),
+                Err(_) => match pending.unresolved_since {
+                    Some(since)
+                        if now.saturating_duration_since(since)
+                            >= RETAINED_GUARD_NETNS_MISSING_GRACE =>
+                    {
+                        retired.push(*netns);
+                    }
+                    Some(_) => {}
+                    None => pending.unresolved_since = Some(now),
+                },
+            }
+        }
+        for netns in retired {
+            if let Some(pending) = self.pending_ack_guards.remove(&netns) {
+                pending.handle.disarm();
+                debug!(
+                    netns_inode = netns,
+                    "Retired late-ack tracking after the closed Ambient UDP netns disappeared"
+                );
+            }
+        }
+    }
+
+    fn disarm_pending_ack_guards_after_reopen(&mut self, netns: u64, pod_uids: &HashSet<String>) {
+        let transferred: Vec<u64> = self
+            .pending_ack_guards
+            .iter()
+            .filter(|(pending_netns, pending)| {
+                **pending_netns == netns
+                    || pending.pod_uids.iter().any(|uid| pod_uids.contains(uid))
+            })
+            .map(|(pending_netns, _)| *pending_netns)
+            .collect();
+        for pending_netns in transferred {
+            if let Some(pending) = self.pending_ack_guards.remove(&pending_netns) {
+                pending.handle.disarm();
             }
         }
     }
@@ -694,7 +736,9 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
         self.unresolved_reasons
             .retain(|uid, _| unresolved_uids.contains(uid));
 
-        self.reconcile_pending_ack_guards(&registry_uids).await;
+        let desired_netns: HashSet<u64> = desired.keys().copied().collect();
+        self.reconcile_pending_ack_guards(&registry_uids, &desired_netns)
+            .await;
 
         // Close a producer when none of its pods still justify it. A pod on the
         // producer for netns N justifies keeping N open when it is still in the
@@ -787,6 +831,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                             handle,
                             target: active.target,
                             pod_uids: active.pod_uids,
+                            unresolved_since: None,
                         },
                     );
                 } else if let Some(handle) = closed.retained_guard_cleanup.take() {
@@ -1006,6 +1051,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             }
             match self.backend.open_udp_capture(&target, netns) {
                 NetnsUdpOpenResult::Opened(handle) => {
+                    self.disarm_pending_ack_guards_after_reopen(netns, &pod_uids);
                     // The successful backend transition removed all guard jumps.
                     // Disarm the older stable cleanup handle so it cannot later
                     // tear down this new live capture instance.
@@ -1034,6 +1080,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                     }
                 }
                 NetnsUdpOpenResult::Guarded(handle) => {
+                    self.disarm_pending_ack_guards_after_reopen(netns, &pod_uids);
                     match self.guarded.entry(netns) {
                         std::collections::hash_map::Entry::Occupied(_) => {
                             // The existing handle already pins the same netns for
@@ -2675,6 +2722,7 @@ mod tests {
         let ack_dir = registry_root.path().join(".udp-not-ready");
         std::fs::create_dir_all(&ack_dir).unwrap();
         std::fs::write(ack_dir.join("pod-a"), b"").unwrap();
+        mgr.backend.set_netns("/cg/a", None);
 
         assert_eq!(mgr.reconcile_once().await, 0);
         assert!(mgr.pending_ack_guards.is_empty());
@@ -2708,6 +2756,16 @@ mod tests {
         std::fs::create_dir_all(&ack_dir).unwrap();
         std::fs::write(ack_dir.join("pod-a"), b"").unwrap();
         source.0.lock().unwrap().push(target("pod-a", "/cg/a"));
+        mgr.backend.set_open_netns("/cg/a", Some(200));
+        assert_eq!(mgr.reconcile_once().await, 0);
+        assert_eq!(
+            mgr.pending_ack_guards.len(),
+            1,
+            "a failed reopen must retain the prior stable cleanup owner"
+        );
+        assert!(cleaned.lock().unwrap().is_empty());
+
+        mgr.backend.set_open_netns("/cg/a", Some(100));
         assert_eq!(mgr.reconcile_once().await, 1);
         assert!(mgr.pending_ack_guards.is_empty());
         assert!(
@@ -2771,10 +2829,45 @@ mod tests {
 
         mgr.backend.set_netns("/cg/a", None);
         assert_eq!(mgr.reconcile_once().await, 0);
+        assert_eq!(mgr.pending_ack_guards.len(), 1);
+        mgr.pending_ack_guards
+            .get_mut(&100)
+            .unwrap()
+            .unresolved_since =
+            Some(Instant::now() - RETAINED_GUARD_NETNS_MISSING_GRACE - Duration::from_secs(1));
+        assert_eq!(mgr.reconcile_once().await, 0);
         assert!(mgr.pending_ack_guards.is_empty());
         assert!(
             cleaned.lock().unwrap().is_empty(),
             "a dead netns needs no in-netns guard teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_uid_netns_reuse_disarms_stale_late_ack_cleanup() {
+        let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100)), ("/cg/b", Some(100))]);
+        let cleaned = backend.guard_cleanups.clone();
+        let registry_root = tempfile::tempdir().unwrap();
+        let ready_dir = registry_root.path().join(".udp-ready");
+        let mut mgr = manager(source.clone(), backend).with_ready_dir(Some(ready_dir));
+
+        assert_eq!(mgr.reconcile_once().await, 1);
+        source.0.lock().unwrap().clear();
+        assert_eq!(mgr.reconcile_once().await, 0);
+        assert_eq!(mgr.pending_ack_guards.len(), 1);
+
+        *source.0.lock().unwrap() = vec![target("pod-b", "/cg/b")];
+        assert_eq!(mgr.reconcile_once().await, 1);
+        assert!(mgr.pending_ack_guards.is_empty());
+
+        let ack_dir = registry_root.path().join(".udp-not-ready");
+        std::fs::create_dir_all(&ack_dir).unwrap();
+        std::fs::write(ack_dir.join("pod-a"), b"").unwrap();
+        assert_eq!(mgr.reconcile_once().await, 1);
+        assert!(
+            cleaned.lock().unwrap().is_empty(),
+            "an old UID's late ack must never tear down a new producer reusing the netns"
         );
     }
 
