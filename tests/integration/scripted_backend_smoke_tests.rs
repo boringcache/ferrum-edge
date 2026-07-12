@@ -412,6 +412,7 @@ async fn serve_blocks_until_shutdown_when_no_listener_handles() {
         admin_jwt_manager: Some(JwtManager::new(JwtConfig {
             secret: env_config.admin_jwt_secret.clone().unwrap(),
             issuer: env_config.admin_jwt_issuer.clone(),
+            audience: None,
             max_ttl_seconds: 3600,
             algorithm: jsonwebtoken::Algorithm::HS256,
         })),
@@ -679,6 +680,7 @@ async fn serve_drains_spawned_tasks_when_late_startup_fails() {
         admin_jwt_manager: Some(JwtManager::new(JwtConfig {
             secret: env_config.admin_jwt_secret.clone().unwrap(),
             issuer: env_config.admin_jwt_issuer.clone(),
+            audience: None,
             max_ttl_seconds: 3600,
             algorithm: jsonwebtoken::Algorithm::HS256,
         })),

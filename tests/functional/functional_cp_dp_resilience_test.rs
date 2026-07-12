@@ -175,6 +175,7 @@ fn build_cp_admin_state(
         jwt_manager: JwtManager::new(JwtConfig {
             secret: ADMIN_JWT_SECRET.to_string(),
             issuer: "ferrum-edge".to_string(),
+            audience: None,
             max_ttl_seconds: 3600,
             algorithm: jsonwebtoken::Algorithm::HS256,
         }),
@@ -213,6 +214,7 @@ fn build_dp_admin_state(
         jwt_manager: JwtManager::new(JwtConfig {
             secret: ADMIN_JWT_SECRET.to_string(),
             issuer: "ferrum-edge".to_string(),
+            audience: None,
             max_ttl_seconds: 3600,
             algorithm: jsonwebtoken::Algorithm::HS256,
         }),

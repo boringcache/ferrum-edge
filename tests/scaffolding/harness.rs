@@ -457,6 +457,7 @@ async fn try_spawn_in_process(
     let jwt_manager = JwtManager::new(JwtConfig {
         secret: builder.jwt_secret.clone(),
         issuer: builder.jwt_issuer.clone(),
+        audience: None,
         max_ttl_seconds: 3600,
         algorithm: jsonwebtoken::Algorithm::HS256,
     });

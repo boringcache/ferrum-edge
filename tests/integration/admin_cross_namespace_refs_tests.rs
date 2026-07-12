@@ -55,6 +55,7 @@ fn make_jwt_manager(config: &TestConfig) -> JwtManager {
     JwtManager::new(JwtConfig {
         secret: config.jwt_secret.clone(),
         issuer: config.jwt_issuer.clone(),
+        audience: None,
         max_ttl_seconds: config.max_ttl,
         algorithm: jsonwebtoken::Algorithm::HS256,
     })

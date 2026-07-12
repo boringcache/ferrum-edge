@@ -191,6 +191,7 @@ async fn start_h3_policy_gateway(
     let jwt_manager = JwtManager::new(JwtConfig {
         secret: H3_POLICY_JWT_SECRET.to_string(),
         issuer: H3_POLICY_JWT_ISSUER.to_string(),
+        audience: None,
         max_ttl_seconds: 3600,
         algorithm: jsonwebtoken::Algorithm::HS256,
     });

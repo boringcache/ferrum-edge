@@ -264,23 +264,34 @@ impl CertificateAuthority for InternalCa {
                     // deliberately ignore any SAN already present in the CSR —
                     // the caller-attested `spiffe_id` is authoritative.
                     //
-                    // SECURITY (TODO before non-UDS callers in Phase B+):
-                    // `rcgen::CertificateSigningRequestParams::from_der` does NOT
-                    // verify the CSR self-signature (proof-of-possession). For
-                    // the local UDS Workload API server this is acceptable — the
-                    // transport itself authenticates the calling workload via
-                    // SO_PEERCRED-class attestation, and the SVID's URI SAN is
-                    // determined by attestation, not by anything in the CSR.
+                    // SECURITY — proof-of-possession (PoP) is enforced
+                    // unconditionally here, before we sign the embedded public
+                    // key. `rcgen::CertificateSigningRequestParams::from_der`
+                    // does NOT check the PKCS#10 self-signature, so on its own
+                    // it would let an attacker who intercepts a victim's CSR
+                    // swap in their own public key and obtain a valid SVID for
+                    // the victim's identity. We therefore verify the CSR
+                    // self-signature with x509-parser first: a valid signature
+                    // proves the requester holds the private key matching the
+                    // public key we are about to certify.
                     //
-                    // For ANY future caller that flows CSRs over a remote
-                    // transport (Vault PKI bridge, cert-manager Issuer, federated
-                    // SPIFFE bundle endpoint, mesh-expansion VM bootstrap), the
-                    // PoP signature MUST be verified before we sign the public
-                    // key — otherwise an attacker who intercepts a CSR can swap
-                    // in their own public key and obtain a valid SVID for the
-                    // victim's identity. Add a webpki / x509-parser-based PoP
-                    // verification step at the start of this arm before wiring
-                    // any non-UDS transport into `IssuanceRequest::Csr`.
+                    // INVARIANT: this arm is safe for ANY transport — the local
+                    // UDS Workload API server (SO_PEERCRED-class attested) today,
+                    // and any future remote CSR bridge (Vault PKI, cert-manager
+                    // Issuer, federated SPIFFE bundle endpoint, mesh-expansion VM
+                    // bootstrap). Do NOT remove this PoP check when wiring a
+                    // non-UDS caller; without it a remote transport would
+                    // silently reintroduce the identity-spoofing vector.
+                    {
+                        use x509_parser::prelude::*;
+                        let (_, parsed_csr) = X509CertificationRequest::from_der(&csr_der)
+                            .map_err(|e| CaError::BadCsr(format!("CSR parse failed: {e}")))?;
+                        parsed_csr.verify_signature().map_err(|e| {
+                            CaError::BadCsr(format!(
+                                "CSR proof-of-possession verification failed: {e}"
+                            ))
+                        })?;
+                    }
                     let csr = rcgen::CertificateSigningRequestParams::from_der(&csr_der.into())
                         .map_err(|e| CaError::BadCsr(format!("CSR parse failed: {e}")))?;
                     let public_key = csr.public_key;
