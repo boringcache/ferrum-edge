@@ -13,7 +13,9 @@ info:
     also mutate proxies, upstreams, plugin configs, and operational refresh/test
     endpoints, and `admin` has full access including consumers, credentials, API
     specs, TLS material management, batch/restore, and audit logs. Tokens
-    without a valid `role` claim are rejected.
+    without a valid `role` claim are rejected. When `FERRUM_ADMIN_JWT_AUDIENCE`
+    is set, tokens must additionally carry a matching `aud` claim; when it is
+    unset (default), the `aud` claim is not validated.
 
     ## Namespaces
 

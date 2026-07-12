@@ -108,6 +108,7 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_ADMIN_TLS_OCSP_RESPONSE_SOURCE` | No | — | Source for DER OCSP response bytes to staple on admin TLS handshakes. File/provider-backed sources are watched when frontend/admin TLS live reload is enabled |
 | `FERRUM_ADMIN_JWT_SECRET` | DB/CP modes | — | HS256 secret for Admin API JWT auth. Must be at least 32 characters. Tokens must include `role: viewer`, `role: operator`, or `role: admin`; tokens without a `role` claim fail closed |
 | `FERRUM_ADMIN_JWT_ISSUER` | No | `ferrum-edge` | Required `iss` claim for Admin API JWT tokens |
+| `FERRUM_ADMIN_JWT_AUDIENCE` | No | — | Optional required `aud` (audience) claim for Admin API JWT tokens. When set, tokens must carry a matching `aud`; when unset (default), the audience is not validated |
 | `FERRUM_ADMIN_JWT_MAX_TTL` | No | `3600` | Maximum accepted token lifetime (`exp - iat`) for externally minted Admin API JWTs |
 | `FERRUM_ADMIN_READ_ONLY` | No | `false` | Set Admin API to read-only mode (DP mode defaults to true). Blocks mutations only — it does **not** exempt the plaintext-admin startup guard above, since read endpoints (e.g. `/backup`) and bearer tokens remain sensitive |
 | `FERRUM_ADMIN_AUDIT_ENABLED` | No | `false` | Enable database-backed audit events for successful Admin API mutations. Responses wait only for bounded queue enqueue; persistence is asynchronous best-effort |

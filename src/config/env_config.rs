@@ -995,6 +995,12 @@ pub struct EnvConfig {
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs`.
     #[allow(dead_code)]
     pub admin_jwt_max_ttl: u64,
+    /// Optional required `aud` (audience) claim for externally minted Admin API
+    /// JWT tokens. When set, verification requires the token to carry an `aud`
+    /// claim matching this value; when unset (default), audience is not checked.
+    /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs`.
+    #[allow(dead_code)]
+    pub admin_jwt_audience: Option<String>,
 
     // Database
     pub db_type: Option<String>,
@@ -2231,6 +2237,7 @@ impl Default for EnvConfig {
             admin_jwt_secret: None,
             admin_jwt_issuer: "ferrum-edge".into(),
             admin_jwt_max_ttl: 3600,
+            admin_jwt_audience: None,
             db_type: None,
             db_url: None,
             db_poll_interval: 30,
@@ -2565,6 +2572,7 @@ impl EnvConfig {
                 => required_for(["database", "cp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
             admin_jwt_issuer: String = "FERRUM_ADMIN_JWT_ISSUER" => "ferrum-edge".to_string();
             admin_jwt_max_ttl: u64 = "FERRUM_ADMIN_JWT_MAX_TTL" => 3600u64;
+            admin_jwt_audience: Option<String> = "FERRUM_ADMIN_JWT_AUDIENCE";
             admin_audit_enabled: bool = "FERRUM_ADMIN_AUDIT_ENABLED" => false;
         }
 
@@ -3248,6 +3256,7 @@ impl EnvConfig {
             admin_jwt_secret,
             admin_jwt_issuer,
             admin_jwt_max_ttl,
+            admin_jwt_audience,
             db_type,
             db_url,
             db_poll_interval,

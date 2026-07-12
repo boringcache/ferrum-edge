@@ -99,6 +99,10 @@ impl AdminClaims {
 pub struct JwtConfig {
     pub secret: String,
     pub issuer: String,
+    /// Optional required `aud` (audience) claim. When `Some`, verification
+    /// requires the token to carry an `aud` claim that matches this value;
+    /// when `None`, audience is not validated (default, unchanged behavior).
+    pub audience: Option<String>,
     pub max_ttl_seconds: u64,
     pub algorithm: Algorithm,
 }
@@ -108,6 +112,7 @@ impl Default for JwtConfig {
         Self {
             secret: String::new(),
             issuer: "ferrum-edge".to_string(),
+            audience: None,
             max_ttl_seconds: 3600,
             algorithm: Algorithm::HS256,
         }
@@ -149,6 +154,17 @@ impl JwtManager {
 
         // Validate issuer
         validation.set_issuer(&[&self.config.issuer]);
+
+        // Optional audience enforcement. When an operator configures an
+        // audience, the token MUST carry a matching `aud` claim: `set_audience`
+        // rejects a *mismatching* claim, and adding `aud` to
+        // `required_spec_claims` makes its *presence* mandatory (so a token that
+        // simply omits `aud` is also rejected). When unset, audience is left
+        // unchecked — behavior is unchanged from before this option existed.
+        if let Some(audience) = &self.config.audience {
+            validation.set_audience(&[audience]);
+            validation.required_spec_claims.insert("aud".to_string());
+        }
 
         // Decode and validate
         let token_data = decode::<AdminClaims>(token, &key, &validation)?;
@@ -247,6 +263,10 @@ pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
     let issuer =
         resolve_ferrum_var("FERRUM_ADMIN_JWT_ISSUER").unwrap_or_else(|| "ferrum-edge".to_string());
 
+    // Optional: when set (and non-empty), Admin API tokens must carry a
+    // matching `aud` claim. Unset ⇒ audience is not validated.
+    let audience = resolve_ferrum_var("FERRUM_ADMIN_JWT_AUDIENCE").filter(|s| !s.is_empty());
+
     let max_ttl = resolve_ferrum_var("FERRUM_ADMIN_JWT_MAX_TTL")
         .and_then(|s| s.parse().ok())
         .unwrap_or(3600);
@@ -254,6 +274,7 @@ pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
     let config = JwtConfig {
         secret,
         issuer,
+        audience,
         max_ttl_seconds: max_ttl,
         algorithm: Algorithm::HS256,
     };
