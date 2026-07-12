@@ -2603,81 +2603,88 @@ struct LostApiSpec {
     proxy_id: String,
 }
 
-/// Upper bound on the number of `api_specs` identities captured for a rollback
+/// Upper bound on the number of `api_specs` identities enumerated for a rollback
 /// recovery report. Far above any realistic per-namespace spec count; keeps the
-/// snapshot query and the `500` response bounded.
-const RESTORE_SNAPSHOT_API_SPEC_CAP: u32 = 500;
+/// snapshot query and the JSON response bounded. When a namespace somehow holds
+/// more specs than this, the report lists the first `CAP` and sets
+/// `api_specs_lost_truncated: true` alongside the authoritative total so the
+/// operator is never under-informed.
+///
+/// Exposed so the truncation-reporting integration test can seed exactly one
+/// spec over the cap without hard-coding the value.
+pub const RESTORE_SNAPSHOT_API_SPEC_CAP: u32 = 500;
 
-/// Best-effort snapshot of a namespace captured before a destructive restore so
-/// a failed import — or a failed clear — can be compensated back to the prior
-/// state on every database backend.
+/// Snapshot of a namespace captured before a destructive restore so a failed
+/// import — or a failed clear — can be compensated back to the prior state on
+/// every database backend.
 struct RestoreSnapshot {
     /// Prior config resources (proxies/consumers/plugin_configs/upstreams).
     payload: RestorePayload,
-    /// `api_specs` present before deletion. API specs are admin-only metadata
-    /// that live OUTSIDE `GatewayConfig`, so a config rollback cannot restore
-    /// them. The captured identities are surfaced to the operator so they know
-    /// exactly which specs to re-submit (and which restored resources to clear
-    /// first) after recovery.
+    /// Identities of `api_specs` present before deletion (up to
+    /// [`RESTORE_SNAPSHOT_API_SPEC_CAP`]). API specs are admin-only metadata that
+    /// live OUTSIDE `GatewayConfig`, so a config rollback cannot restore them.
+    /// The captured identities are surfaced to the operator so they know exactly
+    /// which specs to re-submit (and which restored resources to clear first)
+    /// after recovery.
     api_specs: Vec<LostApiSpec>,
+    /// Authoritative count of `api_specs` in the namespace at snapshot time
+    /// (ignores the cap). Equal to `api_specs.len()` unless truncated.
+    api_specs_total: usize,
+    /// `true` when more than [`RESTORE_SNAPSHOT_API_SPEC_CAP`] specs existed, so
+    /// `api_specs` holds only the first `CAP` of `api_specs_total`.
+    api_specs_truncated: bool,
 }
 
-/// Capture a best-effort snapshot of `namespace` for restore rollback.
+/// Capture an authoritative snapshot of `namespace` for restore rollback.
 ///
-/// Returns `None` when the existing config cannot be loaded — for example when
-/// it is already invalid or otherwise unloadable, which is exactly the case an
-/// operator runs restore to *repair*. In that situation rollback is unavailable
-/// but the restore must still proceed, so a snapshot failure never aborts the
-/// operation; it only downgrades the recovery guarantee.
+/// Returns `Err` ONLY when the prior state cannot be read from the primary due
+/// to a genuine database/connectivity failure. It does NOT fail on an
+/// invalid-but-present config: the snapshot loads raw rows without the fatal
+/// validation pipeline (see [`DatabaseBackend::load_namespace_snapshot`]), so a
+/// namespace an operator runs restore to *repair* still snapshots and keeps
+/// rollback available. The caller treats an `Err` here as fail-safe: it aborts
+/// the destructive restore rather than wiping a config it cannot roll back to.
+///
+/// Both the config resources and the `api_specs` identities are read from the
+/// PRIMARY (never a lagging read replica) so the recovery report is authoritative.
 async fn snapshot_namespace_for_rollback(
     db: &dyn DatabaseBackend,
     namespace: &str,
-) -> Option<RestoreSnapshot> {
-    let payload = match db.load_full_config(namespace).await {
-        Ok(config) => restore_payload_from_config(config),
-        Err(error) => {
-            warn!(
-                namespace = %namespace,
-                error = %error,
-                "Restore: prior config could not be snapshotted; proceeding without rollback capability"
-            );
-            return None;
-        }
-    };
+) -> Result<RestoreSnapshot, anyhow::Error> {
+    // Non-validating raw load from the primary. Invalid-but-present config still
+    // snapshots; a real DB error propagates so the caller aborts.
+    let config = db.load_namespace_snapshot(namespace).await?;
+    let payload = restore_payload_from_config(config);
 
     // `api_specs` are not part of `GatewayConfig`, so capture their identities
-    // separately for rollback bookkeeping. This is best-effort: a lookup failure
-    // must not disable rollback of the config resources we already captured. The
-    // summary listing carries `id`/`proxy_id` without hydrating the spec blob.
-    let api_specs = match db
-        .list_api_specs(
+    // separately from the PRIMARY. `total` is the authoritative count regardless
+    // of the page cap, so the recovery report can be honest about truncation.
+    let listed = db
+        .list_api_specs_authoritative(
             namespace,
             &crate::config::db_backend::ApiSpecListFilter {
                 limit: RESTORE_SNAPSHOT_API_SPEC_CAP,
                 ..Default::default()
             },
         )
-        .await
-    {
-        Ok(result) => result
-            .items
-            .into_iter()
-            .map(|spec| LostApiSpec {
-                id: spec.id,
-                proxy_id: spec.proxy_id,
-            })
-            .collect(),
-        Err(error) => {
-            warn!(
-                namespace = %namespace,
-                error = %error,
-                "Restore: failed to list existing api_specs for rollback bookkeeping; assuming none"
-            );
-            Vec::new()
-        }
-    };
+        .await?;
+    let api_specs_total = usize::try_from(listed.total).unwrap_or(usize::MAX);
+    let api_specs: Vec<LostApiSpec> = listed
+        .items
+        .into_iter()
+        .map(|spec| LostApiSpec {
+            id: spec.id,
+            proxy_id: spec.proxy_id,
+        })
+        .collect();
+    let api_specs_truncated = api_specs_total > api_specs.len();
 
-    Some(RestoreSnapshot { payload, api_specs })
+    Ok(RestoreSnapshot {
+        payload,
+        api_specs,
+        api_specs_total,
+        api_specs_truncated,
+    })
 }
 
 #[derive(Default)]
@@ -2923,34 +2930,31 @@ async fn rollback_failed_restore(
 }
 
 /// Finalize a failed restore. Attempts a best-effort rollback to the pre-restore
-/// snapshot (when one was captured), records the audit event, and builds the
-/// operator-facing `500` response. Shared by the delete-failure and
-/// import-failure paths so both roll back identically.
+/// snapshot, records the audit event, and builds the operator-facing `500`
+/// response. Shared by the delete-failure and import-failure paths so both roll
+/// back identically. The caller always holds a snapshot here — restore aborts
+/// with `503` before touching durable state when one cannot be captured — so
+/// there is no "rollback unavailable" branch.
 async fn finish_failed_restore(
     state: &AdminState,
     db: Arc<dyn DatabaseBackend>,
     actor: &AuditActor,
     namespace: &str,
     restore_errors: Vec<String>,
-    snapshot: &Option<RestoreSnapshot>,
+    snapshot: &RestoreSnapshot,
 ) -> Response<Full<Bytes>> {
-    // Attempt rollback only when we hold a snapshot of the prior state.
-    let (rollback_status, rollback_errors) = match snapshot {
-        None => ("unavailable", None),
-        Some(snapshot) => {
-            match rollback_failed_restore(db.as_ref(), namespace, &snapshot.payload).await {
-                Ok(()) => ("completed", None),
-                Err(errors) => {
-                    error!(
-                        "Restore: rollback failed for namespace '{}': {}",
-                        namespace,
-                        errors.join("; ")
-                    );
-                    ("incomplete", Some(errors))
-                }
+    let (rollback_status, rollback_errors) =
+        match rollback_failed_restore(db.as_ref(), namespace, &snapshot.payload).await {
+            Ok(()) => ("completed", None),
+            Err(errors) => {
+                error!(
+                    "Restore: rollback failed for namespace '{}': {}",
+                    namespace,
+                    errors.join("; ")
+                );
+                ("incomplete", Some(errors))
             }
-        }
-    };
+        };
 
     let event = audit::AuditEvent::new(
         actor,
@@ -2969,11 +2973,8 @@ async fn finish_failed_restore(
 
     let error_message = match rollback_status {
         "completed" => "Restore failed; restore rolled back and prior config retained",
-        "incomplete" => {
-            "Restore failed and rollback of prior config was incomplete; manual recovery required"
-        }
-        // "unavailable"
-        _ => "Restore failed and prior config could not be auto-restored; manual recovery required",
+        // "incomplete"
+        _ => "Restore failed and rollback of prior config was incomplete; manual recovery required",
     };
 
     let mut response = json!({
@@ -2991,18 +2992,20 @@ async fn finish_failed_restore(
     // recovery path: list exactly which specs vanished (by `id` + `proxy_id`) and
     // spell out that the restored resources are now hand-managed, so a plain
     // `POST /api-specs` would collide on route/name/id and must be preceded by
-    // deleting the restored proxy (and its upstream/plugins). Only meaningful
-    // when a snapshot was actually captured.
-    if let Some(snapshot) = snapshot
-        && !snapshot.api_specs.is_empty()
-    {
-        let count = snapshot.api_specs.len();
+    // deleting the restored proxy (and its upstream/plugins).
+    if snapshot.api_specs_total > 0 {
+        // `api_specs_not_restored` is the AUTHORITATIVE total, even when the
+        // listed detail is capped — never under-report how many specs the
+        // operator must re-submit.
+        let total = snapshot.api_specs_total;
         warn!(
             namespace = %namespace,
-            api_spec_count = count,
+            api_spec_count = total,
+            api_specs_listed = snapshot.api_specs.len(),
+            api_specs_truncated = snapshot.api_specs_truncated,
             "Restore: rollback restored config resources but NOT api_specs; operator must re-submit affected API specs"
         );
-        response["api_specs_not_restored"] = json!(count);
+        response["api_specs_not_restored"] = json!(total);
         response["api_specs_lost"] = json!(
             snapshot
                 .api_specs
@@ -3010,9 +3013,18 @@ async fn finish_failed_restore(
                 .map(|spec| json!({ "id": spec.id, "proxy_id": spec.proxy_id }))
                 .collect::<Vec<_>>()
         );
-        response["api_specs_note"] = json!(format!(
-            "{count} API spec(s) were removed and cannot be restored by rollback. Their proxy/upstream/plugin resources were reapplied as hand-managed (api_spec_id cleared), so re-submitting a spec via POST /api-specs first requires deleting the restored proxy (and its upstream/plugins) to avoid route/name/id collisions, then re-submitting the original spec document. Affected specs are listed in api_specs_lost."
-        ));
+        response["api_specs_lost_truncated"] = json!(snapshot.api_specs_truncated);
+        let note = if snapshot.api_specs_truncated {
+            format!(
+                "{total} API spec(s) were removed and cannot be restored by rollback. Their proxy/upstream/plugin resources were reapplied as hand-managed (api_spec_id cleared), so re-submitting a spec via POST /api-specs first requires deleting the restored proxy (and its upstream/plugins) to avoid route/name/id collisions, then re-submitting the original spec document. Only the first {} affected specs are listed in api_specs_lost (api_specs_lost_truncated=true); use GET /api-specs to enumerate the rest.",
+                snapshot.api_specs.len()
+            )
+        } else {
+            format!(
+                "{total} API spec(s) were removed and cannot be restored by rollback. Their proxy/upstream/plugin resources were reapplied as hand-managed (api_spec_id cleared), so re-submitting a spec via POST /api-specs first requires deleting the restored proxy (and its upstream/plugins) to avoid route/name/id collisions, then re-submitting the original spec document. Affected specs are listed in api_specs_lost."
+            )
+        };
+        response["api_specs_note"] = json!(note);
     }
 
     json_response(StatusCode::INTERNAL_SERVER_ERROR, &response)
@@ -4460,13 +4472,35 @@ async fn handle_restore(
 
     // Snapshot the namespace before deletion so a failure in any independently
     // committed import chunk (or a partial clear) can be compensated on every
-    // database backend. Best-effort: if the existing config cannot be loaded
-    // (e.g. it is already invalid — exactly what restore is used to repair), we
-    // proceed WITHOUT rollback capability rather than blocking the repair.
-    let snapshot = snapshot_namespace_for_rollback(db.as_ref(), namespace).await;
+    // database backend. The snapshot loads RAW rows from the primary without the
+    // fatal validation pipeline, so an invalid-but-present config (exactly what
+    // restore is used to repair) still snapshots and keeps rollback available.
+    //
+    // Fail-safe: if the snapshot cannot be taken at all, that means a genuine
+    // database/connectivity failure — NOT an unloadable-but-present config. We
+    // must NOT proceed to delete, or a transiently-unreachable-yet-valid config
+    // would be wiped with no way to roll back. Abort with 503 and leave the
+    // prior config untouched.
+    let snapshot = match snapshot_namespace_for_rollback(db.as_ref(), namespace).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            error!(
+                namespace = %namespace,
+                error = %error,
+                "Restore: aborting — prior config could not be snapshotted for rollback; existing config NOT deleted"
+            );
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": "Restore aborted: the prior configuration could not be snapshotted for rollback (database unavailable). Existing config was NOT deleted; retry once the database is reachable.",
+                    "restore_errors": [format!("failed to snapshot prior config for rollback: {}", error)],
+                }),
+            ));
+        }
+    };
 
-    // Phase 3: Delete all existing resources in the namespace (safe: payload is validated and
-    // the prior state has been snapshotted best-effort above).
+    // Phase 3: Delete all existing resources in the namespace (safe: payload is
+    // validated and the prior state has been snapshotted from the primary above).
     if let Err(e) = db.delete_all_resources(namespace).await {
         error!("Restore: failed to delete existing resources: {}", e);
         if db.delete_all_resources_is_atomic() {
