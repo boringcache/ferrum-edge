@@ -1879,11 +1879,15 @@ async fn test_restore_rolls_back_prior_config_after_mid_import_failure() {
 }
 
 /// Restore must remain usable to REPAIR a namespace whose existing config is
-/// already invalid/unloadable. The recovery snapshot is best-effort: if the
-/// prior config cannot be loaded (here: a corrupt regex listen_path that
-/// `load_full_config` rejects), restore proceeds WITHOUT rollback capability
-/// instead of aborting. Guards the cross-PR interaction with the stricter
-/// `load_full_config` validation.
+/// already invalid/unloadable. The rollback snapshot is taken with a
+/// NON-VALIDATING raw load (`load_namespace_snapshot`), so an invalid-but-present
+/// config (here: a corrupt regex listen_path that the VALIDATING
+/// `load_full_config` would reject) still snapshots successfully — the repair
+/// proceeds AND rollback stays available. The restore succeeds, so rollback is
+/// not exercised here; the point is that stricter `load_full_config` validation
+/// no longer suppresses the snapshot. Contrast with
+/// `test_restore_aborts_when_snapshot_cannot_be_loaded`, where a genuine DB
+/// failure (not invalid content) aborts the restore.
 #[tokio::test]
 async fn test_restore_repairs_namespace_with_unloadable_prior_config() {
     let tc = TestConfig::default();
@@ -1911,10 +1915,12 @@ async fn test_restore_repairs_namespace_with_unloadable_prior_config() {
     let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
     assert_eq!(status, 201, "Seed failed: {:?}", body);
 
-    // Corrupt the existing config directly so `load_full_config` (the snapshot
-    // source) rejects it: an unbalanced character class is an invalid regex
-    // listen_path, which the loader treats as fatal. Admin validation would
-    // never accept this, so we inject it below the API.
+    // Corrupt the existing config directly so the VALIDATING `load_full_config`
+    // would reject it: an unbalanced character class is an invalid regex
+    // listen_path, which that loader treats as fatal. The rollback snapshot now
+    // uses the NON-VALIDATING `load_namespace_snapshot`, which tolerates this and
+    // still captures the prior rows. Admin validation would never accept this, so
+    // we inject it below the API.
     sqlx::query("UPDATE proxies SET listen_path = '~[unclosed' WHERE id = 'restore-corrupt'")
         .execute(&pool)
         .await
@@ -1952,6 +1958,100 @@ async fn test_restore_repairs_namespace_with_unloadable_prior_config() {
         status,
         reqwest::StatusCode::OK,
         "the restored proxy must be present after a repair restore"
+    );
+}
+
+/// A restore MUST NOT delete the prior config when it cannot even snapshot it
+/// for rollback due to a genuine database failure (as opposed to an
+/// invalid-but-present config, which still snapshots — see
+/// `test_restore_repairs_namespace_with_unloadable_prior_config`). Here we
+/// simulate a transient DB outage by closing the pool before restore runs: the
+/// snapshot load fails, so the restore aborts with `503` and never issues the
+/// destructive delete. The prior config survives intact.
+#[tokio::test]
+async fn test_restore_aborts_when_snapshot_cannot_be_loaded() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_restore_snapshot_fail.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+    let pool = db.pool();
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let seed = json!({
+        "proxies": [{
+            "id": "restore-survivor",
+            "listen_path": "/survivor",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "Seed failed: {:?}", body);
+
+    // Simulate a transient database outage: close the shared pool so every
+    // subsequent query — including the rollback snapshot load — fails. This is a
+    // genuine connectivity failure, NOT an invalid-but-present config.
+    pool.close().await;
+
+    let restore_payload = json!({
+        "proxies": [{
+            "id": "restore-should-not-apply",
+            "listen_path": "/nope",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+
+    assert_eq!(
+        status, 503,
+        "restore must abort with 503 when the prior config cannot be snapshotted: {:?}",
+        body
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("NOT be deleted")
+            || body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("NOT deleted"),
+        "abort error must state the existing config was not deleted: {:?}",
+        body
+    );
+
+    // Verify via a FRESH connection to the same SQLite file that the prior config
+    // was NOT wiped — the destructive delete must never have run.
+    let verify_db =
+        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+            .expect("Failed to reconnect for verification");
+    let survivor = verify_db
+        .get_proxy("restore-survivor")
+        .await
+        .expect("verification query failed");
+    assert!(
+        survivor.is_some(),
+        "the prior proxy must survive an aborted restore (no delete ran)"
+    );
+    let should_not_exist = verify_db
+        .get_proxy("restore-should-not-apply")
+        .await
+        .expect("verification query failed");
+    assert!(
+        should_not_exist.is_none(),
+        "the restore payload must NOT have been applied when the restore aborted"
     );
 }
 
@@ -2055,6 +2155,14 @@ async fn test_restore_reports_api_specs_not_restored_on_rollback() {
         "restore must report the api_specs it could not restore: {:?}",
         body
     );
+    // With a single spec (well under the cap), the report is complete, not
+    // truncated.
+    assert_eq!(
+        body["api_specs_lost_truncated"].as_bool(),
+        Some(false),
+        "a single spec must not be reported as truncated: {:?}",
+        body
+    );
     // The recovery report must name the exact spec + proxy so the operator can
     // clear the restored (now hand-managed) resource and re-submit the spec.
     let lost = body["api_specs_lost"]
@@ -2086,6 +2194,138 @@ async fn test_restore_reports_api_specs_not_restored_on_rollback() {
         status,
         reqwest::StatusCode::OK,
         "the spec-owned proxy must survive rollback as a plain resource"
+    );
+}
+
+/// When a namespace holds more `api_specs` than the recovery report's cap, the
+/// rollback response must be HONEST: `api_specs_not_restored` carries the
+/// authoritative total, `api_specs_lost` lists the first `CAP`, and
+/// `api_specs_lost_truncated` is `true`. The operator must never be told fewer
+/// specs were affected than actually were.
+#[tokio::test]
+async fn test_restore_reports_api_specs_truncated_over_cap() {
+    let cap = ferrum_edge::admin::RESTORE_SNAPSHOT_API_SPEC_CAP as usize;
+    let total_specs = cap + 1;
+
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_restore_apispec_trunc.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+    let pool = db.pool();
+
+    // Seed one spec (and its owning proxy) more than the cap so the recovery
+    // report must truncate. Bundles go straight through the backend.
+    for i in 0..total_specs {
+        let proxy: Proxy = serde_json::from_value(json!({
+            "id": format!("spec-proxy-{i}"),
+            "namespace": "ferrum",
+            "backend_host": "backend.example.com",
+            "backend_port": 443,
+            "listen_path": format!("/spec-{i}")
+        }))
+        .expect("proxy deserialization failed");
+        let bundle = ferrum_edge::ExtractedBundle {
+            proxy,
+            upstream: None,
+            plugins: vec![],
+        };
+        let content = format!("minimal owned spec {i}");
+        let content_bytes = content.as_bytes();
+        let spec = ferrum_edge::config::types::ApiSpec {
+            id: format!("spec-{i}"),
+            namespace: "ferrum".to_string(),
+            proxy_id: format!("spec-proxy-{i}"),
+            spec_version: "3.1.0".to_string(),
+            spec_format: ferrum_edge::config::types::SpecFormat::Json,
+            spec_content: ferrum_edge::admin::spec_codec::compress_gzip(content_bytes)
+                .expect("compress failed"),
+            content_encoding: "gzip".to_string(),
+            uncompressed_size: content_bytes.len() as u64,
+            content_hash: ferrum_edge::admin::spec_codec::sha256_hex(content_bytes),
+            title: Some(format!("Test API {i}")),
+            info_version: Some("1.0.0".to_string()),
+            description: None,
+            contact_name: None,
+            contact_email: None,
+            license_name: None,
+            license_identifier: None,
+            tags: vec![],
+            server_urls: vec![],
+            operation_count: 0,
+            resource_hash: String::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        db.submit_api_spec_bundle(&bundle, &spec)
+            .await
+            .expect("Failed to seed api_spec bundle");
+    }
+
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Force the import phase to fail so the restore rolls back and the api_specs
+    // recovery report is produced.
+    sqlx::query(
+        "CREATE TRIGGER fail_restore_apispec_trunc BEFORE INSERT ON proxies \
+         WHEN NEW.id = 'restore-fail' \
+         BEGIN SELECT RAISE(FAIL, 'injected restore persistence failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to install restore fault-injection trigger");
+
+    let restore_payload = json!({
+        "proxies": [{
+            "id": "restore-fail",
+            "listen_path": "/new",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+
+    assert_eq!(status, 500, "Failed restore response: {:?}", body);
+    assert_eq!(
+        body["rollback"].as_str(),
+        Some("completed"),
+        "config rollback should complete: {:?}",
+        body
+    );
+    // Authoritative total is reported, not the capped listing length.
+    assert_eq!(
+        body["api_specs_not_restored"].as_u64(),
+        Some(total_specs as u64),
+        "api_specs_not_restored must be the authoritative total (> cap): {:?}",
+        body["api_specs_not_restored"]
+    );
+    assert_eq!(
+        body["api_specs_lost_truncated"].as_bool(),
+        Some(true),
+        "over-cap report must set api_specs_lost_truncated=true: {:?}",
+        body["api_specs_lost_truncated"]
+    );
+    let lost = body["api_specs_lost"]
+        .as_array()
+        .expect("api_specs_lost must be an array");
+    assert_eq!(
+        lost.len(),
+        cap,
+        "api_specs_lost must list exactly CAP identities when truncated: got {}",
+        lost.len()
+    );
+    let note = body["api_specs_note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("truncated") || note.contains("GET /api-specs"),
+        "truncated note must point the operator at the full enumeration: {:?}",
+        note
     );
 }
 
