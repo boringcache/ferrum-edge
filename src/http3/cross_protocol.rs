@@ -3070,7 +3070,12 @@ where
     let body = if let Some(buffered) = prebuffered_body {
         buffered
     } else {
-        match drain_h3_body(stream, state.max_grpc_recv_size_bytes).await {
+        match super::server::collect_h3_request_body_with_timeout(
+            drain_h3_body(stream, state.max_grpc_recv_size_bytes),
+            proxy.backend_read_timeout_ms,
+        )
+        .await
+        {
             Ok(Some(b)) => b,
             Ok(None) => {
                 release_cross_protocol_circuit_breaker_probe_on_admission_reject(
@@ -3088,7 +3093,7 @@ where
                 )
                 .await;
             }
-            Err(e) => {
+            Err(super::server::H3RequestBodyReadError::Read(e)) => {
                 warn!(
                     proxy_id = %proxy.id,
                     error = %e,
@@ -3104,6 +3109,22 @@ where
                     stream,
                     grpc_proxy::grpc_status::INVALID_ARGUMENT,
                     "Request body read error",
+                    backend_start,
+                    0,
+                )
+                .await;
+            }
+            Err(super::server::H3RequestBodyReadError::TimedOut) => {
+                release_cross_protocol_circuit_breaker_probe_on_admission_reject(
+                    state,
+                    proxy,
+                    current_cb_target_key.as_deref(),
+                    cb_retry_probe_slot_available,
+                );
+                return write_grpc_error(
+                    stream,
+                    grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                    "Request body read timed out",
                     backend_start,
                     0,
                 )

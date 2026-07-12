@@ -2213,6 +2213,23 @@ enum ClientRequestBody {
 enum RequestBodyBufferError {
     TooLarge,
     ClientDisconnected(String),
+    TimedOut,
+}
+
+async fn collect_request_body_with_timeout<F, T, E>(
+    collect: F,
+    request_body_read_timeout_ms: u64,
+) -> Result<Result<T, E>, RequestBodyBufferError>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    if request_body_read_timeout_ms == 0 {
+        return Ok(collect.await);
+    }
+
+    tokio::time::timeout(Duration::from_millis(request_body_read_timeout_ms), collect)
+        .await
+        .map_err(|_| RequestBodyBufferError::TimedOut)
 }
 
 pub(crate) fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
@@ -2230,6 +2247,7 @@ async fn buffer_request_body_for_before_proxy(
     method: &str,
     headers: &HashMap<String, String>,
     max_request_body_size_bytes: usize,
+    request_body_read_timeout_ms: u64,
 ) -> Result<ClientRequestBody, RequestBodyBufferError> {
     if !request_may_have_body(method, headers) {
         return Ok(ClientRequestBody::Streaming(Box::new(request)));
@@ -2246,9 +2264,10 @@ async fn buffer_request_body_for_before_proxy(
     let (_parts, body) = request.into_parts();
     let body_bytes = if max_request_body_size_bytes > 0 {
         let limited = http_body_util::Limited::new(body, max_request_body_size_bytes);
-        limited
-            .collect()
-            .await
+        let collected =
+            collect_request_body_with_timeout(limited.collect(), request_body_read_timeout_ms)
+                .await?;
+        collected
             .map_err(|e| {
                 // Limited::collect() returns either a LengthLimitError (the body
                 // actually exceeded the cap -> 413) or the underlying transport
@@ -2267,8 +2286,9 @@ async fn buffer_request_body_for_before_proxy(
             .to_bytes()
             .to_vec()
     } else {
-        body.collect()
-            .await
+        let collected =
+            collect_request_body_with_timeout(body.collect(), request_body_read_timeout_ms).await?;
+        collected
             .map_err(|e| RequestBodyBufferError::ClientDisconnected(e.to_string()))?
             .to_bytes()
             .to_vec()
@@ -14324,6 +14344,7 @@ async fn handle_proxy_request_inner(
                     &method,
                     &ctx.headers,
                     state.max_request_body_size_bytes,
+                    proxy.backend_read_timeout_ms,
                 )
                 .await
                 {
@@ -14358,6 +14379,14 @@ async fn handle_proxy_request_inner(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
                             r#"{"error":"Client disconnected"}"#,
                         ));
+                    }
+                    Err(RequestBodyBufferError::TimedOut) => {
+                        let response = build_request_body_timeout_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
                     }
                 }
             }
@@ -14474,6 +14503,7 @@ async fn handle_proxy_request_inner(
                     &method,
                     &ctx.headers,
                     state.max_request_body_size_bytes,
+                    proxy.backend_read_timeout_ms,
                 )
                 .await
                 {
@@ -14511,6 +14541,14 @@ async fn handle_proxy_request_inner(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
                             r#"{"error":"Client disconnected"}"#,
                         ));
+                    }
+                    Err(RequestBodyBufferError::TimedOut) => {
+                        let response = build_request_body_timeout_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
                     }
                 }
             }
@@ -14868,6 +14906,7 @@ async fn handle_proxy_request_inner(
                     &method,
                     &hook_headers,
                     state.max_request_body_size_bytes,
+                    proxy.backend_read_timeout_ms,
                 )
                 .await
                 {
@@ -14904,6 +14943,21 @@ async fn handle_proxy_request_inner(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
                             r#"{"error":"Client disconnected"}"#,
                         ));
+                    }
+                    Err(RequestBodyBufferError::TimedOut) => {
+                        release_circuit_breaker_probe_on_admission_reject(
+                            &state,
+                            &proxy,
+                            cb_target_key.as_deref(),
+                            cb_is_half_open_probe,
+                        );
+                        drop(preacquired_backend_admission.take_if_acquired());
+                        let response = build_request_body_timeout_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
                     }
                 }
             }
@@ -15375,11 +15429,25 @@ async fn handle_proxy_request_inner(
                 }
             };
             let (grpc_method, grpc_headers, grpc_req_body) =
-                match grpc_proxy::collect_grpc_request_body(request, state.max_grpc_recv_size_bytes)
-                    .await
+                match grpc_proxy::collect_grpc_request_body(
+                    request,
+                    state.max_grpc_recv_size_bytes,
+                    proxy.backend_read_timeout_ms,
+                )
+                .await
                 {
                     Ok(parts) => parts,
-                    Err(e) => {
+                    Err(grpc_proxy::GrpcRequestBodyCollectError::TimedOut) => {
+                        // `grpc_probe_guard` remains armed: returning drops it and
+                        // releases the admitted HALF_OPEN slot exactly once,
+                        // neutrally, before the response is written by hyper.
+                        record_request(&state, StatusCode::OK.as_u16());
+                        return Ok(build_request_body_timeout_response(
+                            true,
+                            grpc_web_response_content_type,
+                        ));
+                    }
+                    Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(e)) => {
                         record_request(&state, 500);
                         return Ok(grpc_proxy::build_grpc_error_response(
                             13, // INTERNAL
@@ -15683,8 +15751,12 @@ async fn handle_proxy_request_inner(
                 // retry replay) but propagate the streaming decision to the
                 // response so trailers reach the client immediately when
                 // the response path is safe to stream.
-                match grpc_proxy::collect_grpc_request_body(request, state.max_grpc_recv_size_bytes)
-                    .await
+                match grpc_proxy::collect_grpc_request_body(
+                    request,
+                    state.max_grpc_recv_size_bytes,
+                    proxy.backend_read_timeout_ms,
+                )
+                .await
                 {
                     Ok((grpc_method, grpc_headers, grpc_req_body)) => {
                         ctx.bytes_sent_observed.fetch_max(
@@ -15746,7 +15818,18 @@ async fn handle_proxy_request_inner(
                         .await;
                         (result, grpc_req_body)
                     }
-                    Err(error) => (Err(error), Bytes::new()),
+                    Err(grpc_proxy::GrpcRequestBodyCollectError::TimedOut) => {
+                        // As in the split path, the armed RAII guard performs the
+                        // sole neutral probe release on this early return.
+                        record_request(&state, StatusCode::OK.as_u16());
+                        return Ok(build_request_body_timeout_response(
+                            true,
+                            grpc_web_response_content_type,
+                        ));
+                    }
+                    Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(error)) => {
+                        (Err(error), Bytes::new())
+                    }
                 }
             }
         };
@@ -21253,9 +21336,14 @@ async fn proxy_to_backend(
                         (*original_req).into_body(),
                         state.max_request_body_size_bytes,
                     );
-                    match limited.collect().await {
-                        Ok(collected) => collected.to_bytes().to_vec(),
-                        Err(_) => {
+                    match collect_request_body_with_timeout(
+                        limited.collect(),
+                        proxy.backend_read_timeout_ms,
+                    )
+                    .await
+                    {
+                        Ok(Ok(collected)) => collected.to_bytes().to_vec(),
+                        Ok(Err(_)) => {
                             return backend_dispatch_response(
                                 retry::BackendResponse {
                                     status_code: 413,
@@ -21274,11 +21362,23 @@ async fn proxy_to_backend(
                                 None,
                             );
                         }
+                        Err(_) => {
+                            return backend_dispatch_response(
+                                request_body_timeout_backend_response(resolved_ip.clone()),
+                                None,
+                                None,
+                            );
+                        }
                     }
                 } else {
-                    match (*original_req).into_body().collect().await {
-                        Ok(collected) => collected.to_bytes().to_vec(),
-                        Err(e) => {
+                    match collect_request_body_with_timeout(
+                        (*original_req).into_body().collect(),
+                        proxy.backend_read_timeout_ms,
+                    )
+                    .await
+                    {
+                        Ok(Ok(collected)) => collected.to_bytes().to_vec(),
+                        Ok(Err(e)) => {
                             error!(
                                 proxy_id = %proxy.id,
                                 backend_url = %strip_query_params(backend_url),
@@ -21297,6 +21397,13 @@ async fn proxy_to_backend(
                                     backend_resolved_ip: resolved_ip.clone(),
                                     error_class: Some(retry::ErrorClass::ClientDisconnect),
                                 },
+                                None,
+                                None,
+                            );
+                        }
+                        Err(_) => {
+                            return backend_dispatch_response(
+                                request_body_timeout_backend_response(resolved_ip.clone()),
                                 None,
                                 None,
                             );
@@ -22337,6 +22444,45 @@ fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
                 r#"{"error":"Internal server error"}"#,
             ))
         })
+}
+
+fn build_request_body_timeout_response(
+    is_grpc_request: bool,
+    grpc_web_response_content_type: Option<&str>,
+) -> Response<ProxyBody> {
+    const MESSAGE: &str = "Request body read timed out";
+    if let Some(content_type) = grpc_web_response_content_type {
+        return build_grpc_web_error_response(
+            content_type,
+            grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+            MESSAGE,
+        );
+    }
+    if is_grpc_request {
+        return grpc_proxy::build_grpc_error_response(
+            grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+            MESSAGE,
+        );
+    }
+    build_response(
+        StatusCode::REQUEST_TIMEOUT,
+        r#"{"error":"Request body read timed out"}"#,
+    )
+}
+
+fn request_body_timeout_backend_response(resolved_ip: Option<String>) -> retry::BackendResponse {
+    retry::BackendResponse {
+        status_code: StatusCode::REQUEST_TIMEOUT.as_u16(),
+        body: ResponseBody::Buffered(
+            r#"{"error":"Request body read timed out"}"#.as_bytes().to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        // Buffered client-upload timeouts carry no backend health signal.
+        // ClientDisconnect is the existing centrally neutral client-side class.
+        error_class: Some(retry::ErrorClass::ClientDisconnect),
+    }
 }
 
 fn build_plain_text_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
@@ -25193,9 +25339,14 @@ async fn proxy_to_backend_http3(
                     );
                 }
                 let limited = http_body_util::Limited::new(body, state.max_request_body_size_bytes);
-                match limited.collect().await {
-                    Ok(collected) => collected.to_bytes().to_vec(),
-                    Err(_) => {
+                match collect_request_body_with_timeout(
+                    limited.collect(),
+                    proxy.backend_read_timeout_ms,
+                )
+                .await
+                {
+                    Ok(Ok(collected)) => collected.to_bytes().to_vec(),
+                    Ok(Err(_)) => {
                         return (
                             retry::BackendResponse {
                                 status_code: 413,
@@ -25212,11 +25363,19 @@ async fn proxy_to_backend_http3(
                             None,
                         );
                     }
+                    Err(_) => {
+                        return (request_body_timeout_backend_response(resolved_ip), None);
+                    }
                 }
             } else {
-                match body.collect().await {
-                    Ok(collected) => collected.to_bytes().to_vec(),
-                    Err(e) => {
+                match collect_request_body_with_timeout(
+                    body.collect(),
+                    proxy.backend_read_timeout_ms,
+                )
+                .await
+                {
+                    Ok(Ok(collected)) => collected.to_bytes().to_vec(),
+                    Ok(Err(e)) => {
                         error!(
                             proxy_id = %proxy.id,
                             backend_url = %strip_query_params(backend_url),
@@ -25237,6 +25396,9 @@ async fn proxy_to_backend_http3(
                             },
                             None,
                         );
+                    }
+                    Err(_) => {
+                        return (request_body_timeout_backend_response(resolved_ip), None);
                     }
                 }
             }
@@ -26243,6 +26405,66 @@ fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn stalled_buffered_probe_times_out_and_releases_slot_neutral() {
+        use crate::circuit_breaker::CircuitBreaker;
+        use crate::config::types::CircuitBreakerConfig;
+
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            timeout_seconds: 0,
+            failure_status_codes: vec![500],
+            half_open_max_requests: 1,
+            trip_on_connection_errors: true,
+        });
+        cb.record_failure(500, false, false);
+        assert!(
+            cb.can_execute().unwrap(),
+            "the request claims the probe slot"
+        );
+        assert_eq!(cb.half_open_in_flight(), 1);
+
+        let stalled_upload = std::future::pending::<Result<(), ()>>();
+        let result = super::collect_request_body_with_timeout(stalled_upload, 10).await;
+        assert!(
+            matches!(result, Err(super::RequestBodyBufferError::TimedOut)),
+            "a never-ending buffered upload must hit the configured deadline"
+        );
+
+        cb.record_neutral(true);
+        assert_eq!(cb.half_open_in_flight(), 0);
+        assert_eq!(
+            cb.state_name(),
+            "half_open",
+            "a client upload timeout releases the slot without healing or tripping the breaker"
+        );
+        assert!(
+            cb.can_execute().unwrap(),
+            "the released single probe slot admits the next recovery probe"
+        );
+    }
+
+    #[test]
+    fn request_body_timeout_uses_grpc_deadline_response() {
+        let response = super::build_request_body_timeout_response(true, None);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("grpc-status")
+                .and_then(|value| value.to_str().ok()),
+            Some("4")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/grpc")
+        );
+    }
+
     use super::*;
     use crate::config::types::{LoadBalancerAlgorithm, PluginAssociation};
     use crate::plugins::PluginHttpClient;

@@ -45,6 +45,29 @@ use crate::proxy::{
 };
 use crate::tls::{CrlList, TlsPolicy};
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum H3RequestBodyReadError<E> {
+    Read(E),
+    TimedOut,
+}
+
+pub(super) async fn collect_h3_request_body_with_timeout<F, T, E>(
+    collect: F,
+    request_body_read_timeout_ms: u64,
+) -> Result<T, H3RequestBodyReadError<E>>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    if request_body_read_timeout_ms == 0 {
+        return collect.await.map_err(H3RequestBodyReadError::Read);
+    }
+
+    tokio::time::timeout(Duration::from_millis(request_body_read_timeout_ms), collect)
+        .await
+        .map_err(|_| H3RequestBodyReadError::TimedOut)?
+        .map_err(H3RequestBodyReadError::Read)
+}
+
 /// Optional HTTP/3 listener settings that don't affect the core bind contract.
 #[derive(Default)]
 pub struct Http3ListenerOptions {
@@ -2156,24 +2179,37 @@ async fn handle_h3_request(
         let body_was_prebuffered = prebuffered_body_data.is_some();
         let mut body_data = prebuffered_body_data.take().unwrap_or_default();
         if !body_was_prebuffered {
-            while let Some(chunk) = stream.recv_data().await.inspect_err(|_error| {
-                release_h3_circuit_breaker_probe_on_admission_reject(
-                    &state,
-                    &proxy,
-                    cb_target_key.as_deref(),
-                    cb_is_half_open_probe,
-                );
-            })? {
-                let bytes = chunk.chunk();
-                if content_length_limit > 0 && body_data.len() + bytes.len() > content_length_limit
-                {
+            let collect = async {
+                while let Some(chunk) = stream.recv_data().await? {
+                    let bytes = chunk.chunk();
+                    if content_length_limit > 0
+                        && body_data.len() + bytes.len() > content_length_limit
+                    {
+                        return Ok::<_, h3::error::StreamError>(false);
+                    }
+                    body_data.extend_from_slice(bytes);
+                }
+                Ok(true)
+            };
+            match collect_h3_request_body_with_timeout(collect, proxy.backend_read_timeout_ms).await
+            {
+                Ok(true) => {}
+                Ok(false) => {
                     release_h3_circuit_breaker_probe_on_admission_reject(
                         &state,
                         &proxy,
                         cb_target_key.as_deref(),
                         cb_is_half_open_probe,
                     );
-                    record_request(&state, 413);
+                    drop(preacquired_backend_admission.take_if_acquired());
+                    let metric_status = h3_reject_log_status_and_metadata(
+                        &mut ctx,
+                        http_flavor,
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        br#"{"error":"Request body exceeds maximum size"}"#,
+                        &HashMap::new(),
+                    );
+                    record_request(&state, metric_status);
                     send_h3_error_flavor_aware(
                         &mut stream,
                         http_flavor,
@@ -2185,7 +2221,44 @@ async fn handle_h3_request(
                     .await?;
                     return Ok(());
                 }
-                body_data.extend_from_slice(bytes);
+                Err(H3RequestBodyReadError::Read(error)) => {
+                    release_h3_circuit_breaker_probe_on_admission_reject(
+                        &state,
+                        &proxy,
+                        cb_target_key.as_deref(),
+                        cb_is_half_open_probe,
+                    );
+                    return Err(error.into());
+                }
+                Err(H3RequestBodyReadError::TimedOut) => {
+                    release_h3_circuit_breaker_probe_on_admission_reject(
+                        &state,
+                        &proxy,
+                        cb_target_key.as_deref(),
+                        cb_is_half_open_probe,
+                    );
+                    // Admission capacity is no longer protecting backend work;
+                    // release it before an awaited client write can stall.
+                    drop(preacquired_backend_admission.take_if_acquired());
+                    record_request(
+                        &state,
+                        if matches!(http_flavor, HttpFlavor::Grpc) {
+                            StatusCode::OK.as_u16()
+                        } else {
+                            StatusCode::REQUEST_TIMEOUT.as_u16()
+                        },
+                    );
+                    send_h3_error_flavor_aware(
+                        &mut stream,
+                        http_flavor,
+                        StatusCode::REQUEST_TIMEOUT,
+                        r#"{"error":"Request body read timed out"}"#,
+                        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                        "Request body read timed out",
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
         }
         let raw_request_body_bytes = body_data.len() as u64;
@@ -2637,69 +2710,34 @@ async fn handle_h3_request(
                 let body_was_prebuffered = prebuffered_body_data.is_some();
                 let mut body_data = prebuffered_body_data.take().unwrap_or_default();
                 if !body_was_prebuffered {
-                    while let Some(chunk) = stream.recv_data().await.inspect_err(|_e| {
-                        // Client read error during cross-protocol prebuffering,
-                        // before cross_protocol::run (which would release a
-                        // reserved HALF_OPEN probe). Release it here so an aborted
-                        // upload during HALF_OPEN can't permanently wedge the
-                        // breaker — same leak class as the oversized-body 413 path
-                        // below. ClientDisconnect drives a neutral breaker release
-                        // and suppresses the health/latency samples; status is
-                        // irrelevant (no response was produced).
-                        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
-                            &state,
-                            &proxy,
-                            &epoch.load_balancer,
-                            upstream_balancer.as_ref(),
-                            upstream_target.as_deref(),
-                            cb_target_key.as_deref(),
-                            0,
-                            false,
-                            Some(crate::retry::ErrorClass::ClientDisconnect),
-                            cb_is_half_open_probe,
-                            false,
-                            backend_start.elapsed(),
-                        );
-                    })? {
-                        let bytes = chunk.chunk();
-                        if content_length_limit > 0
-                            && body_data.len() + bytes.len() > content_length_limit
-                        {
-                            record_request(&state, 413);
-                            // The circuit-breaker check above may have admitted this
-                            // request as a half-open probe (cb_is_half_open_probe),
-                            // reserving a slot. This cross-protocol prebuffering
-                            // early return bypasses cross_protocol::run (which would
-                            // release it) and no record_connection_start was issued
-                            // on this path, so use the no-conn-end variant to release
-                            // the probe slot without touching the least-connections
-                            // gauge. Without it, a single oversized upload during
-                            // HALF_OPEN permanently wedges the breaker (same leak
-                            // class as the native-H3 streaming path).
-                            //
-                            // Record this BEFORE the client-facing 413 write below: if
-                            // the client resets while the 413 is being written, that
-                            // `.await?` returns Err and the early return runs before
-                            // any code after it, so recording the outcome after the
-                            // write would skip the release and leak the probe slot
-                            // (wedging a single-slot breaker). The native-H3 reject /
-                            // read-error paths in this same patch release before their
-                            // client-facing writes for exactly this reason.
-                            //
-                            // An oversized client upload is client-caused, so
-                            // ClientDisconnect drives the outcome:
-                            //   * connection_error=false — accurate (no transport
-                            //     error occurred; we chose to 413 a too-large body).
-                            //     The ClientDisconnect class centrally suppresses both
-                            //     the least-latency sample (the synthetic 413 reflects
-                            //     no real backend latency) and the passive-health
-                            //     report (no phantom <500 success, and no failure even
-                            //     if 413 sat in unhealthy_status_codes), so passing
-                            //     true here would be redundant and less truthful.
-                            //   * the breaker still goes neutral via record_neutral():
-                            //     the ClientDisconnect arm is evaluated before
-                            //     connection_error, releasing the half-open probe slot
-                            //     without tripping the breaker.
+                    let collect = async {
+                        while let Some(chunk) = stream.recv_data().await? {
+                            let bytes = chunk.chunk();
+                            if content_length_limit > 0
+                                && body_data.len() + bytes.len() > content_length_limit
+                            {
+                                return Ok::<_, h3::error::StreamError>(false);
+                            }
+                            body_data.extend_from_slice(bytes);
+                        }
+                        Ok(true)
+                    };
+                    match collect_h3_request_body_with_timeout(
+                        collect,
+                        proxy.backend_read_timeout_ms,
+                    )
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let metric_status = h3_reject_log_status_and_metadata(
+                                &mut ctx,
+                                http_flavor,
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                br#"{"error":"Request body exceeds maximum size"}"#,
+                                &HashMap::new(),
+                            );
+                            record_request(&state, metric_status);
                             crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
                                 &state,
                                 &proxy,
@@ -2725,7 +2763,59 @@ async fn handle_h3_request(
                             .await?;
                             return Ok(());
                         }
-                        body_data.extend_from_slice(bytes);
+                        Err(H3RequestBodyReadError::Read(error)) => {
+                            // This path returns before cross_protocol::run can
+                            // release an admitted HALF_OPEN probe.
+                            crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
+                                &state,
+                                &proxy,
+                                &epoch.load_balancer,
+                                upstream_balancer.as_ref(),
+                                upstream_target.as_deref(),
+                                cb_target_key.as_deref(),
+                                0,
+                                false,
+                                Some(crate::retry::ErrorClass::ClientDisconnect),
+                                cb_is_half_open_probe,
+                                false,
+                                backend_start.elapsed(),
+                            );
+                            return Err(error.into());
+                        }
+                        Err(H3RequestBodyReadError::TimedOut) => {
+                            crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
+                                &state,
+                                &proxy,
+                                &epoch.load_balancer,
+                                upstream_balancer.as_ref(),
+                                upstream_target.as_deref(),
+                                cb_target_key.as_deref(),
+                                StatusCode::REQUEST_TIMEOUT.as_u16(),
+                                false,
+                                Some(crate::retry::ErrorClass::ClientDisconnect),
+                                cb_is_half_open_probe,
+                                false,
+                                backend_start.elapsed(),
+                            );
+                            record_request(
+                                &state,
+                                if matches!(http_flavor, HttpFlavor::Grpc) {
+                                    StatusCode::OK.as_u16()
+                                } else {
+                                    StatusCode::REQUEST_TIMEOUT.as_u16()
+                                },
+                            );
+                            send_h3_error_flavor_aware(
+                                &mut stream,
+                                http_flavor,
+                                StatusCode::REQUEST_TIMEOUT,
+                                r#"{"error":"Request body read timed out"}"#,
+                                crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                                "Request body read timed out",
+                            )
+                            .await?;
+                            return Ok(());
+                        }
                     }
                 }
                 Some(body_data)
@@ -3783,41 +3873,81 @@ async fn handle_h3_request(
     let body_was_prebuffered = prebuffered_body_data.is_some();
     let mut body_data = prebuffered_body_data.take().unwrap_or_default();
     if !body_was_prebuffered {
-        while let Some(chunk) = stream.recv_data().await.inspect_err(|_e| {
-            // Client read error while buffering the request body, before
-            // backend dispatch. The CB check above may have reserved a
-            // HALF_OPEN probe; release it so the breaker isn't wedged,
-            // matching run_h3_backend_admission_or_send_reject.
-            release_h3_circuit_breaker_probe_on_admission_reject(
-                &state,
-                &proxy,
-                cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            );
-        })? {
-            let bytes = chunk.chunk();
-            if state.max_request_body_size_bytes > 0
-                && body_data.len() + bytes.len() > state.max_request_body_size_bytes
-            {
-                // Oversized body — gateway-side 413 before backend dispatch.
-                // Release the reserved HALF_OPEN probe before the reject write
-                // (which uses `?` and could exit early on client reset).
+        let collect = async {
+            while let Some(chunk) = stream.recv_data().await? {
+                let bytes = chunk.chunk();
+                if state.max_request_body_size_bytes > 0
+                    && body_data.len() + bytes.len() > state.max_request_body_size_bytes
+                {
+                    return Ok::<_, h3::error::StreamError>(false);
+                }
+                body_data.extend_from_slice(bytes);
+            }
+            Ok(true)
+        };
+        match collect_h3_request_body_with_timeout(collect, proxy.backend_read_timeout_ms).await {
+            Ok(true) => {}
+            Ok(false) => {
                 release_h3_circuit_breaker_probe_on_admission_reject(
                     &state,
                     &proxy,
                     cb_target_key.as_deref(),
                     cb_is_half_open_probe,
                 );
-                record_request(&state, 413);
-                send_h3_response(
+                let metric_status = h3_reject_log_status_and_metadata(
+                    &mut ctx,
+                    http_flavor,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    br#"{"error":"Request body exceeds maximum size"}"#,
+                    &HashMap::new(),
+                );
+                record_request(&state, metric_status);
+                send_h3_error_flavor_aware(
                     &mut stream,
+                    http_flavor,
                     StatusCode::PAYLOAD_TOO_LARGE,
                     r#"{"error":"Request body exceeds maximum size"}"#,
+                    crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                    "Request body exceeds maximum size",
                 )
                 .await?;
                 return Ok(());
             }
-            body_data.extend_from_slice(bytes);
+            Err(H3RequestBodyReadError::Read(error)) => {
+                release_h3_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
+                return Err(error.into());
+            }
+            Err(H3RequestBodyReadError::TimedOut) => {
+                release_h3_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
+                record_request(
+                    &state,
+                    if matches!(http_flavor, HttpFlavor::Grpc) {
+                        StatusCode::OK.as_u16()
+                    } else {
+                        StatusCode::REQUEST_TIMEOUT.as_u16()
+                    },
+                );
+                send_h3_error_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    StatusCode::REQUEST_TIMEOUT,
+                    r#"{"error":"Request body read timed out"}"#,
+                    crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                    "Request body read timed out",
+                )
+                .await?;
+                return Ok(());
+            }
         }
     }
 
@@ -8553,6 +8683,42 @@ fn record_request(state: &ProxyState, status: u16) {
             .fetch_add(1, Ordering::Relaxed);
     }
     crate::runtime_metrics::global_ref().record_http_status(status);
+}
+
+#[cfg(test)]
+mod h3_request_body_timeout_tests {
+    #[tokio::test]
+    async fn stalled_buffered_probe_times_out_and_releases_slot_neutral() {
+        use crate::circuit_breaker::CircuitBreaker;
+        use crate::config::types::CircuitBreakerConfig;
+
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            timeout_seconds: 0,
+            failure_status_codes: vec![500],
+            half_open_max_requests: 1,
+            trip_on_connection_errors: true,
+        });
+        cb.record_failure(500, false, false);
+        assert!(
+            cb.can_execute().unwrap(),
+            "the H3 request claims the probe slot"
+        );
+        assert_eq!(cb.half_open_in_flight(), 1);
+
+        let stalled_upload = std::future::pending::<Result<(), ()>>();
+        let result = super::collect_h3_request_body_with_timeout(stalled_upload, 10).await;
+        assert_eq!(result, Err(super::H3RequestBodyReadError::TimedOut));
+
+        cb.record_neutral(true);
+        assert_eq!(cb.half_open_in_flight(), 0);
+        assert_eq!(cb.state_name(), "half_open");
+        assert!(
+            cb.can_execute().unwrap(),
+            "the released H3 probe slot admits the next recovery probe"
+        );
+    }
 }
 
 #[cfg(test)]
