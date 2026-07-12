@@ -964,6 +964,7 @@ async fn run_with_backend(
                 retry_pending_pod_ip_removals(
                     backend.as_mut(),
                     &pod_states,
+                    config,
                     metrics.as_ref(),
                 );
                 retry_pending_node_probe_port_updates(
@@ -2435,7 +2436,7 @@ fn retry_backed_off_pod_enrollments(
 
 fn pending_pod_ip_removal_failures(
     pod_states: &DashMap<String, PodAttachmentState>,
-) -> Vec<(String, std::net::IpAddr)> {
+) -> Vec<(String, String, String, std::net::IpAddr)> {
     if PENDING_CAPTURE_FAILURES.is_empty() {
         return Vec::new();
     }
@@ -2450,8 +2451,9 @@ fn pending_pod_ip_removal_failures(
             {
                 return None;
             }
+            let pod_uid = failure.state_key.strip_prefix(&key_prefix)?.to_string();
             let ip = failure.detail.parse().ok()?;
-            Some((failure.key, ip))
+            Some((failure.key, failure.state_key, pod_uid, ip))
         })
         .collect()
 }
@@ -2637,6 +2639,7 @@ fn retry_pending_node_probe_port_removals(
 fn retry_pending_pod_ip_removals(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
 ) {
     let pending = pending_pod_ip_removal_failures(pod_states);
@@ -2644,7 +2647,7 @@ fn retry_pending_pod_ip_removals(
         return;
     }
 
-    for (failure_key, ip) in pending {
+    for (failure_key, state_key, pod_uid, ip) in pending {
         if let Some(owner_pod_uid) = pod_owning_ip_addr(pod_states, ip) {
             PENDING_CAPTURE_FAILURES.remove(&failure_key);
             debug!(
@@ -2652,6 +2655,7 @@ fn retry_pending_pod_ip_removals(
                 %ip,
                 "Cleared pending pod IP removal failure because another tracked pod owns the IP"
             );
+            complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
             continue;
         }
 
@@ -2663,6 +2667,7 @@ fn retry_pending_pod_ip_removals(
             Ok(()) => {
                 PENDING_CAPTURE_FAILURES.remove(&failure_key);
                 debug!(%ip, "Recovered pending pod IP map removal failure");
+                complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
             }
             Err(e) => {
                 warn!(
@@ -2768,11 +2773,13 @@ fn remove_pod_registry(dir: &std::path::Path, pod_uid: &str) {
 /// Remove the mesh proxy's readiness markers on pod teardown. The proxy also
 /// removes them when its in-netns listeners close, but doing it here too closes
 /// the window where a same-UID re-enroll could observe stale readiness for the
-/// torn-down listeners. Best-effort; shares the registry path-safety guard.
-fn remove_pod_ready_marker(dir: &std::path::Path, pod_uid: &str) {
+/// torn-down listeners. Returns whether every marker is absent so enrollment
+/// can fail closed; teardown callers may deliberately use it best-effort.
+fn remove_pod_ready_marker(dir: &std::path::Path, pod_uid: &str) -> bool {
     if pod_registry_uid_is_unsafe(pod_uid) {
-        return;
+        return false;
     }
+    let mut removed = true;
     for marker_dir in [
         ".ready",
         ".ready4",
@@ -2784,6 +2791,7 @@ fn remove_pod_ready_marker(dir: &std::path::Path, pod_uid: &str) {
         if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
+            removed = false;
             warn!(
                 pod_uid,
                 path = %path.display(),
@@ -2792,6 +2800,7 @@ fn remove_pod_ready_marker(dir: &std::path::Path, pod_uid: &str) {
             );
         }
     }
+    removed
 }
 
 fn write_udp_not_ready_ack(dir: &std::path::Path, pod_uid: &str) {
@@ -2856,6 +2865,42 @@ fn remove_udp_gate_cleaned_proof(dir: &std::path::Path, pod_uid: &str) -> bool {
             warn!(pod_uid, path = %path.display(), %error, "Failed to remove Ambient UDP cleaned-gate proof");
             false
         }
+    }
+}
+
+fn has_pending_pod_ip_removal_failure(state_key: &str) -> bool {
+    PENDING_CAPTURE_FAILURES.iter().any(|entry| {
+        parse_pending_capture_failure_key(entry.key()).is_some_and(|failure| {
+            failure.state_key == state_key && failure.operation == CAPTURE_FAILURE_POD_IP_REMOVE
+        })
+    })
+}
+
+/// Complete a removed pod's durable UDP close handoff after the last pod-IP
+/// cleanup retry succeeds. Live-pod IP-update retries must never mint removal
+/// proof, and a dual-stack removal must wait for both map entries to recover.
+fn complete_removed_udp_close_handoff(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    state_key: &str,
+    pod_uid: &str,
+) {
+    if !udp_readiness_reconcile_enabled(config)
+        || pod_states.contains_key(pod_uid)
+        || has_pending_pod_ip_removal_failure(state_key)
+    {
+        return;
+    }
+    let Some(dir) = &config.node_waypoint_pod_registry_dir else {
+        return;
+    };
+    if write_udp_gate_cleaned_proof(dir, pod_uid) {
+        write_udp_not_ready_ack(dir, pod_uid);
+    } else {
+        warn!(
+            pod_uid,
+            "Withholding Ambient UDP not-ready acknowledgement because durable cleaned-gate proof could not be persisted after pod-IP cleanup retry"
+        );
     }
 }
 
@@ -3449,10 +3494,14 @@ fn handle_pod_added(
     // readiness. Close the BPF UDP gate before publishing the new registry
     // entry; the producer will publish a fresh marker only after its guard and
     // TPROXY socket/rules are live.
-    if config.capture_config.udp_capture_enabled
+    if udp_readiness_reconcile_enabled(config)
         && let Some(dir) = &config.node_waypoint_pod_registry_dir
     {
-        remove_pod_ready_marker(dir, pod_uid);
+        if !remove_pod_ready_marker(dir, pod_uid) {
+            metrics.record_attach_error();
+            remember_failed_pod_enrollment(&state_key, attempt_signature, enrollment_snapshot);
+            return;
+        }
         // A live pod can leave and later re-enter mesh enrollment with the same
         // Kubernetes UID. It must not inherit the prior removal's durable proof,
         // which would let an old proxy request authorize teardown after this
@@ -4504,11 +4553,7 @@ pub fn handle_pod_removed(
         }
         metrics.pods_unenrolled.fetch_add(1, Ordering::Relaxed);
         info!(pod_uid, pod_name = %state.pod_name, "Pod unenrolled from eBPF capture");
-        udp_gate_cleanup_succeeded &= !PENDING_CAPTURE_FAILURES.iter().any(|entry| {
-            parse_pending_capture_failure_key(entry.key()).is_some_and(|failure| {
-                failure.state_key == state_key && failure.operation == CAPTURE_FAILURE_POD_IP_REMOVE
-            })
-        });
+        udp_gate_cleanup_succeeded &= !has_pending_pod_ip_removal_failure(&state_key);
     }
     if udp_readiness_reconcile_enabled(config) {
         if udp_gate_cleanup_succeeded {
@@ -5979,7 +6024,7 @@ mod tests {
     }
 
     #[test]
-    fn pod_removal_withholds_udp_not_ready_ack_when_bpf_gate_cleanup_fails() {
+    fn pod_ip_removal_retry_completes_udp_close_handoff() {
         for udp_capture_enabled in [true, false] {
             let registry = tempfile::tempdir().unwrap();
             let mut capture_config = CaptureConfig::explicit(15006, 15001);
@@ -6031,16 +6076,6 @@ mod tests {
             std::fs::write(required_dir.join("pod-udp"), b"").unwrap();
             reconcile_removed_udp_close_acknowledgements(registry.path(), &pod_states, true);
 
-            for marker_dir in [".udp-not-ready", ".udp-ack-required", ".udp-gate-cleaned"] {
-                reap_orphaned_udp_handshake_markers_older_than(
-                    registry.path(),
-                    marker_dir,
-                    &pod_states,
-                    true,
-                    std::time::Duration::ZERO,
-                );
-            }
-
             assert!(
                 !registry
                     .path()
@@ -6061,7 +6096,32 @@ mod tests {
                 metrics.snapshot().capture_state,
                 NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
             );
-            forget_pending_capture_failures_for_pod(&state_key);
+
+            backend.fail_remove_pod_ip = false;
+            retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
+
+            let ack = registry.path().join(".udp-not-ready").join("pod-udp");
+            let proof = registry.path().join(".udp-gate-cleaned").join("pod-udp");
+            assert!(
+                proof.is_file(),
+                "recovered cleanup must persist proof (udp_capture_enabled={udp_capture_enabled})"
+            );
+            assert!(
+                ack.is_file(),
+                "recovered cleanup must publish an ack (udp_capture_enabled={udp_capture_enabled})"
+            );
+            assert!(!has_pending_pod_ip_removal_failure(&state_key));
+            assert_eq!(
+                metrics.snapshot().capture_state,
+                NODE_AGENT_CAPTURE_STATE_READY
+            );
+
+            std::fs::remove_file(&ack).unwrap();
+            reconcile_removed_udp_close_acknowledgements(registry.path(), &pod_states, true);
+            assert!(
+                ack.is_file(),
+                "durable request must receive a replacement ack after retry recovery (udp_capture_enabled={udp_capture_enabled})"
+            );
         }
     }
 
@@ -6824,16 +6884,84 @@ mod tests {
 
     #[test]
     fn handle_pod_added_closes_udp_guard_before_registry_publication() {
+        for udp_capture_enabled in [true, false] {
+            let mut backend = MockEbpfBackend::default();
+            backend.load_programs().unwrap();
+            let pod_states = DashMap::new();
+            let metrics = NodeAgentMetrics::default();
+            let cgroup_root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-udp")).unwrap();
+            let registry = tempfile::tempdir().unwrap();
+            let ready_dir = registry.path().join(".udp-ready");
+            let proof_dir = registry.path().join(".udp-gate-cleaned");
+            std::fs::create_dir_all(&ready_dir).unwrap();
+            std::fs::create_dir_all(&proof_dir).unwrap();
+            std::fs::write(ready_dir.join("pod-udp"), b"stale").unwrap();
+            std::fs::write(proof_dir.join("pod-udp"), b"stale").unwrap();
+            let mut capture_config = CaptureConfig::explicit(15006, 15001);
+            capture_config.udp_capture_enabled = udp_capture_enabled;
+            let config = NodeAgentConfig {
+                node_name: "test-node".to_string(),
+                capture_config,
+                cgroup_root: cgroup_root.path().to_string_lossy().to_string(),
+                bpf_fs_path: "/nonexistent".to_string(),
+                fallback_mode: FallbackMode::Fail,
+                excluded_namespaces: HashSet::new(),
+                capture_contract: CaptureContract::local_pod_defaults(),
+                trust_domain: "cluster.local".to_string(),
+                node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+            };
+            let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+            let annotations = HashMap::new();
+            let event = PodEvent {
+                pod_uid: "pod-udp",
+                pod_name: "pod-udp",
+                namespace: "default",
+                service_account: None,
+                labels: &labels,
+                annotations: &annotations,
+                pod_ip_str: Some("10.0.0.9"),
+                pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.9")),
+                node_probe_ports: Vec::new(),
+                pod_pid: None,
+                veth_iface_override: Some("veth-udp"),
+            };
+
+            handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
+
+            assert!(registry.path().join("pod-udp").is_file());
+            assert!(
+                !ready_dir.join("pod-udp").exists(),
+                "stale readiness must be cleared before re-enrollment (udp_capture_enabled={udp_capture_enabled})"
+            );
+            assert!(
+                !proof_dir.join("pod-udp").exists(),
+                "stale cleanup proof must be cleared before re-enrollment (udp_capture_enabled={udp_capture_enabled})"
+            );
+            let info = &backend.pod_ips[&"10.0.0.9".parse().unwrap()];
+            assert_eq!(
+                info.capture_flags & ferrum_ebpf_common::POD_CAPTURE_FLAG_UDP_ENABLED != 0,
+                udp_capture_enabled
+            );
+            assert!(info.capture_flags & ferrum_ebpf_common::POD_CAPTURE_FLAG_UDP_READY == 0);
+        }
+    }
+
+    #[test]
+    fn handle_pod_added_retries_when_stale_udp_ready_marker_cannot_be_removed() {
         let mut backend = MockEbpfBackend::default();
         backend.load_programs().unwrap();
         let pod_states = DashMap::new();
         let metrics = NodeAgentMetrics::default();
         let cgroup_root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-udp")).unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-udp-delete-fail"))
+            .unwrap();
         let registry = tempfile::tempdir().unwrap();
-        let ready_dir = registry.path().join(".udp-ready");
-        std::fs::create_dir_all(&ready_dir).unwrap();
-        std::fs::write(ready_dir.join("pod-udp"), b"stale").unwrap();
+        let marker = registry
+            .path()
+            .join(".udp-ready")
+            .join("pod-udp-delete-fail");
+        std::fs::create_dir_all(&marker).unwrap();
         let mut capture_config = CaptureConfig::explicit(15006, 15001);
         capture_config.udp_capture_enabled = true;
         let config = NodeAgentConfig {
@@ -6850,14 +6978,14 @@ mod tests {
         let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
         let annotations = HashMap::new();
         let event = PodEvent {
-            pod_uid: "pod-udp",
-            pod_name: "pod-udp",
+            pod_uid: "pod-udp-delete-fail",
+            pod_name: "pod-udp-delete-fail",
             namespace: "default",
             service_account: None,
             labels: &labels,
             annotations: &annotations,
-            pod_ip_str: Some("10.0.0.9"),
-            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.9")),
+            pod_ip_str: Some("10.0.0.10"),
+            pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.10")),
             node_probe_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-udp"),
@@ -6865,14 +6993,11 @@ mod tests {
 
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
 
-        assert!(registry.path().join("pod-udp").is_file());
-        assert!(
-            !ready_dir.join("pod-udp").exists(),
-            "a stale producer marker must close before re-enrollment is published"
-        );
-        let info = &backend.pod_ips[&"10.0.0.9".parse().unwrap()];
-        assert!(info.capture_flags & ferrum_ebpf_common::POD_CAPTURE_FLAG_UDP_ENABLED != 0);
-        assert!(info.capture_flags & ferrum_ebpf_common::POD_CAPTURE_FLAG_UDP_READY == 0);
+        let state_key = pod_state_key(&pod_states, event.pod_uid);
+        assert!(FAILED_POD_ENROLLMENT_ATTEMPTS.contains_key(&state_key));
+        assert!(!pod_states.contains_key(event.pod_uid));
+        assert!(!registry.path().join(event.pod_uid).exists());
+        forget_failed_pod_enrollment(&state_key);
     }
 
     #[test]
@@ -8485,7 +8610,18 @@ mod tests {
         );
 
         backend.fail_remove_pod_ip = false;
-        retry_pending_pod_ip_removals(&mut backend, &pod_states, &metrics);
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
         assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
         assert!(
@@ -10004,7 +10140,7 @@ mod tests {
         );
 
         backend.fail_remove_pod_ip = false;
-        retry_pending_pod_ip_removals(&mut backend, &pod_states, &metrics);
+        retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
         assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
         assert!(
@@ -10117,7 +10253,18 @@ mod tests {
             ip.to_string()
         );
 
-        retry_pending_pod_ip_removals(&mut backend, &pod_states, &metrics);
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/nonexistent".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        };
+        retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
         assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
         assert!(
@@ -10202,7 +10349,7 @@ mod tests {
             },
         );
 
-        retry_pending_pod_ip_removals(&mut backend, &pod_states, &metrics);
+        retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
         assert!(
             !PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
