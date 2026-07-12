@@ -1,8 +1,82 @@
 use std::fmt::Display;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use tokio::sync::oneshot;
+
+const SANITIZED_LISTENER_FAILURE: &str = "listener serve task exited after successful bind";
+
+/// Durable, lock-free snapshot of serving listeners that exited after bind.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ServingListenerFailure {
+    pub listener: String,
+    pub listen_port: u16,
+    pub error: String,
+    pub kind: ServingListenerFailureKind,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingListenerFailureKind {
+    ServeFailed,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ServingListenerFailureSnapshot {
+    pub failures_total: usize,
+    pub failures: Vec<ServingListenerFailure>,
+}
+
+/// Failure-path-only recorder shared by listener tasks and authenticated admin
+/// observability. Entries are monotonic for the process lifetime, matching the
+/// sticky serving-degraded readiness signal.
+#[derive(Debug)]
+pub struct ServingListenerFailures {
+    failures: arc_swap::ArcSwap<Vec<ServingListenerFailure>>,
+}
+
+impl Default for ServingListenerFailures {
+    fn default() -> Self {
+        Self {
+            failures: arc_swap::ArcSwap::from_pointee(Vec::new()),
+        }
+    }
+}
+
+impl ServingListenerFailures {
+    pub fn record(&self, listener: &str, listen_port: u16) {
+        self.failures.rcu(|current| {
+            if current
+                .iter()
+                .any(|failure| failure.listener == listener && failure.listen_port == listen_port)
+            {
+                return Arc::clone(current);
+            }
+            let mut updated = current.as_ref().clone();
+            updated.push(ServingListenerFailure {
+                listener: listener.to_string(),
+                listen_port,
+                // Never retain the underlying error: listener errors may carry
+                // operator-controlled paths or metadata. The structured log is
+                // the transient diagnostic; this durable surface is sanitized.
+                error: SANITIZED_LISTENER_FAILURE.to_string(),
+                kind: ServingListenerFailureKind::ServeFailed,
+            });
+            Arc::new(updated)
+        });
+    }
+
+    pub fn snapshot(&self) -> ServingListenerFailureSnapshot {
+        let failures = self.failures.load_full();
+        ServingListenerFailureSnapshot {
+            failures_total: failures.len(),
+            failures: failures.as_ref().clone(),
+        }
+    }
+}
 
 /// Record that a serving listener/server task exited with an error after
 /// startup and durably drive the shared readiness flags to not-ready.
@@ -45,6 +119,20 @@ pub fn flip_ready_off_on_listener_failure<E: Display>(
         error = %err,
         "Serving listener task exited with an error; marked serving degraded and flipped readiness to not-ready"
     );
+}
+
+/// Record a durable sanitized listener-failure snapshot and flip readiness via
+/// the shared sticky degradation mechanism.
+pub fn record_post_start_listener_failure<E: Display>(
+    startup_ready: &AtomicBool,
+    serving_degraded: &AtomicBool,
+    failures: &ServingListenerFailures,
+    listener: &str,
+    listen_port: u16,
+    err: &E,
+) {
+    failures.record(listener, listen_port);
+    flip_ready_off_on_listener_failure(startup_ready, serving_degraded, listener, err);
 }
 
 /// Wait for one or more listener startup signals.

@@ -174,7 +174,7 @@ pub struct AdminState {
     /// DP mode differs: it starts with an empty config and defers `startup_ready`
     /// until the first CP snapshot is applied + backend capabilities are classified.
     pub startup_ready: Option<Arc<AtomicBool>>,
-    /// Sticky serving-degradation signal (set only in CP/DP modes, which
+    /// Sticky serving-degradation signal (set in CP/DP/mesh modes, which
     /// supervise post-start listener/server tasks). Set once — and never unset —
     /// by [`crate::startup::flip_ready_off_on_listener_failure`] when a serving
     /// task (CP gRPC server; DP proxy/admin listeners) exits with an error after
@@ -183,9 +183,12 @@ pub struct AdminState {
     /// `true` once after the gRPC start signal and DP re-stores `true` on every
     /// CP-reconnect snapshot — this flag is monotonic, so a post-start serve
     /// failure stays visible even after a later readiness restore. `None` in
-    /// modes without post-start listener supervision (file/database/mesh/
-    /// node_agent), where readiness is governed by `startup_ready` alone.
+    /// modes without post-start listener supervision (file/database/node_agent),
+    /// where readiness is governed by `startup_ready` alone.
     pub serving_degraded: Option<Arc<AtomicBool>>,
+    /// Durable sanitized details for post-start listener failures. Populated by
+    /// mesh mode and exposed only on authenticated observability responses.
+    pub serving_listener_failures: Option<Arc<crate::startup::ServingListenerFailures>>,
     /// Dynamic flag set by the DB polling loop. When `false`, write operations
     /// are rejected early to preserve the cached config until the DB recovers.
     /// This flag is orthogonal to `startup_ready` — a gateway can be ready to
@@ -1022,7 +1025,7 @@ pub async fn handle_admin_request(
             .as_ref()
             .is_none_or(|flag| flag.load(Ordering::Acquire));
         // Sticky serving-degradation overrides a readiness restore (issue
-        // #2117): once a CP/DP serving task dies after startup, `/health` stays
+        // #2117): once a CP/DP/mesh serving task dies after startup, `/health` stays
         // not-ready even though the mode's main task (CP) or a CP reconnect (DP)
         // later stores `startup_ready = true`. Only CP/DP populate this flag.
         let serving_degraded = state
@@ -1031,6 +1034,14 @@ pub async fn handle_admin_request(
             .is_some_and(|flag| flag.load(Ordering::Acquire));
         let ready = startup_ready && !serving_degraded;
         health_status["ready"] = json!(ready);
+
+        if let Some(failures) = state.serving_listener_failures.as_ref() {
+            let snapshot = failures.snapshot();
+            if snapshot.failures_total > 0 {
+                health_status["listener_failures"] =
+                    serde_json::to_value(snapshot).unwrap_or_default();
+            }
+        }
 
         // Report cached config availability for resilience visibility
         if let Some(config) = state.cached_gateway_config() {
@@ -1141,6 +1152,12 @@ pub async fn handle_admin_request(
                     serde_json::to_value(proxy_state.stream_listener_manager.overload_snapshot())
                         .unwrap_or_default(),
                 );
+                if let Some(failures) = state.serving_listener_failures.as_ref() {
+                    obj.insert(
+                        "listener_failures".to_string(),
+                        serde_json::to_value(failures.snapshot()).unwrap_or_default(),
+                    );
+                }
             }
             if detailed {
                 return Ok(json_response(status, &snapshot_value));
