@@ -6738,7 +6738,10 @@ mod tests {
     #[test]
     fn backed_off_enrollment_replay_preserves_and_merges_prior_cleanup_state() {
         let pod_states = DashMap::new();
-        let pod_uid = "pod-cleanup-state-merge";
+        // Workload-identity enrollment validates Kubernetes pod UIDs as UUIDs.
+        // Keep this replay fixture valid so the later attempt writes both
+        // cgroup-backed maps before the injected tc attach failure.
+        let pod_uid = "123e4567-e89b-12d3-a456-426614174000";
         let state_key = pod_state_key(&pod_states, pod_uid);
         let ip = std::net::Ipv4Addr::new(10, 0, 0, 21);
         let cgroup_root = tempfile::tempdir().unwrap();
