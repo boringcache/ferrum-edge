@@ -2019,9 +2019,13 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   is never acknowledged. Verified handshakes are retained for ten minutes
   (20 times the ordinary 30-second orphan-marker grace), covering producer polls,
   bounded responder batches, and realistic producer/node-agent restarts without
-  leaking marker triples forever after a producer ack timeout. Once reaped, a
-  late producer must persist a fresh request and retains its fail-closed guard
-  unless the node-agent can re-establish cleanup proof. The privileged
+  leaking marker triples forever after a producer ack timeout. The enabled
+  producer keeps polling a timed-out close while the UID remains absent and
+  removes its retained guard when a late verified acknowledgement arrives; a
+  same-UID re-enrollment instead owns the normal pre-open teardown. Once reaped,
+  a late producer must persist a fresh request (which refreshes the retention
+  window) and retains its fail-closed guard unless the node-agent can
+  re-establish cleanup proof. The privileged
   `netns-capture-live` gate
   verifies the real manager/backend source producer, including its transparent
   bind, full HBONE round trip, return-source spoofing, no-route fail-closed
