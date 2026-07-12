@@ -9519,10 +9519,7 @@ impl LiveTwoClusterFixture {
         let cp_ambient_source = start_static_mesh_cp_on(
             {
                 let mut slice = source_slice("live-xc-ambient-source");
-                live_xc_retain_ports(
-                    &mut slice,
-                    &[LIVE_XC_AMBIENT_WS_PORT, LIVE_XC_UDP_PORT],
-                );
+                live_xc_retain_ports(&mut slice, &[LIVE_XC_AMBIENT_WS_PORT, LIVE_XC_UDP_PORT]);
                 slice
             },
             "0.0.0.0:0".parse().expect("wildcard CP bind"),
