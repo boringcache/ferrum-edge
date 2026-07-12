@@ -159,10 +159,10 @@ pub fn socket_cookie(_stream: &tokio::net::TcpStream) -> std::io::Result<u64> {
 /// Read the pre-NAT original destination of an iptables-`REDIRECT`ed TCP
 /// connection (Linux netfilter `SO_ORIGINAL_DST` / `IP6T_SO_ORIGINAL_DST`).
 ///
-/// The mesh outbound capture listener uses this to recover which
-/// `service:port` a captured pod actually dialed — host-based routing alone
-/// cannot disambiguate a multi-port service because the router strips ports
-/// from `Host`. **`None` means "no captured original destination"**: non-Linux
+/// Mesh capture listeners use this to recover the original app/service port:
+/// outbound routing uses it to disambiguate multi-port services, while inbound
+/// TLS selection uses it to enforce PeerAuthentication `portLevelMtls` before
+/// the handshake. **`None` means "no captured original destination"**: non-Linux
 /// platforms, traffic that was not NATed (direct dials — every functional test
 /// and any sidecar-less client), `getsockopt` failure (`ENOENT` for
 /// un-redirected flows), or a reported destination identical to the accepted

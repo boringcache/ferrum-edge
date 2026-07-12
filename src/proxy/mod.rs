@@ -3449,6 +3449,9 @@ pub struct ProxyState {
     /// flag-gated PeerAuthentication live reload is enabled; ordinary HTTPS
     /// listeners continue using their static startup TLS config.
     pub mesh_inbound_tls: SharedMeshInboundTls,
+    /// Coherent listener-wide + per-app-port mesh inbound TLS snapshot selected
+    /// from `SO_ORIGINAL_DST` before the TLS handshake.
+    pub mesh_inbound_tls_policy: SharedMeshInboundTlsPolicy,
     /// Whether the current mesh inbound TLS posture is actually terminating
     /// inbound TLS with a SPIFFE peer verifier. This is operator status, not a
     /// dispatch hot-path flag: it distinguishes inbound trust from the outbound
@@ -3580,12 +3583,24 @@ fn clone_svid_bundle_slot(slot: &SharedSvidBundle) -> SharedSvidBundle {
 pub type SharedGatewayTrustBundles = Arc<ArcSwap<Option<RuntimeTrustBundleSet>>>;
 pub type SharedMeshInboundTls = Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>>;
 
+#[derive(Default)]
+pub struct MeshInboundTlsPolicy {
+    pub default: Option<Arc<rustls::ServerConfig>>,
+    pub by_port: HashMap<u16, Option<Arc<rustls::ServerConfig>>>,
+}
+
+pub type SharedMeshInboundTlsPolicy = Arc<ArcSwap<MeshInboundTlsPolicy>>;
+
 fn empty_gateway_trust_bundle_slot() -> SharedGatewayTrustBundles {
     Arc::new(ArcSwap::new(Arc::new(None)))
 }
 
 fn empty_mesh_inbound_tls_slot() -> SharedMeshInboundTls {
     Arc::new(ArcSwap::new(Arc::new(None)))
+}
+
+fn empty_mesh_inbound_tls_policy_slot() -> SharedMeshInboundTlsPolicy {
+    Arc::new(ArcSwap::new(Arc::new(MeshInboundTlsPolicy::default())))
 }
 
 fn load_gateway_svid_bundle(env_config: &EnvConfig) -> Result<SharedSvidBundle, anyhow::Error> {
@@ -4708,6 +4723,7 @@ impl ProxyState {
         let gateway_file_svid_bundle = clone_svid_bundle_slot(&gateway_svid_bundle);
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
         let mesh_inbound_tls = empty_mesh_inbound_tls_slot();
+        let mesh_inbound_tls_policy = empty_mesh_inbound_tls_policy_slot();
         let mesh_inbound_spiffe_verifier_active = Arc::new(AtomicBool::new(false));
         let mesh_outbound_enforcement = crate::modes::mesh::outbound_enforcement::empty_slot();
         let hbone_pool = Arc::new(
@@ -5101,6 +5117,7 @@ impl ProxyState {
             gateway_trust_bundles,
             gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
             mesh_inbound_tls,
+            mesh_inbound_tls_policy,
             mesh_inbound_spiffe_verifier_active,
             mesh_outbound_enforcement,
             backend_svid_rotation_tx,
@@ -11355,34 +11372,6 @@ pub(crate) async fn start_mesh_udp_capture_listener_with_signal(
     .await
 }
 
-/// Start a mesh mTLS/HBONE listener with handshake-failure telemetry enabled.
-///
-/// `mesh_direction` is stamped onto every accepted connection's
-/// [`RequestContext`] / [`StreamConnectionContext`] so mesh-aware plugins
-/// (e.g., `workload_metrics`) can gate CLIENT vs SERVER span emission on
-/// which side of the hop this listener represents.
-pub(crate) async fn start_mesh_proxy_listener_with_tls_and_signal(
-    addr: SocketAddr,
-    state: ProxyState,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-    tls_config: Option<Arc<rustls::ServerConfig>>,
-    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
-    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
-) -> Result<(), anyhow::Error> {
-    start_proxy_listener_with_tls_source_and_signal(
-        addr,
-        state,
-        shutdown,
-        ListenerTlsSource::Static {
-            tls_config,
-            record_mesh_mtls_metric: true,
-        },
-        mesh_direction,
-        started_tx,
-    )
-    .await
-}
-
 /// Start the proxy HTTPS listener with a hot-swappable frontend TLS slot.
 ///
 /// Used when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`. The frontend TLS
@@ -11473,10 +11462,17 @@ impl ListenerTlsSource {
     /// `Dynamic` performs one `ArcSwap::load()` and one inner `Arc` clone per
     /// accept; this is the narrow frontend cert/key live-reload carve-out
     /// and is not on the request path.
-    fn load(&self, state: &ProxyState) -> Option<Arc<rustls::ServerConfig>> {
+    fn load(
+        &self,
+        state: &ProxyState,
+        orig_dst: Option<SocketAddr>,
+    ) -> Option<Arc<rustls::ServerConfig>> {
         match self {
             Self::Static { tls_config, .. } => tls_config.clone(),
-            Self::MeshInbound => state.mesh_inbound_tls.load().as_ref().clone(),
+            Self::MeshInbound => {
+                let policy = state.mesh_inbound_tls_policy.load();
+                select_mesh_inbound_tls_config(&policy.default, &policy.by_port, orig_dst).clone()
+            }
             Self::Dynamic { slot, .. } => slot.load().as_ref().clone(),
         }
     }
@@ -11506,6 +11502,16 @@ impl ListenerTlsSource {
             Self::Dynamic { .. } => true,
         }
     }
+}
+
+fn select_mesh_inbound_tls_config<'a>(
+    default: &'a Option<Arc<rustls::ServerConfig>>,
+    by_port: &'a HashMap<u16, Option<Arc<rustls::ServerConfig>>>,
+    orig_dst: Option<SocketAddr>,
+) -> &'a Option<Arc<rustls::ServerConfig>> {
+    orig_dst
+        .and_then(|dst| by_port.get(&dst.port()))
+        .unwrap_or(default)
 }
 
 struct TlsConnectionMetadata {
@@ -11890,7 +11896,21 @@ async fn run_accept_loop(
                             } else {
                                 None
                             };
-                        let tls_config = tls_source.load(&state);
+                        // Read the captured connection's original destination
+                        // before TLS selection. Inbound REDIRECT preserves the
+                        // workload app/container port, allowing PeerAuthentication
+                        // `portLevelMtls` to choose the ServerConfig before the
+                        // rustls handshake begins.
+                        let orig_dst = if mesh_direction.is_some() {
+                            select_mesh_original_dst(
+                                mesh_direction,
+                                crate::socket_opts::original_dst(&stream),
+                                node_waypoint_orig_dst,
+                            )
+                        } else {
+                            None
+                        };
+                        let tls_config = tls_source.load(&state, orig_dst);
                         // Defense in depth: a TLS-required source (Dynamic
                         // frontend reload slot, MeshInbound peer-auth slot)
                         // that observes a `None` payload must NOT fall
@@ -11910,24 +11930,6 @@ async fn run_accept_loop(
                             continue;
                         }
                         let record_mesh_mtls_metric = tls_source.record_mesh_mtls_metric();
-                        // Read the captured connection's original destination
-                        // ONCE per accept, only on mesh capture listeners. For
-                        // iptables REDIRECT capture, `SO_ORIGINAL_DST` carries
-                        // the pre-NAT address. For NodeWaypoint cgroup/connect
-                        // capture there is no conntrack original-dst state, so
-                        // the eBPF resolver's original destination wins for
-                        // outbound. Every request on the connection shares this
-                        // value. `None` everywhere else and for non-redirected
-                        // traffic.
-                        let orig_dst = if mesh_direction.is_some() {
-                            select_mesh_original_dst(
-                                mesh_direction,
-                                crate::socket_opts::original_dst(&stream),
-                                node_waypoint_orig_dst,
-                            )
-                        } else {
-                            None
-                        };
                         // Each connection gets its own subscriber so that
                         // shutdown can interrupt the per-connection serve
                         // future (sending GOAWAY on H2 / closing keepalive
@@ -36426,6 +36428,29 @@ mod tests {
 
         let mesh = ListenerTlsSource::MeshInbound;
         assert!(!mesh.requires_tls());
+    }
+
+    #[test]
+    fn mesh_inbound_tls_selection_uses_original_app_port_then_fallback() {
+        let default = None;
+        let by_port = HashMap::from([(8080, None), (9090, None)]);
+        let selected_8080 = select_mesh_inbound_tls_config(
+            &default,
+            &by_port,
+            Some("10.0.0.8:8080".parse().expect("socket addr")),
+        );
+        assert!(std::ptr::eq(selected_8080, &by_port[&8080]));
+
+        let selected_unknown = select_mesh_inbound_tls_config(
+            &default,
+            &by_port,
+            Some("10.0.0.8:7070".parse().expect("socket addr")),
+        );
+        assert!(std::ptr::eq(selected_unknown, &default));
+        assert!(std::ptr::eq(
+            select_mesh_inbound_tls_config(&default, &by_port, None),
+            &default
+        ));
     }
 
     /// The multi-port Sidecar egress authority rewrite: any client-supplied

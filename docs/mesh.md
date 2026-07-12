@@ -894,29 +894,15 @@ mTLS modes:
 | `permissive` (default) | Accept both mTLS and plaintext. |
 | `disable` | Disable mTLS. Accept plaintext only. |
 
-> **Per-app-port mTLS (`portLevelMtls`) is NOT currently enforced.** Istio
-> `spec.portLevelMtls` keys are workload **app/container** ports (e.g. `8080`,
-> `8081`), but the inbound mesh listener terminates mTLS on a single **transport**
-> port (Sidecar `15006` / Ambient `15008` / EgressGateway `15090`). A single
-> `rustls::ServerConfig` per listener cannot vary STRICT/PERMISSIVE per app port
-> without pre-handshake `SO_ORIGINAL_DST` demux, so the runtime resolves the
-> **one mode for the whole listener**. Normally that is the policy's top-level
-> `mtls_mode`; if an override key numerically equals the topology's transport
-> port, that override instead determines the whole listener's mode. It still is
-> not enforced only for the intended app port. This is surfaced — not silently
-> discarded: the K8s translator emits a warning, and the Istio CRD status records a
-> `status.ferrum.translation.deferred_fields` entry, so `FerrumAccepted=True`
-> does **not** imply per-port enforcement. **This means a top-level `permissive`
-> with `{8080: strict}` still accepts plaintext on `8080` (fail-open), and a
-> top-level `strict` with `{8081: permissive}` still rejects plaintext on `8081`
-> (fail-closed).** Unless an override key collides with the transport port, set
-> the workload's top-level `mtls_mode` to the posture you need for the whole
-> listener. Full per-app-port enforcement is tracked as a
-> separate architectural item.
+`portLevelMtls` is enforced before the TLS handshake. The inbound accept loop
+reads the REDIRECT-captured connection's `SO_ORIGINAL_DST` once, uses its
+workload app/container port to resolve the winning policy (including the
+fail-secure same-tier tie-break), and selects the prebuilt per-port
+`rustls::ServerConfig`. Direct/non-redirected connections with no original
+destination use the listener-wide resolved mode as a compatibility fallback.
 
-The following `portLevelMtls` example is **accepted but its per-port intent is
-deferred** — the whole listener follows the top-level `strict` mode, and the
-`8081: permissive` override is reported in status but not applied:
+The following policy requires a client certificate on port 8080 while allowing
+optional client authentication on port 8081:
 
 ```yaml
 name: "mixed-mode"
@@ -924,16 +910,17 @@ namespace: "default"
 selector:
   labels:
     app: my-service
-mtls_mode: strict
+mtls_mode: permissive
 port_overrides:
-  8081: permissive   # DEFERRED: app-port override not enforced; whole listener stays strict
+  8080: strict
+  8081: permissive
 ```
 
 Selector-less `PeerAuthentication` applies to all workloads in its namespace (or mesh-wide if namespace-scoped).
 
 ### Resolution and listener wiring
 
-The effective mTLS mode for the inbound TLS-terminating listener is resolved at startup from the initial mesh slice via `resolve_effective_mtls_mode()`. Scope precedence (highest wins): `WorkloadSelector` > `Namespace` > `MeshWide`. Among same-tier matches the tie is resolved **fail-secure**: the more-restrictive effective mode for the port wins (`Strict` > `Permissive` > `Disable`). This is both deterministic (so the posture cannot flap across pods or reconciles) and a genuine trust boundary — because the winner is decided by mode rather than by the policy's namespace string or name, a tenant-controlled policy cannot downgrade inbound mTLS below a trusted same-tier policy by choosing a low-sorting namespace or policy name, and a customized `FERRUM_K8S_ISTIO_ROOT_NAMESPACE` that sorts after tenant namespaces is equally safe. Two conflicting same-tier `PeerAuthentication`s are still an operator misconfiguration; only when their effective modes are identical does the resolver fall back to the value-neutral `(namespace, name)` ordering to pick a canonical winner (this differs from the sibling `ProxyConfig` resolver, which has no security posture to protect and tiebreaks by `name`). Port-level overrides within a policy are applied before this comparison, so the fail-secure choice reflects the mode each policy actually yields for the port. Port-level overrides within the winning policy then take precedence over its top-level `mtls_mode` — but only when keyed on the transport resolution port; Istio `portLevelMtls` app-port keys never match and are deferred, so in that (common) case the comparison and the wired listener both use the policy's top-level mode (see the per-app-port box above and the resolution-port table below).
+The effective mTLS mode is resolved at startup from the initial mesh slice via `resolve_effective_mtls_mode()`. Scope precedence (highest wins): `WorkloadSelector` > `Namespace` > `MeshWide`. Among same-tier matches the tie is resolved **fail-secure**: the more-restrictive effective mode for the app port wins (`Strict` > `Permissive` > `Disable`). This is both deterministic (so the posture cannot flap across pods or reconciles) and a genuine trust boundary — because the winner is decided by mode rather than by the policy's namespace string or name, a tenant-controlled policy cannot downgrade inbound mTLS below a trusted same-tier policy by choosing a low-sorting namespace or policy name, and a customized `FERRUM_K8S_ISTIO_ROOT_NAMESPACE` that sorts after tenant namespaces is equally safe. Two conflicting same-tier `PeerAuthentication`s are still an operator misconfiguration; only when their effective modes are identical does the resolver fall back to the value-neutral `(namespace, name)` ordering to pick a canonical winner (this differs from the sibling `ProxyConfig` resolver, which has no security posture to protect and tiebreaks by `name`). Port-level overrides within a policy are applied before this comparison, so each app port gets the posture that the winning policy yields for that port.
 
 The resulting `MeshClientAuth` is plumbed into the inbound TLS acceptor:
 
@@ -945,22 +932,11 @@ The resulting `MeshClientAuth` is plumbed into the inbound TLS acceptor:
 
 **SPIFFE peer trust-domain verification**: when gateway SVID material is configured (all three of `FERRUM_GATEWAY_SVID_CERT_PATH` / `FERRUM_GATEWAY_SVID_KEY_PATH` / `FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH`), the inbound mTLS / HBONE listener verifies each peer certificate's chain **and** that the peer's SPIFFE URI-SAN trust domain matches the gateway SVID's local trust bundle or one of the slice's federated bundles. This closes the gap where a peer cert that merely chained to the configured client CA was admitted regardless of its SPIFFE trust domain. STRICT requires + validates a peer cert; PERMISSIVE still admits peers that present no cert but trust-domain-validates any cert that is offered (so PERMISSIVE records mTLS identity when present). Without gateway SVID material, the listener keeps the prior chain-only verification against `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`. In PERMISSIVE specifically, the listener requests a client certificate whenever **either** trust anchor exists (the SVID verifier is preferred, otherwise the operator client CA bundle) so an offered cert is verified and its identity recorded; only when **neither** anchor is configured does PERMISSIVE skip the certificate request entirely — and in that fully-degraded case Ferrum emits a single startup warning that inbound peer identity cannot be verified or recorded, rather than silently treating authenticated peers as anonymous. (The **EgressGateway** topology is the exception to PERMISSIVE-optional: there a present trust anchor escalates PERMISSIVE to `Required`, and a missing anchor fails the listener closed — see the EgressGateway requires-client-certificates note above.) The HBONE baggage `source.principal` trust-gate now rests on this verified peer identity. When `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`, the lock-free SVID bundle slot is re-published on slice apply so federated trust-domain additions take effect without a listener restart; file-backed and CA-backed gateway SVID rotations also republish the inbound peer-verifier bundle from the newest local roots plus the last accepted federated overlay. Slice roots for the gateway SVID's own trust domain are additive with the freshly loaded SVID local roots, which lets the control plane stage same-trust-domain CA-root rotation without replacing the SVID source's current root set.
 
-The port used for `port_overrides` lookup is the single **transport** port the topology's TLS-terminating listener binds (see `MeshRuntimeConfig::listener_plan()`) — **not** the workload's app/container port. An override is honored **only** when its key equals this transport port; Istio `portLevelMtls` entries are keyed on app ports (`8080`, `8081`, …), so they never match the resolution port and are **deferred, not enforced** (see the box above). The "override key example" column below therefore shows the transport-port key that would take effect, which is an internal/native-config surface — the Istio operator-facing `portLevelMtls` field cannot produce it:
-
-| Topology | Resolution port (default) | Transport-port override key that takes effect |
-|---|---|---|
-| `Sidecar` | `inbound_listen_addr` (15006) | `port_overrides: {15006: strict}` |
-| `Ambient` | `hbone_listen_addr` (15008) | `port_overrides: {15008: strict}` |
-| `NodeWaypoint` | `hbone_listen_addr` (15008) | `port_overrides: {15008: strict}` |
-| `ServiceWaypoint` | `hbone_listen_addr` (15008) | `port_overrides: {15008: strict}` |
-| `EgressGateway` | `egress_listen_addr` (15090) | `port_overrides: {15090: strict}` |
-| `EastWestGateway` | n/a (SNI passthrough, no termination) | — |
-
-At startup Ferrum emits a structured `warn!` for every applicable PeerAuthentication carrying `port_overrides` keyed on a port other than the transport resolution port, across all config sources (native `MeshSubscribe`, xDS, file), so the deferred intent is visible even where no Istio CRD status is written.
+Per-port TLS configs are built during startup (and during an opted-in live reload), then published as one atomic app-port table. The accept path performs no certificate parsing or policy resolution; it reads the original destination and loads the already-built config for that port. The topology disable guards remain in force for every entry, so a `DISABLE` override cannot bypass the Ambient/HBONE or EgressGateway mTLS-only constraints.
 
 By default, the resolved mode is captured **once at startup** from the first valid slice. Subsequent `PeerAuthentication` changes pushed via the control plane update the in-memory slice and are honored by other plugin paths (e.g. `mesh_authz`, plugin chains), but the inbound TLS `ServerConfig` is not rebuilt.
 
-Set `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true` to opt in to live reload of the resolved mTLS mode and frontend client CA verifier on mesh slice apply. Coverage includes mesh HTTP/HBONE termination listeners **and** mesh-shared TCP+TLS / UDP+DTLS stream listeners: a slice apply that flips `PeerAuthentication` mode (e.g. `PERMISSIVE` → `STRICT`) or rotates the client CA bundle hot-swaps the shared `rustls::ServerConfig` slot for TCP+TLS listeners (snapshotted per accept) and rebuilds the DTLS `FrontendDtlsConfig` on every active `DtlsServer` (new sessions snapshot the swapped material at handshake; existing handshake-complete sessions keep the material they handshake with until they end — rustls/dimpl consult the config only at handshake time). Failure handling differs by path. A single `rustls::ServerConfig` build backs **both** mesh HTTP/HBONE termination and the shared TCP+TLS stream slot, and it is computed *before* the proxy config is applied; if that build fails — or the client-CA-bundle snapshot cannot be read (e.g. a secrets operator truncating the bundle file mid-write) — Ferrum **rejects the whole slice** and keeps the last good config in its entirety, so no authz/`MeshPolicy`/`RequestAuthentication`/`ServiceEntry`/endpoint update from that slice is applied either, until the rebuild succeeds (fail-closed; the inbound posture is never silently weakened). Only the *post-accept* DTLS `FrontendDtlsConfig` rebuild keeps the previous config **for that path** and logs a warning without rejecting the slice. Topology-disable rejection (see below) likewise keeps the last good config wholesale.
+Set `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true` to opt in to live reload of the resolved mTLS modes and frontend client CA verifier on mesh slice apply. Coverage includes mesh HTTP/HBONE termination listeners **and** mesh-shared TCP+TLS / UDP+DTLS stream listeners: a slice apply that changes a top-level or per-app-port `PeerAuthentication` mode, or rotates the client CA bundle, rebuilds the distinct required `rustls::ServerConfig` values and atomically swaps one coherent `{listener fallback, app-port table}` snapshot for future HTTP/HBONE accepts. The listener-wide config is also published to the shared TCP+TLS stream slot (snapshotted per accept), and the DTLS `FrontendDtlsConfig` is rebuilt on every active `DtlsServer` (new sessions snapshot the swapped material at handshake; existing handshake-complete sessions keep the material they handshook with until they end). If any required TLS config build fails — or the client-CA-bundle snapshot cannot be read (e.g. a secrets operator truncating the bundle file mid-write) — Ferrum **rejects the whole slice** and keeps the last good config in its entirety, so no authz/`MeshPolicy`/`RequestAuthentication`/`ServiceEntry`/endpoint update from that slice is applied either, until the rebuild succeeds (fail-closed; the inbound posture is never silently weakened). Only the *post-accept* DTLS rebuild keeps the previous config **for that path** and logs a warning without rejecting the slice. Topology-disable rejection (see below) likewise keeps the last good config wholesale.
 
 Frontend cert/key paths are independently controlled by `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` (default `false`). When that flag is enabled, the proxy HTTPS / H2 / HTTP/3 and admin HTTPS listeners watch their cert/key files on a poll interval (`FERRUM_FRONTEND_TLS_WATCH_INTERVAL_SECONDS`, default 30s) and atomically swap a rebuilt `ServerConfig` on validated change. The two flags are orthogonal: PeerAuthentication live reload covers the mesh inbound mTLS mode + client CA verifier surface, frontend live reload covers the operator-supplied cert/key material across the proxy and admin HTTPS surfaces. See [docs/configuration.md](configuration.md#proxy-listener) for full semantics.
 
@@ -2782,7 +2758,7 @@ Mesh-specific environment variables are listed below. For the full reference of 
 | `FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS` | `30` | NodeWaypoint cgroup-inode lifecycle sweep interval for cgroup-bound identities. Set to `0` to disable only cgroup stats |
 | `FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS` | `30` | NodeWaypoint lazy identity GC interval for identities enrolled without a cgroup binding. Set to `0` only when another component explicitly removes lazy identities |
 | `FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP` | `true` | Whether the auto-injected mesh `RequestAuthentication` (`jwks_auth`) plugin requires the JWT `exp` claim. Secure default `true` rejects `exp`-less tokens. Set `false` only for issuers that legitimately omit `exp`; a present-but-expired `exp` is always rejected regardless |
-| `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED` | `false` | Opt in to live reload of the PeerAuthentication-derived inbound mTLS mode, client CA verifier, and federated SVID bundle slot on slice apply. Does not rotate frontend cert/key material (use `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`) |
+| `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED` | `false` | Opt in to live reload of the PeerAuthentication-derived listener-wide and per-app-port inbound mTLS configs, client CA verifier, and federated SVID bundle slot on slice apply. Does not rotate frontend cert/key material (use `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`) |
 | `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS` | `0` | Seconds to wait after a backend client SVID rotation before force-draining old-generation backend pool entries. `0` keeps existing connections until normal idle/health cleanup |
 | `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS` | `300` | SPIFFE trust-bundle federation poll interval (fetches `RemoteCluster.federation_endpoint` and overlays `TrustBundleSet.federated`). `0` disables; bundles then come only from the CP slice. `remote_clusters` is capped at 256 entries |
 | `FERRUM_MESH_FEDERATION_POLL_TIMEOUT_SECONDS` | `30` | Per-request HTTP timeout for a single federation bundle fetch |
