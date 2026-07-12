@@ -146,6 +146,75 @@ fn mesh_slice_resolve_method_integration() {
     );
 }
 
+// ── Unenforced per-app-port overrides (#2119 honest surface) ─────────────
+
+/// An applicable PeerAuthentication whose `port_overrides` are keyed on APP
+/// ports (Istio `portLevelMtls`, e.g. 8080/9090) rather than the transport
+/// resolution port (15006) is reported as unenforced, sorted, so startup can
+/// warn. Resolution behavior is unchanged — this only surfaces the dropped
+/// intent.
+#[test]
+fn app_port_overrides_reported_as_unenforced() {
+    let slice = MeshSlice {
+        namespace: "prod".to_string(),
+        labels: BTreeMap::new(),
+        peer_authentications: vec![peer_auth(
+            "ns-strict",
+            "prod",
+            None,
+            MtlsMode::Strict,
+            HashMap::from([(9090, MtlsMode::Disable), (8080, MtlsMode::Permissive)]),
+        )],
+        ..MeshSlice::default()
+    };
+
+    let reported = slice.unenforced_peer_auth_port_overrides(15006);
+    assert_eq!(reported.len(), 1);
+    assert_eq!(reported[0].0, "ns-strict");
+    // Sorted ascending, both app ports (neither matches the 15006 listener port).
+    assert_eq!(reported[0].1, vec![8080, 9090]);
+
+    // Resolution itself is untouched: the whole listener follows the top-level
+    // STRICT mode; the app-port PERMISSIVE override is NOT applied.
+    assert_eq!(slice.resolve_effective_mtls_mode(15006), MtlsMode::Strict);
+    assert_eq!(slice.resolve_effective_mtls_mode(8080), MtlsMode::Strict);
+}
+
+/// An override keyed on the transport resolution port (15006) DOES take effect,
+/// so it is NOT reported as unenforced. A policy that does not apply to the
+/// workload is likewise ignored.
+#[test]
+fn transport_port_override_and_non_applicable_policy_not_reported() {
+    let slice = MeshSlice {
+        namespace: "prod".to_string(),
+        labels: BTreeMap::new(),
+        peer_authentications: vec![
+            // Applies to "prod"; override keyed on the listener port → enforced.
+            peer_auth(
+                "ns-listener-override",
+                "prod",
+                None,
+                MtlsMode::Permissive,
+                HashMap::from([(15006, MtlsMode::Strict)]),
+            ),
+            // Different namespace → does not apply to a "prod" workload.
+            peer_auth(
+                "other-ns-app-port",
+                "staging",
+                None,
+                MtlsMode::Strict,
+                HashMap::from([(8080, MtlsMode::Permissive)]),
+            ),
+        ],
+        ..MeshSlice::default()
+    };
+
+    assert!(
+        slice.unenforced_peer_auth_port_overrides(15006).is_empty(),
+        "listener-port override is enforced and out-of-namespace policy does not apply"
+    );
+}
+
 // ── Same-scope tie-breaking (fail-secure: more-restrictive mode wins) ─────
 
 #[test]
