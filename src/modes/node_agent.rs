@@ -54,6 +54,12 @@ const DEFAULT_FALLBACK_MODE: &str = "fail";
 const CNI_METADATA_FETCH_TIMEOUT: Duration = Duration::from_millis(750);
 const POD_ENROLLMENT_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 const UDP_CAPTURE_READINESS_POLL: Duration = Duration::from_millis(250);
+const UDP_HANDSHAKE_ORPHAN_GRACE: Duration = Duration::from_secs(30);
+// Verified handshakes need longer than the ordinary orphan grace for producer
+// polling, bounded responder batches, and process restarts, but cannot live
+// forever after their producer exits. 20 * the 30s grace gives those paths ten
+// minutes in production while keeping the test helper's age injectable.
+const VERIFIED_UDP_HANDSHAKE_RETENTION_MULTIPLIER: u32 = 20;
 
 static FAILED_POD_ENROLLMENT_ATTEMPTS: LazyLock<DashMap<String, FailedPodEnrollmentAttempt>> =
     LazyLock::new(DashMap::new);
@@ -2908,7 +2914,8 @@ fn reconcile_removed_udp_close_acknowledgements(
 /// gone. Left unswept these files accumulate one inode per pod ever seen on the
 /// node. The grace below gives the proxy time to consume a late acknowledgement;
 /// after that, inactive marker sets are safe to remove. A verified handoff with
-/// an outstanding ack requirement is preserved until the producer consumes it.
+/// an outstanding ack requirement gets a wider, bounded restart/consumption
+/// window before it is also considered orphaned.
 /// The scan is bounded per directory per call so a large backlog drains over
 /// several reconcile ticks.
 fn reap_orphaned_udp_not_ready_acks(
@@ -2919,7 +2926,7 @@ fn reap_orphaned_udp_not_ready_acks(
     // The proxy polls the registry every ~2s. Keep a much wider grace so a
     // freshly-published pod-removal ack cannot be reaped before the producer
     // observes the registry removal and consumes it.
-    let minimum_age = std::time::Duration::from_secs(30);
+    let minimum_age = UDP_HANDSHAKE_ORPHAN_GRACE;
     for marker_dir in [".udp-not-ready", ".udp-ack-required", ".udp-gate-cleaned"] {
         reap_orphaned_udp_handshake_markers_older_than(
             dir,
@@ -2977,24 +2984,25 @@ fn reap_orphaned_udp_handshake_markers_older_than(
             udp_gate_cleaned_proof_path(dir, &uid).is_some_and(|path| path.is_file());
         // Only a VERIFIED durable handoff — a producer `.udp-ack-required`
         // request paired with the node-agent-owned `.udp-gate-cleaned` proof —
-        // is live until the producer consumes its acknowledgement and removes
-        // `.udp-ack-required`. Preserve all three records of such a handshake
-        // regardless of age so restart recovery cannot publish an ack and reap
-        // it again in the same reconcile pass. An `.udp-ack-required` request
-        // WITHOUT proof is unverified: it is not evidence the host gate closed,
-        // so it must NOT preserve its companion `.udp-not-ready` ack. Both the
-        // unverified request and any orphaned companions still age out under the
-        // existing bounded leak policy, keeping inode growth bounded for
-        // departed pods.
+        // gets the wider retention window. That lets restart recovery publish
+        // and preserve an ack long enough for a producer to consume it, while
+        // eventually reaping all three records when the producer died after an
+        // ack timeout. An `.udp-ack-required` request WITHOUT proof is
+        // unverified: it is not evidence the host gate closed, so it must NOT
+        // preserve its companion `.udp-not-ready` ack beyond the ordinary
+        // orphan grace. Reaping remains fail-closed: a late producer must write
+        // a fresh request and retain its guard if no cleanup proof remains.
         let verified_handshake = ack_required && gate_cleaned;
-        if verified_handshake {
-            continue;
-        }
+        let retention = if verified_handshake {
+            minimum_age.saturating_mul(VERIFIED_UDP_HANDSHAKE_RETENTION_MULTIPLIER)
+        } else {
+            minimum_age
+        };
         let old_enough = entry
             .metadata()
             .and_then(|metadata| metadata.modified())
             .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
-            .is_ok_and(|age| age >= minimum_age);
+            .is_ok_and(|age| age >= retention);
         if !old_enough {
             continue;
         }
@@ -6124,7 +6132,7 @@ mod tests {
                 marker_dir,
                 &pod_states,
                 true,
-                std::time::Duration::ZERO,
+                UDP_HANDSHAKE_ORPHAN_GRACE,
             );
         }
 
@@ -6143,7 +6151,33 @@ mod tests {
                     .join(".udp-gate-cleaned")
                     .join("pod-gone")
                     .is_file(),
-            "the live verified handoff must survive orphan reaping until the producer consumes it"
+            "the verified handoff must survive reaping below its restart-recovery retention"
+        );
+
+        // A zero base age injects an already-expired verified retention without
+        // sleeping or mutating filesystem timestamps.
+        for marker_dir in [".udp-not-ready", ".udp-ack-required", ".udp-gate-cleaned"] {
+            reap_orphaned_udp_handshake_markers_older_than(
+                registry.path(),
+                marker_dir,
+                &pod_states,
+                true,
+                std::time::Duration::ZERO,
+            );
+        }
+        assert!(
+            !registry
+                .path()
+                .join(".udp-not-ready")
+                .join("pod-gone")
+                .exists()
+                && !required_dir.join("pod-gone").exists()
+                && !registry
+                    .path()
+                    .join(".udp-gate-cleaned")
+                    .join("pod-gone")
+                    .exists(),
+            "the verified handoff must be reaped after its bounded retention expires"
         );
     }
 

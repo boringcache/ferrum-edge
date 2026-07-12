@@ -2016,7 +2016,13 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   both enabled and disabled reconciliation uses that proof to answer a later
   durable `.udp-ack-required` request after the UID has left live pod state,
   including after node-agent restart; a request without verified cleanup proof
-  is never acknowledged. The privileged `netns-capture-live` gate
+  is never acknowledged. Verified handshakes are retained for ten minutes
+  (20 times the ordinary 30-second orphan-marker grace), covering producer polls,
+  bounded responder batches, and realistic producer/node-agent restarts without
+  leaking marker triples forever after a producer ack timeout. Once reaped, a
+  late producer must persist a fresh request and retains its fail-closed guard
+  unless the node-agent can re-establish cleanup proof. The privileged
+  `netns-capture-live` gate
   verifies the real manager/backend source producer, including its transparent
   bind, full HBONE round trip, return-source spoofing, no-route fail-closed
   behavior, capture-disabled absence, idempotent reconcile, pod-deletion cleanup,
