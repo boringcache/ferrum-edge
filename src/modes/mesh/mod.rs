@@ -10465,16 +10465,15 @@ fn startup_inbound_mtls_mode(
     Ok(resolved)
 }
 
-/// Emit a structured startup warning for applicable PeerAuthentication
-/// `port_overrides` (Istio `portLevelMtls`) keyed on ports the inbound listener
-/// does not terminate on — they are silently non-enforced today (the whole
-/// listener resolves against the top-level mode; per-app-port enforcement needs
-/// SO_ORIGINAL_DST demux, tracked separately). This is the runtime honest-surface
-/// for EVERY config source, complementing the K8s translator warning and the
+/// Emit a structured warning for applicable PeerAuthentication `port_overrides`
+/// (Istio `portLevelMtls`). They are not enforced per app port today: even when
+/// an app-port number happens to equal the transport listener port, the selected
+/// mode applies listener-wide. This is the runtime honest-surface for EVERY
+/// config source, complementing the K8s translator warning and the
 /// `status.ferrum.translation.deferred_fields` entry. Does NOT change resolution.
 fn warn_unenforced_peer_auth_port_overrides(slice: &MeshSlice, runtime: &MeshRuntimeConfig) {
     let resolution_port = inbound_mtls_resolution_port(runtime);
-    for (policy, ports) in slice.unenforced_peer_auth_port_overrides(resolution_port) {
+    for (policy, ports) in slice.unenforced_peer_auth_port_overrides() {
         let ports_list = ports
             .iter()
             .map(u16::to_string)
@@ -10497,7 +10496,6 @@ fn live_reload_inbound_mtls_mode(
     slice: &MeshSlice,
     runtime: &MeshRuntimeConfig,
 ) -> Option<config::MtlsMode> {
-    warn_unenforced_peer_auth_port_overrides(slice, runtime);
     let resolved = resolve_inbound_mtls_mode(Some(slice), runtime);
     if let Err(error) = validate_inbound_mtls_mode_for_topology(runtime, resolved) {
         warn!(
@@ -12722,6 +12720,10 @@ fn start_mesh_slice_apply_task(
         let mut updates = mesh_state.subscribe();
         let mut federation_updates = mesh_state.federation_store().subscribe();
         let mut remote_endpoint_updates = mesh_state.remote_endpoint_store().subscribe();
+        // Startup already warned for the initial slice. Track warning content
+        // separately from acceptance so a rejected received slice is still
+        // warned exactly once rather than again on each overlay wake-up.
+        let mut last_warned_override_slice = initial_applied_mesh_slice.clone();
         let mut last_applied_slice = initial_applied_mesh_slice;
         let mut last_applied_federation_revision = *federation_updates.borrow();
         let mut last_applied_remote_revision = *remote_endpoint_updates.borrow();
@@ -12757,6 +12759,17 @@ fn start_mesh_slice_apply_task(
                         "Skipping no-op mesh slice update"
                     );
                 } else {
+                    // Warn once for every newly received slice content,
+                    // independently of PeerAuthentication live reload. Track
+                    // this separately from acceptance so rejected slices and
+                    // federation/remote-only re-applies do not repeat it.
+                    if !mesh_slice_matches_last_applied(
+                        last_warned_override_slice.as_deref(),
+                        slice,
+                    ) {
+                        warn_unenforced_peer_auth_port_overrides(slice, &runtime);
+                        last_warned_override_slice = Some(Arc::new(slice.clone()));
+                    }
                     let live_reload_enabled =
                         proxy_state.env_config.mesh_peer_auth_live_reload_enabled;
                     let federation_snapshot = mesh_state.federation_store().snapshot();

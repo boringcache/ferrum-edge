@@ -682,10 +682,9 @@ impl MeshSlice {
     }
 
     /// PeerAuthentications considered by inbound resolution carrying
-    /// `port_overrides` (Istio `portLevelMtls`) keyed on ports OTHER than
-    /// `resolution_port` — the single transport port the inbound listener
-    /// actually terminates mTLS on. On an ambiguous-label slice this includes
-    /// candidate-only selector policies considered by fail-closed resolution.
+    /// `port_overrides` (Istio `portLevelMtls`). On an ambiguous-label slice
+    /// this includes candidate-only selector policies considered by fail-closed
+    /// resolution.
     ///
     /// Those overrides are NOT enforced today: one `rustls::ServerConfig` per
     /// listener cannot vary STRICT/PERMISSIVE per app port without pre-handshake
@@ -699,10 +698,7 @@ impl MeshSlice {
     ///
     /// Returns `(policy_name, sorted_unenforced_ports)` for each offending
     /// applicable policy; empty when nothing is dropped.
-    pub fn unenforced_peer_auth_port_overrides(
-        &self,
-        resolution_port: u16,
-    ) -> Vec<(String, Vec<u16>)> {
+    pub fn unenforced_peer_auth_port_overrides(&self) -> Vec<(String, Vec<u16>)> {
         let mut reported = Vec::new();
         for pa in &self.peer_authentications {
             let applies = peer_auth_applies_to_workload(pa, &self.namespace, &self.labels);
@@ -712,12 +708,12 @@ impl MeshSlice {
             if !applies && !ambiguous_candidate {
                 continue;
             }
-            let mut ports: Vec<u16> = pa
-                .port_overrides
-                .keys()
-                .copied()
-                .filter(|port| *port != resolution_port)
-                .collect();
+            // Istio portLevelMtls keys are workload app/container ports. Report
+            // every key, including one whose number happens to equal the mesh
+            // transport listener port: that collision applies the selected mode
+            // listener-wide and still does not honor the operator's per-app-port
+            // intent.
+            let mut ports: Vec<u16> = pa.port_overrides.keys().copied().collect();
             if ports.is_empty() {
                 continue;
             }

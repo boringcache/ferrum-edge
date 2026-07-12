@@ -168,7 +168,7 @@ fn app_port_overrides_reported_as_unenforced() {
         ..MeshSlice::default()
     };
 
-    let reported = slice.unenforced_peer_auth_port_overrides(15006);
+    let reported = slice.unenforced_peer_auth_port_overrides();
     assert_eq!(reported.len(), 1);
     assert_eq!(reported[0].0, "ns-strict");
     // Sorted ascending, both app ports (neither matches the 15006 listener port).
@@ -209,21 +209,22 @@ fn ambiguous_candidate_app_port_override_reported_as_unenforced() {
     };
 
     assert_eq!(
-        slice.unenforced_peer_auth_port_overrides(15006),
+        slice.unenforced_peer_auth_port_overrides(),
         vec![("candidate-api".to_string(), vec![8080])]
     );
 }
 
-/// An override keyed on the transport resolution port (15006) DOES take effect,
-/// so it is NOT reported as unenforced. A policy that does not apply to the
-/// workload is likewise ignored.
+/// A workload app-port override remains ambiguous when its number collides with
+/// the transport listener port: resolution applies it listener-wide rather than
+/// only to that app port, so it must still be reported. A policy that does not
+/// apply to the workload remains ignored.
 #[test]
-fn transport_port_override_and_non_applicable_policy_not_reported() {
+fn app_port_collision_with_transport_port_is_reported() {
     let slice = MeshSlice {
         namespace: "prod".to_string(),
         labels: BTreeMap::new(),
         peer_authentications: vec![
-            // Applies to "prod"; override keyed on the listener port → enforced.
+            // 15006 is both this workload's app port and the listener port.
             peer_auth(
                 "ns-listener-override",
                 "prod",
@@ -243,10 +244,15 @@ fn transport_port_override_and_non_applicable_policy_not_reported() {
         ..MeshSlice::default()
     };
 
-    assert!(
-        slice.unenforced_peer_auth_port_overrides(15006).is_empty(),
-        "listener-port override is enforced and out-of-namespace policy does not apply"
+    assert_eq!(
+        slice.unenforced_peer_auth_port_overrides(),
+        vec![("ns-listener-override".to_string(), vec![15006])],
+        "the listener-wide effect does not satisfy per-app-port intent"
     );
+
+    // Keep resolution behavior unchanged: the coincidental key still selects
+    // STRICT for the whole transport listener.
+    assert_eq!(slice.resolve_effective_mtls_mode(15006), MtlsMode::Strict);
 }
 
 // ── Same-scope tie-breaking (fail-secure: more-restrictive mode wins) ─────
