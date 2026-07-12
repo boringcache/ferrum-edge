@@ -3832,6 +3832,16 @@ fn handle_pod_added(
 
     if state.attached {
         forget_failed_pod_enrollment(&state_key);
+        if forget_pending_capture_failure(
+            &state_key,
+            CAPTURE_FAILURE_POD_DETACH,
+            CAPTURE_FAILURE_DETAIL_POD_DETACH,
+        ) {
+            debug!(
+                pod_uid,
+                "Cleared superseded detach failure after same-UID pod re-enrollment"
+            );
+        }
         if let Some(ip) = pod_ip {
             forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
         }
@@ -7124,6 +7134,13 @@ mod tests {
         backend.load_programs().unwrap();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let metrics = NodeAgentMetrics::default();
+        let state_key = pod_state_key(&pod_states, "pod-uid-1");
+        remember_pending_capture_failure(
+            &state_key,
+            CAPTURE_FAILURE_POD_DETACH,
+            CAPTURE_FAILURE_DETAIL_POD_DETACH,
+        );
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED);
         let cgroup_root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
         let config = NodeAgentConfig {
@@ -7164,6 +7181,12 @@ mod tests {
                 .contains_key(&std::net::Ipv4Addr::new(10, 0, 0, 5))
         );
         assert_eq!(metrics.pods_enrolled.load(Ordering::Relaxed), 1);
+        assert!(!has_pending_removal_blocking_failure(&state_key));
+        assert_eq!(
+            metrics.snapshot().capture_state,
+            NODE_AGENT_CAPTURE_STATE_READY,
+            "successful same-UID re-enrollment must supersede a stale detach blocker"
+        );
     }
 
     #[test]
