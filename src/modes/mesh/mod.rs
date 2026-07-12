@@ -10459,7 +10459,7 @@ fn startup_inbound_mtls_mode(
 ) -> Result<config::MtlsMode, anyhow::Error> {
     let resolved = resolve_inbound_mtls_mode(initial_slice, runtime);
     if let Some(slice) = initial_slice {
-        warn_unenforced_peer_auth_port_overrides(slice, runtime);
+        warn_unenforced_peer_auth_port_overrides(slice, runtime, true);
     }
     validate_inbound_mtls_mode_for_topology(runtime, resolved)?;
     Ok(resolved)
@@ -10474,6 +10474,7 @@ fn startup_inbound_mtls_mode(
 fn warn_unenforced_peer_auth_port_overrides(
     slice: &MeshSlice,
     runtime: &MeshRuntimeConfig,
+    applies_to_listener: bool,
 ) -> bool {
     if !runtime.has_inbound_tls_termination_listener() {
         return false;
@@ -10486,12 +10487,17 @@ fn warn_unenforced_peer_auth_port_overrides(
             .map(u16::to_string)
             .collect::<Vec<_>>()
             .join(", ");
-        let effective_mode_detail = if ports.contains(&resolution_port) {
+        let resolution_detail = if ports.contains(&resolution_port) {
             format!(
-                "the override keyed on transport port {resolution_port} determines the mode for the whole listener, not only that app port"
+                "if this policy wins, the override keyed on transport port {resolution_port} supplies its listener-wide mode, not a mode for only that app port"
             )
         } else {
-            "none of these keys matches the transport port, so the policy's top-level mtls mode determines the mode for the whole listener".to_string()
+            "none of these keys matches the transport port, so this policy contributes its top-level mtls mode to listener-wide resolution".to_string()
+        };
+        let apply_detail = if applies_to_listener {
+            "if this slice is accepted, the winning policy's resolved listener-wide mode governs traffic"
+        } else {
+            "PeerAuthentication live reload is disabled, so this received policy does not govern the current listener until restart"
         };
         warn!(
             policy = %policy,
@@ -10500,7 +10506,7 @@ fn warn_unenforced_peer_auth_port_overrides(
             unenforced_ports = %ports_list,
             "mesh PeerAuthentication: portLevelMtls overrides (ports: {ports_list}) are NOT \
              enforced per app port; the inbound listener terminates mTLS on transport port \
-             {resolution_port}; {effective_mode_detail}. Per-app-port mTLS enforcement \
+             {resolution_port}; {resolution_detail}; {apply_detail}. Per-app-port mTLS enforcement \
              (SO_ORIGINAL_DST demux) is tracked separately."
         );
         warned = true;
@@ -12779,15 +12785,19 @@ fn start_mesh_slice_apply_task(
                     // independently of PeerAuthentication live reload. Track
                     // this separately from acceptance so rejected slices and
                     // federation/remote-only re-applies do not repeat it.
+                    let live_reload_enabled =
+                        proxy_state.env_config.mesh_peer_auth_live_reload_enabled;
                     if !mesh_slice_matches_last_applied(
                         last_warned_override_slice.as_deref(),
                         slice,
                     ) {
-                        warn_unenforced_peer_auth_port_overrides(slice, &runtime);
+                        warn_unenforced_peer_auth_port_overrides(
+                            slice,
+                            &runtime,
+                            live_reload_enabled,
+                        );
                         last_warned_override_slice = Some(Arc::new(slice.clone()));
                     }
-                    let live_reload_enabled =
-                        proxy_state.env_config.mesh_peer_auth_live_reload_enabled;
                     let federation_snapshot = mesh_state.federation_store().snapshot();
                     let remote_snapshot = mesh_state.remote_endpoint_store().snapshot();
                     // Snapshot the last-accepted slice BEFORE the primary attempt
@@ -25636,7 +25646,7 @@ mod tests {
         )]);
 
         assert!(
-            !warn_unenforced_peer_auth_port_overrides(&slice, &runtime),
+            !warn_unenforced_peer_auth_port_overrides(&slice, &runtime, true),
             "SNI-passthrough topology must not emit an inbound mTLS enforcement warning"
         );
     }
