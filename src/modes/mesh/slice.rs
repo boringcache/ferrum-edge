@@ -681,9 +681,11 @@ impl MeshSlice {
         effective
     }
 
-    /// Applicable PeerAuthentications carrying `port_overrides` (Istio
-    /// `portLevelMtls`) keyed on ports OTHER than `resolution_port` — the single
-    /// transport port the inbound listener actually terminates mTLS on.
+    /// PeerAuthentications considered by inbound resolution carrying
+    /// `port_overrides` (Istio `portLevelMtls`) keyed on ports OTHER than
+    /// `resolution_port` — the single transport port the inbound listener
+    /// actually terminates mTLS on. On an ambiguous-label slice this includes
+    /// candidate-only selector policies considered by fail-closed resolution.
     ///
     /// Those overrides are NOT enforced today: one `rustls::ServerConfig` per
     /// listener cannot vary STRICT/PERMISSIVE per app port without pre-handshake
@@ -703,7 +705,11 @@ impl MeshSlice {
     ) -> Vec<(String, Vec<u16>)> {
         let mut reported = Vec::new();
         for pa in &self.peer_authentications {
-            if !peer_auth_applies_to_workload(pa, &self.namespace, &self.labels) {
+            let applies = peer_auth_applies_to_workload(pa, &self.namespace, &self.labels);
+            let ambiguous_candidate = self.labels_ambiguous
+                && classify_peer_auth_scope(pa) == PeerAuthScope::WorkloadSelector
+                && peer_auth_selector_namespace_matches(pa, &self.namespace);
+            if !applies && !ambiguous_candidate {
                 continue;
             }
             let mut ports: Vec<u16> = pa

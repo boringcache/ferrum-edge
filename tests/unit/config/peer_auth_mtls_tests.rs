@@ -174,10 +174,44 @@ fn app_port_overrides_reported_as_unenforced() {
     // Sorted ascending, both app ports (neither matches the 15006 listener port).
     assert_eq!(reported[0].1, vec![8080, 9090]);
 
-    // Resolution itself is untouched: the whole listener follows the top-level
-    // STRICT mode; the app-port PERMISSIVE override is NOT applied.
+    // Resolution itself is untouched: the generic resolver still honors an
+    // override when asked about that exact app port.
+    assert_eq!(
+        slice.resolve_effective_mtls_mode(8080),
+        MtlsMode::Permissive
+    );
+
+    // Production asks about the transport listener port, so the whole listener
+    // follows the top-level STRICT mode and the app-port override is not applied.
     assert_eq!(slice.resolve_effective_mtls_mode(15006), MtlsMode::Strict);
-    assert_eq!(slice.resolve_effective_mtls_mode(8080), MtlsMode::Strict);
+}
+
+/// Candidate-only selector policies on an ambiguous-label slice participate in
+/// fail-closed inbound resolution, so their dropped app-port intent must also be
+/// reported even though the partial label intersection cannot match them.
+#[test]
+fn ambiguous_candidate_app_port_override_reported_as_unenforced() {
+    let slice = MeshSlice {
+        namespace: "prod".to_string(),
+        labels: BTreeMap::from([("shared".to_string(), "yes".to_string())]),
+        labels_ambiguous: true,
+        peer_authentications: vec![peer_auth(
+            "candidate-api",
+            "prod",
+            Some(WorkloadSelector {
+                labels: HashMap::from([("app".into(), "api".into())]),
+                namespace: None,
+            }),
+            MtlsMode::Permissive,
+            HashMap::from([(8080, MtlsMode::Strict)]),
+        )],
+        ..MeshSlice::default()
+    };
+
+    assert_eq!(
+        slice.unenforced_peer_auth_port_overrides(15006),
+        vec![("candidate-api".to_string(), vec![8080])]
+    );
 }
 
 /// An override keyed on the transport resolution port (15006) DOES take effect,

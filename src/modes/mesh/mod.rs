@@ -10497,6 +10497,7 @@ fn live_reload_inbound_mtls_mode(
     slice: &MeshSlice,
     runtime: &MeshRuntimeConfig,
 ) -> Option<config::MtlsMode> {
+    warn_unenforced_peer_auth_port_overrides(slice, runtime);
     let resolved = resolve_inbound_mtls_mode(Some(slice), runtime);
     if let Err(error) = validate_inbound_mtls_mode_for_topology(runtime, resolved) {
         warn!(
