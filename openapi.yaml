@@ -3268,12 +3268,15 @@ paths:
                     description: Persistence or preparation errors that caused the restore to fail
                   rollback:
                     type: string
-                    enum: [completed, incomplete, unavailable]
+                    enum: [completed, incomplete, unavailable, not_needed]
                     description: >-
                       Outcome of the best-effort rollback. `completed` — prior
                       config reapplied; `incomplete` — reapply failed (see
                       `rollback_errors`); `unavailable` — the prior config
-                      could not be snapshotted, so no rollback was attempted.
+                      could not be snapshotted, so no rollback was attempted;
+                      `not_needed` — the clear failed atomically (SQL / replica-set
+                      MongoDB), so nothing was deleted and the prior config was
+                      retained without any compensating re-import.
                   rollback_errors:
                     type: array
                     items:
@@ -3285,12 +3288,30 @@ paths:
                       Number of API specs present before the restore that a
                       config rollback cannot restore. Present only when the
                       namespace carried specs.
+                  api_specs_lost:
+                    type: array
+                    description: >-
+                      Identities of the API specs a config rollback could not
+                      restore. Present only when `api_specs_not_restored` is set.
+                      Each entry names the spec and the proxy whose (now
+                      hand-managed) resources must be cleared before re-submitting
+                      the spec via POST /api-specs.
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          description: The removed api_spec id.
+                        proxy_id:
+                          type: string
+                          description: The proxy the spec owned (reapplied as a hand-managed resource).
                   api_specs_note:
                     type: string
                     description: >-
-                      Operator guidance to re-submit the affected API specs via
-                      POST /api-specs. Present only when `api_specs_not_restored`
-                      is set.
+                      Operator guidance to recover the affected API specs
+                      (delete the restored proxy/upstream/plugins, then re-submit
+                      the spec via POST /api-specs). Present only when
+                      `api_specs_not_restored` is set.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":

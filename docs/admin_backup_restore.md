@@ -79,7 +79,9 @@ The recovery snapshot in step 2 is captured via `load_full_config`, which **reje
 
 ### API specs are not restored by rollback
 
-`api_specs` are admin-only metadata that live **outside** `GatewayConfig`, so the delete phase removes them but the config rollback cannot bring them back. When a failed restore rolls back a namespace that carried specs, the `500` response reports `api_specs_not_restored` (the count) and `api_specs_note` (guidance). Re-submit the affected specs with `POST /api-specs` after recovery. Successful restores are unaffected — they replace the namespace, including specs, from scratch.
+`api_specs` are admin-only metadata that live **outside** `GatewayConfig`, so the delete phase removes them but the config rollback cannot bring them back. When a failed restore rolls back a namespace that carried specs, the `500` response reports `api_specs_not_restored` (the count), `api_specs_lost` (the exact `id` + `proxy_id` of every dropped spec), and `api_specs_note` (guidance).
+
+Recovery is not a bare re-submit: rollback reapplies the spec-owned proxy/upstream/plugins as **hand-managed** resources (their `api_spec_id` is cleared), so a plain `POST /api-specs` for the same spec collides on route/name/id uniqueness. To reattach a spec, first delete the restored proxy (and its upstream/plugins) listed under `api_specs_lost`, then re-submit the original spec document via `POST /api-specs`. Successful restores are unaffected — they replace the namespace, including specs, from scratch.
 
 ### Safety Guard
 
@@ -174,7 +176,11 @@ If the delete or any resource type fails during import, the endpoint removes the
   ],
   "rollback": "completed",
   "api_specs_not_restored": 2,
-  "api_specs_note": "2 API spec(s) were removed and cannot be restored by rollback; re-submit them via POST /api-specs"
+  "api_specs_lost": [
+    { "id": "spec-1", "proxy_id": "orders-proxy" },
+    { "id": "spec-2", "proxy_id": "billing-proxy" }
+  ],
+  "api_specs_note": "2 API spec(s) were removed and cannot be restored by rollback. Their proxy/upstream/plugin resources were reapplied as hand-managed (api_spec_id cleared), so re-submitting a spec via POST /api-specs first requires deleting the restored proxy (and its upstream/plugins) to avoid route/name/id collisions, then re-submitting the original spec document. Affected specs are listed in api_specs_lost."
 }
 ```
 
@@ -183,8 +189,9 @@ The `rollback` field reports the outcome:
 - `completed` — the prior config was reapplied and retained.
 - `incomplete` — reapplying the prior config failed; the response includes `rollback_errors` and instructs the operator to perform manual recovery. The rollback is best-effort because it uses the same database backend that reported the failure.
 - `unavailable` — the prior config could not be snapshotted (it was already invalid/unloadable), so no rollback was attempted; manual recovery is required.
+- `not_needed` — the **clear itself failed atomically** (SQL runs it in one transaction; replica-set MongoDB in a multi-document transaction). Nothing was deleted, so the prior config — including its `api_specs` — is fully intact and no compensating re-import runs. Only standalone (non-replica-set) MongoDB, whose clear deletes collections one-by-one, can leave a partial state and take the `completed`/`incomplete` path on a delete failure.
 
-`api_specs_not_restored` / `api_specs_note` appear only when the namespace carried API specs, which a config rollback cannot restore (see above). The payload is still validated before the snapshot and delete phases; validation failures return `400` and leave existing config untouched.
+`api_specs_not_restored` / `api_specs_lost` / `api_specs_note` appear only when the namespace carried API specs, which a config rollback cannot restore (see above). The payload is still validated before the snapshot and delete phases; validation failures return `400` and leave existing config untouched.
 
 ## Restore vs. Batch
 
