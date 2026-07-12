@@ -2280,12 +2280,14 @@ jobs:
               src/modes/mesh/*|src/modes/mesh/**|\
               src/modes/node_agent.rs|src/modes/node_agent_cni_server.rs|\
               src/plugins/mesh/*|src/plugins/mesh/**|src/plugins/prometheus_metrics.rs|\
+              src/proxy/backend_dispatch.rs|src/proxy/grpc_proxy.rs|\
               src/proxy/hbone_pool.rs|src/proxy/hbone_proxy.rs|src/proxy/mesh_mtls_pool.rs|\
               src/proxy/mesh_tcp_egress.rs|src/proxy/mesh_tcp_inbound.rs|\
               src/proxy/mesh_udp_capture.rs|src/proxy/mesh_udp_frame.rs|src/proxy/mod.rs|\
               src/proxy/netns_capture.rs|src/proxy/netns_udp_capture.rs|src/proxy/tcp_proxy.rs|src/proxy/udp_batch.rs|\
               src/router_cache.rs|src/socket_opts.rs|\
               src/service_discovery/*|src/service_discovery/**|\
+              src/tls/*|src/tls/**|\
               tests/functional/functional_mesh_mode_test.rs|\
               tests/functional/fixtures/*|tests/functional/fixtures/**|\
               tests/k8s/lib/*|tests/k8s/lib/**|tests/k8s/node_waypoint_ebpf_live/*|tests/k8s/node_waypoint_ebpf_live/**|\
