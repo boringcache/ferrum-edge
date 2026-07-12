@@ -34,6 +34,7 @@ use crate::config::db_backend::{self, DatabaseBackend, IncrementalResult};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot as apply_incremental_to_config;
 use crate::config::types::GatewayConfig;
+use crate::config::validation_pipeline::collect_rejecting_runtime_config_errors;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::cp_server::{CpGrpcServer, CpScope};
 use crate::grpc::mesh_registry::{
@@ -425,8 +426,26 @@ async fn load_full_config_multi_with_sequence(
     for ns in namespaces {
         sequences.insert(ns.clone(), db.latest_change_sequence(ns).await?);
     }
-    let config = load_full_config_multi(db, namespaces).await?;
+    let mut config = load_full_config_multi(db, namespaces).await?;
+    config.normalize_fields();
+    config.resolve_upstream_tls();
+    reject_invalid_cp_full_snapshot(&config)?;
     Ok((config, sequences))
+}
+
+fn reject_invalid_cp_full_snapshot(config: &GatewayConfig) -> Result<(), anyhow::Error> {
+    let validation_errors = collect_rejecting_runtime_config_errors(config);
+    if validation_errors.is_empty() {
+        return Ok(());
+    }
+
+    for message in &validation_errors {
+        error!("CP full config rejected: {}", message);
+    }
+    anyhow::bail!(
+        "CP full configuration validation failed: {} rejecting error(s) found",
+        validation_errors.len()
+    )
 }
 
 /// Partition an `IncrementalResult` by `namespace`, returning a delta for
@@ -1434,32 +1453,8 @@ pub async fn run(
 
                                 // Rejecting validators — collect all failures so
                                 // operators see every reason in a single poll cycle.
-                                let mut validation_errors: Vec<String> = Vec::new();
-                                if let Err(errs) = new_config.validate_regex_listen_paths() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) = new_config.validate_listen_path_encodings() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) = new_config.validate_unique_listen_paths() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) = new_config.validate_stream_proxies() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) = new_config.validate_upstream_references() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) = new_config.validate_plugin_references() {
-                                    validation_errors.extend(errs);
-                                }
-                                if let Err(errs) =
-                                    crate::proxy::validate_mesh_route_dispatch_upstream_references(
-                                        &new_config,
-                                    )
-                                {
-                                    validation_errors.extend(errs);
-                                }
+                                let validation_errors =
+                                    collect_rejecting_runtime_config_errors(&new_config);
                                 if !validation_errors.is_empty() {
                                     for msg in &validation_errors {
                                         error!("CP incremental config rejected: {}", msg);
@@ -1901,6 +1896,26 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn cp_full_snapshot_rejects_dangling_upstream_reference() {
+        let mut proxy = make_proxy("dangling-upstream");
+        proxy.upstream_id = Some("missing-upstream".to_string());
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            ..Default::default()
+        };
+
+        let error = reject_invalid_cp_full_snapshot(&config)
+            .expect_err("CP full snapshot must reject a dangling upstream reference");
+
+        assert!(
+            error
+                .to_string()
+                .contains("CP full configuration validation failed"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

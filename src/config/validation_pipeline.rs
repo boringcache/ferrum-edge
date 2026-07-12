@@ -73,6 +73,39 @@ pub(crate) struct ValidationPipeline<'a> {
     steps: Vec<ValidationStep<'a>>,
 }
 
+/// Collect the rejecting runtime-config validation contract shared by
+/// database full loads and CP incremental updates.
+///
+/// Warning-only validation (for example certificate paths and consumer
+/// identity collisions) remains mode-specific and is intentionally excluded.
+pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    if let Err(found) = config.validate_regex_listen_paths() {
+        errors.extend(found);
+    }
+    if let Err(found) = config.validate_listen_path_encodings() {
+        errors.extend(found);
+    }
+    if let Err(found) = config.validate_unique_listen_paths() {
+        errors.extend(found);
+    }
+    if let Err(found) = config.validate_stream_proxies() {
+        errors.extend(found);
+    }
+    if let Err(found) = config.validate_upstream_references() {
+        errors.extend(found);
+    }
+    if let Err(found) = config.validate_plugin_references() {
+        errors.extend(found);
+    }
+    if let Err(found) = crate::proxy::validate_mesh_route_dispatch_upstream_references(config) {
+        errors.extend(found);
+    }
+
+    errors
+}
+
 impl<'a> ValidationPipeline<'a> {
     pub(crate) fn new(config: &'a mut GatewayConfig) -> Self {
         Self {
