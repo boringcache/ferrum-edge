@@ -312,7 +312,7 @@ async fn stalled_buffered_upload_releases_half_open_probe_neutrally() {
     );
 
     let status: serde_json::Value = client
-        .get(gateway.admin_url("/metrics"))
+        .get(gateway.admin_url("/admin/metrics"))
         .header("Authorization", &auth)
         .send()
         .await
