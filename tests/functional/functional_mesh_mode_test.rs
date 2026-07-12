@@ -6330,17 +6330,29 @@ async fn mesh_websocket_echo_roundtrip_path(
     path: &str,
     payload: &str,
 ) -> Result<String, String> {
+    mesh_websocket_echo_roundtrip_to(
+        SocketAddr::from(([127, 0, 0, 1], port)),
+        host,
+        path,
+        payload,
+    )
+    .await
+}
+
+async fn mesh_websocket_echo_roundtrip_to(
+    address: SocketAddr,
+    host: &str,
+    path: &str,
+    payload: &str,
+) -> Result<String, String> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    let tcp = tokio::time::timeout(
-        Duration::from_secs(5),
-        TcpStream::connect(("127.0.0.1", port)),
-    )
-    .await
-    .map_err(|_| "websocket connect timed out".to_string())?
-    .map_err(|e| format!("websocket connect failed: {e}"))?;
+    let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(address))
+        .await
+        .map_err(|_| "websocket connect timed out".to_string())?
+        .map_err(|e| format!("websocket connect failed: {e}"))?;
 
     // Build the upgrade request with the egress-route Host (tungstenite would
     // otherwise key the Host off the raw 127.0.0.1 address and miss the route).
@@ -8067,14 +8079,15 @@ fn make_source_svids_readable_by_sidecar(temp: &TempDir, svids: &TwoGatewaySvids
 
 #[cfg(target_os = "linux")]
 async fn wait_for_tcp_port_in_netns(pid: u32, port: u16, timeout: Duration) -> bool {
+    wait_for_tcp_addr_in_netns(pid, SocketAddr::from(([127, 0, 0, 1], port)), timeout).await
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_tcp_addr_in_netns(pid: u32, address: SocketAddr, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         let connected = run_in_live_netns(pid, move || {
-            Ok(std::net::TcpStream::connect_timeout(
-                &SocketAddr::from(([127, 0, 0, 1], port)),
-                Duration::from_millis(200),
-            )
-            .is_ok())
+            Ok(std::net::TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok())
         })
         .unwrap_or(false);
         if connected {
@@ -9175,7 +9188,7 @@ fn live_xc_install_destination_capture(
 struct LiveXcGatewaySpawnOptions {
     node_id: &'static str,
     topology: &'static str,
-    netns_pid: u32,
+    netns_pid: Option<u32>,
     run_uid: Option<u32>,
     env: Vec<(&'static str, String)>,
 }
@@ -9215,9 +9228,13 @@ fn live_xc_spawn_gateway(
         waypoint_name: None,
         env_overrides: env,
     };
-    let child = match run_uid {
-        Some(uid) => spawn_mesh_gateway_in_netns_as_uid(temp, options, netns_pid, uid),
-        None => spawn_mesh_gateway_in_netns_as_root(temp, options, netns_pid),
+    let child = match (netns_pid, run_uid) {
+        (Some(netns_pid), Some(uid)) => {
+            spawn_mesh_gateway_in_netns_as_uid(temp, options, netns_pid, uid)
+        }
+        (Some(netns_pid), None) => spawn_mesh_gateway_in_netns_as_root(temp, options, netns_pid),
+        (None, None) => spawn_mesh_gateway(temp, options),
+        (None, Some(_)) => unreachable!("host-netns live gateways run as the test user"),
     };
     LiveGatewayChild::new(child)
 }
@@ -9336,7 +9353,7 @@ impl LiveTwoClusterFixture {
             LiveXcGatewaySpawnOptions {
                 node_id: "live-xc-sidecar-destination",
                 topology: "sidecar",
-                netns_pid: destination.pod.pid(),
+                netns_pid: Some(destination.pod.pid()),
                 run_uid: Some(1337),
                 env: live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B, &dns.resolver),
             },
@@ -9361,7 +9378,7 @@ impl LiveTwoClusterFixture {
             LiveXcGatewaySpawnOptions {
                 node_id: "live-xc-ambient-destination",
                 topology: "ambient",
-                netns_pid: destination.pod.pid(),
+                netns_pid: Some(destination.pod.pid()),
                 run_uid: Some(1337),
                 env: live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B, &dns.resolver),
             },
@@ -9392,7 +9409,7 @@ impl LiveTwoClusterFixture {
             LiveXcGatewaySpawnOptions {
                 node_id: "live-xc-east-west",
                 topology: "east_west_gateway",
-                netns_pid: east_west.pod.pid(),
+                netns_pid: Some(east_west.pod.pid()),
                 run_uid: Some(1337),
                 env: live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B, &dns.resolver),
             },
@@ -9470,7 +9487,7 @@ impl LiveTwoClusterFixture {
             LiveXcGatewaySpawnOptions {
                 node_id: "live-xc-sidecar-source",
                 topology: "sidecar",
-                netns_pid: source.pod.pid(),
+                netns_pid: Some(source.pod.pid()),
                 run_uid: Some(1337),
                 env: sidecar_env,
             },
@@ -9491,14 +9508,17 @@ impl LiveTwoClusterFixture {
             ("FERRUM_MESH_CAPTURE_UDP_PORT", udp_capture_port.to_string()),
             ("FERRUM_MESH_IP6TABLES_ENABLED", "false".to_string()),
         ]);
-        let ambient_source = live_xc_spawn_gateway(
+        let mut ambient_source = live_xc_spawn_gateway(
             &temp_ambient_source,
             cp_ambient_source.addr,
             ports_ambient_source,
             LiveXcGatewaySpawnOptions {
                 node_id: "live-xc-ambient-source",
                 topology: "ambient",
-                netns_pid: source.pod.pid(),
+                // Ambient is a node proxy: it must stay outside workload
+                // namespaces so the per-pod UDP producer can distinguish the
+                // registry target from its own host/proxy namespace.
+                netns_pid: None,
                 run_uid: None,
                 env: ambient_env,
             },
@@ -9513,7 +9533,7 @@ impl LiveTwoClusterFixture {
             LiveXcGatewaySpawnOptions {
                 node_id: "live-xc-unfederated-source",
                 topology: "sidecar",
-                netns_pid: source.pod.pid(),
+                netns_pid: Some(source.pod.pid()),
                 run_uid: Some(1338),
                 env: live_xc_spire_env(
                     spire.agent_socket_a(),
@@ -9532,7 +9552,7 @@ impl LiveTwoClusterFixture {
             LiveXcGatewaySpawnOptions {
                 node_id: "live-xc-wrong-td-source",
                 topology: "sidecar",
-                netns_pid: source.pod.pid(),
+                netns_pid: Some(source.pod.pid()),
                 run_uid: Some(1337),
                 env: live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A, &dns.resolver),
             },
@@ -9547,7 +9567,7 @@ impl LiveTwoClusterFixture {
             LiveXcGatewaySpawnOptions {
                 node_id: "live-xc-missing-sni-source",
                 topology: "sidecar",
-                netns_pid: source.pod.pid(),
+                netns_pid: Some(source.pod.pid()),
                 run_uid: Some(1337),
                 env: live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A, &dns.resolver),
             },
@@ -9555,7 +9575,6 @@ impl LiveTwoClusterFixture {
 
         for (label, port, temp) in [
             ("sidecar source", sidecar_outbound, &temp_sidecar_source),
-            ("ambient source", ambient_outbound, &temp_ambient_source),
             (
                 "unfederated source",
                 unfederated_outbound,
@@ -9576,12 +9595,27 @@ impl LiveTwoClusterFixture {
                 ));
             }
         }
-        wait_for_udp_capture_snapshot(
+        let ambient_address = SocketAddr::from((source.host_ip, ambient_outbound));
+        if !wait_for_tcp_addr_in_netns(source.pod.pid(), ambient_address, STARTUP_TIMEOUT).await {
+            return Err(format!(
+                "ambient source did not bind outside the workload netns\n{}\n{}",
+                captured_output(&temp_ambient_source),
+                spire.diagnostics()
+            ));
+        }
+        if let Err(error) = wait_for_udp_capture_snapshot(
             source.pod.pid(),
             udp_capture_port,
             true,
             Duration::from_secs(20),
-        )?;
+        ) {
+            let status = ambient_source.poll_status();
+            return Err(format!(
+                "{error}; ambient source {status}\n{}\n{}",
+                captured_output(&temp_ambient_source),
+                spire.diagnostics()
+            ));
+        }
 
         Ok(Self {
             source,
@@ -9685,6 +9719,17 @@ impl LiveTwoClusterFixture {
     ) -> Result<String, String> {
         run_async_in_live_netns(self.source.pod.pid(), move || async move {
             mesh_websocket_echo_roundtrip(outbound, host, payload).await
+        })
+    }
+
+    async fn ambient_websocket(
+        &self,
+        host: &'static str,
+        payload: &'static str,
+    ) -> Result<String, String> {
+        let address = SocketAddr::from((self.source.host_ip, self.ambient_outbound));
+        run_async_in_live_netns(self.source.pod.pid(), move || async move {
+            mesh_websocket_echo_roundtrip_to(address, host, "/", payload).await
         })
     }
 
@@ -9848,11 +9893,7 @@ async fn live_xc_test_sidecar_websocket(fixture: &LiveTwoClusterFixture) {
 #[cfg(target_os = "linux")]
 async fn live_xc_test_ambient_websocket(fixture: &LiveTwoClusterFixture) {
     let reply = fixture
-        .websocket(
-            fixture.ambient_outbound,
-            "ambient-ws-live.ferrum.svc.cluster.local",
-            "ambient-live",
-        )
+        .ambient_websocket("ambient-ws-live.ferrum.svc.cluster.local", "ambient-live")
         .await
         .unwrap_or_else(|error| {
             panic!(
