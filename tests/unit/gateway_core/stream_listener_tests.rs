@@ -310,6 +310,73 @@ async fn test_reconcile_detects_port_conflict() {
     drop(blocker);
 }
 
+/// Issue #2117: a non-fatal stream-listener bind failure must be surfaced as
+/// structured state (count + per-resource list) on the admin `/overload`
+/// surface, not only warn-logged. Verifies the failure is recorded and that a
+/// later clean reconcile clears it (the snapshot reflects the latest reconcile).
+#[tokio::test]
+async fn test_bind_failure_surfaced_in_overload_snapshot() {
+    // Occupy a port so the reconcile below cannot bind it.
+    let blocker = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind blocker");
+    let blocked_port = blocker.local_addr().unwrap().port();
+
+    let config = GatewayConfig {
+        proxies: vec![create_stream_proxy(
+            "tcp-conflict",
+            BackendScheme::Tcp,
+            blocked_port,
+        )],
+        ..empty_config()
+    };
+    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
+    let manager = create_manager_with_config_arc(config_arc.clone(), &config);
+
+    // Before any reconcile the snapshot is empty.
+    let before = manager.overload_snapshot();
+    assert_eq!(before.bind_failures_total, 0);
+    assert!(before.bind_failures.is_empty());
+
+    let failures = manager.reconcile().await;
+    assert_eq!(
+        failures.len(),
+        1,
+        "expected one bind failure: {:?}",
+        failures
+    );
+
+    // The failure must now be visible in the structured `/overload` snapshot.
+    let snapshot = manager.overload_snapshot();
+    assert_eq!(snapshot.bind_failures_total, 1);
+    assert_eq!(snapshot.bind_failures.len(), 1);
+    assert_eq!(snapshot.bind_failures[0].proxy_id, "tcp-conflict");
+    assert_eq!(snapshot.bind_failures[0].listen_port, blocked_port);
+    assert!(
+        snapshot.bind_failures[0].error.contains("already in use"),
+        "bind failure error should mention port in use: {}",
+        snapshot.bind_failures[0].error
+    );
+
+    // The direct getter mirrors the overload snapshot.
+    let direct = manager.stream_bind_failures();
+    assert_eq!(direct.len(), 1);
+    assert_eq!(direct[0].proxy_id, "tcp-conflict");
+
+    // Free the port and reconcile with an empty config: the stale failure must
+    // clear, proving the snapshot tracks the most recent reconcile.
+    drop(blocker);
+    config_arc.store(Arc::new(empty_config()));
+    let failures = manager.reconcile().await;
+    assert!(
+        failures.is_empty(),
+        "expected no failures after clearing conflict"
+    );
+    let cleared = manager.overload_snapshot();
+    assert_eq!(cleared.bind_failures_total, 0);
+    assert!(cleared.bind_failures.is_empty());
+}
+
 #[tokio::test]
 async fn test_reconcile_restarts_changed_tcp_listener_without_bind_failure() {
     let port = ephemeral_port().await;

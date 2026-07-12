@@ -66,7 +66,9 @@ FERRUM_OVERLOAD_LOOP_CRITICAL_US=500000       # reject connections (500ms)
   "port_exhaustion_events": 0,
   "stream_listeners": {
     "dtls_demux_sessions_total": 0,
-    "dtls_demux_sessions": []
+    "dtls_demux_sessions": [],
+    "bind_failures_total": 0,
+    "bind_failures": []
   },
   "pressure": {
     "file_descriptors": {
@@ -122,6 +124,34 @@ so treat it as operational telemetry rather than an admission-control source.
 Mitigation knobs:
 - `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` bounds how long a peer can hold DTLS demux state before completing the handshake.
 - `FERRUM_UDP_MAX_SESSIONS` caps total UDP/DTLS sessions per proxy, including DTLS peers still in handshake.
+
+## Stream-Listener Bind Failures
+
+The `/overload.stream_listeners.bind_failures` array and its
+`bind_failures_total` count report stream-listener (TCP/UDP/DTLS) resources that
+failed to bind on the most recent config reconcile:
+
+```json
+"stream_listeners": {
+  "dtls_demux_sessions_total": 0,
+  "dtls_demux_sessions": [],
+  "bind_failures_total": 1,
+  "bind_failures": [
+    { "proxy_id": "tcp-echo", "listen_port": 9100, "error": "port 9100 already in use" }
+  ]
+}
+```
+
+In **data-plane (DP) mode** these binds are intentionally **non-fatal**: the DP
+does not own its config (it comes from the control plane), so a single
+unbindable CP-pushed stream proxy must not prevent the DP from starting or brick
+the other listeners. Only the conflicting listener is skipped; it is retried on
+the next reconcile. Before, a skipped bind was only warn-logged; this structured
+surface lets operators alert on `bind_failures_total > 0` and see exactly which
+proxy/port could not bind without scraping logs. The list always reflects the
+latest reconcile, so a resource that binds cleanly on a later reconcile clears
+its entry. In `database`/`file` mode a startup stream-bind conflict is fatal, so
+this list is primarily a DP diagnostic.
 - Overload critical mode rejects new DTLS demux state before per-peer channels/tasks are allocated.
 
 ## Platform Support

@@ -294,6 +294,28 @@ impl BackendTlsMaterialReloadKey {
 pub struct StreamListenerOverloadSnapshot {
     pub dtls_demux_sessions_total: u64,
     pub dtls_demux_sessions: Vec<DtlsDemuxSessionSnapshot>,
+    /// Number of stream-listener resources that failed to bind on the most
+    /// recent `reconcile()`. In DP mode these binds are intentionally
+    /// non-fatal (a bad CP-pushed config must not brick the data plane), so
+    /// this count plus [`Self::bind_failures`] give operators structured
+    /// visibility beyond the warn log.
+    pub bind_failures_total: usize,
+    /// Structured per-resource stream-listener bind failures from the most
+    /// recent `reconcile()`. Empty once every configured stream listener binds
+    /// successfully.
+    pub bind_failures: Vec<StreamBindFailure>,
+}
+
+/// A single stream-listener (TCP/UDP/DTLS) that failed to bind during the most
+/// recent [`StreamListenerManager::reconcile`]. Surfaced in the admin
+/// `/overload` response under `stream_listeners.bind_failures` so a non-fatal
+/// bind failure (e.g. a port conflict on a CP-pushed proxy in DP mode) is
+/// observable rather than only warn-logged.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StreamBindFailure {
+    pub proxy_id: String,
+    pub listen_port: u16,
+    pub error: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -322,6 +344,12 @@ pub struct StreamListenerManager {
     listeners: tokio::sync::Mutex<std::collections::HashMap<String, ListenerHandle>>,
     dtls_metrics: arc_swap::ArcSwap<Vec<DtlsDemuxMetricEntry>>,
     stream_backend_metrics: arc_swap::ArcSwap<Vec<StreamBackendMetricEntry>>,
+    /// Structured snapshot of the most recent `reconcile()`'s stream-listener
+    /// bind failures. Published at the end of every reconcile (startup and
+    /// runtime/CP-pushed), lock-free via `ArcSwap`, and surfaced in the admin
+    /// `/overload` response. In DP mode these binds are non-fatal, so this is
+    /// the operator-facing counterpart to the per-failure warn log.
+    bind_failures: arc_swap::ArcSwap<Vec<StreamBindFailure>>,
     bind_addr: IpAddr,
     config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     dns_cache: DnsCache,
@@ -623,6 +651,7 @@ impl StreamListenerManager {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             dtls_metrics: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
             stream_backend_metrics: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
+            bind_failures: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
             bind_addr,
             config,
             dns_cache,
@@ -1533,6 +1562,22 @@ impl StreamListenerManager {
         self.stream_backend_metrics
             .store(Arc::new(stream_backend_entries));
 
+        // Publish a structured snapshot of this reconcile's bind failures for
+        // the admin `/overload` surface. Overwrites the previous snapshot so it
+        // always reflects the latest reconcile (a resource that binds cleanly on
+        // a later reconcile clears its entry). Empty Vec allocation is cheap and
+        // only happens on the cold reconcile path, never per connection.
+        self.bind_failures.store(Arc::new(
+            bind_failures
+                .iter()
+                .map(|(proxy_id, port, err)| StreamBindFailure {
+                    proxy_id: proxy_id.clone(),
+                    listen_port: *port,
+                    error: err.clone(),
+                })
+                .collect(),
+        ));
+
         bind_failures
     }
 
@@ -1595,10 +1640,20 @@ impl StreamListenerManager {
             });
         }
 
+        let bind_failures = self.bind_failures.load_full();
         StreamListenerOverloadSnapshot {
             dtls_demux_sessions_total,
             dtls_demux_sessions,
+            bind_failures_total: bind_failures.len(),
+            bind_failures: bind_failures.as_ref().clone(),
         }
+    }
+
+    /// Structured snapshot of the most recent `reconcile()`'s stream-listener
+    /// bind failures. Lock-free `ArcSwap` load; used by the admin `/overload`
+    /// surface and tests. Empty once every configured stream listener binds.
+    pub fn stream_bind_failures(&self) -> Arc<Vec<StreamBindFailure>> {
+        self.bind_failures.load_full()
     }
 
     /// Estimate active stream backend sockets without including frontend HTTP/WebSocket sessions.

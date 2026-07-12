@@ -8379,6 +8379,59 @@ components:
             reject_new_requests:
               type: boolean
               description: Whether new requests/streams are being rejected with 503
+        stream_listeners:
+          type: object
+          description: |
+            Stream-listener (TCP/UDP/DTLS) diagnostics. Present only when the
+            gateway has a proxy state (absent in control-plane mode).
+          required: [dtls_demux_sessions_total, dtls_demux_sessions, bind_failures_total, bind_failures]
+          properties:
+            dtls_demux_sessions_total:
+              type: integer
+              format: uint64
+              description: Total pre-handshake DTLS demux sessions across all UDP+DTLS listeners (eventually consistent).
+            dtls_demux_sessions:
+              type: array
+              description: Per-listener pre-handshake DTLS demux session counts.
+              items:
+                type: object
+                required: [listener_key, listen_port, sessions]
+                properties:
+                  listener_key:
+                    type: string
+                  listen_port:
+                    type: integer
+                    format: uint16
+                  sessions:
+                    type: integer
+                    format: uint64
+            bind_failures_total:
+              type: integer
+              description: |
+                Number of stream-listener resources that failed to bind on the
+                most recent config reconcile. In DP mode these binds are
+                intentionally non-fatal (a bad CP-pushed config must not brick
+                the data plane), so this count surfaces the failures beyond the
+                warn log. `0` once every configured stream listener binds.
+            bind_failures:
+              type: array
+              description: |
+                Structured per-resource stream-listener bind failures from the
+                most recent reconcile. Empty once all stream listeners bind.
+              items:
+                type: object
+                required: [proxy_id, listen_port, error]
+                properties:
+                  proxy_id:
+                    type: string
+                    description: ID of the proxy whose stream listener failed to bind.
+                  listen_port:
+                    type: integer
+                    format: uint16
+                    description: The listen port that could not be bound.
+                  error:
+                    type: string
+                    description: Human-readable bind failure reason (e.g. "port already in use").
 
     # ── Runtime metrics ─────────────────────────────────────────────
     RuntimeMetricsSnapshot:
