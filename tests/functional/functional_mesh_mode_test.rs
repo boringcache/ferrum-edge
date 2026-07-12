@@ -30,7 +30,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value;
 use tempfile::TempDir;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_stream::wrappers::{
     IntervalStream, ReceiverStream, TcpListenerStream, UnboundedReceiverStream, UnixListenerStream,
@@ -8712,16 +8712,67 @@ fn live_xc_source_slice(
 }
 
 #[cfg(target_os = "linux")]
-fn live_xc_spire_env(socket: String, workload_id: &str) -> Vec<(&'static str, String)> {
+fn live_xc_spire_env(
+    socket: String,
+    workload_id: &str,
+    dns_resolver: &str,
+) -> Vec<(&'static str, String)> {
     vec![
         ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
         ("FERRUM_MESH_ALLOW_NO_CA", "false".to_string()),
         ("FERRUM_MESH_CA_BACKEND", "spire_agent".to_string()),
         ("FERRUM_MESH_SPIRE_AGENT_SOCKET", socket),
         ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", workload_id.to_string()),
+        ("FERRUM_DNS_RESOLVER_ADDRESS", dns_resolver.to_string()),
         ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
         ("FERRUM_LOG_LEVEL", "debug".to_string()),
     ]
+}
+
+#[cfg(target_os = "linux")]
+struct LiveXcDnsServer {
+    resolver: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(target_os = "linux")]
+impl LiveXcDnsServer {
+    async fn start(advertised_ip: std::net::Ipv4Addr) -> Result<Self, String> {
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|error| format!("bind live fixture DNS responder: {error}"))?;
+        let port = socket
+            .local_addr()
+            .map_err(|error| format!("read live fixture DNS address: {error}"))?
+            .port();
+        let task = tokio::spawn(async move {
+            let mut request = [0u8; 2048];
+            loop {
+                let Ok((size, peer)) = socket.recv_from(&mut request).await else {
+                    return;
+                };
+                if size < 12 {
+                    continue;
+                }
+                let mut response = request[..size].to_vec();
+                response[2] = 0x81;
+                response[3] = 0x83;
+                response[6..12].fill(0);
+                let _ = socket.send_to(&response, peer).await;
+            }
+        });
+        Ok(Self {
+            resolver: format!("{advertised_ip}:{port}"),
+            task,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LiveXcDnsServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -9177,6 +9228,7 @@ struct LiveTwoClusterFixture {
     _east_west: LiveVethPod,
     destination: LiveVethPod,
     _host_network: LiveXcHostNetwork,
+    _dns: LiveXcDnsServer,
     _spire: LiveTwoClusterSpire,
     _backends: LiveXcBackends,
     _registry: TempDir,
@@ -9222,6 +9274,7 @@ impl LiveTwoClusterFixture {
         let destination = LiveVethPod::spawn_indexed(22)?;
         let host_network =
             LiveXcHostNetwork::install(source.pod_ip(), east_west.pod_ip(), destination.pod_ip())?;
+        let dns = LiveXcDnsServer::start(source.host_ip).await?;
         let spire = LiveTwoClusterSpire::start().await?;
         let backends = LiveXcBackends::start(destination.pod.pid())?;
         let registry = TempDir::new().map_err(|error| format!("live registry tempdir: {error}"))?;
@@ -9285,7 +9338,7 @@ impl LiveTwoClusterFixture {
                 topology: "sidecar",
                 netns_pid: destination.pod.pid(),
                 run_uid: Some(1337),
-                env: live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B),
+                env: live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B, &dns.resolver),
             },
         );
         if !wait_for_tcp_port_in_netns(
@@ -9310,7 +9363,7 @@ impl LiveTwoClusterFixture {
                 topology: "ambient",
                 netns_pid: destination.pod.pid(),
                 run_uid: Some(1337),
-                env: live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B),
+                env: live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B, &dns.resolver),
             },
         );
         if !wait_for_tcp_port_in_netns(
@@ -9341,7 +9394,7 @@ impl LiveTwoClusterFixture {
                 topology: "east_west_gateway",
                 netns_pid: east_west.pod.pid(),
                 run_uid: Some(1337),
-                env: live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B),
+                env: live_xc_spire_env(spire.agent_socket_b(), LIVE_XC_ID_B, &dns.resolver),
             },
         );
         if !wait_for_tcp_port_in_netns(east_west.pod.pid(), east_west_port, STARTUP_TIMEOUT).await {
@@ -9404,7 +9457,8 @@ impl LiveTwoClusterFixture {
         let ports_sidecar_source = reserve_mesh_ports().await;
         let sidecar_inbound = ports_sidecar_source.inbound;
         let sidecar_outbound = ports_sidecar_source.outbound;
-        let mut sidecar_env = live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A);
+        let mut sidecar_env =
+            live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A, &dns.resolver);
         sidecar_env.extend([
             ("FERRUM_MESH_CAPTURE_MODE", "iptables".to_string()),
             ("FERRUM_MESH_PROXY_UID", "1337".to_string()),
@@ -9425,7 +9479,8 @@ impl LiveTwoClusterFixture {
         let ports_ambient_source = reserve_mesh_ports().await;
         let ambient_outbound = ports_ambient_source.outbound;
         let udp_capture_port = ferrum_edge::capture::DEFAULT_UDP_OUTBOUND_PORT;
-        let mut ambient_env = live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A_AMBIENT);
+        let mut ambient_env =
+            live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A_AMBIENT, &dns.resolver);
         ambient_env.extend([
             ("FERRUM_POOL_WARMUP_ENABLED", "true".to_string()),
             (
@@ -9460,7 +9515,11 @@ impl LiveTwoClusterFixture {
                 topology: "sidecar",
                 netns_pid: source.pod.pid(),
                 run_uid: Some(1338),
-                env: live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A_UNFEDERATED),
+                env: live_xc_spire_env(
+                    spire.agent_socket_a(),
+                    LIVE_XC_ID_A_UNFEDERATED,
+                    &dns.resolver,
+                ),
             },
         );
 
@@ -9475,7 +9534,7 @@ impl LiveTwoClusterFixture {
                 topology: "sidecar",
                 netns_pid: source.pod.pid(),
                 run_uid: Some(1337),
-                env: live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A),
+                env: live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A, &dns.resolver),
             },
         );
 
@@ -9490,7 +9549,7 @@ impl LiveTwoClusterFixture {
                 topology: "sidecar",
                 netns_pid: source.pod.pid(),
                 run_uid: Some(1337),
-                env: live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A),
+                env: live_xc_spire_env(spire.agent_socket_a(), LIVE_XC_ID_A, &dns.resolver),
             },
         );
 
@@ -9529,6 +9588,7 @@ impl LiveTwoClusterFixture {
             _east_west: east_west,
             destination,
             _host_network: host_network,
+            _dns: dns,
             _spire: spire,
             _backends: backends,
             _registry: registry,
