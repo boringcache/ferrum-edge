@@ -681,6 +681,49 @@ impl MeshSlice {
         effective
     }
 
+    /// PeerAuthentications considered by inbound resolution carrying
+    /// `port_overrides` (Istio `portLevelMtls`). On an ambiguous-label slice
+    /// this includes candidate-only selector policies considered by fail-closed
+    /// resolution.
+    ///
+    /// Those overrides are NOT enforced today: one `rustls::ServerConfig` per
+    /// listener cannot vary STRICT/PERMISSIVE per app port without pre-handshake
+    /// SO_ORIGINAL_DST demux, so [`Self::resolve_effective_mtls_mode`] resolves
+    /// one mode for the whole listener. Normally the top-level `mtls_mode` wins;
+    /// when a key equals the transport resolution port, that override wins
+    /// listener-wide rather than per app port. This does NOT change that
+    /// resolution — it only reports the dropped intent so startup can surface it (fail-open / fail-closed
+    /// visibility) for EVERY config source (native `MeshSubscribe`, xDS, file),
+    /// not just the K8s translator/status path. Full per-app-port enforcement is
+    /// tracked as a separate architectural item.
+    ///
+    /// Returns `(policy_namespace/name, sorted_unenforced_ports)` for each
+    /// offending applicable policy; empty when nothing is dropped.
+    pub fn unenforced_peer_auth_port_overrides(&self) -> Vec<(String, Vec<u16>)> {
+        let mut reported = Vec::new();
+        for pa in &self.peer_authentications {
+            let applies = peer_auth_applies_to_workload(pa, &self.namespace, &self.labels);
+            let ambiguous_candidate = self.labels_ambiguous
+                && classify_peer_auth_scope(pa) == PeerAuthScope::WorkloadSelector
+                && peer_auth_selector_namespace_matches(pa, &self.namespace);
+            if !applies && !ambiguous_candidate {
+                continue;
+            }
+            // Istio portLevelMtls keys are workload app/container ports. Report
+            // every key, including one whose number happens to equal the mesh
+            // transport listener port: that collision applies the selected mode
+            // listener-wide and still does not honor the operator's per-app-port
+            // intent.
+            let mut ports: Vec<u16> = pa.port_overrides.keys().copied().collect();
+            if ports.is_empty() {
+                continue;
+            }
+            ports.sort_unstable();
+            reported.push((format!("{}/{}", pa.namespace, pa.name), ports));
+        }
+        reported
+    }
+
     /// Returns the most-specific applicable [`MeshProxyConfig`] for this slice's
     /// workload, or `None` when no `ProxyConfig` applies.
     ///
