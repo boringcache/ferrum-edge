@@ -9,6 +9,35 @@ import sys
 from pathlib import Path
 
 
+MESH_FEDERATION_DOCUMENTATION_PATHS = frozenset(
+    {
+        "docs/configuration.md",
+        "docs/mesh.md",
+        "docs/mesh_multicluster_federation_runbook.md",
+        "docs/spire_deployment.md",
+    }
+)
+
+MESH_E2E_SIDECAR_DOCUMENTATION_PATHS = frozenset(
+    {
+        "docs/configuration.md",
+        "docs/mesh.md",
+        "docs/spire_deployment.md",
+    }
+)
+
+# verify_required_ci.py requires the PR planner's protected documentation set
+# to cover this union, so new live-suite documentation triggers cannot silently
+# receive lightweight CI.
+LIVE_SUITE_DOCUMENTATION_PATHS = (
+    MESH_FEDERATION_DOCUMENTATION_PATHS | MESH_E2E_SIDECAR_DOCUMENTATION_PATHS
+)
+
+
+def exact_path_patterns(paths: frozenset[str]) -> list[str]:
+    return [rf"^{re.escape(path)}$" for path in sorted(paths)]
+
+
 SUITE_PATTERNS: dict[str, list[str]] = {
     "gateway-api": [
         r"^\.github/workflows/(ci|gateway-api-conformance)\.yml$",
@@ -61,7 +90,7 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^src/plugins/mesh/",
         r"^src/capture/",
         r"^src/proxy/",
-        r"^docs/(mesh|mesh_multicluster_federation_runbook|spire_deployment|configuration)\.md$",
+        *exact_path_patterns(MESH_FEDERATION_DOCUMENTATION_PATHS),
     ],
     # Single-cluster Sidecar mesh live e2e (STRICT mTLS / authz / RequestAuth
     # JWT / DR connectTimeout / CP-delivered native MeshSubscribe config) +
@@ -153,7 +182,7 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^src/backend_conn_limit\.rs$",
         r"^src/capture/",
         r"^src/proxy/",
-        r"^docs/(mesh|spire_deployment|configuration)\.md$",
+        *exact_path_patterns(MESH_E2E_SIDECAR_DOCUMENTATION_PATHS),
     ],
 }
 

@@ -55,16 +55,19 @@ adding, removing, or materially changing a workflow.
 
 ```
 Pull Request
-    ├─► Format
-    ├─► Unit / inline-lib / integration-shard / functional-shard tests
-    ├─► Lint, dependency audit, vendored regressions
-    ├─► Coverage workflow mirror
-    ├─► eBPF/netns live checks when relevant
-    ├─► Gateway / mesh / Helm / performance gates
-    └─► Five target release builds
+    └─► CI plan
+            ├─► Docs/license/agent-only: lightweight Tests aggregate
+            └─► Full CI
+                    ├─► Format
+                    ├─► Unit / inline-lib / integration-shard / functional-shard tests
+                    ├─► Lint, dependency audit, vendored regressions
+                    ├─► Coverage workflow mirror
+                    ├─► eBPF/netns live checks when relevant
+                    ├─► Gateway / mesh / Helm / performance gates
+                    └─► Five target release builds
 
 Push to main
-    ├─► Same required validation gate as PRs
+    ├─► Full required validation gate
     └─► Five target release builds
             └─► Tests aggregate passes
                     ├─► Replace latest GitHub prerelease
@@ -88,12 +91,29 @@ Push tag v* (e.g., v0.2.0)
 ## CI Pipeline (ci.yml)
 
 The CI workflow is triggered by every pull request and every push to `main`.
-The `Tests` aggregate is the required validation gate for both event types: it
-waits for format, test shards, lint, dependency audit, vendored patch
-regressions, the Coverage workflow mirror, Gateway/mesh/Helm gates, eBPF/netns
-gates, performance, and the cross-platform build matrix. Pushes to `main`
-publish the `latest` prerelease and Docker images only after that aggregate and
-the build matrix pass.
+The `CI Plan` job first selects `full` or `light` mode. Pull requests whose
+entire diff is limited to ordinary documentation, `.agents/**`, `.claude/**`,
+Markdown outside `vendor/`, or license files use light mode and preserve a fast
+`Tests` aggregate without starting the Rust/build matrix. Documentation that
+deliberately triggers a live datapath suite (including the mesh, SPIRE,
+configuration, NodeWaypoint, and CI contract/runbook files) remains full mode.
+The planner runs `git diff --check` for PR diff hygiene and disables rename
+detection when classifying paths, so both the source and destination of a rename
+are checked.
+Any unrecognized path, an empty/unavailable diff, a mixed code-and-docs change,
+a push to `main`, or a manual run fails over to full mode. The decision table
+and its executable examples live in `.github/scripts/pr_ci_plan.py`. PR
+decisions use the planner from the base branch when available, so a planner-only
+edit cannot classify itself as light; edits to the planner therefore receive
+the full matrix. The required-CI verifier also checks that documentation paths
+used by live-suite filters remain in the planner's full-CI set.
+
+In full mode, the `Tests` aggregate waits for format, test shards, lint,
+dependency audit, vendored patch regressions, the Coverage workflow mirror,
+Gateway/mesh/Helm gates, eBPF/netns gates, performance, and the cross-platform
+build matrix. In light mode it requires the planner to succeed and accepts the
+planned heavy jobs as skipped. Pushes to `main` publish the `latest` prerelease
+and Docker images only after the full aggregate and build matrix pass.
 
 CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progress: true`, so a newer push to the same branch cancels the older CI run. On `main`, that can interrupt an in-flight publish job such as Docker manifest creation. If the cancellation left publishing incomplete, re-run the newest workflow attempt (the one for the latest `main` SHA) — re-running the older, canceled run would re-publish stale binaries and images as `latest`.
 
@@ -103,7 +123,7 @@ CI uses `concurrency.group: ci-publish-${{ github.ref }}` with `cancel-in-progre
 
 **Runs**: `ubuntu-latest`
 
-Checks Rust formatting on pull requests and pushes to `main`:
+Checks Rust formatting on full-mode pull requests and pushes to `main`:
 
 ```bash
 cargo fmt --all -- --check
@@ -117,11 +137,14 @@ cargo fmt --all -- --check
 
 **Runs**: `ubuntu-latest`
 
-Runs the required test matrix in parallel. The commands below are grouped by job,
-not run as one sequential shell script:
+Runs the required test matrix in parallel for full-mode pull requests and
+pushes to `main`. The commands below are grouped by job, not run as one
+sequential shell script:
 
 ```bash
 # test-unit
+# First runs the four explicit plugin-hardening regressions, then the complete
+# unit suite in the same job so both commands reuse one compiled test binary.
 cargo test --test unit_tests
 
 # test-lib
@@ -184,7 +207,7 @@ cargo clippy --all-targets -- -D warnings
 
 **Runs**: `ubuntu-latest`
 
-The job runs on PRs and pushes to `main`. On PRs, eBPF validation steps only run when files under `ebpf/` changed relative to the PR base; on `main`, they run without the PR path filter. When eBPF changes are present, CI installs stable and nightly Rust toolchains plus `bpf-linker`, uses nightly to build `ferrum-ebpf`, uses stable to run `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs` artifact with 14-day retention. If this job is edited, preserve the intent that the shared-types test runs on stable Rust. When no eBPF files changed on a PR, the job no-ops and reports success.
+The job runs on full-mode PRs and pushes to `main`. On PRs, eBPF validation steps only run when files under `ebpf/` changed relative to the PR base; on `main`, they run without the PR path filter. When eBPF changes are present, CI installs stable and nightly Rust toolchains plus `bpf-linker`, uses nightly to build `ferrum-ebpf`, uses stable to run `cargo test -p ferrum-ebpf-common`, and uploads the compiled `ebpf-programs` artifact with 14-day retention. If this job is edited, preserve the intent that the shared-types test runs on stable Rust. When no eBPF files changed on a full-mode PR, the job no-ops and reports success.
 
 #### 5. NodeWaypoint eBPF Live Datapath Workflow
 
@@ -223,7 +246,7 @@ diagnostics, mesh drift snapshots, pod-registry dumps, live assertions, and
 
 **Runs**: `ubuntu-latest`
 
-Runs on PRs, pushes to `main`, and manual dispatches. PRs first apply a
+Runs on full-mode PRs, pushes to `main`, and manual dispatches. PRs first apply a
 performance-sensitive path filter; unrelated PRs skip the expensive benchmark
 and report success. Relevant PRs and all `main` pushes build the gateway in the
 `ci-release` profile, build `tests/performance/backend_server`, start both
@@ -252,7 +275,18 @@ python3 tests/performance/ci_overhead_bench.py \
 
 **Runs**: `ubuntu-latest`, `macos-latest`, `windows-latest`
 
-Builds optimized release binaries for Linux x86_64, Linux ARM64, macOS x86_64, macOS ARM64, and Windows x86_64. These run on PRs and on pushes to `main`. The job installs the same prerequisites as the Release pipeline matrix — `protoc` on every OS, `libcurl4-openssl-dev` on Linux, and NASM on Windows — and builds with `--features cloud-secrets` so Vault/AWS/Azure/GCP secret backends are included. The macOS x86_64 build targets `x86_64-apple-darwin` with the standard Apple/Rust toolchain (no `cross` needed) and runs on whichever host architecture GitHub maps `macos-latest` to today (currently ARM64); pin to a concrete runner image such as `macos-14` if the host architecture must be guaranteed.
+Builds cross-platform verification binaries on full-mode PRs and optimized
+release binaries on pushes to `main` for Linux x86_64, Linux ARM64, macOS
+x86_64, macOS ARM64, and Windows x86_64. The job installs the same
+prerequisites as the Release pipeline matrix — `protoc` on every OS,
+`libcurl4-openssl-dev` on Linux, and NASM on Windows — and builds with
+`--features cloud-secrets` so Vault/AWS/Azure/GCP secret backends are included.
+Linux ARM64 downloads the checksum-verified `cross` 0.2.5 release through the
+repository's pinned installer action instead of compiling the tool from source.
+The macOS x86_64 build targets `x86_64-apple-darwin` with the standard
+Apple/Rust toolchain (no `cross` needed) and runs on whichever host architecture
+GitHub maps `macos-latest` to today (currently ARM64); pin to a concrete runner
+image such as `macos-14` if the host architecture must be guaranteed.
 
 #### 8. Latest Release and Docker Jobs
 
