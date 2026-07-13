@@ -1432,7 +1432,7 @@ pub async fn handle_admin_request(
         return Ok(resp);
     }
 
-    match (method, segments.as_slice()) {
+    let response = match (method.clone(), segments.as_slice()) {
         // Proxies CRUD
         (Method::GET, ["proxies"]) => {
             crud::handle_list::<Proxy>(&state, &pagination, auth.role, &namespace).await
@@ -1969,7 +1969,102 @@ pub async fn handle_admin_request(
             StatusCode::NOT_FOUND,
             &json!({"error": "Not Found"}),
         )),
+    };
+    if state.admin_audit_enabled
+        && let (Ok(http_response), Some(db)) = (response.as_ref(), state.db.as_ref())
+        && http_response.status().is_success()
+        && tls_mutation_audit_descriptor(&method, segments.as_slice(), None).is_some()
+    {
+        let response_body = if method == Method::POST
+            && matches!(
+                segments.as_slice(),
+                ["admin", "tls", _] | ["admin", "tls", "acme", _] | ["admin", "tls", "rotate", _]
+            ) {
+            http_response
+                .body()
+                .clone()
+                .collect()
+                .await
+                .ok()
+                .and_then(|body| serde_json::from_slice::<Value>(&body.to_bytes()).ok())
+        } else {
+            None
+        };
+        if let Some((action, resource_type, resource_id)) =
+            tls_mutation_audit_descriptor(&method, segments.as_slice(), response_body.as_ref())
+        {
+            let event = audit::AuditEvent::new(
+                &auth,
+                action,
+                resource_type,
+                resource_id,
+                &namespace,
+                json!({"path": path}),
+            );
+            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+                log_audit_enqueue_failure(&error);
+            }
+        }
     }
+    response
+}
+
+fn tls_mutation_audit_descriptor(
+    method: &Method,
+    segments: &[&str],
+    response_body: Option<&Value>,
+) -> Option<(&'static str, &'static str, String)> {
+    if !matches!(segments, ["admin", "tls", ..])
+        || (method != Method::POST && method != Method::PUT && method != Method::DELETE)
+        || matches!(segments, ["admin", "tls", "validate"])
+    {
+        return None;
+    }
+    let action = match segments {
+        ["admin", "tls", "acme", "orders", _, "finalize"] if method == Method::POST => "finalize",
+        ["admin", "tls", "acme", "renew", _] if method == Method::POST => "renew",
+        ["admin", "tls", "rotate", _] if method == Method::POST => "rotate",
+        _ if method == Method::POST => "create",
+        _ if method == Method::PUT => "update",
+        _ if method == Method::DELETE => "delete",
+        _ => return None,
+    };
+    let resource_type = match segments.get(2).copied() {
+        Some("certificates") => "tls_certificate",
+        Some("private-keys") => "tls_private_key",
+        Some("ca-bundles") => "tls_ca_bundle",
+        Some("crls") => "tls_crl",
+        Some("ocsp-responses") => "tls_ocsp_response",
+        Some("jwks") => "tls_jwks",
+        Some("acme") => "tls_acme",
+        Some("rotate") => "tls_rotation",
+        _ => "tls_material",
+    };
+    let resource_id = match segments {
+        ["admin", "tls", "acme", "orders", id, "finalize"] => (*id).to_string(),
+        ["admin", "tls", "acme", "renew", certificate_id] => (*certificate_id).to_string(),
+        // Prefer the normalized surface from the handler's response body so
+        // documented aliases (e.g. /rotate/frontend vs the canonical watcher
+        // name) audit under the surface that was actually rotated.
+        ["admin", "tls", "rotate", surface] => response_body
+            .and_then(|body| body.get("surface"))
+            .and_then(Value::as_str)
+            .unwrap_or(surface)
+            .to_string(),
+        // Every 4-segment ACME path is a collection (accounts/orders/
+        // certificates), so creates take the created resource's id from the
+        // response body — this arm must come before the generic
+        // `["admin", "tls", _, id]` arm, which would otherwise bind the
+        // collection name as the id.
+        ["admin", "tls", _] | ["admin", "tls", "acme", _] => response_body
+            .and_then(|body| body.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("new")
+            .to_string(),
+        ["admin", "tls", _, id] | ["admin", "tls", "acme", _, id] => (*id).to_string(),
+        _ => segments.last().copied().unwrap_or("new").to_string(),
+    };
+    Some((action, resource_type, resource_id))
 }
 
 #[derive(Debug, Deserialize)]
@@ -5440,6 +5535,36 @@ mod tests {
                 route.join("/")
             );
         }
+    }
+
+    #[test]
+    fn tls_audit_descriptor_uses_acted_on_and_created_resource_ids() {
+        let created = json!({"id": "generated-order"});
+        let (_, _, create_id) = tls_mutation_audit_descriptor(
+            &Method::POST,
+            &["admin", "tls", "acme", "orders"],
+            Some(&created),
+        )
+        .expect("ACME order create should be audited");
+        assert_eq!(create_id, "generated-order");
+
+        let (_, _, finalize_id) = tls_mutation_audit_descriptor(
+            &Method::POST,
+            &["admin", "tls", "acme", "orders", "edge-order", "finalize"],
+            None,
+        )
+        .expect("ACME order finalize should be audited");
+        assert_eq!(finalize_id, "edge-order");
+
+        let rotated =
+            json!({"accepted": true, "requested_surface": "frontend", "surface": "frontend_tls"});
+        let (_, _, rotate_id) = tls_mutation_audit_descriptor(
+            &Method::POST,
+            &["admin", "tls", "rotate", "frontend"],
+            Some(&rotated),
+        )
+        .expect("TLS rotation should be audited");
+        assert_eq!(rotate_id, "frontend_tls");
     }
 
     #[test]

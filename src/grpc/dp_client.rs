@@ -433,14 +433,6 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
         // The timer is only armed after startup readiness (initial snapshot applied)
         // to avoid disconnecting from the fallback before the DP has any config.
         //
-        // Known limitation: should_race_primary is evaluated once per connection
-        // attempt, not continuously. If startup_ready flips from false to true
-        // while the fallback stream is running (first snapshot applied mid-stream),
-        // the primary-retry timer is NOT armed until the fallback stream ends
-        // (disconnect or error). This is acceptable: the fallback is actively
-        // serving valid config, and the primary will be retried on the next
-        // reconnect cycle when the outer loop re-evaluates.
-        //
         // Acquire pairs with the Release store in connect_and_subscribe_with_startup_ready
         // (and the admin /health endpoint reads with Acquire too). On x86 all loads are
         // acquire-fenced by the hardware, but on ARM/AArch64 Relaxed could theoretically
@@ -508,6 +500,21 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                 _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
                     info!("{} gRPC TLS source changed; reconnecting CP stream", tls_reload.as_ref().map(|reload| reload.label).unwrap_or("DP"));
                     update_state_disconnected(&connection_state, cp_url, is_primary);
+                    backoff_secs = BACKOFF_INITIAL_SECS;
+                    continue;
+                }
+                _ = wait_for_readiness_then_primary_retry(
+                    startup_ready.clone(),
+                    primary_retry_secs,
+                ), if is_fallback && primary_retry_secs > 0 => {
+                    info!(
+                        "Primary CP retry interval ({}s) elapsed after startup readiness; disconnecting from fallback CP [{}/{}] to retry primary",
+                        primary_retry_secs,
+                        current_cp_index + 1,
+                        cp_count,
+                    );
+                    update_state_disconnected(&connection_state, cp_url, is_primary);
+                    current_cp_index = 0;
                     backoff_secs = BACKOFF_INITIAL_SECS;
                     continue;
                 }
@@ -605,6 +612,20 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
 
         backoff_secs = next_backoff_secs(backoff_secs, increase_backoff);
     }
+}
+
+async fn wait_for_readiness_then_primary_retry(
+    startup_ready: Option<Arc<AtomicBool>>,
+    primary_retry_secs: u64,
+) {
+    let Some(startup_ready) = startup_ready else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    while !startup_ready.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(primary_retry_secs)).await;
 }
 
 async fn wait_optional_tls_reload(mut revision_rx: Option<watch::Receiver<u64>>) {

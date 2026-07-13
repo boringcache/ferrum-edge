@@ -1476,7 +1476,7 @@ Authenticates requests using HS256 JWT Bearer tokens matched against consumer cr
 | `expected_issuers` | String[] | `[]` | Accepted `iss` values |
 | `audiences` | String[] | `[]` | Accepted `aud` values; audience validation is disabled when empty |
 | `require_exp` | Boolean | `true` | Require an `exp` claim; expiration is always validated when present |
-| `require_nbf` | Boolean | `true` | Require an `nbf` claim and validate it |
+| `require_nbf` | Boolean | `false` | Require an `nbf` claim; when present, `nbf` is always validated |
 | `leeway_secs` | u64 | `0` | Clock leeway for time-based JWT claims; max `300` |
 
 **Consumer credential** (`jwt`) — array. Secrets must be at least 32 characters:

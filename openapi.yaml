@@ -52,8 +52,11 @@ info:
     `X-Data-Source: cached` response header. Write operations require a live
     database and return `503 Service Unavailable` when one is not present.
 
-    The Admin API can be placed in **read-only mode**, in which case all POST,
-    PUT, and DELETE operations return `403 Forbidden`.
+    The Admin API can be placed in **read-only mode**, in which case persisted
+    configuration and database mutations return `403 Forbidden`. Authenticated
+    operational POST endpoints that do not persist configuration remain
+    available, including mesh egress-scope dry-runs, backend capability
+    refreshes, and forced TLS source reloads.
 
     ## Request body size limits
 
@@ -1164,6 +1167,9 @@ paths:
       summary: Force an active TLS source watcher to re-pull sources
       description: |
         Enqueues an immediate source poll for an active TLS source watcher.
+        This is an operational reload rather than a persisted configuration
+        mutation, so it is available in read-only file, DP, and mesh modes with
+        an operator or admin JWT.
         Supported surfaces are `proxy_https`, `backend_tls`, `admin_https`,
         `dtls`, `database_tls`, `cp_grpc`, `dp_grpc`, `svid`, and `all`. Aliases
         `frontend`, `backend`, `admin`, `frontend_dtls`, `db`, `database`,
@@ -1660,6 +1666,10 @@ paths:
         can issue `GET /backend-capabilities` immediately afterward to
         observe the post-refresh state.
 
+        This operational recovery action does not persist configuration and is
+        available in read-only file, DP, and mesh modes with standard JWT
+        authentication.
+
         Use cases:
         - Protocol rollouts (e.g., freshly enabled HTTP/3 on a fleet).
         - Recovery after a live downgrade (`mark_h3_unsupported`,
@@ -2044,7 +2054,8 @@ paths:
       summary: Dry-run a candidate destination against the current Sidecar egress scope
       description: |
         Tests whether a candidate destination is admitted by the current
-        resolved Sidecar egress scope. Never mutates slice state.
+        resolved Sidecar egress scope. Never mutates slice state and remains
+        available in read-only mesh and DP modes with standard JWT authentication.
 
         Useful to validate critical destinations before flipping
         `FERRUM_MESH_SIDECAR_ENFORCED=true` on the control plane.
@@ -11043,8 +11054,8 @@ components:
           description: Require an exp claim; expiration is always validated when present
         require_nbf:
           type: boolean
-          default: true
-          description: Require an nbf claim and validate it
+          default: false
+          description: Require an nbf claim; when present, nbf is always validated
         leeway_secs:
           type: integer
           format: uint64

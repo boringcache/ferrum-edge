@@ -88,10 +88,9 @@ path, not for routine build-out schema work.
 When Ferrum Edge starts in `database`, `cp`, or `migrate` mode, it runs the **MigrationRunner** which:
 
 1. Creates the `_ferrum_migrations` tracking table if it doesn't exist
-2. Detects pre-migration databases (databases created before the migration system was added) and bootstraps them by marking the initial schema as "already applied"
-3. Checks which migrations have been applied by reading `_ferrum_migrations`
-4. Runs any pending migrations in order
-5. Records each applied migration with its version, name, timestamp, checksum, and execution time
+2. Checks which migrations have been applied by reading `_ferrum_migrations`
+3. Runs any pending migrations in order
+4. Records each applied migration with its version, name, timestamp, checksum, and execution time
 
 ### Migration Tracking Table
 
@@ -107,11 +106,7 @@ CREATE TABLE _ferrum_migrations (
 
 ### Upgrading from Pre-Migration Versions
 
-If you're upgrading from a version of Ferrum Edge that predates the migration system (any version before this feature was added), the process is automatic for the tracked baseline schema:
-
-1. The MigrationRunner detects that the `proxies` table exists but `_ferrum_migrations` does not contain any records
-2. It marks the V1 (initial_schema) migration as already applied
-3. Any subsequent migrations (V2, V3, etc.) are then applied normally
+Databases that predate migration tracking are not auto-bootstrapped. Back up the database and rebuild it from the current baseline before starting a current binary against it.
 
 Build-out caveat: newer development snapshots may intentionally fold schema
 changes into the baseline instead of adding an upgrade migration. In that case,
@@ -206,6 +201,17 @@ sql: r#"
     CREATE INDEX IF NOT EXISTS idx_my_cache_key ON my_cache (key)
 "#,
 ```
+
+By default, all statements in one custom-plugin migration and its tracking-row
+insert execute in a single transaction. PostgreSQL statements that must run at
+top level are detected automatically, including `CREATE INDEX CONCURRENTLY`,
+`DROP INDEX CONCURRENTLY`, concurrent `REINDEX`, `VACUUM`, database creation or
+deletion, and `ALTER SYSTEM`. For those migrations, Ferrum executes every
+statement first and records `_ferrum_plugin_migrations` only after all
+statements succeed. A failed statement therefore never creates a tracking row;
+because PostgreSQL cannot roll back this class of DDL as one unit, authors
+should keep these migrations idempotent and use one top-level operation per
+migration where practical.
 
 ### Checksum Validation
 

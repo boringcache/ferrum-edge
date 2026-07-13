@@ -144,7 +144,7 @@ impl ProviderType {
 }
 
 /// Authentication method for a provider.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum AuthMethod {
     /// `Authorization: Bearer {api_key}`
     BearerToken { api_key: String },
@@ -209,7 +209,6 @@ struct CachedToken {
 }
 
 /// Thread-safe OAuth2 token cache for Google Vertex AI.
-#[derive(Debug)]
 struct OAuth2Cache {
     cache: ArcSwapOption<CachedToken>,
     refresh_lock: Mutex<()>,

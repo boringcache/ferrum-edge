@@ -416,6 +416,9 @@ pub(crate) fn consumer_response_body(consumer: &Consumer) -> Value {
 }
 
 pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response<Full<Bytes>> {
+    if config_update_target_was_not_found(error) {
+        return not_found_response::<Consumer>();
+    }
     let message = error.to_string();
     let status = if super::is_unique_constraint_violation(&message) {
         StatusCode::CONFLICT
@@ -2161,6 +2164,17 @@ fn not_found_response<R: AdminResource>() -> Response<Full<Bytes>> {
         StatusCode::NOT_FOUND,
         &json!({"error": R::NOT_FOUND_MESSAGE}),
     )
+}
+
+fn config_update_target_was_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains(" was not found in namespace '")
+            || message.contains("proxy '") && message.ends_with("' was not found")
+            || message.contains("consumer '") && message.ends_with("' was not found")
+            || message.contains("plugin config '") && message.ends_with("' was not found")
+            || message.contains("upstream '") && message.ends_with("' was not found")
+    })
 }
 
 async fn handle_write<R: AdminResource>(

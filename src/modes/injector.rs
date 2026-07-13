@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
@@ -601,6 +602,7 @@ pub async fn run(
         .map_err(|e| anyhow::anyhow!("invalid injector configuration: {e}"))?;
     let tls_acceptor = build_tls_acceptor(&env_config, &config)?;
     let max_connections = env_config.max_connections;
+    let shutdown_drain_seconds = env_config.shutdown_drain_seconds;
     let config = Arc::new(config);
     let connection_limiter = if max_connections > 0 {
         Some(Arc::new(Semaphore::new(max_connections)))
@@ -624,6 +626,7 @@ pub async fn run(
     let mut shutdown_rx = shutdown_tx.subscribe();
     let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
     let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
+    let mut connections = JoinSet::new();
 
     loop {
         tokio::select! {
@@ -648,7 +651,7 @@ pub async fn run(
                             }
                             None => None,
                         };
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             let _connection_permit = connection_permit;
                             if let Some(acceptor) = tls_acceptor {
                                 match tls::accept_with_optional_timeout(
@@ -695,7 +698,32 @@ pub async fn run(
             }
             _ = shutdown_rx.changed() => {
                 info!("Injector admission webhook shutting down");
+                let drain = async {
+                    while connections.join_next().await.is_some() {}
+                };
+                if tokio::time::timeout(
+                    std::time::Duration::from_secs(shutdown_drain_seconds),
+                    drain,
+                )
+                .await
+                .is_err()
+                {
+                    warn!(
+                        shutdown_drain_seconds,
+                        remaining_connections = connections.len(),
+                        "Injector shutdown drain timed out; aborting remaining connections"
+                    );
+                    connections.abort_all();
+                    while connections.join_next().await.is_some() {}
+                }
                 return Ok(());
+            }
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result
+                    && !error.is_cancelled()
+                {
+                    warn!(%error, "Injector connection task failed");
+                }
             }
         }
     }
@@ -886,6 +914,10 @@ fn build_sidecar_patch_for_namespace(
         return Ok(Vec::new());
     }
 
+    if injected_shape_matches(pod, config, admission_namespace)? {
+        return Ok(Vec::new());
+    }
+
     reject_reserved_name_conflicts(pod, config)?;
 
     let mut patch = Vec::new();
@@ -923,6 +955,28 @@ fn build_sidecar_patch_for_namespace(
     Ok(patch)
 }
 
+fn injected_shape_matches(
+    pod: &Value,
+    config: &InjectorConfig,
+    admission_namespace: Option<&str>,
+) -> Result<bool, String> {
+    let Some(sidecar) = named_container(pod, "/spec/containers", "ferrum-edge") else {
+        return Ok(false);
+    };
+    let namespace = pod_namespace(pod, admission_namespace, config);
+    if sidecar != &sidecar_container(config, pod, namespace.as_str()) {
+        return Ok(false);
+    }
+
+    if config.capture_mode != CaptureMode::Iptables {
+        return Ok(true);
+    }
+    let Some(init) = named_container(pod, "/spec/initContainers", "ferrum-edge-init") else {
+        return Ok(false);
+    };
+    Ok(init == &init_container(config, pod)?)
+}
+
 fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
     let annotations = pod
         .pointer("/metadata/annotations")
@@ -949,14 +1003,16 @@ fn should_inject(pod: &Value, config: &InjectorConfig) -> bool {
 }
 
 fn reject_reserved_name_conflicts(pod: &Value, config: &InjectorConfig) -> Result<(), String> {
-    if pod_has_ferrum_sidecar(pod) {
+    if named_container(pod, "/spec/containers", "ferrum-edge").is_some() {
         return Err(
             "pod spec already defines reserved container name ferrum-edge; refusing injection"
                 .to_string(),
         );
     }
 
-    if config.capture_mode == CaptureMode::Iptables && pod_has_ferrum_init_container(pod) {
+    if config.capture_mode == CaptureMode::Iptables
+        && named_container(pod, "/spec/initContainers", "ferrum-edge-init").is_some()
+    {
         return Err(
             "pod spec already defines reserved init container name ferrum-edge-init; refusing injection"
                 .to_string(),
@@ -1014,23 +1070,13 @@ fn ensure_containers(pod: &Value, patch: &mut Vec<JsonPatchOperation>) {
     }
 }
 
-fn pod_has_ferrum_sidecar(pod: &Value) -> bool {
-    pod.pointer("/spec/containers")
+fn named_container<'a>(pod: &'a Value, pointer: &str, name: &str) -> Option<&'a Value> {
+    pod.pointer(pointer)
         .and_then(Value::as_array)
-        .is_some_and(|containers| {
-            containers.iter().any(|container| {
-                container.get("name").and_then(Value::as_str) == Some("ferrum-edge")
-            })
-        })
-}
-
-fn pod_has_ferrum_init_container(pod: &Value) -> bool {
-    pod.pointer("/spec/initContainers")
-        .and_then(Value::as_array)
-        .is_some_and(|containers| {
-            containers.iter().any(|container| {
-                container.get("name").and_then(Value::as_str) == Some("ferrum-edge-init")
-            })
+        .and_then(|containers| {
+            containers
+                .iter()
+                .find(|container| container.get("name").and_then(Value::as_str) == Some(name))
         })
 }
 
@@ -1582,6 +1628,89 @@ mod tests {
         )
         .expect_err("reserved name conflict should be rejected");
         assert!(err.contains("reserved container name ferrum-edge"));
+    }
+
+    #[test]
+    fn patch_is_idempotent_for_an_already_injected_pod() {
+        let config = test_config(true, CaptureMode::Iptables);
+        let mut pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {"ferrum.io/injected": "true"}
+            },
+            "spec": {
+                "serviceAccountName": "default",
+                "containers": [{"name": "app", "image": "app:test"}],
+                "initContainers": []
+            }
+        });
+        let namespace = pod_namespace(&pod, None, &config);
+        let sidecar = sidecar_container(&config, &pod, &namespace);
+        let init = init_container(&config, &pod).expect("init container");
+        pod["spec"]["containers"]
+            .as_array_mut()
+            .unwrap()
+            .push(sidecar);
+        pod["spec"]["initContainers"]
+            .as_array_mut()
+            .unwrap()
+            .push(init);
+        let patch = build_sidecar_patch_for_namespace(&pod, &config, None)
+            .expect("reinvocation should be accepted");
+        assert!(patch.is_empty());
+    }
+
+    #[test]
+    fn patch_rejects_generated_sidecar_shape_with_extra_fields() {
+        let config = test_config(true, CaptureMode::Iptables);
+        let mut pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {"ferrum.io/injected": "true"}
+            },
+            "spec": {
+                "serviceAccountName": "default",
+                "containers": [{"name": "app", "image": "app:test"}],
+                "initContainers": []
+            }
+        });
+        let namespace = pod_namespace(&pod, None, &config);
+        let mut sidecar = sidecar_container(&config, &pod, &namespace);
+        sidecar["securityContext"]["privileged"] = Value::Bool(true);
+        let init = init_container(&config, &pod).expect("init container");
+        pod["spec"]["containers"]
+            .as_array_mut()
+            .unwrap()
+            .push(sidecar);
+        pod["spec"]["initContainers"]
+            .as_array_mut()
+            .unwrap()
+            .push(init);
+
+        let error = build_sidecar_patch_for_namespace(&pod, &config, None)
+            .expect_err("extra sidecar fields must not pass reinvocation validation");
+        assert!(error.contains("reserved container name ferrum-edge"));
+    }
+
+    #[test]
+    fn patch_rejects_injected_marker_with_fake_reserved_containers() {
+        let pod = json!({
+            "metadata": {
+                "labels": {"ferrum.io/mesh": "enabled"},
+                "annotations": {"ferrum.io/injected": "true"}
+            },
+            "spec": {
+                "containers": [{"name": "ferrum-edge", "image": "attacker/fake:latest"}],
+                "initContainers": [{"name": "ferrum-edge-init", "image": "attacker/fake:latest"}]
+            }
+        });
+        let error = build_sidecar_patch_for_namespace(
+            &pod,
+            &test_config(true, CaptureMode::Iptables),
+            None,
+        )
+        .expect_err("observability marker must not bypass reserved-name validation");
+        assert!(error.contains("reserved container name ferrum-edge"));
     }
 
     #[test]

@@ -63,6 +63,44 @@ impl CustomPluginMigration {
             _ => self.sql,
         }
     }
+
+    /// Whether this migration contains PostgreSQL DDL that must execute at
+    /// top level rather than inside an explicit transaction.
+    fn requires_non_transactional_postgres_execution(&self, db_type: &str) -> bool {
+        if db_type != "postgres" {
+            return false;
+        }
+
+        self.sql_for_db(db_type).split(';').any(|statement| {
+            let normalized = strip_leading_sql_comments(statement)
+                .split_whitespace()
+                .map(str::to_ascii_uppercase)
+                .collect::<Vec<_>>()
+                .join(" ");
+            normalized.starts_with("VACUUM")
+                || normalized.starts_with("CREATE DATABASE")
+                || normalized.starts_with("DROP DATABASE")
+                || normalized.starts_with("ALTER SYSTEM")
+                || normalized.starts_with("REINDEX") && normalized.contains(" CONCURRENTLY")
+                || normalized.starts_with("CREATE INDEX") && normalized.contains(" CONCURRENTLY")
+                || normalized.starts_with("CREATE UNIQUE INDEX")
+                    && normalized.contains(" CONCURRENTLY")
+                || normalized.starts_with("DROP INDEX") && normalized.contains(" CONCURRENTLY")
+        })
+    }
+}
+
+fn strip_leading_sql_comments(mut sql: &str) -> &str {
+    loop {
+        sql = sql.trim_start();
+        if let Some(comment) = sql.strip_prefix("--") {
+            sql = comment.split_once('\n').map_or("", |(_, rest)| rest);
+        } else if let Some(comment) = sql.strip_prefix("/*") {
+            sql = comment.split_once("*/").map_or("", |(_, rest)| rest);
+        } else {
+            return sql;
+        }
+    }
 }
 
 /// Record of a custom plugin migration that was applied.
@@ -440,29 +478,57 @@ impl MigrationRunner {
                 let sql = migration.sql_for_db(&self.db_type);
                 let start = Instant::now();
 
-                // Execute each statement separated by semicolons, supporting
-                // multi-statement migrations (e.g., CREATE TABLE + CREATE INDEX).
-                for statement in sql.split(';') {
-                    let trimmed = statement.trim();
-                    if trimmed.is_empty() {
-                        continue;
+                let non_transactional =
+                    migration.requires_non_transactional_postgres_execution(&self.db_type);
+                let now;
+                if non_transactional {
+                    // PostgreSQL online DDL such as CREATE INDEX CONCURRENTLY
+                    // cannot run in an explicit transaction. Execute every
+                    // statement successfully before writing the tracking row.
+                    for statement in sql.split(';') {
+                        let trimmed = statement.trim();
+                        if !trimmed.is_empty() {
+                            sqlx::query(trimmed).execute(&self.pool).await?;
+                        }
                     }
-                    sqlx::query(trimmed).execute(&self.pool).await?;
+                    now = Utc::now().to_rfc3339();
+                    let elapsed_ms = start.elapsed().as_millis() as i64;
+                    let insert_sql = Self::plugin_migration_insert_sql(&self.db_type);
+                    sqlx::query(&insert_sql)
+                        .bind(*plugin_name)
+                        .bind(migration.version as i32)
+                        .bind(migration.name)
+                        .bind(&now)
+                        .bind(migration.checksum)
+                        .bind(elapsed_ms as i32)
+                        .execute(&self.pool)
+                        .await?;
+                } else {
+                    // Default path: migration statements and tracking remain
+                    // atomic in one transaction.
+                    let mut tx = self.pool.begin().await?;
+                    for statement in sql.split(';') {
+                        let trimmed = statement.trim();
+                        if !trimmed.is_empty() {
+                            sqlx::query(trimmed).execute(&mut *tx).await?;
+                        }
+                    }
+                    now = Utc::now().to_rfc3339();
+                    let elapsed_ms = start.elapsed().as_millis() as i64;
+                    let insert_sql = Self::plugin_migration_insert_sql(&self.db_type);
+                    sqlx::query(&insert_sql)
+                        .bind(*plugin_name)
+                        .bind(migration.version as i32)
+                        .bind(migration.name)
+                        .bind(&now)
+                        .bind(migration.checksum)
+                        .bind(elapsed_ms as i32)
+                        .execute(&mut *tx)
+                        .await?;
+                    tx.commit().await?;
                 }
 
                 let elapsed_ms = start.elapsed().as_millis() as i64;
-
-                let now = Utc::now().to_rfc3339();
-                let insert_sql = Self::plugin_migration_insert_sql(&self.db_type);
-                sqlx::query(&insert_sql)
-                    .bind(*plugin_name)
-                    .bind(migration.version as i32)
-                    .bind(migration.name)
-                    .bind(&now)
-                    .bind(migration.checksum)
-                    .bind(elapsed_ms as i32)
-                    .execute(&self.pool)
-                    .await?;
 
                 let record = PluginMigrationRecord {
                     plugin_name: plugin_name.to_string(),

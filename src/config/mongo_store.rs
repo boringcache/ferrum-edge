@@ -445,8 +445,8 @@ mod inner {
                     "MongoDB connected without a replica set (FERRUM_MONGO_REPLICA_SET is unset). \
                      Multi-document writes (proxy delete/update, api_spec submit/replace) will \
                      fall back to compensating rollback instead of transactions, leaving a small \
-                     window where partial failure can orphan documents until the polling cycle \
-                     cleans them. Configure FERRUM_MONGO_REPLICA_SET to enable transactions."
+                     window where partial failure may require operator reconciliation. Configure \
+                     FERRUM_MONGO_REPLICA_SET to enable transactions."
                 );
             }
 
