@@ -40,6 +40,7 @@ adding, removing, or materially changing a workflow.
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | Path-filtered PRs, manual | Live multicluster federation datapath validation. |
 | `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
+| `scaling-regression.yml` | Scheduled Scaling Regression | Weekly schedule, manual | Runs the 30k proxy scale and 10k proxy load-stress tests excluded from PR CI. |
 | `claude-review.yml` | Claude PR Review | `@claude review` issue comment on PRs | Maintainer-triggered AI review comments. |
 | `cleanup-pending-reviews.yml` | Cleanup Pending Deployment Reviews | Schedule, manual | Clears stale pending deployment review state. |
 | `prune-stale-prs.yml` | Prune Stale PRs and Branches | Schedule, manual | Repository hygiene for stale PRs/branches. |
@@ -144,6 +145,12 @@ cargo nextest run --test functional_tests \
   --no-fail-fast \
   -E 'not test(/test_scale_perf_30k_proxies/) and not test(/test_load_stress_10k_proxies/)'
 ```
+
+The excluded 30k scale variants (SQLite, PostgreSQL, and MongoDB) and the 10k
+PostgreSQL load-stress test run weekly and on manual dispatch in the
+`Scheduled Scaling Regression` workflow. Its matrix jobs have independent
+failure signals and a three-hour timeout for the large provisioning and load
+phases.
 
 **What it tests**:
 - Unit tests in `tests/unit_tests.rs`
