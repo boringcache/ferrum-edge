@@ -2650,16 +2650,15 @@ jobs:
 
       - name: Install pinned SPIRE server and agent
         env:
-          SPIRE_VERSION: 1.12.4
+          SPIRE_VERSION: 1.15.2
+          SPIRE_LINUX_AMD64_MUSL_SHA256: 3874d07ffeb6640bafb9fe6a538de06151f155d5ed2f8e8a51f138d2f51b8105
         run: |
           set -euo pipefail
           archive="spire-${SPIRE_VERSION}-linux-amd64-musl.tar.gz"
-          checksum="spire-${SPIRE_VERSION}-linux-amd64-musl_sha256sum.txt"
           base="https://github.com/spiffe/spire/releases/download/v${SPIRE_VERSION}"
           cd "$RUNNER_TEMP"
           curl -fsSLO "$base/$archive"
-          curl -fsSLO "$base/$checksum"
-          sha256sum --check "$checksum"
+          printf '%s  %s\n' "$SPIRE_LINUX_AMD64_MUSL_SHA256" "$archive" | sha256sum --check --strict
           tar -xzf "$archive"
           sudo install -m 0755 "spire-${SPIRE_VERSION}/bin/spire-server" /usr/local/bin/spire-server
           sudo install -m 0755 "spire-${SPIRE_VERSION}/bin/spire-agent" /usr/local/bin/spire-agent
