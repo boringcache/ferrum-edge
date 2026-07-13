@@ -6200,6 +6200,22 @@ impl PluginConfig {
             }
         }
 
+        // `transaction_log_schema` is process-global by design: it registers
+        // named schemas into a single global registry, so a proxy / proxy_group
+        // scope is meaningless. The runtime rejecting contract shared by database
+        // full-loads and CP broadcasts (`GatewayConfig::validate_plugin_references`)
+        // already rejects any non-global scope here; enforce the SAME invariant on
+        // the admin write path so an operator write fails closed with a clear 4xx
+        // at write time instead of admitting a document that every subsequent
+        // full-config load then rejects (which flips the DB poll loop to
+        // `db_available=false` and wedges the whole admin API read-only).
+        if self.plugin_name == "transaction_log_schema" && self.scope != PluginScope::Global {
+            errors.push(
+                "transaction_log_schema must have scope 'global' (it registers process-global named schemas)"
+                    .to_string(),
+            );
+        }
+
         // Config JSON size
         let config_json = serde_json::to_string(&self.config).unwrap_or_default();
         let max_config_size = if self.plugin_name == "openapi_validator" {

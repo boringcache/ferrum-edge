@@ -141,10 +141,28 @@ Ferrum's Kubernetes controller patches Gateway API status across every level the
 | HTTPRoute / GRPCRoute parent status (`Accepted`, `ResolvedRefs`, `Programmed`, `Conflicted`) | Emitted |
 | TLSRoute / TCPRoute parent status | Emitted for watched L4 routes |
 
+GatewayClass and Gateway status updates use Kubernetes server-side apply with
+the stable field manager `ferrum.io/gateway-controller`. Their structural
+condition and listener lists are keyed list-maps, so the minimal apply document
+can own Ferrum's entries without copying another manager's fields. Ferrum sets
+`force=true` to reclaim the status fields it continuously reconciles after
+upgrades or legacy merge-patch writes.
+
+Route `status.parents` is an atomic list in the upstream Gateway API CRDs, so a
+partial server-side apply would still replace the entire list and could remove
+another controller's parent entries. Ferrum instead follows the upstream
+read-modify-write requirement: it reads the freshest status, preserves every
+non-Ferrum parent, replaces only Ferrum-owned parents, and includes that read's
+`metadata.resourceVersion` in the merge patch. A `409 Conflict` triggers a
+refetch, re-merge, and jittered retry (up to five attempts); exhaustion leaves
+the resource for the next reconcile rather than writing stale status.
+
 `Programmed=True` on a Gateway is additionally gated on the serving data-plane
 Service having a ready EndpointSlice endpoint when
 `FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAMESPACE`/`_NAME` are set; otherwise it
-reflects translation/materialization only.
+reflects translation/materialization only. Route programming uses the typed
+route-to-parent materialization records emitted alongside proxy generation; it
+does not reconstruct source routes from proxy ID strings.
 
 ### Condition reasons that diverge from the upstream constants table
 
