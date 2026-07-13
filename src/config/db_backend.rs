@@ -77,10 +77,26 @@ impl Default for ApiSpecListFilter {
     }
 }
 
+/// Namespace-qualified key for resources whose IDs are not globally unique.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct NamespacedResourceId {
+    pub namespace: String,
+    pub id: String,
+}
+
+impl NamespacedResourceId {
+    pub fn new(namespace: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            id: id.into(),
+        }
+    }
+}
+
 /// Result of an incremental config poll.
 ///
 /// Contains only resources referenced by durable change-log records newer than
-/// the caller's sequence cursor, plus IDs of resources that were deleted. The
+/// the caller's sequence cursor, plus keys of resources that were deleted. The
 /// polling loop advances `sequence_cursor` only after the delta validates and
 /// applies, so rejected deltas are retried from the same durable point.
 ///
@@ -90,7 +106,7 @@ pub struct IncrementalResult {
     pub added_or_modified_proxies: Vec<Proxy>,
     pub removed_proxy_ids: Vec<String>,
     pub added_or_modified_consumers: Vec<Consumer>,
-    pub removed_consumer_ids: Vec<String>,
+    pub removed_consumer_ids: Vec<NamespacedResourceId>,
     pub added_or_modified_plugin_configs: Vec<PluginConfig>,
     pub removed_plugin_config_ids: Vec<String>,
     pub added_or_modified_upstreams: Vec<Upstream>,
@@ -402,17 +418,29 @@ pub trait DatabaseBackend: Send + Sync {
 
     // -----------------------------------------------------------------------
     // Proxy CRUD
+    //
+    // ID-only reads/deletes/updates are namespace-predicated at the query
+    // level (issue #2122 DB-M1): the tenant boundary is enforced by the
+    // WHERE clause / filter document itself, not by a post-read comparison
+    // in the caller. `update_*` returns `Ok(false)` when no row/document
+    // matched `(namespace, id)` (issue #2122 DB-M4) so a PUT racing a
+    // concurrent delete surfaces as not-found instead of a phantom success;
+    // implementations must not emit a config-change record in that case.
     // -----------------------------------------------------------------------
 
     async fn create_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error>;
-    async fn update_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error>;
-    async fn delete_proxy(&self, id: &str) -> Result<bool, anyhow::Error>;
-    async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error>;
+    async fn update_proxy(&self, proxy: &Proxy) -> Result<bool, anyhow::Error>;
+    async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error>;
+    async fn get_proxy(&self, namespace: &str, id: &str) -> Result<Option<Proxy>, anyhow::Error>;
     /// Load an existing proxy for write prechecks/audit without rejecting
     /// repairable proxy-plugin reference corruption. Backends that store
     /// associations inline can use the normal read path.
-    async fn get_proxy_for_write(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
-        self.get_proxy(id).await
+    async fn get_proxy_for_write(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<Proxy>, anyhow::Error> {
+        self.get_proxy(namespace, id).await
     }
     /// Check whether a proxy with the given ID exists in `namespace`.
     /// Returns `true` only when the row is in the requested namespace, so
@@ -435,9 +463,13 @@ pub trait DatabaseBackend: Send + Sync {
     // -----------------------------------------------------------------------
 
     async fn create_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error>;
-    async fn update_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error>;
-    async fn delete_consumer(&self, id: &str) -> Result<bool, anyhow::Error>;
-    async fn get_consumer(&self, id: &str) -> Result<Option<Consumer>, anyhow::Error>;
+    async fn update_consumer(&self, consumer: &Consumer) -> Result<bool, anyhow::Error>;
+    async fn delete_consumer(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error>;
+    async fn get_consumer(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<Consumer>, anyhow::Error>;
     async fn list_consumers_paginated(
         &self,
         namespace: &str,
@@ -450,9 +482,13 @@ pub trait DatabaseBackend: Send + Sync {
     // -----------------------------------------------------------------------
 
     async fn create_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error>;
-    async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error>;
-    async fn delete_plugin_config(&self, id: &str) -> Result<bool, anyhow::Error>;
-    async fn get_plugin_config(&self, id: &str) -> Result<Option<PluginConfig>, anyhow::Error>;
+    async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<bool, anyhow::Error>;
+    async fn delete_plugin_config(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error>;
+    async fn get_plugin_config(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<PluginConfig>, anyhow::Error>;
     async fn list_plugin_configs_paginated(
         &self,
         namespace: &str,
@@ -465,10 +501,18 @@ pub trait DatabaseBackend: Send + Sync {
     // -----------------------------------------------------------------------
 
     async fn create_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error>;
-    async fn update_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error>;
-    async fn delete_upstream(&self, id: &str) -> Result<bool, anyhow::Error>;
-    async fn get_upstream(&self, id: &str) -> Result<Option<Upstream>, anyhow::Error>;
-    async fn cleanup_orphaned_upstream(&self, upstream_id: &str) -> Result<(), anyhow::Error>;
+    async fn update_upstream(&self, upstream: &Upstream) -> Result<bool, anyhow::Error>;
+    async fn delete_upstream(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error>;
+    async fn get_upstream(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<Upstream>, anyhow::Error>;
+    async fn cleanup_orphaned_upstream(
+        &self,
+        namespace: &str,
+        upstream_id: &str,
+    ) -> Result<(), anyhow::Error>;
     async fn list_upstreams_paginated(
         &self,
         namespace: &str,

@@ -230,7 +230,7 @@ async fn submit_bundle_happy_path_all_resources_tagged() {
     // distinguish spec-owned from hand-added resources per the OpenAPI
     // schema. `get_proxy` is on the admin path and must preserve it.
     let proxy_row = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy not found");
@@ -480,7 +480,7 @@ async fn replace_bundle_spec_owned_replaced_hand_added_survives() {
 
     // Old spec-owned plugin must be gone.
     let old_plugin = store
-        .get_plugin_config(&spec_plugin_id)
+        .get_plugin_config(ns, &spec_plugin_id)
         .await
         .expect("get_plugin_config failed");
     assert!(
@@ -490,7 +490,7 @@ async fn replace_bundle_spec_owned_replaced_hand_added_survives() {
 
     // New spec-owned plugin must exist.
     let new_plugin = store
-        .get_plugin_config(&new_spec_plugin_id)
+        .get_plugin_config(ns, &new_spec_plugin_id)
         .await
         .expect("get_plugin_config failed");
     assert!(
@@ -502,7 +502,7 @@ async fn replace_bundle_spec_owned_replaced_hand_added_survives() {
     // UPDATE-s the proxy in place rather than DELETE + INSERT, so the proxy PK
     // is stable and the FK cascade does NOT fire.
     let hand_plugin_row = store
-        .get_plugin_config(&hand_plugin_id)
+        .get_plugin_config(ns, &hand_plugin_id)
         .await
         .expect("get_plugin_config for hand plugin failed");
     assert!(
@@ -512,7 +512,7 @@ async fn replace_bundle_spec_owned_replaced_hand_added_survives() {
 
     // Proxy primary key must be stable — same id, same created_at.
     let proxy_after = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must still exist after replace");
@@ -596,7 +596,7 @@ async fn replace_api_spec_bundle_does_not_delete_same_api_spec_id_in_other_names
 
     assert!(
         store
-            .get_plugin_config(&other_plugin_id)
+            .get_plugin_config(other_ns, &other_plugin_id)
             .await
             .expect("get other namespace plugin")
             .is_some(),
@@ -604,7 +604,7 @@ async fn replace_api_spec_bundle_does_not_delete_same_api_spec_id_in_other_names
     );
     assert!(
         store
-            .get_upstream(&other_upstream_id)
+            .get_upstream(other_ns, &other_upstream_id)
             .await
             .expect("get other namespace upstream")
             .is_some(),
@@ -888,12 +888,15 @@ async fn delete_api_spec_cascades_and_spares_hand_upstreams() {
     assert!(spec_row.is_none(), "spec row must be gone after delete");
 
     // Proxy must be gone.
-    let proxy_row = store.get_proxy(&proxy_id).await.expect("get_proxy failed");
+    let proxy_row = store
+        .get_proxy(ns, &proxy_id)
+        .await
+        .expect("get_proxy failed");
     assert!(proxy_row.is_none(), "proxy must be gone after spec delete");
 
     // Spec-owned upstream must be gone.
     let upstream_row = store
-        .get_upstream(&upstream_id)
+        .get_upstream(ns, &upstream_id)
         .await
         .expect("get_upstream failed");
     assert!(
@@ -903,7 +906,7 @@ async fn delete_api_spec_cascades_and_spares_hand_upstreams() {
 
     // Hand-added upstream must still exist.
     let hand_row = store
-        .get_upstream(&hand_upstream_id)
+        .get_upstream(ns, &hand_upstream_id)
         .await
         .expect("get_upstream for hand upstream failed");
     assert!(
@@ -914,7 +917,7 @@ async fn delete_api_spec_cascades_and_spares_hand_upstreams() {
     // Spec-owned plugin must be gone (deleted by either api_spec_id cleanup or
     // the proxy FK cascade — both are in play).
     let plugin_row = store
-        .get_plugin_config(&plugin_id)
+        .get_plugin_config(ns, &plugin_id)
         .await
         .expect("get_plugin_config failed");
     assert!(
@@ -991,7 +994,7 @@ async fn delete_api_spec_does_not_delete_same_api_spec_id_in_other_namespace() {
     );
     assert!(
         store
-            .get_plugin_config(&other_plugin_id)
+            .get_plugin_config(other_ns, &other_plugin_id)
             .await
             .expect("get other namespace plugin")
             .is_some(),
@@ -999,7 +1002,7 @@ async fn delete_api_spec_does_not_delete_same_api_spec_id_in_other_namespace() {
     );
     assert!(
         store
-            .get_upstream(&other_upstream_id)
+            .get_upstream(other_ns, &other_upstream_id)
             .await
             .expect("get other namespace upstream")
             .is_some(),
@@ -1058,7 +1061,7 @@ async fn delete_api_spec_cleans_orphaned_proxy_group_plugin() {
 
     assert!(
         store
-            .get_plugin_config(&proxy_group_plugin_id)
+            .get_plugin_config(ns, &proxy_group_plugin_id)
             .await
             .expect("get proxy_group before delete")
             .is_some(),
@@ -1073,7 +1076,7 @@ async fn delete_api_spec_cleans_orphaned_proxy_group_plugin() {
 
     assert!(
         store
-            .get_plugin_config(&proxy_group_plugin_id)
+            .get_plugin_config(ns, &proxy_group_plugin_id)
             .await
             .expect("get proxy_group after delete")
             .is_none(),
@@ -1352,7 +1355,7 @@ async fn delete_proxy_cascades_api_spec_row_via_fk() {
 
     // Delete the proxy directly (not via delete_api_spec).
     let deleted = store
-        .delete_proxy(&proxy_id)
+        .delete_proxy(ns, &proxy_id)
         .await
         .expect("delete_proxy failed");
     assert!(deleted, "delete_proxy must return true for existing proxy");
@@ -1369,7 +1372,7 @@ async fn delete_proxy_cascades_api_spec_row_via_fk() {
 
     // The spec-owned plugin must also be gone (proxy FK → plugin_configs cascade).
     let after_plugin = store
-        .get_plugin_config(&plugin_id)
+        .get_plugin_config(ns, &plugin_id)
         .await
         .expect("get_plugin_config failed");
     assert!(
@@ -1411,7 +1414,7 @@ async fn replace_with_changed_resources_keeps_hand_added_plugins() {
 
     // Capture proxy created_at before replace.
     let proxy_before = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must exist before replace");
@@ -1445,7 +1448,7 @@ async fn replace_with_changed_resources_keeps_hand_added_plugins() {
 
     // Hand-added plugin must still exist.
     let hand_row = store
-        .get_plugin_config(&hand_plugin_id)
+        .get_plugin_config(ns, &hand_plugin_id)
         .await
         .expect("get_plugin_config for hand plugin failed");
     assert!(
@@ -1455,7 +1458,7 @@ async fn replace_with_changed_resources_keeps_hand_added_plugins() {
 
     // Old spec-owned plugin must be gone.
     let old_spec_row = store
-        .get_plugin_config(&spec_plugin_id)
+        .get_plugin_config(ns, &spec_plugin_id)
         .await
         .expect("get_plugin_config failed");
     assert!(
@@ -1465,7 +1468,7 @@ async fn replace_with_changed_resources_keeps_hand_added_plugins() {
 
     // New spec-owned plugin must exist.
     let new_spec_row = store
-        .get_plugin_config(&new_spec_plugin_id)
+        .get_plugin_config(ns, &new_spec_plugin_id)
         .await
         .expect("get_plugin_config failed");
     assert!(
@@ -1475,7 +1478,7 @@ async fn replace_with_changed_resources_keeps_hand_added_plugins() {
 
     // Proxy primary key must be preserved (created_at unchanged).
     let proxy_after = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must still exist after replace");
@@ -1917,7 +1920,7 @@ async fn replace_with_unchanged_resources_skips_proxy_write() {
 
     // Capture proxy.updated_at before the PUT.
     let proxy_before = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy not found");
@@ -1982,7 +1985,7 @@ async fn replace_with_unchanged_resources_skips_proxy_write() {
 
     // proxy.updated_at must NOT have advanced.
     let proxy_after = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy not found");
@@ -2061,7 +2064,7 @@ async fn replace_with_changed_resources_updates_proxy() {
         .await
         .expect("initial submit");
 
-    let proxy_before = store.get_proxy(&proxy_id).await.unwrap().unwrap();
+    let proxy_before = store.get_proxy(ns, &proxy_id).await.unwrap().unwrap();
     let before_ts = proxy_before.updated_at;
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2120,7 +2123,7 @@ async fn replace_with_changed_resources_updates_proxy() {
         .expect("replace failed");
 
     // Proxy must have been re-inserted with new backend_host.
-    let proxy_after = store.get_proxy(&proxy_id).await.unwrap().unwrap();
+    let proxy_after = store.get_proxy(ns, &proxy_id).await.unwrap().unwrap();
     assert_eq!(proxy_after.backend_host, "backend-v2.internal");
     assert!(
         proxy_after.updated_at > before_ts || proxy_after.updated_at >= before_ts,
@@ -2547,7 +2550,7 @@ async fn submit_imported_plugins_appear_in_proxy_plugins_associations() {
 
     // Verify proxy.plugins association list was persisted (via proxy_plugins table).
     let proxy_after = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must exist");
@@ -2601,7 +2604,7 @@ async fn replace_updates_proxy_plugins_associations() {
 
     // Proxy associations must now reference only the new plugin (for spec-owned entries).
     let proxy_after = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must exist");
@@ -2655,13 +2658,13 @@ async fn replace_with_changed_upstream_id_does_not_fail_fk() {
 
     // Confirm U1 exists and proxy references it.
     let u1 = store
-        .get_upstream(&upstream_id_v1)
+        .get_upstream(ns, &upstream_id_v1)
         .await
         .expect("get u1")
         .expect("u1 must exist");
     assert_eq!(u1.id, upstream_id_v1);
     let p_before = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get proxy")
         .expect("proxy must exist");
@@ -2687,7 +2690,7 @@ async fn replace_with_changed_upstream_id_does_not_fail_fk() {
 
     // U1 must be gone.
     let u1_after = store
-        .get_upstream(&upstream_id_v1)
+        .get_upstream(ns, &upstream_id_v1)
         .await
         .expect("get u1 after");
     assert!(
@@ -2697,7 +2700,7 @@ async fn replace_with_changed_upstream_id_does_not_fail_fk() {
 
     // U2 must exist.
     let u2_after = store
-        .get_upstream(&upstream_id_v2)
+        .get_upstream(ns, &upstream_id_v2)
         .await
         .expect("get u2 after")
         .expect("U2 must exist");
@@ -2705,7 +2708,7 @@ async fn replace_with_changed_upstream_id_does_not_fail_fk() {
 
     // Proxy must reference U2.
     let p_after = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get proxy")
         .expect("proxy must exist");
@@ -2787,7 +2790,7 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
     // Add the junction row manually (direct DB update to proxy.plugins).
     let proxy_with_manual = {
         let mut p = store
-            .get_proxy(&proxy_id)
+            .get_proxy(ns, &proxy_id)
             .await
             .expect("get_proxy failed")
             .expect("proxy must exist");
@@ -2826,7 +2829,7 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
 
     // The proxy-group plugin itself must still exist (not deleted).
     let manual_row = store
-        .get_plugin_config(&manual_plugin_id)
+        .get_plugin_config(ns, &manual_plugin_id)
         .await
         .expect("get_plugin_config failed");
     assert!(
@@ -2836,7 +2839,7 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
 
     // The proxy's plugin associations must include the manual proxy-group plugin.
     let proxy_after = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must still exist");
@@ -2909,7 +2912,7 @@ async fn replace_removes_removed_spec_declared_external_proxy_plugin_association
         .expect("initial submit failed");
 
     let proxy_before = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must exist");
@@ -2940,7 +2943,7 @@ async fn replace_removes_removed_spec_declared_external_proxy_plugin_association
         .expect("replace failed");
 
     let proxy_after = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must still exist");
@@ -2980,7 +2983,7 @@ async fn replace_same_hash_reconciles_drifted_spec_owned_proxy() {
         .expect("initial submit failed");
 
     let mut drifted_proxy = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must exist");
@@ -2992,7 +2995,7 @@ async fn replace_same_hash_reconciles_drifted_spec_owned_proxy() {
         .expect("direct proxy drift update failed");
 
     let proxy_after_drift = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must exist");
@@ -3004,7 +3007,7 @@ async fn replace_same_hash_reconciles_drifted_spec_owned_proxy() {
         .expect("same-hash replace should reconcile drift");
 
     let proxy_after_replace = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must still exist");
@@ -3080,7 +3083,7 @@ async fn replace_api_spec_rejects_external_proxy_referencing_spec_owned_upstream
     );
 
     let upstream_after = store
-        .get_upstream(&upstream_id)
+        .get_upstream(ns, &upstream_id)
         .await
         .expect("get_upstream failed");
     assert!(
@@ -3088,7 +3091,7 @@ async fn replace_api_spec_rejects_external_proxy_referencing_spec_owned_upstream
         "guarded replace must leave the spec-owned upstream intact"
     );
     let manual_proxy_after = store
-        .get_proxy(&manual_proxy_id)
+        .get_proxy(ns, &manual_proxy_id)
         .await
         .expect("get_proxy failed");
     assert!(
@@ -3143,7 +3146,7 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
         .expect("initial submit failed");
 
     let proxy_after_submit = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy")
         .expect("proxy must exist");
@@ -3171,7 +3174,7 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
         .expect("replace failed");
 
     let proxy_after_replace = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy after replace")
         .expect("proxy must still exist");
@@ -3204,7 +3207,7 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
         .expect("replace with stale ts failed");
 
     let proxy_stale_after = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy stale")
         .expect("proxy must still exist");
@@ -3268,11 +3271,14 @@ async fn delete_proxy_cleans_up_orphaned_upstream() {
     store.create_proxy(&p2).await.expect("create P2");
 
     // Delete P1 — P2 still references the upstream → upstream must NOT be deleted.
-    let deleted = store.delete_proxy(&proxy_id_1).await.expect("delete P1");
+    let deleted = store
+        .delete_proxy(ns, &proxy_id_1)
+        .await
+        .expect("delete P1");
     assert!(deleted, "delete_proxy P1 must return true");
 
     let upstream_after_p1_delete = store
-        .get_upstream(&upstream_id)
+        .get_upstream(ns, &upstream_id)
         .await
         .expect("get_upstream after P1 delete");
     assert!(
@@ -3281,11 +3287,14 @@ async fn delete_proxy_cleans_up_orphaned_upstream() {
     );
 
     // ------------------------------------------------------------------ positive: delete P2 → upstream now orphaned → must be removed
-    let deleted2 = store.delete_proxy(&proxy_id_2).await.expect("delete P2");
+    let deleted2 = store
+        .delete_proxy(ns, &proxy_id_2)
+        .await
+        .expect("delete P2");
     assert!(deleted2, "delete_proxy P2 must return true");
 
     let upstream_after_p2_delete = store
-        .get_upstream(&upstream_id)
+        .get_upstream(ns, &upstream_id)
         .await
         .expect("get_upstream after P2 delete");
     assert!(
@@ -3324,7 +3333,7 @@ async fn update_proxy_reassignment_cleans_up_orphaned_old_upstream() {
         .expect("reassign proxy upstream");
 
     let old_after_reassign = store
-        .get_upstream(&old_upstream_id)
+        .get_upstream(ns, &old_upstream_id)
         .await
         .expect("get old upstream after reassignment");
     assert!(
@@ -3333,7 +3342,7 @@ async fn update_proxy_reassignment_cleans_up_orphaned_old_upstream() {
     );
 
     let new_after_reassign = store
-        .get_upstream(&new_upstream_id)
+        .get_upstream(ns, &new_upstream_id)
         .await
         .expect("get new upstream after reassignment");
     assert!(
@@ -3364,7 +3373,7 @@ async fn update_proxy_reassignment_cleans_up_orphaned_old_upstream() {
         .expect("reassign first shared proxy");
 
     let shared_old_after_reassign = store
-        .get_upstream(&shared_old_upstream_id)
+        .get_upstream(ns, &shared_old_upstream_id)
         .await
         .expect("get shared old upstream after reassignment");
     assert!(
@@ -3405,7 +3414,7 @@ async fn delete_proxy_removes_drifted_spec_owned_upstream() {
         .await
         .expect("create hand upstream");
     let mut drifted_proxy = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get proxy")
         .expect("proxy exists");
@@ -3415,11 +3424,14 @@ async fn delete_proxy_removes_drifted_spec_owned_upstream() {
         .await
         .expect("drift proxy upstream");
 
-    let deleted = store.delete_proxy(&proxy_id).await.expect("delete proxy");
+    let deleted = store
+        .delete_proxy(ns, &proxy_id)
+        .await
+        .expect("delete proxy");
     assert!(deleted, "delete_proxy must delete the spec-owned proxy");
 
     let spec_upstream = store
-        .get_upstream(&spec_upstream_id)
+        .get_upstream(ns, &spec_upstream_id)
         .await
         .expect("get spec upstream");
     assert!(
@@ -3564,7 +3576,7 @@ async fn concurrent_put_same_spec_resource_hash_idempotent() {
         .expect("initial submit failed");
 
     let proxy_after_post = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy after POST")
         .expect("proxy must exist after POST");
@@ -3633,7 +3645,7 @@ async fn concurrent_put_same_spec_resource_hash_idempotent() {
 
     // The proxy row must not have advanced its updated_at (resource_hash short-circuit).
     let proxy_after_puts = store
-        .get_proxy(&proxy_id)
+        .get_proxy(ns, &proxy_id)
         .await
         .expect("get_proxy after PUTs")
         .expect("proxy must still exist");

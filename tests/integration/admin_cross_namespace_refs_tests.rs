@@ -12,8 +12,10 @@
 //! to confirm:
 //!
 //!   1. A proxy in namespace `B` referencing an `upstream_id` that lives in
-//!      namespace `A` is rejected with 400 and the diagnostic identifies it
-//!      as a cross-namespace reference.
+//!      namespace `A` is rejected with 400. Since lookups became
+//!      namespace-predicated (issue #2122 DB-M1), the diagnostic reports the
+//!      target as missing in the caller's namespace instead of disclosing
+//!      which namespace owns it.
 //!   2. A proxy in namespace `B` whose `plugins[]` association points at a
 //!      `plugin_config` that lives in namespace `A` is rejected with 400.
 //!   3. A `plugin_config` in namespace `B` whose `proxy_id` points at a proxy
@@ -97,6 +99,7 @@ async fn build_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDir) {
         mode: "database".to_string(),
         read_only: false,
         admin_audit_enabled: false,
+        admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
         serving_listener_failures: None,
@@ -270,9 +273,12 @@ async fn cross_namespace_upstream_reference_is_rejected() {
         status, body
     );
     let err = err_string(&body);
+    // Lookups are namespace-predicated (issue #2122 DB-M1): a resource in
+    // another namespace reports as missing in the caller's namespace, so the
+    // rejection no longer discloses which namespace owns the resource.
     assert!(
-        err.contains("Cross-namespace") && err.contains("up-shared") && err.contains(NAMESPACE_A),
-        "error must identify cross-namespace ref + upstream id + source namespace; got: {}",
+        err.contains("does not exist") && err.contains("up-shared") && err.contains(NAMESPACE_B),
+        "error must report the upstream as missing in the caller's namespace; got: {}",
         err
     );
 }
@@ -313,9 +319,9 @@ async fn same_namespace_upstream_reference_is_accepted() {
 
 #[tokio::test]
 async fn missing_upstream_reports_does_not_exist_not_cross_namespace() {
-    // When the upstream genuinely doesn't exist anywhere, the error should
-    // still say "does not exist" — only an *existing* row in another
-    // namespace should yield the cross-namespace diagnostic.
+    // When the upstream genuinely doesn't exist anywhere, the error says
+    // "does not exist" — the same shape a cross-namespace reference now
+    // yields, since lookups are namespace-predicated (issue #2122 DB-M1).
     let tc = TestConfig::default();
     let (state, _tmp) = build_admin_state(&tc).await;
     let (base_url, _shutdown) = start_admin(state).await;
@@ -374,9 +380,11 @@ async fn cross_namespace_plugin_config_proxy_reference_is_rejected() {
         status, body
     );
     let err = err_string(&body);
+    // Namespace-predicated lookup: the namespace-A proxy reports as missing
+    // in namespace B (no cross-tenant disclosure).
     assert!(
-        err.contains("Cross-namespace") && err.contains("p-a-shared") && err.contains(NAMESPACE_A),
-        "error must identify cross-namespace ref + proxy id + source namespace; got: {}",
+        err.contains("does not exist") && err.contains("p-a-shared") && err.contains(NAMESPACE_B),
+        "error must report the proxy as missing in the caller's namespace; got: {}",
         err
     );
 }
@@ -494,9 +502,11 @@ async fn mesh_route_dispatch_cross_namespace_destination_upstream_is_rejected() 
         body
     );
     let err = err_string(&body);
+    // Namespace-predicated lookup: the namespace-A upstream reports as
+    // missing in namespace B (no cross-tenant disclosure).
     assert!(
-        err.contains("cross-namespace") && err.contains("up-shared") && err.contains(NAMESPACE_A),
-        "error must identify cross-namespace upstream ref; got: {}",
+        err.contains("does not exist") && err.contains("up-shared"),
+        "error must report the destination upstream as missing; got: {}",
         err
     );
 }
@@ -661,8 +671,10 @@ async fn batch_cross_namespace_upstream_reference_is_rejected() {
         .collect::<Vec<_>>()
         .join("; ");
     assert!(
-        joined.contains("up-shared") && joined.contains(NAMESPACE_A),
-        "batch error must mention upstream id + source namespace; got: {}",
+        joined.contains("up-shared")
+            && joined.contains("does not exist")
+            && joined.contains(NAMESPACE_B),
+        "batch error must report the upstream as missing in the caller's namespace; got: {}",
         joined
     );
 }

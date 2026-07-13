@@ -137,10 +137,22 @@ pub(crate) trait AdminResource:
         error: &anyhow::Error,
         _action: WriteAction<'_>,
     ) -> Response<Full<Bytes>> {
-        super::json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &super::db_error_response(error),
-        )
+        // Unique-constraint violations at persist time are conflicts, not
+        // server faults: the admission prechecks are namespace-scoped and
+        // raceable, so the DB constraint is the authoritative backstop (e.g.
+        // reusing a proxy/upstream id that exists in another namespace, or a
+        // concurrent create winning the race after the precheck passed).
+        // Surface the constraint message (it names the conflicting key);
+        // everything else stays a redacted 500.
+        let message = error.to_string();
+        if super::is_unique_constraint_violation(&message) {
+            super::json_response(StatusCode::CONFLICT, &json!({ "error": message }))
+        } else {
+            super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &super::db_error_response(error),
+            )
+        }
     }
 
     fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
@@ -154,16 +166,16 @@ pub(crate) trait AdminResource:
         true
     }
 
-    async fn db_get(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>>;
-    async fn db_get_scoped(
+    // Reads/deletes are namespace-predicated at the query level (issue #2122
+    // DB-M1): the backend WHERE clause / filter document carries the tenant
+    // boundary, so no post-read namespace comparison is needed here.
+    async fn db_get(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<Option<Self>>;
+    async fn db_get_for_write(
         db: &dyn DatabaseBackend,
+        namespace: &str,
         id: &str,
-        _namespace: &str,
     ) -> DbResult<Option<Self>> {
-        Self::db_get(db, id).await
-    }
-    async fn db_get_for_write(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>> {
-        Self::db_get(db, id).await
+        Self::db_get(db, namespace, id).await
     }
     async fn db_list(
         db: &dyn DatabaseBackend,
@@ -171,8 +183,11 @@ pub(crate) trait AdminResource:
         pagination: &super::PaginationParams,
     ) -> DbResult<PaginatedResult<Self>>;
     async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()>;
-    async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()>;
-    async fn db_delete(db: &dyn DatabaseBackend, id: &str) -> DbResult<bool>;
+    /// Returns `Ok(false)` when no row/document matched `(namespace, id)` —
+    /// a PUT racing a concurrent delete surfaces as not-found instead of a
+    /// phantom success (issue #2122 DB-M4).
+    async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<bool>;
+    async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool>;
 
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
@@ -257,11 +272,8 @@ pub(crate) async fn handle_get<R: AdminResource>(
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(ref db) = state.db {
-        match R::db_get_scoped(db.as_ref(), id, namespace).await {
+        match R::db_get(db.as_ref(), namespace, id).await {
             Ok(Some(resource)) => {
-                if resource.namespace() != namespace {
-                    return Ok(not_found_response::<R>());
-                }
                 let body = R::response_body_for_role(&resource, role);
                 return Ok(super::json_response(StatusCode::OK, &body));
             }
@@ -340,10 +352,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     };
     let db = db_arc.as_ref();
 
-    let existing = match R::db_get_for_write(db, id).await {
-        Ok(Some(resource)) if resource.namespace() != namespace => {
-            return Ok(not_found_response::<R>());
-        }
+    let existing = match R::db_get_for_write(db, namespace, id).await {
         Ok(None) => {
             return Ok(not_found_response::<R>());
         }
@@ -353,7 +362,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         Ok(Some(resource)) => resource,
     };
 
-    match R::db_delete(db, id).await {
+    match R::db_delete(db, namespace, id).await {
         Ok(true) => {
             let event = AuditEvent::new(
                 actor,
@@ -452,13 +461,10 @@ async fn validate_openapi_validator_precondition(
             "openapi_validator requires proxy_id".to_string(),
         ]));
     };
-    match db.get_proxy(proxy_id).await {
-        Ok(Some(proxy)) if proxy.namespace != namespace => {
-            Err(AfterValidateError::BadRequest(vec![format!(
-                "Cross-namespace reference forbidden: proxy_id '{}' belongs to namespace '{}' but plugin_config is in namespace '{}'",
-                proxy_id, proxy.namespace, namespace
-            )]))
-        }
+    // The lookup is namespace-predicated, so a proxy living in another
+    // namespace is indistinguishable from a missing one — cross-namespace
+    // references are rejected without disclosing other tenants' resources.
+    match db.get_proxy(namespace, proxy_id).await {
         Ok(Some(proxy)) if proxy.api_spec_id.is_none() => {
             Err(AfterValidateError::BadRequest(vec![
                 "openapi_validator requires a proxy with an attached api_spec".to_string(),
@@ -466,8 +472,8 @@ async fn validate_openapi_validator_precondition(
         }
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err(AfterValidateError::BadRequest(vec![format!(
-            "proxy_id '{}' does not exist",
-            proxy_id
+            "proxy_id '{}' does not exist in namespace '{}'",
+            proxy_id, namespace
         )])),
         Err(error) => Err(AfterValidateError::Db(error)),
     }
@@ -500,17 +506,13 @@ pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
         match db.check_upstream_exists(upstream_id, namespace).await {
             Ok(true) => {}
             Ok(false) => {
-                let message = match db.get_upstream(upstream_id).await {
-                    Ok(Some(other)) => format!(
-                        "PluginConfig '{}' (mesh_route_dispatch) rule {} references upstream_id '{}' from namespace '{}' (plugin_config is in namespace '{}'); cross-namespace references are forbidden",
-                        plugin_config.id, rule_idx, upstream_id, other.namespace, namespace
-                    ),
-                    _ => format!(
-                        "PluginConfig '{}' (mesh_route_dispatch) rule {} references non-existent upstream_id '{}'",
-                        plugin_config.id, rule_idx, upstream_id
-                    ),
-                };
-                errors.push(message);
+                // Reads are namespace-predicated, so an upstream in another
+                // namespace reports as non-existent (cross-namespace
+                // references are equally forbidden either way).
+                errors.push(format!(
+                    "PluginConfig '{}' (mesh_route_dispatch) rule {} references upstream_id '{}' that does not exist in namespace '{}'",
+                    plugin_config.id, rule_idx, upstream_id, namespace
+                ));
             }
             Err(error) => return Err(error),
         }
@@ -588,10 +590,9 @@ async fn validate_mesh_route_dispatch_plugin_retry_conflicts(
             // attached never dispatches, so it must NOT trigger a conflict.
             if let Some(proxy_id) = plugin_config.proxy_id.as_deref()
                 && let Some(proxy) = db
-                    .get_proxy(proxy_id)
+                    .get_proxy(namespace, proxy_id)
                     .await
                     .map_err(AfterValidateError::Db)?
-                && proxy.namespace == namespace
                 && proxy
                     .plugins
                     .iter()
@@ -793,8 +794,9 @@ async fn proxy_shadows_global_mesh_route_dispatch_excluding(
         if assoc.plugin_config_id == excluded_id {
             continue;
         }
-        if let Some(plugin) = db.get_plugin_config(&assoc.plugin_config_id).await?
-            && plugin.namespace == namespace
+        if let Some(plugin) = db
+            .get_plugin_config(namespace, &assoc.plugin_config_id)
+            .await?
             && plugin.enabled
             && plugin.plugin_name == "mesh_route_dispatch"
         {
@@ -848,8 +850,8 @@ async fn evaluate_mesh_route_dispatch_rules_for_proxy(
         } else {
             None
         };
-        match db.get_upstream(override_uid).await {
-            Ok(Some(upstream)) if upstream.namespace == namespace => {
+        match db.get_upstream(namespace, override_uid).await {
+            Ok(Some(upstream)) => {
                 // Runtime recomputes the per-port retry cap from the OVERRIDE
                 // destination upstream, so derive the temporary proxy's port caps
                 // from it before checking effectiveness.
@@ -905,8 +907,9 @@ async fn applicable_mesh_route_dispatch_plugins(
     let mut seen: HashSet<String> = HashSet::new();
     let mut shadows_global_dispatch = false;
     for assoc in &proxy.plugins {
-        if let Some(plugin) = db.get_plugin_config(&assoc.plugin_config_id).await?
-            && plugin.namespace == namespace
+        if let Some(plugin) = db
+            .get_plugin_config(namespace, &assoc.plugin_config_id)
+            .await?
             && plugin.enabled
             && plugin.plugin_name == "mesh_route_dispatch"
             && seen.insert(plugin.id.clone())
@@ -957,8 +960,9 @@ async fn proxy_shadows_global_mesh_route_dispatch(
     proxy: &Proxy,
 ) -> DbResult<bool> {
     for assoc in &proxy.plugins {
-        if let Some(plugin) = db.get_plugin_config(&assoc.plugin_config_id).await?
-            && plugin.namespace == namespace
+        if let Some(plugin) = db
+            .get_plugin_config(namespace, &assoc.plugin_config_id)
+            .await?
             && plugin.enabled
             && plugin.plugin_name == "mesh_route_dispatch"
         {
@@ -1268,8 +1272,8 @@ impl AdminResource for Upstream {
         )
     }
 
-    async fn db_get(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>> {
-        db.get_upstream(id).await
+    async fn db_get(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<Option<Self>> {
+        db.get_upstream(namespace, id).await
     }
 
     async fn db_list(
@@ -1289,12 +1293,12 @@ impl AdminResource for Upstream {
         db.create_upstream(resource).await
     }
 
-    async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
+    async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<bool> {
         db.update_upstream(resource).await
     }
 
-    async fn db_delete(db: &dyn DatabaseBackend, id: &str) -> DbResult<bool> {
-        db.delete_upstream(id).await
+    async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {
+        db.delete_upstream(namespace, id).await
     }
 
     async fn check_uniqueness(
@@ -1517,8 +1521,8 @@ impl AdminResource for PluginConfig {
         )
     }
 
-    async fn db_get(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>> {
-        db.get_plugin_config(id).await
+    async fn db_get(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<Option<Self>> {
+        db.get_plugin_config(namespace, id).await
     }
 
     async fn db_list(
@@ -1538,12 +1542,12 @@ impl AdminResource for PluginConfig {
         db.create_plugin_config(resource).await
     }
 
-    async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
+    async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<bool> {
         db.update_plugin_config(resource).await
     }
 
-    async fn db_delete(db: &dyn DatabaseBackend, id: &str) -> DbResult<bool> {
-        db.delete_plugin_config(id).await
+    async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {
+        db.delete_plugin_config(namespace, id).await
     }
 
     async fn check_uniqueness(
@@ -1575,17 +1579,14 @@ impl AdminResource for PluginConfig {
             match db.check_proxy_exists(proxy_id, namespace).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    // Distinguish "missing" from "wrong namespace" so the
-                    // operator can fix the actual problem instead of
-                    // chasing a phantom "does not exist".
-                    let message = match db.get_proxy(proxy_id).await {
-                        Ok(Some(other)) => format!(
-                            "Cross-namespace reference forbidden: proxy_id '{}' belongs to namespace '{}' but plugin_config is in namespace '{}'",
-                            proxy_id, other.namespace, namespace
-                        ),
-                        _ => format!("proxy_id '{}' does not exist", proxy_id),
-                    };
-                    return Err(AfterValidateError::BadRequest(vec![message]));
+                    // Proxy reads are namespace-predicated (issue #2122
+                    // DB-M1): a proxy in another namespace reports as
+                    // missing, so cross-namespace references are rejected
+                    // without disclosing other tenants' resources.
+                    return Err(AfterValidateError::BadRequest(vec![format!(
+                        "proxy_id '{}' does not exist in namespace '{}'",
+                        proxy_id, namespace
+                    )]));
                 }
                 Err(error) => return Err(AfterValidateError::Db(error)),
             }
@@ -1736,27 +1737,20 @@ impl AdminResource for Proxy {
         )
     }
 
-    async fn db_get(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>> {
-        db.get_proxy(id).await
-    }
-
-    async fn db_get_scoped(
-        db: &dyn DatabaseBackend,
-        id: &str,
-        namespace: &str,
-    ) -> DbResult<Option<Self>> {
-        if !db.check_proxy_exists(id, namespace).await? {
-            return Ok(None);
-        }
-        db.get_proxy(id).await
+    async fn db_get(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<Option<Self>> {
+        db.get_proxy(namespace, id).await
     }
 
     fn allow_cached_read_fallback(error: &anyhow::Error) -> bool {
         !is_proxy_plugin_association_load_error(error)
     }
 
-    async fn db_get_for_write(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>> {
-        db.get_proxy_for_write(id).await
+    async fn db_get_for_write(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        id: &str,
+    ) -> DbResult<Option<Self>> {
+        db.get_proxy_for_write(namespace, id).await
     }
 
     async fn db_list(
@@ -1776,12 +1770,12 @@ impl AdminResource for Proxy {
         db.create_proxy(resource).await
     }
 
-    async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
+    async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<bool> {
         db.update_proxy(resource).await
     }
 
-    async fn db_delete(db: &dyn DatabaseBackend, id: &str) -> DbResult<bool> {
-        db.delete_proxy(id).await
+    async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {
+        db.delete_proxy(namespace, id).await
     }
 
     async fn check_uniqueness(
@@ -1844,11 +1838,15 @@ impl AdminResource for Proxy {
         error: &anyhow::Error,
         _action: WriteAction<'_>,
     ) -> Response<Full<Bytes>> {
-        if error.to_string().contains(PROXY_ROUTE_CONFLICT_ERROR) {
+        let message = error.to_string();
+        if message.contains(PROXY_ROUTE_CONFLICT_ERROR) {
             return super::json_response(
                 StatusCode::CONFLICT,
                 &json!({"error": PROXY_ROUTE_CONFLICT_ERROR}),
             );
+        }
+        if super::is_unique_constraint_violation(&message) {
+            return super::json_response(StatusCode::CONFLICT, &json!({ "error": message }));
         }
 
         super::json_response(
@@ -1870,13 +1868,10 @@ impl AdminResource for Proxy {
             .as_ref()
             .and_then(|config| config.mesh.as_deref());
         if let Some(upstream_id) = resource.upstream_id.as_deref() {
-            match db.get_upstream(upstream_id).await {
-                Ok(Some(upstream)) if upstream.namespace != namespace => {
-                    return Err(AfterValidateError::BadRequest(vec![format!(
-                        "Cross-namespace reference forbidden: upstream_id '{}' belongs to namespace '{}' but proxy is in namespace '{}'",
-                        upstream_id, upstream.namespace, namespace
-                    )]));
-                }
+            // Namespace-predicated lookup: an upstream in another namespace
+            // reports as missing (cross-namespace references are equally
+            // forbidden either way).
+            match db.get_upstream(namespace, upstream_id).await {
                 Ok(Some(upstream)) => {
                     if let Some(owner_spec_id) = upstream.api_spec_id.as_deref() {
                         let same_spec_proxy = existing
@@ -1931,8 +1926,8 @@ impl AdminResource for Proxy {
                 }
                 Ok(None) => {
                     return Err(AfterValidateError::BadRequest(vec![format!(
-                        "upstream_id '{}' does not exist",
-                        upstream_id
+                        "upstream_id '{}' does not exist in namespace '{}'",
+                        upstream_id, namespace
                     )]));
                 }
                 Err(error) => return Err(AfterValidateError::Db(error)),
@@ -1948,8 +1943,8 @@ impl AdminResource for Proxy {
             .await
             .map_err(AfterValidateError::Db)?
         {
-            match db.get_upstream(&override_dest.upstream_id).await {
-                Ok(Some(upstream)) if upstream.namespace == namespace => {
+            match db.get_upstream(namespace, &override_dest.upstream_id).await {
+                Ok(Some(upstream)) => {
                     if let Some(conflict) = first_effective_mesh_transport_conflict_with_mesh(
                         &proxy_with_resolved_port_caps(resource, &upstream),
                         &upstream,
@@ -1970,7 +1965,7 @@ impl AdminResource for Proxy {
                 // Missing / cross-namespace override upstreams are reported
                 // by the dedicated mesh_route_dispatch reference validator;
                 // skip them here.
-                Ok(_) => {}
+                Ok(None) => {}
                 Err(error) => return Err(AfterValidateError::Db(error)),
             }
         }
@@ -2043,7 +2038,10 @@ impl AdminResource for Proxy {
             && let Some(old_upstream_id) = old_proxy.upstream_id.as_deref()
             && resource.upstream_id.as_deref() != Some(old_upstream_id)
         {
-            db.cleanup_orphaned_upstream(old_upstream_id).await?;
+            // The previous upstream lives in the proxy's own namespace (the
+            // write precheck loaded `existing` namespace-scoped).
+            db.cleanup_orphaned_upstream(&old_proxy.namespace, old_upstream_id)
+                .await?;
         }
 
         Ok(())
@@ -2107,8 +2105,8 @@ impl AdminResource for Consumer {
         consumer_persist_error_response(error)
     }
 
-    async fn db_get(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>> {
-        db.get_consumer(id).await
+    async fn db_get(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<Option<Self>> {
+        db.get_consumer(namespace, id).await
     }
 
     async fn db_list(
@@ -2128,12 +2126,12 @@ impl AdminResource for Consumer {
         db.create_consumer(resource).await
     }
 
-    async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
+    async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<bool> {
         db.update_consumer(resource).await
     }
 
-    async fn db_delete(db: &dyn DatabaseBackend, id: &str) -> DbResult<bool> {
-        db.delete_consumer(id).await
+    async fn db_delete(db: &dyn DatabaseBackend, namespace: &str, id: &str) -> DbResult<bool> {
+        db.delete_consumer(namespace, id).await
     }
 
     async fn check_uniqueness(
@@ -2220,8 +2218,11 @@ async fn handle_write<R: AdminResource>(
 
     let existing = match action {
         WriteAction::Create => None,
-        WriteAction::Update { id } => match R::db_get_for_write(db, id).await {
-            Ok(Some(existing)) if existing.namespace() != namespace => {
+        WriteAction::Update { id } => match R::db_get_for_write(db, namespace, id).await {
+            // Updating a resource that does not exist in this namespace is a
+            // 404 — proceeding would let the persist step "succeed" against
+            // zero rows (issue #2122 DB-M4 phantom update).
+            Ok(None) => {
                 return Ok(not_found_response::<R>());
             }
             Ok(existing) => existing,
@@ -2230,10 +2231,6 @@ async fn handle_write<R: AdminResource>(
             }
         },
     };
-
-    if matches!(action, WriteAction::Update { .. }) && existing.is_none() {
-        return Ok(not_found_response::<R>());
-    }
 
     match action {
         WriteAction::Create => {
@@ -2263,7 +2260,7 @@ async fn handle_write<R: AdminResource>(
     }
 
     if matches!(action, WriteAction::Create) {
-        match R::db_get(db, resource.id()).await {
+        match R::db_get(db, namespace, resource.id()).await {
             Ok(Some(_)) => {
                 return Ok(super::json_response(
                     StatusCode::CONFLICT,
@@ -2331,17 +2328,24 @@ async fn handle_write<R: AdminResource>(
         }
     }
 
-    let persist_result = match action {
-        WriteAction::Create => R::db_create(db, &resource).await,
-        WriteAction::Update { .. } => R::db_update(db, &resource).await,
-    };
-    if let Err(error) = persist_result {
-        if matches!(action, WriteAction::Update { .. })
-            && config_update_target_was_not_found(&error)
-        {
-            return Ok(not_found_response::<R>());
+    match action {
+        WriteAction::Create => {
+            if let Err(error) = R::db_create(db, &resource).await {
+                return Ok(R::map_persist_db_error(&error, action));
+            }
         }
-        return Ok(R::map_persist_db_error(&error, action));
+        WriteAction::Update { .. } => match R::db_update(db, &resource).await {
+            // The row vanished between the precheck and the write (concurrent
+            // delete). The backend recorded no change — report not-found
+            // rather than a phantom success (issue #2122 DB-M4).
+            Ok(false) => {
+                return Ok(not_found_response::<R>());
+            }
+            Ok(true) => {}
+            Err(error) => {
+                return Ok(R::map_persist_db_error(&error, action));
+            }
+        },
     }
 
     if let Err(error) =

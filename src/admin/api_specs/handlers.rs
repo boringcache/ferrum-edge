@@ -866,7 +866,10 @@ async fn assign_ids_for_put(
     }
 
     // Load the existing proxy to get upstream_id and created_at.
-    let existing_proxy = match db.get_proxy_for_write(&existing_spec.proxy_id).await {
+    let existing_proxy = match db
+        .get_proxy_for_write(namespace, &existing_spec.proxy_id)
+        .await
+    {
         Ok(Some(p)) => Some(p),
         Ok(None) => None,
         Err(e) => return Err(classify_db_error(e)),
@@ -1389,16 +1392,8 @@ async fn validate_bundle(
 
             for assoc in &extra_associations {
                 let pid = &assoc.plugin_config_id;
-                match db.get_plugin_config(pid).await {
+                match db.get_plugin_config(namespace, pid).await {
                     Ok(Some(existing)) => {
-                        if existing.namespace != namespace {
-                            assoc_errors.push(format!(
-                                "plugin_config_id '{}' belongs to namespace '{}', not '{}'",
-                                pid, existing.namespace, namespace
-                            ));
-                            continue;
-                        }
-
                         use crate::config::types::PluginScope;
                         match existing.scope {
                             PluginScope::Global => {
@@ -1483,17 +1478,10 @@ async fn validate_bundle(
                     }
                 }
             } else {
-                match db.get_upstream(upstream_id).await {
-                    Ok(Some(existing)) if existing.namespace != namespace => {
-                        failures.push(ValidationFailure {
-                            resource_type: "proxy",
-                            id: proxy.id.clone(),
-                            errors: vec![format!(
-                                "upstream_id '{}' belongs to namespace '{}', not '{}'",
-                                upstream_id, existing.namespace, namespace
-                            )],
-                        });
-                    }
+                // Namespace-predicated lookup: an upstream in another
+                // namespace reports as missing (cross-namespace references
+                // are equally forbidden either way).
+                match db.get_upstream(namespace, upstream_id).await {
                     Ok(Some(existing)) if existing.api_spec_id.is_some() => {
                         failures.push(ValidationFailure {
                             resource_type: "proxy",
@@ -1525,7 +1513,9 @@ async fn validate_bundle(
                     Ok(None) => failures.push(ValidationFailure {
                         resource_type: "proxy",
                         id: proxy.id.clone(),
-                        errors: vec![format!("upstream_id '{upstream_id}' does not exist")],
+                        errors: vec![format!(
+                            "upstream_id '{upstream_id}' does not exist in namespace '{namespace}'"
+                        )],
                     }),
                     Err(e) => return Err(classify_db_error(e)),
                 }
@@ -1540,12 +1530,8 @@ async fn validate_bundle(
             let resolved_upstream = if bundled_id_matches {
                 bundle.upstream.clone()
             } else {
-                match db.get_upstream(upstream_id).await {
-                    Ok(Some(existing))
-                        if existing.namespace == namespace && existing.api_spec_id.is_none() =>
-                    {
-                        Some(existing)
-                    }
+                match db.get_upstream(namespace, upstream_id).await {
+                    Ok(Some(existing)) if existing.api_spec_id.is_none() => Some(existing),
                     Ok(_) => None,
                     Err(e) => return Err(classify_db_error(e)),
                 }
@@ -1779,8 +1765,10 @@ async fn validate_bundle_route_override_conflicts(
         if bundle_plugin_ids.contains(id) {
             continue;
         }
-        if let Some(pc) = db.get_plugin_config(id).await.map_err(classify_db_error)?
-            && pc.namespace == namespace
+        if let Some(pc) = db
+            .get_plugin_config(namespace, id)
+            .await
+            .map_err(classify_db_error)?
             && pc.enabled
             && pc.plugin_name == "mesh_route_dispatch"
         {
@@ -1858,9 +1846,8 @@ async fn validate_bundle_route_override_conflicts(
             // Resolve the override destination upstream: bundle first, then DB.
             let resolved = match bundle.upstream.as_ref() {
                 Some(u) if u.id == override_uid => Some(u.clone()),
-                _ => match db.get_upstream(override_uid).await {
-                    Ok(Some(u)) if u.namespace == namespace => Some(u),
-                    Ok(_) => None,
+                _ => match db.get_upstream(namespace, override_uid).await {
+                    Ok(u) => u,
                     Err(e) => return Err(classify_db_error(e)),
                 },
             };
@@ -2434,11 +2421,13 @@ pub async fn handle_put_api_spec(
     //      skip-on-unchanged logic (Fix 2).
     // Use the *stored* upstream_id — NOT the bundle's post-assignment
     // upstream.id, which can be operator-changed.
-    let existing_proxy_row: Option<crate::config::types::Proxy> =
-        match db.get_proxy_for_write(&existing_spec.proxy_id).await {
-            Ok(p) => p,
-            Err(e) => return Ok(error_response(classify_db_error(e))),
-        };
+    let existing_proxy_row: Option<crate::config::types::Proxy> = match db
+        .get_proxy_for_write(namespace, &existing_spec.proxy_id)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return Ok(error_response(classify_db_error(e))),
+    };
     let existing_upstream_id: Option<&str> = existing_spec_upstream.as_ref().map(|u| u.id.as_str());
 
     let ValidatedBundle { bundle, metadata } = match validate_bundle(

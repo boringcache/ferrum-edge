@@ -1604,6 +1604,11 @@ pub struct EnvConfig {
     pub admin_read_only: bool,
     /// Enable database-backed Admin API mutation audit events. Default: false.
     pub admin_audit_enabled: bool,
+    /// Require admin JWTs to carry an `ns` claim authorizing the
+    /// `X-Ferrum-Namespace` value on namespace-scoped admin routes.
+    /// Mirrors `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` on the gRPC plane.
+    /// Default: false (namespace header is a routing selector only).
+    pub admin_require_namespace_claim: bool,
     /// Disable admin TLS certificate verification (for testing only)
     pub admin_tls_no_verify: bool,
 
@@ -2388,6 +2393,7 @@ impl Default for EnvConfig {
             tls_no_verify: false,
             admin_read_only: false,
             admin_audit_enabled: false,
+            admin_require_namespace_claim: false,
             admin_tls_no_verify: false,
             stream_proxy_bind_address: "0.0.0.0".into(),
             dtls_cert_path: None,
@@ -2574,6 +2580,7 @@ impl EnvConfig {
             admin_jwt_max_ttl: u64 = "FERRUM_ADMIN_JWT_MAX_TTL" => 3600u64;
             admin_jwt_audience: Option<String> = "FERRUM_ADMIN_JWT_AUDIENCE";
             admin_audit_enabled: bool = "FERRUM_ADMIN_AUDIT_ENABLED" => false;
+            admin_require_namespace_claim: bool = "FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM" => false;
         }
 
         env_config! {
@@ -3408,6 +3415,7 @@ impl EnvConfig {
             tls_no_verify,
             admin_read_only,
             admin_audit_enabled,
+            admin_require_namespace_claim,
             admin_tls_no_verify,
             enable_http3,
             http3_idle_timeout,

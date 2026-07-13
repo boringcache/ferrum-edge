@@ -63,6 +63,7 @@ fn test_audit_event_new_populates_metadata_and_preserves_diff() {
     let actor = AuditActor {
         sub: "admin-user".to_string(),
         role: AdminRole::Admin,
+        allowed_namespaces: ferrum_edge::grpc::auth::AllowedNamespaces::empty(),
     };
     let diff = update_diff(json!({ "enabled": false }), json!({ "enabled": true }));
     let before = Utc::now();

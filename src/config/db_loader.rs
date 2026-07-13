@@ -40,14 +40,14 @@ use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 // Re-export trait types so existing `use crate::config::db_loader::{IncrementalResult, ...}` works.
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult, NamespaceResourceCounts,
-    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
-    extract_db_hostname, redact_url,
+    NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError,
+    SortOrder, extract_db_hostname, redact_url,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -159,7 +159,23 @@ fn consumer_credential_index_entries(consumer: &Consumer) -> Vec<ConsumerCredent
     entries
 }
 
-fn proxy_route_key_hash(listen_path: Option<&str>) -> String {
+/// Deduped set of identity values a consumer claims within its namespace:
+/// id, username, and custom_id (when present). Deduped because
+/// self-collisions — a consumer whose own custom_id equals its own id or
+/// username — are explicitly allowed (matching
+/// `GatewayConfig::validate_unique_consumer_identities`); only cross-consumer
+/// collisions must trip the `consumer_identity_index` primary key.
+fn consumer_identity_values(consumer: &Consumer) -> Vec<&str> {
+    let mut values = vec![consumer.id.as_str(), consumer.username.as_str()];
+    if let Some(custom_id) = consumer.custom_id.as_deref() {
+        values.push(custom_id);
+    }
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+pub(crate) fn proxy_route_key_hash(listen_path: Option<&str>) -> String {
     let mut hasher = Sha256::new();
     match listen_path {
         Some(path) => {
@@ -653,12 +669,20 @@ impl DatabaseStore {
     async fn delete_consumer_credential_index_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
         consumer_id: &str,
     ) -> Result<(), anyhow::Error> {
-        sqlx::query(&self.q("DELETE FROM consumer_credential_index WHERE consumer_id = ?"))
-            .bind(consumer_id)
-            .execute(&mut **tx)
-            .await?;
+        // Consumer ids are only unique per namespace (composite consumers PK),
+        // so the delete must be namespace-scoped or it would wipe another
+        // namespace's rows for a same-id consumer.
+        sqlx::query(
+            &self
+                .q("DELETE FROM consumer_credential_index WHERE namespace = ? AND consumer_id = ?"),
+        )
+        .bind(namespace)
+        .bind(consumer_id)
+        .execute(&mut **tx)
+        .await?;
         Ok(())
     }
 
@@ -675,6 +699,49 @@ impl DatabaseStore {
                 .bind(entry.credential_type)
                 .bind(&entry.credential_hash)
                 .bind(&consumer.id)
+                .execute(&mut **tx)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_consumer_identity_index_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        consumer_id: &str,
+    ) -> Result<(), anyhow::Error> {
+        sqlx::query(
+            &self.q("DELETE FROM consumer_identity_index WHERE namespace = ? AND consumer_id = ?"),
+        )
+        .bind(namespace)
+        .bind(consumer_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Insert one `consumer_identity_index` row per identity value the
+    /// consumer claims (issue #2121). The table's composite
+    /// `PRIMARY KEY (namespace, identity_value)` is the persistence-level
+    /// cross-field collision guard: a violation here means another consumer in
+    /// the namespace already claims the value as its id, username, or
+    /// custom_id. The constraint error is intentionally propagated — the admin
+    /// layer maps unique-constraint text to HTTP 409.
+    async fn insert_consumer_identity_index_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        consumer: &Consumer,
+    ) -> Result<(), anyhow::Error> {
+        let sql = self.q("INSERT INTO consumer_identity_index \
+             (namespace, identity_value, consumer_id, created_at) VALUES (?, ?, ?, ?)");
+        let created_at = Utc::now().to_rfc3339();
+        for value in consumer_identity_values(consumer) {
+            sqlx::query(&sql)
+                .bind(&consumer.namespace)
+                .bind(value)
+                .bind(&consumer.id)
+                .bind(&created_at)
                 .execute(&mut **tx)
                 .await?;
         }
@@ -1288,6 +1355,23 @@ impl DatabaseStore {
             .run()?;
         Self::reject_invalid_gateway_plugin_references("load_full_config", &config)?;
 
+        // Fail-closed consumer identity handling (issue #2121): quarantine
+        // (remove) consumers whose id/username/custom_id collides with an
+        // earlier-loaded consumer instead of warn-and-overwrite, which
+        // mis-routes JWKS/JWT authentication. The consumer_identity_index
+        // table blocks new collisions at write time; this covers pre-existing
+        // rows.
+        let quarantined = config.quarantine_colliding_consumer_identities();
+        if !quarantined.is_empty() {
+            for message in &quarantined {
+                error!("{}", message);
+            }
+            error!(
+                "Quarantined {} consumer(s) with colliding identities during full config load",
+                quarantined.len()
+            );
+        }
+
         ValidationPipeline::new(&mut config)
             .resolve_upstream_tls()
             .validate_all_fields_with_ip_policy(
@@ -1884,7 +1968,7 @@ impl DatabaseStore {
         Ok(())
     }
 
-    pub async fn update_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
+    pub async fn update_proxy(&self, proxy: &Proxy) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let circuit_breaker_json = proxy
             .circuit_breaker
@@ -1902,19 +1986,33 @@ impl DatabaseStore {
         };
 
         let mut tx = self.pool().begin().await?;
-        let old_upstream_id: Option<String> =
-            sqlx::query(&self.q("SELECT upstream_id FROM proxies WHERE id = ? AND namespace = ?"))
-                .bind(&proxy.id)
-                .bind(&proxy.namespace)
-                .fetch_optional(&mut *tx)
-                .await?
-                .and_then(|row| row.try_get::<String, _>("upstream_id").ok());
+        // Existence read inside the transaction is the not-found authority —
+        // not the UPDATE's rows_affected. MySQL without CLIENT_FOUND_ROWS
+        // (sqlx's default) counts *changed* rows, so an update writing
+        // identical values would falsely report 0 for an existing row.
+        // FOR UPDATE locks the row against a concurrent delete until commit.
+        let proxy_select_sql = if self.db_type == "sqlite" {
+            self.q("SELECT upstream_id FROM proxies WHERE id = ? AND namespace = ?")
+        } else {
+            self.q("SELECT upstream_id FROM proxies WHERE id = ? AND namespace = ? FOR UPDATE")
+        };
+        let proxy_row: Option<AnyRow> = sqlx::query(&proxy_select_sql)
+            .bind(&proxy.id)
+            .bind(&proxy.namespace)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(proxy_row) = proxy_row else {
+            tx.rollback().await?;
+            self.check_slow_query("update_proxy", start);
+            return Ok(false);
+        };
+        let old_upstream_id: Option<String> = proxy_row.try_get::<String, _>("upstream_id").ok();
         self.ensure_proxy_route_unique_tx(&mut tx, proxy, Some(&proxy.id))
             .await?;
 
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
-        let result = sqlx::query(
+        sqlx::query(
             &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&proxy.name)
@@ -1969,13 +2067,6 @@ impl DatabaseStore {
         .bind(&proxy.namespace)
         .execute(&mut *tx)
         .await?;
-        if result.rows_affected() == 0 {
-            anyhow::bail!(
-                "proxy '{}' was not found in namespace '{}'",
-                proxy.id,
-                proxy.namespace
-            );
-        }
 
         // Update plugin associations: remove old, insert new
         sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE proxy_id = ?"))
@@ -1999,7 +2090,7 @@ impl DatabaseStore {
         if let Some(old_upstream_id) = old_upstream_id.as_deref()
             && proxy.upstream_id.as_deref() != Some(old_upstream_id)
         {
-            self.cleanup_orphaned_upstream_tx(&mut tx, old_upstream_id)
+            self.cleanup_orphaned_upstream_tx(&mut tx, &proxy.namespace, old_upstream_id)
                 .await?;
         }
 
@@ -2010,23 +2101,26 @@ impl DatabaseStore {
         tx.commit().await?;
 
         self.check_slow_query("update_proxy", start);
-        Ok(())
+        Ok(true)
     }
 
-    pub async fn delete_proxy(&self, id: &str) -> Result<bool, anyhow::Error> {
+    pub async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
 
         // Look up the proxy's current upstream_id before deleting so we can
         // cascade-delete that upstream if it becomes orphaned. Also capture the
         // api_spec row, if this proxy owns one, before the FK cascade removes it.
+        // The lookup is scoped to the caller's namespace so a tenant cannot
+        // reach a same-id proxy in another namespace (issue #2122).
         let proxy_select_sql = if self.db_type == "sqlite" {
-            self.q("SELECT upstream_id, namespace FROM proxies WHERE id = ?")
+            self.q("SELECT upstream_id FROM proxies WHERE id = ? AND namespace = ?")
         } else {
-            self.q("SELECT upstream_id, namespace FROM proxies WHERE id = ? FOR UPDATE")
+            self.q("SELECT upstream_id FROM proxies WHERE id = ? AND namespace = ? FOR UPDATE")
         };
         let proxy_row: Option<AnyRow> = sqlx::query(&proxy_select_sql)
             .bind(id)
+            .bind(namespace)
             .fetch_optional(&mut *tx)
             .await?;
         let Some(proxy_row) = proxy_row else {
@@ -2035,7 +2129,6 @@ impl DatabaseStore {
             return Ok(false);
         };
         let upstream_id: Option<String> = proxy_row.try_get::<String, _>("upstream_id").ok();
-        let proxy_namespace: String = proxy_row.try_get("namespace")?;
 
         let spec_row: Option<AnyRow> =
             sqlx::query(&self.q("SELECT id, namespace FROM api_specs WHERE proxy_id = ?"))
@@ -2046,8 +2139,8 @@ impl DatabaseStore {
             .as_ref()
             .map(|row| Ok::<_, anyhow::Error>((row.try_get("id")?, row.try_get("namespace")?)))
             .transpose()?;
-        if let Some((ref spec_id, ref namespace)) = spec_owner {
-            self.ensure_no_external_spec_upstream_refs_tx(&mut tx, namespace, spec_id, id)
+        if let Some((ref spec_id, ref spec_namespace)) = spec_owner {
+            self.ensure_no_external_spec_upstream_refs_tx(&mut tx, spec_namespace, spec_id, id)
                 .await?;
         }
         let proxy_scoped_plugin_rows: Vec<AnyRow> =
@@ -2068,7 +2161,7 @@ impl DatabaseStore {
 
         let result = sqlx::query(&self.q("DELETE FROM proxies WHERE id = ? AND namespace = ?"))
             .bind(id)
-            .bind(&proxy_namespace)
+            .bind(namespace)
             .execute(&mut *tx)
             .await?;
 
@@ -2084,12 +2177,12 @@ impl DatabaseStore {
         // If this was a spec-owned proxy, delete every upstream tagged with the
         // spec id, not only the proxy's current upstream_id. Direct admin CRUD
         // can drift the pointer away from the original spec-owned upstream.
-        if let Some((ref spec_id, ref namespace)) = spec_owner {
+        if let Some((ref spec_id, ref spec_namespace)) = spec_owner {
             let upstream_rows: Vec<AnyRow> = sqlx::query(
                 &self.q("SELECT id FROM upstreams WHERE api_spec_id = ? AND namespace = ?"),
             )
             .bind(spec_id)
-            .bind(namespace)
+            .bind(spec_namespace)
             .fetch_all(&mut *tx)
             .await?;
             let upstream_ids: Vec<String> = upstream_rows
@@ -2098,13 +2191,13 @@ impl DatabaseStore {
                 .collect::<Result<_, _>>()?;
             sqlx::query(&self.q("DELETE FROM upstreams WHERE api_spec_id = ? AND namespace = ?"))
                 .bind(spec_id)
-                .bind(namespace)
+                .bind(spec_namespace)
                 .execute(&mut *tx)
                 .await?;
             for upstream_id in upstream_ids {
                 self.record_config_change_tx(
                     &mut tx,
-                    namespace,
+                    spec_namespace,
                     "upstream",
                     &upstream_id,
                     "delete",
@@ -2115,24 +2208,25 @@ impl DatabaseStore {
 
         // If the proxy had an upstream, check if it's now orphaned and delete it
         if let Some(ref uid) = upstream_id {
-            self.cleanup_orphaned_upstream_tx(&mut tx, uid).await?;
+            self.cleanup_orphaned_upstream_tx(&mut tx, namespace, uid)
+                .await?;
         }
 
-        self.record_config_change_tx(&mut tx, &proxy_namespace, "proxy", id, "delete")
+        self.record_config_change_tx(&mut tx, namespace, "proxy", id, "delete")
             .await?;
-        for (plugin_id, namespace) in proxy_scoped_plugins {
+        for (plugin_id, plugin_namespace) in proxy_scoped_plugins {
             self.record_config_change_tx(
                 &mut tx,
-                &namespace,
+                &plugin_namespace,
                 "plugin_config",
                 &plugin_id,
                 "delete",
             )
             .await?;
-            self.compact_config_changes_tx(&mut tx, &namespace).await?;
+            self.compact_config_changes_tx(&mut tx, &plugin_namespace)
+                .await?;
         }
-        self.compact_config_changes_tx(&mut tx, &proxy_namespace)
-            .await?;
+        self.compact_config_changes_tx(&mut tx, namespace).await?;
         tx.commit().await?;
 
         self.check_slow_query("delete_proxy", start);
@@ -2181,18 +2275,19 @@ impl DatabaseStore {
     async fn cleanup_orphaned_upstream_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
         upstream_id: &str,
     ) -> Result<(), anyhow::Error> {
         let upstream_row: Option<AnyRow> = sqlx::query(
-            &self.q("SELECT namespace, api_spec_id FROM upstreams WHERE id = ? LIMIT 1"),
+            &self.q("SELECT api_spec_id FROM upstreams WHERE id = ? AND namespace = ? LIMIT 1"),
         )
         .bind(upstream_id)
+        .bind(namespace)
         .fetch_optional(&mut **tx)
         .await?;
         let Some(upstream_row) = upstream_row else {
             return Ok(());
         };
-        let namespace: String = upstream_row.try_get("namespace")?;
         let api_spec_id: Option<String> = upstream_row.try_get("api_spec_id")?;
         if api_spec_id.is_some() {
             return Ok(());
@@ -2202,12 +2297,12 @@ impl DatabaseStore {
             &self.q("SELECT id FROM proxies WHERE upstream_id = ? AND namespace = ? LIMIT 1"),
         )
         .bind(upstream_id)
-        .bind(&namespace)
+        .bind(namespace)
         .fetch_all(&mut **tx)
         .await?;
 
         let dispatch_ref = if ref_rows.is_empty() {
-            self.find_mesh_route_dispatch_upstream_ref_tx(tx, upstream_id, &namespace)
+            self.find_mesh_route_dispatch_upstream_ref_tx(tx, upstream_id, namespace)
                 .await?
         } else {
             None
@@ -2217,20 +2312,26 @@ impl DatabaseStore {
             info!("Cleaning up orphaned upstream {}", upstream_id);
             sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ? AND namespace = ?"))
                 .bind(upstream_id)
-                .bind(&namespace)
+                .bind(namespace)
                 .execute(&mut **tx)
                 .await?;
-            self.record_config_change_tx(tx, &namespace, "upstream", upstream_id, "delete")
+            self.record_config_change_tx(tx, namespace, "upstream", upstream_id, "delete")
                 .await?;
-            self.compact_config_changes_tx(tx, &namespace).await?;
+            self.compact_config_changes_tx(tx, namespace).await?;
         }
 
         Ok(())
     }
 
-    pub async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
+    pub async fn get_proxy(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<Proxy>, anyhow::Error> {
         let start = Instant::now();
-        let proxy = self.load_proxy_with_associations(id, "get_proxy").await?;
+        let proxy = self
+            .load_proxy_with_associations(namespace, id, "get_proxy")
+            .await?;
         if let Some(proxy) = proxy.as_ref() {
             self.reject_invalid_loaded_proxy_plugin_associations("get_proxy", proxy)
                 .await?;
@@ -2239,10 +2340,14 @@ impl DatabaseStore {
         Ok(proxy)
     }
 
-    pub async fn get_proxy_for_write(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
+    pub async fn get_proxy_for_write(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<Proxy>, anyhow::Error> {
         let start = Instant::now();
         let proxy = self
-            .load_proxy_with_associations(id, "get_proxy_for_write")
+            .load_proxy_with_associations(namespace, id, "get_proxy_for_write")
             .await?;
         self.check_slow_query("get_proxy_for_write", start);
         Ok(proxy)
@@ -2250,13 +2355,19 @@ impl DatabaseStore {
 
     async fn load_proxy_with_associations(
         &self,
+        namespace: &str,
         id: &str,
         operation: &str,
     ) -> Result<Option<Proxy>, anyhow::Error> {
-        let row: Option<AnyRow> = sqlx::query(&self.q("SELECT * FROM proxies WHERE id = ?"))
-            .bind(id)
-            .fetch_optional(&self.pool())
-            .await?;
+        // Namespace predicate keeps ID-only admin reads tenant-scoped
+        // (issue #2122): a caller can never see a same-id proxy that lives in
+        // another namespace.
+        let row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT * FROM proxies WHERE id = ? AND namespace = ?"))
+                .bind(id)
+                .bind(namespace)
+                .fetch_optional(&self.pool())
+                .await?;
 
         let row = match row {
             Some(r) => r,
@@ -2318,6 +2429,11 @@ impl DatabaseStore {
         .await?;
         self.insert_consumer_credential_index_tx(&mut tx, consumer)
             .await?;
+        // Identity rows ride the same transaction as the consumer INSERT: a
+        // cross-field identity collision aborts the whole create via the
+        // consumer_identity_index PK (mapped to HTTP 409 by the admin layer).
+        self.insert_consumer_identity_index_tx(&mut tx, consumer)
+            .await?;
         self.record_config_change_tx(
             &mut tx,
             &consumer.namespace,
@@ -2334,14 +2450,36 @@ impl DatabaseStore {
         Ok(())
     }
 
-    pub async fn update_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error> {
+    pub async fn update_consumer(&self, consumer: &Consumer) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let creds_json = serde_json::to_string(&consumer.credentials)?;
         let acl_groups_json = serde_json::to_string(&consumer.acl_groups)?;
         let mut tx = self.pool().begin().await?;
-        self.delete_consumer_credential_index_tx(&mut tx, &consumer.id)
+        // Existence read inside the transaction is the not-found authority —
+        // not the UPDATE's rows_affected. MySQL without CLIENT_FOUND_ROWS
+        // (sqlx's default) counts *changed* rows, so an update writing
+        // identical values would falsely report 0 for an existing row.
+        // FOR UPDATE locks the row against a concurrent delete until commit.
+        let exists_sql = if self.db_type == "sqlite" {
+            self.q("SELECT id FROM consumers WHERE id = ? AND namespace = ?")
+        } else {
+            self.q("SELECT id FROM consumers WHERE id = ? AND namespace = ? FOR UPDATE")
+        };
+        let existing: Option<AnyRow> = sqlx::query(&exists_sql)
+            .bind(&consumer.id)
+            .bind(&consumer.namespace)
+            .fetch_optional(&mut *tx)
             .await?;
-        let result = sqlx::query(&self.q(
+        if existing.is_none() {
+            tx.rollback().await?;
+            self.check_slow_query("update_consumer", start);
+            return Ok(false);
+        }
+        self.delete_consumer_credential_index_tx(&mut tx, &consumer.namespace, &consumer.id)
+            .await?;
+        self.delete_consumer_identity_index_tx(&mut tx, &consumer.namespace, &consumer.id)
+            .await?;
+        sqlx::query(&self.q(
             "UPDATE consumers SET username=?, custom_id=?, credentials=?, acl_groups=?, updated_at=? WHERE id=? AND namespace=?",
         ))
         .bind(&consumer.username)
@@ -2353,14 +2491,9 @@ impl DatabaseStore {
         .bind(&consumer.namespace)
         .execute(&mut *tx)
         .await?;
-        if result.rows_affected() == 0 {
-            anyhow::bail!(
-                "consumer '{}' was not found in namespace '{}'",
-                consumer.id,
-                consumer.namespace
-            );
-        }
         self.insert_consumer_credential_index_tx(&mut tx, consumer)
+            .await?;
+        self.insert_consumer_identity_index_tx(&mut tx, consumer)
             .await?;
         self.record_config_change_tx(
             &mut tx,
@@ -2375,45 +2508,56 @@ impl DatabaseStore {
         tx.commit().await?;
 
         self.check_slow_query("update_consumer", start);
-        Ok(())
+        Ok(true)
     }
 
-    pub async fn delete_consumer(&self, id: &str) -> Result<bool, anyhow::Error> {
+    pub async fn delete_consumer(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
-        let namespace: Option<String> =
-            sqlx::query(&self.q("SELECT namespace FROM consumers WHERE id = ?"))
+        // Scope the existence check to the caller's namespace (issue #2122):
+        // consumer ids are only unique per namespace.
+        let existing: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT id FROM consumers WHERE id = ? AND namespace = ?"))
                 .bind(id)
+                .bind(namespace)
                 .fetch_optional(&mut *tx)
-                .await?
-                .map(|row| row.try_get::<String, _>("namespace"))
-                .transpose()?;
-        let Some(namespace) = namespace else {
+                .await?;
+        if existing.is_none() {
             tx.rollback().await?;
             self.check_slow_query("delete_consumer", start);
             return Ok(false);
-        };
-        self.delete_consumer_credential_index_tx(&mut tx, id)
+        }
+        // The FK cascade on both index tables covers these deletes; keep them
+        // explicit for defense in depth (mirrors delete_all_resources).
+        self.delete_consumer_credential_index_tx(&mut tx, namespace, id)
+            .await?;
+        self.delete_consumer_identity_index_tx(&mut tx, namespace, id)
             .await?;
         let result = sqlx::query(&self.q("DELETE FROM consumers WHERE id = ? AND namespace = ?"))
             .bind(id)
-            .bind(&namespace)
+            .bind(namespace)
             .execute(&mut *tx)
             .await?;
-        self.record_config_change_tx(&mut tx, &namespace, "consumer", id, "delete")
+        self.record_config_change_tx(&mut tx, namespace, "consumer", id, "delete")
             .await?;
-        self.compact_config_changes_tx(&mut tx, &namespace).await?;
+        self.compact_config_changes_tx(&mut tx, namespace).await?;
         tx.commit().await?;
         self.check_slow_query("delete_consumer", start);
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn get_consumer(&self, id: &str) -> Result<Option<Consumer>, anyhow::Error> {
+    pub async fn get_consumer(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<Consumer>, anyhow::Error> {
         let start = Instant::now();
-        let row: Option<AnyRow> = sqlx::query(&self.q("SELECT * FROM consumers WHERE id = ?"))
-            .bind(id)
-            .fetch_optional(&self.pool())
-            .await?;
+        let row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT * FROM consumers WHERE id = ? AND namespace = ?"))
+                .bind(id)
+                .bind(namespace)
+                .fetch_optional(&self.pool())
+                .await?;
 
         let result = match row {
             Some(r) => {
@@ -2467,7 +2611,7 @@ impl DatabaseStore {
         Ok(())
     }
 
-    pub async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
+    pub async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let config_json = serde_json::to_string(&pc.config)?;
         let scope_str = match pc.scope {
@@ -2476,7 +2620,27 @@ impl DatabaseStore {
             PluginScope::Global => "global",
         };
         let mut tx = self.pool().begin().await?;
-        let result = sqlx::query(
+        // Existence read inside the transaction is the not-found authority —
+        // not the UPDATE's rows_affected. MySQL without CLIENT_FOUND_ROWS
+        // (sqlx's default) counts *changed* rows, so an update writing
+        // identical values would falsely report 0 for an existing row.
+        // FOR UPDATE locks the row against a concurrent delete until commit.
+        let exists_sql = if self.db_type == "sqlite" {
+            self.q("SELECT id FROM plugin_configs WHERE id = ? AND namespace = ?")
+        } else {
+            self.q("SELECT id FROM plugin_configs WHERE id = ? AND namespace = ? FOR UPDATE")
+        };
+        let existing: Option<AnyRow> = sqlx::query(&exists_sql)
+            .bind(&pc.id)
+            .bind(&pc.namespace)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if existing.is_none() {
+            tx.rollback().await?;
+            self.check_slow_query("update_plugin_config", start);
+            return Ok(false);
+        }
+        sqlx::query(
             &self.q("UPDATE plugin_configs SET plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&pc.plugin_name)
@@ -2490,13 +2654,6 @@ impl DatabaseStore {
         .bind(&pc.namespace)
         .execute(&mut *tx)
         .await?;
-        if result.rows_affected() == 0 {
-            anyhow::bail!(
-                "plugin config '{}' was not found in namespace '{}'",
-                pc.id,
-                pc.namespace
-            );
-        }
         self.record_config_change_tx(&mut tx, &pc.namespace, "plugin_config", &pc.id, "upsert")
             .await?;
         if pc.scope == PluginScope::Proxy
@@ -2510,24 +2667,29 @@ impl DatabaseStore {
         tx.commit().await?;
 
         self.check_slow_query("update_plugin_config", start);
-        Ok(())
+        Ok(true)
     }
 
-    pub async fn delete_plugin_config(&self, id: &str) -> Result<bool, anyhow::Error> {
+    pub async fn delete_plugin_config(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
-        let namespace: Option<String> =
-            sqlx::query(&self.q("SELECT namespace FROM plugin_configs WHERE id = ?"))
+        // Scope the existence check to the caller's namespace (issue #2122) so
+        // a tenant cannot delete a same-id plugin config in another namespace.
+        let existing: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT id FROM plugin_configs WHERE id = ? AND namespace = ?"))
                 .bind(id)
+                .bind(namespace)
                 .fetch_optional(&mut *tx)
-                .await?
-                .map(|row| row.try_get::<String, _>("namespace"))
-                .transpose()?;
-        let Some(namespace) = namespace else {
+                .await?;
+        if existing.is_none() {
             tx.rollback().await?;
             self.check_slow_query("delete_plugin_config", start);
             return Ok(false);
-        };
+        }
 
         let affected_proxy_rows: Vec<AnyRow> =
             sqlx::query(&self.q("SELECT proxy_id FROM proxy_plugins WHERE plugin_config_id = ?"))
@@ -2552,7 +2714,7 @@ impl DatabaseStore {
                 sqlx::query(&sql)
                     .bind(&updated_at)
                     .bind(proxy_id)
-                    .bind(&namespace)
+                    .bind(namespace)
                     .execute(&mut *tx)
                     .await?;
             }
@@ -2561,16 +2723,16 @@ impl DatabaseStore {
         let result =
             sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ? AND namespace = ?"))
                 .bind(id)
-                .bind(&namespace)
+                .bind(namespace)
                 .execute(&mut *tx)
                 .await?;
-        self.record_config_change_tx(&mut tx, &namespace, "plugin_config", id, "delete")
+        self.record_config_change_tx(&mut tx, namespace, "plugin_config", id, "delete")
             .await?;
         for proxy_id in affected_proxy_ids {
-            self.record_config_change_tx(&mut tx, &namespace, "proxy", &proxy_id, "upsert")
+            self.record_config_change_tx(&mut tx, namespace, "proxy", &proxy_id, "upsert")
                 .await?;
         }
-        self.compact_config_changes_tx(&mut tx, &namespace).await?;
+        self.compact_config_changes_tx(&mut tx, namespace).await?;
 
         tx.commit().await?;
 
@@ -2578,12 +2740,18 @@ impl DatabaseStore {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn get_plugin_config(&self, id: &str) -> Result<Option<PluginConfig>, anyhow::Error> {
+    pub async fn get_plugin_config(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<PluginConfig>, anyhow::Error> {
         let start = Instant::now();
-        let row: Option<AnyRow> = sqlx::query(&self.q("SELECT * FROM plugin_configs WHERE id = ?"))
-            .bind(id)
-            .fetch_optional(&self.pool())
-            .await?;
+        let row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT * FROM plugin_configs WHERE id = ? AND namespace = ?"))
+                .bind(id)
+                .bind(namespace)
+                .fetch_optional(&self.pool())
+                .await?;
 
         let result = match row {
             Some(r) => {
@@ -3045,7 +3213,7 @@ impl DatabaseStore {
         Ok(())
     }
 
-    pub async fn update_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
+    pub async fn update_upstream(&self, upstream: &Upstream) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let targets_json = serde_json::to_string(&upstream.targets)?;
         let algo_json = serde_json::to_string(&upstream.algorithm)?;
@@ -3074,7 +3242,27 @@ impl DatabaseStore {
         let backend_tls_san_allow_list_json = upstream_backend_tls_san_allow_list_json(upstream)?;
 
         let mut tx = self.pool().begin().await?;
-        let result = sqlx::query(
+        // Existence read inside the transaction is the not-found authority —
+        // not the UPDATE's rows_affected. MySQL without CLIENT_FOUND_ROWS
+        // (sqlx's default) counts *changed* rows, so an update writing
+        // identical values would falsely report 0 for an existing row.
+        // FOR UPDATE locks the row against a concurrent delete until commit.
+        let exists_sql = if self.db_type == "sqlite" {
+            self.q("SELECT id FROM upstreams WHERE id = ? AND namespace = ?")
+        } else {
+            self.q("SELECT id FROM upstreams WHERE id = ? AND namespace = ? FOR UPDATE")
+        };
+        let existing: Option<AnyRow> = sqlx::query(&exists_sql)
+            .bind(&upstream.id)
+            .bind(&upstream.namespace)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if existing.is_none() {
+            tx.rollback().await?;
+            self.check_slow_query("update_upstream", start);
+            return Ok(false);
+        }
+        sqlx::query(
             &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, subsets=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, backend_tls_sni=?, backend_tls_san_allow_list=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&upstream.name)
@@ -3096,13 +3284,6 @@ impl DatabaseStore {
         .bind(&upstream.namespace)
         .execute(&mut *tx)
         .await?;
-        if result.rows_affected() == 0 {
-            anyhow::bail!(
-                "upstream '{}' was not found in namespace '{}'",
-                upstream.id,
-                upstream.namespace
-            );
-        }
         self.record_config_change_tx(
             &mut tx,
             &upstream.namespace,
@@ -3116,7 +3297,7 @@ impl DatabaseStore {
         tx.commit().await?;
 
         self.check_slow_query("update_upstream", start);
-        Ok(())
+        Ok(true)
     }
 
     async fn mesh_route_dispatch_plugin_configs_tx(
@@ -3154,28 +3335,29 @@ impl DatabaseStore {
     /// Returns `Err` if the upstream is still in use.
     /// Uses a transaction to prevent race conditions between the reference
     /// check and the delete.
-    pub async fn delete_upstream(&self, id: &str) -> Result<bool, anyhow::Error> {
+    pub async fn delete_upstream(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
-        let namespace: Option<String> =
-            sqlx::query(&self.q("SELECT namespace FROM upstreams WHERE id = ?"))
+        // Scope the existence check to the caller's namespace (issue #2122) so
+        // a tenant cannot delete a same-id upstream in another namespace.
+        let existing: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT id FROM upstreams WHERE id = ? AND namespace = ?"))
                 .bind(id)
+                .bind(namespace)
                 .fetch_optional(&mut *tx)
-                .await?
-                .map(|row| row.try_get::<String, _>("namespace"))
-                .transpose()?;
-        let Some(namespace) = namespace else {
+                .await?;
+        if existing.is_none() {
             tx.rollback().await?;
             self.check_slow_query("delete_upstream", start);
             return Ok(false);
-        };
+        }
 
         // Check reference within the transaction to prevent races
         let ref_rows: Vec<AnyRow> = sqlx::query(
             &self.q("SELECT id FROM proxies WHERE upstream_id = ? AND namespace = ? LIMIT 1"),
         )
         .bind(id)
-        .bind(&namespace)
+        .bind(namespace)
         .fetch_all(&mut *tx)
         .await?;
         if !ref_rows.is_empty() {
@@ -3186,7 +3368,7 @@ impl DatabaseStore {
             );
         }
         if let Some(plugin) = self
-            .find_mesh_route_dispatch_upstream_ref_tx(&mut tx, id, &namespace)
+            .find_mesh_route_dispatch_upstream_ref_tx(&mut tx, id, namespace)
             .await?
         {
             tx.rollback().await?;
@@ -3199,12 +3381,12 @@ impl DatabaseStore {
 
         let result = sqlx::query(&self.q("DELETE FROM upstreams WHERE id = ? AND namespace = ?"))
             .bind(id)
-            .bind(&namespace)
+            .bind(namespace)
             .execute(&mut *tx)
             .await?;
-        self.record_config_change_tx(&mut tx, &namespace, "upstream", id, "delete")
+        self.record_config_change_tx(&mut tx, namespace, "upstream", id, "delete")
             .await?;
-        self.compact_config_changes_tx(&mut tx, &namespace).await?;
+        self.compact_config_changes_tx(&mut tx, namespace).await?;
 
         tx.commit().await?;
 
@@ -3217,12 +3399,13 @@ impl DatabaseStore {
     /// Uses a transaction to prevent race conditions between check and delete.
     pub async fn cleanup_orphaned_upstream(
         &self,
+        namespace: &str,
         old_upstream_id: &str,
     ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
 
-        self.cleanup_orphaned_upstream_tx(&mut tx, old_upstream_id)
+        self.cleanup_orphaned_upstream_tx(&mut tx, namespace, old_upstream_id)
             .await?;
 
         tx.commit().await?;
@@ -3231,12 +3414,18 @@ impl DatabaseStore {
         Ok(())
     }
 
-    pub async fn get_upstream(&self, id: &str) -> Result<Option<Upstream>, anyhow::Error> {
+    pub async fn get_upstream(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<Upstream>, anyhow::Error> {
         let start = Instant::now();
-        let row: Option<AnyRow> = sqlx::query(&self.q("SELECT * FROM upstreams WHERE id = ?"))
-            .bind(id)
-            .fetch_optional(&self.pool())
-            .await?;
+        let row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT * FROM upstreams WHERE id = ? AND namespace = ?"))
+                .bind(id)
+                .bind(namespace)
+                .fetch_optional(&self.pool())
+                .await?;
 
         let result = match row {
             Some(r) => Ok(Some(row_to_upstream(&r)?)),
@@ -3722,6 +3911,10 @@ impl DatabaseStore {
                 .filter(|id| !loaded_consumer_ids.contains(*id))
                 .cloned(),
         );
+        let removed_consumer_ids = removed_consumer_ids
+            .into_iter()
+            .map(|id| NamespacedResourceId::new(namespace, id))
+            .collect();
 
         let mut added_or_modified_plugin_configs = self
             .load_plugin_configs_by_ids(namespace, &plugin_config_upserts)
@@ -4507,6 +4700,8 @@ impl DatabaseStore {
                 .await?;
             self.insert_consumer_credential_index_tx(&mut tx, consumer)
                 .await?;
+            self.insert_consumer_identity_index_tx(&mut tx, consumer)
+                .await?;
             self.record_config_change_tx(
                 &mut tx,
                 &consumer.namespace,
@@ -4700,8 +4895,9 @@ impl DatabaseStore {
     /// 2. plugin_configs (may reference proxies)
     /// 3. proxies (may reference upstreams)
     /// 4. consumer_credential_index
-    /// 5. consumers
-    /// 6. upstreams
+    /// 5. consumer_identity_index
+    /// 6. consumers
+    /// 7. upstreams
     pub async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
@@ -4740,6 +4936,10 @@ impl DatabaseStore {
             .execute(&mut *tx)
             .await?;
         sqlx::query(&self.q("DELETE FROM consumer_credential_index WHERE namespace = ?"))
+            .bind(namespace)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(&self.q("DELETE FROM consumer_identity_index WHERE namespace = ?"))
             .bind(namespace)
             .execute(&mut *tx)
             .await?;
@@ -6733,20 +6933,24 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::create_proxy(self, proxy).await
     }
 
-    async fn update_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
+    async fn update_proxy(&self, proxy: &Proxy) -> Result<bool, anyhow::Error> {
         DatabaseStore::update_proxy(self, proxy).await
     }
 
-    async fn delete_proxy(&self, id: &str) -> Result<bool, anyhow::Error> {
-        DatabaseStore::delete_proxy(self, id).await
+    async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
+        DatabaseStore::delete_proxy(self, namespace, id).await
     }
 
-    async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
-        DatabaseStore::get_proxy(self, id).await
+    async fn get_proxy(&self, namespace: &str, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
+        DatabaseStore::get_proxy(self, namespace, id).await
     }
 
-    async fn get_proxy_for_write(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
-        DatabaseStore::get_proxy_for_write(self, id).await
+    async fn get_proxy_for_write(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<Proxy>, anyhow::Error> {
+        DatabaseStore::get_proxy_for_write(self, namespace, id).await
     }
 
     async fn check_proxy_exists(
@@ -6770,16 +6974,20 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::create_consumer(self, consumer).await
     }
 
-    async fn update_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error> {
+    async fn update_consumer(&self, consumer: &Consumer) -> Result<bool, anyhow::Error> {
         DatabaseStore::update_consumer(self, consumer).await
     }
 
-    async fn delete_consumer(&self, id: &str) -> Result<bool, anyhow::Error> {
-        DatabaseStore::delete_consumer(self, id).await
+    async fn delete_consumer(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
+        DatabaseStore::delete_consumer(self, namespace, id).await
     }
 
-    async fn get_consumer(&self, id: &str) -> Result<Option<Consumer>, anyhow::Error> {
-        DatabaseStore::get_consumer(self, id).await
+    async fn get_consumer(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<Consumer>, anyhow::Error> {
+        DatabaseStore::get_consumer(self, namespace, id).await
     }
 
     async fn list_consumers_paginated(
@@ -6795,16 +7003,20 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::create_plugin_config(self, pc).await
     }
 
-    async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
+    async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<bool, anyhow::Error> {
         DatabaseStore::update_plugin_config(self, pc).await
     }
 
-    async fn delete_plugin_config(&self, id: &str) -> Result<bool, anyhow::Error> {
-        DatabaseStore::delete_plugin_config(self, id).await
+    async fn delete_plugin_config(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
+        DatabaseStore::delete_plugin_config(self, namespace, id).await
     }
 
-    async fn get_plugin_config(&self, id: &str) -> Result<Option<PluginConfig>, anyhow::Error> {
-        DatabaseStore::get_plugin_config(self, id).await
+    async fn get_plugin_config(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<PluginConfig>, anyhow::Error> {
+        DatabaseStore::get_plugin_config(self, namespace, id).await
     }
 
     async fn list_plugin_configs_paginated(
@@ -6820,20 +7032,28 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::create_upstream(self, upstream).await
     }
 
-    async fn update_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
+    async fn update_upstream(&self, upstream: &Upstream) -> Result<bool, anyhow::Error> {
         DatabaseStore::update_upstream(self, upstream).await
     }
 
-    async fn delete_upstream(&self, id: &str) -> Result<bool, anyhow::Error> {
-        DatabaseStore::delete_upstream(self, id).await
+    async fn delete_upstream(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
+        DatabaseStore::delete_upstream(self, namespace, id).await
     }
 
-    async fn get_upstream(&self, id: &str) -> Result<Option<Upstream>, anyhow::Error> {
-        DatabaseStore::get_upstream(self, id).await
+    async fn get_upstream(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<Upstream>, anyhow::Error> {
+        DatabaseStore::get_upstream(self, namespace, id).await
     }
 
-    async fn cleanup_orphaned_upstream(&self, upstream_id: &str) -> Result<(), anyhow::Error> {
-        DatabaseStore::cleanup_orphaned_upstream(self, upstream_id).await
+    async fn cleanup_orphaned_upstream(
+        &self,
+        namespace: &str,
+        upstream_id: &str,
+    ) -> Result<(), anyhow::Error> {
+        DatabaseStore::cleanup_orphaned_upstream(self, namespace, upstream_id).await
     }
 
     async fn list_upstreams_paginated(

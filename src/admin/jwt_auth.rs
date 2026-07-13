@@ -92,6 +92,18 @@ impl AdminClaims {
             ),
         }
     }
+
+    /// Namespaces this token is authorized for, from the optional `ns` claim.
+    ///
+    /// Shares the parser with the CP/DP gRPC plane so both surfaces accept
+    /// identical claim shapes (single string or array of strings). A missing
+    /// claim yields `AllowedNamespaces::empty()`; malformed shapes are
+    /// rejected (fail-closed) rather than treated as absent — a garbled
+    /// tenancy claim must never widen access. Only *enforced* against the
+    /// requested namespace when `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`.
+    pub fn allowed_namespaces(&self) -> Result<crate::grpc::auth::AllowedNamespaces, String> {
+        crate::grpc::auth::parse_ns_claim(&self.additional)
+    }
 }
 
 /// JWT Configuration

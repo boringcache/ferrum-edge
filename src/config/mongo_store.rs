@@ -12,8 +12,11 @@
 //!
 //! **Document model**: Each document is a direct BSON serialization of the
 //! domain type (`Proxy`, `Consumer`, etc.) with `_id` set to the resource's
-//! `id` field. Plugin associations are embedded in the proxy document's
-//! `plugins` array (no junction table needed — unlike the relational model).
+//! `id` field. Consumers are the exception: their `_id` is the composite
+//! `"{namespace}:{id}"` (see [`consumer_doc_id`]) so consumer ids are unique
+//! per namespace rather than globally. Plugin associations are embedded in
+//! the proxy document's `plugins` array (no junction table needed — unlike
+//! the relational model).
 //!
 //! **Full loads and incremental polling**: Replica-set full loads use a
 //! snapshot transaction so the runtime config is read from one multi-collection
@@ -38,9 +41,10 @@
 mod inner {
     use crate::config::db_backend::{
         ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, DeleteAllResourcesError, DeleteMode,
-        IncrementalResult, NamespaceResourceCounts, PaginatedResult, SnapshotDataIntegrityError,
-        SortOrder,
+        IncrementalResult, NamespaceResourceCounts, NamespacedResourceId,
+        PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
     };
+    use crate::config::db_loader::proxy_route_key_hash;
     use crate::config::types::{
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
         Upstream,
@@ -66,6 +70,7 @@ mod inner {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tracing::{debug, error, info, warn};
+    use uuid::Uuid;
     use zeroize::Zeroizing;
     // regex::escape is used for safe MongoDB $regex pattern construction in list filters.
     use regex::escape as regex_escape;
@@ -74,24 +79,12 @@ mod inner {
     // `run_migrations`. Source: src/mongo/db/operation_exit_code.idl (server)
     // and https://www.mongodb.com/docs/manual/reference/error-codes/.
     const MONGO_ERR_INDEX_NOT_FOUND: i32 = 27;
+    const MONGO_ERR_NAMESPACE_EXISTS: i32 = 48;
     const MONGO_ERR_INDEX_ALREADY_EXISTS: i32 = 68;
     const MONGO_ERR_INDEX_OPTIONS_CONFLICT: i32 = 85;
     const MONGO_ERR_INDEX_KEY_SPECS_CONFLICT: i32 = 86;
     const CHANGE_LOG_BATCH_LIMIT: i64 = 10_000;
     const CHANGE_LOG_RETAIN_PER_NAMESPACE: u64 = 100_000;
-
-    fn require_matched_update(
-        result: mongodb::results::UpdateResult,
-        resource_type: &str,
-        id: &str,
-    ) -> Result<(), mongodb::error::Error> {
-        if result.matched_count == 0 {
-            return Err(mongodb::error::Error::custom(format!(
-                "{resource_type} '{id}' was not found"
-            )));
-        }
-        Ok(())
-    }
 
     #[derive(Clone, Copy)]
     struct ConfigChangeWrite<'a> {
@@ -99,6 +92,40 @@ mod inner {
         resource_type: &'a str,
         resource_id: &'a str,
         operation: &'a str,
+    }
+
+    /// Proxy fields needed by the transactional admission guards
+    /// (route-bucket lock + uniqueness re-check + upstream reference guard),
+    /// extracted once so transaction closures don't clone the whole `Proxy`.
+    #[derive(Clone)]
+    struct ProxyWriteGuardParams {
+        namespace: String,
+        listen_path: Option<String>,
+        hosts: Vec<String>,
+        /// Stream schemes (tcp/tcps/udp/dtls) skip route-bucket enforcement —
+        /// they route on `listen_port` and have `check_listen_port_unique`.
+        is_stream: bool,
+        upstream_id: Option<String>,
+    }
+
+    impl ProxyWriteGuardParams {
+        fn from_proxy(proxy: &Proxy) -> Self {
+            Self {
+                namespace: proxy.namespace.clone(),
+                listen_path: proxy.listen_path.clone(),
+                hosts: proxy.hosts.clone(),
+                is_stream: proxy.effective_scheme().is_stream(),
+                upstream_id: proxy.upstream_id.clone(),
+            }
+        }
+    }
+
+    /// One proxy in a (namespace, listen_path) route bucket, as needed by the
+    /// standalone post-write route reconciliation.
+    struct RouteBucketCandidate {
+        id: String,
+        hosts: Vec<String>,
+        created_at: String,
     }
 
     /// Build an ordering-safe `$gte` lower bound for the string-typed
@@ -141,6 +168,10 @@ mod inner {
 
     fn is_index_not_found(err: &mongodb::error::Error) -> bool {
         is_mongo_command_error_with_code(err, MONGO_ERR_INDEX_NOT_FOUND)
+    }
+
+    fn is_namespace_exists(err: &mongodb::error::Error) -> bool {
+        is_mongo_command_error_with_code(err, MONGO_ERR_NAMESPACE_EXISTS)
     }
 
     fn is_index_already_exists(err: &mongodb::error::Error) -> bool {
@@ -883,6 +914,30 @@ mod inner {
             self.collection("config_change_counters")
         }
 
+        /// Merged consumer identity keyspace (id ∪ username ∪ custom_id per
+        /// namespace). Documents are `{_id: "{namespace}:{value}", namespace,
+        /// identity_value, consumer_id}` — `_id` uniqueness is the atomic
+        /// guard against two consumers claiming the same identity value.
+        fn consumer_identity_index(&self) -> MongoCollectionHandle {
+            self.collection("consumer_identity_index")
+        }
+
+        /// Per-(namespace, route-bucket) lock documents keyed by
+        /// `"{namespace}:{route_key_hash}"`. The Mongo analogue of the SQL
+        /// backend's `proxy_route_locks` `SELECT ... FOR UPDATE` row.
+        fn proxy_route_locks(&self) -> MongoCollectionHandle {
+            self.collection("proxy_route_locks")
+        }
+
+        /// Per-(namespace, upstream) guard documents keyed by
+        /// `"{namespace}:{upstream_id}"`. Written in-session by proxy
+        /// create/update transactions that reference the upstream and by
+        /// `delete_upstream`'s transaction, so a concurrent create-referencing
+        /// transaction and the delete transaction write-conflict and serialize.
+        fn upstream_ref_guards(&self) -> MongoCollectionHandle {
+            self.collection("upstream_ref_guards")
+        }
+
         // -------------------------------------------------------------------
         // Internal helpers
         // -------------------------------------------------------------------
@@ -1084,24 +1139,33 @@ mod inner {
             resource_type: &str,
             resource_id: &str,
             change_error: &anyhow::Error,
-        ) {
+        ) -> bool {
             match self
                 .collection(collection_name)
                 .delete_one(doc! { "_id": resource_id })
                 .await
             {
-                Ok(result) if result.deleted_count > 0 => warn!(
-                    "Rolled back MongoDB standalone {} create for id '{}' in namespace '{}' after config_changes write failed: {}",
-                    resource_type, resource_id, namespace, change_error
-                ),
-                Ok(_) => warn!(
-                    "MongoDB standalone {} create for id '{}' in namespace '{}' failed to record config_changes, but rollback found no inserted document: {}",
-                    resource_type, resource_id, namespace, change_error
-                ),
-                Err(rollback_err) => warn!(
-                    "MongoDB standalone {} create for id '{}' in namespace '{}' failed to record config_changes and rollback failed: {}; original error: {}",
-                    resource_type, resource_id, namespace, rollback_err, change_error
-                ),
+                Ok(result) if result.deleted_count > 0 => {
+                    warn!(
+                        "Rolled back MongoDB standalone {} create for id '{}' in namespace '{}' after config_changes write failed: {}",
+                        resource_type, resource_id, namespace, change_error
+                    );
+                    true
+                }
+                Ok(_) => {
+                    warn!(
+                        "MongoDB standalone {} create for id '{}' in namespace '{}' failed to record config_changes, but rollback confirmed no inserted document remains: {}",
+                        resource_type, resource_id, namespace, change_error
+                    );
+                    true
+                }
+                Err(rollback_err) => {
+                    warn!(
+                        "MongoDB standalone {} create for id '{}' in namespace '{}' failed to record config_changes and rollback failed: {}; original error: {}",
+                        resource_type, resource_id, namespace, rollback_err, change_error
+                    );
+                    false
+                }
             }
         }
 
@@ -1111,12 +1175,12 @@ mod inner {
             resource_type: &str,
             resource_ids: &[&str],
             change_error: &anyhow::Error,
-        ) {
+        ) -> HashSet<String> {
             if resource_ids.is_empty() {
-                return;
+                return HashSet::new();
             }
 
-            let mut deleted_count = 0_u64;
+            let mut confirmed_absent = HashSet::with_capacity(resource_ids.len());
             for chunk in resource_ids.chunks(500) {
                 let id_values: Vec<Bson> = chunk
                     .iter()
@@ -1128,29 +1192,40 @@ mod inner {
                     .await
                 {
                     Ok(result) => {
-                        deleted_count += result.deleted_count;
+                        // A successful delete_many confirms that every ID in
+                        // this chunk is absent when the operation completes,
+                        // including IDs that were already absent.
+                        confirmed_absent
+                            .extend(chunk.iter().map(|resource_id| (*resource_id).to_string()));
+                        debug!(
+                            "MongoDB standalone {} batch rollback deleted {} documents from a {}-ID chunk",
+                            resource_type,
+                            result.deleted_count,
+                            chunk.len()
+                        );
                     }
                     Err(rollback_err) => {
                         warn!(
-                            "MongoDB standalone {} batch create failed to record config_changes and rollback failed after deleting {} of {} inserted documents: {}; original error: {}",
+                            "MongoDB standalone {} batch create failed to record config_changes and rollback failed after confirming {} of {} inserted documents absent: {}; original error: {}",
                             resource_type,
-                            deleted_count,
+                            confirmed_absent.len(),
                             resource_ids.len(),
                             rollback_err,
                             change_error
                         );
-                        return;
+                        return confirmed_absent;
                     }
                 }
             }
 
             warn!(
-                "Rolled back MongoDB standalone {} batch create after config_changes write failed; deleted {} of {} inserted documents: {}",
+                "Rolled back MongoDB standalone {} batch create after config_changes write failed; confirmed {} of {} inserted documents absent: {}",
                 resource_type,
-                deleted_count,
+                confirmed_absent.len(),
                 resource_ids.len(),
                 change_error
             );
+            confirmed_absent
         }
 
         fn resource_ids_without_failed_insert_indices<'a>(
@@ -1194,32 +1269,41 @@ mod inner {
             resource_id: &str,
             previous_doc: Option<Document>,
             change_error: &anyhow::Error,
-        ) {
+        ) -> bool {
             let Some(previous_doc) = previous_doc else {
                 warn!(
                     "MongoDB standalone {} update for id '{}' failed to record config_changes, \
                      but no previous document was available to restore: {}",
                     resource_type, resource_id, change_error
                 );
-                return;
+                return false;
             };
             match self
                 .collection(collection_name)
                 .replace_one(doc! { "_id": resource_id }, previous_doc)
                 .await
             {
-                Ok(result) if result.matched_count > 0 => warn!(
-                    "Restored MongoDB standalone {} update for id '{}' after config_changes write failed: {}",
-                    resource_type, resource_id, change_error
-                ),
-                Ok(_) => warn!(
-                    "MongoDB standalone {} update for id '{}' failed to record config_changes, but rollback found no document to restore: {}",
-                    resource_type, resource_id, change_error
-                ),
-                Err(rollback_err) => warn!(
-                    "MongoDB standalone {} update for id '{}' failed to record config_changes and rollback failed: {}; original error: {}",
-                    resource_type, resource_id, rollback_err, change_error
-                ),
+                Ok(result) if result.matched_count > 0 => {
+                    warn!(
+                        "Restored MongoDB standalone {} update for id '{}' after config_changes write failed: {}",
+                        resource_type, resource_id, change_error
+                    );
+                    true
+                }
+                Ok(_) => {
+                    warn!(
+                        "MongoDB standalone {} update for id '{}' failed to record config_changes, but rollback found no document to restore: {}",
+                        resource_type, resource_id, change_error
+                    );
+                    false
+                }
+                Err(rollback_err) => {
+                    warn!(
+                        "MongoDB standalone {} update for id '{}' failed to record config_changes and rollback failed: {}; original error: {}",
+                        resource_type, resource_id, rollback_err, change_error
+                    );
+                    false
+                }
             }
         }
 
@@ -1487,6 +1571,512 @@ mod inner {
                 }
             }
             Ok(None)
+        }
+
+        // -------------------------------------------------------------------
+        // Proxy admission guards (route uniqueness + upstream references)
+        // -------------------------------------------------------------------
+
+        /// Take the per-(namespace, route-bucket) admission lock inside a
+        /// transaction by upserting a lock document with a fresh nonce.
+        ///
+        /// This is the Mongo analogue of the SQL backend's
+        /// `SELECT ... FOR UPDATE` lock row (`lock_proxy_route_bucket_tx`):
+        /// two concurrent transactions writing the same lock document raise a
+        /// WriteConflict, which the driver's `and_run` retry loop resolves by
+        /// aborting and re-running one of them — serializing all admission
+        /// checks for the same route bucket.
+        async fn lock_proxy_route_bucket_in_session(
+            &self,
+            session: &mut ClientSession,
+            namespace: &str,
+            listen_path: Option<&str>,
+        ) -> mongodb::error::Result<()> {
+            let route_key_hash = proxy_route_key_hash(listen_path);
+            self.proxy_route_locks()
+                .update_one(
+                    doc! { "_id": format!("{namespace}:{route_key_hash}") },
+                    doc! {
+                        "$set": {
+                            "nonce": Uuid::new_v4().to_string(),
+                            "updated_at": Utc::now().to_rfc3339(),
+                        }
+                    },
+                )
+                .upsert(true)
+                .session(&mut *session)
+                .await?;
+            Ok(())
+        }
+
+        /// Session-aware variant of `check_listen_path_unique` — same
+        /// candidate query and `hosts_overlap` logic, but every read runs on
+        /// the caller's transaction session so it observes (and conflicts
+        /// with) concurrent admissions serialized by the route-bucket lock.
+        async fn check_listen_path_unique_in_session(
+            &self,
+            session: &mut ClientSession,
+            namespace: &str,
+            listen_path: Option<&str>,
+            hosts: &[String],
+            exclude_proxy_id: Option<&str>,
+        ) -> Result<bool, anyhow::Error> {
+            if listen_path.is_none() && hosts.is_empty() {
+                return Ok(false);
+            }
+            let mut filter = match listen_path {
+                Some(path) => doc! { "namespace": namespace, "listen_path": path },
+                None => doc! { "namespace": namespace, "listen_path": null },
+            };
+            filter.insert(
+                "backend_scheme",
+                doc! { "$nin": ["tcp", "tcps", "udp", "dtls"] },
+            );
+            if let Some(id) = exclude_proxy_id {
+                filter.insert("_id", doc! { "$ne": id });
+            }
+            let proxies = self.proxies();
+            let mut cursor = proxies
+                .find(filter)
+                .projection(doc! { "_id": 1, "hosts": 1 })
+                .session(&mut *session)
+                .await?;
+            while cursor.advance(&mut *session).await? {
+                let doc = cursor.deserialize_current()?;
+                let existing_hosts: Vec<String> = doc
+                    .get_array("hosts")
+                    .ok()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if crate::config::types::hosts_overlap(hosts, &existing_hosts) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+
+        /// Transaction-scoped proxy admission guards: route-bucket lock +
+        /// uniqueness re-check, and (when the proxy references an upstream)
+        /// the upstream reference guard + existence check.
+        ///
+        /// Mirrors the SQL backend's `ensure_proxy_route_unique_tx`: stream
+        /// schemes (tcp/tcps/udp/dtls) skip route enforcement — they have
+        /// their own `check_listen_port_unique` — and route conflicts surface
+        /// as [`PROXY_ROUTE_CONFLICT_ERROR`] so the admin layer maps 409.
+        async fn ensure_proxy_admission_guards_in_session(
+            &self,
+            session: &mut ClientSession,
+            params: &ProxyWriteGuardParams,
+            exclude_proxy_id: Option<&str>,
+        ) -> mongodb::error::Result<()> {
+            if !params.is_stream {
+                self.lock_proxy_route_bucket_in_session(
+                    &mut *session,
+                    &params.namespace,
+                    params.listen_path.as_deref(),
+                )
+                .await?;
+                let unique = self
+                    .check_listen_path_unique_in_session(
+                        &mut *session,
+                        &params.namespace,
+                        params.listen_path.as_deref(),
+                        &params.hosts,
+                        exclude_proxy_id,
+                    )
+                    .await
+                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
+                if !unique {
+                    // Owned String payload — `mongodb::error::Error`'s Display
+                    // only surfaces custom payloads that downcast to String,
+                    // and the admin layer matches this substring for 409.
+                    return Err(mongodb::error::Error::custom(
+                        PROXY_ROUTE_CONFLICT_ERROR.to_string(),
+                    ));
+                }
+            }
+            if let Some(ref upstream_id) = params.upstream_id {
+                // Guard doc: a concurrent `delete_upstream` transaction writes
+                // the same document, so create-referencing and delete
+                // write-conflict and serialize instead of racing.
+                self.upstream_ref_guards()
+                    .update_one(
+                        doc! { "_id": format!("{}:{}", params.namespace, upstream_id) },
+                        doc! {
+                            "$set": {
+                                "nonce": Uuid::new_v4().to_string(),
+                                "updated_at": Utc::now().to_rfc3339(),
+                            }
+                        },
+                    )
+                    .upsert(true)
+                    .session(&mut *session)
+                    .await?;
+                let exists = self
+                    .upstreams()
+                    .find_one(doc! {
+                        "_id": upstream_id.as_str(),
+                        "namespace": params.namespace.as_str(),
+                    })
+                    .projection(doc! { "_id": 1 })
+                    .session(&mut *session)
+                    .await?
+                    .is_some();
+                if !exists {
+                    return Err(mongodb::error::Error::custom(format!(
+                        "referenced upstream '{}' does not exist in namespace '{}'",
+                        upstream_id, params.namespace
+                    )));
+                }
+            }
+            Ok(())
+        }
+
+        /// Standalone-path upstream existence check for proxy writes.
+        async fn upstream_exists_in_namespace(
+            &self,
+            namespace: &str,
+            upstream_id: &str,
+        ) -> Result<bool, anyhow::Error> {
+            let existing = self
+                .upstreams()
+                .find_one(doc! { "_id": upstream_id, "namespace": namespace })
+                .projection(doc! { "_id": 1 })
+                .await?;
+            Ok(existing.is_some())
+        }
+
+        /// Fetch every proxy in the same (namespace, listen_path) route
+        /// bucket, excluding stream schemes, with the fields needed for the
+        /// standalone post-write reconciliation: `_id`, `hosts`, and the
+        /// stored `created_at` string.
+        async fn listen_path_bucket_candidates(
+            &self,
+            namespace: &str,
+            listen_path: Option<&str>,
+        ) -> Result<Vec<RouteBucketCandidate>, anyhow::Error> {
+            let mut filter = match listen_path {
+                Some(path) => doc! { "namespace": namespace, "listen_path": path },
+                None => doc! { "namespace": namespace, "listen_path": null },
+            };
+            filter.insert(
+                "backend_scheme",
+                doc! { "$nin": ["tcp", "tcps", "udp", "dtls"] },
+            );
+            let proxies = self.proxies();
+            let mut cursor = proxies
+                .find(filter)
+                .projection(doc! { "_id": 1, "hosts": 1, "created_at": 1 })
+                .await?;
+            let mut candidates = Vec::new();
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                let Ok(id) = doc.get_str("_id") else {
+                    continue;
+                };
+                let hosts: Vec<String> = doc
+                    .get_array("hosts")
+                    .ok()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let created_at = doc.get_str("created_at").unwrap_or_default().to_string();
+                candidates.push(RouteBucketCandidate {
+                    id: id.to_string(),
+                    hosts,
+                    created_at,
+                });
+            }
+            Ok(candidates)
+        }
+
+        /// Deterministic loser-yield for the standalone proxy-route
+        /// reconciliation: after writing its own document, a writer re-reads
+        /// the route bucket and yields iff some conflicting document has a
+        /// strictly smaller `(created_at, _id)` pair. `created_at` is a
+        /// stored RFC 3339 string, so string comparison is deterministic and
+        /// both racers reading the same committed documents reach the same
+        /// verdict (chronological fidelity at sub-second precision is not
+        /// required — only a total order is).
+        ///
+        /// This narrows the standalone TOCTOU to convergent post-write
+        /// reconciliation: whichever racer observes the conflict deletes the
+        /// losing document. A residual window remains when the loser's
+        /// re-check runs before the winner's write lands; full serialization
+        /// requires `FERRUM_MONGO_REPLICA_SET` (transactions + route-bucket
+        /// lock docs).
+        fn standalone_route_writer_should_yield(
+            my_id: &str,
+            my_hosts: &[String],
+            candidates: &[RouteBucketCandidate],
+        ) -> bool {
+            let Some(me) = candidates.iter().find(|c| c.id == my_id) else {
+                // Our own write is already gone (concurrent delete) — nothing
+                // to yield.
+                return false;
+            };
+            candidates.iter().any(|other| {
+                other.id != my_id
+                    && crate::config::types::hosts_overlap(my_hosts, &other.hosts)
+                    && (other.created_at.as_str(), other.id.as_str())
+                        < (me.created_at.as_str(), me.id.as_str())
+            })
+        }
+
+        /// Standalone updates mutate a document that already owned its old
+        /// route. After replacement, any overlapping route owned by another
+        /// proxy makes the update yield and restore its previous document.
+        /// This differs from create-vs-create ordering: an existing proxy's
+        /// original `created_at` must not let a later route mutation displace
+        /// a concurrently admitted create.
+        fn standalone_route_update_has_conflict(
+            my_id: &str,
+            my_hosts: &[String],
+            candidates: &[RouteBucketCandidate],
+        ) -> bool {
+            candidates.iter().any(|other| {
+                other.id != my_id && crate::config::types::hosts_overlap(my_hosts, &other.hosts)
+            })
+        }
+
+        // -------------------------------------------------------------------
+        // Consumer identity index maintenance
+        // -------------------------------------------------------------------
+
+        /// Insert identity reservations for `values` inside a transaction.
+        /// A duplicate-key error (another consumer owns one of the values)
+        /// aborts the transaction; the E11000 message contains
+        /// "duplicate key", which the admin layer maps to HTTP 409.
+        async fn insert_consumer_identity_docs_in_session(
+            &self,
+            session: &mut ClientSession,
+            namespace: &str,
+            consumer_id: &str,
+            values: &[String],
+        ) -> mongodb::error::Result<()> {
+            if values.is_empty() {
+                return Ok(());
+            }
+            self.consumer_identity_index()
+                .insert_many(consumer_identity_index_docs(namespace, consumer_id, values))
+                .session(&mut *session)
+                .await?;
+            Ok(())
+        }
+
+        /// Delete this consumer's reservations for specific identity values
+        /// inside a transaction. Filtered by `consumer_id` so a value that
+        /// was already re-claimed by another consumer is never touched.
+        async fn delete_consumer_identity_values_in_session(
+            &self,
+            session: &mut ClientSession,
+            namespace: &str,
+            consumer_id: &str,
+            values: &[String],
+        ) -> mongodb::error::Result<()> {
+            if values.is_empty() {
+                return Ok(());
+            }
+            let ids: Vec<Bson> = values
+                .iter()
+                .map(|value| Bson::String(consumer_identity_doc_id(namespace, value)))
+                .collect();
+            self.consumer_identity_index()
+                .delete_many(doc! { "_id": { "$in": ids }, "consumer_id": consumer_id })
+                .session(&mut *session)
+                .await?;
+            Ok(())
+        }
+
+        /// For an ORDERED `insert_many` failure, the number of leading
+        /// documents that were actually inserted (everything before the first
+        /// reported write-error index; later documents were never attempted).
+        /// Unknown failures, including InsertMany errors without a reported
+        /// write-error index, return `None`: cleanup cannot safely attribute
+        /// any reservation to this attempt and must retain all of them.
+        fn ordered_insert_inserted_prefix_len(err: &mongodb::error::Error) -> Option<usize> {
+            let mongodb::error::ErrorKind::InsertMany(insert_error) = err.kind.as_ref() else {
+                return None;
+            };
+            insert_error
+                .write_errors
+                .as_deref()?
+                .iter()
+                .map(|write_error| write_error.index)
+                .min()
+        }
+
+        /// Standalone reserve-first: insert the identity reservations BEFORE
+        /// writing the consumer document. A duplicate-key error means another
+        /// consumer owns one of the values — best-effort delete exactly the
+        /// documents this call inserted (the prefix before the failed index)
+        /// and bail without touching the consumer. Deleting only the inserted
+        /// prefix matters: releasing the full value set could remove
+        /// reservations that a pre-existing consumer with the same id already
+        /// legitimately owns.
+        async fn reserve_consumer_identity_docs_standalone(
+            &self,
+            namespace: &str,
+            consumer_id: &str,
+            values: &[String],
+        ) -> Result<(), anyhow::Error> {
+            if values.is_empty() {
+                return Ok(());
+            }
+            if let Err(err) = self
+                .consumer_identity_index()
+                .insert_many(consumer_identity_index_docs(namespace, consumer_id, values))
+                .await
+            {
+                if let Some(inserted) = Self::ordered_insert_inserted_prefix_len(&err) {
+                    self.release_consumer_identity_values_best_effort(
+                        namespace,
+                        consumer_id,
+                        &values[..inserted],
+                    )
+                    .await;
+                } else {
+                    warn!(
+                        "Retaining MongoDB consumer identity reservations for '{}' in namespace \
+                         '{}' because the failed ordered insert did not report a verifiable \
+                         write-error index",
+                        consumer_id, namespace
+                    );
+                }
+                return Err(err.into());
+            }
+            Ok(())
+        }
+
+        /// Best-effort compensation: delete identity reservations this call
+        /// inserted. Filtered by `consumer_id` so reservations owned by other
+        /// consumers (including the one that won a duplicate-key race) are
+        /// never deleted.
+        async fn release_consumer_identity_values_best_effort(
+            &self,
+            namespace: &str,
+            consumer_id: &str,
+            values: &[String],
+        ) {
+            if values.is_empty() {
+                return;
+            }
+            let ids: Vec<Bson> = values
+                .iter()
+                .map(|value| Bson::String(consumer_identity_doc_id(namespace, value)))
+                .collect();
+            if let Err(err) = self
+                .consumer_identity_index()
+                .delete_many(doc! { "_id": { "$in": ids }, "consumer_id": consumer_id })
+                .await
+            {
+                warn!(
+                    "MongoDB best-effort consumer identity reservation rollback failed for \
+                     consumer '{}' in namespace '{}': {}",
+                    consumer_id, namespace, err
+                );
+            }
+        }
+
+        /// Release reservations only for consumer documents whose compensating
+        /// delete was confirmed. Reservations for documents in a failed or
+        /// unverified rollback chunk remain held so later writes cannot claim
+        /// identities that may still belong to a persisted consumer.
+        async fn release_confirmed_batch_consumer_identity_docs_best_effort(
+            &self,
+            consumers: &[Consumer],
+            confirmed_absent_doc_ids: &HashSet<String>,
+        ) {
+            for consumer in consumers {
+                if confirmed_absent_doc_ids
+                    .contains(&consumer_doc_id(&consumer.namespace, &consumer.id))
+                {
+                    self.release_consumer_identity_values_best_effort(
+                        &consumer.namespace,
+                        &consumer.id,
+                        &consumer_identity_values(consumer),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        /// Best-effort deletion of specific identity-index documents
+        /// (matched by both `_id` and `consumer_id`), used to release exactly
+        /// the prefix an ordered batch reservation insert managed to commit.
+        async fn release_consumer_identity_docs_best_effort(&self, docs: &[Document]) {
+            for chunk in docs.chunks(500) {
+                let clauses: Vec<Document> = chunk
+                    .iter()
+                    .filter_map(|doc| {
+                        let id = doc.get_str("_id").ok()?;
+                        let consumer_id = doc.get_str("consumer_id").ok()?;
+                        Some(doc! { "_id": id, "consumer_id": consumer_id })
+                    })
+                    .collect();
+                if clauses.is_empty() {
+                    continue;
+                }
+                if let Err(err) = self
+                    .consumer_identity_index()
+                    .delete_many(doc! { "$or": clauses })
+                    .await
+                {
+                    warn!(
+                        "MongoDB best-effort batch consumer identity reservation rollback \
+                         failed: {}",
+                        err
+                    );
+                    return;
+                }
+            }
+        }
+
+        /// Load plain consumer `id` values (not the composite `_id`) matching
+        /// a cold-path filter — change-log records carry plain resource ids.
+        async fn load_consumer_plain_ids_filtered(
+            &self,
+            filter: Document,
+        ) -> Result<HashSet<String>, anyhow::Error> {
+            let consumers = self.consumers();
+            let options = FindOptions::builder().projection(doc! { "id": 1 }).build();
+            let mut cursor = consumers.find(filter).with_options(options).await?;
+            let mut ids = HashSet::new();
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                if let Ok(id) = doc.get_str("id") {
+                    ids.insert(id.to_string());
+                }
+            }
+            Ok(ids)
+        }
+
+        async fn load_consumer_plain_ids_filtered_in_session(
+            &self,
+            session: &mut ClientSession,
+            filter: Document,
+        ) -> Result<HashSet<String>, anyhow::Error> {
+            let consumers = self.consumers();
+            let mut cursor = consumers
+                .find(filter)
+                .projection(doc! { "id": 1 })
+                .session(&mut *session)
+                .await?;
+            let mut ids = HashSet::new();
+            while cursor.advance(&mut *session).await? {
+                let doc = cursor.deserialize_current()?;
+                if let Ok(id) = doc.get_str("id") {
+                    ids.insert(id.to_string());
+                }
+            }
+            Ok(ids)
         }
 
         async fn current_api_spec_resource_hash(
@@ -1839,10 +2429,63 @@ mod inner {
         Ok(proxy)
     }
 
+    /// Composite MongoDB `_id` for consumer documents: `"{namespace}:{id}"`.
+    ///
+    /// The namespace charset forbids `':'`, so the first `':'` is an
+    /// unambiguous delimiter between namespace and id. Using a composite key
+    /// makes consumer ids unique per namespace instead of globally (issue
+    /// #2121). The serde-serialized `id` and `namespace` fields remain in the
+    /// document — all reads strip `_id` before deserializing.
+    fn consumer_doc_id(namespace: &str, id: &str) -> String {
+        format!("{namespace}:{id}")
+    }
+
+    /// Composite `_id` for `consumer_identity_index` documents:
+    /// `"{namespace}:{identity_value}"`. Same delimiter rationale as
+    /// [`consumer_doc_id`].
+    fn consumer_identity_doc_id(namespace: &str, value: &str) -> String {
+        format!("{namespace}:{value}")
+    }
+
+    /// The identity values a consumer claims in the merged per-namespace
+    /// identity keyspace: id ∪ username ∪ custom_id. Self-collisions within
+    /// one consumer are allowed, so the set is deduped.
+    fn consumer_identity_values(consumer: &Consumer) -> Vec<String> {
+        let mut values = vec![consumer.id.clone(), consumer.username.clone()];
+        if let Some(ref custom_id) = consumer.custom_id {
+            values.push(custom_id.clone());
+        }
+        values.sort();
+        values.dedup();
+        values
+    }
+
+    fn consumer_identity_index_doc(namespace: &str, value: &str, consumer_id: &str) -> Document {
+        doc! {
+            "_id": consumer_identity_doc_id(namespace, value),
+            "namespace": namespace,
+            "identity_value": value,
+            "consumer_id": consumer_id,
+        }
+    }
+
+    fn consumer_identity_index_docs(
+        namespace: &str,
+        consumer_id: &str,
+        values: &[String],
+    ) -> Vec<Document> {
+        values
+            .iter()
+            .map(|value| consumer_identity_index_doc(namespace, value, consumer_id))
+            .collect()
+    }
+
     /// Convert a domain `Consumer` into a BSON `Document`.
     fn consumer_to_doc(consumer: &Consumer) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(consumer)?;
-        doc.insert("_id", consumer.id.as_str());
+        // Composite `_id` ("{namespace}:{id}") — consumer ids are unique per
+        // namespace, not globally. See `consumer_doc_id`.
+        doc.insert("_id", consumer_doc_id(&consumer.namespace, &consumer.id));
         // `custom_id` participates in the `{namespace, custom_id}` unique+
         // sparse index. Strip when absent for the same reason as Proxy above.
         strip_null_fields(&mut doc, &["custom_id"]);
@@ -2204,6 +2847,16 @@ mod inner {
             config.normalize_fields();
             config.resolve_upstream_tls();
 
+            // Fail-closed consumer identity collisions (issue #2121): Mongo
+            // `load_full_config` does not run the SQL-side
+            // `ValidationPipeline`, so quarantine colliding consumers here
+            // directly. First-loaded consumer wins; the
+            // `consumer_identity_index` collection prevents NEW collisions
+            // from being committed, this guard covers pre-existing rows.
+            for message in config.quarantine_colliding_consumer_identities() {
+                error!("MongoDB config: {}", message);
+            }
+
             // Defense in depth — Mongo `load_full_config` does not run the
             // SQL-side `ValidationPipeline`, so a row written directly into
             // the proxy collection with an encoded-slash listen_path would
@@ -2515,8 +3168,16 @@ mod inner {
             );
 
             let mut added_or_modified_consumers = Vec::new();
+            // Consumer point-loads use the composite `_id`
+            // ("{namespace}:{id}"); change-log records carry plain ids and
+            // the namespace is in scope, so construct the composite keys here
+            // to keep the `{namespace, _id}` index usable.
+            let consumer_upsert_doc_ids: Vec<String> = consumer_upserts
+                .iter()
+                .map(|id| consumer_doc_id(namespace, id))
+                .collect();
             for doc in self
-                .load_change_ids(self.consumers(), namespace, &consumer_upserts)
+                .load_change_ids(self.consumers(), namespace, &consumer_upsert_doc_ids)
                 .await?
             {
                 added_or_modified_consumers.push(doc_to_consumer(doc)?);
@@ -2531,6 +3192,10 @@ mod inner {
                     .filter(|id| !loaded_consumer_ids.contains(*id))
                     .cloned(),
             );
+            let removed_consumer_ids = removed_consumer_ids
+                .into_iter()
+                .map(|id| NamespacedResourceId::new(namespace, id))
+                .collect();
 
             let mut added_or_modified_plugin_configs = Vec::new();
             for doc in self
@@ -2595,15 +3260,31 @@ mod inner {
         async fn create_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
             let doc = proxy_to_doc(proxy)?;
+            let guard_params = ProxyWriteGuardParams::from_proxy(proxy);
             if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
                 session
                     .start_transaction()
                     .and_run(
-                        (self, doc, proxy.namespace.clone(), proxy.id.clone()),
-                        |s, (this, doc, namespace, id)| {
+                        (
+                            self,
+                            doc,
+                            proxy.namespace.clone(),
+                            proxy.id.clone(),
+                            guard_params,
+                        ),
+                        |s, (this, doc, namespace, id, guard_params)| {
                             Box::pin(async move {
+                                // Route-bucket lock + uniqueness re-check +
+                                // upstream reference guard, all in-session so
+                                // concurrent admissions serialize (DB-H1/DB-H4).
+                                this.ensure_proxy_admission_guards_in_session(
+                                    &mut *s,
+                                    guard_params,
+                                    None,
+                                )
+                                .await?;
                                 this.proxies()
                                     .insert_one(doc.clone())
                                     .session(&mut *s)
@@ -2625,7 +3306,76 @@ mod inner {
                 self.compact_config_changes_best_effort(&proxy.namespace)
                     .await;
             } else {
+                // Standalone (no transactions): pre-check the referenced
+                // upstream, insert, then reconcile post-write. The pre+post
+                // checks converge for every interleaving of a concurrent
+                // create+delete pair — either this create observes the delete
+                // and self-reverts, or `delete_upstream`'s post-delete
+                // re-check observes this proxy and re-inserts the upstream.
+                if let Some(ref upstream_id) = proxy.upstream_id
+                    && !self
+                        .upstream_exists_in_namespace(&proxy.namespace, upstream_id)
+                        .await?
+                {
+                    anyhow::bail!(
+                        "referenced upstream '{}' does not exist in namespace '{}'",
+                        upstream_id,
+                        proxy.namespace
+                    );
+                }
                 self.proxies().insert_one(doc).await?;
+                // Post-write route reconciliation (see
+                // `standalone_route_writer_should_yield`): deterministic
+                // loser-yield narrows the standalone TOCTOU; full
+                // serialization requires FERRUM_MONGO_REPLICA_SET.
+                if !guard_params.is_stream {
+                    let candidates = self
+                        .listen_path_bucket_candidates(
+                            &proxy.namespace,
+                            proxy.listen_path.as_deref(),
+                        )
+                        .await?;
+                    if Self::standalone_route_writer_should_yield(
+                        &proxy.id,
+                        &proxy.hosts,
+                        &candidates,
+                    ) {
+                        if let Err(err) = self
+                            .proxies()
+                            .delete_one(doc! { "_id": &proxy.id, "namespace": &proxy.namespace })
+                            .await
+                        {
+                            warn!(
+                                "MongoDB standalone proxy route-conflict self-revert failed \
+                                 for '{}': {}",
+                                proxy.id, err
+                            );
+                        }
+                        anyhow::bail!(PROXY_ROUTE_CONFLICT_ERROR);
+                    }
+                }
+                if let Some(ref upstream_id) = proxy.upstream_id
+                    && !self
+                        .upstream_exists_in_namespace(&proxy.namespace, upstream_id)
+                        .await?
+                {
+                    if let Err(err) = self
+                        .proxies()
+                        .delete_one(doc! { "_id": &proxy.id, "namespace": &proxy.namespace })
+                        .await
+                    {
+                        warn!(
+                            "MongoDB standalone proxy upstream-vanished self-revert failed \
+                             for '{}': {}",
+                            proxy.id, err
+                        );
+                    }
+                    anyhow::bail!(
+                        "referenced upstream '{}' does not exist in namespace '{}'",
+                        upstream_id,
+                        proxy.namespace
+                    );
+                }
                 if let Err(err) = self
                     .record_config_change(&proxy.namespace, "proxy", &proxy.id, "upsert")
                     .await
@@ -2645,7 +3395,7 @@ mod inner {
             Ok(())
         }
 
-        async fn update_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
+        async fn update_proxy(&self, proxy: &Proxy) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
             // Preserve api_spec_id: the incoming Proxy from the admin CRUD
             // endpoint has api_spec_id: None (stripped in normalize()), but
@@ -2656,17 +3406,42 @@ mod inner {
             // Inject that tag into the replacement document before writing so
             // the method cannot succeed with an untagged spec-owned proxy.
             let mut doc = proxy_to_doc(proxy)?;
+            let guard_params = ProxyWriteGuardParams::from_proxy(proxy);
 
             let use_replica_set = self.replica_set_configured.load(Ordering::Acquire);
-            let transaction_orphaned_proxy_group_plugin_deletes = if use_replica_set {
+            if use_replica_set {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
-                session
+                let (matched, orphaned_proxy_group_plugin_deletes) = session
                     .start_transaction()
                     .and_run(
-                        (self, &proxy.id, doc, proxy.namespace.clone()),
-                        |s, (this, id, doc, namespace)| {
+                        (self, &proxy.id, doc, proxy.namespace.clone(), guard_params),
+                        |s, (this, id, doc, namespace, guard_params)| {
                             Box::pin(async move {
+                                // Establish target existence before admission
+                                // guards so a concurrent delete surfaces as a
+                                // no-match update, not a route conflict.
+                                if this
+                                    .proxies()
+                                    .find_one(doc! {
+                                        "_id": *id,
+                                        "namespace": namespace.as_str(),
+                                    })
+                                    .session(&mut *s)
+                                    .await?
+                                    .is_none()
+                                {
+                                    return Ok((false, Vec::<(String, String)>::new()));
+                                }
+                                // Route-bucket lock + uniqueness re-check +
+                                // upstream reference guard, all in-session so
+                                // concurrent admissions serialize (DB-H1/DB-H4).
+                                this.ensure_proxy_admission_guards_in_session(
+                                    &mut *s,
+                                    guard_params,
+                                    Some(id.as_str()),
+                                )
+                                .await?;
                                 let mut doc = doc.clone();
                                 if let Some(spec_doc) = this
                                     .api_specs()
@@ -2682,12 +3457,26 @@ mod inner {
                                     })?;
                                     doc.insert("api_spec_id", sid);
                                 }
-                                let result = this
+                                let replace_result = this
                                     .proxies()
-                                    .replace_one(mongodb::bson::doc! { "_id": *id }, doc)
+                                    .replace_one(
+                                        mongodb::bson::doc! {
+                                            "_id": *id,
+                                            "namespace": namespace.as_str(),
+                                        },
+                                        doc,
+                                    )
                                     .session(&mut *s)
                                     .await?;
-                                require_matched_update(result, "proxy", id)?;
+                                if replace_result.matched_count == 0 {
+                                    // Phantom update: no document in this
+                                    // namespace. Skip cleanup and DO NOT write
+                                    // a config-change record — a concurrent
+                                    // delete must surface as not-found, not as
+                                    // an upsert change (DB-M4). The lock/guard
+                                    // upserts that commit are inert metadata.
+                                    return Ok((false, Vec::<(String, String)>::new()));
+                                }
                                 let orphaned = this
                                     .cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut *s))
                                     .await
@@ -2710,67 +3499,151 @@ mod inner {
                                     )
                                     .await?;
                                 }
-                                Ok(orphaned)
+                                Ok((true, orphaned))
                             })
                         },
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("update_proxy transaction failed: {}", e))?
-            } else {
-                let previous_doc = self.proxies().find_one(doc! { "_id": &proxy.id }).await?;
-                if let Some(spec_doc) = self
-                    .api_specs()
-                    .find_one(doc! { "proxy_id": &proxy.id })
-                    .await?
-                {
-                    let sid = spec_doc.get_str("_id").map_err(|e| {
-                        anyhow::anyhow!("api_spec for proxy {} is missing _id: {}", proxy.id, e)
-                    })?;
-                    doc.insert("api_spec_id", sid);
-                }
-                let result = self
-                    .proxies()
-                    .replace_one(doc! { "_id": &proxy.id }, doc)
-                    .await?;
-                require_matched_update(result, "proxy", &proxy.id)?;
-                if let Err(err) = self
-                    .record_config_change(&proxy.namespace, "proxy", &proxy.id, "upsert")
-                    .await
-                {
-                    self.rollback_standalone_updated_document(
-                        "proxies",
-                        "proxy",
-                        &proxy.id,
-                        previous_doc,
-                        &err,
-                    )
-                    .await;
-                    return Err(err);
-                }
-                self.cleanup_orphaned_proxy_group_plugins().await?
-            };
-            let orphaned_proxy_group_plugin_deletes =
-                transaction_orphaned_proxy_group_plugin_deletes;
-            if use_replica_set {
-                self.compact_config_changes_best_effort(&proxy.namespace)
-                    .await;
-                for (_, namespace) in &orphaned_proxy_group_plugin_deletes {
-                    if namespace != &proxy.namespace {
-                        self.compact_config_changes_best_effort(namespace).await;
+                    .map_err(|e| anyhow::anyhow!("update_proxy transaction failed: {}", e))?;
+                if matched {
+                    self.compact_config_changes_best_effort(&proxy.namespace)
+                        .await;
+                    for (_, namespace) in &orphaned_proxy_group_plugin_deletes {
+                        if namespace != &proxy.namespace {
+                            self.compact_config_changes_best_effort(namespace).await;
+                        }
                     }
                 }
-            } else {
-                for (plugin_id, namespace) in orphaned_proxy_group_plugin_deletes {
-                    self.record_config_change(&namespace, "plugin_config", &plugin_id, "delete")
-                        .await?;
+                self.check_slow_query("update_proxy", start);
+                return Ok(matched);
+            }
+
+            // Standalone (no transactions): pre-checks, replace, then
+            // post-write reconciliation. This narrows the TOCTOU windows to
+            // convergent post-write repair; full serialization requires
+            // FERRUM_MONGO_REPLICA_SET.
+            let previous_doc = self
+                .proxies()
+                .find_one(doc! { "_id": &proxy.id, "namespace": &proxy.namespace })
+                .await?;
+            let Some(previous_doc) = previous_doc else {
+                self.check_slow_query("update_proxy", start);
+                return Ok(false);
+            };
+            let previous_upstream_id = previous_doc.get_str("upstream_id").ok().map(str::to_string);
+            let upstream_ref_changed = proxy.upstream_id.is_some()
+                && proxy.upstream_id.as_deref() != previous_upstream_id.as_deref();
+            if upstream_ref_changed
+                && let Some(ref upstream_id) = proxy.upstream_id
+                && !self
+                    .upstream_exists_in_namespace(&proxy.namespace, upstream_id)
+                    .await?
+            {
+                anyhow::bail!(
+                    "referenced upstream '{}' does not exist in namespace '{}'",
+                    upstream_id,
+                    proxy.namespace
+                );
+            }
+            if let Some(spec_doc) = self
+                .api_specs()
+                .find_one(doc! { "proxy_id": &proxy.id })
+                .await?
+            {
+                let sid = spec_doc.get_str("_id").map_err(|e| {
+                    anyhow::anyhow!("api_spec for proxy {} is missing _id: {}", proxy.id, e)
+                })?;
+                doc.insert("api_spec_id", sid);
+            }
+            let replace_result = self
+                .proxies()
+                .replace_one(
+                    doc! { "_id": &proxy.id, "namespace": &proxy.namespace },
+                    doc,
+                )
+                .await?;
+            if replace_result.matched_count == 0 {
+                // Phantom update (concurrent delete): no config-change record.
+                self.check_slow_query("update_proxy", start);
+                return Ok(false);
+            }
+            // Post-write route reconciliation: unlike two creates, an update
+            // always yields to any conflicting route owner and restores its
+            // previous document. The pre-existing proxy's original
+            // `created_at` must not make its route mutation win.
+            if !guard_params.is_stream {
+                let candidates = self
+                    .listen_path_bucket_candidates(&proxy.namespace, proxy.listen_path.as_deref())
+                    .await?;
+                if Self::standalone_route_update_has_conflict(&proxy.id, &proxy.hosts, &candidates)
+                {
+                    if let Err(err) = self
+                        .proxies()
+                        .replace_one(
+                            doc! { "_id": &proxy.id, "namespace": &proxy.namespace },
+                            previous_doc.clone(),
+                        )
+                        .await
+                    {
+                        warn!(
+                            "MongoDB standalone proxy route-conflict restore failed for '{}': {}",
+                            proxy.id, err
+                        );
+                    }
+                    anyhow::bail!(PROXY_ROUTE_CONFLICT_ERROR);
                 }
+            }
+            if upstream_ref_changed
+                && let Some(ref upstream_id) = proxy.upstream_id
+                && !self
+                    .upstream_exists_in_namespace(&proxy.namespace, upstream_id)
+                    .await?
+            {
+                if let Err(err) = self
+                    .proxies()
+                    .replace_one(
+                        doc! { "_id": &proxy.id, "namespace": &proxy.namespace },
+                        previous_doc.clone(),
+                    )
+                    .await
+                {
+                    warn!(
+                        "MongoDB standalone proxy upstream-vanished restore failed for '{}': {}",
+                        proxy.id, err
+                    );
+                }
+                anyhow::bail!(
+                    "referenced upstream '{}' does not exist in namespace '{}'",
+                    upstream_id,
+                    proxy.namespace
+                );
+            }
+            if let Err(err) = self
+                .record_config_change(&proxy.namespace, "proxy", &proxy.id, "upsert")
+                .await
+            {
+                self.rollback_standalone_updated_document(
+                    "proxies",
+                    "proxy",
+                    &proxy.id,
+                    Some(previous_doc),
+                    &err,
+                )
+                .await;
+                return Err(err);
+            }
+            let orphaned_proxy_group_plugin_deletes =
+                self.cleanup_orphaned_proxy_group_plugins().await?;
+            for (plugin_id, namespace) in orphaned_proxy_group_plugin_deletes {
+                self.record_config_change(&namespace, "plugin_config", &plugin_id, "delete")
+                    .await?;
             }
 
             self.check_slow_query("update_proxy", start);
-            Ok(())
+            Ok(true)
         }
 
-        async fn delete_proxy(&self, id: &str) -> Result<bool, anyhow::Error> {
+        async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
             if self.replica_set_configured.load(Ordering::Acquire) {
                 let connection = self.connection();
@@ -2782,213 +3655,230 @@ mod inner {
                     orphaned_proxy_group_plugin_deletes,
                 ) = session
                     .start_transaction()
-                    .and_run((self, id.to_string()), |s, (this, id)| {
-                        Box::pin(async move {
-                            // Capture upstream_id before deleting the proxy.
-                            let proxy_doc = this
-                                .proxies()
-                                .find_one(mongodb::bson::doc! { "_id": id.as_str() })
-                                .session(&mut *s)
-                                .await?;
-                            let Some(proxy_doc) = proxy_doc else {
-                                return Ok((
-                                    false,
-                                    String::new(),
-                                    None::<String>,
-                                    Vec::<(String, String)>::new(),
-                                ));
-                            };
-                            let proxy_namespace_for_changes = proxy_doc
-                                .get_str("namespace")
-                                .map(str::to_string)
-                                .unwrap_or_else(|_| crate::config::types::default_namespace());
-                            let upstream_id_to_check: Option<String> =
-                                proxy_doc.get_str("upstream_id").ok().map(str::to_string);
-                            let proxy_scoped_plugin_ids_for_changes = this
-                                .load_collection_ids_filtered_in_session(
-                                    &mut *s,
-                                    "plugin_configs",
-                                    mongodb::bson::doc! { "proxy_id": id.as_str() },
-                                )
-                                .await
-                                .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
-
-                            let spec_owner: Option<(String, String)> = this
-                                .api_specs()
-                                .find_one(mongodb::bson::doc! { "proxy_id": id.as_str() })
-                                .session(&mut *s)
-                                .await?
-                                .map(|doc| {
-                                    let sid =
-                                        doc.get_str("_id").map(str::to_string).map_err(|e| {
-                                            mongodb::error::Error::custom(format!(
-                                                "api_spec for proxy {} is missing _id: {}",
-                                                id, e
-                                            ))
-                                        })?;
-                                    let namespace = doc
-                                        .get_str("namespace")
-                                        .map(str::to_string)
-                                        .unwrap_or_else(|_| {
-                                            crate::config::types::default_namespace()
-                                        });
-                                    Ok::<_, mongodb::error::Error>((sid, namespace))
-                                })
-                                .transpose()?;
-                            if let Some((ref sid, ref namespace)) = spec_owner {
-                                this.ensure_no_external_spec_upstream_refs_opt_session(
-                                    Some(&mut *s),
-                                    namespace,
-                                    sid,
-                                    id,
-                                )
-                                .await
-                                .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
-                            }
-                            let spec_upstream_ids_for_changes =
-                                if let Some((ref sid, ref namespace)) = spec_owner {
-                                    this.load_collection_ids_filtered_in_session(
+                    .and_run(
+                        (self, namespace.to_string(), id.to_string()),
+                        |s, (this, namespace, id)| {
+                            Box::pin(async move {
+                                // Capture upstream_id before deleting the proxy.
+                                // Namespace-predicated so a cross-namespace admin
+                                // call can never delete another namespace's proxy.
+                                let proxy_doc = this
+                                    .proxies()
+                                    .find_one(mongodb::bson::doc! {
+                                        "_id": id.as_str(),
+                                        "namespace": namespace.as_str(),
+                                    })
+                                    .session(&mut *s)
+                                    .await?;
+                                let Some(proxy_doc) = proxy_doc else {
+                                    return Ok((
+                                        false,
+                                        String::new(),
+                                        None::<String>,
+                                        Vec::<(String, String)>::new(),
+                                    ));
+                                };
+                                let proxy_namespace_for_changes = namespace.clone();
+                                let upstream_id_to_check: Option<String> =
+                                    proxy_doc.get_str("upstream_id").ok().map(str::to_string);
+                                let proxy_scoped_plugin_ids_for_changes = this
+                                    .load_collection_ids_filtered_in_session(
                                         &mut *s,
-                                        "upstreams",
-                                        mongodb::bson::doc! {
-                                            "api_spec_id": sid.as_str(),
-                                            "namespace": namespace.as_str(),
-                                        },
+                                        "plugin_configs",
+                                        mongodb::bson::doc! { "proxy_id": id.as_str() },
                                     )
                                     .await
-                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?
-                                } else {
-                                    HashSet::new()
-                                };
+                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
 
-                            this.plugin_configs()
-                                .delete_many(mongodb::bson::doc! { "proxy_id": id.as_str() })
-                                .session(&mut *s)
-                                .await?;
-                            let result = this
-                                .proxies()
-                                .delete_one(mongodb::bson::doc! { "_id": id.as_str() })
-                                .session(&mut *s)
-                                .await?;
-
-                            let mut deleted_orphaned_upstream_id: Option<String> = None;
-                            if result.deleted_count > 0 {
-                                // Cascade api_specs + spec-owned upstreams.
+                                let spec_owner: Option<(String, String)> = this
+                                    .api_specs()
+                                    .find_one(mongodb::bson::doc! { "proxy_id": id.as_str() })
+                                    .session(&mut *s)
+                                    .await?
+                                    .map(|doc| {
+                                        let sid = doc.get_str("_id").map(str::to_string).map_err(
+                                            |e| {
+                                                mongodb::error::Error::custom(format!(
+                                                    "api_spec for proxy {} is missing _id: {}",
+                                                    id, e
+                                                ))
+                                            },
+                                        )?;
+                                        let namespace = doc
+                                            .get_str("namespace")
+                                            .map(str::to_string)
+                                            .unwrap_or_else(|_| {
+                                                crate::config::types::default_namespace()
+                                            });
+                                        Ok::<_, mongodb::error::Error>((sid, namespace))
+                                    })
+                                    .transpose()?;
                                 if let Some((ref sid, ref namespace)) = spec_owner {
-                                    this.api_specs()
-                                        .delete_one(mongodb::bson::doc! {
-                                            "_id": sid.as_str(),
-                                            "namespace": namespace.as_str(),
-                                        })
-                                        .session(&mut *s)
-                                        .await?;
-                                    this.upstreams()
-                                        .delete_many(mongodb::bson::doc! {
-                                            "api_spec_id": sid.as_str(),
-                                            "namespace": namespace.as_str(),
-                                        })
-                                        .session(&mut *s)
-                                        .await?;
+                                    this.ensure_no_external_spec_upstream_refs_opt_session(
+                                        Some(&mut *s),
+                                        namespace,
+                                        sid,
+                                        id,
+                                    )
+                                    .await
+                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
                                 }
-                                // Cascade-delete orphaned upstream.
-                                if let Some(ref uid) = upstream_id_to_check {
-                                    let still_referenced = this
-                                        .proxies()
-                                        .count_documents(mongodb::bson::doc! {
-                                            "upstream_id": uid.as_str()
-                                        })
-                                        .session(&mut *s)
-                                        .await?
-                                        > 0;
-                                    let dispatch_ref = if !still_referenced {
-                                        this.find_mesh_route_dispatch_upstream_ref_opt_session(
-                                            Some(&mut *s),
-                                            uid,
+                                let spec_upstream_ids_for_changes =
+                                    if let Some((ref sid, ref namespace)) = spec_owner {
+                                        this.load_collection_ids_filtered_in_session(
+                                            &mut *s,
+                                            "upstreams",
+                                            mongodb::bson::doc! {
+                                                "api_spec_id": sid.as_str(),
+                                                "namespace": namespace.as_str(),
+                                            },
                                         )
                                         .await
                                         .map_err(|e| mongodb::error::Error::custom(e.to_string()))?
                                     } else {
-                                        None
+                                        HashSet::new()
                                     };
-                                    if !still_referenced && dispatch_ref.is_none() {
-                                        let upstream_delete = this
-                                            .upstreams()
-                                            .delete_one(mongodb::bson::doc! { "_id": uid.as_str() })
+
+                                this.plugin_configs()
+                                    .delete_many(mongodb::bson::doc! { "proxy_id": id.as_str() })
+                                    .session(&mut *s)
+                                    .await?;
+                                let result = this
+                                    .proxies()
+                                    .delete_one(mongodb::bson::doc! {
+                                        "_id": id.as_str(),
+                                        "namespace": namespace.as_str(),
+                                    })
+                                    .session(&mut *s)
+                                    .await?;
+
+                                let mut deleted_orphaned_upstream_id: Option<String> = None;
+                                if result.deleted_count > 0 {
+                                    // Cascade api_specs + spec-owned upstreams.
+                                    if let Some((ref sid, ref namespace)) = spec_owner {
+                                        this.api_specs()
+                                            .delete_one(mongodb::bson::doc! {
+                                                "_id": sid.as_str(),
+                                                "namespace": namespace.as_str(),
+                                            })
                                             .session(&mut *s)
                                             .await?;
-                                        if upstream_delete.deleted_count > 0 {
-                                            deleted_orphaned_upstream_id = Some(uid.clone());
+                                        this.upstreams()
+                                            .delete_many(mongodb::bson::doc! {
+                                                "api_spec_id": sid.as_str(),
+                                                "namespace": namespace.as_str(),
+                                            })
+                                            .session(&mut *s)
+                                            .await?;
+                                    }
+                                    // Cascade-delete orphaned upstream.
+                                    if let Some(ref uid) = upstream_id_to_check {
+                                        let still_referenced = this
+                                            .proxies()
+                                            .count_documents(mongodb::bson::doc! {
+                                                "upstream_id": uid.as_str()
+                                            })
+                                            .session(&mut *s)
+                                            .await?
+                                            > 0;
+                                        let dispatch_ref = if !still_referenced {
+                                            this.find_mesh_route_dispatch_upstream_ref_opt_session(
+                                                Some(&mut *s),
+                                                uid,
+                                            )
+                                            .await
+                                            .map_err(
+                                                |e| mongodb::error::Error::custom(e.to_string()),
+                                            )?
+                                        } else {
+                                            None
+                                        };
+                                        if !still_referenced && dispatch_ref.is_none() {
+                                            let upstream_delete = this
+                                                .upstreams()
+                                                .delete_one(mongodb::bson::doc! {
+                                                    "_id": uid.as_str(),
+                                                    "namespace": namespace.as_str(),
+                                                })
+                                                .session(&mut *s)
+                                                .await?;
+                                            if upstream_delete.deleted_count > 0 {
+                                                deleted_orphaned_upstream_id = Some(uid.clone());
+                                            }
                                         }
                                     }
                                 }
-                            }
 
-                            let orphaned_proxy_group_plugin_deletes = this
-                                .cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut *s))
-                                .await
-                                .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
-                            if result.deleted_count > 0 {
-                                this.record_config_change_in_session(
-                                    &mut *s,
-                                    proxy_namespace_for_changes.as_str(),
-                                    "proxy",
-                                    id.as_str(),
-                                    "delete",
-                                )
-                                .await?;
-                                for plugin_id in proxy_scoped_plugin_ids_for_changes.iter() {
+                                let orphaned_proxy_group_plugin_deletes = this
+                                    .cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut *s))
+                                    .await
+                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
+                                if result.deleted_count > 0 {
                                     this.record_config_change_in_session(
                                         &mut *s,
                                         proxy_namespace_for_changes.as_str(),
-                                        "plugin_config",
-                                        plugin_id.as_str(),
+                                        "proxy",
+                                        id.as_str(),
                                         "delete",
                                     )
                                     .await?;
-                                }
-                                if let Some((_, namespace)) = spec_owner.as_ref() {
-                                    for upstream_id in spec_upstream_ids_for_changes.iter() {
+                                    for plugin_id in proxy_scoped_plugin_ids_for_changes.iter() {
                                         this.record_config_change_in_session(
                                             &mut *s,
-                                            namespace.as_str(),
+                                            proxy_namespace_for_changes.as_str(),
+                                            "plugin_config",
+                                            plugin_id.as_str(),
+                                            "delete",
+                                        )
+                                        .await?;
+                                    }
+                                    if let Some((_, namespace)) = spec_owner.as_ref() {
+                                        for upstream_id in spec_upstream_ids_for_changes.iter() {
+                                            this.record_config_change_in_session(
+                                                &mut *s,
+                                                namespace.as_str(),
+                                                "upstream",
+                                                upstream_id.as_str(),
+                                                "delete",
+                                            )
+                                            .await?;
+                                        }
+                                    }
+                                    if let Some(upstream_id) = deleted_orphaned_upstream_id.as_ref()
+                                    {
+                                        this.record_config_change_in_session(
+                                            &mut *s,
+                                            proxy_namespace_for_changes.as_str(),
                                             "upstream",
                                             upstream_id.as_str(),
                                             "delete",
                                         )
                                         .await?;
                                     }
+                                    for (plugin_id, namespace) in
+                                        &orphaned_proxy_group_plugin_deletes
+                                    {
+                                        this.record_config_change_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            "plugin_config",
+                                            plugin_id.as_str(),
+                                            "delete",
+                                        )
+                                        .await?;
+                                    }
                                 }
-                                if let Some(upstream_id) = deleted_orphaned_upstream_id.as_ref() {
-                                    this.record_config_change_in_session(
-                                        &mut *s,
-                                        proxy_namespace_for_changes.as_str(),
-                                        "upstream",
-                                        upstream_id.as_str(),
-                                        "delete",
-                                    )
-                                    .await?;
-                                }
-                                for (plugin_id, namespace) in &orphaned_proxy_group_plugin_deletes {
-                                    this.record_config_change_in_session(
-                                        &mut *s,
-                                        namespace.as_str(),
-                                        "plugin_config",
-                                        plugin_id.as_str(),
-                                        "delete",
-                                    )
-                                    .await?;
-                                }
-                            }
-                            let spec_namespace_for_changes =
-                                spec_owner.as_ref().map(|(_, namespace)| namespace.clone());
-                            Ok((
-                                result.deleted_count > 0,
-                                proxy_namespace_for_changes,
-                                spec_namespace_for_changes,
-                                orphaned_proxy_group_plugin_deletes,
-                            ))
-                        })
-                    })
+                                let spec_namespace_for_changes =
+                                    spec_owner.as_ref().map(|(_, namespace)| namespace.clone());
+                                Ok((
+                                    result.deleted_count > 0,
+                                    proxy_namespace_for_changes,
+                                    spec_namespace_for_changes,
+                                    orphaned_proxy_group_plugin_deletes,
+                                ))
+                            })
+                        },
+                    )
                     .await
                     .map_err(|e| anyhow::anyhow!("delete_proxy transaction failed: {}", e))?;
                 if deleted {
@@ -3009,15 +3899,15 @@ mod inner {
                 return Ok(deleted);
             }
 
-            let proxy_doc_for_changes = self.proxies().find_one(doc! { "_id": id }).await?;
-            let Some(proxy_doc_for_changes) = proxy_doc_for_changes else {
+            let proxy_doc_for_changes = self
+                .proxies()
+                .find_one(doc! { "_id": id, "namespace": namespace })
+                .await?;
+            if proxy_doc_for_changes.is_none() {
                 self.check_slow_query("delete_proxy", start);
                 return Ok(false);
             };
-            let proxy_namespace_for_changes = proxy_doc_for_changes
-                .get_str("namespace")
-                .map(str::to_string)
-                .unwrap_or_else(|_| crate::config::types::default_namespace());
+            let proxy_namespace_for_changes = namespace.to_string();
             let proxy_scoped_plugin_ids_for_changes = self
                 .load_collection_ids_filtered("plugin_configs", doc! { "proxy_id": id })
                 .await?;
@@ -3047,12 +3937,11 @@ mod inner {
                 };
 
             // Non-replica-set best-effort path.
-            let proxy_doc = self.proxies().find_one(doc! { "_id": id }).await?;
-            let proxy_namespace = proxy_doc
-                .as_ref()
-                .and_then(|doc| doc.get_str("namespace").ok())
-                .map(str::to_string)
-                .unwrap_or_else(crate::config::types::default_namespace);
+            let proxy_doc = self
+                .proxies()
+                .find_one(doc! { "_id": id, "namespace": namespace })
+                .await?;
+            let proxy_namespace = namespace.to_string();
             let upstream_id_to_check: Option<String> = proxy_doc
                 .as_ref()
                 .and_then(|doc| doc.get_str("upstream_id").ok().map(str::to_string));
@@ -3079,7 +3968,10 @@ mod inner {
                     .await?;
             }
 
-            let result = self.proxies().delete_one(doc! { "_id": id }).await?;
+            let result = self
+                .proxies()
+                .delete_one(doc! { "_id": id, "namespace": namespace })
+                .await?;
             let mut deleted_spec_upstream_ids_for_changes = HashSet::new();
             let mut deleted_orphaned_upstream_id_for_changes = None;
             if result.deleted_count > 0 {
@@ -3117,7 +4009,11 @@ mod inner {
                     };
                     if !still_referenced && dispatch_ref.is_none() {
                         info!("Cascade-deleting orphaned upstream {}", uid);
-                        match self.upstreams().delete_one(doc! { "_id": uid }).await {
+                        match self
+                            .upstreams()
+                            .delete_one(doc! { "_id": uid, "namespace": namespace })
+                            .await
+                        {
                             Ok(delete_result) if delete_result.deleted_count > 0 => {
                                 deleted_orphaned_upstream_id_for_changes = Some(uid.clone());
                             }
@@ -3168,9 +4064,16 @@ mod inner {
             Ok(result.deleted_count > 0)
         }
 
-        async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
+        async fn get_proxy(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> Result<Option<Proxy>, anyhow::Error> {
             let start = std::time::Instant::now();
-            let result = self.proxies().find_one(doc! { "_id": id }).await?;
+            let result = self
+                .proxies()
+                .find_one(doc! { "_id": id, "namespace": namespace })
+                .await?;
             self.check_slow_query("get_proxy", start);
             match result {
                 Some(doc) => Ok(Some(doc_to_proxy(doc)?)),
@@ -3225,15 +4128,33 @@ mod inner {
         async fn create_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
             let doc = consumer_to_doc(consumer)?;
+            let identity_values = consumer_identity_values(consumer);
             if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
                 session
                     .start_transaction()
                     .and_run(
-                        (self, doc, consumer.namespace.clone(), consumer.id.clone()),
-                        |s, (this, doc, namespace, id)| {
+                        (
+                            self,
+                            doc,
+                            consumer.namespace.clone(),
+                            consumer.id.clone(),
+                            identity_values,
+                        ),
+                        |s, (this, doc, namespace, id, identity_values)| {
                             Box::pin(async move {
+                                // Reserve the merged identity keyspace
+                                // (id ∪ username ∪ custom_id) in the same
+                                // transaction — a duplicate key means another
+                                // consumer owns one of the values (409).
+                                this.insert_consumer_identity_docs_in_session(
+                                    &mut *s,
+                                    namespace.as_str(),
+                                    id.as_str(),
+                                    identity_values,
+                                )
+                                .await?;
                                 this.consumers()
                                     .insert_one(doc.clone())
                                     .session(&mut *s)
@@ -3255,19 +4176,51 @@ mod inner {
                 self.compact_config_changes_best_effort(&consumer.namespace)
                     .await;
             } else {
-                self.consumers().insert_one(doc).await?;
+                // Standalone: RESERVE FIRST. Inserting the identity docs
+                // before the consumer makes the identity-index `_id` the
+                // atomic admission guard — a duplicate key error (E11000,
+                // "duplicate key") bails before the consumer is written.
+                self.reserve_consumer_identity_docs_standalone(
+                    &consumer.namespace,
+                    &consumer.id,
+                    &identity_values,
+                )
+                .await?;
+                if let Err(err) = self.consumers().insert_one(doc).await {
+                    self.release_consumer_identity_values_best_effort(
+                        &consumer.namespace,
+                        &consumer.id,
+                        &identity_values,
+                    )
+                    .await;
+                    return Err(err.into());
+                }
                 if let Err(err) = self
                     .record_config_change(&consumer.namespace, "consumer", &consumer.id, "upsert")
                     .await
                 {
-                    self.rollback_standalone_created_document(
-                        "consumers",
-                        &consumer.namespace,
-                        "consumer",
-                        &consumer.id,
-                        &err,
-                    )
-                    .await;
+                    let rollback_confirmed = self
+                        .rollback_standalone_created_document(
+                            "consumers",
+                            &consumer.namespace,
+                            "consumer",
+                            &consumer_doc_id(&consumer.namespace, &consumer.id),
+                            &err,
+                        )
+                        .await;
+                    if rollback_confirmed {
+                        self.release_consumer_identity_values_best_effort(
+                            &consumer.namespace,
+                            &consumer.id,
+                            &identity_values,
+                        )
+                        .await;
+                    } else {
+                        warn!(
+                            "Retaining MongoDB consumer identity reservations for '{}' in namespace '{}' because create rollback could not be verified",
+                            consumer.id, consumer.namespace
+                        );
+                    }
                     return Err(err);
                 }
             }
@@ -3275,24 +4228,75 @@ mod inner {
             Ok(())
         }
 
-        async fn update_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error> {
+        async fn update_consumer(&self, consumer: &Consumer) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
             let doc = consumer_to_doc(consumer)?;
-            if self.replica_set_configured() {
+            let new_identity_values = consumer_identity_values(consumer);
+            let composite_id = consumer_doc_id(&consumer.namespace, &consumer.id);
+            let matched = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
-                session
+                let matched = session
                     .start_transaction()
                     .and_run(
-                        (self, doc, consumer.namespace.clone(), consumer.id.clone()),
-                        |s, (this, doc, namespace, id)| {
+                        (
+                            self,
+                            doc,
+                            consumer.namespace.clone(),
+                            consumer.id.clone(),
+                            composite_id,
+                            new_identity_values,
+                        ),
+                        |s, (this, doc, namespace, id, composite_id, new_identity_values)| {
                             Box::pin(async move {
-                                let result = this
+                                // Read the previous consumer in-session to diff
+                                // the identity keyspace (id ∪ username ∪
+                                // custom_id).
+                                let previous = this
                                     .consumers()
-                                    .replace_one(doc! { "_id": id.as_str() }, doc.clone())
+                                    .find_one(doc! { "_id": composite_id.as_str() })
                                     .session(&mut *s)
                                     .await?;
-                                require_matched_update(result, "consumer", id.as_str())?;
+                                let Some(previous) = previous else {
+                                    // Phantom update: no writes performed, no
+                                    // config-change record (DB-M4).
+                                    return Ok(false);
+                                };
+                                let previous_consumer = doc_to_consumer(previous)
+                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
+                                let old_values = consumer_identity_values(&previous_consumer);
+                                let replace_result = this
+                                    .consumers()
+                                    .replace_one(doc! { "_id": composite_id.as_str() }, doc.clone())
+                                    .session(&mut *s)
+                                    .await?;
+                                if replace_result.matched_count == 0 {
+                                    return Ok(false);
+                                }
+                                let added: Vec<String> = new_identity_values
+                                    .iter()
+                                    .filter(|value| !old_values.contains(value))
+                                    .cloned()
+                                    .collect();
+                                let removed: Vec<String> = old_values
+                                    .iter()
+                                    .filter(|value| !new_identity_values.contains(value))
+                                    .cloned()
+                                    .collect();
+                                this.insert_consumer_identity_docs_in_session(
+                                    &mut *s,
+                                    namespace.as_str(),
+                                    id.as_str(),
+                                    &added,
+                                )
+                                .await?;
+                                this.delete_consumer_identity_values_in_session(
+                                    &mut *s,
+                                    namespace.as_str(),
+                                    id.as_str(),
+                                    &removed,
+                                )
+                                .await?;
                                 this.record_config_change_in_session(
                                     &mut *s,
                                     namespace.as_str(),
@@ -3301,66 +4305,141 @@ mod inner {
                                     "upsert",
                                 )
                                 .await?;
-                                Ok(())
+                                Ok(true)
                             })
                         },
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("update_consumer transaction failed: {}", e))?;
-                self.compact_config_changes_best_effort(&consumer.namespace)
-                    .await;
+                if matched {
+                    self.compact_config_changes_best_effort(&consumer.namespace)
+                        .await;
+                }
+                matched
             } else {
                 let previous_doc = self
                     .consumers()
-                    .find_one(doc! { "_id": &consumer.id })
+                    .find_one(doc! { "_id": &composite_id })
                     .await?;
-                let result = self
+                let Some(previous_doc) = previous_doc else {
+                    self.check_slow_query("update_consumer", start);
+                    return Ok(false);
+                };
+                let previous_consumer = doc_to_consumer(previous_doc.clone())?;
+                let old_values = consumer_identity_values(&previous_consumer);
+                let added: Vec<String> = new_identity_values
+                    .iter()
+                    .filter(|value| !old_values.contains(value))
+                    .cloned()
+                    .collect();
+                let removed: Vec<String> = old_values
+                    .iter()
+                    .filter(|value| !new_identity_values.contains(value))
+                    .cloned()
+                    .collect();
+                // Standalone: reserve the ADDED identity values first, then
+                // replace the consumer, then release the removed values. A
+                // duplicate key on the reservation (another consumer owns one
+                // of the values) bails before the consumer is touched.
+                self.reserve_consumer_identity_docs_standalone(
+                    &consumer.namespace,
+                    &consumer.id,
+                    &added,
+                )
+                .await?;
+                let replace_result = match self
                     .consumers()
-                    .replace_one(doc! { "_id": &consumer.id }, doc)
-                    .await?;
-                require_matched_update(result, "consumer", &consumer.id)?;
+                    .replace_one(doc! { "_id": &composite_id }, doc)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        self.release_consumer_identity_values_best_effort(
+                            &consumer.namespace,
+                            &consumer.id,
+                            &added,
+                        )
+                        .await;
+                        return Err(err.into());
+                    }
+                };
+                if replace_result.matched_count == 0 {
+                    // Phantom update (concurrent delete): release the
+                    // reservations, no config-change record (DB-M4).
+                    self.release_consumer_identity_values_best_effort(
+                        &consumer.namespace,
+                        &consumer.id,
+                        &added,
+                    )
+                    .await;
+                    self.check_slow_query("update_consumer", start);
+                    return Ok(false);
+                }
                 if let Err(err) = self
                     .record_config_change(&consumer.namespace, "consumer", &consumer.id, "upsert")
                     .await
                 {
-                    self.rollback_standalone_updated_document(
-                        "consumers",
-                        "consumer",
-                        &consumer.id,
-                        previous_doc,
-                        &err,
-                    )
-                    .await;
+                    let rollback_confirmed = self
+                        .rollback_standalone_updated_document(
+                            "consumers",
+                            "consumer",
+                            &composite_id,
+                            Some(previous_doc),
+                            &err,
+                        )
+                        .await;
+                    if rollback_confirmed {
+                        self.release_consumer_identity_values_best_effort(
+                            &consumer.namespace,
+                            &consumer.id,
+                            &added,
+                        )
+                        .await;
+                    }
                     return Err(err);
                 }
-            }
+                // Removed values are released last so a change-record failure
+                // (which restores the previous consumer) never leaves the
+                // restored identities unreserved.
+                self.release_consumer_identity_values_best_effort(
+                    &consumer.namespace,
+                    &consumer.id,
+                    &removed,
+                )
+                .await;
+                true
+            };
             self.check_slow_query("update_consumer", start);
-            Ok(())
+            Ok(matched)
         }
 
-        async fn delete_consumer(&self, id: &str) -> Result<bool, anyhow::Error> {
+        async fn delete_consumer(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
-            let existing = self.consumers().find_one(doc! { "_id": id }).await?;
-            let namespace = existing
-                .as_ref()
-                .and_then(|doc| doc.get_str("namespace").ok())
-                .map(str::to_string)
-                .unwrap_or_else(crate::config::types::default_namespace);
+            let composite_id = consumer_doc_id(namespace, id);
             let deleted = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
                 let deleted = session
                     .start_transaction()
                     .and_run(
-                        (self, id.to_string(), namespace.clone()),
-                        |s, (this, id, namespace)| {
+                        (self, id.to_string(), namespace.to_string(), composite_id),
+                        |s, (this, id, namespace, composite_id)| {
                             Box::pin(async move {
                                 let result = this
                                     .consumers()
-                                    .delete_one(doc! { "_id": id.as_str() })
+                                    .delete_one(doc! { "_id": composite_id.as_str() })
                                     .session(&mut *s)
                                     .await?;
                                 if result.deleted_count > 0 {
+                                    // Release the consumer's identity
+                                    // reservations in the same transaction.
+                                    this.consumer_identity_index()
+                                        .delete_many(doc! {
+                                            "namespace": namespace.as_str(),
+                                            "consumer_id": id.as_str(),
+                                        })
+                                        .session(&mut *s)
+                                        .await?;
                                     this.record_config_change_in_session(
                                         &mut *s,
                                         namespace.as_str(),
@@ -3377,13 +4456,32 @@ mod inner {
                     .await
                     .map_err(|e| anyhow::anyhow!("delete_consumer transaction failed: {}", e))?;
                 if deleted {
-                    self.compact_config_changes_best_effort(&namespace).await;
+                    self.compact_config_changes_best_effort(namespace).await;
                 }
                 deleted
             } else {
-                let result = self.consumers().delete_one(doc! { "_id": id }).await?;
+                let result = self
+                    .consumers()
+                    .delete_one(doc! { "_id": &composite_id })
+                    .await?;
                 if result.deleted_count > 0 {
-                    self.record_config_change(&namespace, "consumer", id, "delete")
+                    // Delete the consumer first, then its identity
+                    // reservations. Best-effort: a failure here leaves
+                    // orphaned reservations that 409 future claims of the
+                    // same values until repaired, but the consumer delete
+                    // itself already succeeded.
+                    if let Err(err) = self
+                        .consumer_identity_index()
+                        .delete_many(doc! { "namespace": namespace, "consumer_id": id })
+                        .await
+                    {
+                        warn!(
+                            "MongoDB standalone consumer identity index cleanup failed for \
+                             consumer '{}' in namespace '{}': {}",
+                            id, namespace, err
+                        );
+                    }
+                    self.record_config_change(namespace, "consumer", id, "delete")
                         .await?;
                 }
                 result.deleted_count > 0
@@ -3392,9 +4490,16 @@ mod inner {
             Ok(deleted)
         }
 
-        async fn get_consumer(&self, id: &str) -> Result<Option<Consumer>, anyhow::Error> {
+        async fn get_consumer(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> Result<Option<Consumer>, anyhow::Error> {
             let start = std::time::Instant::now();
-            let result = self.consumers().find_one(doc! { "_id": id }).await?;
+            let result = self
+                .consumers()
+                .find_one(doc! { "_id": consumer_doc_id(namespace, id) })
+                .await?;
             self.check_slow_query("get_consumer", start);
             match result {
                 Some(doc) => Ok(Some(doc_to_consumer(doc)?)),
@@ -3516,15 +4621,21 @@ mod inner {
             Ok(())
         }
 
-        async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
+        async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
             // Preserve api_spec_id by carrying it into the replacement document.
             // Returning an error is safer than silently detaching spec ownership.
             let mut doc = plugin_config_to_doc(pc)?;
             let existing_doc = self
                 .plugin_configs()
-                .find_one(doc! { "_id": &pc.id })
+                .find_one(doc! { "_id": &pc.id, "namespace": &pc.namespace })
                 .await?;
+            if existing_doc.is_none() {
+                // No document in this namespace — phantom update, no
+                // config-change record (DB-M4).
+                self.check_slow_query("update_plugin_config", start);
+                return Ok(false);
+            }
             let existing_spec_id = match existing_doc.as_ref().and_then(|d| d.get("api_spec_id")) {
                 Some(Bson::String(s)) if !s.is_empty() => Some(s.clone()),
                 Some(Bson::Null) | None => None,
@@ -3547,18 +4658,28 @@ mod inner {
                 } else {
                     None
                 };
-                session
+                let matched = session
                     .start_transaction()
                     .and_run(
                         (self, doc, pc.namespace.clone(), pc.id.clone(), proxy_id),
                         |s, (this, doc, namespace, id, proxy_id)| {
                             Box::pin(async move {
-                                let result = this
+                                let replace_result = this
                                     .plugin_configs()
-                                    .replace_one(doc! { "_id": id.as_str() }, doc.clone())
+                                    .replace_one(
+                                        doc! {
+                                            "_id": id.as_str(),
+                                            "namespace": namespace.as_str(),
+                                        },
+                                        doc.clone(),
+                                    )
                                     .session(&mut *s)
                                     .await?;
-                                require_matched_update(result, "plugin config", id.as_str())?;
+                                if replace_result.matched_count == 0 {
+                                    // Phantom update: no config-change record
+                                    // (DB-M4).
+                                    return Ok(false);
+                                }
                                 this.record_config_change_in_session(
                                     &mut *s,
                                     namespace.as_str(),
@@ -3577,7 +4698,7 @@ mod inner {
                                     )
                                     .await?;
                                 }
-                                Ok(())
+                                Ok(true)
                             })
                         },
                     )
@@ -3585,13 +4706,22 @@ mod inner {
                     .map_err(|e| {
                         anyhow::anyhow!("update_plugin_config transaction failed: {}", e)
                     })?;
-                self.compact_config_changes_best_effort(&pc.namespace).await;
+                if matched {
+                    self.compact_config_changes_best_effort(&pc.namespace).await;
+                }
+                self.check_slow_query("update_plugin_config", start);
+                return Ok(matched);
             } else {
-                let result = self
+                let replace_result = self
                     .plugin_configs()
-                    .replace_one(doc! { "_id": &pc.id }, doc)
+                    .replace_one(doc! { "_id": &pc.id, "namespace": &pc.namespace }, doc)
                     .await?;
-                require_matched_update(result, "plugin config", &pc.id)?;
+                if replace_result.matched_count == 0 {
+                    // Phantom update (concurrent delete): no config-change
+                    // record (DB-M4).
+                    self.check_slow_query("update_plugin_config", start);
+                    return Ok(false);
+                }
                 let change_result: Result<(), anyhow::Error> = async {
                     self.record_config_change(&pc.namespace, "plugin_config", &pc.id, "upsert")
                         .await?;
@@ -3617,17 +4747,26 @@ mod inner {
                 }
             }
             self.check_slow_query("update_plugin_config", start);
-            Ok(())
+            Ok(true)
         }
 
-        async fn delete_plugin_config(&self, id: &str) -> Result<bool, anyhow::Error> {
+        async fn delete_plugin_config(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
-            let existing = self.plugin_configs().find_one(doc! { "_id": id }).await?;
-            let namespace = existing
-                .as_ref()
-                .and_then(|doc| doc.get_str("namespace").ok())
-                .map(str::to_string)
-                .unwrap_or_else(crate::config::types::default_namespace);
+            let existing = self
+                .plugin_configs()
+                .find_one(doc! { "_id": id, "namespace": namespace })
+                .await?;
+            if existing.is_none() {
+                // No document in this namespace — nothing to delete, and no
+                // proxy associations to pull.
+                self.check_slow_query("delete_plugin_config", start);
+                return Ok(false);
+            }
+            let namespace = namespace.to_string();
             let mut affected_proxy_ids = Vec::new();
             let mut affected_cursor = self
                 .proxies()
@@ -3668,7 +4807,10 @@ mod inner {
                                     .await?;
                                 let result = this
                                     .plugin_configs()
-                                    .delete_one(doc! { "_id": id.as_str() })
+                                    .delete_one(doc! {
+                                        "_id": id.as_str(),
+                                        "namespace": namespace.as_str(),
+                                    })
                                     .session(&mut *s)
                                     .await?;
                                 if result.deleted_count > 0 {
@@ -3713,7 +4855,10 @@ mod inner {
                         },
                     )
                     .await?;
-                let result = self.plugin_configs().delete_one(doc! { "_id": id }).await?;
+                let result = self
+                    .plugin_configs()
+                    .delete_one(doc! { "_id": id, "namespace": &namespace })
+                    .await?;
                 if result.deleted_count > 0 {
                     self.record_config_change(&namespace, "plugin_config", id, "delete")
                         .await?;
@@ -3728,9 +4873,16 @@ mod inner {
             Ok(deleted)
         }
 
-        async fn get_plugin_config(&self, id: &str) -> Result<Option<PluginConfig>, anyhow::Error> {
+        async fn get_plugin_config(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> Result<Option<PluginConfig>, anyhow::Error> {
             let start = std::time::Instant::now();
-            let result = self.plugin_configs().find_one(doc! { "_id": id }).await?;
+            let result = self
+                .plugin_configs()
+                .find_one(doc! { "_id": id, "namespace": namespace })
+                .await?;
             self.check_slow_query("get_plugin_config", start);
             match result {
                 Some(doc) => Ok(Some(doc_to_plugin_config(doc)?)),
@@ -3823,15 +4975,21 @@ mod inner {
             Ok(())
         }
 
-        async fn update_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
+        async fn update_upstream(&self, upstream: &Upstream) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
             // Preserve api_spec_id by carrying it into the replacement document.
             // Returning an error is safer than silently detaching spec ownership.
             let mut doc = upstream_to_doc(upstream)?;
             let existing_doc = self
                 .upstreams()
-                .find_one(doc! { "_id": &upstream.id })
+                .find_one(doc! { "_id": &upstream.id, "namespace": &upstream.namespace })
                 .await?;
+            if existing_doc.is_none() {
+                // No document in this namespace — phantom update, no
+                // config-change record (DB-M4).
+                self.check_slow_query("update_upstream", start);
+                return Ok(false);
+            }
             let existing_spec_id = match existing_doc.as_ref().and_then(|d| d.get("api_spec_id")) {
                 Some(Bson::String(s)) if !s.is_empty() => Some(s.clone()),
                 Some(Bson::Null) | None => None,
@@ -3849,18 +5007,28 @@ mod inner {
             if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
-                session
+                let matched = session
                     .start_transaction()
                     .and_run(
                         (self, doc, upstream.namespace.clone(), upstream.id.clone()),
                         |s, (this, doc, namespace, id)| {
                             Box::pin(async move {
-                                let result = this
+                                let replace_result = this
                                     .upstreams()
-                                    .replace_one(doc! { "_id": id.as_str() }, doc.clone())
+                                    .replace_one(
+                                        doc! {
+                                            "_id": id.as_str(),
+                                            "namespace": namespace.as_str(),
+                                        },
+                                        doc.clone(),
+                                    )
                                     .session(&mut *s)
                                     .await?;
-                                require_matched_update(result, "upstream", id.as_str())?;
+                                if replace_result.matched_count == 0 {
+                                    // Phantom update: no config-change record
+                                    // (DB-M4).
+                                    return Ok(false);
+                                }
                                 this.record_config_change_in_session(
                                     &mut *s,
                                     namespace.as_str(),
@@ -3869,20 +5037,32 @@ mod inner {
                                     "upsert",
                                 )
                                 .await?;
-                                Ok(())
+                                Ok(true)
                             })
                         },
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("update_upstream transaction failed: {}", e))?;
-                self.compact_config_changes_best_effort(&upstream.namespace)
-                    .await;
+                if matched {
+                    self.compact_config_changes_best_effort(&upstream.namespace)
+                        .await;
+                }
+                self.check_slow_query("update_upstream", start);
+                return Ok(matched);
             } else {
-                let result = self
+                let replace_result = self
                     .upstreams()
-                    .replace_one(doc! { "_id": &upstream.id }, doc)
+                    .replace_one(
+                        doc! { "_id": &upstream.id, "namespace": &upstream.namespace },
+                        doc,
+                    )
                     .await?;
-                require_matched_update(result, "upstream", &upstream.id)?;
+                if replace_result.matched_count == 0 {
+                    // Phantom update (concurrent delete): no config-change
+                    // record (DB-M4).
+                    self.check_slow_query("update_upstream", start);
+                    return Ok(false);
+                }
                 if let Err(err) = self
                     .record_config_change(&upstream.namespace, "upstream", &upstream.id, "upsert")
                     .await
@@ -3899,52 +5079,103 @@ mod inner {
                 }
             }
             self.check_slow_query("update_upstream", start);
-            Ok(())
+            Ok(true)
         }
 
-        async fn delete_upstream(&self, id: &str) -> Result<bool, anyhow::Error> {
+        async fn delete_upstream(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
-            let proxy_refs = self
-                .proxies()
-                .count_documents(doc! { "upstream_id": id })
-                .await?;
-            if proxy_refs > 0 {
-                anyhow::bail!(
-                    "Upstream {} is referenced by one or more proxies and cannot be deleted",
-                    id
-                );
-            }
-            if let Some(plugin) = self
-                .find_mesh_route_dispatch_upstream_ref_opt_session(None, id)
-                .await?
-            {
-                anyhow::bail!(
-                    "Upstream {} is referenced by mesh_route_dispatch plugin_config '{}' and cannot be deleted",
-                    id,
-                    plugin.id
-                );
-            }
-            let existing = self.upstreams().find_one(doc! { "_id": id }).await?;
-            let namespace = existing
-                .as_ref()
-                .and_then(|doc| doc.get_str("namespace").ok())
-                .map(str::to_string)
-                .unwrap_or_else(crate::config::types::default_namespace);
             let deleted = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
                 let deleted = session
                     .start_transaction()
                     .and_run(
-                        (self, id.to_string(), namespace.clone()),
+                        (self, id.to_string(), namespace.to_string()),
                         |s, (this, id, namespace)| {
                             Box::pin(async move {
+                                // Avoid creating a guard for a missing target.
+                                // This read is inside the transaction so the
+                                // following guard write still serializes with
+                                // concurrent proxy admissions/deletes.
+                                if this
+                                    .upstreams()
+                                    .find_one(doc! {
+                                        "_id": id.as_str(),
+                                        "namespace": namespace.as_str(),
+                                    })
+                                    .projection(doc! { "_id": 1 })
+                                    .session(&mut *s)
+                                    .await?
+                                    .is_none()
+                                {
+                                    return Ok(false);
+                                }
+                                // Write the same guard doc that proxy
+                                // create/update transactions write when they
+                                // reference this upstream, so a concurrent
+                                // create-referencing transaction and this
+                                // delete write-conflict and serialize (DB-H4).
+                                // The upstream document itself is never
+                                // modified — an unknown field would break
+                                // deserialization elsewhere.
+                                this.upstream_ref_guards()
+                                    .update_one(
+                                        doc! { "_id": format!("{}:{}", namespace, id) },
+                                        doc! {
+                                            "$set": {
+                                                "nonce": Uuid::new_v4().to_string(),
+                                                "updated_at": Utc::now().to_rfc3339(),
+                                            }
+                                        },
+                                    )
+                                    .upsert(true)
+                                    .session(&mut *s)
+                                    .await?;
+                                // Reference checks run INSIDE the transaction
+                                // so they cannot race a concurrent
+                                // create-referencing transaction.
+                                let proxy_refs = this
+                                    .proxies()
+                                    .count_documents(doc! { "upstream_id": id.as_str() })
+                                    .session(&mut *s)
+                                    .await?;
+                                if proxy_refs > 0 {
+                                    return Err(mongodb::error::Error::custom(format!(
+                                        "Upstream {} is referenced by one or more proxies and cannot be deleted",
+                                        id
+                                    )));
+                                }
+                                if let Some(plugin) = this
+                                    .find_mesh_route_dispatch_upstream_ref_opt_session(
+                                        Some(&mut *s),
+                                        id.as_str(),
+                                    )
+                                    .await
+                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?
+                                {
+                                    return Err(mongodb::error::Error::custom(format!(
+                                        "Upstream {} is referenced by mesh_route_dispatch plugin_config '{}' and cannot be deleted",
+                                        id, plugin.id
+                                    )));
+                                }
                                 let result = this
                                     .upstreams()
-                                    .delete_one(doc! { "_id": id.as_str() })
+                                    .delete_one(doc! {
+                                        "_id": id.as_str(),
+                                        "namespace": namespace.as_str(),
+                                    })
                                     .session(&mut *s)
                                     .await?;
                                 if result.deleted_count > 0 {
+                                    // The upstream is gone — drop its guard
+                                    // doc so the collection doesn't accrete
+                                    // entries for deleted upstreams.
+                                    this.upstream_ref_guards()
+                                        .delete_one(
+                                            doc! { "_id": format!("{}:{}", namespace, id) },
+                                        )
+                                        .session(&mut *s)
+                                        .await?;
                                     this.record_config_change_in_session(
                                         &mut *s,
                                         namespace.as_str(),
@@ -3961,24 +5192,96 @@ mod inner {
                     .await
                     .map_err(|e| anyhow::anyhow!("delete_upstream transaction failed: {}", e))?;
                 if deleted {
-                    self.compact_config_changes_best_effort(&namespace).await;
+                    self.compact_config_changes_best_effort(namespace).await;
                 }
                 deleted
             } else {
-                let result = self.upstreams().delete_one(doc! { "_id": id }).await?;
-                if result.deleted_count > 0 {
-                    self.record_config_change(&namespace, "upstream", id, "delete")
-                        .await?;
+                // Standalone pre-checks (best-effort, no transaction).
+                // Verify the target in the requested namespace before scanning
+                // references so a wrong-namespace delete remains a 404 and
+                // does not disclose another namespace's relationships.
+                // Capture the document now so a post-delete re-check can
+                // restore it.
+                let existing = self
+                    .upstreams()
+                    .find_one(doc! { "_id": id, "namespace": namespace })
+                    .await?;
+                let Some(existing) = existing else {
+                    self.check_slow_query("delete_upstream", start);
+                    return Ok(false);
+                };
+                let proxy_refs = self
+                    .proxies()
+                    .count_documents(doc! { "upstream_id": id })
+                    .await?;
+                if proxy_refs > 0 {
+                    anyhow::bail!(
+                        "Upstream {} is referenced by one or more proxies and cannot be deleted",
+                        id
+                    );
                 }
-                result.deleted_count > 0
+                if let Some(plugin) = self
+                    .find_mesh_route_dispatch_upstream_ref_opt_session(None, id)
+                    .await?
+                {
+                    anyhow::bail!(
+                        "Upstream {} is referenced by mesh_route_dispatch plugin_config '{}' and cannot be deleted",
+                        id,
+                        plugin.id
+                    );
+                }
+                let result = self
+                    .upstreams()
+                    .delete_one(doc! { "_id": id, "namespace": namespace })
+                    .await?;
+                if result.deleted_count == 0 {
+                    self.check_slow_query("delete_upstream", start);
+                    return Ok(false);
+                }
+                // Post-delete re-check: a proxy referencing this upstream may
+                // have been created between the pre-check and the delete. If
+                // one appeared, re-insert the captured document and bail.
+                // Together with create_proxy's post-insert existence
+                // re-check, these two post-write reconciliations converge for
+                // every interleaving of a concurrent create+delete pair:
+                // whichever write lands second observes the other and
+                // self-reverts. Full serialization requires
+                // FERRUM_MONGO_REPLICA_SET.
+                let proxy_refs_after = self
+                    .proxies()
+                    .count_documents(doc! { "upstream_id": id })
+                    .await?;
+                if proxy_refs_after > 0 {
+                    if let Err(err) = self.upstreams().insert_one(existing).await {
+                        warn!(
+                            "MongoDB standalone delete_upstream re-insert after late proxy \
+                             reference failed for '{}': {}",
+                            id, err
+                        );
+                    }
+                    anyhow::bail!(
+                        "Upstream {} is referenced by one or more proxies and cannot be deleted",
+                        id
+                    );
+                }
+                self.record_config_change(namespace, "upstream", id, "delete")
+                    .await?;
+                true
             };
             self.check_slow_query("delete_upstream", start);
             Ok(deleted)
         }
 
-        async fn get_upstream(&self, id: &str) -> Result<Option<Upstream>, anyhow::Error> {
+        async fn get_upstream(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> Result<Option<Upstream>, anyhow::Error> {
             let start = std::time::Instant::now();
-            let result = self.upstreams().find_one(doc! { "_id": id }).await?;
+            let result = self
+                .upstreams()
+                .find_one(doc! { "_id": id, "namespace": namespace })
+                .await?;
             self.check_slow_query("get_upstream", start);
             match result {
                 Some(doc) => Ok(Some(doc_to_upstream(doc)?)),
@@ -3986,63 +5289,63 @@ mod inner {
             }
         }
 
-        async fn cleanup_orphaned_upstream(&self, upstream_id: &str) -> Result<(), anyhow::Error> {
+        async fn cleanup_orphaned_upstream(
+            &self,
+            namespace: &str,
+            upstream_id: &str,
+        ) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
             let deleted_namespace = if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
                 session
                     .start_transaction()
-                    .and_run((self, upstream_id.to_string()), |s, (this, upstream_id)| {
-                        Box::pin(async move {
-                            let count = this
-                                .proxies()
-                                .count_documents(doc! { "upstream_id": upstream_id.as_str() })
-                                .session(&mut *s)
-                                .await?;
-                            let mut deleted_namespace = None;
-                            if count == 0 {
-                                let dispatch_ref = this
-                                    .find_mesh_route_dispatch_upstream_ref_opt_session(
-                                        Some(&mut *s),
-                                        upstream_id,
-                                    )
-                                    .await
-                                    .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
-                                if dispatch_ref.is_none() {
-                                    let upstream_namespace = this
-                                        .upstreams()
-                                        .find_one(doc! { "_id": upstream_id.as_str() })
-                                        .projection(doc! { "namespace": 1 })
-                                        .session(&mut *s)
-                                        .await?
-                                        .and_then(|doc| {
-                                            doc.get_str("namespace").map(str::to_string).ok()
-                                        });
-                                    let result = this
-                                        .upstreams()
-                                        .delete_one(doc! { "_id": upstream_id.as_str() })
-                                        .session(&mut *s)
-                                        .await?;
-                                    if result.deleted_count > 0 {
-                                        let namespace = upstream_namespace.unwrap_or_else(
-                                            crate::config::types::default_namespace,
-                                        );
-                                        this.record_config_change_in_session(
-                                            &mut *s,
-                                            namespace.as_str(),
-                                            "upstream",
-                                            upstream_id.as_str(),
-                                            "delete",
+                    .and_run(
+                        (self, namespace.to_string(), upstream_id.to_string()),
+                        |s, (this, namespace, upstream_id)| {
+                            Box::pin(async move {
+                                let count = this
+                                    .proxies()
+                                    .count_documents(doc! { "upstream_id": upstream_id.as_str() })
+                                    .session(&mut *s)
+                                    .await?;
+                                let mut deleted_namespace = None;
+                                if count == 0 {
+                                    let dispatch_ref = this
+                                        .find_mesh_route_dispatch_upstream_ref_opt_session(
+                                            Some(&mut *s),
+                                            upstream_id,
                                         )
-                                        .await?;
-                                        deleted_namespace = Some(namespace);
+                                        .await
+                                        .map_err(|e| {
+                                            mongodb::error::Error::custom(e.to_string())
+                                        })?;
+                                    if dispatch_ref.is_none() {
+                                        let result = this
+                                            .upstreams()
+                                            .delete_one(doc! {
+                                                "_id": upstream_id.as_str(),
+                                                "namespace": namespace.as_str(),
+                                            })
+                                            .session(&mut *s)
+                                            .await?;
+                                        if result.deleted_count > 0 {
+                                            this.record_config_change_in_session(
+                                                &mut *s,
+                                                namespace.as_str(),
+                                                "upstream",
+                                                upstream_id.as_str(),
+                                                "delete",
+                                            )
+                                            .await?;
+                                            deleted_namespace = Some(namespace.clone());
+                                        }
                                     }
                                 }
-                            }
-                            Ok(deleted_namespace)
-                        })
-                    })
+                                Ok(deleted_namespace)
+                            })
+                        },
+                    )
                     .await
                     .map_err(|e| {
                         anyhow::anyhow!("cleanup_orphaned_upstream transaction failed: {}", e)
@@ -4052,15 +5355,6 @@ mod inner {
                     .proxies()
                     .count_documents(doc! { "upstream_id": upstream_id })
                     .await?;
-                let upstream_namespace = if count == 0 {
-                    self.upstreams()
-                        .find_one(doc! { "_id": upstream_id })
-                        .projection(doc! { "namespace": 1 })
-                        .await?
-                        .and_then(|doc| doc.get_str("namespace").map(str::to_string).ok())
-                } else {
-                    None
-                };
                 let dispatch_ref = if count == 0 {
                     self.find_mesh_route_dispatch_upstream_ref_opt_session(None, upstream_id)
                         .await?
@@ -4070,14 +5364,12 @@ mod inner {
                 if count == 0 && dispatch_ref.is_none() {
                     let result = self
                         .upstreams()
-                        .delete_one(doc! { "_id": upstream_id })
+                        .delete_one(doc! { "_id": upstream_id, "namespace": namespace })
                         .await?;
                     if result.deleted_count > 0 {
-                        let namespace = upstream_namespace
-                            .unwrap_or_else(crate::config::types::default_namespace);
-                        self.record_config_change(&namespace, "upstream", upstream_id, "delete")
+                        self.record_config_change(namespace, "upstream", upstream_id, "delete")
                             .await?;
-                        Some(namespace)
+                        Some(namespace.to_string())
                     } else {
                         None
                     }
@@ -4242,21 +5534,24 @@ mod inner {
             if let Some(custom_id) = custom_id {
                 candidates.push(Bson::String(custom_id.to_string()));
             }
+            // Consumer `_id` is the composite "{namespace}:{id}", so identity
+            // matching (and self-exclusion) must run against the plain `id`
+            // field that serde keeps in the document.
             let mut filter = doc! {
                 "namespace": namespace,
                 "$or": [
-                    { "_id": { "$in": candidates.clone() } },
+                    { "id": { "$in": candidates.clone() } },
                     { "username": { "$in": candidates.clone() } },
                     { "custom_id": { "$in": candidates } },
                 ],
             };
             if let Some(id) = exclude_consumer_id {
-                filter.insert("_id", doc! { "$ne": id });
+                filter.insert("id", doc! { "$ne": id });
             }
             let result = self.consumers().find_one(filter).await?;
             match result {
                 Some(doc) => {
-                    let conflict_id = doc.get_str("_id").unwrap_or("unknown").to_string();
+                    let conflict_id = doc.get_str("id").unwrap_or("unknown").to_string();
                     Ok(Some(conflict_id))
                 }
                 None => Ok(None),
@@ -4274,7 +5569,9 @@ mod inner {
                 "credentials.keyauth": { "$elemMatch": { "key": key } }
             };
             if let Some(id) = exclude_consumer_id {
-                filter.insert("_id", doc! { "$ne": id });
+                // Consumer `_id` is composite ("{namespace}:{id}") — exclude
+                // by the plain `id` field.
+                filter.insert("id", doc! { "$ne": id });
             }
             let count = self.consumers().count_documents(filter).await?;
             Ok(count == 0)
@@ -4291,7 +5588,9 @@ mod inner {
                 "credentials.mtls_auth": { "$elemMatch": { "identity": identity } }
             };
             if let Some(id) = exclude_consumer_id {
-                filter.insert("_id", doc! { "$ne": id });
+                // Consumer `_id` is composite ("{namespace}:{id}") — exclude
+                // by the plain `id` field.
+                filter.insert("id", doc! { "$ne": id });
             }
             let count = self.consumers().count_documents(filter).await?;
             Ok(count == 0)
@@ -4466,6 +5765,19 @@ mod inner {
                 .iter()
                 .map(consumer_to_doc)
                 .collect::<Result<_, _>>()?;
+            // Identity reservations for the whole batch. Two batch members
+            // colliding with each other also collide here (duplicate `_id` on
+            // the ordered insert).
+            let identity_docs: Vec<Document> = consumers
+                .iter()
+                .flat_map(|consumer| {
+                    consumer_identity_index_docs(
+                        &consumer.namespace,
+                        &consumer.id,
+                        &consumer_identity_values(consumer),
+                    )
+                })
+                .collect();
             if self.replica_set_configured() {
                 let connection = self.connection();
                 let mut session = connection.client.start_session().await?;
@@ -4475,27 +5787,38 @@ mod inner {
                     .collect();
                 let count = session
                     .start_transaction()
-                    .and_run((self, docs, changes), |s, (this, docs, changes)| {
-                        Box::pin(async move {
-                            let result = this
-                                .consumers()
-                                .insert_many(docs.clone())
-                                .ordered(false)
-                                .session(&mut *s)
-                                .await?;
-                            for (namespace, id) in changes.iter() {
-                                this.record_config_change_in_session(
-                                    &mut *s,
-                                    namespace.as_str(),
-                                    "consumer",
-                                    id.as_str(),
-                                    "upsert",
-                                )
-                                .await?;
-                            }
-                            Ok(result.inserted_ids.len())
-                        })
-                    })
+                    .and_run(
+                        (self, docs, changes, identity_docs),
+                        |s, (this, docs, changes, identity_docs)| {
+                            Box::pin(async move {
+                                // Reserve the merged identity keyspace first — a
+                                // duplicate key aborts the whole transaction.
+                                if !identity_docs.is_empty() {
+                                    this.consumer_identity_index()
+                                        .insert_many(identity_docs.clone())
+                                        .session(&mut *s)
+                                        .await?;
+                                }
+                                let result = this
+                                    .consumers()
+                                    .insert_many(docs.clone())
+                                    .ordered(false)
+                                    .session(&mut *s)
+                                    .await?;
+                                for (namespace, id) in changes.iter() {
+                                    this.record_config_change_in_session(
+                                        &mut *s,
+                                        namespace.as_str(),
+                                        "consumer",
+                                        id.as_str(),
+                                        "upsert",
+                                    )
+                                    .await?;
+                                }
+                                Ok(result.inserted_ids.len())
+                            })
+                        },
+                    )
                     .await
                     .map_err(|e| {
                         anyhow::anyhow!("batch_create_consumers transaction failed: {}", e)
@@ -4509,21 +5832,52 @@ mod inner {
                 }
                 Ok(count)
             } else {
-                let ids: Vec<&str> = consumers
+                // Standalone RESERVE FIRST: insert identity reservations for
+                // the whole batch (ordered) before any consumer document. On
+                // failure, best-effort delete exactly the documents this call
+                // inserted (the prefix before the failed index) — releasing
+                // the full set could remove reservations a pre-existing
+                // consumer with the same id legitimately owns.
+                if let Err(err) = self
+                    .consumer_identity_index()
+                    .insert_many(identity_docs.clone())
+                    .await
+                {
+                    if let Some(inserted) = Self::ordered_insert_inserted_prefix_len(&err) {
+                        self.release_consumer_identity_docs_best_effort(&identity_docs[..inserted])
+                            .await;
+                    } else {
+                        warn!(
+                            "Retaining MongoDB batch consumer identity reservations because the \
+                             failed ordered insert did not report a verifiable write-error index"
+                        );
+                    }
+                    return Err(err.into());
+                }
+                // Composite `_id`s ("{namespace}:{id}") for document-level
+                // rollback; change-log records keep the plain resource ids.
+                let doc_ids: Vec<String> = consumers
                     .iter()
-                    .map(|consumer| consumer.id.as_str())
+                    .map(|consumer| consumer_doc_id(&consumer.namespace, &consumer.id))
                     .collect();
+                let ids: Vec<&str> = doc_ids.iter().map(String::as_str).collect();
                 let result = match self.consumers().insert_many(docs).ordered(false).await {
                     Ok(result) => result,
                     Err(err) => {
                         let rollback_ids =
                             Self::rollback_ids_for_unordered_insert_error(&ids, &err);
                         let err = anyhow::Error::new(err);
-                        self.rollback_standalone_created_documents(
-                            "consumers",
-                            "consumer",
-                            &rollback_ids,
-                            &err,
+                        let confirmed_absent = self
+                            .rollback_standalone_created_documents(
+                                "consumers",
+                                "consumer",
+                                &rollback_ids,
+                                &err,
+                            )
+                            .await;
+                        self.release_confirmed_batch_consumer_identity_docs_best_effort(
+                            consumers,
+                            &confirmed_absent,
                         )
                         .await;
                         return Err(err);
@@ -4539,8 +5893,14 @@ mod inner {
                     })
                     .collect();
                 if let Err(err) = self.record_config_changes_batch(&changes).await {
-                    self.rollback_standalone_created_documents("consumers", "consumer", &ids, &err)
+                    let confirmed_absent = self
+                        .rollback_standalone_created_documents("consumers", "consumer", &ids, &err)
                         .await;
+                    self.release_confirmed_batch_consumer_identity_docs_best_effort(
+                        consumers,
+                        &confirmed_absent,
+                    )
+                    .await;
                     return Err(err);
                 }
                 Ok(result.inserted_ids.len())
@@ -4769,10 +6129,13 @@ mod inner {
                                     )
                                     .await
                                     .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
+                                // Consumers project the plain `id` field —
+                                // their `_id` is the composite
+                                // "{namespace}:{id}" and change-log records
+                                // carry plain resource ids.
                                 let consumer_ids = this
-                                    .load_collection_ids_filtered_in_session(
+                                    .load_consumer_plain_ids_filtered_in_session(
                                         &mut *s,
-                                        "consumers",
                                         ns_filter.clone(),
                                     )
                                     .await
@@ -4802,6 +6165,12 @@ mod inner {
                                     .session(&mut *s)
                                     .await?;
                                 this.consumers()
+                                    .delete_many(ns_filter.clone())
+                                    .session(&mut *s)
+                                    .await?;
+                                // Namespace wipe releases every consumer
+                                // identity reservation in the namespace.
+                                this.consumer_identity_index()
                                     .delete_many(ns_filter.clone())
                                     .session(&mut *s)
                                     .await?;
@@ -4873,8 +6242,10 @@ mod inner {
                     .load_collection_ids_filtered("proxies", ns_filter.clone())
                     .await
                     .map_err(&delete_error)?;
+                // Plain `id` field — consumer `_id` is the composite
+                // "{namespace}:{id}" and change-log records carry plain ids.
                 let consumer_ids = self
-                    .load_collection_ids_filtered("consumers", ns_filter.clone())
+                    .load_consumer_plain_ids_filtered(ns_filter.clone())
                     .await
                     .map_err(&delete_error)?;
                 let plugin_config_ids = self
@@ -4894,6 +6265,12 @@ mod inner {
                     .await
                     .map_err(|error| delete_error(error.into()))?;
                 self.consumers()
+                    .delete_many(ns_filter.clone())
+                    .await
+                    .map_err(|error| delete_error(error.into()))?;
+                // Namespace wipe releases every consumer identity reservation
+                // in the namespace.
+                self.consumer_identity_index()
                     .delete_many(ns_filter.clone())
                     .await
                     .map_err(|error| delete_error(error.into()))?;
@@ -5097,7 +6474,13 @@ mod inner {
                 )
                 .await?;
 
-            // consumers indexes — uniqueness scoped to namespace
+            // consumers indexes — uniqueness scoped to namespace.
+            //
+            // NOTE: the consumers collection's `_id` is the composite
+            // "{namespace}:{id}" (see `consumer_doc_id`), so consumer *id*
+            // uniqueness is per-namespace via `_id` itself — no extra index
+            // needed. The username/custom_id unique indexes below stay as
+            // secondary guards for their individual fields.
             self.consumers()
                 .create_index(
                     IndexModel::builder()
@@ -5170,6 +6553,31 @@ mod inner {
                         .build(),
                 )
                 .await?;
+
+            // consumer_identity_index — merged identity keyspace
+            // (id ∪ username ∪ custom_id) per namespace. Documents are keyed
+            // by `_id = "{namespace}:{identity_value}"`, so uniqueness needs
+            // no extra index; the non-unique {namespace} index supports
+            // namespace wipes (`delete_all_resources`) and per-consumer
+            // cleanup filters.
+            self.consumer_identity_index()
+                .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
+                .await?;
+
+            // proxy_route_locks and upstream_ref_guards are keyed purely by
+            // `_id` ("{namespace}:{route_key_hash}" /
+            // "{namespace}:{upstream_id}") and need no indexes — but they are
+            // written from INSIDE transactions, and MongoDB < 4.4 cannot
+            // implicitly create a collection in a multi-document transaction,
+            // so create them explicitly here. NamespaceExists (code 48) is
+            // tolerated for idempotent multi-instance startup.
+            for lock_collection in ["proxy_route_locks", "upstream_ref_guards"] {
+                match self.db().create_collection(lock_collection).await {
+                    Ok(()) => {}
+                    Err(e) if is_namespace_exists(&e) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
 
             // plugin_configs indexes
             self.plugin_configs()
@@ -6914,7 +8322,11 @@ mod inner {
             if let Some((connection, s)) = session {
                 let consumers_collection: Collection<Document> =
                     connection.db.collection("consumers");
-                let mut cursor = consumers_collection.find(filter).session(&mut *s).await?;
+                let mut cursor = consumers_collection
+                    .find(filter)
+                    .sort(doc! { "id": 1 })
+                    .session(&mut *s)
+                    .await?;
                 while cursor.advance(&mut *s).await? {
                     let doc = cursor.deserialize_current().map_err(|error| {
                         map_snapshot_document_error(snapshot, "consumer", None, error)
@@ -6928,7 +8340,10 @@ mod inner {
                 }
             } else {
                 let consumers_collection = self.consumers();
-                let mut cursor = consumers_collection.find(filter).await?;
+                let mut cursor = consumers_collection
+                    .find(filter)
+                    .sort(doc! { "id": 1 })
+                    .await?;
                 while cursor.advance().await? {
                     let doc = cursor.deserialize_current().map_err(|error| {
                         map_snapshot_document_error(snapshot, "consumer", None, error)
@@ -7720,7 +9135,12 @@ mod inner {
             };
 
             let doc = consumer_to_doc(&consumer).expect("consumer_to_doc should succeed");
-            assert_eq!(doc.get_str("_id").unwrap(), "consumer-1");
+            // Consumer `_id` is the composite "{namespace}:{id}" so consumer
+            // ids are unique per namespace (issue #2121).
+            assert_eq!(
+                doc.get_str("_id").unwrap(),
+                format!("{}:consumer-1", crate::config::types::default_namespace())
+            );
 
             let restored = doc_to_consumer(doc).expect("doc_to_consumer should succeed");
             assert_eq!(restored.id, consumer.id);
@@ -8533,6 +9953,46 @@ mod inner {
             );
         }
 
+        #[test]
+        fn standalone_route_update_yields_to_any_conflicting_owner() {
+            let candidates = vec![
+                RouteBucketCandidate {
+                    id: "existing-update".to_string(),
+                    hosts: vec!["example.com".to_string()],
+                    created_at: "2025-01-01T00:00:00Z".to_string(),
+                },
+                RouteBucketCandidate {
+                    id: "concurrent-create".to_string(),
+                    hosts: vec!["example.com".to_string()],
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                },
+            ];
+
+            assert!(MongoStore::standalone_route_update_has_conflict(
+                "existing-update",
+                &["example.com".to_string()],
+                &candidates,
+            ));
+            assert!(
+                !MongoStore::standalone_route_writer_should_yield(
+                    "existing-update",
+                    &["example.com".to_string()],
+                    &candidates,
+                ),
+                "the update regression must not reuse create-vs-create created_at ordering",
+            );
+        }
+
+        #[test]
+        fn unknown_ordered_identity_insert_state_has_no_cleanup_prefix() {
+            let error = mongodb::error::Error::custom("unknown insert state");
+            assert_eq!(
+                MongoStore::ordered_insert_inserted_prefix_len(&error),
+                None,
+                "non-InsertMany failures must retain reservations whose ownership is unknown",
+            );
+        }
+
         // -------------------------------------------------------------------
         // delete_proxy / update_proxy / api-spec step-order regression guards
         // -------------------------------------------------------------------
@@ -8568,7 +10028,7 @@ mod inner {
                 .expect("standalone delete_proxy marker");
             let standalone_path = &source[standalone_start..];
             let proxy_delete = standalone_path
-                .find("let result = self.proxies().delete_one")
+                .find(".delete_one(doc! { \"_id\": id, \"namespace\": namespace })")
                 .expect("standalone proxy delete call");
             let plugin_cleanup = standalone_path
                 .find("self.plugin_configs()")
@@ -8805,7 +10265,7 @@ mod inner {
         fn delete_proxy_guards_external_spec_upstream_refs_before_spec_upstream_delete() {
             let source = include_str!("mongo_store.rs");
             let delete_proxy_start = source
-                .find("async fn delete_proxy(&self, id: &str)")
+                .find("async fn delete_proxy(&self, namespace: &str, id: &str)")
                 .expect("delete_proxy function");
             let delete_proxy_body = &source[delete_proxy_start..];
             let non_replica_start = delete_proxy_body
@@ -8822,6 +10282,34 @@ mod inner {
                 guard < upstream_delete,
                 "delete_proxy must guard external references before deleting \
                  upstreams tagged with the spec id"
+            );
+        }
+
+        #[test]
+        fn delete_upstream_standalone_checks_namespaced_target_before_references() {
+            let source = include_str!("mongo_store.rs");
+            let delete_start = source
+                .find("async fn delete_upstream(&self, namespace: &str, id: &str)")
+                .expect("delete_upstream function");
+            let delete_body = &source[delete_start..];
+            let standalone_start = delete_body
+                .find("// Standalone pre-checks (best-effort, no transaction).")
+                .expect("delete_upstream standalone marker");
+            let standalone_path = &delete_body[standalone_start..];
+            let target_lookup = standalone_path
+                .find(".find_one(doc! { \"_id\": id, \"namespace\": namespace })")
+                .expect("namespace-scoped upstream existence lookup");
+            let proxy_refs = standalone_path
+                .find(".count_documents(doc! { \"upstream_id\": id })")
+                .expect("proxy reference check");
+            let plugin_refs = standalone_path
+                .find(".find_mesh_route_dispatch_upstream_ref_opt_session(None, id)")
+                .expect("plugin reference check");
+
+            assert!(
+                target_lookup < proxy_refs && target_lookup < plugin_refs,
+                "standalone delete_upstream must establish target existence in the requested \
+                 namespace before scanning references"
             );
         }
 

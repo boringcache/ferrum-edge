@@ -35,6 +35,8 @@ paths:
 - `Proxy`, `Upstream`, and `PluginConfig` carry optional `api_spec_id` ownership tags. Do not strip or repurpose them.
 - `FERRUM_NAMESPACE` controls what a gateway loads. DB queries filter by namespace. File mode filters after deserialize. Admin API uses `X-Ferrum-Namespace`.
 - Uniqueness is per namespace for listen path, proxy name, consumer identity, upstream name, and listen port. Same listen port across namespaces is allowed at config level; OS bind catches real conflicts.
+- Consumer ids are per-namespace (SQL PK `(namespace, id)`; Mongo consumer `_id` is `"{namespace}:{id}"`). Consumer id, username, and custom_id share ONE identity keyspace per namespace, enforced in persistence by the `consumer_identity_index` table/collection written transactionally with every consumer write (cross-field collisions are 409s; self-collisions within one consumer are allowed). Full config loads quarantine pre-existing colliding consumers fail-closed via `GatewayConfig::quarantine_colliding_consumer_identities()` — do not revert to warn-and-overwrite.
+- ID-only `DatabaseBackend` reads/deletes/updates are namespace-predicated at the query level (`get_/delete_/update_*` carry the namespace in the WHERE clause / filter document); update methods return `Ok(false)` on zero matched rows and must not emit a config-change record for phantom updates.
 - Hostname normalization is ASCII-lowercase at admission through `normalize_fields()` for `Proxy.hosts`, `Proxy.backend_host`, and `UpstreamTarget.host`.
 - Apply normalization at admin API, loaders, DP gRPC, and restore entrypoints. Do not re-lowercase in DNS, pool, health, or LB keys.
 

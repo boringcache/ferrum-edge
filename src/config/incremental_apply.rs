@@ -28,10 +28,10 @@ fn apply_incremental_resources(config: &mut GatewayConfig, result: IncrementalRe
         .iter()
         .map(String::as_str)
         .collect();
-    let removed_consumers: HashSet<&str> = result
+    let removed_consumers: HashSet<(&str, &str)> = result
         .removed_consumer_ids
         .iter()
-        .map(String::as_str)
+        .map(|key| (key.namespace.as_str(), key.id.as_str()))
         .collect();
     let removed_plugins: HashSet<&str> = result
         .removed_plugin_config_ids
@@ -47,9 +47,9 @@ fn apply_incremental_resources(config: &mut GatewayConfig, result: IncrementalRe
     config
         .proxies
         .retain(|proxy| !removed_proxies.contains(proxy.id.as_str()));
-    config
-        .consumers
-        .retain(|consumer| !removed_consumers.contains(consumer.id.as_str()));
+    config.consumers.retain(|consumer| {
+        !removed_consumers.contains(&(consumer.namespace.as_str(), consumer.id.as_str()))
+    });
     config
         .plugin_configs
         .retain(|plugin| !removed_plugins.contains(plugin.id.as_str()));
@@ -62,11 +62,7 @@ fn apply_incremental_resources(config: &mut GatewayConfig, result: IncrementalRe
         result.added_or_modified_proxies,
         |proxy| proxy.id.as_str(),
     );
-    upsert_by_id(
-        &mut config.consumers,
-        result.added_or_modified_consumers,
-        |consumer| consumer.id.as_str(),
-    );
+    upsert_consumers_by_namespace_and_id(&mut config.consumers, result.added_or_modified_consumers);
     upsert_by_id(
         &mut config.plugin_configs,
         result.added_or_modified_plugin_configs,
@@ -77,6 +73,28 @@ fn apply_incremental_resources(config: &mut GatewayConfig, result: IncrementalRe
         result.added_or_modified_upstreams,
         |upstream| upstream.id.as_str(),
     );
+}
+
+fn upsert_consumers_by_namespace_and_id(
+    existing: &mut Vec<crate::config::types::Consumer>,
+    updates: Vec<crate::config::types::Consumer>,
+) {
+    let mut index: HashMap<(String, String), usize> = existing
+        .iter()
+        .enumerate()
+        .map(|(i, consumer)| ((consumer.namespace.clone(), consumer.id.clone()), i))
+        .collect();
+
+    for consumer in updates {
+        let key = (consumer.namespace.clone(), consumer.id.clone());
+        if let Some(&pos) = index.get(&key) {
+            existing[pos] = consumer;
+        } else {
+            let pos = existing.len();
+            existing.push(consumer);
+            index.insert(key, pos);
+        }
+    }
 }
 
 /// Upsert items into a vec by ID: replace existing entries, append new ones.
