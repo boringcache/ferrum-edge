@@ -82,7 +82,7 @@ These `FERRUM_DB_*` settings apply to both SQL and MongoDB backends:
 | `FERRUM_DB_TYPE` | Set to `mongodb` |
 | `FERRUM_DB_URL` | MongoDB connection string (`mongodb://` or `mongodb+srv://`) |
 | `FERRUM_DB_POLL_INTERVAL` | Polling interval in seconds (same as SQL) |
-| `FERRUM_DB_CONFIG_BACKUP_PATH` | On-disk JSON backup for startup failover (same as SQL) |
+| `FERRUM_DB_CONFIG_BACKUP_PATH` | On-disk JSON backup served if the initial config load fails transiently after connect. Unlike SQL backends, MongoDB has no lazy-pool connect-time bootstrap: if every configured Mongo URL is unreachable at startup the process exits rather than serving the backup |
 | `FERRUM_DB_FAILOVER_URLS` | Comma-separated fallback MongoDB URLs (same pattern as SQL, but see [Failover](#failover) below) |
 | `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | Slow query warning threshold (same as SQL) |
 | `FERRUM_DB_TLS_MODE` | MongoDB TLS policy: `disable`, `require`, or `verify-full` (see [TLS](#tls)) |

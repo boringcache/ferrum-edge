@@ -4016,11 +4016,22 @@ impl EnvConfig {
 
     /// Returns the read replica URL with database TLS query parameters appended,
     /// using the same logic as `effective_db_url()`.
+    ///
+    /// `FERRUM_DB_READ_REPLICA_URL` is a SQL-only feature: the MongoDB config
+    /// store always reads from the primary and never opens a replica pool, so
+    /// the value is ignored for `mongodb` backends. Returning `None` here keeps
+    /// it consistent with that runtime behavior and, critically, prevents the
+    /// shared `append_db_tls_params_to_url()` MongoDB URI-TLS-conflict check
+    /// from failing startup over a stale/unused replica URI (e.g. one carrying
+    /// `?tls=true`) that would never actually be used.
     pub fn effective_db_read_replica_url(&self) -> Result<Option<String>, String> {
+        let db_type = self.db_type.as_deref().unwrap_or("");
+        if db_type == "mongodb" {
+            return Ok(None);
+        }
         let Some(base_url) = self.db_read_replica_url.as_ref() else {
             return Ok(None);
         };
-        let db_type = self.db_type.as_deref().unwrap_or("");
         self.append_db_tls_params_to_url(base_url, db_type)
             .map(Some)
     }
