@@ -1,7 +1,6 @@
 pub(crate) mod sql_dialect;
 pub mod v001_initial_schema;
 
-use anyhow::Context;
 use chrono::Utc;
 use sqlx::any::AnyRow;
 use sqlx::pool::PoolConnection;
