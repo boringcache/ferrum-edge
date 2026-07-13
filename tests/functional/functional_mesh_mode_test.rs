@@ -3673,6 +3673,92 @@ fn mint_cross_cluster_svid_under(
     }
 }
 
+/// Poll the complete destination path until the east-west listener accepts an
+/// SNI-routed mTLS connection and the destination presents its expected SVID.
+/// A bare TCP connect only proves that the passthrough listener has bound; this
+/// probe also proves that its destination route is live and that the downstream
+/// mesh listener has installed its server SVID before a test request is driven.
+async fn wait_for_cross_cluster_destination_ready(
+    east_west_port: u16,
+    service_sni: &str,
+    expected_destination_spiffe: &str,
+    readiness_client_spiffe: &str,
+    readiness_client_svid: &CrossClusterSvid,
+    readiness_client_bundle_path: &std::path::Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
+
+    let bundle = ferrum_edge::identity::file_loader::load_svid_bundle_from_files(
+        std::path::Path::new(&readiness_client_svid.cert_path),
+        std::path::Path::new(&readiness_client_svid.key_path),
+        readiness_client_bundle_path,
+        Some(readiness_client_spiffe),
+    )
+    .map_err(|error| format!("load readiness client SVID: {error}"))?;
+    let expected_client = SpiffeId::new(readiness_client_spiffe)
+        .map_err(|error| format!("invalid readiness client SPIFFE ID: {error}"))?;
+    if bundle.spiffe_id != expected_client {
+        return Err(format!(
+            "readiness client SVID '{}' does not match expected '{}'",
+            bundle.spiffe_id, expected_client
+        ));
+    }
+    let bundle_slot = Arc::new(ArcSwap::from_pointee(Some(bundle)));
+    let expected_peer = SpiffeId::new(expected_destination_spiffe)
+        .map_err(|error| format!("invalid destination SPIFFE ID: {error}"))?;
+    let tls_config = ferrum_edge::tls::build_spiffe_outbound_config(
+        bundle_slot,
+        Some(expected_peer),
+        None,
+        vec![b"h2".to_vec()],
+        Arc::new(Vec::new()),
+    )
+    .map_err(|error| format!("build readiness client TLS config: {error}"))?;
+    let connector = tokio_rustls::TlsConnector::from(tls_config);
+    let deadline = Instant::now() + timeout;
+    let mut last_error = "readiness probe did not run".to_string();
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "east-west destination did not become mTLS-ready: {last_error}"
+            ));
+        }
+
+        let probe = async {
+            let tcp = TcpStream::connect(("127.0.0.1", east_west_port))
+                .await
+                .map_err(|error| format!("connect east-west listener: {error}"))?;
+            let server_name = rustls::pki_types::ServerName::try_from(service_sni.to_string())
+                .map_err(|error| format!("invalid readiness SNI: {error}"))?;
+            let mut tls = connector
+                .connect(server_name, tcp)
+                .await
+                .map_err(|error| format!("destination mTLS handshake: {error}"))?;
+
+            // TLS 1.3 can surface a server-side client-auth rejection after the
+            // client handshake future resolves. An accepted mesh listener stays
+            // open waiting for HTTP/2 bytes; an alert/EOF is not readiness.
+            let mut byte = [0u8; 1];
+            match tokio::time::timeout(Duration::from_millis(250), tls.read(&mut byte)).await {
+                Err(_) => Ok(()),
+                Ok(Ok(0)) => Err("destination closed after the mTLS handshake".to_string()),
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(error)) => Err(format!("destination rejected readiness client: {error}")),
+            }
+        };
+
+        match tokio::time::timeout(remaining.min(Duration::from_secs(5)), probe).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => last_error = error,
+            Err(_) => last_error = "readiness probe timed out".to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// A config-layer `TrustBundle` (base64 DER) for `trust_domain` from a CA PEM.
 fn config_trust_bundle(trust_domain: &str, ca_pem: &str) -> TrustBundle {
     use base64::Engine;
@@ -4062,7 +4148,6 @@ async fn drive_cross_cluster_egress(client_trusted: bool) -> Result<(u16, String
             cp_a.shutdown().await;
             cp_b.shutdown().await;
             cp_c.shutdown().await;
-            tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
 
@@ -4104,7 +4189,30 @@ async fn drive_cross_cluster_egress(client_trusted: bool) -> Result<(u16, String
             cp_a.shutdown().await;
             cp_b.shutdown().await;
             cp_c.shutdown().await;
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+        if let Err(error) = wait_for_cross_cluster_destination_ready(
+            b_east_west_port,
+            "svc-c.ferrum.svc.cluster.local",
+            c_spiffe,
+            b_spiffe,
+            &b_svid,
+            &temp_b.path().join("gateway-b-bundle.pem"),
+            STARTUP_TIMEOUT,
+        )
+        .await
+        {
+            last_failure = format!(
+                "attempt {attempt}: gateway B/C mTLS path never became ready: {error}\n\
+                 --- gateway B ---\n{}\n--- gateway C ---\n{}",
+                captured_output(&temp_b),
+                captured_output(&temp_c)
+            );
+            kill_child(&mut child_b);
+            kill_child(&mut child_c);
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            cp_c.shutdown().await;
             continue;
         }
 
@@ -4148,32 +4256,14 @@ async fn drive_cross_cluster_egress(client_trusted: bool) -> Result<(u16, String
             cp_a.shutdown().await;
             cp_b.shutdown().await;
             cp_c.shutdown().await;
-            tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
 
-        // Drive the captured app request for svc-c. The positive path retries
-        // until it converges to 200 (slice apply / route materialization race);
-        // the negative asserts the FINAL state (must never converge to 200).
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let last: Result<(u16, String), String> = loop {
-            let attempt =
-                match plaintext_http_get(a_outbound_port, "svc-c.ferrum.svc.cluster.local", "/")
-                    .await
-                {
-                    Ok((status, body)) => {
-                        if status == 200 && body.contains("backend-ok") {
-                            break Ok((status, body));
-                        }
-                        Ok((status, body))
-                    }
-                    Err(e) => Err(format!("cross-cluster egress GET failed: {e}")),
-                };
-            if Instant::now() >= deadline {
-                break attempt;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        };
+        // The B/C readiness gate has already absorbed setup races. Drive once
+        // so an HTTP status or body regression is never hidden by retries.
+        let last = plaintext_http_get(a_outbound_port, "svc-c.ferrum.svc.cluster.local", "/")
+            .await
+            .map_err(|error| format!("cross-cluster egress GET failed: {error}"));
 
         let output_a = captured_output(&temp_a);
         let output_b = captured_output(&temp_b);
@@ -4425,7 +4515,6 @@ async fn try_start_sidecar_cross_cluster_fixture(
         cp_a.shutdown().await;
         cp_b.shutdown().await;
         cp_c.shutdown().await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
         return None;
     }
 
@@ -4463,7 +4552,25 @@ async fn try_start_sidecar_cross_cluster_fixture(
         cp_a.shutdown().await;
         cp_b.shutdown().await;
         cp_c.shutdown().await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        return None;
+    }
+    if wait_for_cross_cluster_destination_ready(
+        b_east_west_port,
+        "svc-c.ferrum.svc.cluster.local",
+        c_spiffe,
+        b_spiffe,
+        &b_svid,
+        &temp_b.path().join("gateway-b-bundle.pem"),
+        STARTUP_TIMEOUT,
+    )
+    .await
+    .is_err()
+    {
+        kill_child(&mut child_b);
+        kill_child(&mut child_c);
+        cp_a.shutdown().await;
+        cp_b.shutdown().await;
+        cp_c.shutdown().await;
         return None;
     }
 
@@ -4503,7 +4610,6 @@ async fn try_start_sidecar_cross_cluster_fixture(
         cp_a.shutdown().await;
         cp_b.shutdown().await;
         cp_c.shutdown().await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
         return None;
     }
 
@@ -4523,12 +4629,10 @@ async fn try_start_sidecar_cross_cluster_fixture(
 
 /// Drive one captured native-gRPC request from client gateway A across the
 /// east-west gateway B to the gRPC trailers-echo backend behind dest gateway C
-/// (two trust domains, federated bundle). `converged` is the caller's success
-/// predicate (the positive path polls until it accepts a response; the untrusted
-/// negative passes a predicate that never accepts and asserts the FINAL state).
+/// (two trust domains, federated bundle). The fixture's mTLS readiness gate
+/// absorbs startup races before this sends exactly one assertion-bearing call.
 async fn drive_cross_cluster_grpc_egress(
     client_trusted: bool,
-    converged: fn(&GrpcEgressResponse) -> bool,
 ) -> Result<(GrpcEgressResponse, String), String> {
     ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
     let payload = b"ferrum-mesh-xc-grpc-payload";
@@ -4544,26 +4648,14 @@ async fn drive_cross_cluster_grpc_egress(
             continue;
         };
 
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let last: Result<GrpcEgressResponse, String> = loop {
-            let observed = grpc_egress_request(
-                fixture.a_outbound_port,
-                "svc-c.ferrum.svc.cluster.local",
-                "/echo.Mesh/Call",
-                &framed,
-            )
-            .await
-            .map_err(|e| format!("cross-cluster gRPC egress request failed: {e}"));
-            match observed {
-                Ok(resp) if converged(&resp) => break Ok(resp),
-                other => {
-                    if Instant::now() >= deadline {
-                        break other;
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        };
+        let last = grpc_egress_request(
+            fixture.a_outbound_port,
+            "svc-c.ferrum.svc.cluster.local",
+            "/echo.Mesh/Call",
+            &framed,
+        )
+        .await
+        .map_err(|error| format!("cross-cluster gRPC egress request failed: {error}"));
 
         let logs = fixture.logs();
         fixture.shutdown().await;
@@ -4591,16 +4683,9 @@ async fn drive_cross_cluster_grpc_egress(
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_sidecar_cross_cluster_grpc_routes_a_to_c_over_east_west_with_trailers() {
-    let (resp, logs) = drive_cross_cluster_grpc_egress(true, |resp| {
-        resp.status == 200
-            && resp.trailers.get("grpc-status").map(String::as_str) == Some("0")
-            && resp
-                .body
-                .windows(b"ferrum-mesh-xc-grpc-payload".len())
-                .any(|w| w == b"ferrum-mesh-xc-grpc-payload")
-    })
-    .await
-    .expect("cross-cluster gRPC egress drive");
+    let (resp, logs) = drive_cross_cluster_grpc_egress(true)
+        .await
+        .expect("cross-cluster gRPC egress drive");
     assert_eq!(
         resp.status, 200,
         "the captured gRPC request must traverse A's cross-cluster mesh-mTLS egress through the \
@@ -4640,12 +4725,9 @@ async fn functional_mesh_sidecar_cross_cluster_grpc_routes_a_to_c_over_east_west
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_sidecar_cross_cluster_grpc_rejects_untrusted_client() {
-    let (resp, logs) = drive_cross_cluster_grpc_egress(false, |resp| {
-        // The success shape must never be observed; poll to the deadline.
-        resp.status == 200 && resp.trailers.get("grpc-status").map(String::as_str) == Some("0")
-    })
-    .await
-    .expect("untrusted cross-cluster gRPC egress drive");
+    let (resp, logs) = drive_cross_cluster_grpc_egress(false)
+        .await
+        .expect("untrusted cross-cluster gRPC egress drive");
     assert!(
         !(resp.status == 200 && resp.trailers.get("grpc-status").map(String::as_str) == Some("0")),
         "an untrusted gateway's cross-cluster gRPC request must fail closed, not complete: \
@@ -4678,24 +4760,12 @@ async fn drive_cross_cluster_ws_egress(client_trusted: bool) -> Result<(String, 
             continue;
         };
 
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let last: Result<String, String> = loop {
-            let observed = mesh_websocket_echo_roundtrip(
-                fixture.a_outbound_port,
-                "svc-c.ferrum.svc.cluster.local",
-                "mesh-xc-ws-hello",
-            )
-            .await;
-            if let Ok(ref reply) = observed
-                && reply.contains("backend-ws:mesh-xc-ws-hello")
-            {
-                break observed;
-            }
-            if Instant::now() >= deadline {
-                break observed;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        };
+        let last = mesh_websocket_echo_roundtrip(
+            fixture.a_outbound_port,
+            "svc-c.ferrum.svc.cluster.local",
+            "mesh-xc-ws-hello",
+        )
+        .await;
 
         let logs = fixture.logs();
         fixture.shutdown().await;
@@ -5121,7 +5191,6 @@ async fn drive_ambient_cross_cluster_egress(
             cp_a.shutdown().await;
             cp_b.shutdown().await;
             cp_c.shutdown().await;
-            tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
 
@@ -5163,7 +5232,30 @@ async fn drive_ambient_cross_cluster_egress(
             cp_a.shutdown().await;
             cp_b.shutdown().await;
             cp_c.shutdown().await;
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+        if let Err(error) = wait_for_cross_cluster_destination_ready(
+            b_east_west_port,
+            "svc-c.ferrum.svc.cluster.local",
+            c_spiffe,
+            b_spiffe,
+            &b_svid,
+            &temp_b.path().join("gateway-b-bundle.pem"),
+            STARTUP_TIMEOUT,
+        )
+        .await
+        {
+            last_failure = format!(
+                "attempt {attempt}: ambient gateway B/C mTLS path never became ready: {error}\n\
+                 --- gateway B ---\n{}\n--- gateway C ---\n{}",
+                captured_output(&temp_b),
+                captured_output(&temp_c)
+            );
+            kill_child(&mut child_b);
+            kill_child(&mut child_c);
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            cp_c.shutdown().await;
             continue;
         }
 
@@ -5211,31 +5303,14 @@ async fn drive_ambient_cross_cluster_egress(
             cp_a.shutdown().await;
             cp_b.shutdown().await;
             cp_c.shutdown().await;
-            tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
 
-        // Drive the captured app request for svc-c. The positive path retries
-        // until 200; the negative asserts the FINAL state (never converges to 200).
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let last: Result<(u16, String), String> = loop {
-            let attempt =
-                match plaintext_http_get(a_outbound_port, "svc-c.ferrum.svc.cluster.local", "/")
-                    .await
-                {
-                    Ok((status, body)) => {
-                        if status == 200 && body.contains("backend-ok") {
-                            break Ok((status, body));
-                        }
-                        Ok((status, body))
-                    }
-                    Err(e) => Err(format!("ambient cross-cluster egress GET failed: {e}")),
-                };
-            if Instant::now() >= deadline {
-                break attempt;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        };
+        // The B/C readiness gate has already absorbed setup races. Drive once
+        // so an HTTP status or body regression is never hidden by retries.
+        let last = plaintext_http_get(a_outbound_port, "svc-c.ferrum.svc.cluster.local", "/")
+            .await
+            .map_err(|error| format!("ambient cross-cluster egress GET failed: {error}"));
 
         let output_a = captured_output(&temp_a);
         let output_b = captured_output(&temp_b);
@@ -5480,7 +5555,6 @@ async fn try_start_ambient_cross_cluster_fixture(
         cp_a.shutdown().await;
         cp_b.shutdown().await;
         cp_c.shutdown().await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
         return None;
     }
 
@@ -5518,7 +5592,25 @@ async fn try_start_ambient_cross_cluster_fixture(
         cp_a.shutdown().await;
         cp_b.shutdown().await;
         cp_c.shutdown().await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        return None;
+    }
+    if wait_for_cross_cluster_destination_ready(
+        b_east_west_port,
+        "svc-c.ferrum.svc.cluster.local",
+        c_spiffe,
+        b_spiffe,
+        &b_svid,
+        &temp_b.path().join("gateway-b-bundle.pem"),
+        STARTUP_TIMEOUT,
+    )
+    .await
+    .is_err()
+    {
+        kill_child(&mut child_b);
+        kill_child(&mut child_c);
+        cp_a.shutdown().await;
+        cp_b.shutdown().await;
+        cp_c.shutdown().await;
         return None;
     }
 
@@ -5558,7 +5650,6 @@ async fn try_start_ambient_cross_cluster_fixture(
         cp_a.shutdown().await;
         cp_b.shutdown().await;
         cp_c.shutdown().await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
         return None;
     }
 
@@ -5595,24 +5686,12 @@ async fn drive_ambient_cross_cluster_ws_egress(
             continue;
         };
 
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let last: Result<String, String> = loop {
-            let observed = mesh_websocket_echo_roundtrip(
-                fixture.a_outbound_port,
-                "svc-c.ferrum.svc.cluster.local",
-                "mesh-amb-xc-ws-hello",
-            )
-            .await;
-            if let Ok(ref reply) = observed
-                && reply.contains("backend-ws:mesh-amb-xc-ws-hello")
-            {
-                break observed;
-            }
-            if Instant::now() >= deadline {
-                break observed;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        };
+        let last = mesh_websocket_echo_roundtrip(
+            fixture.a_outbound_port,
+            "svc-c.ferrum.svc.cluster.local",
+            "mesh-amb-xc-ws-hello",
+        )
+        .await;
 
         let logs = fixture.logs();
         fixture.shutdown().await;
@@ -5687,25 +5766,13 @@ async fn drive_ambient_cross_cluster_ws_path_egress() -> Result<(String, String)
             continue;
         };
 
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let last: Result<String, String> = loop {
-            let observed = mesh_websocket_echo_roundtrip_path(
-                fixture.a_outbound_port,
-                "svc-c.ferrum.svc.cluster.local",
-                CLIENT_PATH,
-                "mesh-amb-xc-ws-path-hello",
-            )
-            .await;
-            if let Ok(ref reply) = observed
-                && reply.contains("mesh-amb-xc-ws-path-hello")
-            {
-                break observed;
-            }
-            if Instant::now() >= deadline {
-                break observed;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        };
+        let last = mesh_websocket_echo_roundtrip_path(
+            fixture.a_outbound_port,
+            "svc-c.ferrum.svc.cluster.local",
+            CLIENT_PATH,
+            "mesh-amb-xc-ws-path-hello",
+        )
+        .await;
 
         let logs = fixture.logs();
         fixture.shutdown().await;
@@ -8517,6 +8584,12 @@ impl LiveTwoClusterSpire {
             .to_string()
     }
 
+    fn wait_for_cluster_b_svid(&self, workload_id: &str, workload_uid: u32) -> Result<(), String> {
+        let root = self.cluster_b.path().display().to_string();
+        let uid = workload_uid.to_string();
+        run_live_xc_spire(&["wait-svid", &root, workload_id, &uid]).map(|_| ())
+    }
+
     fn diagnostics(&self) -> String {
         let read = |root: &std::path::Path, name: &str| {
             std::fs::read_to_string(root.join(name)).unwrap_or_else(|error| format!("<{error}>"))
@@ -9534,6 +9607,15 @@ impl LiveTwoClusterFixture {
                 spire.diagnostics()
             ));
         }
+        spire.wait_for_cluster_b_svid(LIVE_XC_ID_B, 1337)?;
+        let east_west_address = SocketAddr::from((east_west.pod_ip(), east_west_port));
+        if !wait_for_tcp_addr_in_netns(source.pod.pid(), east_west_address, STARTUP_TIMEOUT).await {
+            return Err(format!(
+                "source cluster could not connect to the SVID-ready east-west listener\n{}\n{}",
+                captured_output(&temp_east_west),
+                spire.diagnostics()
+            ));
+        }
 
         let source_slice = |node_id| {
             live_xc_source_slice(
@@ -9971,46 +10053,68 @@ fn live_xc_udp_round_trip(
 
 #[cfg(target_os = "linux")]
 async fn live_xc_test_http(fixture: &LiveTwoClusterFixture) {
-    let mut last = Err("HTTP row did not run".to_string());
     let destination = format!("{LIVE_XC_MULTI_VIP}:{LIVE_XC_HTTP_PORT}")
         .parse()
         .expect("HTTP VIP");
-    for _ in 0..20 {
-        last = live_xc_http_get_from_vip(
-            fixture.source.pod.pid(),
-            destination,
-            "live-matrix.ferrum.svc.cluster.local:18080",
-        );
-        if matches!(&last, Ok((200, body)) if body.contains("http-live-ok")) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-    panic!(
-        "HTTP did not cross the live east-west/destination-capture path: {last:?}\n{}",
+    let (status, body) = live_xc_http_get_from_vip(
+        fixture.source.pod.pid(),
+        destination,
+        "live-matrix.ferrum.svc.cluster.local:18080",
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "HTTP did not cross the live east-west/destination-capture path: {error}\n{}",
+            fixture.diagnostics()
+        )
+    });
+    assert_eq!(
+        status,
+        200,
+        "live cross-cluster HTTP status; body: {body:?}\n{}",
+        fixture.diagnostics()
+    );
+    assert!(
+        body.contains("http-live-ok"),
+        "live cross-cluster HTTP body: {body:?}\n{}",
         fixture.diagnostics()
     );
 }
 
 #[cfg(target_os = "linux")]
 async fn live_xc_test_grpc(fixture: &LiveTwoClusterFixture) {
-    let mut last = Err("gRPC row did not run".to_string());
-    for _ in 0..20 {
-        last = fixture.grpc().await;
-        if matches!(&last, Ok(response)
-            if response.status == 200
-                && response.trailers.get("grpc-status").map(String::as_str) == Some("0")
-                && response.trailers.get("x-live-two-cluster").map(String::as_str)
-                    == Some("grpc-ok")
-                && response.body.windows(b"live-two-cluster-grpc".len())
-                    .any(|window| window == b"live-two-cluster-grpc"))
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-    panic!(
-        "Sidecar gRPC did not preserve data/trailers across the live fixture: {last:?}\n{}",
+    let response = fixture.grpc().await.unwrap_or_else(|error| {
+        panic!(
+            "Sidecar gRPC did not cross the live fixture: {error}\n{}",
+            fixture.diagnostics()
+        )
+    });
+    assert_eq!(
+        response.status,
+        200,
+        "live cross-cluster gRPC status: {response:?}\n{}",
+        fixture.diagnostics()
+    );
+    assert_eq!(
+        response.trailers.get("grpc-status").map(String::as_str),
+        Some("0"),
+        "live cross-cluster grpc-status trailer: {response:?}\n{}",
+        fixture.diagnostics()
+    );
+    assert_eq!(
+        response
+            .trailers
+            .get("x-live-two-cluster")
+            .map(String::as_str),
+        Some("grpc-ok"),
+        "live cross-cluster custom trailer: {response:?}\n{}",
+        fixture.diagnostics()
+    );
+    assert!(
+        response
+            .body
+            .windows(b"live-two-cluster-grpc".len())
+            .any(|window| window == b"live-two-cluster-grpc"),
+        "live cross-cluster gRPC body: {response:?}\n{}",
         fixture.diagnostics()
     );
 }
