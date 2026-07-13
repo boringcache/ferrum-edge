@@ -10344,12 +10344,31 @@ mod inner {
             let non_empty_guard = load_body
                 .find("if !validation_errors.is_empty() {")
                 .expect("load_full_config non-empty validation guard");
-            let rejection = load_body
-                .find("anyhow::bail!(")
-                .expect("load_full_config rejecting bail");
             let success = load_body
                 .find("Ok(config)")
                 .expect("load_full_config success return");
+
+            // Brace-match the guard's block so the bail assertion is scoped
+            // to it: a later unrelated bail must not satisfy this test if the
+            // guard itself regresses to log-only. Format-string braces ({})
+            // are balanced, so they do not skew the depth count.
+            let mut depth = 0usize;
+            let mut guard_end = None;
+            for (offset, ch) in load_body[non_empty_guard..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            guard_end = Some(non_empty_guard + offset + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let guard_block =
+                &load_body[non_empty_guard..guard_end.expect("validation guard block must close")];
 
             assert!(
                 normalize < quarantine && quarantine < rejecting_validation,
@@ -10357,11 +10376,15 @@ mod inner {
                  consumer identity quarantine"
             );
             assert!(
-                rejecting_validation < non_empty_guard
-                    && non_empty_guard < rejection
-                    && rejection < success,
-                "non-empty rejecting validation errors must bail before load_full_config can \
-                 return Ok(config)"
+                rejecting_validation < non_empty_guard && non_empty_guard < success,
+                "the rejecting validation guard must sit between the shared validation call and \
+                 the Ok(config) success return"
+            );
+            assert!(
+                guard_block.contains("anyhow::bail!(")
+                    && guard_block.contains("MongoDB configuration validation failed"),
+                "the non-empty rejecting validation guard itself must bail with the MongoDB \
+                 validation failure error, not merely log"
             );
         }
 
