@@ -10380,11 +10380,17 @@ mod inner {
                 "the rejecting validation guard must sit between the shared validation call and \
                  the Ok(config) success return"
             );
+            let bail_start = guard_block.find("anyhow::bail!(").expect(
+                "the non-empty rejecting validation guard itself must bail, not merely log",
+            );
+            let bail_call = &guard_block[bail_start..];
+            let bail_end = bail_call
+                .find(");")
+                .expect("validation guard bail invocation must terminate");
             assert!(
-                guard_block.contains("anyhow::bail!(")
-                    && guard_block.contains("MongoDB configuration validation failed"),
-                "the non-empty rejecting validation guard itself must bail with the MongoDB \
-                 validation failure error, not merely log"
+                bail_call[..bail_end].contains("MongoDB configuration validation failed"),
+                "the guard's bail invocation itself must carry the MongoDB validation failure \
+                 message"
             );
         }
 
