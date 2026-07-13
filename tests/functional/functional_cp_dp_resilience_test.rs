@@ -36,7 +36,7 @@ use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
-    start_admin_listener,
+    start_admin_listener_with_tls_and_signal,
 };
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
@@ -259,10 +259,12 @@ async fn spawn_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<b
     let shutdown_rx_clone = shutdown_rx.clone();
     tokio::spawn(async move {
         let admin_addr: SocketAddr = addr;
-        let _ = start_admin_listener(
+        let _ = start_admin_listener_with_tls_and_signal(
             admin_addr,
             state_clone,
             shutdown_rx_clone,
+            None,
+            None,
             ferrum_edge::admin::AdminConnLimiter::unlimited(),
         )
         .await;
