@@ -25,6 +25,25 @@ server_cli() {
   spire-server "$@" -socketPath "$root/server.sock"
 }
 
+wait_for_workload_svid() {
+  local root="$1" workload_id="$2" workload_uid="$3"
+  for _ in $(seq 1 100); do
+    if setpriv \
+      "--reuid=$workload_uid" \
+      "--regid=$workload_uid" \
+      --clear-groups \
+      -- spire-agent api fetch x509 \
+        -socketPath "$root/agent.sock" \
+        -timeout 1s \
+        -silent >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "SPIRE SVID was not issued for $workload_id (uid $workload_uid)" >&2
+  return 1
+}
+
 case "$command_name" in
   start)
     root="${1:?root directory is required}"
@@ -124,21 +143,14 @@ EOF
       args+=(-federatesWith "spiffe://$peer_domain")
     fi
     server_cli "$root" "${args[@]}"
-    for _ in $(seq 1 30); do
-      if setpriv \
-        "--reuid=$workload_uid" \
-        "--regid=$workload_uid" \
-        --clear-groups \
-        -- spire-agent api fetch x509 \
-          -socketPath "$root/agent.sock" \
-          -timeout 1s \
-          -silent >/dev/null 2>&1; then
-        exit 0
-      fi
-      sleep 1
-    done
-    echo "SPIRE workload entry did not become available for $workload_id (uid $workload_uid)" >&2
-    exit 1
+    wait_for_workload_svid "$root" "$workload_id" "$workload_uid"
+    ;;
+
+  wait-svid)
+    root="${1:?root directory is required}"
+    workload_id="${2:?workload SPIFFE ID is required}"
+    workload_uid="${3:-1337}"
+    wait_for_workload_svid "$root" "$workload_id" "$workload_uid"
     ;;
 
   stop)
@@ -157,7 +169,7 @@ EOF
     ;;
 
   *)
-    echo "usage: $0 {start|federate|register|stop} ..." >&2
+    echo "usage: $0 {start|federate|register|wait-svid|stop} ..." >&2
     exit 2
     ;;
 esac

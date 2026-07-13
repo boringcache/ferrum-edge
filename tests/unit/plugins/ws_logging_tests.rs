@@ -7,6 +7,8 @@ use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Direction, Plugin, PluginHttpClient, PluginResult, WsDisconnectContext,
     ws_logging::WsLogging,
 };
+use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
+use ferrum_edge::retry::ErrorClass;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -245,6 +247,89 @@ async fn test_ws_logging_ws_disconnect_with_auth_method() {
     ctx.auth_method = Some("jwt_auth");
 
     plugin.on_ws_disconnect(&ctx).await;
+}
+
+#[tokio::test]
+async fn test_ws_logging_custom_schema_applies_to_ws_disconnect() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let endpoint = format!("ws://{addr}/logs");
+    let (payload_tx, payload_rx) = tokio::sync::oneshot::channel::<String>();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let ws = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake");
+        let (_sink, mut read) = ws.split();
+        let payload = match read.next().await {
+            Some(Ok(Message::Text(payload))) => payload.to_string(),
+            other => panic!("expected text log batch, got {other:?}"),
+        };
+        let _ = payload_tx.send(payload);
+    });
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+            "reconnect_delay_ms": 100,
+            "buffer_capacity": 16,
+            "schema": {
+                "summary_type": "http",
+                "rename": {
+                    "event": "kind",
+                    "frames_client_to_backend": "upstream_frames",
+                    "direction": "disconnect_direction",
+                    "io_side": "failure_side"
+                },
+                "omit": ["frames_backend_to_client", "proxy_name"],
+                "order": ["kind", "upstream_frames", "*"],
+                "static_fields": { "service": "edge-ws" },
+                "derived_fields": [
+                    { "name": "record_type", "kind": "summary_kind" },
+                    { "name": "outcome", "kind": "outcome" },
+                    { "name": "backend_host", "kind": "backend_host" }
+                ],
+                "metadata": { "mode": "flatten", "prefix": "meta_" }
+            }
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+
+    let mut ctx = test_ws_disconnect_context();
+    ctx.auth_method = Some("jwt_auth");
+    ctx.error_class = Some(ErrorClass::ConnectionReset);
+    ctx.io_side = Some(StreamIoSide::Write);
+    plugin.on_ws_disconnect(&ctx).await;
+
+    let payload = await_within("custom-schema disconnect batch", payload_rx)
+        .await
+        .expect("payload channel closed");
+    let batch: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON batch");
+    let entry = &batch[0];
+
+    assert_eq!(entry["kind"], "websocket_disconnect");
+    assert_eq!(entry["upstream_frames"], 3);
+    assert_eq!(entry["disconnect_direction"], "client_to_backend");
+    assert_eq!(entry["failure_side"], "write");
+    assert_eq!(entry["service"], "edge-ws");
+    assert_eq!(entry["record_type"], "websocket_disconnect");
+    assert_eq!(entry["outcome"], "error");
+    assert_eq!(entry["backend_host"], "backend.local");
+    assert_eq!(entry["meta_correlation_id"], "cid-123");
+    assert_eq!(entry["meta_authorization"], "[REDACTED]");
+    assert!(entry.get("event").is_none());
+    assert!(entry.get("frames_client_to_backend").is_none());
+    assert!(entry.get("frames_backend_to_client").is_none());
+    assert!(entry.get("proxy_name").is_none());
+    assert!(entry.get("metadata").is_none());
+
+    drop(plugin);
+    let _ = await_within("custom-schema server shutdown", server).await;
 }
 
 #[tokio::test]

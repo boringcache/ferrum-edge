@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 use tracing::warn;
 
-use super::utils::log_schema::{SchemaView, SummarySchema, resolve_schema};
+use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
 pub struct StdoutLogging {
@@ -69,7 +69,7 @@ impl StdoutLogging {
             }
             Some(_) => return Err("stdout_logging: filter must be an object".to_string()),
         };
-        let schema = resolve_schema(config, "stdout_logging")?;
+        let schema = resolve_schema(config, "stdout_logging", SchemaCapabilities::BASE)?;
         Ok(Self { filter, schema })
     }
 

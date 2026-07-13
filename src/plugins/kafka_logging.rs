@@ -11,7 +11,9 @@ use std::time::Duration;
 use tokio::task::spawn_blocking;
 use tracing::warn;
 
-use super::utils::log_schema::{SummaryLogEntryView, SummarySchema, resolve_schema};
+use super::utils::log_schema::{
+    SchemaCapabilities, SummaryLogEntryView, SummarySchema, resolve_schema,
+};
 use super::utils::{BatchConfig, BatchingLogger, PluginHttpClient, RetryPolicy, SummaryLogEntry};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
@@ -226,7 +228,7 @@ impl KafkaLogging {
             producer,
             flush_timeout: Duration::from_secs(flush_timeout_seconds),
         });
-        let schema = resolve_schema(config, "kafka_logging")?;
+        let schema = resolve_schema(config, "kafka_logging", SchemaCapabilities::BASE)?;
         let logger = BatchingLogger::spawn(
             BatchConfig {
                 // Kafka flushes one userspace message at a time here. Larger
