@@ -35,12 +35,13 @@ node_agent, migrate) fails at template time with a pointer to the right chart.
   protect a still-live plaintext listener on 9000. Literal `/0` CIDRs are
   rejected as ineffective protection; the binary is authoritative for other
   permit-all CIDR unions. If computed exec probes are enabled,
-  `admin.allowedCidrs` must include exact source `127.0.0.1/32` (or the bare IP)
+  `admin.allowedCidrs` must contain source `127.0.0.1` (for example
+  `127.0.0.0/8`, `127.0.0.1/32`, or the bare IP)
   because the admin TCP filter does not special-case loopback. Any IPv6 bind form
   (`::`, `[::]`, `::1`, `[::1]`) instead shifts the computed probes to `--host ::1`
-  and requires `::1/128` (or bare `::1`) in the allowlist — an unspecified IPv6
-  bind is not guaranteed to accept v4-mapped `127.0.0.1`, so the probes use IPv6
-  loopback for every IPv6 bind.
+  and requires an entry containing `::1` (such as `::/127`, `::1/128`, or bare
+  `::1`) — an unspecified IPv6 bind is not guaranteed to accept v4-mapped
+  `127.0.0.1`, so the probes use IPv6 loopback for every IPv6 bind.
   `admin.bindAddress` must be an IP literal — any hostname (`localhost`,
   `admin.internal`, ...) is rejected at render (the binary requires an IP); use
   `127.0.0.1` or `::1`.
@@ -84,8 +85,9 @@ node_agent, migrate) fails at template time with a pointer to the right chart.
   of a managed base var (e.g. `FERRUM_ADMIN_JWT_SECRET_VAULT`) resolves into that
   base var and would collide with the chart's own source, aborting startup with
   "Multiple secret sources configured". Generated `<name>_FILE` vars from
-  `secretFileMounts` are reserved as well, so `env`/`extraEnv` cannot shadow a
-  required secret's file source.
+  `secretFileMounts` are reserved as well, and so are their base names, so
+  `env`/`extraEnv` cannot shadow a file source or configure both `<name>` and
+  `<name>_FILE` (which Ferrum rejects as conflicting providers).
 - **TLS and `_FILE` Secret mounts are non-root readable.** They default to mode
   `0440` with pod `fsGroup: 65532`, matching the distroless nonroot image. Both
   `secretVolumeDefaultMode` and `podSecurityContext` are overridable for images

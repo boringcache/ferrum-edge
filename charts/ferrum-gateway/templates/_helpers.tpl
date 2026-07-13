@@ -160,6 +160,123 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 {{- end -}}
 
+{{/* Convert a validated IPv4 literal to its unsigned 32-bit integer value. */}}
+{{- define "ferrum-gateway.ipv4ToInt" -}}
+{{- $v := . | toString -}}
+{{- if and (include "ferrum-gateway.isIpLiteral" $v) (not (contains ":" $v)) -}}
+{{- $parts := splitList "." $v -}}
+{{- add (mul (index $parts 0 | int64) 16777216) (mul (index $parts 1 | int64) 65536) (mul (index $parts 2 | int64) 256) (index $parts 3 | int64) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Convert one validated IPv6 hextet to an integer. Helm has no base-16 atoi. */}}
+{{- define "ferrum-gateway.hexToInt" -}}
+{{- $digits := dict "0" 0 "1" 1 "2" 2 "3" 3 "4" 4 "5" 5 "6" 6 "7" 7 "8" 8 "9" 9 "a" 10 "b" 11 "c" 12 "d" 13 "e" 14 "f" 15 -}}
+{{- $value := 0 -}}
+{{- range $digit := regexFindAll "." (lower (. | toString)) -1 -}}
+{{- $value = add (mul $value 16) (get $digits $digit) -}}
+{{- end -}}
+{{- $value -}}
+{{- end -}}
+
+{{/* Expand an IPv6 literal to eight decimal hextets. Embedded IPv4 tails are
+     converted to two hextets before expanding `::`. */}}
+{{- define "ferrum-gateway.ipv6Hextets" -}}
+{{- $ip := lower (. | toString) | trimPrefix "[" | trimSuffix "]" -}}
+{{- $valid := and (include "ferrum-gateway.isIpLiteral" $ip) (contains ":" $ip) -}}
+{{- if and $valid (contains "." $ip) -}}
+{{- $tail := regexFind "[0-9.]+$" $ip -}}
+{{- $tailInt := include "ferrum-gateway.ipv4ToInt" $tail -}}
+{{- if not $tailInt -}}
+{{- $valid = false -}}
+{{- else -}}
+{{- $tailValue := $tailInt | int64 -}}
+{{- $ip = regexReplaceAll "[0-9.]+$" $ip (printf "%x:%x" (div $tailValue 65536) (mod $tailValue 65536)) -}}
+{{- end -}}
+{{- end -}}
+{{- $hextets := list -}}
+{{- if $valid -}}
+{{- $sides := splitList "::" $ip -}}
+{{- if gt (len $sides) 2 -}}
+{{- $valid = false -}}
+{{- else if eq (len $sides) 2 -}}
+{{- $left := list -}}
+{{- $right := list -}}
+{{- if index $sides 0 -}}{{- $left = splitList ":" (index $sides 0) -}}{{- end -}}
+{{- if index $sides 1 -}}{{- $right = splitList ":" (index $sides 1) -}}{{- end -}}
+{{- $missing := sub 8 (add (len $left) (len $right)) | int -}}
+{{- if lt $missing 1 -}}
+{{- $valid = false -}}
+{{- else -}}
+{{- range $part := $left -}}{{- $hextets = append $hextets $part -}}{{- end -}}
+{{- range until $missing -}}{{- $hextets = append $hextets "0" -}}{{- end -}}
+{{- range $part := $right -}}{{- $hextets = append $hextets $part -}}{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- $hextets = splitList ":" $ip -}}
+{{- if ne (len $hextets) 8 -}}{{- $valid = false -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $decimal := list -}}
+{{- if $valid -}}
+{{- range $part := $hextets -}}
+{{- if not (regexMatch "^[0-9a-f]{1,4}$" $part) -}}
+{{- $valid = false -}}
+{{- else -}}
+{{- $decimal = append $decimal (include "ferrum-gateway.hexToInt" $part) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and $valid (eq (len $decimal) 8) -}}{{- join "," $decimal -}}{{- end -}}
+{{- end -}}
+
+{{/* Return "true" when one comma-separated allowlist entry contains the supplied
+     probe source. This mirrors IpNet::contains for both IP families so ordinary
+     covering subnets (127.0.0.0/8, 10.0.0.0/8, fd00::/8, ...) are accepted. */}}
+{{- define "ferrum-gateway.adminAllowlistContainsIp" -}}
+{{- $target := .ip | toString | trimPrefix "[" | trimSuffix "]" | lower -}}
+{{- $found := false -}}
+{{- range $raw := splitList "," (.allowedCidrs | default "") -}}
+{{- $entry := trim $raw | lower -}}
+{{- $parts := splitList "/" $entry -}}
+{{- $network := index $parts 0 | trimPrefix "[" | trimSuffix "]" -}}
+{{- if and (eq (len $parts) 1) (eq $network $target) -}}
+{{- $found = true -}}
+{{- else if and (eq (len $parts) 2) (regexMatch "^[0-9]+$" (index $parts 1)) -}}
+{{- $prefix := index $parts 1 | int -}}
+{{- if and (not (contains ":" $target)) (not (contains ":" $network)) (ge $prefix 0) (le $prefix 32) -}}
+{{- $targetInt := include "ferrum-gateway.ipv4ToInt" $target -}}
+{{- $networkInt := include "ferrum-gateway.ipv4ToInt" $network -}}
+{{- if and $targetInt $networkInt -}}
+{{- $blockSize := 1 | int64 -}}
+{{- range until (sub 32 $prefix | int) -}}{{- $blockSize = mul $blockSize 2 -}}{{- end -}}
+{{- if eq (div ($targetInt | int64) $blockSize) (div ($networkInt | int64) $blockSize) -}}{{- $found = true -}}{{- end -}}
+{{- end -}}
+{{- else if and (contains ":" $target) (contains ":" $network) (ge $prefix 0) (le $prefix 128) -}}
+{{- $targetHextets := include "ferrum-gateway.ipv6Hextets" $target -}}
+{{- $networkHextets := include "ferrum-gateway.ipv6Hextets" $network -}}
+{{- if and $targetHextets $networkHextets -}}
+{{- $targetParts := splitList "," $targetHextets -}}
+{{- $networkParts := splitList "," $networkHextets -}}
+{{- $matches := true -}}
+{{- $fullHextets := div $prefix 16 | int -}}
+{{- range $i := until $fullHextets -}}
+{{- if ne (index $targetParts $i | int) (index $networkParts $i | int) -}}{{- $matches = false -}}{{- end -}}
+{{- end -}}
+{{- $remainingBits := mod $prefix 16 | int -}}
+{{- if and $matches (gt $remainingBits 0) -}}
+{{- $blockSize := 1 -}}
+{{- range until (sub 16 $remainingBits | int) -}}{{- $blockSize = mul $blockSize 2 -}}{{- end -}}
+{{- if ne (div (index $targetParts $fullHextets | int) $blockSize) (div (index $networkParts $fullHextets | int) $blockSize) -}}{{- $matches = false -}}{{- end -}}
+{{- end -}}
+{{- if $matches -}}{{- $found = true -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $found -}}true{{- end -}}
+{{- end -}}
+
 {{/*
 Return the first DP CP URL that is PLAINTEXT to a non-loopback host, or "" if
 none. Mirrors cp_dp_grpc_url_is_nonloopback_plaintext() in
@@ -476,7 +593,8 @@ Validation: fail render on missing/unsafe configuration.
 {{- if and $bind (not (include "ferrum-gateway.isIpLiteral" $bind)) -}}
 {{- fail (printf "admin.bindAddress=%q is not an IP literal: the binary requires FERRUM_ADMIN_BIND_ADDRESS to parse as an IP address (e.g. 127.0.0.1, ::1, 0.0.0.0, ::) and exits otherwise. Use an IP literal, not a hostname." $bind) -}}
 {{- end -}}
-{{- $loopback := has $bind (list "" "127.0.0.1" "::1") -}}
+{{- $normalizedBind := $bind | trimPrefix "[" | trimSuffix "]" -}}
+{{- $loopback := or (eq $normalizedBind "") (eq $normalizedBind "::1") (regexMatch "^127\\." $normalizedBind) -}}
 {{- $adminHttpPort := include "ferrum-gateway.adminHttpPort" . -}}
 {{- $adminSvc := $admin.service | default dict -}}
 {{- if and $adminSvc.enabled $loopback -}}
@@ -534,13 +652,7 @@ Validation: fail render on missing/unsafe configuration.
      cover the same host the probes dial, keyed off ferrum-gateway.probeHost. */}}
 {{- $probeHost := include "ferrum-gateway.probeHost" . -}}
 {{- $probeIsV6 := contains ":" $probeHost -}}
-{{- $probeEscaped := $probeHost | replace "." "\\." -}}
-{{- $hasProbeSource := false -}}
-{{- if $probeIsV6 -}}
-{{- $hasProbeSource = regexMatch (printf "(^|[[:space:],])\\[?%s\\]?(/128)?([[:space:],]|$)" $probeEscaped) $admin.allowedCidrs -}}
-{{- else -}}
-{{- $hasProbeSource = regexMatch (printf "(^|[[:space:],])%s(/32)?([[:space:],]|$)" $probeEscaped) $admin.allowedCidrs -}}
-{{- end -}}
+{{- $hasProbeSource := include "ferrum-gateway.adminAllowlistContainsIp" (dict "ip" $probeHost "allowedCidrs" $admin.allowedCidrs) -}}
 {{- if not $hasProbeSource -}}
 {{- $probeCidr := ternary (printf "%s/128" $probeHost) (printf "%s/32" $probeHost) $probeIsV6 -}}
 {{- fail (printf "admin.allowedCidrs must include %s (or bare %s) while the default exec probes are enabled; the computed exec probes dial the admin.bindAddress %s and the admin TCP allowlist otherwise drops the in-pod health checks. Add the exact probe source (or a covering CIDR) or override/disable every computed probe handler." $probeCidr $probeHost $probeHost) -}}
@@ -779,12 +891,15 @@ FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRE
 {{- $reserved = append $reserved (printf "%s%s" $name $sfx) -}}
 {{- end -}}
 {{- end -}}
-{{/* secretFileMounts emit <name>_FILE env vars later in the container spec, so
-     reserve those generated names too — otherwise env/extraEnv could shadow a
-     required secret's file source after the source guard already accepted it.
-     (secretFileMounts names may be any FERRUM_* var, not only reserved ones.) */}}
+{{/* secretFileMounts emit <name>_FILE env vars later in the container spec. Both
+     the generated name AND its base must be reserved: setting the base directly
+     alongside its _FILE source makes resolve_all_env_secrets() reject the two
+     providers for one key. (Mount names may be any FERRUM_* var.) */}}
 {{- range .Values.secretFileMounts -}}
-{{- if .name -}}{{- $reserved = append $reserved (printf "%s_FILE" .name) -}}{{- end -}}
+{{- if .name -}}
+{{- $reserved = append $reserved .name -}}
+{{- $reserved = append $reserved (printf "%s_FILE" .name) -}}
+{{- end -}}
 {{- end -}}
 {{- range $entry := .Values.extraEnv }}
 {{- if has $entry.name $reserved }}

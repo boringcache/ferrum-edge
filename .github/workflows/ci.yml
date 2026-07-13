@@ -2100,7 +2100,7 @@ jobs:
           fi
           grep -F 'contains a /0 catch-all CIDR' "$RUNNER_TEMP/ferrum-gateway-helm-results/catch-all-admin-cidr.err"
           # The runtime allowlist filters loopback too, so computed exec probes
-          # require their exact 127.0.0.1 source.
+          # require an entry that contains their 127.0.0.1 source.
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=database --set database.type=sqlite \
             --set-string database.sqlite.path=/data/ferrum.db \
@@ -2113,6 +2113,13 @@ jobs:
             exit 1
           fi
           grep -F 'must include 127.0.0.1/32' "$RUNNER_TEMP/ferrum-gateway-helm-results/probe-loopback-missing.err"
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-gateway-credentials \
+            --set admin.bindAddress=0.0.0.0 \
+            --set-string admin.allowedCidrs=127.0.0.0/8 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/probe-loopback-covering-cidr.yaml"
           # ports.adminHttp=0 switches computed probes to admin HTTPS, which only
           # serves with admin TLS material; render must fail without it.
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
@@ -2261,6 +2268,17 @@ jobs:
             echo "::error title=IPv6 probe host mismatch::admin.bindAddress=::1 must produce a --host ::1 probe"
             exit 1
           fi
+          # Rust's IpAddr::is_loopback treats all of 127/8 as loopback. Publishing
+          # a Service for 127.0.0.2 would still be unreachable through the pod IP.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set admin.bindAddress=127.0.0.2 \
+            --set admin.service.enabled=true \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv4-loopback-service.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv4-loopback-service.err"; then
+            echo "::error title=127/8 admin Service rendered::all 127/8 binds must be classified as loopback"
+            exit 1
+          fi
+          grep -F 'requires admin.bindAddress to be a non-loopback address' "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv4-loopback-service.err"
           # An unspecified IPv6 admin bind ([::]) is not guaranteed to accept v4-mapped
           # 127.0.0.1, so the computed probes must also dial ::1 for any IPv6 bind form.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
@@ -2293,6 +2311,18 @@ jobs:
             exit 1
           fi
           grep -F 'env.FERRUM_ADMIN_JWT_SECRET_FILE is managed by first-class' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-env-collision.err"
+          # The direct base also conflicts with its generated _FILE provider.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set 'secretFileMounts[0].name=FERRUM_BASIC_AUTH_HMAC_SECRET' \
+            --set 'secretFileMounts[0].secretName=ferrum-basic-auth' \
+            --set-string env.FERRUM_BASIC_AUTH_HMAC_SECRET=direct-secret \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/file-base-env-collision.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/file-base-env-collision.err"; then
+            echo "::error title=Secret file base env accepted::a direct base must not coexist with its _FILE provider"
+            exit 1
+          fi
+          grep -F 'env.FERRUM_BASIC_AUTH_HMAC_SECRET is managed by first-class' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-base-env-collision.err"
           # A proxy Service with no publishable ports is skipped (empty ports is
           # rejected by the API server).
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
@@ -2578,11 +2608,28 @@ jobs:
             exit 1
           fi
           grep -F 'must include 10.0.0.5/32' "$RUNNER_TEMP/ferrum-gateway-helm-results/concrete-cidr-missing.err"
-          # The exact probe source (or a covering CIDR) satisfies the guard.
+          # The exact probe source and a covering CIDR both satisfy the guard.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=file --set admin.bindAddress=10.0.0.5 \
             --set-string admin.allowedCidrs=10.0.0.5/32 \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/concrete-cidr-present.yaml"
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set admin.bindAddress=10.0.0.5 \
+            --set-string admin.allowedCidrs=10.0.0.0/8 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/concrete-covering-cidr.yaml"
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set admin.bindAddress=fd00::5 \
+            --set-string admin.allowedCidrs=fd00::/8 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv6-covering-cidr.yaml"
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set admin.bindAddress=fd00::5 \
+            --set-string admin.allowedCidrs=fe00::/8 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv6-cidr-missing.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv6-cidr-missing.err"; then
+            echo "::error title=IPv6 probe source omitted from allowlist::an unrelated IPv6 CIDR must not satisfy the guard"
+            exit 1
+          fi
+          grep -F 'must include fd00::5/128' "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv6-cidr-missing.err"
           # A resolver-suffixed source of a chart-managed base var is reserved: it
           # resolves into the base var and would collide with the chart's own
           # source at secret resolution (resolve_all_env_secrets aborts startup).

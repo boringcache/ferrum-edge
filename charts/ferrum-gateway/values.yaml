@@ -97,10 +97,11 @@ streamPorts: []
 # crash-loops. A /0 CIDR is not protection; the chart rejects literal /0 entries
 # here, while the binary remains authoritative for equivalent permit-all unions.
 # If you set admin.allowedCidrs while using the computed exec probes, include the
-# exact probe source so the admin TCP filter does not drop them. The probe source
+# probe source (directly or through a covering CIDR) so the admin TCP filter does
+# not drop them. The probe source
 # tracks admin.bindAddress: 127.0.0.1 for the empty default / 0.0.0.0, ::1 for ::,
-# and the configured address itself for any concrete bind (e.g. add 10.0.0.5/32
-# when admin.bindAddress=10.0.0.5).
+# and the configured address itself for any concrete bind (e.g. add 10.0.0.0/8
+# or 10.0.0.5/32 when admin.bindAddress=10.0.0.5).
 # -----------------------------------------------------------------------------
 admin:
   # Empty keeps the safe loopback default. Set to "0.0.0.0" or "::" to expose
@@ -311,8 +312,10 @@ secretFileMounts: []
 # values (FERRUM_MODE, FERRUM_DB_*, FERRUM_ADMIN_JWT_SECRET, etc.) are rejected,
 # as are their external-secret resolver suffixes (_VAULT/_AWS/_AZURE/_GCP/_FILE):
 # a suffixed source of a chart-managed base var resolves into that base var and
-# would collide with the chart's own source at startup. Use the dedicated value
-# (existingSecret / valueFrom / secretFileMounts) to source a managed secret.
+# would collide with the chart's own source at startup. A secretFileMounts entry
+# also reserves both `<name>` and `<name>_FILE`, because configuring the direct
+# base alongside the file source is the same provider conflict. Use the dedicated
+# value (existingSecret / valueFrom / secretFileMounts) to source a managed secret.
 # Example: FERRUM_LOG_LEVEL: info
 # Enabling HTTP/3 (FERRUM_ENABLE_HTTP3: "true") makes the proxy Service publish
 # its HTTPS port on UDP too (QUIC); it needs frontend TLS (or dp mode) and a
