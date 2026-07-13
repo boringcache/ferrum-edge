@@ -3324,6 +3324,66 @@ impl GatewayConfig {
         }
     }
 
+    /// Fail-closed handling of consumer identity collisions at full-load time
+    /// (issue #2121): remove every consumer whose id/username/custom_id
+    /// collides with the merged identity keyspace of an earlier-loaded
+    /// consumer, instead of letting `ConsumerIndex` warn-and-overwrite one
+    /// identity mapping (which mis-routes JWKS/JWT authentication).
+    ///
+    /// First-loaded consumer wins. Callers must load consumers in a stable
+    /// order (the SQL and Mongo full loaders sort by id). Self-collisions (a
+    /// consumer whose own custom_id equals its own id/username) are allowed, matching
+    /// [`Self::validate_unique_consumer_identities`].
+    ///
+    /// Returns one human-readable message per quarantined consumer; callers
+    /// log these at `error!` severity. Persistence-level enforcement (the
+    /// `consumer_identity_index` table/collection) prevents *new* collisions
+    /// from being committed; this guard covers pre-existing rows.
+    pub fn quarantine_colliding_consumer_identities(&mut self) -> Vec<String> {
+        let mut claimed: HashMap<String, (String, &'static str)> = HashMap::new();
+        let mut messages = Vec::new();
+
+        self.consumers.retain(|consumer| {
+            let mut values: Vec<(&'static str, &str)> = vec![
+                ("id", consumer.id.as_str()),
+                ("username", consumer.username.as_str()),
+            ];
+            if let Some(ref custom_id) = consumer.custom_id {
+                values.push(("custom_id", custom_id.as_str()));
+            }
+            // Self-collisions within one consumer are fine — dedupe values.
+            values.sort_by_key(|(_, value)| *value);
+            values.dedup_by_key(|(_, value)| *value);
+
+            let conflict = values.iter().find_map(|(field, value)| {
+                claimed
+                    .get(*value)
+                    .map(|(other_id, other_field)| (*field, *value, other_id.clone(), *other_field))
+            });
+
+            match conflict {
+                Some((field, value, other_id, other_field)) => {
+                    messages.push(format!(
+                        "Quarantined consumer '{}': its {} '{}' collides with the {} of \
+                         consumer '{}' — the consumer is excluded from this config load to \
+                         prevent incorrect JWKS/JWT authentication. Repair the stored \
+                         consumer records to restore it.",
+                        consumer.id, field, value, other_field, other_id
+                    ));
+                    false
+                }
+                None => {
+                    for (field, value) in values {
+                        claimed.insert(value.to_string(), (consumer.id.clone(), field));
+                    }
+                    true
+                }
+            }
+        });
+
+        messages
+    }
+
     /// Validate that consumer credentials are unique across all consumers.
     ///
     /// Checks keyauth API keys, basicauth usernames, and mTLS identities.
@@ -3816,10 +3876,13 @@ impl GatewayConfig {
             }
         }
 
-        let mut seen_consumer_ids: HashSet<&str> = HashSet::new();
+        let mut seen_consumer_ids: HashSet<(&str, &str)> = HashSet::new();
         for consumer in &self.consumers {
-            if !seen_consumer_ids.insert(&consumer.id) {
-                errors.push(format!("Duplicate consumer ID '{}'", consumer.id));
+            if !seen_consumer_ids.insert((&consumer.namespace, &consumer.id)) {
+                errors.push(format!(
+                    "Duplicate consumer ID '{}' in namespace '{}'",
+                    consumer.id, consumer.namespace
+                ));
             }
         }
 

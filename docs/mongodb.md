@@ -240,6 +240,21 @@ FERRUM_MONGO_DATABASE=ferrum
 
 The `w=majority` write concern ensures writes are acknowledged by a majority of members before returning, providing durability guarantees.
 
+### Concurrent-Write Admission Hardening (issue #2122)
+
+Admission checks that cannot be expressed as unique indexes (host-overlap route uniqueness, upstream reference integrity) are check-then-write and therefore raceable. The gateway hardens them differently per topology:
+
+**Replica set (full serialization):**
+
+- **Route uniqueness (DB-H1)** — `create_proxy`/`update_proxy` transactions first upsert a nonce document in the `proxy_route_locks` collection (`_id = "{namespace}:{route_key_hash}"`), then re-run the host/listen-path uniqueness check *inside* the transaction. Two concurrent transactions touching the same route bucket write-conflict on the lock document; the driver aborts and retries one, serializing them — the Mongo analogue of SQL's `SELECT ... FOR UPDATE` lock row.
+- **Upstream references (DB-H4)** — proxy writes that reference an upstream upsert a nonce document in `upstream_ref_guards` (`_id = "{namespace}:{upstream_id}"`) and verify the upstream exists in-session; `delete_upstream` writes the same guard document and runs its referencing-proxy checks inside its transaction. A concurrent create-referencing-proxy and delete-upstream pair write-conflict on the guard and serialize. The upstream document itself is never modified.
+
+**Standalone (convergent post-write reconciliation):** without transactions the gateway performs the check again *after* the write. Route conflicts resolve by deterministic loser-yield on `(created_at, _id)` — the losing document removes/restores itself and the request gets a 409; upstream delete-vs-reference races re-check after the delete and restore the upstream if a reference appeared. Every interleaving of one concurrent pair converges, but a narrow residual window remains — **replica sets are required for full concurrent-write safety**, consistent with the incremental-polling and multi-document-atomicity requirements above.
+
+Consumer identity uniqueness (issue #2121 — `id`/`username`/`custom_id` share one keyspace per namespace) needs no lock documents: it is enforced atomically by the `consumer_identity_index` collection's `_id = "{namespace}:{identity_value}"` uniqueness, reserved *before* the consumer write on standalone deployments and written in the same transaction on replica sets. Consumer documents themselves use `_id = "{namespace}:{id}"`, making consumer ids per-namespace.
+
+Both lock/guard collections hold tiny nonce documents (one per route bucket / referenced upstream) and are created explicitly at migration time because MongoDB < 4.4 cannot implicitly create collections inside transactions.
+
 ## Managed Services
 
 ### MongoDB Atlas

@@ -10297,6 +10297,7 @@ fn start_mesh_admin_listeners(
         mode: "mesh".to_string(),
         read_only: true,
         admin_audit_enabled: env_config.admin_audit_enabled,
+        admin_require_namespace_claim: env_config.admin_require_namespace_claim,
         startup_ready: Some(startup_ready.clone()),
         serving_degraded: Some(serving_degraded.clone()),
         serving_listener_failures: Some(serving_listener_failures.clone()),

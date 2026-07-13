@@ -102,6 +102,7 @@ fn create_test_env_config() -> EnvConfig {
         tls_no_verify: false,
         admin_read_only: false,
         admin_audit_enabled: false,
+        admin_require_namespace_claim: false,
         admin_tls_no_verify: false,
         enable_http3: false,
         http3_idle_timeout: 30,

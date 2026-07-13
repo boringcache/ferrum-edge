@@ -76,6 +76,7 @@ fn admin_state_with_mesh_runtime(
         mode: "mesh".to_string(),
         read_only: false,
         admin_audit_enabled: false,
+        admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
         serving_listener_failures: None,

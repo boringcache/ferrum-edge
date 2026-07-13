@@ -533,12 +533,13 @@ impl CpRejectedDeltaTracker {
 /// each namespace that has at least one changed or removed resource.
 ///
 /// Resources are matched by their `namespace` field; removed IDs are
-/// partitioned via a `(id → namespace)` lookup built from the CP's current
-/// accepted config so deletions reach the right per-namespace channel.
+/// partitioned via lookups built from the CP's current accepted config so
+/// deletions reach the right per-namespace channel. Consumer lookup keys are
+/// `(namespace, id)` because consumer IDs are namespace-local.
 fn partition_incremental_by_namespace(
     result: IncrementalResult,
     proxy_ns: &std::collections::HashMap<String, String>,
-    consumer_ns: &std::collections::HashMap<String, String>,
+    consumer_ns: &std::collections::HashMap<(String, String), String>,
     plugin_config_ns: &std::collections::HashMap<String, String>,
     upstream_ns: &std::collections::HashMap<String, String>,
 ) -> std::collections::HashMap<String, IncrementalResult> {
@@ -598,13 +599,13 @@ fn partition_incremental_by_namespace(
                 .push(id);
         }
     }
-    for id in result.removed_consumer_ids {
-        if let Some(ns) = consumer_ns.get(&id) {
+    for key in result.removed_consumer_ids {
+        if let Some(ns) = consumer_ns.get(&(key.namespace.clone(), key.id.clone())) {
             buckets
                 .entry(ns.clone())
                 .or_insert_with(|| make_empty(poll_timestamp))
                 .removed_consumer_ids
-                .push(id);
+                .push(key);
         }
     }
     for id in result.removed_plugin_config_ids {
@@ -629,16 +630,17 @@ fn partition_incremental_by_namespace(
     buckets
 }
 
-/// Build an `(id → namespace)` lookup from a full config snapshot. Used by
+/// Build resource-key-to-namespace lookups from a full config snapshot. Used by
 /// the multi-namespace incremental path so removal IDs (which don't carry
-/// their own namespace) can still be routed to the right per-namespace
-/// broadcast channel.
+/// their own namespace, except consumers) can still be routed to the right
+/// per-namespace broadcast channel. Consumer keys include namespace because
+/// consumer ids are only unique within a namespace.
 #[allow(clippy::type_complexity)]
 fn build_namespace_lookups(
     config: &GatewayConfig,
 ) -> (
     std::collections::HashMap<String, String>,
-    std::collections::HashMap<String, String>,
+    std::collections::HashMap<(String, String), String>,
     std::collections::HashMap<String, String>,
     std::collections::HashMap<String, String>,
 ) {
@@ -650,7 +652,7 @@ fn build_namespace_lookups(
     let consumer_ns = config
         .consumers
         .iter()
-        .map(|c| (c.id.clone(), c.namespace.clone()))
+        .map(|c| ((c.namespace.clone(), c.id.clone()), c.namespace.clone()))
         .collect();
     let plugin_config_ns = config
         .plugin_configs
@@ -908,6 +910,7 @@ pub async fn run(
         mode: "cp".into(),
         read_only: env_config.admin_read_only,
         admin_audit_enabled: env_config.admin_audit_enabled,
+        admin_require_namespace_claim: env_config.admin_require_namespace_claim,
         startup_ready: Some(startup_ready.clone()),
         serving_degraded: Some(serving_degraded.clone()),
         serving_listener_failures: None,
@@ -1984,7 +1987,7 @@ fn log_cp_listener_monitor_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::db_backend::IncrementalResult;
+    use crate::config::db_backend::{IncrementalResult, NamespacedResourceId};
     use crate::config::types::*;
     use chrono::Utc;
     use std::time::Instant;
@@ -2256,6 +2259,39 @@ mod tests {
         assert_eq!(tenant_delta.removed_proxy_ids, vec!["p1"]);
     }
 
+    #[test]
+    fn partition_incremental_routes_duplicate_consumer_ids_by_namespace() {
+        let mut prod = make_consumer("c1");
+        prod.namespace = "prod".to_string();
+        let mut staging = make_consumer("c1");
+        staging.namespace = "staging".to_string();
+        let current = GatewayConfig {
+            consumers: vec![prod, staging],
+            ..Default::default()
+        };
+        let (proxy_ns, consumer_ns, plugin_config_ns, upstream_ns) =
+            build_namespace_lookups(&current);
+        let mut result = empty_incremental();
+        result.removed_consumer_ids = vec![NamespacedResourceId::new("staging", "c1")];
+
+        let partitions = partition_incremental_by_namespace(
+            result,
+            &proxy_ns,
+            &consumer_ns,
+            &plugin_config_ns,
+            &upstream_ns,
+        );
+
+        assert!(!partitions.contains_key("prod"));
+        assert_eq!(
+            partitions
+                .get("staging")
+                .expect("staging delete must retain its namespace")
+                .removed_consumer_ids,
+            vec![NamespacedResourceId::new("staging", "c1")]
+        );
+    }
+
     // ── upsert_by_id ───────────────────────────────────────────────────
 
     #[test]
@@ -2357,7 +2393,7 @@ mod tests {
         let mut inc = empty_incremental();
         inc.removed_proxy_ids = vec!["remove".to_string()];
         inc.added_or_modified_proxies = vec![make_proxy("added")];
-        inc.removed_consumer_ids = vec!["c1".to_string()];
+        inc.removed_consumer_ids = vec![NamespacedResourceId::new("ferrum", "c1")];
         inc.added_or_modified_consumers = vec![make_consumer("c2")];
         apply_incremental_to_config(&mut config, inc);
 
@@ -2367,6 +2403,45 @@ mod tests {
         assert!(!config.proxies.iter().any(|p| p.id == "remove"));
         assert_eq!(config.consumers.len(), 1);
         assert_eq!(config.consumers[0].id, "c2");
+    }
+
+    #[test]
+    fn apply_incremental_keys_consumers_by_namespace_and_id() {
+        let mut prod = make_consumer("c1");
+        prod.namespace = "prod".to_string();
+        let mut staging = make_consumer("c1");
+        staging.namespace = "staging".to_string();
+        let mut updated_staging = staging.clone();
+        updated_staging.username = "updated-staging".to_string();
+        let mut config = GatewayConfig {
+            consumers: vec![prod, staging],
+            ..Default::default()
+        };
+        let mut inc = empty_incremental();
+        inc.removed_consumer_ids = vec![NamespacedResourceId::new("staging", "c1")];
+        inc.added_or_modified_consumers = vec![updated_staging];
+
+        apply_incremental_to_config(&mut config, inc);
+
+        assert_eq!(config.consumers.len(), 2);
+        assert_eq!(
+            config
+                .consumers
+                .iter()
+                .find(|consumer| consumer.namespace == "prod")
+                .expect("prod consumer must remain")
+                .username,
+            "user_c1"
+        );
+        assert_eq!(
+            config
+                .consumers
+                .iter()
+                .find(|consumer| consumer.namespace == "staging")
+                .expect("staging consumer must be updated")
+                .username,
+            "updated-staging"
+        );
     }
 
     // Regression: prior to this fix, CP mode used `tokio::select!` over the

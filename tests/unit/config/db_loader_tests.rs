@@ -281,7 +281,11 @@ async fn upstream_backend_tls_identity_fields_round_trip_sql_store() {
     ];
 
     store.create_upstream(&upstream).await.unwrap();
-    let loaded = store.get_upstream("tls-u1").await.unwrap().unwrap();
+    let loaded = store
+        .get_upstream("ferrum", "tls-u1")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         loaded.backend_tls_sni.as_deref(),
         Some("reviews.mesh.internal")
@@ -298,7 +302,11 @@ async fn upstream_backend_tls_identity_fields_round_trip_sql_store() {
     upstream.backend_tls_san_allow_list = vec!["10.0.0.8".to_string()];
     store.update_upstream(&upstream).await.unwrap();
 
-    let loaded = store.get_upstream("tls-u1").await.unwrap().unwrap();
+    let loaded = store
+        .get_upstream("ferrum", "tls-u1")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         loaded.backend_tls_sni.as_deref(),
         Some("ratings.mesh.internal")

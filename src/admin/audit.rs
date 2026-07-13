@@ -64,6 +64,11 @@ impl AuditEvent {
 pub struct AuditActor {
     pub sub: String,
     pub role: AdminRole,
+    /// Namespaces authorized by the token's optional `ns` claim. Parsed
+    /// fail-closed at authentication time (a malformed claim rejects the
+    /// token); only *enforced* against `X-Ferrum-Namespace` when
+    /// `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`.
+    pub allowed_namespaces: crate::grpc::auth::AllowedNamespaces,
 }
 
 impl AuditActor {
@@ -71,6 +76,7 @@ impl AuditActor {
         Ok(Self {
             sub: claims.sub.clone(),
             role: claims.admin_role()?,
+            allowed_namespaces: claims.allowed_namespaces()?,
         })
     }
 }

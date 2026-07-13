@@ -37,8 +37,12 @@ fn jwt_manager() -> JwtManager {
 }
 
 fn admin_token() -> String {
+    admin_token_with_additional_claims(json!({}))
+}
+
+fn admin_token_with_additional_claims(additional: Value) -> String {
     let now = chrono::Utc::now();
-    let claims = json!({
+    let mut claims = json!({
         "iss": JWT_ISSUER,
         "sub": "obs-test",
         "role": "admin",
@@ -47,6 +51,10 @@ fn admin_token() -> String {
         "exp": (now + chrono::Duration::seconds(600)).timestamp(),
         "jti": uuid::Uuid::new_v4().to_string(),
     });
+    claims
+        .as_object_mut()
+        .unwrap()
+        .extend(additional.as_object().unwrap().clone());
     encode(
         &Header::new(jsonwebtoken::Algorithm::HS256),
         &claims,
@@ -67,6 +75,7 @@ fn admin_state(metrics_auth: MetricsAuthPolicy) -> AdminState {
         mode: "file".to_string(),
         read_only: true,
         admin_audit_enabled: false,
+        admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
         serving_listener_failures: None,
@@ -241,6 +250,36 @@ async fn metrics_requires_auth_by_default() {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|ct| ct.contains("text/plain"))
     );
+}
+
+#[tokio::test]
+async fn malformed_namespace_claim_does_not_authorize_observability_detail() {
+    let (base, _sd) = start_admin(admin_state(MetricsAuthPolicy::default())).await;
+    let token = admin_token_with_additional_claims(json!({"ns": {"invalid": true}}));
+    let client = reqwest::Client::new();
+
+    let health = client
+        .get(format!("{base}/health"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status().as_u16(), 200);
+    let body: Value = health.json().await.unwrap();
+    assert_eq!(body.get("status").and_then(Value::as_str), Some("ok"));
+    assert!(body.get("ready").is_some());
+    assert!(
+        body.get("mode").is_none(),
+        "malformed ns leaked detail: {body}"
+    );
+
+    let metrics = client
+        .get(format!("{base}/metrics"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(metrics.status().as_u16(), 401);
 }
 
 #[tokio::test]

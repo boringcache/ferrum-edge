@@ -637,6 +637,7 @@ async fn start_node_agent_admin_listeners(
         mode: "node_agent".to_string(),
         read_only: true,
         admin_audit_enabled: env_config.admin_audit_enabled,
+        admin_require_namespace_claim: env_config.admin_require_namespace_claim,
         startup_ready: Some(startup_ready),
         // node_agent mode has no post-start listener supervision that flips
         // readiness; readiness is governed by `startup_ready` alone.

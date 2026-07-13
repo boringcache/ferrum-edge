@@ -639,10 +639,10 @@ fn rejected_delta_change_set_hash(result: &db_backend::IncrementalResult) -> u64
             .iter()
             .map(|consumer| (consumer.id.as_str(), consumer)),
     );
-    hash_sorted_ids(
+    hash_sorted_namespaced_ids(
         &mut hasher,
         "removed_consumer_ids",
-        result.removed_consumer_ids.iter().map(String::as_str),
+        result.removed_consumer_ids.iter(),
     );
     hash_sorted_resource_fingerprints(
         &mut hasher,
@@ -753,6 +753,23 @@ fn hash_sorted_ids<'a>(
     ids.sort_unstable();
     ids.len().hash(hasher);
     for id in ids {
+        id.hash(hasher);
+    }
+}
+
+fn hash_sorted_namespaced_ids<'a>(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    label: &'static str,
+    ids: impl Iterator<Item = &'a crate::config::db_backend::NamespacedResourceId>,
+) {
+    label.hash(hasher);
+    let mut ids: Vec<(&str, &str)> = ids
+        .map(|key| (key.namespace.as_str(), key.id.as_str()))
+        .collect();
+    ids.sort_unstable();
+    ids.len().hash(hasher);
+    for (namespace, id) in ids {
+        namespace.hash(hasher);
         id.hash(hasher);
     }
 }
@@ -1563,6 +1580,7 @@ pub async fn run(
         mode: "database".into(),
         read_only: env_config.admin_read_only,
         admin_audit_enabled: env_config.admin_audit_enabled,
+        admin_require_namespace_claim: env_config.admin_require_namespace_claim,
         startup_ready: Some(startup_ready.clone()),
         // Database mode has no post-start listener supervision that flips
         // readiness; readiness is governed by `startup_ready` alone.
