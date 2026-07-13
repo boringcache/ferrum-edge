@@ -1,0 +1,168 @@
+{{- include "ferrum-gateway.validate" . -}}
+{{- $adminHttp := include "ferrum-gateway.adminHttpPort" . -}}
+{{- $ports := .Values.ports | default dict -}}
+{{- $healthCmd := list "/app/ferrum-edge" "health" -}}
+{{- if eq ($adminHttp | toString) "0" -}}
+{{- $healthCmd = list "/app/ferrum-edge" "health" "--tls" "--tls-no-verify" -}}
+{{- else -}}
+{{- $healthCmd = list "/app/ferrum-edge" "health" "-p" ($adminHttp | toString) "--host" "127.0.0.1" -}}
+{{- end -}}
+{{- $probeHandler := .Values.probes.override | default dict -}}
+{{- if not $probeHandler }}{{- $probeHandler = dict "exec" (dict "command" $healthCmd) -}}{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ferrum-gateway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferrum-gateway.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "ferrum-gateway.selectorLabels" . | nindent 6 }}
+  strategy:
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ferrum-gateway.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- if and (eq .Values.mode "file") .Values.file.inlineConfig (not .Values.file.existingConfigMap) }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "ferrum-gateway.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ferrum-edge
+          image: {{ include "ferrum-gateway.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["run"]
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            {{- if and (hasKey $ports "proxyHttp") (ne ($ports.proxyHttp | toString) "0") }}
+            - name: proxy-http
+              containerPort: {{ $ports.proxyHttp }}
+              protocol: TCP
+            {{- end }}
+            {{- if and (hasKey $ports "proxyHttps") (ne ($ports.proxyHttps | toString) "0") }}
+            - name: proxy-https
+              containerPort: {{ $ports.proxyHttps }}
+              protocol: TCP
+            {{- end }}
+            {{- if and (hasKey $ports "adminHttp") (ne ($ports.adminHttp | toString) "0") }}
+            - name: admin-http
+              containerPort: {{ $ports.adminHttp }}
+              protocol: TCP
+            {{- end }}
+            {{- if and (hasKey $ports "adminHttps") (ne ($ports.adminHttps | toString) "0") }}
+            - name: admin-https
+              containerPort: {{ $ports.adminHttps }}
+              protocol: TCP
+            {{- end }}
+            {{- if eq .Values.mode "cp" }}
+            - name: grpc
+              containerPort: {{ include "ferrum-gateway.cpGrpcPort" . }}
+              protocol: TCP
+            {{- end }}
+            {{- range .Values.streamPorts }}
+            - name: {{ .name }}
+              containerPort: {{ .containerPort }}
+              protocol: {{ .protocol | default "TCP" }}
+            {{- end }}
+          env:
+            {{- include "ferrum-gateway.modeEnv" . | nindent 12 }}
+            {{- include "ferrum-gateway.portEnv" . | nindent 12 }}
+            {{- include "ferrum-gateway.shutdownEnv" . | nindent 12 }}
+            {{- include "ferrum-gateway.tlsEnv" . | nindent 12 }}
+            {{- include "ferrum-gateway.secretFileEnv" . | nindent 12 }}
+            {{- include "ferrum-gateway.userEnv" . | nindent 12 }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            {{- toYaml $probeHandler | nindent 12 }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+          {{- end }}
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            {{- toYaml $probeHandler | nindent 12 }}
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+          {{- end }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            {{- toYaml $probeHandler | nindent 12 }}
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if eq .Values.mode "file" }}
+            - name: ferrum-config
+              mountPath: {{ .Values.file.mountPath | default "/etc/ferrum/config" }}
+              readOnly: true
+            {{- end }}
+            {{- include "ferrum-gateway.tlsMounts" . | nindent 12 }}
+            {{- include "ferrum-gateway.secretFileMounts" . | nindent 12 }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if eq .Values.mode "file" }}
+        - name: ferrum-config
+          configMap:
+            name: {{ .Values.file.existingConfigMap | default (printf "%s-config" (include "ferrum-gateway.fullname" .)) }}
+        {{- end }}
+        {{- include "ferrum-gateway.tlsVolumes" . | nindent 8 }}
+        {{- include "ferrum-gateway.secretFileVolumes" . | nindent 8 }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

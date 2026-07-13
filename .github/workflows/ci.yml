@@ -1881,6 +1881,69 @@ jobs:
             fi
           done
 
+      - name: Core gateway chart static validation
+        if: steps.helm_changes.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ferrum-gateway-helm-results"
+          helm lint ./charts/ferrum-gateway
+          # Default (file mode) renders a runnable, Secret-free gateway.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
+          grep -Fq 'name: FERRUM_FILE_CONFIG_PATH' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
+          # Each supported mode renders.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-gateway-credentials \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/database-rendered.yaml"
+          helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            -f ./charts/ferrum-gateway/examples/cp-values.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-rendered.yaml"
+          grep -Fq 'name: FERRUM_CP_GRPC_LISTEN_ADDR' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-rendered.yaml"
+          helm template ferrum-dp ./charts/ferrum-gateway --namespace ferrum \
+            -f ./charts/ferrum-gateway/examples/dp-values.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-rendered.yaml"
+          grep -Fq 'name: FERRUM_DP_CP_GRPC_URLS' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-rendered.yaml"
+          # Secret-backed modes render env via valueFrom, never inline secrets.
+          for name in FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET; do
+            if ! grep -A5 "name: ${name}" "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-rendered.yaml" | grep -q 'valueFrom:'; then
+              echo "::error title=Gateway CP secret not via valueFrom::${name} must be a Secret reference in cp-values.yaml"
+              exit 1
+            fi
+          done
+          # database/cp mode without an admin JWT secret must fail render.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/missing-admin-jwt.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/missing-admin-jwt.err"; then
+            echo "::error title=Missing admin JWT rendered successfully::database mode must require an admin JWT secret"
+            exit 1
+          fi
+          grep -F 'admin.jwtSecret requires exactly one of' "$RUNNER_TEMP/ferrum-gateway-helm-results/missing-admin-jwt.err"
+          # A non-loopback plaintext admin bind in database mode must fail render
+          # (the binary hard-fails on this at boot).
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-gateway-credentials \
+            --set admin.bindAddress=0.0.0.0 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/unsafe-admin-bind.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/unsafe-admin-bind.err"; then
+            echo "::error title=Unsafe admin bind rendered successfully::non-loopback plaintext admin bind must fail in database mode"
+            exit 1
+          fi
+          grep -F 'hard-fails on a non-loopback plaintext admin bind' "$RUNNER_TEMP/ferrum-gateway-helm-results/unsafe-admin-bind.err"
+
+      - name: Upload core gateway chart diagnostics
+        if: always() && steps.helm_changes.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ferrum-gateway-helm-chart
+          path: ${{ runner.temp }}/ferrum-gateway-helm-results
+          retention-days: 7
+
       - name: Download prebuilt gateway binary
         if: steps.helm_changes.outputs.changed == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

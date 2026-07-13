@@ -1,0 +1,491 @@
+{{/*
+Ferrum Edge core-gateway chart helpers.
+
+Design notes:
+- Templates intentionally fail at render time for invalid or unsafe settings so
+  an un-bootable pod (missing DB URL / JWT secret, or a non-loopback plaintext
+  admin bind the binary hard-fails on in database/cp modes) is never rendered.
+- Secret material is never rendered into ConfigMaps and never inlined into logs;
+  credentials flow only through env values or Secret references the operator owns.
+*/}}
+
+{{- define "ferrum-gateway.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "ferrum-gateway.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ferrum-gateway.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "ferrum-gateway.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "ferrum-gateway.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{- define "ferrum-gateway.labels" -}}
+helm.sh/chart: {{ include "ferrum-gateway.chart" . }}
+{{ include "ferrum-gateway.selectorLabels" . }}
+app.kubernetes.io/part-of: ferrum-edge
+app.kubernetes.io/component: gateway
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- with .Values.commonLabels }}
+{{ toYaml . }}
+{{- end }}
+{{- end -}}
+
+{{- define "ferrum-gateway.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create -}}
+{{- default (include "ferrum-gateway.fullname" .) .Values.serviceAccount.name -}}
+{{- else -}}
+{{- default "default" .Values.serviceAccount.name -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ferrum-gateway.image" -}}
+{{- $tag := .Values.image.tag | default .Chart.AppVersion -}}
+{{- printf "%s:%s" .Values.image.repository $tag -}}
+{{- end -}}
+
+{{/* File-mode config path (kept in sync with the ConfigMap mount). */}}
+{{- define "ferrum-gateway.fileConfigPath" -}}
+{{- $file := .Values.file | default dict -}}
+{{- $dir := $file.mountPath | default "/etc/ferrum/config" -}}
+{{- printf "%s/%s" (trimSuffix "/" $dir) ($file.fileName | default "config.yaml") -}}
+{{- end -}}
+
+{{/* Admin plaintext HTTP port (0 disables plaintext admin). */}}
+{{- define "ferrum-gateway.adminHttpPort" -}}
+{{- $ports := .Values.ports | default dict -}}
+{{- if hasKey $ports "adminHttp" -}}{{- $ports.adminHttp -}}{{- else -}}9000{{- end -}}
+{{- end -}}
+
+{{/* True when a secret source (value / existingSecret.name / valueFrom) is set. */}}
+{{- define "ferrum-gateway.sourceConfigured" -}}
+{{- $source := . | default dict -}}
+{{- $existing := $source.existingSecret | default dict -}}
+{{- if or $source.value $source.valueFrom $existing.name -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Validate a single secret source: exactly one of value, existingSecret.name, or
+valueFrom, and (optionally) a minimum inline-value length.
+*/}}
+{{- define "ferrum-gateway.validateOneSource" -}}
+{{- $label := .label -}}
+{{- $source := .source | default dict -}}
+{{- $existing := $source.existingSecret | default dict -}}
+{{- $count := 0 -}}
+{{- if $source.value -}}{{- $count = add $count 1 -}}{{- end -}}
+{{- if $source.valueFrom -}}{{- $count = add $count 1 -}}{{- end -}}
+{{- if $existing.name -}}{{- $count = add $count 1 -}}{{- end -}}
+{{- if ne $count 1 -}}
+{{- fail (printf "%s requires exactly one of value, existingSecret.name, or valueFrom" $label) -}}
+{{- end -}}
+{{- if and $source.value .minLength (lt (len $source.value) (.minLength | int)) -}}
+{{- fail (printf "%s.value must be at least %d characters" $label (.minLength | int)) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Render an env var from a secret source (value or Secret reference). */}}
+{{- define "ferrum-gateway.renderSecretEnv" -}}
+{{- $source := .source | default dict -}}
+{{- $existing := $source.existingSecret | default dict -}}
+- name: {{ .name }}
+{{- if $source.valueFrom }}
+  valueFrom:
+{{ toYaml $source.valueFrom | nindent 4 }}
+{{- else if $existing.name }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ $existing.name | quote }}
+      key: {{ default .defaultKey $existing.key | quote }}
+{{- else }}
+  value: {{ $source.value | quote }}
+{{- end }}
+{{- end -}}
+
+{{- define "ferrum-gateway.uriComponentEncode" -}}
+{{- . | toString | urlquery | replace "+" "%20" -}}
+{{- end -}}
+
+{{- define "ferrum-gateway.structuredDbUrl" -}}
+{{- $db := . -}}
+{{- $port := "" -}}
+{{- if $db.port -}}{{- $port = printf ":%v" $db.port -}}{{- end -}}
+{{- $host := $db.host -}}
+{{- if and (contains ":" $host) (not (hasPrefix "[" $host)) -}}
+{{- $host = printf "[%s]" $host -}}
+{{- end -}}
+{{- $auth := "" -}}
+{{- if and $db.username $db.password -}}
+{{- $auth = printf "%s:%s@" (include "ferrum-gateway.uriComponentEncode" $db.username) (include "ferrum-gateway.uriComponentEncode" $db.password) -}}
+{{- end -}}
+{{- $path := "" -}}
+{{- if $db.name -}}{{- $path = printf "/%s" (include "ferrum-gateway.uriComponentEncode" $db.name) -}}{{- end -}}
+{{- $query := "" -}}
+{{- if $db.params -}}
+{{- $pairs := list -}}
+{{- range $key := keys $db.params | sortAlpha -}}
+{{- $pairs = append $pairs (printf "%s=%s" (include "ferrum-gateway.uriComponentEncode" $key) (include "ferrum-gateway.uriComponentEncode" (get $db.params $key))) -}}
+{{- end -}}
+{{- if $pairs -}}{{- $query = printf "?%s" (join "&" $pairs) -}}{{- end -}}
+{{- end -}}
+{{- printf "%s://%s%s%s%s%s" $db.type $auth $host $port $path $query -}}
+{{- end -}}
+
+{{- define "ferrum-gateway.renderDbUrlEnv" -}}
+{{- $db := .Values.database | default dict -}}
+{{- $existing := $db.existingSecret | default dict -}}
+{{- $sqlite := $db.sqlite | default dict -}}
+- name: FERRUM_DB_URL
+{{- if $db.urlFrom }}
+  valueFrom:
+{{ toYaml $db.urlFrom | nindent 4 }}
+{{- else if $existing.name }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ $existing.name | quote }}
+      key: {{ default "url" $existing.urlKey | quote }}
+{{- else if $db.url }}
+  value: {{ $db.url | quote }}
+{{- else if and (eq $db.type "sqlite") $sqlite.path }}
+  value: {{ printf "sqlite:%s?mode=%s" $sqlite.path (default "rwc" $sqlite.mode) | quote }}
+{{- else }}
+  value: {{ include "ferrum-gateway.structuredDbUrl" $db | quote }}
+{{- end }}
+{{- end -}}
+
+{{/* ---------------------------------------------------------------------------
+Validation: fail render on missing/unsafe configuration.
+--------------------------------------------------------------------------- */}}
+{{- define "ferrum-gateway.validateDatabase" -}}
+{{- $db := .Values.database | default dict -}}
+{{- if not $db.type -}}
+{{- fail (printf "database.type is required for mode=%s (one of: sqlite, postgres, mysql, mongodb)" .Values.mode) -}}
+{{- end -}}
+{{- if not (has $db.type (list "sqlite" "postgres" "mysql" "mongodb")) -}}
+{{- fail "database.type must be one of: sqlite, postgres, mysql, mongodb" -}}
+{{- end -}}
+{{- $urlCount := 0 -}}
+{{- $existing := $db.existingSecret | default dict -}}
+{{- $sqlite := $db.sqlite | default dict -}}
+{{- if $db.url -}}{{- $urlCount = add $urlCount 1 -}}{{- end -}}
+{{- if $db.urlFrom -}}{{- $urlCount = add $urlCount 1 -}}{{- end -}}
+{{- if $existing.name -}}{{- $urlCount = add $urlCount 1 -}}{{- end -}}
+{{- if and (eq $db.type "sqlite") $sqlite.path -}}{{- $urlCount = add $urlCount 1 -}}{{- end -}}
+{{- if $db.host -}}{{- $urlCount = add $urlCount 1 -}}{{- end -}}
+{{- if ne $urlCount 1 -}}
+{{- fail "database requires exactly one URL source: url, urlFrom, existingSecret.name, sqlite.path, or structured host settings" -}}
+{{- end -}}
+{{- if and (ne $db.type "sqlite") $sqlite.path -}}
+{{- fail "database.sqlite.path is valid only when database.type=sqlite" -}}
+{{- end -}}
+{{- if and (eq $db.type "sqlite") $db.host -}}
+{{- fail "database.host is not valid when database.type=sqlite" -}}
+{{- end -}}
+{{- if and $db.host (or (eq $db.type "postgres") (eq $db.type "mysql")) (not $db.name) -}}
+{{- fail "database.name is required for structured postgres/mysql database URLs" -}}
+{{- end -}}
+{{- if or $db.username $db.password -}}
+{{- if not $db.host -}}{{- fail "database username/password require structured host settings" -}}{{- end -}}
+{{- if not (and $db.username $db.password) -}}{{- fail "database structured credentials require both username and password, or neither" -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ferrum-gateway.validate" -}}
+{{- $mode := .Values.mode | default "" -}}
+{{- if not (has $mode (list "database" "file" "cp" "dp")) -}}
+{{- fail (printf "mode must be one of: database, file, cp, dp (got %q). The mesh, injector, and node_agent modes live in the ferrum-mesh chart, not this one." $mode) -}}
+{{- end -}}
+{{- if or (eq $mode "database") (eq $mode "cp") -}}
+{{- include "ferrum-gateway.validateDatabase" . -}}
+{{- include "ferrum-gateway.validateOneSource" (dict "label" "admin.jwtSecret" "source" (.Values.admin.jwtSecret | default dict) "minLength" 32) -}}
+{{- end -}}
+{{- if eq $mode "cp" -}}
+{{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" (.Values.grpc.jwtSecret | default dict) "minLength" 32) -}}
+{{- end -}}
+{{- if eq $mode "dp" -}}
+{{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" (.Values.grpc.jwtSecret | default dict) "minLength" 32) -}}
+{{- if not .Values.dp.cpGrpcUrls -}}
+{{- fail "dp.cpGrpcUrls is required for mode=dp (comma-separated CP gRPC URLs, e.g. https://ferrum-cp:50051)" -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $mode "file" -}}
+{{- $file := .Values.file | default dict -}}
+{{- if and (not $file.inlineConfig) (not $file.existingConfigMap) -}}
+{{- fail "mode=file requires either file.inlineConfig or file.existingConfigMap" -}}
+{{- end -}}
+{{- if and $file.inlineConfig $file.existingConfigMap -}}
+{{- fail "set only one of file.inlineConfig or file.existingConfigMap, not both" -}}
+{{- end -}}
+{{- end -}}
+{{/* Admin bind safety. The binary binds admin to loopback by default. */}}
+{{- $admin := .Values.admin | default dict -}}
+{{- $bind := $admin.bindAddress | default "" -}}
+{{- $loopback := has $bind (list "" "127.0.0.1" "::1" "localhost") -}}
+{{- $adminHttpPort := include "ferrum-gateway.adminHttpPort" . -}}
+{{- $adminSvc := $admin.service | default dict -}}
+{{- if and $adminSvc.enabled $loopback -}}
+{{- fail "admin.service.enabled=true requires admin.bindAddress to be a non-loopback address (e.g. 0.0.0.0 or ::); a loopback-bound admin listener is not reachable through a Service" -}}
+{{- end -}}
+{{- if and (not $loopback) (or (eq $mode "database") (eq $mode "cp")) (ne ($adminHttpPort | toString) "0") -}}
+{{- $tlsAdmin := (.Values.tls | default dict).admin | default dict -}}
+{{- $hasProtection := or $admin.allowedCidrs (and $tlsAdmin.enabled $tlsAdmin.secretName) $admin.allowInsecureHttp -}}
+{{- if not $hasProtection -}}
+{{- fail (printf "mode=%s hard-fails on a non-loopback plaintext admin bind. Set one of: admin.allowedCidrs, admin TLS (tls.admin.enabled + ports.adminHttp=0), or admin.allowInsecureHttp=true with a NetworkPolicy" $mode) -}}
+{{- end -}}
+{{- end -}}
+{{/* Graceful shutdown: give the pod time to drain plus the ~5s cleanup window. */}}
+{{- $drain := .Values.shutdownDrainSeconds -}}
+{{- $grace := .Values.terminationGracePeriodSeconds -}}
+{{- if and $drain $grace (lt (int $grace) (add (int $drain) 5)) -}}
+{{- fail (printf "terminationGracePeriodSeconds (%d) must be at least shutdownDrainSeconds + 5s cleanup (%d)" (int $grace) (add (int $drain) 5)) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* ---------------------------------------------------------------------------
+Env assembly.
+--------------------------------------------------------------------------- */}}
+{{- define "ferrum-gateway.reservedEnv" -}}
+FERRUM_MODE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET FERRUM_DP_CP_GRPC_URLS FERRUM_FILE_CONFIG_PATH FERRUM_CP_GRPC_LISTEN_ADDR
+{{- end -}}
+
+{{- define "ferrum-gateway.modeEnv" -}}
+{{- $mode := .Values.mode -}}
+- name: FERRUM_MODE
+  value: {{ $mode | quote }}
+{{- if .Values.ferrumNamespace }}
+- name: FERRUM_NAMESPACE
+  value: {{ .Values.ferrumNamespace | quote }}
+{{- end }}
+{{- if or (eq $mode "database") (eq $mode "cp") }}
+- name: FERRUM_DB_TYPE
+  value: {{ .Values.database.type | quote }}
+{{ include "ferrum-gateway.renderDbUrlEnv" . }}
+{{ include "ferrum-gateway.renderSecretEnv" (dict "name" "FERRUM_ADMIN_JWT_SECRET" "source" (.Values.admin.jwtSecret | default dict) "defaultKey" "admin-jwt-secret") }}
+{{- else if include "ferrum-gateway.sourceConfigured" (.Values.admin.jwtSecret | default dict) }}
+{{ include "ferrum-gateway.renderSecretEnv" (dict "name" "FERRUM_ADMIN_JWT_SECRET" "source" (.Values.admin.jwtSecret | default dict) "defaultKey" "admin-jwt-secret") }}
+{{- end }}
+{{- if eq $mode "cp" }}
+{{ include "ferrum-gateway.renderSecretEnv" (dict "name" "FERRUM_CP_DP_GRPC_JWT_SECRET" "source" (.Values.grpc.jwtSecret | default dict) "defaultKey" "cp-dp-grpc-jwt-secret") }}
+- name: FERRUM_CP_GRPC_LISTEN_ADDR
+  value: {{ printf "%s:%v" (.Values.cp.grpcBindAddress | default "0.0.0.0") (include "ferrum-gateway.cpGrpcPort" .) | quote }}
+{{- if .Values.cp.namespaces }}
+- name: FERRUM_CP_NAMESPACES
+  value: {{ .Values.cp.namespaces | quote }}
+{{- end }}
+{{- if .Values.cp.requireNamespaceClaim }}
+- name: FERRUM_CP_REQUIRE_NAMESPACE_CLAIM
+  value: "true"
+{{- end }}
+{{- end }}
+{{- if eq $mode "dp" }}
+- name: FERRUM_DP_CP_GRPC_URLS
+  value: {{ .Values.dp.cpGrpcUrls | quote }}
+{{ include "ferrum-gateway.renderSecretEnv" (dict "name" "FERRUM_CP_DP_GRPC_JWT_SECRET" "source" (.Values.grpc.jwtSecret | default dict) "defaultKey" "cp-dp-grpc-jwt-secret") }}
+{{- if .Values.dp.failoverPrimaryRetrySeconds }}
+- name: FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS
+  value: {{ .Values.dp.failoverPrimaryRetrySeconds | quote }}
+{{- end }}
+{{- end }}
+{{- if eq $mode "file" }}
+- name: FERRUM_FILE_CONFIG_PATH
+  value: {{ include "ferrum-gateway.fileConfigPath" . | quote }}
+{{- end }}
+{{- end -}}
+
+{{- define "ferrum-gateway.cpGrpcPort" -}}
+{{- $ports := .Values.ports | default dict -}}
+{{- $ports.cpGrpc | default 50051 -}}
+{{- end -}}
+
+{{/* Proxy / admin port + bind env. Ports set to 0 disable the listener. */}}
+{{- define "ferrum-gateway.portEnv" -}}
+{{- $ports := .Values.ports | default dict -}}
+{{- if hasKey $ports "proxyHttp" }}
+- name: FERRUM_PROXY_HTTP_PORT
+  value: {{ $ports.proxyHttp | quote }}
+{{- end }}
+{{- if hasKey $ports "proxyHttps" }}
+- name: FERRUM_PROXY_HTTPS_PORT
+  value: {{ $ports.proxyHttps | quote }}
+{{- end }}
+{{- if hasKey $ports "adminHttp" }}
+- name: FERRUM_ADMIN_HTTP_PORT
+  value: {{ $ports.adminHttp | quote }}
+{{- end }}
+{{- if hasKey $ports "adminHttps" }}
+- name: FERRUM_ADMIN_HTTPS_PORT
+  value: {{ $ports.adminHttps | quote }}
+{{- end }}
+{{- $admin := .Values.admin | default dict }}
+{{- if $admin.bindAddress }}
+- name: FERRUM_ADMIN_BIND_ADDRESS
+  value: {{ $admin.bindAddress | quote }}
+{{- end }}
+{{- if $admin.allowedCidrs }}
+- name: FERRUM_ADMIN_ALLOWED_CIDRS
+  value: {{ $admin.allowedCidrs | quote }}
+{{- end }}
+{{- if $admin.allowInsecureHttp }}
+- name: FERRUM_ALLOW_INSECURE_ADMIN_HTTP
+  value: "true"
+{{- end }}
+{{- end -}}
+
+{{/* Shutdown drain env (pairs with terminationGracePeriodSeconds). */}}
+{{- define "ferrum-gateway.shutdownEnv" -}}
+{{- if .Values.shutdownDrainSeconds }}
+- name: FERRUM_SHUTDOWN_DRAIN_SECONDS
+  value: {{ .Values.shutdownDrainSeconds | quote }}
+{{- end }}
+{{- end -}}
+
+{{/* TLS path env for each enabled surface. */}}
+{{- define "ferrum-gateway.tlsEnv" -}}
+{{- $tls := .Values.tls | default dict -}}
+{{- $f := $tls.frontend | default dict -}}
+{{- if and $f.enabled $f.secretName }}
+- name: FERRUM_FRONTEND_TLS_CERT_PATH
+  value: {{ printf "%s/%s" (trimSuffix "/" ($f.mountPath | default "/etc/ferrum/tls/frontend")) ($f.certKey | default "tls.crt") | quote }}
+- name: FERRUM_FRONTEND_TLS_KEY_PATH
+  value: {{ printf "%s/%s" (trimSuffix "/" ($f.mountPath | default "/etc/ferrum/tls/frontend")) ($f.keyKey | default "tls.key") | quote }}
+{{- if $f.clientCaKey }}
+- name: FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH
+  value: {{ printf "%s/%s" (trimSuffix "/" ($f.mountPath | default "/etc/ferrum/tls/frontend")) $f.clientCaKey | quote }}
+{{- end }}
+{{- end }}
+{{- $a := $tls.admin | default dict -}}
+{{- if and $a.enabled $a.secretName }}
+- name: FERRUM_ADMIN_TLS_CERT_PATH
+  value: {{ printf "%s/%s" (trimSuffix "/" ($a.mountPath | default "/etc/ferrum/tls/admin")) ($a.certKey | default "tls.crt") | quote }}
+- name: FERRUM_ADMIN_TLS_KEY_PATH
+  value: {{ printf "%s/%s" (trimSuffix "/" ($a.mountPath | default "/etc/ferrum/tls/admin")) ($a.keyKey | default "tls.key") | quote }}
+{{- if $a.clientCaKey }}
+- name: FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH
+  value: {{ printf "%s/%s" (trimSuffix "/" ($a.mountPath | default "/etc/ferrum/tls/admin")) $a.clientCaKey | quote }}
+{{- end }}
+{{- end }}
+{{- $b := $tls.backend | default dict -}}
+{{- if and $b.enabled $b.secretName }}
+- name: FERRUM_BACKEND_TLS_CLIENT_CERT_PATH
+  value: {{ printf "%s/%s" (trimSuffix "/" ($b.mountPath | default "/etc/ferrum/tls/backend")) ($b.clientCertKey | default "tls.crt") | quote }}
+- name: FERRUM_BACKEND_TLS_CLIENT_KEY_PATH
+  value: {{ printf "%s/%s" (trimSuffix "/" ($b.mountPath | default "/etc/ferrum/tls/backend")) ($b.clientKeyKey | default "tls.key") | quote }}
+{{- end }}
+{{- if eq .Values.mode "cp" }}
+{{- $cg := $tls.cpGrpc | default dict -}}
+{{- if and $cg.enabled $cg.secretName }}
+- name: FERRUM_CP_GRPC_TLS_CERT_PATH
+  value: {{ printf "%s/%s" (trimSuffix "/" ($cg.mountPath | default "/etc/ferrum/tls/cp-grpc")) ($cg.certKey | default "tls.crt") | quote }}
+- name: FERRUM_CP_GRPC_TLS_KEY_PATH
+  value: {{ printf "%s/%s" (trimSuffix "/" ($cg.mountPath | default "/etc/ferrum/tls/cp-grpc")) ($cg.keyKey | default "tls.key") | quote }}
+{{- if $cg.clientCaKey }}
+- name: FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH
+  value: {{ printf "%s/%s" (trimSuffix "/" ($cg.mountPath | default "/etc/ferrum/tls/cp-grpc")) $cg.clientCaKey | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if eq .Values.mode "dp" }}
+{{- $dg := $tls.dpGrpc | default dict -}}
+{{- if and $dg.enabled $dg.secretName }}
+- name: FERRUM_DP_GRPC_TLS_CA_CERT_PATH
+  value: {{ printf "%s/%s" (trimSuffix "/" ($dg.mountPath | default "/etc/ferrum/tls/dp-grpc")) ($dg.caKey | default "ca.crt") | quote }}
+{{- if $dg.clientCertKey }}
+- name: FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH
+  value: {{ printf "%s/%s" (trimSuffix "/" ($dg.mountPath | default "/etc/ferrum/tls/dp-grpc")) $dg.clientCertKey | quote }}
+- name: FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
+  value: {{ printf "%s/%s" (trimSuffix "/" ($dg.mountPath | default "/etc/ferrum/tls/dp-grpc")) ($dg.clientKeyKey | default "tls.key") | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/* External-secret _FILE-suffix env: mount a Secret key and point <VAR>_FILE at it. */}}
+{{- define "ferrum-gateway.secretFileEnv" -}}
+{{- range .Values.secretFileMounts }}
+- name: {{ printf "%s_FILE" .name }}
+  value: {{ printf "%s/%s" (trimSuffix "/" (.mountPath | default (printf "/etc/ferrum/secret-files/%s" (lower .name)))) (.secretKey | default "value") | quote }}
+{{- end }}
+{{- end -}}
+
+{{/* User-supplied simple string env, with reserved keys rejected. */}}
+{{- define "ferrum-gateway.userEnv" -}}
+{{- $reserved := splitList " " (include "ferrum-gateway.reservedEnv" .) -}}
+{{- range $name, $value := .Values.env }}
+{{- if has $name $reserved }}
+{{- fail (printf "env.%s is managed by first-class chart values; set it through the dedicated value instead of env" $name) }}
+{{- end }}
+- name: {{ $name }}
+  value: {{ $value | quote }}
+{{- end }}
+{{- end -}}
+
+{{/* ---------------------------------------------------------------------------
+Volumes / mounts.
+--------------------------------------------------------------------------- */}}
+{{- define "ferrum-gateway.tlsVolumes" -}}
+{{- $tls := .Values.tls | default dict -}}
+{{- range $key, $section := $tls }}
+{{- $s := $section | default dict }}
+{{- if and $s.enabled $s.secretName }}
+{{- if or (not (has $key (list "cpGrpc" "dpGrpc"))) (and (eq $key "cpGrpc") (eq $.Values.mode "cp")) (and (eq $key "dpGrpc") (eq $.Values.mode "dp")) }}
+- name: {{ printf "tls-%s" ($key | kebabcase) }}
+  secret:
+    secretName: {{ $s.secretName | quote }}
+    defaultMode: 0400
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{- define "ferrum-gateway.tlsMounts" -}}
+{{- $tls := .Values.tls | default dict -}}
+{{- $defaults := dict "frontend" "/etc/ferrum/tls/frontend" "admin" "/etc/ferrum/tls/admin" "backend" "/etc/ferrum/tls/backend" "cpGrpc" "/etc/ferrum/tls/cp-grpc" "dpGrpc" "/etc/ferrum/tls/dp-grpc" -}}
+{{- range $key, $section := $tls }}
+{{- $s := $section | default dict }}
+{{- if and $s.enabled $s.secretName }}
+{{- if or (not (has $key (list "cpGrpc" "dpGrpc"))) (and (eq $key "cpGrpc") (eq $.Values.mode "cp")) (and (eq $key "dpGrpc") (eq $.Values.mode "dp")) }}
+- name: {{ printf "tls-%s" ($key | kebabcase) }}
+  mountPath: {{ $s.mountPath | default (get $defaults $key) | quote }}
+  readOnly: true
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{- define "ferrum-gateway.secretFileVolumes" -}}
+{{- range $i, $m := .Values.secretFileMounts }}
+- name: {{ printf "secret-file-%d" $i }}
+  secret:
+    secretName: {{ $m.secretName | quote }}
+    defaultMode: 0400
+    items:
+      - key: {{ ($m.secretKey | default "value") | quote }}
+        path: {{ ($m.secretKey | default "value") | quote }}
+{{- end }}
+{{- end -}}
+
+{{- define "ferrum-gateway.secretFileMounts" -}}
+{{- range $i, $m := .Values.secretFileMounts }}
+- name: {{ printf "secret-file-%d" $i }}
+  mountPath: {{ ($m.mountPath | default (printf "/etc/ferrum/secret-files/%s" (lower $m.name))) | quote }}
+  readOnly: true
+{{- end }}
+{{- end -}}

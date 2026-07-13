@@ -1,0 +1,23 @@
+{{- if and (eq .Values.mode "cp") .Values.cp.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ printf "%s-grpc" (include "ferrum-gateway.fullname" .) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferrum-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane-grpc
+  {{- with .Values.cp.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.cp.service.type | default "ClusterIP" }}
+  selector:
+    {{- include "ferrum-gateway.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ include "ferrum-gateway.cpGrpcPort" . }}
+      targetPort: grpc
+      protocol: TCP
+{{- end }}

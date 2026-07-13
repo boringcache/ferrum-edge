@@ -1,0 +1,39 @@
+{{- if and .Values.service.enabled (ne .Values.mode "cp") }}
+{{- $ports := .Values.ports | default dict -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ferrum-gateway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferrum-gateway.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "ferrum-gateway.selectorLabels" . | nindent 4 }}
+  ports:
+    {{- if and (hasKey $ports "proxyHttp") (ne ($ports.proxyHttp | toString) "0") }}
+    - name: http
+      port: {{ .Values.service.httpPort | default 80 }}
+      targetPort: proxy-http
+      protocol: TCP
+    {{- end }}
+    {{- if and (hasKey $ports "proxyHttps") (ne ($ports.proxyHttps | toString) "0") }}
+    - name: https
+      port: {{ .Values.service.httpsPort | default 443 }}
+      targetPort: proxy-https
+      protocol: TCP
+    {{- end }}
+    {{- range .Values.streamPorts }}
+    {{- if .service }}
+    - name: {{ .name }}
+      port: {{ .servicePort | default .containerPort }}
+      targetPort: {{ .name }}
+      protocol: {{ .protocol | default "TCP" }}
+    {{- end }}
+    {{- end }}
+{{- end }}

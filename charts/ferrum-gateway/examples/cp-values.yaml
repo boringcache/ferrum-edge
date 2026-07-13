@@ -1,0 +1,46 @@
+# Control-plane mode: read/write admin, no proxy, distributes config to data
+# planes over gRPC. Pairs with dp-values.yaml.
+#
+# Create the Secrets first:
+#   kubectl -n ferrum create secret generic ferrum-cp-db \
+#     --from-literal=url='postgres://ferrum:<percent-encoded-pw>@postgres.ferrum.svc:5432/ferrum'
+#   kubectl -n ferrum create secret generic ferrum-grpc-credentials \
+#     --from-literal=admin-jwt-secret="$(openssl rand -hex 32)" \
+#     --from-literal=cp-dp-grpc-jwt-secret="$(openssl rand -hex 32)"
+#
+#   helm install ferrum-cp ./charts/ferrum-gateway -n ferrum \
+#     -f charts/ferrum-gateway/examples/cp-values.yaml
+mode: cp
+
+replicaCount: 2
+
+database:
+  type: postgres
+  existingSecret:
+    name: ferrum-cp-db
+    urlKey: url
+
+admin:
+  jwtSecret:
+    existingSecret:
+      name: ferrum-grpc-credentials
+      key: admin-jwt-secret
+
+grpc:
+  jwtSecret:
+    existingSecret:
+      name: ferrum-grpc-credentials
+      key: cp-dp-grpc-jwt-secret
+
+cp:
+  service:
+    enabled: true
+    type: ClusterIP
+
+# Production control planes should serve gRPC over TLS. Provide a Secret with
+# tls.crt/tls.key (and optionally ca.crt for mTLS) and enable it here:
+# tls:
+#   cpGrpc:
+#     enabled: true
+#     secretName: ferrum-cp-grpc-tls
+#     clientCaKey: ca.crt

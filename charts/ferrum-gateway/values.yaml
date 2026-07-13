@@ -1,0 +1,355 @@
+# Ferrum Edge core-gateway Helm chart values.
+#
+# This chart deploys the Ferrum Edge binary in one of the CORE gateway operating
+# modes: database, file, cp (control plane), or dp (data plane). The mesh,
+# injector, and node_agent modes live in the separate `ferrum-mesh` chart.
+#
+# Secrets (admin JWT, DB URL, CP/DP gRPC JWT) are NEVER generated or rendered
+# into ConfigMaps by this chart. Provide them as inline values (dev only) or,
+# preferably, as references to Secrets you create out-of-band.
+
+# -----------------------------------------------------------------------------
+# Operating mode (first-class, required). One of: database, file, cp, dp.
+#   database - read/write admin + proxy; polls a PostgreSQL/MySQL/SQLite/MongoDB
+#   file     - read-only admin + proxy; config from a mounted YAML/JSON file
+#   cp       - read/write admin, no proxy; distributes config to DPs over gRPC
+#   dp       - read-only admin + proxy; pulls config from one or more CPs
+# Any other value (mesh/injector/node_agent/migrate) fails at template time.
+# -----------------------------------------------------------------------------
+mode: file
+
+# Optional name overrides (standard Helm convention).
+nameOverride: ""
+fullnameOverride: ""
+
+# Extra labels stamped on every rendered object (merged into the label helper).
+commonLabels: {}
+
+image:
+  repository: ferrumedge/ferrum-edge
+  # Defaults to the chart appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+  # Names of imagePullSecrets to attach to the pod.
+  pullSecrets: []
+
+# Number of gateway replicas. A proxy is horizontally scalable; the control
+# plane (cp) can also run multiple replicas behind its gRPC Service.
+replicaCount: 2
+
+# Logical Ferrum namespace selector (FERRUM_NAMESPACE). Optional; leave empty to
+# use the binary default.
+ferrumNamespace: ""
+
+# Graceful shutdown. terminationGracePeriodSeconds must be >= shutdownDrainSeconds
+# + ~5s cleanup or the chart fails render. On SIGTERM the gateway stops accept
+# loops, marks itself draining, adds `Connection: close`, and waits up to
+# FERRUM_SHUTDOWN_DRAIN_SECONDS for in-flight work before exiting.
+shutdownDrainSeconds: 30
+terminationGracePeriodSeconds: 40
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# -----------------------------------------------------------------------------
+# Ports. Container ports are derived from these; a port of 0 disables that
+# listener (and the matching container/service port is not rendered).
+#   proxyHttp/proxyHttps - front-door proxy listeners (FERRUM_PROXY_HTTP/S_PORT)
+#   adminHttp/adminHttps - admin API listeners (FERRUM_ADMIN_HTTP/S_PORT)
+#   cpGrpc               - control-plane gRPC listener (cp mode only)
+# -----------------------------------------------------------------------------
+ports:
+  proxyHttp: 8000
+  proxyHttps: 8443
+  adminHttp: 9000
+  adminHttps: 9443
+  cpGrpc: 50051
+
+# Stream (raw TCP/UDP) proxy listeners. Ferrum binds these from its config
+# (`listen_port`); Kubernetes only routes to them if the matching container and
+# Service ports exist. Declare each here. `service: true` publishes the port on
+# the proxy Service.
+#   - name: postgres-tcp
+#     containerPort: 15432
+#     protocol: TCP
+#     service: true
+#   - name: dns-udp
+#     containerPort: 15353
+#     protocol: UDP
+#     service: true
+streamPorts: []
+
+# -----------------------------------------------------------------------------
+# Admin API. The admin listeners bind to loopback (127.0.0.1) by default, so
+# admin is NOT reachable through the pod IP unless you set admin.bindAddress.
+#
+# SAFETY: in the write-capable database and cp modes the binary HARD-FAILS on a
+# non-loopback PLAINTEXT admin bind unless you also supply one of:
+#   - admin.allowedCidrs (an IP allowlist)
+#   - admin TLS (tls.admin.enabled=true) with ports.adminHttp=0 (drop plaintext)
+#   - admin.allowInsecureHttp=true (local/dev; always pair with a NetworkPolicy)
+# The chart mirrors this and fails render early instead of shipping a pod that
+# crash-loops. If you set admin.allowedCidrs, INCLUDE 127.0.0.1/32 and ::1/128
+# so the in-pod exec health probe is not dropped.
+# -----------------------------------------------------------------------------
+admin:
+  # Empty keeps the safe loopback default. Set to "0.0.0.0" or "::" to expose
+  # admin through a Service (required when admin.service.enabled=true).
+  bindAddress: ""
+  allowedCidrs: ""
+  allowInsecureHttp: false
+  # Admin JWT secret (FERRUM_ADMIN_JWT_SECRET). REQUIRED and >=32 chars for
+  # database and cp modes. Optional for file (a random read-only secret is
+  # generated at startup) and dp (read-only admin). The chart never mints it.
+  jwtSecret:
+    # value: "at-least-32-characters-long-dev-only"
+    existingSecret:
+      name: ""
+      key: admin-jwt-secret
+    valueFrom: {}
+  # Cluster-internal admin Service (ClusterIP). Only enable together with a
+  # non-loopback admin.bindAddress and a NetworkPolicy restricting access.
+  service:
+    enabled: false
+    type: ClusterIP
+    annotations: {}
+
+# CP/DP gRPC JWT secret (FERRUM_CP_DP_GRPC_JWT_SECRET). REQUIRED and >=32 chars
+# for cp and dp modes; the CP mints/validates and the DP presents this token.
+grpc:
+  jwtSecret:
+    # value: "at-least-32-characters-long-dev-only"
+    existingSecret:
+      name: ""
+      key: cp-dp-grpc-jwt-secret
+    valueFrom: {}
+
+# -----------------------------------------------------------------------------
+# Database settings (database and cp modes). Provide EXACTLY ONE URL source:
+#   url               - direct FERRUM_DB_URL value (dev only)
+#   urlFrom           - full EnvVarSource (e.g. secretKeyRef) for FERRUM_DB_URL
+#   existingSecret    - shorthand Secret reference {name, urlKey}
+#   sqlite.path       - convenience: renders sqlite:<path>?mode=<mode>
+#   structured host/* - host/port/name/username/password/params, percent-encoded
+# For Secret-backed network credentials, store the fully percent-encoded URL in
+# a Secret and use existingSecret or urlFrom (structured Secret-backed
+# username/password cannot be safely encoded and is rejected).
+# -----------------------------------------------------------------------------
+database:
+  # One of: sqlite, postgres, mysql, mongodb.
+  type: ""
+  url: ""
+  urlFrom: {}
+  existingSecret:
+    name: ""
+    urlKey: url
+  sqlite:
+    path: ""
+    mode: rwc
+  host: ""
+  port: null
+  name: ""
+  username: ""
+  password: ""
+  params: {}
+
+# -----------------------------------------------------------------------------
+# File-mode config (mode=file). Provide EITHER an inline config (rendered into a
+# ConfigMap and mounted) OR reference an existing ConfigMap. Kubernetes does not
+# send SIGHUP on ConfigMap change; roll the Deployment (or use a reloader) after
+# editing config. The chart stamps a checksum annotation so `helm upgrade`
+# rolls pods when inlineConfig changes.
+# -----------------------------------------------------------------------------
+file:
+  mountPath: /etc/ferrum/config
+  fileName: config.yaml
+  # Minimal valid default config (no proxies). Replace with your routes.
+  inlineConfig: |
+    version: "1"
+    proxies: []
+  # Reference an out-of-band ConfigMap instead of inlineConfig.
+  existingConfigMap: ""
+
+# -----------------------------------------------------------------------------
+# Control-plane settings (mode=cp).
+# -----------------------------------------------------------------------------
+cp:
+  # gRPC listener bind host (combined with ports.cpGrpc for FERRUM_CP_GRPC_LISTEN_ADDR).
+  grpcBindAddress: "0.0.0.0"
+  # Comma-separated namespaces this CP serves (FERRUM_CP_NAMESPACES). Optional.
+  namespaces: ""
+  # Require a JWT `ns` claim on namespace-scoped gRPC calls (FERRUM_CP_REQUIRE_NAMESPACE_CLAIM).
+  requireNamespaceClaim: false
+  # gRPC Service (ClusterIP) exposing the CP to DP pods.
+  service:
+    enabled: true
+    type: ClusterIP
+    annotations: {}
+
+# -----------------------------------------------------------------------------
+# Data-plane settings (mode=dp).
+# -----------------------------------------------------------------------------
+dp:
+  # Comma-separated CP gRPC URLs (FERRUM_DP_CP_GRPC_URLS). REQUIRED for dp.
+  # e.g. "https://ferrum-cp-east:50051,https://ferrum-cp-west:50051"
+  cpGrpcUrls: ""
+  # Optional multi-CP failover primary retry seconds (FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS).
+  failoverPrimaryRetrySeconds: ""
+
+# -----------------------------------------------------------------------------
+# TLS material. Each enabled surface mounts a Secret (standard tls.crt/tls.key/
+# ca.crt keys) read-only and sets the matching FERRUM_*_TLS_*_PATH env vars.
+# cpGrpc applies only in cp mode; dpGrpc only in dp mode.
+# -----------------------------------------------------------------------------
+tls:
+  frontend:
+    enabled: false
+    secretName: ""
+    mountPath: /etc/ferrum/tls/frontend
+    certKey: tls.crt
+    keyKey: tls.key
+    # Optional mTLS client CA bundle key within the same Secret.
+    clientCaKey: ""
+  admin:
+    enabled: false
+    secretName: ""
+    mountPath: /etc/ferrum/tls/admin
+    certKey: tls.crt
+    keyKey: tls.key
+    clientCaKey: ""
+  backend:
+    enabled: false
+    secretName: ""
+    mountPath: /etc/ferrum/tls/backend
+    clientCertKey: tls.crt
+    clientKeyKey: tls.key
+  cpGrpc:
+    enabled: false
+    secretName: ""
+    mountPath: /etc/ferrum/tls/cp-grpc
+    certKey: tls.crt
+    keyKey: tls.key
+    clientCaKey: ""
+  dpGrpc:
+    enabled: false
+    secretName: ""
+    mountPath: /etc/ferrum/tls/dp-grpc
+    caKey: ca.crt
+    clientCertKey: ""
+    clientKeyKey: tls.key
+
+# -----------------------------------------------------------------------------
+# External-secret _FILE suffix mounts. Ferrum resolves any FERRUM_* env var with
+# a `_FILE` suffix by reading the referenced file. Use this to mount a Secret
+# key at a path and point `<name>_FILE` at it (e.g. name: FERRUM_ADMIN_JWT_SECRET).
+#   - name: FERRUM_ADMIN_JWT_SECRET
+#     secretName: ferrum-admin
+#     secretKey: admin-jwt-secret
+#     mountPath: /etc/ferrum/secret-files/admin
+# -----------------------------------------------------------------------------
+secretFileMounts: []
+
+# Extra simple string env vars (map form). Reserved keys managed by first-class
+# values (FERRUM_MODE, FERRUM_DB_*, FERRUM_ADMIN_JWT_SECRET, etc.) are rejected.
+# Example: FERRUM_LOG_LEVEL: info
+env: {}
+
+# Extra raw env entries (list form) for valueFrom / fieldRef cases.
+#   - name: FERRUM_DB_CONFIG_BACKUP_PATH
+#     value: /etc/ferrum/backup-config.json
+extraEnv: []
+
+# Arbitrary extra volumes / mounts (e.g. a PVC for a sqlite database file).
+extraVolumes: []
+extraVolumeMounts: []
+
+# -----------------------------------------------------------------------------
+# Health probes. Admin binds loopback by default, so the defaults use the in-pod
+# exec `ferrum-edge health` check (a kubelet httpGet targets the pod IP and would
+# miss a loopback listener). Liveness/startup verify the process + admin listener;
+# readiness verifies unauthenticated /health (status + ready), which is the tiered
+# detail exposed without auth. When ports.adminHttp=0 (TLS-only admin) the exec
+# health command auto-detects TLS + 9443. Set a probe block to `null`/custom to
+# override entirely.
+# -----------------------------------------------------------------------------
+probes:
+  startup:
+    enabled: true
+    failureThreshold: 30
+    periodSeconds: 5
+  liveness:
+    enabled: true
+    initialDelaySeconds: 10
+    periodSeconds: 15
+  readiness:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  # Provide a custom exec/httpGet handler to replace the computed default, e.g.:
+  # override:
+  #   httpGet:
+  #     path: /health
+  #     port: admin-http
+  override: {}
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 64Mi
+  limits:
+    cpu: "2"
+    memory: 256Mi
+
+# Rolling update tuned for a proxy: never drop below the desired count while a
+# new revision comes up.
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+# Pod-level security context and container security context. Defaults harden the
+# runtime for a distroless, non-root image.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+# Proxy Service (front-door). Publishes proxyHttp/proxyHttps and any streamPorts
+# marked `service: true`.
+service:
+  enabled: true
+  type: ClusterIP
+  annotations: {}
+  # Optional fixed ports on the Service; targetPort tracks the container ports.
+  httpPort: 80
+  httpsPort: 443
+
+# Optional HorizontalPodAutoscaler.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: null
+
+# Optional PodDisruptionBudget.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  # maxUnavailable: 1
