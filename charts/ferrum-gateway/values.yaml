@@ -98,10 +98,11 @@ streamPorts: []
 # here, while the binary remains authoritative for equivalent permit-all unions.
 # If you set admin.allowedCidrs while using the computed exec probes, include the
 # probe source (directly or through a covering CIDR) so the admin TCP filter does
-# not drop them. The probe source
-# tracks admin.bindAddress: 127.0.0.1 for the empty default / 0.0.0.0, ::1 for ::,
-# and the configured address itself for any concrete bind (e.g. add 10.0.0.0/8
-# or 10.0.0.5/32 when admin.bindAddress=10.0.0.5).
+# not drop them. The probe source tracks admin.bindAddress: 127.0.0.1 for the
+# empty default / 0.0.0.0 and every concrete 127/8 bind, ::1 for ::, and the
+# configured address itself for other concrete binds (e.g. add 10.0.0.0/8 or
+# 10.0.0.5/32 when admin.bindAddress=10.0.0.5). Use bare IPv6 CIDR syntax such as
+# fd00::/8; the runtime rejects bracketed forms such as [fd00::]/8.
 # -----------------------------------------------------------------------------
 admin:
   # Empty keeps the safe loopback default. Set to "0.0.0.0" or "::" to expose
@@ -111,8 +112,9 @@ admin:
   # "127.0.0.1" (or "::1") for loopback. The admin listener binds ONLY this
   # address, so the computed exec probes dial it directly: wildcard binds
   # (0.0.0.0 / ::) probe loopback (127.0.0.1 / ::1), while a concrete bind (::1,
-  # 10.0.0.5, ...) is probed as-is — and any admin.allowedCidrs must then cover
-  # that same probe source.
+  # 10.0.0.5, ...) is probed as-is. The listener normally observes that same TCP
+  # source, except a concrete 127/8 destination uses 127.0.0.1 on Linux; any
+  # admin.allowedCidrs must cover the observed source.
   bindAddress: ""
   allowedCidrs: ""
   allowInsecureHttp: false
@@ -301,6 +303,9 @@ secretVolumeDefaultMode: 288
 # External-secret _FILE suffix mounts. Ferrum resolves any FERRUM_* env var with
 # a `_FILE` suffix by reading the referenced file. Use this to mount a Secret
 # key at a path and point `<name>_FILE` at it (e.g. name: FERRUM_ADMIN_JWT_SECRET).
+# Only FERRUM_DB_URL, FERRUM_ADMIN_JWT_SECRET, and
+# FERRUM_CP_DP_GRPC_JWT_SECRET may replace chart-managed variables this way;
+# other managed names are rejected because their direct env is still rendered.
 #   - name: FERRUM_ADMIN_JWT_SECRET
 #     secretName: ferrum-admin
 #     secretKey: admin-jwt-secret

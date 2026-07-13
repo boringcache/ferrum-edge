@@ -42,6 +42,8 @@ node_agent, migrate) fails at template time with a pointer to the right chart.
   and requires an entry containing `::1` (such as `::/127`, `::1/128`, or bare
   `::1`) — an unspecified IPv6 bind is not guaranteed to accept v4-mapped
   `127.0.0.1`, so the probes use IPv6 loopback for every IPv6 bind.
+  IPv6 allowlist entries use bare address syntax (`fd00::/8`, `::1/128`), not
+  URL-style brackets (`[fd00::]/8`), matching the runtime's strict CIDR parser.
   `admin.bindAddress` must be an IP literal — any hostname (`localhost`,
   `admin.internal`, ...) is rejected at render (the binary requires an IP); use
   `127.0.0.1` or `::1`.
@@ -87,7 +89,11 @@ node_agent, migrate) fails at template time with a pointer to the right chart.
   "Multiple secret sources configured". Generated `<name>_FILE` vars from
   `secretFileMounts` are reserved as well, and so are their base names, so
   `env`/`extraEnv` cannot shadow a file source or configure both `<name>` and
-  `<name>_FILE` (which Ferrum rejects as conflicting providers).
+  `<name>_FILE` (which Ferrum rejects as conflicting providers). A mount may
+  replace a chart-managed base only for the first-class DB/JWT file sources
+  (`FERRUM_DB_URL`, `FERRUM_ADMIN_JWT_SECRET`, and
+  `FERRUM_CP_DP_GRPC_JWT_SECRET`); other managed names such as `FERRUM_MODE`
+  are rejected because the chart renders their direct value too.
 - **TLS and `_FILE` Secret mounts are non-root readable.** They default to mode
   `0440` with pod `fsGroup: 65532`, matching the distroless nonroot image. Both
   `secretVolumeDefaultMode` and `podSecurityContext` are overridable for images
@@ -115,8 +121,11 @@ The exec probes dial the admin listener at its configured bind address, because
 the runtime binds admin ONLY to `admin.bindAddress`. Wildcard binds probe
 loopback (`0.0.0.0`→`127.0.0.1`, `::`→`::1`); a concrete bind is probed as-is
 (`::1`, `10.0.0.5`, ...). If you also set `admin.allowedCidrs`, it must cover
-that same probe source or the admin TCP allowlist drops the in-pod checks — the
-chart fails render otherwise.
+the TCP source observed by the listener or the admin allowlist drops the in-pod
+checks. That source normally equals the dial address, except Linux connections
+to any concrete `127/8` bind (for example `127.0.0.2`) originate from
+`127.0.0.1`; use `127.0.0.1/32` or a covering `127.0.0.0/8`. The chart fails
+render otherwise.
 
 Liveness and readiness have **separate** override knobs so a custom handler
 cannot silently re-couple them. Replace only one probe's computed handler with

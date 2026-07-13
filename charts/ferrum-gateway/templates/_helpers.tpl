@@ -145,6 +145,16 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 {{- end -}}
 
+{{/* Source address the admin listener observes for the computed exec probe.
+     Linux selects 127.0.0.1 when connecting to any concrete 127/8 destination;
+     other concrete/wildcard probe hosts use the same local address they dial. */}}
+{{- define "ferrum-gateway.probeSource" -}}
+{{- $host := include "ferrum-gateway.probeHost" . -}}
+{{- if regexMatch "^127\\." $host -}}127.0.0.1
+{{- else -}}{{ $host }}
+{{- end -}}
+{{- end -}}
+
 {{/* "true" when the value parses as an IPv4 or IPv6 literal, else "". Mirrors
      EnvConfig::validate() rejecting any non-IP FERRUM_ADMIN_BIND_ADDRESS. The
      IPv4 arm enforces 0-255 octets (so 999.999.999.999 is rejected at render)
@@ -239,7 +249,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- range $raw := splitList "," (.allowedCidrs | default "") -}}
 {{- $entry := trim $raw | lower -}}
 {{- $parts := splitList "/" $entry -}}
-{{- $network := index $parts 0 | trimPrefix "[" | trimSuffix "]" -}}
+{{- $network := index $parts 0 -}}
 {{- if and (eq (len $parts) 1) (eq $network $target) -}}
 {{- $found = true -}}
 {{- else if and (eq (len $parts) 2) (regexMatch "^[0-9]+$" (index $parts 1)) -}}
@@ -247,7 +257,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- if and (not (contains ":" $target)) (not (contains ":" $network)) (ge $prefix 0) (le $prefix 32) -}}
 {{- $targetInt := include "ferrum-gateway.ipv4ToInt" $target -}}
 {{- $networkInt := include "ferrum-gateway.ipv4ToInt" $network -}}
-{{- if and $targetInt $networkInt -}}
+{{- if and (ne $targetInt "") (ne $networkInt "") -}}
 {{- $blockSize := 1 | int64 -}}
 {{- range until (sub 32 $prefix | int) -}}{{- $blockSize = mul $blockSize 2 -}}{{- end -}}
 {{- if eq (div ($targetInt | int64) $blockSize) (div ($networkInt | int64) $blockSize) -}}{{- $found = true -}}{{- end -}}
@@ -500,6 +510,19 @@ Validation: fail render on missing/unsafe configuration.
 {{- if not (has $mode (list "database" "file" "cp" "dp")) -}}
 {{- fail (printf "mode must be one of: database, file, cp, dp (got %q). The mesh, injector, and node_agent modes live in the ferrum-mesh chart, not this one." $mode) -}}
 {{- end -}}
+{{/* A generic secretFileMount emits <name>_FILE. Most chart-managed variables
+     are also rendered directly, which gives the external-secret resolver two
+     providers for the same base and aborts startup. Only the three first-class
+     DB/JWT source guards suppress their direct env when a matching file source
+     is selected. */}}
+{{- $managedFileSources := list "FERRUM_DB_URL" "FERRUM_ADMIN_JWT_SECRET" "FERRUM_CP_DP_GRPC_JWT_SECRET" -}}
+{{- $reservedEnv := splitList " " (include "ferrum-gateway.reservedEnv" .) -}}
+{{- range $mount := .Values.secretFileMounts | default list -}}
+{{- $name := $mount.name | default "" -}}
+{{- if and (has $name $reservedEnv) (not (has $name $managedFileSources)) -}}
+{{- fail (printf "secretFileMounts entry name=%s conflicts with a chart-managed env that is rendered directly; only FERRUM_DB_URL, FERRUM_ADMIN_JWT_SECRET, and FERRUM_CP_DP_GRPC_JWT_SECRET support replacing their first-class source with a matching _FILE mount" $name) -}}
+{{- end -}}
+{{- end -}}
 {{- if or (eq $mode "database") (eq $mode "cp") -}}
 {{- include "ferrum-gateway.validateDatabase" . -}}
 {{- end -}}
@@ -583,6 +606,15 @@ Validation: fail render on missing/unsafe configuration.
 {{/* Admin bind safety. The binary binds admin to loopback by default. */}}
 {{- $admin := .Values.admin | default dict -}}
 {{- $bind := $admin.bindAddress | default "" -}}
+{{/* CidrSet::parse_strict accepts bare IPv6 IPs/CIDRs, not URL-style brackets.
+     Reject brackets even when probes are overridden/disabled so the rendered
+     pod cannot pass Helm validation and then exit during EnvConfig parsing. */}}
+{{- range $raw := splitList "," ($admin.allowedCidrs | default "") -}}
+{{- $entry := trim $raw -}}
+{{- if or (contains "[" $entry) (contains "]" $entry) -}}
+{{- fail (printf "admin.allowedCidrs entry %q uses bracketed IPv6 syntax, but the runtime requires bare IPv6 addresses/CIDRs (for example fd00::/8 or ::1/128)" $entry) -}}
+{{- end -}}
+{{- end -}}
 {{/* EnvConfig::validate() rejects any FERRUM_ADMIN_BIND_ADDRESS that is not an
      IP literal (src/config/env_config.rs), so a hostname (localhost,
      admin.internal, host.docker.internal, ...) boots and then exits. Reject any
@@ -612,9 +644,9 @@ Validation: fail render on missing/unsafe configuration.
 {{- fail (printf "mode=%s hard-fails on a non-loopback plaintext admin bind. Set one of: admin.allowedCidrs, admin TLS (tls.admin.enabled + ports.adminHttp=0), or admin.allowInsecureHttp=true with a NetworkPolicy" $mode) -}}
 {{- end -}}
 {{- end -}}
-{{/* The default exec probes connect from 127.0.0.1, and the admin accept loop
-     applies allowedCidrs to loopback like every other source. Require the exact
-     probe source whenever at least one computed handler is active. */}}
+{{/* The admin accept loop applies allowedCidrs to in-pod probes like every other
+     source. Require the source address the listener actually observes whenever
+     at least one computed handler is active. */}}
 {{- $probes := .Values.probes | default dict -}}
 {{- $startup := $probes.startup | default dict -}}
 {{- $liveness := $probes.liveness | default dict -}}
@@ -646,16 +678,16 @@ Validation: fail render on missing/unsafe configuration.
 {{- end -}}
 {{- end -}}
 {{- if and $admin.allowedCidrs (or $defaultLiveProbe $defaultReadyProbe) -}}
-{{/* The exec probes connect FROM the exact probe host (loopback for wildcard
-     binds, the configured concrete address otherwise), and the admin accept loop
-     applies allowedCidrs to that source like any other. Require the allowlist to
-     cover the same host the probes dial, keyed off ferrum-gateway.probeHost. */}}
+{{/* The dial destination and observed TCP source normally match. Linux is the
+     exception for a concrete 127/8 destination: it selects 127.0.0.1 as source.
+     Validate the observed source rather than assuming the dial host is the peer. */}}
 {{- $probeHost := include "ferrum-gateway.probeHost" . -}}
-{{- $probeIsV6 := contains ":" $probeHost -}}
-{{- $hasProbeSource := include "ferrum-gateway.adminAllowlistContainsIp" (dict "ip" $probeHost "allowedCidrs" $admin.allowedCidrs) -}}
+{{- $probeSource := include "ferrum-gateway.probeSource" . -}}
+{{- $probeIsV6 := contains ":" $probeSource -}}
+{{- $hasProbeSource := include "ferrum-gateway.adminAllowlistContainsIp" (dict "ip" $probeSource "allowedCidrs" $admin.allowedCidrs) -}}
 {{- if not $hasProbeSource -}}
-{{- $probeCidr := ternary (printf "%s/128" $probeHost) (printf "%s/32" $probeHost) $probeIsV6 -}}
-{{- fail (printf "admin.allowedCidrs must include %s (or bare %s) while the default exec probes are enabled; the computed exec probes dial the admin.bindAddress %s and the admin TCP allowlist otherwise drops the in-pod health checks. Add the exact probe source (or a covering CIDR) or override/disable every computed probe handler." $probeCidr $probeHost $probeHost) -}}
+{{- $probeCidr := ternary (printf "%s/128" $probeSource) (printf "%s/32" $probeSource) $probeIsV6 -}}
+{{- fail (printf "admin.allowedCidrs must include %s (or bare %s) while the default exec probes are enabled; the computed exec probes dial admin host %s from source %s and the admin TCP allowlist otherwise drops the in-pod health checks. Add the exact probe source (or a covering CIDR) or override/disable every computed probe handler." $probeCidr $probeSource $probeHost $probeSource) -}}
 {{- end -}}
 {{- end -}}
 {{/* Graceful shutdown: give the pod time to drain plus the ~5s cleanup window.

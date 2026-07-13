@@ -2120,6 +2120,12 @@ jobs:
             --set admin.bindAddress=0.0.0.0 \
             --set-string admin.allowedCidrs=127.0.0.0/8 \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/probe-loopback-covering-cidr.yaml"
+          # A valid network address whose integer value is zero must not be
+          # confused with an invalid/empty IPv4 conversion result.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set-string admin.allowedCidrs=0.0.0.0/1 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/probe-zero-network-cidr.yaml"
           # ports.adminHttp=0 switches computed probes to admin HTTPS, which only
           # serves with admin TLS material; render must fail without it.
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
@@ -2279,6 +2285,26 @@ jobs:
             exit 1
           fi
           grep -F 'requires admin.bindAddress to be a non-loopback address' "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv4-loopback-service.err"
+          # A probe dials a concrete 127/8 listener at that address, but Linux
+          # selects 127.0.0.1 as the TCP source observed by the listener.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set admin.bindAddress=127.0.0.2 \
+            --set-string admin.allowedCidrs=127.0.0.2/32 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv4-loopback-wrong-source.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv4-loopback-wrong-source.err"; then
+            echo "::error title=127/8 probe destination mistaken for source::the listener observes 127.0.0.1"
+            exit 1
+          fi
+          grep -F 'must include 127.0.0.1/32' "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv4-loopback-wrong-source.err"
+          grep -F 'dial admin host 127.0.0.2 from source 127.0.0.1' "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv4-loopback-wrong-source.err"
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set admin.bindAddress=127.0.0.2 \
+            --set-string admin.allowedCidrs=127.0.0.1/32 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv4-loopback-exact-source.yaml"
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set admin.bindAddress=127.0.0.2 \
+            --set-string admin.allowedCidrs=127.0.0.0/8 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv4-loopback-source-cidr.yaml"
           # An unspecified IPv6 admin bind ([::]) is not guaranteed to accept v4-mapped
           # 127.0.0.1, so the computed probes must also dial ::1 for any IPv6 bind form.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
@@ -2289,6 +2315,20 @@ jobs:
             echo "::error title=IPv6 any-bind probe host mismatch::admin.bindAddress=:: must produce a --host ::1 probe"
             exit 1
           fi
+          # Runtime CIDR parsing accepts bare IPv6, not URL-style brackets. This
+          # must fail even with every computed probe disabled.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set-string 'admin.allowedCidrs=[fd00::]/8' \
+            --set probes.startup.enabled=false \
+            --set probes.liveness.enabled=false \
+            --set probes.readiness.enabled=false \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/bracketed-ipv6-cidr.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/bracketed-ipv6-cidr.err"; then
+            echo "::error title=Bracketed IPv6 CIDR rendered::the runtime strict parser would reject it at boot"
+            exit 1
+          fi
+          grep -F 'uses bracketed IPv6 syntax' "$RUNNER_TEMP/ferrum-gateway-helm-results/bracketed-ipv6-cidr.err"
           # Both admin ports disabled leaves no admin listener for the probes: fail.
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=file --set ports.adminHttp=0 --set ports.adminHttps=0 \
@@ -2311,6 +2351,19 @@ jobs:
             exit 1
           fi
           grep -F 'env.FERRUM_ADMIN_JWT_SECRET_FILE is managed by first-class' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-env-collision.err"
+          # secretFileMounts may replace only the DB/JWT managed sources whose
+          # helpers suppress the direct env; always-rendered managed vars would
+          # otherwise produce both the base and _FILE provider and abort startup.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set 'secretFileMounts[0].name=FERRUM_MODE' \
+            --set 'secretFileMounts[0].secretName=ferrum-mode' \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/managed-file-source-collision.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/managed-file-source-collision.err"; then
+            echo "::error title=Managed env accepted as generic file source::FERRUM_MODE and FERRUM_MODE_FILE would collide"
+            exit 1
+          fi
+          grep -F 'secretFileMounts entry name=FERRUM_MODE conflicts with a chart-managed env' "$RUNNER_TEMP/ferrum-gateway-helm-results/managed-file-source-collision.err"
           # The direct base also conflicts with its generated _FILE provider.
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=file \

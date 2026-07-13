@@ -63,7 +63,7 @@
         "bindAddress": { "type": "string" },
         "allowedCidrs": {
           "type": "string",
-          "description": "Comma-separated admin source allowlist. Literal /0 entries do not protect plaintext; computed exec probes require an entry containing their source (for example 127.0.0.0/8, 127.0.0.1/32, or bare 127.0.0.1). Runtime CIDR canonicalization is authoritative."
+          "description": "Comma-separated admin source allowlist using bare IP/CIDR syntax (IPv6 brackets are rejected). Literal /0 entries do not protect plaintext; computed exec probes require an entry containing their observed TCP source (for example 127.0.0.0/8, 127.0.0.1/32, or bare 127.0.0.1). Runtime CIDR canonicalization is authoritative."
         },
         "allowInsecureHttp": { "type": "boolean" },
         "jwtSecret": {
@@ -144,7 +144,7 @@
     },
     "secretFileMounts": {
       "type": "array",
-      "description": "Secret keys exposed through <name>_FILE. Matching entries satisfy required DB/JWT source guards.",
+      "description": "Secret keys exposed through <name>_FILE. Matching entries satisfy required DB/JWT source guards. FERRUM_DB_URL, FERRUM_ADMIN_JWT_SECRET, and FERRUM_CP_DP_GRPC_JWT_SECRET are the only chart-managed bases replaceable this way; other managed env names are rejected to prevent duplicate providers.",
       "items": {
         "type": "object",
         "required": ["name", "secretName"],
