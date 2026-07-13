@@ -49,6 +49,7 @@ mod inner {
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
         Upstream,
     };
+    use crate::config::validation_pipeline::collect_rejecting_runtime_config_errors;
     use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
     use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
     use arc_swap::ArcSwap;
@@ -2857,17 +2858,21 @@ mod inner {
                 error!("MongoDB config: {}", message);
             }
 
-            // Defense in depth — Mongo `load_full_config` does not run the
-            // SQL-side `ValidationPipeline`, so a row written directly into
-            // the proxy collection with an encoded-slash listen_path would
-            // otherwise reach `ProxyState::validate_full_config()` as the
-            // only guard. Reject here as well so a Mongo-backed CP broadcast
-            // can never carry the bypass shape downstream.
-            if let Err(errors) = config.validate_listen_path_encodings() {
-                for msg in &errors {
+            // Mongo does not run the SQL-side `ValidationPipeline`, but full
+            // runtime loads must still fail closed on the same rejecting
+            // validation contract used by SQL loads and CP updates. This
+            // catches malformed routes, stream proxy shapes, dangling upstream
+            // references, and invalid plugin associations before startup or
+            // broadcast can build runtime caches from invalid collection data.
+            let validation_errors = collect_rejecting_runtime_config_errors(&config);
+            if !validation_errors.is_empty() {
+                for msg in &validation_errors {
                     error!("MongoDB config rejected — {}", msg);
                 }
-                anyhow::bail!("MongoDB has listen_path(s) containing encoded slashes");
+                anyhow::bail!(
+                    "MongoDB configuration validation failed: {} rejecting error(s) found",
+                    validation_errors.len()
+                );
             }
 
             Ok(config)
