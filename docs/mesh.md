@@ -897,16 +897,20 @@ mTLS modes:
 `portLevelMtls` is enforced at the earliest point where the workload app port
 is known. For REDIRECT-captured connections, the inbound accept loop reads
 `SO_ORIGINAL_DST` once and selects the prebuilt per-port `rustls::ServerConfig`
-before the handshake. Direct mesh-transport dials have no original destination,
-so a policy whose app ports span TLS and plaintext wire postures uses a
-PERMISSIVE-style acceptor: it peeks without consuming the first record and can
-admit either verified TLS or plaintext far enough to route the request. After
-HTTP authority or an HBONE CONNECT target resolves the app port, Ferrum verifies
-that the connection's actual transport satisfies that port's effective mode.
-`STRICT` requires a verified peer
-certificate, `DISABLE` requires plaintext, and `PERMISSIVE` admits either. The
-acceptor is not an authorization bypass: a mismatch is rejected before the
-plugin/backend path with a structured warning and a protocol-appropriate 403
+before the handshake. A captured Sidecar `ingress[]` listener port is translated
+to its validated `defaultEndpoint` app port first, and that translated port is
+carried with the connection so later checks compare against the exact posture
+that governed the handshake. Direct mesh-transport dials have no original
+destination, so a policy whose app ports span TLS and plaintext wire postures
+uses a PERMISSIVE-style acceptor: it peeks without consuming the first record
+and can admit either verified TLS or plaintext far enough to route the request.
+After HTTP authority or an HBONE CONNECT is processed, Ferrum applies routing
+plugin overrides and load-balancer target selection, then verifies the actual
+transport against the effective target app port's mode. `STRICT` requires a
+verified peer certificate, `DISABLE` requires plaintext, and `PERMISSIVE`
+admits either. The acceptor is not an authorization bypass: a mismatch is
+rejected after routing policy has resolved the destination but before backend
+admission or dispatch, with a structured warning and a protocol-appropriate 403
 response (including normalized gRPC rejection).
 
 `FERRUM_MESH_PRODUCTION_MODE=true` never enables plaintext on inbound

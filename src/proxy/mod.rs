@@ -3572,6 +3572,10 @@ struct RequestConnectionMetadata {
     /// conntrack state. `None` everywhere else — see
     /// [`crate::socket_opts::original_dst`] for the exact contract.
     orig_dst: Option<SocketAddr>,
+    /// Captured inbound app port actually used for accept-time mesh TLS policy
+    /// selection, after applying any Sidecar ingress listener-to-app alias.
+    /// `None` for direct dials and non-mesh listeners.
+    mesh_inbound_pre_handshake_app_port: Option<u16>,
 }
 
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
@@ -7865,6 +7869,7 @@ async fn handle_connection(
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     orig_dst: Option<SocketAddr>,
+    mesh_inbound_pre_handshake_app_port: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
@@ -7919,6 +7924,7 @@ async fn handle_connection(
             node_waypoint_identity: node_waypoint_identity.clone(),
             mesh_direction,
             orig_dst,
+            mesh_inbound_pre_handshake_app_port,
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -11489,6 +11495,7 @@ impl ListenerTlsSource {
             Self::Static { tls_config, .. } => ListenerTlsSelection {
                 tls_config: tls_config.clone(),
                 accepts_plaintext: false,
+                mesh_inbound_pre_handshake_app_port: None,
             },
             Self::MeshInbound { allows_plaintext } => {
                 let policy = state.mesh_inbound_tls_policy.load();
@@ -11497,6 +11504,7 @@ impl ListenerTlsSource {
             Self::Dynamic { slot, .. } => ListenerTlsSelection {
                 tls_config: slot.load().as_ref().clone(),
                 accepts_plaintext: false,
+                mesh_inbound_pre_handshake_app_port: None,
             },
         }
     }
@@ -11535,6 +11543,10 @@ struct ListenerTlsSelection {
     /// to the plaintext handler. Only mesh PeerAuthentication uses this dual
     /// posture; ordinary HTTPS listeners remain TLS-only.
     accepts_plaintext: bool,
+    /// Captured app port used to select this TLS posture, after ingress alias
+    /// translation. Stashed on the connection so the post-route fast path
+    /// compares against the same port that governed the handshake.
+    mesh_inbound_pre_handshake_app_port: Option<u16>,
 }
 
 fn mtls_mode_accepts_plaintext(mode: crate::modes::mesh::config::MtlsMode) -> bool {
@@ -11572,6 +11584,7 @@ fn select_mesh_inbound_tls(
             )
             .clone(),
             accepts_plaintext: mtls_mode_accepts_plaintext(mode),
+            mesh_inbound_pre_handshake_app_port: Some(app_port),
         };
     }
 
@@ -11630,6 +11643,7 @@ fn select_mesh_inbound_tls(
         tls_config: permissive_tls.or(strict_tls),
         accepts_plaintext: mtls_mode_accepts_plaintext(policy.default_mode)
             || (has_different_port_mode && any_mode_accepts_plaintext && any_mode_accepts_tls),
+        mesh_inbound_pre_handshake_app_port: None,
     }
 }
 
@@ -11691,16 +11705,20 @@ fn mesh_inbound_transport_satisfies_mode(
     }
 }
 
-fn mesh_inbound_peer_auth_app_port(proxy: &Proxy) -> u16 {
+fn mesh_inbound_peer_auth_app_port(proxy: &Proxy, upstream_target: Option<&UpstreamTarget>) -> u16 {
     // Sidecar ingress authorization intentionally uses the declared listener
     // port stored on RequestContext, but PeerAuthentication.portLevelMtls is
-    // keyed by the workload app/container port behind defaultEndpoint.
-    proxy.backend_port
+    // keyed by the workload app/container port behind defaultEndpoint. Route
+    // overrides and upstream selection can replace that initial proxy port, so
+    // the concrete target port is authoritative once one has been selected.
+    upstream_target
+        .map(|target| target.port)
+        .unwrap_or(proxy.backend_port)
 }
 
 fn mesh_inbound_requires_post_route_transport_gate(
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
-    orig_dst: Option<SocketAddr>,
+    pre_handshake_app_port: Option<u16>,
     resolved_app_port: u16,
 ) -> bool {
     if mesh_direction != Some(crate::modes::mesh::MeshTrafficDirection::Inbound) {
@@ -11710,8 +11728,95 @@ fn mesh_inbound_requires_post_route_transport_gate(
     // signal, so every resolved proxy needs the authoritative post-route check.
     // Captured traffic additionally needs it whenever routing — including an
     // operator-supplied explicit proxy — selects a different backend app port
-    // than SO_ORIGINAL_DST selected before the handshake.
-    orig_dst.is_none() || orig_dst.is_some_and(|dst| dst.port() != resolved_app_port)
+    // than the translated app port used to select the handshake posture.
+    pre_handshake_app_port.is_none()
+        || pre_handshake_app_port.is_some_and(|port| port != resolved_app_port)
+}
+
+#[derive(Clone, Copy)]
+struct MeshInboundPeerAuthTransportMismatch {
+    resolved_app_port: u16,
+    required_mode: crate::modes::mesh::config::MtlsMode,
+}
+
+fn mesh_inbound_peer_auth_transport_mismatch(
+    state: &ProxyState,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    pre_handshake_app_port: Option<u16>,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    is_tls: bool,
+    has_verified_peer_certificate: bool,
+) -> Option<MeshInboundPeerAuthTransportMismatch> {
+    let resolved_app_port = mesh_inbound_peer_auth_app_port(proxy, upstream_target);
+    if !mesh_inbound_requires_post_route_transport_gate(
+        mesh_direction,
+        pre_handshake_app_port,
+        resolved_app_port,
+    ) {
+        return None;
+    }
+
+    let policy = state.mesh_inbound_tls_policy.load();
+    let required_mode = policy
+        .modes_by_port
+        .get(&resolved_app_port)
+        .copied()
+        .unwrap_or(policy.default_mode);
+    (!mesh_inbound_transport_satisfies_mode(required_mode, is_tls, has_verified_peer_certificate))
+        .then_some(MeshInboundPeerAuthTransportMismatch {
+            resolved_app_port,
+            required_mode,
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reject_mesh_inbound_peer_auth_transport_mismatch(
+    state: &ProxyState,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    proxy: &Proxy,
+    mismatch: MeshInboundPeerAuthTransportMismatch,
+    is_tls: bool,
+    is_grpc_request: bool,
+    start_time: Instant,
+    plugin_execution_ns: u64,
+    log_reason: &'static str,
+    request_path: Option<&str>,
+) -> Response<ProxyBody> {
+    warn!(
+        proxy_id = %proxy.id,
+        resolved_app_port = mismatch.resolved_app_port,
+        required_mode = ?mismatch.required_mode,
+        transport_tls = is_tls,
+        verified_peer_certificate = ctx.tls_client_cert_der.is_some(),
+        client_ip = %ctx.client_ip,
+        "Rejecting mesh inbound request because its transport does not satisfy the effective target app-port PeerAuthentication mode"
+    );
+    let reject = finalize_reject_response_with_after_proxy_hooks(
+        plugins,
+        ctx,
+        StatusCode::FORBIDDEN,
+        br#"{"error":"Mesh inbound transport does not satisfy PeerAuthentication for the resolved application port"}"#,
+        HashMap::new(),
+        is_grpc_request,
+    )
+    .await;
+    if is_grpc_request {
+        apply_grpc_reject_metadata(ctx, &reject);
+    }
+    log_rejected_request_with_path(
+        plugins,
+        ctx,
+        reject.http_status.as_u16(),
+        start_time,
+        log_reason,
+        plugin_execution_ns,
+        request_path,
+    )
+    .await;
+    record_request(state, reject.http_status.as_u16());
+    build_response_from_normalized_reject(reject)
 }
 
 struct TlsConnectionMetadata {
@@ -11721,6 +11826,8 @@ struct TlsConnectionMetadata {
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     /// See [`RequestConnectionMetadata::orig_dst`].
     orig_dst: Option<SocketAddr>,
+    /// See [`RequestConnectionMetadata::mesh_inbound_pre_handshake_app_port`].
+    mesh_inbound_pre_handshake_app_port: Option<u16>,
 }
 
 struct NodeWaypointAcceptIdentity {
@@ -12158,6 +12265,7 @@ async fn run_accept_loop(
                             let ListenerTlsSelection {
                                 mut tls_config,
                                 accepts_plaintext,
+                                mesh_inbound_pre_handshake_app_port,
                             } = tls_selection;
                             if tls_config.is_some() && accepts_plaintext {
                                 // A captured stream-family port is an L4
@@ -12338,6 +12446,7 @@ async fn run_accept_loop(
                                     node_waypoint_identity,
                                     mesh_direction,
                                     orig_dst,
+                                    mesh_inbound_pre_handshake_app_port,
                                 };
                                 handle_tls_connection(
                                     stream,
@@ -12358,6 +12467,7 @@ async fn run_accept_loop(
                                     node_waypoint_identity,
                                     mesh_direction,
                                     orig_dst,
+                                    mesh_inbound_pre_handshake_app_port,
                                 )
                                 .await
                             };
@@ -12499,6 +12609,8 @@ async fn handle_tls_connection(
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
             mesh_direction: tls_connection_metadata.mesh_direction,
             orig_dst: tls_connection_metadata.orig_dst,
+            mesh_inbound_pre_handshake_app_port: tls_connection_metadata
+                .mesh_inbound_pre_handshake_app_port,
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -13841,6 +13953,8 @@ async fn handle_proxy_request_inner(
     ctx.frontend_sni_hostname = connection_metadata.frontend_sni_hostname;
     ctx.mesh_direction = connection_metadata.mesh_direction;
     ctx.orig_dst = connection_metadata.orig_dst;
+    let mesh_inbound_pre_handshake_app_port =
+        connection_metadata.mesh_inbound_pre_handshake_app_port;
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     if let Some(identity) = connection_metadata.node_waypoint_identity {
@@ -14477,58 +14591,6 @@ async fn handle_proxy_request_inner(
         }
     };
 
-    // Direct dials to mesh transport listeners do not carry a REDIRECT
-    // `SO_ORIGINAL_DST`, so the accept loop cannot select an app-port-specific
-    // TLS config before the handshake. Captured connections normally already
-    // selected by their app port, but Host routing can resolve a different
-    // single-port service. Once routing has resolved the workload port, enforce
-    // its effective PeerAuthentication mode for direct dials and captured-port
-    // mismatches. A certificate present here has already passed the rustls
-    // verifier selected for the connection.
-    let resolved_app_port = mesh_inbound_peer_auth_app_port(&proxy);
-    if mesh_inbound_requires_post_route_transport_gate(
-        ctx.mesh_direction,
-        ctx.orig_dst,
-        resolved_app_port,
-    ) {
-        // Direct dials always require the authoritative post-route gate because
-        // they have no app-port signal at handshake time. Captured traffic was
-        // already selected by SO_ORIGINAL_DST; keep its hot path unchanged when
-        // that port is the app port routing serves, but re-check mismatches so a
-        // Host-routed single-port service cannot inherit a weaker captured
-        // port's transport posture.
-        let policy = state.mesh_inbound_tls_policy.load();
-        let required_mode = policy
-            .modes_by_port
-            .get(&resolved_app_port)
-            .copied()
-            .unwrap_or(policy.default_mode);
-        if !mesh_inbound_transport_satisfies_mode(
-            required_mode,
-            is_tls,
-            ctx.tls_client_cert_der.is_some(),
-        ) {
-            warn!(
-                proxy_id = %proxy.id,
-                resolved_app_port,
-                ?required_mode,
-                transport_tls = is_tls,
-                verified_peer_certificate = ctx.tls_client_cert_der.is_some(),
-                client_ip = %ctx.client_ip,
-                "Rejecting mesh inbound request because its transport does not satisfy the resolved app-port PeerAuthentication mode"
-            );
-            state.request_count.fetch_add(1, Ordering::Relaxed);
-            let reject = normalize_reject_response(
-                StatusCode::FORBIDDEN,
-                br#"{"error":"Mesh inbound transport does not satisfy PeerAuthentication for the resolved application port"}"#,
-                &EMPTY_HEADERS,
-                request_uses_grpc_content_type,
-            );
-            record_status(&state, reject.http_status.as_u16());
-            return Ok(build_response_from_normalized_reject(reject));
-        }
-    }
-
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     debug!(proxy_id = %proxy.id, method = %method, path = %path, client_ip = %ctx.client_ip, "Request routed to proxy");
 
@@ -15000,6 +15062,8 @@ async fn handle_proxy_request_inner(
             &proxy,
             &epoch,
             &mut ctx,
+            is_tls,
+            mesh_inbound_pre_handshake_app_port,
             client_request_body,
             &plugins,
             start_time,
@@ -15018,6 +15082,8 @@ async fn handle_proxy_request_inner(
             &proxy,
             &epoch,
             &mut ctx,
+            is_tls,
+            mesh_inbound_pre_handshake_app_port,
             client_request_body,
             &plugins,
             start_time,
@@ -15126,6 +15192,37 @@ async fn handle_proxy_request_inner(
         selection.target,
         request_host.as_deref(),
     );
+
+    // The effective PeerAuthentication app port is not authoritative until
+    // routing plugins have applied their overrides and load balancing has
+    // selected a concrete upstream target. Direct dials always require this
+    // gate. Captured connections skip it only when the final target port is the
+    // same translated app port that selected the pre-handshake TLS posture.
+    if let Some(mismatch) = mesh_inbound_peer_auth_transport_mismatch(
+        &state,
+        ctx.mesh_direction,
+        mesh_inbound_pre_handshake_app_port,
+        &proxy,
+        upstream_target.as_deref(),
+        is_tls,
+        ctx.tls_client_cert_der.is_some(),
+    ) {
+        return Ok(reject_mesh_inbound_peer_auth_transport_mismatch(
+            &state,
+            &plugins,
+            &mut ctx,
+            &proxy,
+            mismatch,
+            is_tls,
+            is_grpc_request,
+            start_time,
+            plugin_execution_ns,
+            "mesh_inbound_peer_auth_transport_mismatch",
+            Some(&original_request_path),
+        )
+        .await);
+    }
+
     let upstream_balancer = selection.balancer;
     let upstream_is_fallback = selection.is_fallback;
     let sticky_cookie_needed = selection.sticky_cookie_needed;
@@ -36985,6 +37082,11 @@ mod tests {
             select_mesh_inbound_tls(&policy, Some("10.0.0.8:8443".parse().expect("socket addr")));
         assert!(selected.tls_config.is_some());
         assert!(!selected.accepts_plaintext);
+        assert_eq!(
+            selected.mesh_inbound_pre_handshake_app_port,
+            Some(8080),
+            "the post-route comparison must retain the translated app port that selected TLS"
+        );
     }
 
     #[test]
@@ -36994,7 +37096,13 @@ mod tests {
         let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
         ctx.mesh_inbound_listener_authz_port = Some(8443);
 
-        assert_eq!(mesh_inbound_peer_auth_app_port(&proxy), 8080);
+        assert_eq!(mesh_inbound_peer_auth_app_port(&proxy, None), 8080);
+        let selected_target = target_for_test(9090);
+        assert_eq!(
+            mesh_inbound_peer_auth_app_port(&proxy, Some(&selected_target)),
+            9090,
+            "a concrete post-override upstream target must replace the route template port"
+        );
         assert_eq!(
             ctx.mesh_inbound_listener_authz_port,
             Some(8443),
@@ -37051,13 +37159,18 @@ mod tests {
         ));
         assert!(!mesh_inbound_requires_post_route_transport_gate(
             Some(MeshTrafficDirection::Inbound),
-            Some("10.0.0.8:8080".parse().expect("socket addr")),
+            Some(8080),
             8080
         ));
         assert!(mesh_inbound_requires_post_route_transport_gate(
             Some(MeshTrafficDirection::Inbound),
-            Some("10.0.0.8:9090".parse().expect("socket addr")),
+            Some(9090),
             8080
+        ));
+        assert!(mesh_inbound_requires_post_route_transport_gate(
+            Some(MeshTrafficDirection::Inbound),
+            Some(8080),
+            8443
         ));
         assert!(!mesh_inbound_requires_post_route_transport_gate(
             Some(MeshTrafficDirection::Outbound),
