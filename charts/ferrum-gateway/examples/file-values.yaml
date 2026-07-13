@@ -21,6 +21,8 @@ file:
         strip_listen_path: true
         auth_mode: single
         plugins: []
+    consumers: []
+    plugin_configs: []
 
 service:
   type: LoadBalancer

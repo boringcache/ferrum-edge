@@ -104,12 +104,18 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- if hasKey $ports "adminHttps" -}}{{- $ports.adminHttps -}}{{- else -}}9443{{- end -}}
 {{- end -}}
 
-{{/* Loopback host the computed exec probes must dial. The admin listener binds
-     IPv6 loopback only for ::1, so the probe (and any allowlist entry) must match
-     that family instead of the IPv4 127.0.0.1 default. */}}
+{{/* Loopback host the computed exec probes must dial. Any IPv6 bind form (::,
+     [::], ::1, [::1]) makes the admin listener bind [::]/[::1], which is not
+     guaranteed to accept IPv4-mapped 127.0.0.1 (v4-mapped acceptance depends on
+     IPV6_V6ONLY / dual-stack, which the runtime does not force), so the probe
+     (and any allowlist entry) must use IPv6 loopback ::1 for every IPv6 bind.
+     ::1 always reaches a listener bound to :: or ::1. IPv4 binds (0.0.0.0,
+     127.0.0.1) keep the 127.0.0.1 default. Detection: an IPv6 literal is the
+     only bind form containing ':'. */}}
 {{- define "ferrum-gateway.probeHost" -}}
 {{- $bind := (.Values.admin | default dict).bindAddress | default "" -}}
-{{- if eq $bind "::1" -}}::1{{- else -}}127.0.0.1{{- end -}}
+{{- $bind = trimSuffix "]" (trimPrefix "[" $bind) -}}
+{{- if contains ":" $bind -}}::1{{- else -}}127.0.0.1{{- end -}}
 {{- end -}}
 
 {{/* "true" when the value parses as an IPv4 or IPv6 literal, else "". Mirrors
@@ -511,11 +517,18 @@ Validation: fail render on missing/unsafe configuration.
 {{- end -}}
 {{/* Graceful shutdown: give the pod time to drain plus the ~5s cleanup window.
      Use presence (not truthiness) checks so an intentional drain of 0 (skip
-     draining, per docs/configuration.md) is honored instead of dropped. */}}
+     draining, per docs/configuration.md) is honored instead of dropped. A null
+     shutdownDrainSeconds omits FERRUM_SHUTDOWN_DRAIN_SECONDS, so the binary
+     falls back to its 30s default (shutdown_drain_seconds default in
+     src/config/env_config.rs); validate the grace period against that default
+     rather than skipping the guard, or a lowered grace SIGKILLs the pod
+     mid-drain. */}}
 {{- $drain := .Values.shutdownDrainSeconds -}}
+{{- $effectiveDrain := 30 -}}
+{{- if not (kindIs "invalid" $drain) -}}{{- $effectiveDrain = int $drain -}}{{- end -}}
 {{- $grace := .Values.terminationGracePeriodSeconds -}}
-{{- if and (not (kindIs "invalid" $drain)) (not (kindIs "invalid" $grace)) (lt (int $grace) (add (int $drain) 5)) -}}
-{{- fail (printf "terminationGracePeriodSeconds (%d) must be at least shutdownDrainSeconds + 5s cleanup (%d)" (int $grace) (add (int $drain) 5)) -}}
+{{- if and (not (kindIs "invalid" $grace)) (lt (int $grace) (add $effectiveDrain 5)) -}}
+{{- fail (printf "terminationGracePeriodSeconds (%d) must be at least the effective shutdownDrainSeconds + 5s cleanup (%d); a null shutdownDrainSeconds uses the binary's 30s default" (int $grace) (add $effectiveDrain 5)) -}}
 {{- end -}}
 {{- end -}}
 

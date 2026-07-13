@@ -1969,6 +1969,11 @@ jobs:
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
           grep -Fq 'name: FERRUM_FILE_CONFIG_PATH' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
+          # GatewayConfig deserialization requires all four top-level lists (version,
+          # proxies, consumers, plugin_configs) with no serde defaults, so the default
+          # inline ConfigMap must emit consumers/plugin_configs or the pod fails to boot.
+          grep -Fq 'consumers: []' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
+          grep -Fq 'plugin_configs: []' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
           # Each supported mode renders.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=database --set database.type=sqlite \
@@ -2255,6 +2260,16 @@ jobs:
             echo "::error title=IPv6 probe host mismatch::admin.bindAddress=::1 must produce a --host ::1 probe"
             exit 1
           fi
+          # An unspecified IPv6 admin bind ([::]) is not guaranteed to accept v4-mapped
+          # 127.0.0.1, so the computed probes must also dial ::1 for any IPv6 bind form.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set-string admin.bindAddress=:: \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv6-any-bind.yaml"
+          any_probe_block="$(awk '/^[[:space:]]+readinessProbe:/{f=1} f{print} f&&/periodSeconds:/{exit}' "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv6-any-bind.yaml")"
+          if ! grep -q -- '- ::1' <<<"$any_probe_block"; then
+            echo "::error title=IPv6 any-bind probe host mismatch::admin.bindAddress=:: must produce a --host ::1 probe"
+            exit 1
+          fi
           # Both admin ports disabled leaves no admin listener for the probes: fail.
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=file --set ports.adminHttp=0 --set ports.adminHttps=0 \
@@ -2504,11 +2519,12 @@ jobs:
           fi
           grep -F 'accepts at most one source' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-admin-jwt-conflict.err"
           # A values file may use explicit nulls to omit shutdown drain and clear the
-          # PDB minAvailable default (the schema must accept null for both).
+          # PDB minAvailable default (the schema must accept null for both). The grace
+          # period must still cover the binary's 30s default drain + 5s cleanup.
           cat > "$RUNNER_TEMP/ferrum-gateway-helm-results/null-values.yaml" <<'NULLEOF'
           mode: file
           shutdownDrainSeconds: null
-          terminationGracePeriodSeconds: 10
+          terminationGracePeriodSeconds: 40
           podDisruptionBudget:
             enabled: true
             minAvailable: null
@@ -2521,6 +2537,21 @@ jobs:
             echo "::error title=Null shutdown drain still rendered::shutdownDrainSeconds: null must omit the env"
             exit 1
           fi
+          # A null shutdownDrainSeconds still drains for the binary's 30s default, so a
+          # grace period below 30+5 must fail render instead of being skipped.
+          cat > "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.yaml" <<'NULLGRACEEOF'
+          mode: file
+          shutdownDrainSeconds: null
+          terminationGracePeriodSeconds: 10
+          NULLGRACEEOF
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            -f "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.yaml" \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace-rendered.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.err"; then
+            echo "::error title=Null drain skipped grace guard::null shutdownDrainSeconds must be validated against the 30s binary default"
+            exit 1
+          fi
+          grep -F 'null shutdownDrainSeconds uses the binary' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-drain-low-grace.err"
           grep -Fq 'maxUnavailable: 1' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-rendered.yaml"
           if grep -Fq 'minAvailable:' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-rendered.yaml"; then
             echo "::error title=Null minAvailable still rendered::minAvailable: null must fall through to maxUnavailable"

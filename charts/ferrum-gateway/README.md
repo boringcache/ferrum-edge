@@ -36,8 +36,11 @@ node_agent, migrate) fails at template time with a pointer to the right chart.
   rejected as ineffective protection; the binary is authoritative for other
   permit-all CIDR unions. If computed exec probes are enabled,
   `admin.allowedCidrs` must include exact source `127.0.0.1/32` (or the bare IP)
-  because the admin TCP filter does not special-case loopback (an `::1` bind
-  requires `::1/128` instead, and shifts the computed probes to `--host ::1`).
+  because the admin TCP filter does not special-case loopback. Any IPv6 bind form
+  (`::`, `[::]`, `::1`, `[::1]`) instead shifts the computed probes to `--host ::1`
+  and requires `::1/128` (or bare `::1`) in the allowlist — an unspecified IPv6
+  bind is not guaranteed to accept v4-mapped `127.0.0.1`, so the probes use IPv6
+  loopback for every IPv6 bind.
   `admin.bindAddress` must be an IP literal — any hostname (`localhost`,
   `admin.internal`, ...) is rejected at render (the binary requires an IP); use
   `127.0.0.1` or `::1`.
@@ -86,8 +89,10 @@ node_agent, migrate) fails at template time with a pointer to the right chart.
 - **Graceful shutdown** wires `terminationGracePeriodSeconds` to the
   `FERRUM_SHUTDOWN_DRAIN_SECONDS` drain window (grace must exceed drain + ~5s
   cleanup, enforced at render). `shutdownDrainSeconds: 0` is a valid "skip
-  draining" value and is rendered explicitly; set it to `null` to fall back to
-  the binary's 30s default.
+  draining" value and is rendered explicitly; set it to `null` to omit the env
+  and fall back to the binary's 30s default. A `null` drain is still validated
+  against that 30s default, so a grace period below 35s fails render rather than
+  letting Kubernetes SIGKILL the pod mid-drain.
 
 ## Probes
 
@@ -131,6 +136,12 @@ File mode generates a random read-only admin JWT secret at startup, so no
 credential Secret is required. Kubernetes does not send `SIGHUP` on ConfigMap
 change; the chart stamps a config checksum so `helm upgrade` rolls pods, or run
 `kubectl rollout restart` after editing config.
+
+The rendered config must define all four `GatewayConfig` top-level lists —
+`version`, `proxies`, `consumers`, and `plugin_configs` — because none carry a
+serde default and deserialization uses `deny_unknown_fields`. The default
+`file.inlineConfig` supplies empty `consumers`/`plugin_configs` lists; keep them
+(or an `existingConfigMap` equivalent) or the pod fails to boot.
 
 ### Control plane + data plane pair
 
