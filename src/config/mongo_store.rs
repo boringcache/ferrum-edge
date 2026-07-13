@@ -5197,6 +5197,19 @@ mod inner {
                 deleted
             } else {
                 // Standalone pre-checks (best-effort, no transaction).
+                // Verify the target in the requested namespace before scanning
+                // references so a wrong-namespace delete remains a 404 and
+                // does not disclose another namespace's relationships.
+                // Capture the document now so a post-delete re-check can
+                // restore it.
+                let existing = self
+                    .upstreams()
+                    .find_one(doc! { "_id": id, "namespace": namespace })
+                    .await?;
+                let Some(existing) = existing else {
+                    self.check_slow_query("delete_upstream", start);
+                    return Ok(false);
+                };
                 let proxy_refs = self
                     .proxies()
                     .count_documents(doc! { "upstream_id": id })
@@ -5217,16 +5230,6 @@ mod inner {
                         plugin.id
                     );
                 }
-                // Capture the document before deleting so a post-delete
-                // re-check can restore it.
-                let existing = self
-                    .upstreams()
-                    .find_one(doc! { "_id": id, "namespace": namespace })
-                    .await?;
-                let Some(existing) = existing else {
-                    self.check_slow_query("delete_upstream", start);
-                    return Ok(false);
-                };
                 let result = self
                     .upstreams()
                     .delete_one(doc! { "_id": id, "namespace": namespace })
@@ -10279,6 +10282,34 @@ mod inner {
                 guard < upstream_delete,
                 "delete_proxy must guard external references before deleting \
                  upstreams tagged with the spec id"
+            );
+        }
+
+        #[test]
+        fn delete_upstream_standalone_checks_namespaced_target_before_references() {
+            let source = include_str!("mongo_store.rs");
+            let delete_start = source
+                .find("async fn delete_upstream(&self, namespace: &str, id: &str)")
+                .expect("delete_upstream function");
+            let delete_body = &source[delete_start..];
+            let standalone_start = delete_body
+                .find("// Standalone pre-checks (best-effort, no transaction).")
+                .expect("delete_upstream standalone marker");
+            let standalone_path = &delete_body[standalone_start..];
+            let target_lookup = standalone_path
+                .find(".find_one(doc! { \"_id\": id, \"namespace\": namespace })")
+                .expect("namespace-scoped upstream existence lookup");
+            let proxy_refs = standalone_path
+                .find(".count_documents(doc! { \"upstream_id\": id })")
+                .expect("proxy reference check");
+            let plugin_refs = standalone_path
+                .find(".find_mesh_route_dispatch_upstream_ref_opt_session(None, id)")
+                .expect("plugin reference check");
+
+            assert!(
+                target_lookup < proxy_refs && target_lookup < plugin_refs,
+                "standalone delete_upstream must establish target existence in the requested \
+                 namespace before scanning references"
             );
         }
 
