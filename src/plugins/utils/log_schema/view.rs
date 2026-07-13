@@ -707,7 +707,9 @@ mod tests {
     }
 
     fn serialize_via(summary: &TransactionSummary, raw_schema: Value) -> Value {
-        let schema = SummarySchema::compile(&raw_schema, "test").unwrap();
+        let schema =
+            SummarySchema::compile(&raw_schema, "test", super::super::SchemaCapabilities::BASE)
+                .unwrap();
         let view = SchemaView {
             summary,
             schema: &schema,
@@ -716,7 +718,9 @@ mod tests {
     }
 
     fn serialize_stream(summary: &StreamTransactionSummary, raw_schema: Value) -> Value {
-        let schema = SummarySchema::compile(&raw_schema, "test").unwrap();
+        let schema =
+            SummarySchema::compile(&raw_schema, "test", super::super::SchemaCapabilities::BASE)
+                .unwrap();
         let view = SchemaView {
             summary,
             schema: &schema,

@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 
-use super::utils::log_schema::{SchemaView, SummarySchema, resolve_schema};
+use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLogger, PluginHttpClient, RetryPolicy,
     build_batch_config, handle_http_batch_response, parse_custom_headers, parse_http_endpoint,
@@ -164,7 +164,7 @@ impl LokiLogging {
             },
         );
 
-        let schema = resolve_schema(config, "loki_logging")?;
+        let schema = resolve_schema(config, "loki_logging", SchemaCapabilities::BASE)?;
         Ok(Self {
             logger,
             endpoint_hostname,

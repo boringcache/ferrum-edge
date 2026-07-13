@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use tokio::time::Instant;
 use tracing::warn;
 
-use super::utils::log_schema::{SummarySchema, resolve_schema};
+use super::utils::log_schema::{SchemaCapabilities, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry,
     UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, parse_socket_host,
@@ -289,7 +289,7 @@ impl StatsdLogging {
         };
 
         warn_on_unsupported_inline_schema_keys(config);
-        let schema = resolve_schema(config, "statsd_logging")?;
+        let schema = resolve_schema(config, "statsd_logging", SchemaCapabilities::BASE)?;
         let flush_config = StatsdFlushConfig {
             hostname: host.clone(),
             port: port as u16,

@@ -31,8 +31,8 @@ use super::utils::log_schema::view::{
     MetadataNested, extract_host_from_url, serialize_schema_metadata,
 };
 use super::utils::log_schema::{
-    DerivedKind, MetadataPolicy, SchemaSerializable, SchemaView, SummarySchema, TimestampFormat,
-    resolve_schema,
+    DerivedKind, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView, SummarySchema,
+    TimestampFormat, resolve_schema,
 };
 use super::utils::{BatchConfigDefaults, PluginHttpClient, validate_batch_config};
 use super::{
@@ -309,7 +309,10 @@ impl WsLogging {
         let retry_delay_ms = optional_u64(config, "retry_delay_ms", batch_defaults.retry_delay_ms)?;
         let reconnect_delay_ms = optional_u64(config, "reconnect_delay_ms", 5000)?;
 
-        let schema = resolve_schema(config, "ws_logging")?;
+        // ws_logging is the only caller that serializes WebSocket-disconnect
+        // entries, so it opts into that field family. Every other logging
+        // plugin uses the shared compiler under `SchemaCapabilities::BASE`.
+        let schema = resolve_schema(config, "ws_logging", SchemaCapabilities::WS_LOGGING)?;
         let ws_config = WsConfig {
             endpoint_url,
             connector,

@@ -139,11 +139,12 @@ caveat applies only to incremental admin-API edits.
 | `metadata` | object | `{mode: nested}` | How to render the `metadata` map: `nested` / `omit` / `flatten`. |
 | `timestamp_format` | `rfc3339` / `epoch_ms` / `epoch_s` | `rfc3339` | Conversion for timestamp string fields. Parse failures fall back to the raw string. |
 
-### WebSocket Disconnect Fields
+### WebSocket Disconnect Fields (`ws_logging` only)
 
-`ws_logging` applies `summary_type: http` and `summary_type: both` schemas
-to the record emitted when a WebSocket session disconnects. The native keys
-available to `omit`, `rename`, and `order` are:
+These keys are scoped to the **`ws_logging`** plugin. `ws_logging` applies
+`summary_type: http` and `summary_type: both` schemas to the record emitted
+when a WebSocket session disconnects, and only there are the WebSocket-disconnect
+keys valid. The native keys available to `omit`, `rename`, and `order` are:
 
 `event`, `namespace`, `proxy_id`, `proxy_name`, `client_ip`,
 `consumer_username`, `auth_method`, `backend_target`, `protocol`,
@@ -155,6 +156,17 @@ The disconnect-specific keys are `event`, `frames_client_to_backend`,
 `frames_backend_to_client`, `direction`, and `io_side`. A
 `summary_type: stream` schema remains limited to TCP, UDP, and DTLS entries;
 WebSocket disconnects retain their native shape under that setting.
+
+Every other logging plugin (`http_logging`, `kafka_logging`,
+`loki_logging`, `stdout_logging`, `tcp_logging`, `udp_logging`,
+`statsd_logging`) uses the shared compiler without this field family: these
+WebSocket-disconnect names are **rejected** in `omit` / `rename` / `order`
+and never reserve output keys, so a non-`ws_logging` schema is free to use
+names like `event` for a `static_fields` entry or a flattened metadata key.
+Named schemas defined via `transaction_log_schema` are process-global and
+compile without the WebSocket-disconnect family too, so they stay portable
+across every logging plugin; use an inline `ws_logging` `schema:` to shape
+disconnect-specific keys.
 
 ### Derived Kinds
 

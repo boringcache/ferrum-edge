@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::Plugin;
-use crate::plugins::utils::log_schema::{SummarySchema, registry};
+use crate::plugins::utils::log_schema::{SchemaCapabilities, SummarySchema, registry};
 
 #[derive(Debug)]
 pub struct TransactionLogSchema {
@@ -65,8 +65,12 @@ impl TransactionLogSchema {
             }
             // Compile (validates everything). Plugin name uses the schema
             // entry name so error messages point at the offending entry.
+            // Named schemas are process-global and portable across every
+            // logging plugin, so they compile under the base capability set
+            // — ws-only fields belong to inline `ws_logging` schemas only.
             let plugin_label = format!("transaction_log_schema[{name}]");
-            let compiled = SummarySchema::compile(schema_value, &plugin_label)?;
+            let compiled =
+                SummarySchema::compile(schema_value, &plugin_label, SchemaCapabilities::BASE)?;
 
             // Stage the local map FIRST so a defensive duplicate check can
             // short-circuit before the process-global registry is mutated.

@@ -8,6 +8,37 @@
 
 use super::SummaryType;
 
+/// Optional field families a specific caller opts into.
+///
+/// [`super::SummarySchema::compile`] is shared by every logging plugin, but
+/// only `ws_logging` serializes `WsDisconnectLogEntry`. The
+/// WebSocket-disconnect field family is therefore gated behind an explicit
+/// capability so every other caller (`http_logging`, `kafka_logging`,
+/// `loki_logging`, `stdout_logging`, …) sees exactly the base HTTP / stream
+/// registry: ws-only names stay rejected in `omit` / `rename` / `order` and
+/// never reserve output keys that would collide with `static_fields` or
+/// flattened metadata.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SchemaCapabilities {
+    /// Expose the `ws_logging` WebSocket-disconnect field family to `http`
+    /// and `both` summary types.
+    pub websocket_disconnect: bool,
+}
+
+impl SchemaCapabilities {
+    /// Base registry shared by every non-WebSocket logging plugin — exactly
+    /// the HTTP and stream field families, matching pre-WS behavior.
+    pub const BASE: Self = Self {
+        websocket_disconnect: false,
+    };
+
+    /// `ws_logging` capability: additionally expose the WebSocket-disconnect
+    /// field family to `http` / `both` schemas.
+    pub const WS_LOGGING: Self = Self {
+        websocket_disconnect: true,
+    };
+}
+
 /// Metadata for a single native field on a summary struct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FieldMeta {
@@ -227,8 +258,12 @@ pub const STREAM_FIELDS: &[FieldMeta] = &[
 
 /// Fields on the `ws_logging` WebSocket disconnect entry in declaration order.
 ///
-/// WebSocket disconnect entries are part of the HTTP / WebSocket summary
-/// family, so these fields are visible to `summary_type: http` and `both`.
+/// WebSocket disconnect entries belong to the HTTP / WebSocket summary
+/// family, but the shared log-schema compiler only exposes them to `http` /
+/// `both` schemas when the caller opts in via
+/// [`SchemaCapabilities::websocket_disconnect`] (i.e. the `ws_logging`
+/// plugin). Every other logging plugin sees the base registry, so ws-only
+/// names stay rejected and never reserve output keys.
 pub const WS_DISCONNECT_FIELDS: &[FieldMeta] = &[
     FieldMeta {
         name: "event",
@@ -300,34 +335,42 @@ pub const WS_DISCONNECT_FIELDS: &[FieldMeta] = &[
     },
 ];
 
-/// Look up a field by name for the given summary type.
+/// The field families visible for `summary_type` under `caps`.
 ///
-/// For [`SummaryType::Both`] the field may exist on any registered entry type.
-pub fn lookup(summary_type: SummaryType, name: &str) -> Option<FieldMeta> {
-    match summary_type {
-        SummaryType::Http => HTTP_FIELDS
-            .iter()
-            .chain(WS_DISCONNECT_FIELDS.iter())
-            .find(|f| f.name == name)
-            .copied(),
-        SummaryType::Stream => STREAM_FIELDS.iter().find(|f| f.name == name).copied(),
-        SummaryType::Both => HTTP_FIELDS
-            .iter()
-            .chain(STREAM_FIELDS.iter())
-            .chain(WS_DISCONNECT_FIELDS.iter())
-            .find(|f| f.name == name)
-            .copied(),
+/// The WebSocket-disconnect family is appended to the `http` / `both`
+/// families only when the caller opts in via
+/// [`SchemaCapabilities::websocket_disconnect`].
+fn field_sets(summary_type: SummaryType, caps: SchemaCapabilities) -> Vec<&'static [FieldMeta]> {
+    let mut sets: Vec<&'static [FieldMeta]> = match summary_type {
+        SummaryType::Http => vec![HTTP_FIELDS],
+        SummaryType::Stream => vec![STREAM_FIELDS],
+        SummaryType::Both => vec![HTTP_FIELDS, STREAM_FIELDS],
+    };
+    if caps.websocket_disconnect && matches!(summary_type, SummaryType::Http | SummaryType::Both) {
+        sets.push(WS_DISCONNECT_FIELDS);
     }
+    sets
 }
 
-/// All field names visible for the given summary type, in declaration order,
-/// deduplicated across entry types.
-pub fn fields_for(summary_type: SummaryType) -> Vec<FieldMeta> {
-    match summary_type {
-        SummaryType::Http => union_fields(&[HTTP_FIELDS, WS_DISCONNECT_FIELDS]),
-        SummaryType::Stream => STREAM_FIELDS.to_vec(),
-        SummaryType::Both => union_fields(&[HTTP_FIELDS, STREAM_FIELDS, WS_DISCONNECT_FIELDS]),
-    }
+/// Look up a field by name for the given summary type and capabilities.
+///
+/// For [`SummaryType::Both`] the field may exist on any visible entry type.
+pub fn lookup(
+    summary_type: SummaryType,
+    caps: SchemaCapabilities,
+    name: &str,
+) -> Option<FieldMeta> {
+    field_sets(summary_type, caps)
+        .iter()
+        .flat_map(|set| set.iter())
+        .find(|f| f.name == name)
+        .copied()
+}
+
+/// All field names visible for the given summary type and capabilities, in
+/// declaration order, deduplicated across entry types.
+pub fn fields_for(summary_type: SummaryType, caps: SchemaCapabilities) -> Vec<FieldMeta> {
+    union_fields(&field_sets(summary_type, caps))
 }
 
 fn union_fields(field_sets: &[&[FieldMeta]]) -> Vec<FieldMeta> {
@@ -348,14 +391,14 @@ fn union_fields(field_sets: &[&[FieldMeta]]) -> Vec<FieldMeta> {
 /// Suggest the closest known field name to a misspelling, when the
 /// Levenshtein distance is small enough to be useful (≤ 2 for short names,
 /// ≤ 3 for long names).
-pub fn levenshtein_suggest(summary_type: SummaryType, name: &str) -> Option<&'static str> {
-    let candidates: &[&[FieldMeta]] = match summary_type {
-        SummaryType::Http => &[HTTP_FIELDS, WS_DISCONNECT_FIELDS],
-        SummaryType::Stream => &[STREAM_FIELDS],
-        SummaryType::Both => &[HTTP_FIELDS, STREAM_FIELDS, WS_DISCONNECT_FIELDS],
-    };
+pub fn levenshtein_suggest(
+    summary_type: SummaryType,
+    caps: SchemaCapabilities,
+    name: &str,
+) -> Option<&'static str> {
+    let candidates = field_sets(summary_type, caps);
     let mut best: Option<(usize, &'static str)> = None;
-    for set in candidates {
+    for set in &candidates {
         for field in *set {
             let d = levenshtein(name, field.name);
             if best.map(|(b, _)| d < b).unwrap_or(true) {
@@ -394,10 +437,13 @@ fn levenshtein(a: &str, b: &str) -> usize {
 mod tests {
     use super::*;
 
+    const BASE: SchemaCapabilities = SchemaCapabilities::BASE;
+    const WS: SchemaCapabilities = SchemaCapabilities::WS_LOGGING;
+
     #[test]
     fn lookup_known_http_field() {
         assert_eq!(
-            lookup(SummaryType::Http, "proxy_id"),
+            lookup(SummaryType::Http, BASE, "proxy_id"),
             Some(FieldMeta {
                 name: "proxy_id",
                 is_timestamp: false
@@ -408,7 +454,7 @@ mod tests {
     #[test]
     fn lookup_known_stream_field() {
         assert_eq!(
-            lookup(SummaryType::Stream, "bytes_sent"),
+            lookup(SummaryType::Stream, BASE, "bytes_sent"),
             Some(FieldMeta {
                 name: "bytes_sent",
                 is_timestamp: false
@@ -418,70 +464,101 @@ mod tests {
 
     #[test]
     fn lookup_unknown_returns_none() {
-        assert!(lookup(SummaryType::Http, "not_a_field").is_none());
+        assert!(lookup(SummaryType::Http, BASE, "not_a_field").is_none());
     }
 
     #[test]
     fn lookup_http_field_not_on_stream() {
         // request_path is only on TransactionSummary.
-        assert!(lookup(SummaryType::Stream, "request_path").is_none());
-        assert!(lookup(SummaryType::Http, "request_path").is_some());
-        assert!(lookup(SummaryType::Both, "request_path").is_some());
+        assert!(lookup(SummaryType::Stream, BASE, "request_path").is_none());
+        assert!(lookup(SummaryType::Http, BASE, "request_path").is_some());
+        assert!(lookup(SummaryType::Both, BASE, "request_path").is_some());
     }
 
     #[test]
     fn lookup_stream_only_field_not_on_http() {
-        assert!(lookup(SummaryType::Http, "timestamp_connected").is_none());
-        assert!(lookup(SummaryType::Stream, "timestamp_connected").is_some());
-        assert!(lookup(SummaryType::Both, "timestamp_connected").is_some());
+        assert!(lookup(SummaryType::Http, BASE, "timestamp_connected").is_none());
+        assert!(lookup(SummaryType::Stream, BASE, "timestamp_connected").is_some());
+        assert!(lookup(SummaryType::Both, BASE, "timestamp_connected").is_some());
     }
 
     #[test]
-    fn lookup_websocket_disconnect_field_as_http() {
-        assert!(lookup(SummaryType::Http, "frames_client_to_backend").is_some());
-        assert!(lookup(SummaryType::Stream, "frames_client_to_backend").is_none());
-        assert!(lookup(SummaryType::Both, "frames_client_to_backend").is_some());
+    fn websocket_disconnect_field_gated_by_capability() {
+        // WS-only field: invisible without the capability (every non-ws
+        // plugin), visible with it (ws_logging).
+        assert!(lookup(SummaryType::Http, BASE, "frames_client_to_backend").is_none());
+        assert!(lookup(SummaryType::Both, BASE, "frames_client_to_backend").is_none());
+        assert!(lookup(SummaryType::Http, WS, "frames_client_to_backend").is_some());
+        assert!(lookup(SummaryType::Both, WS, "frames_client_to_backend").is_some());
+        // The capability never leaks WS fields into stream schemas.
+        assert!(lookup(SummaryType::Stream, WS, "frames_client_to_backend").is_none());
+    }
+
+    #[test]
+    fn ws_only_protocol_field_gated_on_http() {
+        // `protocol` exists on the WS-disconnect family but not on the base
+        // HTTP registry. It must stay unknown for http/both without the
+        // capability so non-ws plugins reject it exactly as before.
+        assert!(lookup(SummaryType::Http, BASE, "protocol").is_none());
+        assert!(lookup(SummaryType::Http, WS, "protocol").is_some());
+        // Stream summaries carry their own `protocol` field regardless.
+        assert!(lookup(SummaryType::Stream, BASE, "protocol").is_some());
     }
 
     #[test]
     fn timestamp_flag_set_correctly() {
-        let f = lookup(SummaryType::Http, "timestamp_received").unwrap();
+        let f = lookup(SummaryType::Http, BASE, "timestamp_received").unwrap();
         assert!(f.is_timestamp);
-        let f = lookup(SummaryType::Stream, "timestamp_connected").unwrap();
+        let f = lookup(SummaryType::Stream, BASE, "timestamp_connected").unwrap();
         assert!(f.is_timestamp);
-        let f = lookup(SummaryType::Stream, "timestamp_disconnected").unwrap();
+        let f = lookup(SummaryType::Stream, BASE, "timestamp_disconnected").unwrap();
         assert!(f.is_timestamp);
-        let f = lookup(SummaryType::Http, "client_ip").unwrap();
+        let f = lookup(SummaryType::Http, BASE, "client_ip").unwrap();
         assert!(!f.is_timestamp);
     }
 
     #[test]
     fn fields_for_both_unions_and_dedupes() {
-        let all = fields_for(SummaryType::Both);
+        let all = fields_for(SummaryType::Both, BASE);
         // namespace, proxy_id, client_ip etc. exist on both — should appear once.
         let namespaces = all.iter().filter(|f| f.name == "namespace").count();
         assert_eq!(namespaces, 1);
         let proxy_ids = all.iter().filter(|f| f.name == "proxy_id").count();
         assert_eq!(proxy_ids, 1);
-        let expected = union_fields(&[HTTP_FIELDS, STREAM_FIELDS, WS_DISCONNECT_FIELDS]);
+        // Base capability: no WS-disconnect family in the union.
+        let expected = union_fields(&[HTTP_FIELDS, STREAM_FIELDS]);
         assert_eq!(all, expected);
+    }
+
+    #[test]
+    fn fields_for_both_includes_ws_family_with_capability() {
+        let base = fields_for(SummaryType::Both, BASE);
+        let ws = fields_for(SummaryType::Both, WS);
+        // The WS capability adds the WS-only fields (deduped against the
+        // overlap with HTTP / stream fields).
+        assert!(base.iter().all(|f| f.name != "frames_client_to_backend"));
+        assert!(ws.iter().any(|f| f.name == "frames_client_to_backend"));
+        assert_eq!(
+            ws,
+            union_fields(&[HTTP_FIELDS, STREAM_FIELDS, WS_DISCONNECT_FIELDS])
+        );
     }
 
     #[test]
     fn levenshtein_suggests_close_match() {
         assert_eq!(
-            levenshtein_suggest(SummaryType::Http, "proxy_idd"),
+            levenshtein_suggest(SummaryType::Http, BASE, "proxy_idd"),
             Some("proxy_id")
         );
         assert_eq!(
-            levenshtein_suggest(SummaryType::Http, "lateny_total_ms"),
+            levenshtein_suggest(SummaryType::Http, BASE, "lateny_total_ms"),
             Some("latency_total_ms")
         );
     }
 
     #[test]
     fn levenshtein_skips_far_matches() {
-        assert!(levenshtein_suggest(SummaryType::Http, "completely_unrelated").is_none());
+        assert!(levenshtein_suggest(SummaryType::Http, BASE, "completely_unrelated").is_none());
     }
 
     #[test]

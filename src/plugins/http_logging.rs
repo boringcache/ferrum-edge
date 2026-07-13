@@ -16,7 +16,9 @@ use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 
-use super::utils::log_schema::{SummaryLogEntryBatchView, SummarySchema, resolve_schema};
+use super::utils::log_schema::{
+    SchemaCapabilities, SummaryLogEntryBatchView, SummarySchema, resolve_schema,
+};
 use super::utils::{
     BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry, build_batch_config,
     handle_http_batch_response, parse_custom_headers, parse_http_endpoint, validate_batch_config,
@@ -58,7 +60,7 @@ impl HttpLogging {
         };
         validate_batch_config(config, "http_logging", batch_defaults)?;
 
-        let schema = resolve_schema(config, "http_logging")?;
+        let schema = resolve_schema(config, "http_logging", SchemaCapabilities::BASE)?;
         let flush_config = HttpFlushConfig {
             endpoint_url,
             custom_headers,
