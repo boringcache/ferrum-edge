@@ -172,24 +172,66 @@ fn peer_auth_workload_selector_scope() {
     }
 }
 
-/// `portLevelMtls.<port>.mode` overrides the workload-level mode for the
-/// specified port. `resolve_effective_mtls_mode` looks up the override.
+/// A mixed-mode policy resolves independently per app port, which is the input
+/// used by the pre-handshake `SO_ORIGINAL_DST` TLS-config selector.
 #[test]
 fn peer_auth_port_level_mtls_override() {
     register_feature!(
         category = CATEGORY,
         feature = "portLevelMtls.<port>.mode",
         status = Status::Supported,
-        notes = "Per-port override within the winning policy; resolve_effective_mtls_mode reads port_overrides[port].",
+        notes = "Mixed STRICT/PERMISSIVE app ports resolve independently for pre-handshake ServerConfig selection.",
     );
     let pa = translate_one(json!({
-        "mtls": {"mode": "STRICT"},
-        "portLevelMtls": {"8080": {"mode": "PERMISSIVE"}}
+        "selector": {"matchLabels": {"app": "api"}},
+        "mtls": {"mode": "PERMISSIVE"},
+        "portLevelMtls": {
+            "8080": {"mode": "STRICT"},
+            "9090": {"mode": "PERMISSIVE"}
+        }
     }));
-    assert_eq!(pa.mtls_mode, MtlsMode::Strict);
+    assert_eq!(pa.mtls_mode, MtlsMode::Permissive);
     assert_eq!(
         pa.port_overrides.get(&8080).copied(),
+        Some(MtlsMode::Strict)
+    );
+    assert_eq!(
+        pa.port_overrides.get(&9090).copied(),
         Some(MtlsMode::Permissive)
+    );
+    let labels = HashMap::from([("app".to_string(), "api".to_string())]);
+    assert_eq!(
+        resolve_effective_mtls_mode(std::slice::from_ref(&pa), "default", &labels, 8080),
+        MtlsMode::Strict
+    );
+    assert_eq!(
+        resolve_effective_mtls_mode(std::slice::from_ref(&pa), "default", &labels, 9090),
+        MtlsMode::Permissive
+    );
+}
+
+/// Istio only applies `portLevelMtls` when the policy has a workload selector.
+#[test]
+fn peer_auth_port_level_mtls_requires_selector() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "portLevelMtls requires workload selector",
+        status = Status::Supported,
+        notes = "Selector-less portLevelMtls entries are carried but ignored during effective-mode resolution.",
+    );
+    let pa = translate_one(json!({
+        "selector": null,
+        "mtls": {"mode": "STRICT"},
+        "portLevelMtls": {
+            "8080": {"mode": "DISABLE"}
+        }
+    }));
+    let labels = HashMap::<String, String>::new();
+
+    assert_eq!(
+        resolve_effective_mtls_mode(std::slice::from_ref(&pa), "default", &labels, 8080),
+        MtlsMode::Strict,
+        "selector-less portLevelMtls must not override the workload-level mode"
     );
 }
 

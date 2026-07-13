@@ -439,6 +439,9 @@ async fn test_http3_proxy_state_creation() {
         gateway_trust_bundles: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
         mesh_inbound_tls: empty_mesh_inbound_tls(),
+        mesh_inbound_tls_policy: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ferrum_edge::proxy::MeshInboundTlsPolicy::default(),
+        )),
         mesh_inbound_spiffe_verifier_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mesh_outbound_enforcement: ferrum_edge::modes::mesh::outbound_enforcement::empty_slot(),
         backend_svid_rotation_tx,
@@ -725,6 +728,9 @@ async fn test_http3_full_integration() {
         gateway_trust_bundles: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
         mesh_inbound_tls: empty_mesh_inbound_tls(),
+        mesh_inbound_tls_policy: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ferrum_edge::proxy::MeshInboundTlsPolicy::default(),
+        )),
         mesh_inbound_spiffe_verifier_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mesh_outbound_enforcement: ferrum_edge::modes::mesh::outbound_enforcement::empty_slot(),
         backend_svid_rotation_tx,

@@ -502,7 +502,7 @@ fn peer_authentication_status(
         .unwrap_or("UNSET")
         .to_string();
     let scope = istio_policy_scope_label(object, istio_root_namespace);
-    let port_overrides: Vec<String> = object
+    let configured_port_overrides: Vec<String> = object
         .spec
         .get("portLevelMtls")
         .and_then(Value::as_object)
@@ -515,6 +515,17 @@ fn peer_authentication_status(
                 .collect()
         })
         .unwrap_or_default();
+    let has_workload_selector = object
+        .spec
+        .get("selector")
+        .is_some_and(|selector| !selector.is_null());
+    let port_overrides_ignored_without_selector =
+        !has_workload_selector && !configured_port_overrides.is_empty();
+    let port_overrides = if has_workload_selector {
+        configured_port_overrides
+    } else {
+        Vec::new()
+    };
 
     let (accepted, reason, message, detail) = match result {
         Ok(_translation) => {
@@ -527,45 +538,20 @@ fn peer_authentication_status(
             } else {
                 resolved_mode.as_str()
             };
-            // `portLevelMtls` is imported verbatim (app-port keyed) but the
-            // inbound mesh listener terminates mTLS on a single transport port
-            // and cannot vary STRICT/PERMISSIVE per app port without
-            // SO_ORIGINAL_DST demux. The runtime applies the top-level mode to
-            // the whole listener unless an override key equals the transport
-            // port, in which case that override applies listener-wide. Either
-            // way, the per-app-port intent is NOT enforced.
-            // FerrumAccepted stays True (the policy is otherwise valid and its
-            // listener-wide mode is applied), but the gap MUST be visible so
-            // FerrumAccepted=True no longer implies per-port enforcement. Keep
-            // this in sync with the translator warning in
-            // `src/config_sources/k8s/istio.rs`.
-            let mut deferred: Vec<&'static str> = Vec::new();
-            if !port_overrides.is_empty() {
-                deferred.push(
-                    "portLevelMtls (per-app-port mTLS not enforced: the inbound mesh listener \
-                     terminates mTLS on a single transport port; the top-level mtls.mode governs \
-                     the whole listener unless an override key equals the transport port, in \
-                     which case that override governs the whole listener; per-app-port \
-                     enforcement via SO_ORIGINAL_DST demux is tracked separately)",
-                );
-            }
-            let message = if deferred.is_empty() {
-                format!(
-                    "Ferrum accepted this PeerAuthentication (scope: {scope}; resolved mTLS mode: {effective_mode})"
-                )
+            let ignored_suffix = if port_overrides_ignored_without_selector {
+                "; portLevelMtls ignored because no workload selector is specified"
             } else {
-                format!(
-                    "Ferrum accepted this PeerAuthentication (scope: {scope}; resolved mTLS mode: \
-                     {effective_mode}); deferred fields: {}",
-                    deferred.join(", ")
-                )
+                ""
             };
+            let message = format!(
+                "Ferrum accepted this PeerAuthentication (scope: {scope}; resolved mTLS mode: {effective_mode}{ignored_suffix})"
+            );
             let detail = json!({
                 "translation": {
                     "scope": scope,
                     "configured_mtls_mode": resolved_mode,
                     "port_level_overrides": port_overrides,
-                    "deferred_fields": deferred,
+                    "port_level_overrides_ignored_without_selector": port_overrides_ignored_without_selector,
                 }
             });
             (true, "Accepted", message, Some(detail))
@@ -1772,6 +1758,7 @@ mod tests {
             "PeerAuthentication",
             "mixed-modes",
             json!({
+                "selector": { "matchLabels": { "app": "api" } },
                 "mtls": { "mode": "STRICT" },
                 "portLevelMtls": {
                     "8080": { "mode": "PERMISSIVE" },
