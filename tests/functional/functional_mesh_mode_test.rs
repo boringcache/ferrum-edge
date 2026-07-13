@@ -3805,7 +3805,9 @@ async fn wait_for_authoritative_cross_cluster_http(
 
     loop {
         let last_observation = match classify_cross_cluster_http(
-            plaintext_http_get(outbound_port, "svc-c.ferrum.svc.cluster.local", "/").await,
+            plaintext_http_get(outbound_port, "svc-c.ferrum.svc.cluster.local", "/")
+                .await
+                .map_err(|error| error.to_string()),
         ) {
             Ok((status, body)) => return Ok((status, body)),
             Err(transient) => transient,
