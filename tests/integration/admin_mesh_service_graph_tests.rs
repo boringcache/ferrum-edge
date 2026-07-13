@@ -81,6 +81,7 @@ fn admin_state_with_mesh_runtime(
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: HashSet::new(),

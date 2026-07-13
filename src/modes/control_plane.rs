@@ -915,6 +915,7 @@ pub async fn run(
         serving_degraded: Some(serving_degraded.clone()),
         serving_listener_failures: None,
         db_available: Some(db_available.clone()),
+        config_rejected: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
         reserved_ports: reserved_ports.clone(),

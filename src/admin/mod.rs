@@ -205,6 +205,16 @@ pub struct AdminState {
     /// serve traffic (`startup_ready=true`) while admin writes are blocked
     /// (`db_available=false`) during a transient DB outage.
     pub db_available: Option<Arc<AtomicBool>>,
+    /// Set by the database-mode poll loop when the latest full config load was
+    /// rejected by the shared runtime-config *validation* contract (a reachable
+    /// backend served a semantically-invalid snapshot) rather than failing on
+    /// connectivity. Orthogonal to `db_available`: on a validation rejection the
+    /// backend is reachable and admin writes are the in-band repair tool, so
+    /// `db_available` stays `true` while this flag rises. Cleared by the next
+    /// successful load. Surfaced only in the authenticated `/health` detail
+    /// (`config_rejected`) and coarsely as a `"degraded"` status; `None` in
+    /// modes without a database poll loop. See issue #2158.
+    pub config_rejected: Option<Arc<AtomicBool>>,
     /// Max request body size in MiB for POST /restore.
     pub admin_restore_max_body_size_mib: usize,
     /// Max request body size in MiB for POST/PUT /api-specs.
@@ -1115,6 +1125,24 @@ pub async fn handle_admin_request(
                     "current_backoff_seconds": snapshot.current_backoff_seconds,
                 });
             }
+        }
+
+        // Config-rejection signal (issue #2158): the latest full config load was
+        // rejected by the runtime-config validation contract while the backend
+        // stayed reachable. Admin writes remain ENABLED (they are the in-band
+        // repair path — `db_available` is left `true`), so surface the condition
+        // as a coarse `"degraded"` status plus a `config_rejected` detail flag.
+        // The boolean detail is authenticated-only: it is added to
+        // `health_status`, which the minimal unauthenticated body below does not
+        // echo. The coarse status is consistent with the other DB-driven
+        // degradations above. Cleared by the next accepted load.
+        let config_rejected = state
+            .config_rejected
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed));
+        if config_rejected {
+            health_status["status"] = json!("degraded");
+            health_status["config_rejected"] = json!(true);
         }
 
         if state

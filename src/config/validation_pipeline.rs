@@ -105,6 +105,55 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     errors
 }
 
+/// Marker error distinguishing a config-VALIDATION rejection — the loaded
+/// snapshot was reachable but is semantically invalid per
+/// [`collect_rejecting_runtime_config_errors`] — from a connectivity/driver
+/// failure.
+///
+/// Both full and incremental database loads return this (wrapped in
+/// `anyhow::Error`) when a reachable backend yields an invalid config snapshot.
+/// It is downcast-discoverable through `anyhow` so the database-mode poll loop
+/// can keep `db_available = true` (the backend is reachable and admin writes
+/// are the in-band repair tool) on a validation rejection, while still
+/// returning `Err` so runtime caches and CP broadcast never rebuild from a
+/// rejected snapshot. A genuine connectivity error carries no such marker and
+/// keeps the fail-closed `db_available = false` behavior.
+#[derive(Debug)]
+pub(crate) struct ConfigValidationRejection {
+    /// Backend label for logging (e.g. `"MongoDB"` / `"Database"`).
+    pub backend: &'static str,
+    /// The individual rejecting validation messages.
+    pub errors: Vec<String>,
+}
+
+impl std::fmt::Display for ConfigValidationRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} configuration validation failed: {} rejecting error(s) found",
+            self.backend,
+            self.errors.len()
+        )
+    }
+}
+
+impl std::error::Error for ConfigValidationRejection {}
+
+impl ConfigValidationRejection {
+    /// Build the `anyhow::Error` a loader returns on a validation rejection.
+    pub(crate) fn into_anyhow(self) -> anyhow::Error {
+        anyhow::Error::new(self)
+    }
+}
+
+/// Returns `true` when any link in the error chain is a
+/// [`ConfigValidationRejection`] — i.e. the load failed because a reachable
+/// snapshot was semantically invalid, not because the backend was unreachable.
+pub(crate) fn is_config_validation_rejection(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.is::<ConfigValidationRejection>())
+}
+
 impl<'a> ValidationPipeline<'a> {
     pub(crate) fn new(config: &'a mut GatewayConfig) -> Self {
         Self {
@@ -425,8 +474,9 @@ fn handle_validation_errors(
 #[cfg(test)]
 mod tests {
     use super::{
-        ValidationAction, ValidationPipeline, collect_rejecting_runtime_config_errors,
-        handle_validation_errors,
+        ConfigValidationRejection, ValidationAction, ValidationPipeline,
+        collect_rejecting_runtime_config_errors, handle_validation_errors,
+        is_config_validation_rejection,
     };
     use crate::config::types::{
         GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy, default_namespace,
@@ -455,6 +505,38 @@ mod tests {
         let errors = rejecting_errors(config);
         assert_eq!(errors.len(), 1, "expected one rejecting error: {errors:?}");
         assert!(errors[0].contains(expected), "unexpected error: {errors:?}");
+    }
+
+    #[test]
+    fn config_validation_rejection_is_downcast_discoverable_through_anyhow() {
+        // Issue #2158: the database-mode poll loop must be able to tell a
+        // validation rejection apart from a connectivity failure, even when the
+        // error is wrapped with additional context on its way out of the loader.
+        let err = ConfigValidationRejection {
+            backend: "MongoDB",
+            errors: vec!["dangling upstream reference".to_string()],
+        }
+        .into_anyhow();
+        assert!(is_config_validation_rejection(&err));
+
+        let wrapped = err.context("while polling authoritative primary");
+        assert!(
+            is_config_validation_rejection(&wrapped),
+            "a context-wrapped rejection must still be discoverable"
+        );
+        assert!(
+            wrapped.to_string().contains("while polling"),
+            "context must be preserved"
+        );
+    }
+
+    #[test]
+    fn connectivity_error_is_not_a_config_validation_rejection() {
+        let err = anyhow::anyhow!("connection refused (os error 61)");
+        assert!(
+            !is_config_validation_rejection(&err),
+            "a plain connectivity error must NOT classify as a validation rejection"
+        );
     }
 
     #[test]

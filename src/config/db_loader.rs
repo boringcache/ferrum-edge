@@ -1387,9 +1387,18 @@ impl DatabaseStore {
             for message in &validation_errors {
                 tracing::error!("Database config rejected — {}", message);
             }
-            anyhow::bail!(
-                "Database configuration validation failed: {} rejecting error(s) found",
-                validation_errors.len()
+            // Typed, downcast-discoverable rejection (parity with the Mongo
+            // loader) so the database-mode poll loop classifies this as a
+            // reachable-but-invalid snapshot and keeps admin writes enabled for
+            // in-band repair (issue #2158), rather than treating it as a
+            // connectivity outage. Still an `Err`, so caches / CP broadcast
+            // fail closed.
+            return Err(
+                crate::config::validation_pipeline::ConfigValidationRejection {
+                    backend: "Database",
+                    errors: validation_errors,
+                }
+                .into_anyhow(),
             );
         }
 
