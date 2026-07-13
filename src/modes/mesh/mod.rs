@@ -10612,6 +10612,7 @@ fn resolve_inbound_mtls_modes_by_port(
     let carried_override_ports = slice
         .peer_authentications
         .iter()
+        .filter(|policy| slice::peer_auth_has_workload_selector(policy))
         .flat_map(|policy| policy.port_overrides.keys().copied())
         .collect::<std::collections::BTreeSet<_>>();
     // A shared-SPIFFE slice with ambiguous labels cannot reliably identify its
@@ -10630,6 +10631,31 @@ fn resolve_inbound_mtls_modes_by_port(
         .filter(|port| local_ports.contains(port))
         .map(|port| (port, slice.resolve_inbound_mtls_mode_fail_closed(port)))
         .collect()
+}
+
+/// When PeerAuthentication TLS reload is disabled, the startup table is fixed.
+/// Reject a slice that makes an overridden app port newly local when that port
+/// was filtered out of the fixed table; accepting it would route traffic under
+/// the listener fallback instead of the configured override until restart.
+fn newly_selectable_inbound_peer_auth_port_requires_reload(
+    previous_slice: Option<&MeshSlice>,
+    next_slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+    fixed_default_mode: config::MtlsMode,
+    fixed_modes_by_port: &std::collections::BTreeMap<u16, config::MtlsMode>,
+) -> Option<(u16, config::MtlsMode)> {
+    let previous_slice = previous_slice?;
+    let previous_ports = selectable_inbound_peer_auth_ports(previous_slice, runtime);
+
+    let next_modes = effective_inbound_mtls_modes_for_topology(
+        &resolve_inbound_mtls_modes_by_port(Some(next_slice), runtime),
+        runtime.topology,
+    );
+    next_modes.into_iter().find(|(port, mode)| {
+        !previous_ports.contains(port)
+            && !fixed_modes_by_port.contains_key(port)
+            && *mode != fixed_default_mode
+    })
 }
 
 /// EgressGateway's PERMISSIVE policy is deliberately escalated to a required
@@ -12977,6 +13003,25 @@ async fn apply_mesh_slice_generation(
     last_applied_slice: &mut Option<Arc<MeshSlice>>,
     dns_proxy: &Option<Arc<MeshDnsProxy>>,
 ) -> bool {
+    if has_termination_listener && !live_reload_enabled {
+        let fixed_policy = proxy_state.mesh_inbound_tls_policy.load();
+        if let Some((port, mode)) = newly_selectable_inbound_peer_auth_port_requires_reload(
+            last_applied_slice.as_deref(),
+            base_slice,
+            runtime,
+            fixed_policy.default_mode,
+            &fixed_policy.modes_by_port,
+        ) {
+            warn!(
+                mesh_slice_version = %base_slice.version,
+                app_port = port,
+                required_mode = ?mode,
+                "Rejecting mesh slice because it makes an overridden inbound app port newly selectable while PeerAuthentication TLS live reload is disabled; restart with the new port present or enable FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED"
+            );
+            return false;
+        }
+    }
+
     let federation_activation = FederationActivation::from_env_config(&proxy_state.env_config);
     let live_reload = if live_reload_enabled {
         live_reload_inbound_mtls_mode(base_slice, runtime).and_then(|mtls_mode| {
@@ -18033,6 +18078,7 @@ mod tests {
             node_id: "node-a".to_string(),
             namespace: "default".to_string(),
             version: "test".to_string(),
+            labels: std::collections::BTreeMap::from([("app".to_string(), "reviews".to_string())]),
             workloads: vec![local],
             services: vec![http_mesh_service("reviews", 8080, spiffe)],
             peer_authentications: vec![peer_auth_with_port_override(
@@ -26037,6 +26083,13 @@ mod tests {
         runtime
     }
 
+    fn reviews_peer_auth_selector() -> config::WorkloadSelector {
+        config::WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+            namespace: None,
+        }
+    }
+
     fn peer_auth_with_port_override(
         port: u16,
         mode: config::MtlsMode,
@@ -26045,7 +26098,7 @@ mod tests {
             name: "ns-policy".to_string(),
             namespace: "default".to_string(),
             scope: None,
-            selector: None,
+            selector: Some(reviews_peer_auth_selector()),
             mtls_mode: config::MtlsMode::Permissive,
             port_overrides: HashMap::from([(port, mode)]),
         }
@@ -26067,6 +26120,7 @@ mod tests {
         MeshSlice {
             namespace: "default".to_string(),
             workload_spiffe_id: Some(local.spiffe_id.to_string()),
+            labels: std::collections::BTreeMap::from([("app".to_string(), "reviews".to_string())]),
             workloads: vec![local],
             peer_authentications: peer_auths,
             ..MeshSlice::default()
@@ -26098,7 +26152,7 @@ mod tests {
                 name: "mixed".to_string(),
                 namespace: "default".to_string(),
                 scope: None,
-                selector: None,
+                selector: Some(reviews_peer_auth_selector()),
                 mtls_mode: config::MtlsMode::Permissive,
                 port_overrides: HashMap::from([
                     (8080, config::MtlsMode::Strict),
@@ -26123,10 +26177,10 @@ mod tests {
             workload_spiffe_id: Some(local.spiffe_id.to_string()),
             workloads: vec![local],
             ..slice_with_peer_auths(vec![config::PeerAuthentication {
-                name: "namespace-wide".to_string(),
+                name: "selector-scoped".to_string(),
                 namespace: "default".to_string(),
                 scope: None,
-                selector: None,
+                selector: Some(reviews_peer_auth_selector()),
                 mtls_mode: config::MtlsMode::Strict,
                 port_overrides: HashMap::from([
                     (8080, config::MtlsMode::Strict),
@@ -26138,7 +26192,7 @@ mod tests {
         assert_eq!(
             resolve_inbound_mtls_modes_by_port_for_test(&slice),
             std::collections::BTreeMap::from([(8080, config::MtlsMode::Strict)]),
-            "an unrelated namespace-wide override must not alter this listener posture"
+            "an override for an unrelated workload port must not alter this listener posture"
         );
     }
 
@@ -26150,13 +26204,14 @@ mod tests {
         let slice = MeshSlice {
             namespace: "default".to_string(),
             workload_spiffe_id: Some(local.spiffe_id.to_string()),
+            labels: std::collections::BTreeMap::from([("app".to_string(), "reviews".to_string())]),
             workloads: vec![local],
             services: vec![service],
             peer_authentications: vec![config::PeerAuthentication {
                 name: "service-port-is-not-an-app-port".to_string(),
                 namespace: "default".to_string(),
                 scope: None,
-                selector: None,
+                selector: Some(reviews_peer_auth_selector()),
                 mtls_mode: config::MtlsMode::Permissive,
                 port_overrides: HashMap::from([
                     (80, config::MtlsMode::Disable),
@@ -26184,7 +26239,7 @@ mod tests {
                 name: "ingress".to_string(),
                 namespace: "default".to_string(),
                 scope: None,
-                selector: None,
+                selector: Some(reviews_peer_auth_selector()),
                 mtls_mode: config::MtlsMode::Permissive,
                 port_overrides: HashMap::from([
                     (8080, config::MtlsMode::Strict),
@@ -26277,11 +26332,73 @@ mod tests {
     }
 
     #[test]
+    fn newly_local_override_requires_reload_when_startup_table_filtered_it() {
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/reviews".to_string()),
+            ..runtime_with_topology(MeshTopology::Sidecar)
+        };
+        let policy = peer_auth_with_port_override(9090, config::MtlsMode::Strict);
+        let previous = slice_with_peer_auths(vec![policy.clone()]);
+        let mut next = slice_with_peer_auths(vec![policy]);
+        next.workloads[0].ports.push(WorkloadPort {
+            port: 9090,
+            protocol: AppProtocol::Http,
+            name: Some("admin".to_string()),
+        });
+
+        assert_eq!(
+            newly_selectable_inbound_peer_auth_port_requires_reload(
+                Some(&previous),
+                &next,
+                &runtime,
+                config::MtlsMode::Permissive,
+                &std::collections::BTreeMap::new(),
+            ),
+            Some((9090, config::MtlsMode::Strict)),
+            "a route-only slice must not expose a port whose startup override table omitted it"
+        );
+        assert_eq!(
+            newly_selectable_inbound_peer_auth_port_requires_reload(
+                Some(&previous),
+                &next,
+                &runtime,
+                config::MtlsMode::Permissive,
+                &std::collections::BTreeMap::from([(9090, config::MtlsMode::Strict,)]),
+            ),
+            None,
+            "a port already present in the fixed startup policy remains safe to expose"
+        );
+    }
+
+    #[test]
+    fn selectorless_port_overrides_are_absent_from_inbound_table() {
+        let slice = slice_with_peer_auths(vec![config::PeerAuthentication {
+            name: "namespace-strict".to_string(),
+            namespace: "default".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: config::MtlsMode::Strict,
+            port_overrides: HashMap::from([(8080, config::MtlsMode::Disable)]),
+        }]);
+
+        assert!(
+            resolve_inbound_mtls_modes_by_port_for_test(&slice).is_empty(),
+            "Istio ignores portLevelMtls when PeerAuthentication has no workload selector"
+        );
+        assert_eq!(
+            slice.resolve_inbound_mtls_mode_fail_closed(8080),
+            config::MtlsMode::Strict,
+            "the selector-less policy's workload-level mode remains authoritative"
+        );
+    }
+
+    #[test]
     fn ambiguous_slice_preserves_candidate_port_overrides_fail_closed() {
         let mut slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
             8080,
             config::MtlsMode::Strict,
         )]);
+        slice.labels.clear();
         slice.labels_ambiguous = true;
 
         assert_eq!(
@@ -26304,7 +26421,7 @@ mod tests {
                 name: "transport-port-collision".to_string(),
                 namespace: "default".to_string(),
                 scope: None,
-                selector: None,
+                selector: Some(reviews_peer_auth_selector()),
                 mtls_mode: config::MtlsMode::Strict,
                 port_overrides: HashMap::from([(transport_port, config::MtlsMode::Permissive)]),
             }]);

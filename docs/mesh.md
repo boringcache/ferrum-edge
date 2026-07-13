@@ -894,8 +894,11 @@ mTLS modes:
 | `permissive` (default) | Accept both mTLS and plaintext. |
 | `disable` | Disable mTLS. Accept plaintext only. |
 
-`portLevelMtls` is enforced at the earliest point where the workload app port
-is known. For REDIRECT-captured connections, the inbound accept loop reads
+`portLevelMtls` applies only to a `PeerAuthentication` that explicitly carries
+a workload selector; selector-less namespace- or mesh-wide policies use only
+their workload-level `mtls` mode. Applicable overrides are enforced at the
+earliest point where the workload app port is known. For REDIRECT-captured
+connections, the inbound accept loop reads
 `SO_ORIGINAL_DST` once and selects the prebuilt per-port `rustls::ServerConfig`
 before the handshake. A captured Sidecar `ingress[]` listener port is translated
 to its validated `defaultEndpoint` app port first, and that translated port is
@@ -904,18 +907,20 @@ dials have no original destination, so a policy whose app ports span TLS and
 plaintext wire postures
 uses a PERMISSIVE-style acceptor: it peeks without consuming the first record
 and can admit either verified TLS or plaintext far enough to route the request.
-After HTTP authority or an HBONE CONNECT is processed, Ferrum applies routing
-plugin overrides and load-balancer target selection, then verifies the actual
-transport against the effective target app port's mode in the current atomic
-policy snapshot. The check runs for every inbound request, including requests
-reused on a captured keep-alive connection after live reload. HTTP, gRPC, and
-WebSocket retry paths repeat it after retry backoff and load-balancer target
-rotation, before acquiring target admission or dispatching the retry. `STRICT`
+As soon as the initial HTTP authority or HBONE CONNECT target resolves a
+concrete app port, Ferrum checks the current atomic policy snapshot before any
+request plugin runs. It then applies routing-plugin overrides and load-balancer
+target selection and repeats the check against the effective target app port.
+The check runs for every inbound request, including requests reused on a
+captured keep-alive connection after live reload. HTTP, gRPC, and WebSocket
+retry paths repeat it after retry backoff and load-balancer target rotation,
+before acquiring target admission or dispatching the retry. `STRICT`
 requires a verified peer certificate, `DISABLE` requires plaintext, and
 `PERMISSIVE` admits either. The acceptor is not an authorization bypass: a
-mismatch is rejected after routing policy has resolved the destination but
-before backend admission or dispatch, with a structured warning and a
-protocol-appropriate 403 response (including normalized gRPC rejection).
+mismatch on the initial resolved port is rejected before plugin side effects;
+a mismatch introduced by a later route override or target rotation is rejected
+before backend admission or dispatch. Both paths emit a structured warning and
+a protocol-appropriate 403 response (including normalized gRPC rejection).
 
 `FERRUM_MESH_PRODUCTION_MODE=true` never enables plaintext on inbound
 TLS-terminating listeners. A `PERMISSIVE` policy with usable server TLS material
@@ -941,7 +946,9 @@ port_overrides:
   8081: permissive
 ```
 
-Selector-less `PeerAuthentication` applies to all workloads in its namespace (or mesh-wide if namespace-scoped).
+Selector-less `PeerAuthentication` applies its workload-level mode to all
+workloads in its namespace (or mesh-wide if namespace-scoped), but its
+`portLevelMtls`/`port_overrides` entries are ignored.
 
 ### Resolution and listener wiring
 
@@ -961,7 +968,7 @@ Per-port TLS configs and their effective modes are built during startup (and dur
 
 The selectable app-port table uses the same runtime workload SPIFFE identity and `multi_cluster.local_cluster` context as Sidecar inbound route materialization. A local VM/WorkloadEntry tagged with the declared local cluster therefore retains its `portLevelMtls` entry at both accept-time and request-time enforcement, while a foreign cluster workload cannot contribute a local listener port.
 
-By default, the resolved mode is captured **once at startup** from the first valid slice. Subsequent `PeerAuthentication` changes pushed via the control plane update the in-memory slice and are honored by other plugin paths (e.g. `mesh_authz`, plugin chains), but the inbound TLS `ServerConfig` is not rebuilt.
+By default, the resolved mode is captured **once at startup** from the first valid slice. Subsequent `PeerAuthentication` changes pushed via the control plane update the in-memory slice and are honored by other plugin paths (e.g. `mesh_authz`, plugin chains), but the inbound TLS `ServerConfig` is not rebuilt. If a later route-only slice would make an app port newly local while an applicable override for that port was filtered out of the fixed startup table, Ferrum rejects the whole slice instead of serving the new route under the listener fallback. Restart with the port present or enable PeerAuthentication live reload.
 
 Set `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true` to opt in to live reload of the resolved mTLS modes and frontend client CA verifier on mesh slice apply. Coverage includes mesh HTTP/HBONE termination listeners **and** mesh-shared TCP+TLS / UDP+DTLS stream listeners: a slice apply that changes a top-level or per-app-port `PeerAuthentication` mode, or rotates the client CA bundle, rebuilds the distinct required `rustls::ServerConfig` values and atomically swaps one coherent `{listener fallback, app-port table}` snapshot for future HTTP/HBONE accepts. The listener-wide config is also published to the shared TCP+TLS stream slot (snapshotted per accept), and the DTLS `FrontendDtlsConfig` is rebuilt on every active `DtlsServer` (new sessions snapshot the swapped material at handshake; existing handshake-complete sessions keep the material they handshook with until they end). If any required TLS config build fails — or the client-CA-bundle snapshot cannot be read (e.g. a secrets operator truncating the bundle file mid-write) — Ferrum **rejects the whole slice** and keeps the last good config in its entirety, so no authz/`MeshPolicy`/`RequestAuthentication`/`ServiceEntry`/endpoint update from that slice is applied either, until the rebuild succeeds (fail-closed; the inbound posture is never silently weakened). Only the *post-accept* DTLS rebuild keeps the previous config **for that path** and logs a warning without rejecting the slice. Topology-disable rejection (see below) likewise keeps the last good config wholesale.
 

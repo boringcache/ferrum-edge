@@ -502,7 +502,7 @@ fn peer_authentication_status(
         .unwrap_or("UNSET")
         .to_string();
     let scope = istio_policy_scope_label(object, istio_root_namespace);
-    let port_overrides: Vec<String> = object
+    let configured_port_overrides: Vec<String> = object
         .spec
         .get("portLevelMtls")
         .and_then(Value::as_object)
@@ -515,6 +515,17 @@ fn peer_authentication_status(
                 .collect()
         })
         .unwrap_or_default();
+    let has_workload_selector = object
+        .spec
+        .get("selector")
+        .is_some_and(|selector| !selector.is_null());
+    let port_overrides_ignored_without_selector =
+        !has_workload_selector && !configured_port_overrides.is_empty();
+    let port_overrides = if has_workload_selector {
+        configured_port_overrides
+    } else {
+        Vec::new()
+    };
 
     let (accepted, reason, message, detail) = match result {
         Ok(_translation) => {
@@ -527,14 +538,20 @@ fn peer_authentication_status(
             } else {
                 resolved_mode.as_str()
             };
+            let ignored_suffix = if port_overrides_ignored_without_selector {
+                "; portLevelMtls ignored because no workload selector is specified"
+            } else {
+                ""
+            };
             let message = format!(
-                "Ferrum accepted this PeerAuthentication (scope: {scope}; resolved mTLS mode: {effective_mode})"
+                "Ferrum accepted this PeerAuthentication (scope: {scope}; resolved mTLS mode: {effective_mode}{ignored_suffix})"
             );
             let detail = json!({
                 "translation": {
                     "scope": scope,
                     "configured_mtls_mode": resolved_mode,
                     "port_level_overrides": port_overrides,
+                    "port_level_overrides_ignored_without_selector": port_overrides_ignored_without_selector,
                 }
             });
             (true, "Accepted", message, Some(detail))
@@ -1741,6 +1758,7 @@ mod tests {
             "PeerAuthentication",
             "mixed-modes",
             json!({
+                "selector": { "matchLabels": { "app": "api" } },
                 "mtls": { "mode": "STRICT" },
                 "portLevelMtls": {
                     "8080": { "mode": "PERMISSIVE" },

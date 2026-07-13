@@ -14685,6 +14685,43 @@ async fn handle_proxy_request_inner(
         return Ok(build_response_from_normalized_reject(reject));
     }
 
+    // A mixed direct-listener posture may intentionally accept cert-less TLS
+    // far enough to resolve the application port. Once the initial route has
+    // supplied a concrete app port, enforce its PeerAuthentication mode before
+    // any request plugin runs. Route overrides and load-balancer selection can
+    // still change the destination later, so the authoritative post-plugin and
+    // per-retry checks below remain required. An upstream template with port 0
+    // has no concrete initial app port and is deferred to those later checks.
+    if proxy.backend_port != 0
+        && let Some(mismatch) = mesh_inbound_peer_auth_transport_mismatch(
+            &state,
+            ctx.mesh_direction,
+            mesh_inbound_pre_handshake_app_port,
+            &proxy,
+            None,
+            is_tls,
+            ctx.tls_client_cert_der.is_some(),
+        )
+    {
+        // Deliberately pass an empty plugin list: this is the pre-plugin trust
+        // boundary, so neither after_proxy nor transaction-log plugin hooks may
+        // run for a transport that the initial app-port policy has rejected.
+        return Ok(reject_mesh_inbound_peer_auth_transport_mismatch(
+            &state,
+            &[],
+            &mut ctx,
+            &proxy,
+            mismatch,
+            is_tls,
+            is_grpc_request,
+            start_time,
+            0,
+            "mesh_inbound_peer_auth_initial_route_mismatch",
+            None,
+        )
+        .await);
+    }
+
     // Load plugin-cache values once for this request. Every plugin list,
     // capability bitset, and buffering flag below is derived from the same
     // cache generation without retaining the full cache across awaits.
@@ -37260,6 +37297,17 @@ mod tests {
         assert_eq!(
             retry_gate_count, retry_rotation_count,
             "every backend target-rotation loop must re-check the effective app-port PeerAuthentication mode before retry dispatch"
+        );
+
+        let initial_gate = src
+            .find("mesh_inbound_peer_auth_initial_route_mismatch")
+            .expect("initial-route PeerAuthentication gate must remain present");
+        let first_request_plugin = src
+            .find("match plugin.on_request_received(&mut ctx).await")
+            .expect("request plugin phase must remain present");
+        assert!(
+            initial_gate < first_request_plugin,
+            "the initial app-port PeerAuthentication gate must reject before on_request_received plugins"
         );
     }
 

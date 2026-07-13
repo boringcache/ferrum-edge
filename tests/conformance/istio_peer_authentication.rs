@@ -183,6 +183,7 @@ fn peer_auth_port_level_mtls_override() {
         notes = "Mixed STRICT/PERMISSIVE app ports resolve independently for pre-handshake ServerConfig selection.",
     );
     let pa = translate_one(json!({
+        "selector": {"matchLabels": {"app": "api"}},
         "mtls": {"mode": "PERMISSIVE"},
         "portLevelMtls": {
             "8080": {"mode": "STRICT"},
@@ -198,7 +199,7 @@ fn peer_auth_port_level_mtls_override() {
         pa.port_overrides.get(&9090).copied(),
         Some(MtlsMode::Permissive)
     );
-    let labels = HashMap::<String, String>::new();
+    let labels = HashMap::from([("app".to_string(), "api".to_string())]);
     assert_eq!(
         resolve_effective_mtls_mode(std::slice::from_ref(&pa), "default", &labels, 8080),
         MtlsMode::Strict
@@ -206,6 +207,30 @@ fn peer_auth_port_level_mtls_override() {
     assert_eq!(
         resolve_effective_mtls_mode(std::slice::from_ref(&pa), "default", &labels, 9090),
         MtlsMode::Permissive
+    );
+}
+
+/// Istio only applies `portLevelMtls` when the policy has a workload selector.
+#[test]
+fn peer_auth_port_level_mtls_requires_selector() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "portLevelMtls requires workload selector",
+        status = Status::Supported,
+        notes = "Selector-less portLevelMtls entries are carried but ignored during effective-mode resolution.",
+    );
+    let pa = translate_one(json!({
+        "mtls": {"mode": "STRICT"},
+        "portLevelMtls": {
+            "8080": {"mode": "DISABLE"}
+        }
+    }));
+    let labels = HashMap::<String, String>::new();
+
+    assert_eq!(
+        resolve_effective_mtls_mode(std::slice::from_ref(&pa), "default", &labels, 8080),
+        MtlsMode::Strict,
+        "selector-less portLevelMtls must not override the workload-level mode"
     );
 }
 

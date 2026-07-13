@@ -2771,13 +2771,31 @@ fn peer_auth_applies_to_workload<L: WorkloadLabels + ?Sized>(
             .is_none_or(|selector| workload_selector_matches(selector, namespace, labels))
 }
 
+/// Istio applies `portLevelMtls` only when the PeerAuthentication explicitly
+/// carries a workload selector. Keep both the canonical `PolicyScope` form and
+/// the legacy `selector` form so native/file slices and translated K8s slices
+/// share the same rule. An explicitly present empty selector still counts.
+pub(super) fn peer_auth_has_workload_selector(pa: &PeerAuthentication) -> bool {
+    match pa.scope.as_ref() {
+        Some(PolicyScope::WorkloadSelector { .. }) => true,
+        Some(PolicyScope::MeshWide | PolicyScope::Namespace { .. }) => false,
+        None => pa.selector.is_some(),
+    }
+}
+
 /// Effective inbound mTLS mode a single PeerAuthentication yields for `port`: a
-/// per-port override takes precedence over the policy's top-level `mtls_mode`.
+/// per-port override on a selector-scoped policy takes precedence over the
+/// policy's top-level `mtls_mode`. Selector-less namespace/mesh-wide policies
+/// ignore `port_overrides`, matching Istio's `portLevelMtls` contract.
 fn peer_auth_effective_mode(pa: &PeerAuthentication, port: u16) -> MtlsMode {
-    pa.port_overrides
-        .get(&port)
-        .copied()
-        .unwrap_or(pa.mtls_mode)
+    if peer_auth_has_workload_selector(pa) {
+        pa.port_overrides
+            .get(&port)
+            .copied()
+            .unwrap_or(pa.mtls_mode)
+    } else {
+        pa.mtls_mode
+    }
 }
 
 /// Fail-secure restrictiveness rank used to resolve SAME-tier
@@ -5107,27 +5125,43 @@ mod tests {
         let policies = vec![pa(
             "ns-strict",
             "default",
+            Some(WorkloadSelector {
+                labels: HashMap::from([("app".into(), "api".into())]),
+                namespace: None,
+            }),
+            MtlsMode::Strict,
+            HashMap::from([(8080, MtlsMode::Disable)]),
+        )];
+        let labels = HashMap::from([("app".to_string(), "api".to_string())]);
+        // Port 8080 has an override to Disable.
+        let mode = resolve_effective_mtls_mode(&policies, "default", &labels, 8080);
+        assert_eq!(mode, MtlsMode::Disable);
+
+        // Port 443 uses the top-level mode.
+        let mode = resolve_effective_mtls_mode(&policies, "default", &labels, 443);
+        assert_eq!(mode, MtlsMode::Strict);
+    }
+
+    #[test]
+    fn selectorless_port_override_is_ignored() {
+        let policies = vec![pa(
+            "namespace-strict",
+            "default",
             None,
             MtlsMode::Strict,
             HashMap::from([(8080, MtlsMode::Disable)]),
         )];
-        // Port 8080 has an override to Disable.
-        let mode = resolve_effective_mtls_mode(
-            &policies,
-            "default",
-            &HashMap::<String, String>::new(),
-            8080,
-        );
-        assert_eq!(mode, MtlsMode::Disable);
 
-        // Port 443 uses the top-level mode.
-        let mode = resolve_effective_mtls_mode(
-            &policies,
-            "default",
-            &HashMap::<String, String>::new(),
-            443,
+        assert_eq!(
+            resolve_effective_mtls_mode(
+                &policies,
+                "default",
+                &HashMap::<String, String>::new(),
+                8080,
+            ),
+            MtlsMode::Strict,
+            "portLevelMtls must not alter a selector-less namespace policy"
         );
-        assert_eq!(mode, MtlsMode::Strict);
     }
 
     #[test]

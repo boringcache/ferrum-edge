@@ -481,6 +481,7 @@ fn peer_authentication_port_level_overrides_visible_in_detail() {
         "PeerAuthentication",
         "mixed",
         json!({
+            "selector": { "matchLabels": { "app": "api" } },
             "mtls": { "mode": "STRICT" },
             "portLevelMtls": {
                 "8080": { "mode": "PERMISSIVE" }
@@ -505,6 +506,7 @@ fn peer_authentication_port_level_mtls_is_not_deferred() {
         "PeerAuthentication",
         "mixed-mode",
         json!({
+            "selector": { "matchLabels": { "app": "api" } },
             "mtls": { "mode": "STRICT" },
             "portLevelMtls": {
                 "8080": { "mode": "PERMISSIVE" }
@@ -557,6 +559,7 @@ fn peer_authentication_port_level_mtls_emits_no_deferral_warning() {
         "PeerAuthentication",
         "mixed-mode",
         json!({
+            "selector": { "matchLabels": { "app": "api" } },
             "mtls": { "mode": "STRICT" },
             "portLevelMtls": {
                 "8080": { "mode": "PERMISSIVE" },
@@ -572,6 +575,40 @@ fn peer_authentication_port_level_mtls_emits_no_deferral_warning() {
             .all(|w| !w.contains("portLevelMtls")),
         "unexpected portLevelMtls warning: {:?}",
         translation.warnings
+    );
+}
+
+#[test]
+fn peer_authentication_selectorless_port_level_mtls_is_reported_ignored() {
+    let obj = object(
+        "security.istio.io/v1",
+        "PeerAuthentication",
+        "namespace-strict",
+        json!({
+            "mtls": { "mode": "STRICT" },
+            "portLevelMtls": {
+                "8080": { "mode": "DISABLE" }
+            }
+        }),
+    );
+    let updates = plan_istio_status_updates(&[obj], options());
+    let update = &updates[0];
+    let condition = find_condition(
+        update.status["conditions"].as_array().unwrap(),
+        "FerrumAccepted",
+    );
+    assert!(condition["message"].as_str().unwrap().contains("ignored"));
+
+    let translation = &update.ferrum_detail.as_ref().unwrap()["translation"];
+    assert!(
+        translation["port_level_overrides"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        translation["port_level_overrides_ignored_without_selector"].as_bool(),
+        Some(true)
     );
 }
 
