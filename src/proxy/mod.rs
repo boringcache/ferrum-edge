@@ -11626,9 +11626,8 @@ fn select_mesh_inbound_tls(
             .any(mtls_mode_accepts_tls);
     ListenerTlsSelection {
         tls_config: permissive_tls.or(strict_tls),
-        accepts_plaintext: has_different_port_mode
-            && any_mode_accepts_plaintext
-            && any_mode_accepts_tls,
+        accepts_plaintext: mtls_mode_accepts_plaintext(policy.default_mode)
+            || (has_different_port_mode && any_mode_accepts_plaintext && any_mode_accepts_tls),
     }
 }
 
@@ -36816,6 +36815,34 @@ mod tests {
             MtlsMode::Disable,
             true,
             true
+        ));
+    }
+
+    #[test]
+    fn direct_mesh_inbound_uniform_permissive_accepts_plaintext() {
+        use crate::modes::mesh::config::MtlsMode;
+
+        let tls = crate::tls::temporary_disabled_listener_tls_config()
+            .expect("temporary TLS config for selection test");
+        let policy = MeshInboundTlsPolicy {
+            default: Some(tls),
+            by_port: HashMap::new(),
+            default_mode: MtlsMode::Permissive,
+            modes_by_port: std::collections::BTreeMap::new(),
+            app_port_by_orig_dst_port: std::collections::BTreeMap::new(),
+        };
+
+        let selected = select_mesh_inbound_tls(&policy, None);
+        assert!(selected.tls_config.is_some());
+        assert!(
+            selected.accepts_plaintext,
+            "uniform PERMISSIVE must demux direct plaintext before rustls"
+        );
+        assert!(!mesh_inbound_selection_uses_tls(
+            true,
+            selected.accepts_plaintext,
+            false,
+            b'G'
         ));
     }
 

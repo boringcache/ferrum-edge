@@ -9764,10 +9764,11 @@ async fn serve_mesh_runtime(
     let inbound_app_port_by_orig_dst_port =
         resolve_inbound_app_ports_by_orig_dst_port(initial_applied_mesh_slice.as_deref());
     let initial_inbound_tls_snapshot = if env_config.mesh_peer_auth_live_reload_enabled {
-        let mut snapshot = mesh_inbound_tls_reload_snapshot(
+        let mut snapshot = mesh_inbound_tls_reload_snapshot_for_listener(
             &env_config,
             inbound_mtls_mode,
             inbound_mtls_modes_by_port.clone(),
+            has_termination_listener,
         )?;
         snapshot.app_port_by_orig_dst_port = inbound_app_port_by_orig_dst_port.clone();
         Some(snapshot)
@@ -11464,6 +11465,23 @@ fn mesh_inbound_tls_reload_snapshot(
     })
 }
 
+fn mesh_inbound_tls_reload_snapshot_for_listener(
+    env_config: &EnvConfig,
+    mtls_mode: config::MtlsMode,
+    port_modes: std::collections::BTreeMap<u16, config::MtlsMode>,
+    has_termination_listener: bool,
+) -> Result<MeshInboundTlsReloadSnapshot, anyhow::Error> {
+    if !has_termination_listener {
+        return Ok(MeshInboundTlsReloadSnapshot {
+            mtls_mode,
+            port_modes,
+            app_port_by_orig_dst_port: std::collections::BTreeMap::new(),
+            client_ca_bundle: None,
+        });
+    }
+    mesh_inbound_tls_reload_snapshot(env_config, mtls_mode, port_modes)
+}
+
 fn load_mesh_frontend_server_identity(
     env_config: &EnvConfig,
     gateway_svid_bundle: &crate::identity::SharedSvidBundle,
@@ -12191,10 +12209,11 @@ fn plan_mesh_inbound_tls_reload_with_federation(
     has_termination_listener: bool,
 ) -> Option<MeshInboundTlsReloadPlan> {
     let port_modes = resolve_inbound_mtls_modes_by_port(Some(slice));
-    let mut next_snapshot = match mesh_inbound_tls_reload_snapshot(
+    let mut next_snapshot = match mesh_inbound_tls_reload_snapshot_for_listener(
         &proxy_state.env_config,
         mtls_mode,
         port_modes,
+        has_termination_listener,
     ) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -12509,6 +12528,23 @@ async fn apply_mesh_inbound_tls_reload(
             );
         }
     }
+}
+
+fn publish_mesh_inbound_app_port_aliases(proxy_state: &ProxyState, slice: &MeshSlice) {
+    let aliases = resolve_inbound_app_ports_by_orig_dst_port(Some(slice));
+    let current = proxy_state.mesh_inbound_tls_policy.load_full();
+    if current.app_port_by_orig_dst_port == aliases {
+        return;
+    }
+    proxy_state
+        .mesh_inbound_tls_policy
+        .store(Arc::new(crate::proxy::MeshInboundTlsPolicy {
+            default: current.default.clone(),
+            by_port: current.by_port.clone(),
+            default_mode: current.default_mode,
+            modes_by_port: current.modes_by_port.clone(),
+            app_port_by_orig_dst_port: aliases,
+        }));
 }
 
 /// Reconcile the SPIFFE federation pollers against the latest accepted mesh
@@ -12839,6 +12875,12 @@ async fn apply_mesh_slice_generation(
                     Some(federation_snapshot),
                     federation_activation,
                 );
+                // Sidecar ingress routes remain live-reloadable even when
+                // PeerAuthentication TLS rebuilding is disabled. Publish the
+                // listener-port -> backend-app-port demux table for every
+                // accepted slice so pre-handshake policy selection follows the
+                // same ingress generation as routing.
+                publish_mesh_inbound_app_port_aliases(proxy_state, base_slice);
                 match live_reload {
                     Some((mtls_mode, plan)) => {
                         apply_mesh_inbound_tls_reload(
@@ -25830,6 +25872,35 @@ mod tests {
     }
 
     #[test]
+    fn ingress_alias_publish_is_independent_of_peer_auth_live_reload() {
+        let env = EnvConfig {
+            mesh_peer_auth_live_reload_enabled: false,
+            ..EnvConfig::default()
+        };
+        let proxy_state = make_test_proxy_state_with_env(GatewayConfig::default(), env);
+        let mut listener = ingress_listener(8443, "127.0.0.1", 8080);
+        listener.owner_namespace = "default".to_string();
+        listener.owner_service = "api".to_string();
+
+        publish_mesh_inbound_app_port_aliases(
+            &proxy_state,
+            &MeshSlice {
+                local_ingress_listeners: vec![listener],
+                ..MeshSlice::default()
+            },
+        );
+
+        assert_eq!(
+            proxy_state
+                .mesh_inbound_tls_policy
+                .load()
+                .app_port_by_orig_dst_port,
+            std::collections::BTreeMap::from([(8443, 8080)]),
+            "accepted ingress aliases must refresh while PeerAuth TLS reload is disabled"
+        );
+    }
+
+    #[test]
     fn resolve_inbound_mtls_mode_excludes_mesh_transport_port_overrides() {
         for (topology, transport_port) in [
             (MeshTopology::Sidecar, 15006),
@@ -25983,6 +26054,24 @@ mod tests {
 
         assert!(first.client_ca_bundle.is_some());
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn passthrough_tls_snapshot_skips_unused_per_port_client_ca() {
+        let env = EnvConfig {
+            frontend_tls_client_ca_bundle_path: Some("/missing/unused-client-ca.pem".to_string()),
+            ..EnvConfig::default()
+        };
+        let snapshot = mesh_inbound_tls_reload_snapshot_for_listener(
+            &env,
+            config::MtlsMode::Strict,
+            std::collections::BTreeMap::from([(8080, config::MtlsMode::Permissive)]),
+            false,
+        )
+        .expect("passthrough topology must not read unused per-port CA material");
+
+        assert!(snapshot.client_ca_bundle.is_none());
+        assert_eq!(snapshot.port_modes[&8080], config::MtlsMode::Permissive);
     }
 
     #[test]
