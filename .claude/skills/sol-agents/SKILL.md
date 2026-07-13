@@ -1,6 +1,6 @@
 ---
 name: sol-agents
-description: Dispatch and orchestrate parallel gpt-5.6-sol codex CLI subagents (medium/high effort) for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the codex review loop. Use when the user asks to spawn sol/codex agents on issues, PRs, review findings, or red CI.
+description: Dispatch and orchestrate parallel gpt-5.6-sol codex CLI subagents (high/xhigh/max effort) for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the codex review loop. Use when the user asks to spawn sol/codex agents on issues, PRs, review findings, or red CI.
 ---
 
 # sol-agents: codex CLI subagent orchestration
@@ -16,7 +16,7 @@ PROMPT=$(cat <<'EOF'
 <per-task prompt — see modes below>
 EOF
 )
-codex exec --model gpt-5.6-sol -c model_reasoning_effort='"<medium|high>"' \
+codex exec --model gpt-5.6-sol -c model_reasoning_effort='"<high|xhigh|max>"' \
   --sandbox danger-full-access \
   --cd <ABS_PATH_TO_SHARED_REPO_CLONE> \
   "$PROMPT" < /dev/null
@@ -33,13 +33,19 @@ Non-negotiables:
 
 ## Effort selection
 
-- **medium** — default. Measured on par with high for scoped fixes, review rounds,
-  test work, doc reconciliation (clean codex rounds, correct root-causing) at a
-  fraction of the latency/cost.
-- **high** — security-critical surfaces (authz, trust boundaries, fail-closed
+Tiers bumped up 2026-07-13 after the models were nerfed — everything shifts one
+level higher than the old medium/high split.
+
+- **high** — default. Handles scoped fixes, review rounds, test work, and doc
+  reconciliation (clean codex rounds, correct root-causing) at reasonable
+  latency/cost.
+- **xhigh** — security-critical surfaces (authz, trust boundaries, fail-closed
   contracts), architecturally sensitive proxy-core/dispatch work, or greenfield
   multi-file features.
-- The user may override per prompt ("on high", "on medium") — honor it.
+- **max** — the hardest, highest-stakes work: subtle protocol correctness, deep
+  multi-subsystem refactors, or anything where a wrong call is expensive and the
+  extra deliberation earns its cost. Use sparingly.
+- The user may override per prompt ("on max", "on xhigh", "on high") — honor it.
 
 ## Prompt construction (all modes)
 
