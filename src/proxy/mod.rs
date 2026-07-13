@@ -3445,10 +3445,15 @@ pub struct ProxyState {
     /// Serializes the cold-path gateway SVID writers:
     /// CP-delivered trust-bundle apply, CP trust clear, and file SVID reload.
     pub gateway_svid_update_lock: Arc<std::sync::Mutex<()>>,
-    /// Dynamic mesh inbound TLS config. Mesh mode updates this slot when
-    /// flag-gated PeerAuthentication live reload is enabled; ordinary HTTPS
-    /// listeners continue using their static startup TLS config.
+    /// Listener-wide compatibility view of the dynamic mesh inbound TLS config.
+    /// Mesh HTTP/HBONE accept loops use `mesh_inbound_tls_policy` as the single
+    /// authoritative source; this derived slot remains for shared stream TLS
+    /// publication/status compatibility and is written alongside that policy.
     pub mesh_inbound_tls: SharedMeshInboundTls,
+    /// Authoritative coherent listener-wide + per-app-port mesh inbound TLS and
+    /// effective-mode snapshot. Captured traffic selects before the handshake;
+    /// direct traffic checks the resolved app-port mode after routing.
+    pub mesh_inbound_tls_policy: SharedMeshInboundTlsPolicy,
     /// Whether the current mesh inbound TLS posture is actually terminating
     /// inbound TLS with a SPIFFE peer verifier. This is operator status, not a
     /// dispatch hot-path flag: it distinguishes inbound trust from the outbound
@@ -3567,6 +3572,10 @@ struct RequestConnectionMetadata {
     /// conntrack state. `None` everywhere else — see
     /// [`crate::socket_opts::original_dst`] for the exact contract.
     orig_dst: Option<SocketAddr>,
+    /// Captured inbound app port actually used for accept-time mesh TLS policy
+    /// selection, after applying any Sidecar ingress listener-to-app alias.
+    /// `None` for direct dials and non-mesh listeners.
+    mesh_inbound_pre_handshake_app_port: Option<u16>,
 }
 
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
@@ -3580,12 +3589,42 @@ fn clone_svid_bundle_slot(slot: &SharedSvidBundle) -> SharedSvidBundle {
 pub type SharedGatewayTrustBundles = Arc<ArcSwap<Option<RuntimeTrustBundleSet>>>;
 pub type SharedMeshInboundTls = Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>>;
 
+pub struct MeshInboundTlsPolicy {
+    pub default: Option<Arc<rustls::ServerConfig>>,
+    pub by_port: HashMap<u16, Option<Arc<rustls::ServerConfig>>>,
+    pub default_mode: crate::modes::mesh::config::MtlsMode,
+    pub modes_by_port: std::collections::BTreeMap<u16, crate::modes::mesh::config::MtlsMode>,
+    /// Translate a captured Sidecar ingress[] listener port to its
+    /// defaultEndpoint backend app port before selecting PeerAuthentication.
+    /// Ordinary captured inbound routes need no entry because their original
+    /// destination already is the app/container port.
+    pub app_port_by_orig_dst_port: std::collections::BTreeMap<u16, u16>,
+}
+
+impl Default for MeshInboundTlsPolicy {
+    fn default() -> Self {
+        Self {
+            default: None,
+            by_port: HashMap::new(),
+            default_mode: crate::modes::mesh::config::MtlsMode::Permissive,
+            modes_by_port: std::collections::BTreeMap::new(),
+            app_port_by_orig_dst_port: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+pub type SharedMeshInboundTlsPolicy = Arc<ArcSwap<MeshInboundTlsPolicy>>;
+
 fn empty_gateway_trust_bundle_slot() -> SharedGatewayTrustBundles {
     Arc::new(ArcSwap::new(Arc::new(None)))
 }
 
 fn empty_mesh_inbound_tls_slot() -> SharedMeshInboundTls {
     Arc::new(ArcSwap::new(Arc::new(None)))
+}
+
+fn empty_mesh_inbound_tls_policy_slot() -> SharedMeshInboundTlsPolicy {
+    Arc::new(ArcSwap::new(Arc::new(MeshInboundTlsPolicy::default())))
 }
 
 fn load_gateway_svid_bundle(env_config: &EnvConfig) -> Result<SharedSvidBundle, anyhow::Error> {
@@ -4708,6 +4747,7 @@ impl ProxyState {
         let gateway_file_svid_bundle = clone_svid_bundle_slot(&gateway_svid_bundle);
         let gateway_trust_bundles = empty_gateway_trust_bundle_slot();
         let mesh_inbound_tls = empty_mesh_inbound_tls_slot();
+        let mesh_inbound_tls_policy = empty_mesh_inbound_tls_policy_slot();
         let mesh_inbound_spiffe_verifier_active = Arc::new(AtomicBool::new(false));
         let mesh_outbound_enforcement = crate::modes::mesh::outbound_enforcement::empty_slot();
         let hbone_pool = Arc::new(
@@ -5101,6 +5141,7 @@ impl ProxyState {
             gateway_trust_bundles,
             gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
             mesh_inbound_tls,
+            mesh_inbound_tls_policy,
             mesh_inbound_spiffe_verifier_active,
             mesh_outbound_enforcement,
             backend_svid_rotation_tx,
@@ -7829,6 +7870,7 @@ async fn handle_connection(
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     orig_dst: Option<SocketAddr>,
+    mesh_inbound_pre_handshake_app_port: Option<u16>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
@@ -7883,6 +7925,7 @@ async fn handle_connection(
             node_waypoint_identity: node_waypoint_identity.clone(),
             mesh_direction,
             orig_dst,
+            mesh_inbound_pre_handshake_app_port,
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -8004,6 +8047,7 @@ async fn handle_websocket_request_authenticated(
     start_time: Instant,
     is_h2_websocket: bool,
     is_tls: bool,
+    mesh_inbound_pre_handshake_app_port: Option<u16>,
     cb_target_key: Option<String>,
     cb_is_half_open_probe: bool,
     requires_ws_frame_hooks: bool,
@@ -8477,6 +8521,36 @@ async fn handle_websocket_request_authenticated(
                         retry_cb_target_key =
                             Some(crate::circuit_breaker::target_key(&next.host, next.port));
                         retry_target = Some(next);
+                    }
+
+                    // A retry may rotate to a different app-port lane, and a
+                    // live PeerAuthentication reload may also tighten the
+                    // current lane during the retry backoff. Re-check before
+                    // acquiring any admission or circuit-breaker state for the
+                    // next target and before attempting its backend handshake.
+                    if let Some(mismatch) = mesh_inbound_peer_auth_transport_mismatch(
+                        &state,
+                        ctx.mesh_direction,
+                        mesh_inbound_pre_handshake_app_port,
+                        &proxy,
+                        retry_target.as_deref(),
+                        is_tls,
+                        ctx.tls_client_cert_der.is_some(),
+                    ) {
+                        return Ok(reject_mesh_inbound_peer_auth_transport_mismatch(
+                            &state,
+                            plugins.as_ref(),
+                            &mut ctx,
+                            &proxy,
+                            mismatch,
+                            is_tls,
+                            false,
+                            start_time,
+                            plugin_execution_ns,
+                            "mesh_inbound_peer_auth_retry_target_mismatch",
+                            Some(&original_request_path),
+                        )
+                        .await);
                     }
 
                     let mut retry_admitted_by_cb = true;
@@ -11356,34 +11430,6 @@ pub(crate) async fn start_mesh_udp_capture_listener_with_signal(
     .await
 }
 
-/// Start a mesh mTLS/HBONE listener with handshake-failure telemetry enabled.
-///
-/// `mesh_direction` is stamped onto every accepted connection's
-/// [`RequestContext`] / [`StreamConnectionContext`] so mesh-aware plugins
-/// (e.g., `workload_metrics`) can gate CLIENT vs SERVER span emission on
-/// which side of the hop this listener represents.
-pub(crate) async fn start_mesh_proxy_listener_with_tls_and_signal(
-    addr: SocketAddr,
-    state: ProxyState,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-    tls_config: Option<Arc<rustls::ServerConfig>>,
-    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
-    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
-) -> Result<(), anyhow::Error> {
-    start_proxy_listener_with_tls_source_and_signal(
-        addr,
-        state,
-        shutdown,
-        ListenerTlsSource::Static {
-            tls_config,
-            record_mesh_mtls_metric: true,
-        },
-        mesh_direction,
-        started_tx,
-    )
-    .await
-}
-
 /// Start the proxy HTTPS listener with a hot-swappable frontend TLS slot.
 ///
 /// Used when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`. The frontend TLS
@@ -11414,7 +11460,7 @@ pub async fn start_proxy_listener_with_dynamic_tls_and_signal(
 }
 
 /// Start a proxy listener whose TLS config is loaded dynamically from
-/// `ProxyState::mesh_inbound_tls` on every accepted connection.
+/// `ProxyState::mesh_inbound_tls_policy` on every accepted connection.
 ///
 /// Mesh-mode mTLS / HBONE termination listeners use this when
 /// `FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED=true`. The mesh slice apply task
@@ -11429,13 +11475,14 @@ pub async fn start_proxy_listener_with_mesh_inbound_tls_and_signal(
     state: ProxyState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    allows_plaintext: bool,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     start_proxy_listener_with_tls_source_and_signal(
         addr,
         state,
         shutdown,
-        ListenerTlsSource::MeshInbound,
+        ListenerTlsSource::MeshInbound { allows_plaintext },
         mesh_direction,
         started_tx,
     )
@@ -11450,10 +11497,11 @@ enum ListenerTlsSource {
         tls_config: Option<Arc<rustls::ServerConfig>>,
         record_mesh_mtls_metric: bool,
     },
-    /// Dynamic mesh inbound TLS loaded from `ProxyState::mesh_inbound_tls` on
-    /// every accept so PeerAuthentication changes can hot-swap future
-    /// handshakes without restarting the listener.
-    MeshInbound,
+    /// Dynamic mesh inbound TLS loaded from the authoritative
+    /// `ProxyState::mesh_inbound_tls_policy` on every accept so
+    /// PeerAuthentication changes can hot-swap future handshakes without
+    /// restarting the listener.
+    MeshInbound { allows_plaintext: bool },
     /// Dynamic frontend TLS loaded from a shared `ArcSwap` slot on every
     /// accept so a successful cert/key reload (opt-in via
     /// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`) takes effect on the next
@@ -11474,11 +11522,22 @@ impl ListenerTlsSource {
     /// `Dynamic` performs one `ArcSwap::load()` and one inner `Arc` clone per
     /// accept; this is the narrow frontend cert/key live-reload carve-out
     /// and is not on the request path.
-    fn load(&self, state: &ProxyState) -> Option<Arc<rustls::ServerConfig>> {
+    fn load(&self, state: &ProxyState, orig_dst: Option<SocketAddr>) -> ListenerTlsSelection {
         match self {
-            Self::Static { tls_config, .. } => tls_config.clone(),
-            Self::MeshInbound => state.mesh_inbound_tls.load().as_ref().clone(),
-            Self::Dynamic { slot, .. } => slot.load().as_ref().clone(),
+            Self::Static { tls_config, .. } => ListenerTlsSelection {
+                tls_config: tls_config.clone(),
+                accepts_plaintext: false,
+                mesh_inbound_pre_handshake_app_port: None,
+            },
+            Self::MeshInbound { allows_plaintext } => {
+                let policy = state.mesh_inbound_tls_policy.load();
+                select_mesh_inbound_tls_for_listener(&policy, orig_dst, *allows_plaintext)
+            }
+            Self::Dynamic { slot, .. } => ListenerTlsSelection {
+                tls_config: slot.load().as_ref().clone(),
+                accepts_plaintext: false,
+                mesh_inbound_pre_handshake_app_port: None,
+            },
         }
     }
 
@@ -11488,7 +11547,7 @@ impl ListenerTlsSource {
                 record_mesh_mtls_metric,
                 ..
             } => *record_mesh_mtls_metric,
-            Self::MeshInbound => true,
+            Self::MeshInbound { .. } => true,
             Self::Dynamic {
                 record_mesh_mtls_metric,
                 ..
@@ -11503,10 +11562,285 @@ impl ListenerTlsSource {
     /// without frontend TLS materials, so it must fall through to plaintext.
     fn requires_tls(&self) -> bool {
         match self {
-            Self::Static { .. } | Self::MeshInbound => false,
+            Self::Static { .. } => false,
+            Self::MeshInbound { allows_plaintext } => !allows_plaintext,
             Self::Dynamic { .. } => true,
         }
     }
+}
+
+struct ListenerTlsSelection {
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    /// When TLS is configured, inspect the first byte and send non-TLS traffic
+    /// to the plaintext handler. Only mesh PeerAuthentication uses this dual
+    /// posture; ordinary HTTPS listeners remain TLS-only.
+    accepts_plaintext: bool,
+    /// Captured app port used to select this TLS posture, after ingress alias
+    /// translation. Stashed on the connection for mismatch diagnostics; the
+    /// request gate always consults the current live policy snapshot.
+    mesh_inbound_pre_handshake_app_port: Option<u16>,
+}
+
+fn mtls_mode_accepts_plaintext(mode: crate::modes::mesh::config::MtlsMode) -> bool {
+    matches!(
+        mode,
+        crate::modes::mesh::config::MtlsMode::Permissive
+            | crate::modes::mesh::config::MtlsMode::Disable
+    )
+}
+
+fn mtls_mode_accepts_tls(mode: crate::modes::mesh::config::MtlsMode) -> bool {
+    mode != crate::modes::mesh::config::MtlsMode::Disable
+}
+
+fn select_mesh_inbound_tls(
+    policy: &MeshInboundTlsPolicy,
+    orig_dst: Option<SocketAddr>,
+) -> ListenerTlsSelection {
+    if let Some(dst) = orig_dst {
+        let app_port = policy
+            .app_port_by_orig_dst_port
+            .get(&dst.port())
+            .copied()
+            .unwrap_or_else(|| dst.port());
+        let mode = policy
+            .modes_by_port
+            .get(&app_port)
+            .copied()
+            .unwrap_or(policy.default_mode);
+        return ListenerTlsSelection {
+            tls_config: select_mesh_inbound_tls_config(
+                &policy.default,
+                &policy.by_port,
+                Some(app_port),
+            )
+            .clone(),
+            accepts_plaintext: mtls_mode_accepts_plaintext(mode),
+            mesh_inbound_pre_handshake_app_port: Some(app_port),
+        };
+    }
+
+    // A direct dial has no app-port signal until HTTP/HBONE routing. Build a
+    // dual-wire accept posture whenever any effective mode admits plaintext,
+    // and choose the least restrictive available TLS verifier so every TLS
+    // mode can complete its handshake. The post-routing gate below enforces
+    // the selected app port exactly (STRICT still requires a verified cert;
+    // DISABLE still rejects TLS).
+    let permissive_tls = if policy.default_mode == crate::modes::mesh::config::MtlsMode::Permissive
+    {
+        policy.default.clone()
+    } else {
+        None
+    }
+    .or_else(|| {
+        policy.modes_by_port.iter().find_map(|(port, mode)| {
+            if *mode == crate::modes::mesh::config::MtlsMode::Permissive {
+                policy.by_port.get(port).cloned().flatten()
+            } else {
+                None
+            }
+        })
+    });
+    let strict_tls = if policy.default_mode == crate::modes::mesh::config::MtlsMode::Strict {
+        policy.default.clone()
+    } else {
+        None
+    }
+    .or_else(|| {
+        policy.modes_by_port.iter().find_map(|(port, mode)| {
+            if *mode == crate::modes::mesh::config::MtlsMode::Strict {
+                policy.by_port.get(port).cloned().flatten()
+            } else {
+                None
+            }
+        })
+    });
+    let has_different_port_mode = policy
+        .modes_by_port
+        .values()
+        .any(|mode| *mode != policy.default_mode);
+    let any_mode_accepts_plaintext = mtls_mode_accepts_plaintext(policy.default_mode)
+        || policy
+            .modes_by_port
+            .values()
+            .copied()
+            .any(mtls_mode_accepts_plaintext);
+    let any_mode_accepts_tls = mtls_mode_accepts_tls(policy.default_mode)
+        || policy
+            .modes_by_port
+            .values()
+            .copied()
+            .any(mtls_mode_accepts_tls);
+    ListenerTlsSelection {
+        tls_config: permissive_tls.or(strict_tls),
+        accepts_plaintext: mtls_mode_accepts_plaintext(policy.default_mode)
+            || (has_different_port_mode && any_mode_accepts_plaintext && any_mode_accepts_tls),
+        mesh_inbound_pre_handshake_app_port: None,
+    }
+}
+
+fn select_mesh_inbound_tls_for_listener(
+    policy: &MeshInboundTlsPolicy,
+    orig_dst: Option<SocketAddr>,
+    allows_plaintext: bool,
+) -> ListenerTlsSelection {
+    let mut selection = select_mesh_inbound_tls(policy, orig_dst);
+    selection.accepts_plaintext &= allows_plaintext;
+    selection
+}
+
+fn first_byte_is_tls_client_hello(first_byte: u8) -> bool {
+    // A TLS connection begins with a handshake record containing ClientHello.
+    // This intentionally remains a one-byte discriminator only for HTTP-family
+    // inbound traffic: a plaintext HTTP request cannot validly begin with 0x16,
+    // and the post-route gate rejects plaintext for STRICT ports. Captured
+    // stream-family routes bypass this classifier entirely so application TLS
+    // and binary protocols are relayed byte-for-byte under PERMISSIVE.
+    first_byte == 0x16
+}
+
+fn mesh_inbound_selection_uses_tls(
+    has_tls_config: bool,
+    accepts_plaintext: bool,
+    stream_family_passthrough: bool,
+    first_byte: u8,
+) -> bool {
+    has_tls_config
+        && (!accepts_plaintext
+            || (!stream_family_passthrough && first_byte_is_tls_client_hello(first_byte)))
+}
+
+fn select_mesh_inbound_tls_config<'a>(
+    default: &'a Option<Arc<rustls::ServerConfig>>,
+    by_port: &'a HashMap<u16, Option<Arc<rustls::ServerConfig>>>,
+    app_port: Option<u16>,
+) -> &'a Option<Arc<rustls::ServerConfig>> {
+    app_port
+        .and_then(|port| by_port.get(&port))
+        .unwrap_or(default)
+}
+
+fn mesh_inbound_transport_satisfies_mode(
+    mode: crate::modes::mesh::config::MtlsMode,
+    is_tls: bool,
+    has_verified_peer_certificate: bool,
+) -> bool {
+    match mode {
+        crate::modes::mesh::config::MtlsMode::Strict => is_tls && has_verified_peer_certificate,
+        crate::modes::mesh::config::MtlsMode::Permissive => true,
+        crate::modes::mesh::config::MtlsMode::Disable => !is_tls,
+        // DestinationRule-only client modes are invalid on PeerAuthentication.
+        // Fail closed if malformed native config ever lets one reach this gate.
+        crate::modes::mesh::config::MtlsMode::Simple
+        | crate::modes::mesh::config::MtlsMode::Mutual
+        | crate::modes::mesh::config::MtlsMode::IstioMutual => false,
+    }
+}
+
+fn mesh_inbound_peer_auth_app_port(proxy: &Proxy, upstream_target: Option<&UpstreamTarget>) -> u16 {
+    // Sidecar ingress authorization intentionally uses the declared listener
+    // port stored on RequestContext, but PeerAuthentication.portLevelMtls is
+    // keyed by the workload app/container port behind defaultEndpoint. Route
+    // overrides and upstream selection can replace that initial proxy port, so
+    // the concrete target port is authoritative once one has been selected.
+    upstream_target
+        .map(|target| target.port)
+        .unwrap_or(proxy.backend_port)
+}
+
+fn mesh_inbound_requires_post_route_transport_gate(
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+) -> bool {
+    // Every HTTP-family/HBONE request on a mesh inbound listener must consult
+    // the current atomic policy snapshot. In particular, a captured keep-alive
+    // connection may have completed its handshake under an older PERMISSIVE or
+    // DISABLE posture before live reload made the same app port STRICT.
+    mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+}
+
+#[derive(Clone, Copy)]
+struct MeshInboundPeerAuthTransportMismatch {
+    pre_handshake_app_port: Option<u16>,
+    resolved_app_port: u16,
+    required_mode: crate::modes::mesh::config::MtlsMode,
+}
+
+fn mesh_inbound_peer_auth_transport_mismatch(
+    state: &ProxyState,
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    pre_handshake_app_port: Option<u16>,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    is_tls: bool,
+    has_verified_peer_certificate: bool,
+) -> Option<MeshInboundPeerAuthTransportMismatch> {
+    let resolved_app_port = mesh_inbound_peer_auth_app_port(proxy, upstream_target);
+    if !mesh_inbound_requires_post_route_transport_gate(mesh_direction) {
+        return None;
+    }
+
+    let policy = state.mesh_inbound_tls_policy.load();
+    let required_mode = policy
+        .modes_by_port
+        .get(&resolved_app_port)
+        .copied()
+        .unwrap_or(policy.default_mode);
+    (!mesh_inbound_transport_satisfies_mode(required_mode, is_tls, has_verified_peer_certificate))
+        .then_some(MeshInboundPeerAuthTransportMismatch {
+            pre_handshake_app_port,
+            resolved_app_port,
+            required_mode,
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reject_mesh_inbound_peer_auth_transport_mismatch(
+    state: &ProxyState,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    proxy: &Proxy,
+    mismatch: MeshInboundPeerAuthTransportMismatch,
+    is_tls: bool,
+    is_grpc_request: bool,
+    start_time: Instant,
+    plugin_execution_ns: u64,
+    log_reason: &'static str,
+    request_path: Option<&str>,
+) -> Response<ProxyBody> {
+    warn!(
+        proxy_id = %proxy.id,
+        pre_handshake_app_port = ?mismatch.pre_handshake_app_port,
+        resolved_app_port = mismatch.resolved_app_port,
+        required_mode = ?mismatch.required_mode,
+        transport_tls = is_tls,
+        verified_peer_certificate = ctx.tls_client_cert_der.is_some(),
+        client_ip = %ctx.client_ip,
+        "Rejecting mesh inbound request because its transport does not satisfy the effective target app-port PeerAuthentication mode"
+    );
+    let reject = finalize_reject_response_with_after_proxy_hooks(
+        plugins,
+        ctx,
+        StatusCode::FORBIDDEN,
+        br#"{"error":"Mesh inbound transport does not satisfy PeerAuthentication for the resolved application port"}"#,
+        HashMap::new(),
+        is_grpc_request,
+    )
+    .await;
+    if is_grpc_request {
+        apply_grpc_reject_metadata(ctx, &reject);
+    }
+    log_rejected_request_with_path(
+        plugins,
+        ctx,
+        reject.http_status.as_u16(),
+        start_time,
+        log_reason,
+        plugin_execution_ns,
+        request_path,
+    )
+    .await;
+    record_request(state, reject.http_status.as_u16());
+    build_response_from_normalized_reject(reject)
 }
 
 struct TlsConnectionMetadata {
@@ -11516,6 +11850,8 @@ struct TlsConnectionMetadata {
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     /// See [`RequestConnectionMetadata::orig_dst`].
     orig_dst: Option<SocketAddr>,
+    /// See [`RequestConnectionMetadata::mesh_inbound_pre_handshake_app_port`].
+    mesh_inbound_pre_handshake_app_port: Option<u16>,
 }
 
 struct NodeWaypointAcceptIdentity {
@@ -11891,7 +12227,21 @@ async fn run_accept_loop(
                             } else {
                                 None
                             };
-                        let tls_config = tls_source.load(&state);
+                        // Read the captured connection's original destination
+                        // before TLS selection. Inbound REDIRECT preserves the
+                        // workload app/container port, allowing PeerAuthentication
+                        // `portLevelMtls` to choose the ServerConfig before the
+                        // rustls handshake begins.
+                        let orig_dst = if mesh_direction.is_some() {
+                            select_mesh_original_dst(
+                                mesh_direction,
+                                crate::socket_opts::original_dst(&stream),
+                                node_waypoint_orig_dst,
+                            )
+                        } else {
+                            None
+                        };
+                        let tls_selection = tls_source.load(&state, orig_dst);
                         // Defense in depth: a TLS-required source (Dynamic
                         // frontend reload slot, MeshInbound peer-auth slot)
                         // that observes a `None` payload must NOT fall
@@ -11902,7 +12252,7 @@ async fn run_accept_loop(
                         // config and only ever stores `Some(..)`; this guard
                         // protects against a slot transiently or buggily
                         // holding `None`.
-                        if tls_config.is_none() && tls_source.requires_tls() {
+                        if tls_selection.tls_config.is_none() && tls_source.requires_tls() {
                             debug!(
                                 remote_addr = %remote_addr.ip(),
                                 "Dropping TLS connection: TLS slot is empty for a TLS-required listener (live-reload race or misconfiguration)"
@@ -11911,24 +12261,6 @@ async fn run_accept_loop(
                             continue;
                         }
                         let record_mesh_mtls_metric = tls_source.record_mesh_mtls_metric();
-                        // Read the captured connection's original destination
-                        // ONCE per accept, only on mesh capture listeners. For
-                        // iptables REDIRECT capture, `SO_ORIGINAL_DST` carries
-                        // the pre-NAT address. For NodeWaypoint cgroup/connect
-                        // capture there is no conntrack original-dst state, so
-                        // the eBPF resolver's original destination wins for
-                        // outbound. Every request on the connection shares this
-                        // value. `None` everywhere else and for non-redirected
-                        // traffic.
-                        let orig_dst = if mesh_direction.is_some() {
-                            select_mesh_original_dst(
-                                mesh_direction,
-                                crate::socket_opts::original_dst(&stream),
-                                node_waypoint_orig_dst,
-                            )
-                        } else {
-                            None
-                        };
                         // Each connection gets its own subscriber so that
                         // shutdown can interrupt the per-connection serve
                         // future (sending GOAWAY on H2 / closing keepalive
@@ -11944,6 +12276,90 @@ async fn run_accept_loop(
                             // Track this connection for graceful drain.
                             // The guard decrements the counter on drop (all exit paths).
                             let _conn_guard = crate::overload::ConnectionGuard::new(&state.overload);
+
+                            // PeerAuthentication PERMISSIVE, and direct dials
+                            // spanning TLS plus DISABLE app-port modes, must
+                            // accept both wire protocols on one transport
+                            // listener. Peek without consuming the ClientHello;
+                            // exact per-port enforcement still happens after
+                            // routing. Bound this pre-protocol read with the TLS
+                            // handshake timeout so an idle peer cannot pin a
+                            // connection indefinitely before Hyper's header
+                            // timeout starts.
+                            let ListenerTlsSelection {
+                                mut tls_config,
+                                accepts_plaintext,
+                                mesh_inbound_pre_handshake_app_port,
+                            } = tls_selection;
+                            if tls_config.is_some() && accepts_plaintext {
+                                // A captured stream-family port is an L4
+                                // passthrough surface. In PERMISSIVE mode every
+                                // byte sequence, including an application-level
+                                // TLS ClientHello beginning with 0x16, belongs to
+                                // the backend protocol and must not be consumed
+                                // by the mesh HTTP TLS terminator.
+                                let stream_family_passthrough = mesh_direction
+                                    == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+                                    && orig_dst.is_some_and(|dst| {
+                                        state
+                                            .request_epoch
+                                            .load()
+                                            .route_table
+                                            .mesh_tcp_inbound_entry(dst)
+                                            .is_some()
+                                    });
+                                if stream_family_passthrough {
+                                    tls_config = None;
+                                } else {
+                                    let mut first_byte = [0_u8; 1];
+                                    let peek = stream.peek(&mut first_byte);
+                                    let peek_result = if state
+                                        .env_config
+                                        .frontend_tls_handshake_timeout_seconds
+                                        > 0
+                                    {
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_secs(
+                                                state
+                                                    .env_config
+                                                    .frontend_tls_handshake_timeout_seconds,
+                                            ),
+                                            peek,
+                                        )
+                                        .await
+                                        {
+                                            Ok(result) => result,
+                                            Err(_) => Err(std::io::Error::from(
+                                                std::io::ErrorKind::TimedOut,
+                                            )),
+                                        }
+                                    } else {
+                                        peek.await
+                                    };
+                                    match peek_result {
+                                        Ok(0) => return,
+                                        Ok(_)
+                                            if !mesh_inbound_selection_uses_tls(
+                                                tls_config.is_some(),
+                                                accepts_plaintext,
+                                                false,
+                                                first_byte[0],
+                                            ) =>
+                                        {
+                                            tls_config = None;
+                                        }
+                                        Ok(_) => {}
+                                        Err(error) => {
+                                            debug!(
+                                                remote_addr = %remote_addr.ip(),
+                                                %error,
+                                                "Unable to classify dual-posture mesh inbound connection"
+                                            );
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
 
                             // Raw-TCP mesh egress: a captured plaintext
                             // outbound connection whose original destination
@@ -12054,6 +12470,7 @@ async fn run_accept_loop(
                                     node_waypoint_identity,
                                     mesh_direction,
                                     orig_dst,
+                                    mesh_inbound_pre_handshake_app_port,
                                 };
                                 handle_tls_connection(
                                     stream,
@@ -12074,6 +12491,7 @@ async fn run_accept_loop(
                                     node_waypoint_identity,
                                     mesh_direction,
                                     orig_dst,
+                                    mesh_inbound_pre_handshake_app_port,
                                 )
                                 .await
                             };
@@ -12215,6 +12633,8 @@ async fn handle_tls_connection(
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
             mesh_direction: tls_connection_metadata.mesh_direction,
             orig_dst: tls_connection_metadata.orig_dst,
+            mesh_inbound_pre_handshake_app_port: tls_connection_metadata
+                .mesh_inbound_pre_handshake_app_port,
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -13557,6 +13977,8 @@ async fn handle_proxy_request_inner(
     ctx.frontend_sni_hostname = connection_metadata.frontend_sni_hostname;
     ctx.mesh_direction = connection_metadata.mesh_direction;
     ctx.orig_dst = connection_metadata.orig_dst;
+    let mesh_inbound_pre_handshake_app_port =
+        connection_metadata.mesh_inbound_pre_handshake_app_port;
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     if let Some(identity) = connection_metadata.node_waypoint_identity {
@@ -14263,6 +14685,43 @@ async fn handle_proxy_request_inner(
         return Ok(build_response_from_normalized_reject(reject));
     }
 
+    // A mixed direct-listener posture may intentionally accept cert-less TLS
+    // far enough to resolve the application port. Once the initial route has
+    // supplied a concrete app port, enforce its PeerAuthentication mode before
+    // any request plugin runs. Route overrides and load-balancer selection can
+    // still change the destination later, so the authoritative post-plugin and
+    // per-retry checks below remain required. An upstream template with port 0
+    // has no concrete initial app port and is deferred to those later checks.
+    if proxy.backend_port != 0
+        && let Some(mismatch) = mesh_inbound_peer_auth_transport_mismatch(
+            &state,
+            ctx.mesh_direction,
+            mesh_inbound_pre_handshake_app_port,
+            &proxy,
+            None,
+            is_tls,
+            ctx.tls_client_cert_der.is_some(),
+        )
+    {
+        // Deliberately pass an empty plugin list: this is the pre-plugin trust
+        // boundary, so neither after_proxy nor transaction-log plugin hooks may
+        // run for a transport that the initial app-port policy has rejected.
+        return Ok(reject_mesh_inbound_peer_auth_transport_mismatch(
+            &state,
+            &[],
+            &mut ctx,
+            &proxy,
+            mismatch,
+            is_tls,
+            is_grpc_request,
+            start_time,
+            0,
+            "mesh_inbound_peer_auth_initial_route_mismatch",
+            None,
+        )
+        .await);
+    }
+
     // Load plugin-cache values once for this request. Every plugin list,
     // capability bitset, and buffering flag below is derived from the same
     // cache generation without retaining the full cache across awaits.
@@ -14664,6 +15123,8 @@ async fn handle_proxy_request_inner(
             &proxy,
             &epoch,
             &mut ctx,
+            is_tls,
+            mesh_inbound_pre_handshake_app_port,
             client_request_body,
             &plugins,
             start_time,
@@ -14682,6 +15143,8 @@ async fn handle_proxy_request_inner(
             &proxy,
             &epoch,
             &mut ctx,
+            is_tls,
+            mesh_inbound_pre_handshake_app_port,
             client_request_body,
             &plugins,
             start_time,
@@ -14790,6 +15253,37 @@ async fn handle_proxy_request_inner(
         selection.target,
         request_host.as_deref(),
     );
+
+    // The effective PeerAuthentication app port is not authoritative until
+    // routing plugins have applied their overrides and load balancing has
+    // selected a concrete upstream target. Re-check every inbound request
+    // against the current atomic policy snapshot so a keep-alive connection
+    // accepted before live reload cannot retain a weaker transport posture.
+    if let Some(mismatch) = mesh_inbound_peer_auth_transport_mismatch(
+        &state,
+        ctx.mesh_direction,
+        mesh_inbound_pre_handshake_app_port,
+        &proxy,
+        upstream_target.as_deref(),
+        is_tls,
+        ctx.tls_client_cert_der.is_some(),
+    ) {
+        return Ok(reject_mesh_inbound_peer_auth_transport_mismatch(
+            &state,
+            &plugins,
+            &mut ctx,
+            &proxy,
+            mismatch,
+            is_tls,
+            is_grpc_request,
+            start_time,
+            plugin_execution_ns,
+            "mesh_inbound_peer_auth_transport_mismatch",
+            Some(&original_request_path),
+        )
+        .await);
+    }
+
     let upstream_balancer = selection.balancer;
     let upstream_is_fallback = selection.is_fallback;
     let sticky_cookie_needed = selection.sticky_cookie_needed;
@@ -15121,6 +15615,7 @@ async fn handle_proxy_request_inner(
             start_time,
             is_h2_ws,
             is_tls,
+            mesh_inbound_pre_handshake_app_port,
             cb_target_key,
             cb_is_half_open_probe,
             requires_ws_frame_hooks,
@@ -15979,6 +16474,36 @@ async fn handle_proxy_request_inner(
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
                     grpc_final_cb_key = grpc_current_cb_key.clone();
                     grpc_current_target = Some(next);
+                }
+
+                // Retry backoff and target rotation cross a fresh policy
+                // boundary: the selected app port may differ from the first
+                // attempt, and live reload may have tightened even the same
+                // port. Re-check before any retry-target breaker/admission
+                // state is acquired and before the gRPC pool can dispatch.
+                if let Some(mismatch) = mesh_inbound_peer_auth_transport_mismatch(
+                    &state,
+                    ctx.mesh_direction,
+                    mesh_inbound_pre_handshake_app_port,
+                    &proxy,
+                    grpc_current_target.as_deref(),
+                    is_tls,
+                    ctx.tls_client_cert_der.is_some(),
+                ) {
+                    return Ok(reject_mesh_inbound_peer_auth_transport_mismatch(
+                        &state,
+                        &plugins,
+                        &mut ctx,
+                        &proxy,
+                        mismatch,
+                        is_tls,
+                        true,
+                        start_time,
+                        plugin_execution_ns,
+                        "mesh_inbound_peer_auth_retry_target_mismatch",
+                        Some(&original_request_path),
+                    )
+                    .await);
                 }
 
                 // Re-screen the (possibly LB-rotated) retry target for mesh
@@ -17864,6 +18389,35 @@ async fn handle_proxy_request_inner(
                     current_dispatch_h3 = !requires_response_stream_inspection
                         && supports_native_http3_backend(&state, &proxy, current_target.as_deref());
                 }
+            }
+
+            // Re-evaluate the live PeerAuthentication snapshot for every
+            // retry attempt. The load balancer may have rotated to a target
+            // on another app-port lane, while even a same-target retry may
+            // follow a policy reload that tightened the current lane.
+            if let Some(mismatch) = mesh_inbound_peer_auth_transport_mismatch(
+                &state,
+                ctx.mesh_direction,
+                mesh_inbound_pre_handshake_app_port,
+                &proxy,
+                current_target.as_deref(),
+                is_tls,
+                ctx.tls_client_cert_der.is_some(),
+            ) {
+                return Ok(reject_mesh_inbound_peer_auth_transport_mismatch(
+                    &state,
+                    &plugins,
+                    &mut ctx,
+                    &proxy,
+                    mismatch,
+                    is_tls,
+                    is_grpc_request,
+                    start_time,
+                    plugin_execution_ns,
+                    "mesh_inbound_peer_auth_retry_target_mismatch",
+                    Some(&original_request_path),
+                )
+                .await);
             }
 
             if let Some(reason) =
@@ -36413,11 +36967,11 @@ mod tests {
     }
 
     /// `Dynamic` is only constructed for TLS-terminating HTTPS listeners and
-    /// must fail closed when its slot is empty. `MeshInbound` uses the same
-    /// slot shape for PeerAuthentication live reload, where `None` is a valid
-    /// plaintext state for DISABLE/permissive-without-materials.
+    /// must fail closed when its slot is empty. Sidecar dev listeners may use
+    /// `None` as an intentional plaintext state; HBONE and production mesh
+    /// listeners remain TLS-required.
     #[test]
-    fn listener_tls_source_dynamic_requires_tls_but_mesh_inbound_allows_plaintext() {
+    fn listener_tls_source_respects_mesh_plaintext_capability() {
         let slot = crate::tls::empty_frontend_tls_slot();
         let dynamic = ListenerTlsSource::Dynamic {
             slot,
@@ -36425,8 +36979,336 @@ mod tests {
         };
         assert!(dynamic.requires_tls());
 
-        let mesh = ListenerTlsSource::MeshInbound;
-        assert!(!mesh.requires_tls());
+        let sidecar_dev = ListenerTlsSource::MeshInbound {
+            allows_plaintext: true,
+        };
+        assert!(!sidecar_dev.requires_tls());
+
+        let hbone = ListenerTlsSource::MeshInbound {
+            allows_plaintext: false,
+        };
+        assert!(hbone.requires_tls());
+    }
+
+    #[test]
+    fn mesh_inbound_tls_selection_uses_original_app_port_then_fallback() {
+        let default = None;
+        let by_port = HashMap::from([(8080, None), (9090, None)]);
+        let selected_8080 = select_mesh_inbound_tls_config(&default, &by_port, Some(8080));
+        assert!(std::ptr::eq(selected_8080, &by_port[&8080]));
+
+        let selected_unknown = select_mesh_inbound_tls_config(&default, &by_port, Some(7070));
+        assert!(std::ptr::eq(selected_unknown, &default));
+        assert!(std::ptr::eq(
+            select_mesh_inbound_tls_config(&default, &by_port, None),
+            &default
+        ));
+    }
+
+    #[test]
+    fn direct_mesh_inbound_mixed_wire_modes_accept_tls_and_plaintext_for_post_route_gate() {
+        use crate::modes::mesh::config::MtlsMode;
+
+        let tls = crate::tls::temporary_disabled_listener_tls_config()
+            .expect("temporary TLS config for selection test");
+        for policy in [
+            MeshInboundTlsPolicy {
+                default: None,
+                by_port: HashMap::from([(8080, Some(Arc::clone(&tls)))]),
+                default_mode: MtlsMode::Disable,
+                modes_by_port: std::collections::BTreeMap::from([(8080, MtlsMode::Strict)]),
+                app_port_by_orig_dst_port: std::collections::BTreeMap::new(),
+            },
+            MeshInboundTlsPolicy {
+                default: Some(Arc::clone(&tls)),
+                by_port: HashMap::from([(8081, None)]),
+                default_mode: MtlsMode::Strict,
+                modes_by_port: std::collections::BTreeMap::from([(8081, MtlsMode::Disable)]),
+                app_port_by_orig_dst_port: std::collections::BTreeMap::new(),
+            },
+        ] {
+            let selected = select_mesh_inbound_tls(&policy, None);
+            assert!(
+                selected.tls_config.is_some(),
+                "direct mixed-wire posture must retain a TLS acceptor"
+            );
+            assert!(
+                selected.accepts_plaintext,
+                "direct mixed-wire posture must also admit plaintext to routing"
+            );
+            assert!(mesh_inbound_selection_uses_tls(
+                selected.tls_config.is_some(),
+                selected.accepts_plaintext,
+                false,
+                0x16
+            ));
+            assert!(!mesh_inbound_selection_uses_tls(
+                selected.tls_config.is_some(),
+                selected.accepts_plaintext,
+                false,
+                b'G'
+            ));
+        }
+
+        // Once routing supplies the app port, the permissive accept posture is
+        // narrowed back to the exact policy rather than becoming a bypass.
+        assert!(!mesh_inbound_transport_satisfies_mode(
+            MtlsMode::Strict,
+            false,
+            false
+        ));
+        assert!(!mesh_inbound_transport_satisfies_mode(
+            MtlsMode::Disable,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn direct_mesh_inbound_uniform_permissive_accepts_plaintext() {
+        use crate::modes::mesh::config::MtlsMode;
+
+        let tls = crate::tls::temporary_disabled_listener_tls_config()
+            .expect("temporary TLS config for selection test");
+        let policy = MeshInboundTlsPolicy {
+            default: Some(tls),
+            by_port: HashMap::new(),
+            default_mode: MtlsMode::Permissive,
+            modes_by_port: std::collections::BTreeMap::new(),
+            app_port_by_orig_dst_port: std::collections::BTreeMap::new(),
+        };
+
+        let selected = select_mesh_inbound_tls(&policy, None);
+        assert!(selected.tls_config.is_some());
+        assert!(
+            selected.accepts_plaintext,
+            "uniform PERMISSIVE must demux direct plaintext before rustls"
+        );
+        assert!(!mesh_inbound_selection_uses_tls(
+            true,
+            selected.accepts_plaintext,
+            false,
+            b'G'
+        ));
+    }
+
+    #[test]
+    fn direct_egress_gateway_effective_strict_posture_is_tls_only() {
+        use crate::modes::mesh::config::MtlsMode;
+
+        let tls = crate::tls::temporary_disabled_listener_tls_config()
+            .expect("temporary TLS config for selection test");
+        // EgressGateway PERMISSIVE is escalated while building the listener and
+        // published as the effective STRICT mode in MeshInboundTlsPolicy.
+        let policy = MeshInboundTlsPolicy {
+            default: Some(tls),
+            by_port: HashMap::new(),
+            default_mode: MtlsMode::Strict,
+            modes_by_port: std::collections::BTreeMap::new(),
+            app_port_by_orig_dst_port: std::collections::BTreeMap::new(),
+        };
+
+        let selected = select_mesh_inbound_tls(&policy, None);
+        assert!(selected.tls_config.is_some());
+        assert!(
+            !selected.accepts_plaintext,
+            "the topology-escalated egress posture must never enable direct plaintext demux"
+        );
+        assert!(mesh_inbound_selection_uses_tls(
+            true,
+            selected.accepts_plaintext,
+            false,
+            b'G'
+        ));
+    }
+
+    #[test]
+    fn hbone_permissive_listener_is_tls_only() {
+        use crate::modes::mesh::config::MtlsMode;
+
+        let tls = crate::tls::temporary_disabled_listener_tls_config()
+            .expect("temporary TLS config for selection test");
+        let policy = MeshInboundTlsPolicy {
+            default: Some(tls),
+            by_port: HashMap::new(),
+            default_mode: MtlsMode::Permissive,
+            modes_by_port: std::collections::BTreeMap::new(),
+            app_port_by_orig_dst_port: std::collections::BTreeMap::new(),
+        };
+
+        let selected = select_mesh_inbound_tls_for_listener(&policy, None, false);
+        assert!(selected.tls_config.is_some());
+        assert!(
+            !selected.accepts_plaintext,
+            "HBONE termination must never demux PERMISSIVE traffic to plaintext"
+        );
+    }
+
+    #[test]
+    fn captured_permissive_stream_port_can_reach_plaintext_relay() {
+        use crate::modes::mesh::config::MtlsMode;
+
+        let tls = crate::tls::temporary_disabled_listener_tls_config()
+            .expect("temporary TLS config for selection test");
+        let policy = MeshInboundTlsPolicy {
+            default: Some(Arc::clone(&tls)),
+            by_port: HashMap::from([(6379, Some(tls))]),
+            default_mode: MtlsMode::Strict,
+            modes_by_port: std::collections::BTreeMap::from([(6379, MtlsMode::Permissive)]),
+            app_port_by_orig_dst_port: std::collections::BTreeMap::new(),
+        };
+        let selected =
+            select_mesh_inbound_tls(&policy, Some("10.0.0.8:6379".parse().expect("socket addr")));
+
+        assert!(selected.tls_config.is_some());
+        assert!(
+            selected.accepts_plaintext,
+            "PERMISSIVE captured app ports must sniff before forcing TLS/Hyper"
+        );
+        assert!(
+            !mesh_inbound_selection_uses_tls(
+                selected.tls_config.is_some(),
+                selected.accepts_plaintext,
+                true,
+                b'*'
+            ),
+            "a plaintext Redis request must select the no-TLS stream relay path"
+        );
+        assert!(
+            !mesh_inbound_selection_uses_tls(
+                selected.tls_config.is_some(),
+                selected.accepts_plaintext,
+                true,
+                0x16
+            ),
+            "application TLS on a PERMISSIVE stream port must remain L4 passthrough"
+        );
+    }
+
+    #[test]
+    fn captured_ingress_tls_selection_maps_listener_to_backend_app_port() {
+        use crate::modes::mesh::config::MtlsMode;
+
+        let strict_tls = crate::tls::temporary_disabled_listener_tls_config()
+            .expect("temporary TLS config for selection test");
+        let policy = MeshInboundTlsPolicy {
+            default: None,
+            by_port: HashMap::from([(8080, Some(Arc::clone(&strict_tls)))]),
+            default_mode: MtlsMode::Permissive,
+            modes_by_port: std::collections::BTreeMap::from([(8080, MtlsMode::Strict)]),
+            app_port_by_orig_dst_port: std::collections::BTreeMap::from([(8443, 8080)]),
+        };
+
+        let selected =
+            select_mesh_inbound_tls(&policy, Some("10.0.0.8:8443".parse().expect("socket addr")));
+        assert!(selected.tls_config.is_some());
+        assert!(!selected.accepts_plaintext);
+        assert_eq!(
+            selected.mesh_inbound_pre_handshake_app_port,
+            Some(8080),
+            "rejection diagnostics must retain the translated app port that selected TLS"
+        );
+    }
+
+    #[test]
+    fn ingress_peer_auth_uses_backend_app_port_not_authorization_listener_port() {
+        let mut proxy = make_validation_proxy("__mesh-ingress-default-api-8443", "/");
+        proxy.backend_port = 8080;
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+        ctx.mesh_inbound_listener_authz_port = Some(8443);
+
+        assert_eq!(mesh_inbound_peer_auth_app_port(&proxy, None), 8080);
+        let selected_target = target_for_test(9090);
+        assert_eq!(
+            mesh_inbound_peer_auth_app_port(&proxy, Some(&selected_target)),
+            9090,
+            "a concrete post-override upstream target must replace the route template port"
+        );
+        assert_eq!(
+            ctx.mesh_inbound_listener_authz_port,
+            Some(8443),
+            "AuthorizationPolicy retains declared ingress listener-port semantics"
+        );
+    }
+
+    #[test]
+    fn mesh_inbound_post_route_transport_gate_enforces_effective_mode() {
+        use crate::modes::mesh::config::MtlsMode;
+
+        assert!(!mesh_inbound_transport_satisfies_mode(
+            MtlsMode::Strict,
+            false,
+            false
+        ));
+        assert!(!mesh_inbound_transport_satisfies_mode(
+            MtlsMode::Strict,
+            true,
+            false
+        ));
+        assert!(mesh_inbound_transport_satisfies_mode(
+            MtlsMode::Strict,
+            true,
+            true
+        ));
+        assert!(mesh_inbound_transport_satisfies_mode(
+            MtlsMode::Permissive,
+            false,
+            false
+        ));
+        assert!(mesh_inbound_transport_satisfies_mode(
+            MtlsMode::Permissive,
+            true,
+            true
+        ));
+        assert!(mesh_inbound_transport_satisfies_mode(
+            MtlsMode::Disable,
+            false,
+            false
+        ));
+        assert!(!mesh_inbound_transport_satisfies_mode(
+            MtlsMode::Disable,
+            true,
+            true
+        ));
+
+        use crate::modes::mesh::MeshTrafficDirection;
+
+        assert!(mesh_inbound_requires_post_route_transport_gate(Some(
+            MeshTrafficDirection::Inbound
+        )));
+        assert!(!mesh_inbound_requires_post_route_transport_gate(Some(
+            MeshTrafficDirection::Outbound
+        )));
+        assert!(!mesh_inbound_requires_post_route_transport_gate(None));
+
+        // Pin the shared retry trust boundary across the three target-rotation
+        // loops without constructing the full ProxyState needed by the live
+        // ArcSwap-backed policy check.
+        let src = include_str!("mod.rs");
+        let rotation_marker = ["backend_dispatch::select_next_", "retry_target("].concat();
+        let gate_marker = ["mesh_inbound_peer_auth_", "retry_target_mismatch"].concat();
+
+        let retry_rotation_count = src.matches(&rotation_marker).count();
+        let retry_gate_count = src.matches(&gate_marker).count();
+        assert_eq!(
+            retry_rotation_count, 3,
+            "update this guard when adding another HTTP/gRPC/WebSocket target-rotation loop"
+        );
+        assert_eq!(
+            retry_gate_count, retry_rotation_count,
+            "every backend target-rotation loop must re-check the effective app-port PeerAuthentication mode before retry dispatch"
+        );
+
+        let initial_gate = src
+            .find("mesh_inbound_peer_auth_initial_route_mismatch")
+            .expect("initial-route PeerAuthentication gate must remain present");
+        let first_request_plugin = src
+            .find("match plugin.on_request_received(&mut ctx).await")
+            .expect("request plugin phase must remain present");
+        assert!(
+            initial_gate < first_request_plugin,
+            "the initial app-port PeerAuthentication gate must reject before on_request_received plugins"
+        );
     }
 
     /// The multi-port Sidecar egress authority rewrite: any client-supplied

@@ -2,6 +2,7 @@
 
 use ferrum_edge::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, ai_token_metrics::AiTokenMetrics,
+    validate_plugin_config,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -808,6 +809,13 @@ fn test_invalid_config_shapes_rejected() {
         let err = AiTokenMetrics::new(&config).err().unwrap();
         assert!(err.contains(needle), "needle={needle}, got: {err}");
     }
+}
+
+#[test]
+fn test_shared_validation_rejects_invalid_ai_token_metrics_config() {
+    let err = validate_plugin_config("ai_token_metrics", &json!({"include_model": "yes"}))
+        .expect_err("shared plugin validation must reject a non-boolean include_model");
+    assert_eq!(err, "ai_token_metrics: 'include_model' must be a boolean");
 }
 
 // ─── Synthetic short-circuit accounting guard ───────────────────────────────

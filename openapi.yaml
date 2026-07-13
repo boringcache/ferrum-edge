@@ -12,7 +12,10 @@ info:
     string `role` claim. `viewer` can call read-only endpoints, `operator` can
     also mutate proxies, upstreams, plugin configs, and operational refresh/test
     endpoints, and `admin` has full access including consumers, credentials, API
-    specs, TLS material management, batch/restore, and audit logs. Tokens
+    spec retrieval and mutations, TLS material management, batch/restore, and
+    audit logs. API spec metadata listing is read-only and therefore available
+    to `viewer`, `operator`, and `admin`; retrieving the original document is
+    Admin-only because it can contain sensitive upstream or plugin config. Tokens
     without a valid `role` claim are rejected. When `FERRUM_ADMIN_JWT_AUDIENCE`
     is set, tokens must additionally carry a matching `aud` claim. When it is
     unset (default), tokens without `aud` are accepted, but tokens carrying an
@@ -4257,6 +4260,8 @@ paths:
         (prefix match), `title_contains` (case-insensitive substring),
         `updated_since` (ISO-8601 timestamp), and `has_tag` (exact tag name).
 
+        This read-only metadata endpoint requires at least the `viewer` role.
+
         This endpoint is available in database and CP modes. It returns 503 in
         DP and file modes where no database is present.
       tags: [API Specs]
@@ -4372,6 +4377,8 @@ paths:
         Parses an OpenAPI 2.0 (Swagger), 3.0.x, 3.1.x, or 3.2.x specification
         document and atomically creates the embedded proxy, optional upstream,
         and proxy-scoped plugins as a single transactional bundle.
+
+        This mutation requires the `admin` role.
 
         The spec document must contain Ferrum extension fields at the root:
 
@@ -4566,6 +4573,9 @@ paths:
 
         The spec content is served as-is — the gateway does not rewrite any
         Ferrum extension fields in the response.
+
+        This endpoint requires the `admin` role because the original document
+        can contain sensitive upstream or plugin configuration.
       tags: [API Specs]
       parameters:
         - name: X-Ferrum-Namespace
@@ -4666,6 +4676,8 @@ paths:
 
         The request body, content negotiation, and validation rules are identical
         to `POST /api-specs`.
+
+        This mutation requires the `admin` role.
       tags: [API Specs]
       parameters:
         - name: X-Ferrum-Namespace
@@ -4770,6 +4782,8 @@ paths:
         case too.
 
         Returns 204 on success, 404 if the spec does not exist.
+
+        This mutation requires the `admin` role.
       tags: [API Specs]
       parameters:
         - name: X-Ferrum-Namespace
@@ -4812,6 +4826,9 @@ paths:
 
         Useful when the proxy ID is known (e.g., from a CI/CD pipeline
         that created the proxy) but the spec UUID is not stored.
+
+        This endpoint requires the `admin` role because the original document
+        can contain sensitive upstream or plugin configuration.
       tags: [API Specs]
       parameters:
         - name: X-Ferrum-Namespace

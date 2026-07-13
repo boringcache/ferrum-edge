@@ -181,6 +181,16 @@ pub struct WorkloadSelector {
     pub namespace: Option<String>,
 }
 
+impl WorkloadSelector {
+    /// Istio policy scopes only treat a selector with at least one label as
+    /// workload-specific. An absent, null, or explicitly empty selector is a
+    /// namespace/mesh default for PeerAuthentication precedence.
+    #[inline]
+    pub fn has_labels(&self) -> bool {
+        !self.labels.is_empty()
+    }
+}
+
 // ── MeshService ───────────────────────────────────────────────────────────
 
 /// A logical service. Workloads are referenced by SPIFFE ID.
@@ -1142,6 +1152,22 @@ pub struct PeerAuthentication {
     pub mtls_mode: MtlsMode,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub port_overrides: HashMap<u16, MtlsMode>,
+}
+
+impl PeerAuthentication {
+    /// Whether this policy has a non-empty workload selector. This is the
+    /// canonical predicate for PeerAuthentication scope classification and
+    /// `portLevelMtls` applicability across translated and native slices.
+    pub fn has_workload_selector(&self) -> bool {
+        match self.scope.as_ref() {
+            Some(PolicyScope::WorkloadSelector { selector }) => selector.has_labels(),
+            Some(PolicyScope::MeshWide | PolicyScope::Namespace { .. }) => false,
+            None => self
+                .selector
+                .as_ref()
+                .is_some_and(WorkloadSelector::has_labels),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

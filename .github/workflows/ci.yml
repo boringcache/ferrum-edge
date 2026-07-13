@@ -24,9 +24,80 @@ env:
   CARGO_HTTP_MULTIPLEXING: "false"
 
 jobs:
+  ci-plan:
+    name: CI Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate PR CI planner examples
+        run: python3 .github/scripts/pr_ci_plan.py --self-test
+
+      - name: Check PR diff hygiene
+        if: github.event_name == 'pull_request'
+        run: git diff --check "origin/${{ github.base_ref }}...HEAD"
+
+      - id: plan
+        name: Select CI mode
+        run: |
+          set -euo pipefail
+
+          changed_files="$RUNNER_TEMP/pr-ci-changed-files.txt"
+          planner=".github/scripts/pr_ci_plan.py"
+          : > "$changed_files"
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base_ref="origin/${BASE_REF}"
+            # Disable rename detection so moving a full-CI input to an allowed
+            # lightweight path reports both the deleted source and destination.
+            git diff --name-only --no-renames "${base_ref}...HEAD" | sort > "$changed_files"
+
+            # A PR that edits only the planner must not be able to classify
+            # itself as light. Use the base branch's trusted planner when it
+            # exists; the current checkout is the bootstrap fallback for the
+            # PR that first introduces this file.
+            trusted_planner="$RUNNER_TEMP/pr_ci_plan.py"
+            if git cat-file -e "${base_ref}:${planner}" 2>/dev/null; then
+              git show "${base_ref}:${planner}" > "$trusted_planner"
+              planner="$trusted_planner"
+            fi
+          fi
+
+          plan="$(python3 "$planner" \
+            --event-name "$EVENT_NAME" \
+            --changed-files "$changed_files")"
+          mode="$(printf '%s\n' "$plan" | sed -n 's/^mode=//p')"
+          reason="$(printf '%s\n' "$plan" | sed -n 's/^reason=//p')"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## CI Plan"
+            echo ""
+            echo "Mode: **${mode}**"
+            echo ""
+            echo "$reason"
+            if [ -s "$changed_files" ]; then
+              echo ""
+              echo "### Changed Files"
+              echo ""
+              while IFS= read -r path; do
+                echo "- \`${path}\`"
+              done < "$changed_files"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+
   fmt:
     name: Format Check
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -42,7 +113,8 @@ jobs:
 
   test-unit:
     name: Unit Tests
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -51,23 +123,11 @@ jobs:
         with:
           shared-key: "ci-test"
 
-      - name: Run unit tests
-        run: cargo test --test unit_tests
-        env:
-          RUST_BACKTRACE: 1
-
-  plugin-hardening-unit-regressions:
-    name: Plugin Hardening Unit Regressions
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
-
-      - uses: ./.github/actions/setup-rust-ci
-        with:
-          shared-key: "ci-plugin-hardening-unit"
-
       - name: Run cache accounting and reload safety regressions
+        # These tests are also part of the complete unit suite below. Run the
+        # explicit contract first so test deletion/renaming cannot silently
+        # weaken the hardening gate, while reusing the same compiled test
+        # binary instead of paying for a second cold Rust job.
         run: |
           set -euo pipefail
           hardening_tests=(
@@ -104,9 +164,15 @@ jobs:
           echo "- test_apply_delta_rejects_malformed_request_size_limiting_and_keeps_prior_cache" >> $GITHUB_STEP_SUMMARY
           echo "- test_apply_delta_rejects_unknown_enabled_plugin_and_keeps_prior_cache" >> $GITHUB_STEP_SUMMARY
 
+      - name: Run unit tests
+        run: cargo test --test unit_tests
+        env:
+          RUST_BACKTRACE: 1
+
   test-lib:
     name: Inline Lib Tests
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -127,7 +193,8 @@ jobs:
 
   test-secrets:
     name: Secret Backends (${{ matrix.name }})
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -176,7 +243,8 @@ jobs:
 
   test-service-integration:
     name: Service Integration (${{ matrix.name }})
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -209,7 +277,8 @@ jobs:
 
   test-pkcs11-softhsm:
     name: PKCS#11 SoftHSM Smoke Test
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -251,7 +320,8 @@ jobs:
 
   build-integration-tests-archive:
     name: Build Integration Tests Archive
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -539,7 +609,8 @@ jobs:
 
   test-conformance:
     name: Mesh Conformance Tests
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -573,7 +644,8 @@ jobs:
 
   dependency-audit:
     name: Dependency Audit (cargo-deny)
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     # cargo-deny only runs `cargo metadata` (no compilation), so this job does
     # not install sccache. Clear the checked-in sccache rustc-wrapper
@@ -615,7 +687,8 @@ jobs:
 
   test-vendor-patches:
     name: Vendored Patch Regressions
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -640,7 +713,8 @@ jobs:
 
   build-gateway-binary:
     name: Build Gateway Binary (functional tests)
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch')
     # This binary is also packaged into a distroless Debian 13 image for the
     # Gateway API conformance lab. Pin the build host so its glibc stays no
     # newer than the runtime image glibc.
@@ -675,7 +749,8 @@ jobs:
 
   build-functional-tests-archive:
     name: Build Functional Tests Archive
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -1056,7 +1131,8 @@ jobs:
 
   gateway-api-conformance:
     name: Gateway API Conformance (CI mirror)
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     # Backstop above the in-script poll bounds (discovery <=30 min +
     # status <=140 min) so the graceful "Timed out" branch is reachable and
@@ -1216,7 +1292,8 @@ jobs:
 
   coverage-gate:
     name: Coverage (CI mirror)
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     timeout-minutes: 180
     permissions:
@@ -1542,7 +1619,8 @@ jobs:
   # except when the live suite genuinely runs.
   mesh-e2e-sidecar-live:
     name: Mesh E2E Sidecar Live (CI mirror)
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     # Backstop above the in-script poll bound (~120 min) so the graceful
     # "Timed out" branch is reachable; the dedicated job caps at 90 min plus
@@ -2289,9 +2367,9 @@ jobs:
     name: Tests
     if: always() && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     needs:
+      - ci-plan
       - fmt
       - test-unit
-      - plugin-hardening-unit-regressions
       - test-lib
       - test-secrets
       - test-service-integration
@@ -2322,6 +2400,7 @@ jobs:
       - performance-regression
       - build-binaries
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
 
@@ -2341,6 +2420,9 @@ jobs:
           require_success() {
             local label="$1"
             local result="$2"
+            if [ "$CI_MODE" = "light" ] && [ "$result" = "skipped" ]; then
+              return
+            fi
             if [ "$result" != "success" ]; then
               echo "::error title=Required CI failed::${label} completed with result '${result}'"
               failures=1
@@ -2366,9 +2448,9 @@ jobs:
           echo "| Suite | Result |" >> $GITHUB_STEP_SUMMARY
           echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
 
+          add_row "CI plan (${CI_MODE})" "${{ needs.ci-plan.result }}"
           add_row "Format" "${{ needs.fmt.result }}"
           add_row "Unit" "${{ needs.test-unit.result }}"
-          add_row "Plugin hardening unit regressions" "${{ needs.plugin-hardening-unit-regressions.result }}"
           add_row "Inline lib" "${{ needs.test-lib.result }}"
           add_row "Secret backends" "${{ needs.test-secrets.result }}"
           add_row "Service integration" "${{ needs.test-service-integration.result }}"
@@ -2399,9 +2481,9 @@ jobs:
           add_row "Performance regression" "${{ needs.performance-regression.result }}"
           add_row "Cross-platform binaries" "${{ needs.build-binaries.result }}"
 
+          require_success "CI plan" "${{ needs.ci-plan.result }}"
           require_success "Format" "${{ needs.fmt.result }}"
           require_success "Unit" "${{ needs.test-unit.result }}"
-          require_success "Plugin hardening unit regressions" "${{ needs.plugin-hardening-unit-regressions.result }}"
           require_success "Inline lib" "${{ needs.test-lib.result }}"
           require_success "Secret backends" "${{ needs.test-secrets.result }}"
           require_success "Service integration" "${{ needs.test-service-integration.result }}"
@@ -2435,10 +2517,13 @@ jobs:
           if [ "$failures" -ne 0 ]; then
             exit 1
           fi
+        env:
+          CI_MODE: ${{ needs.ci-plan.outputs.mode }}
 
   lint:
     name: Lint
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -2453,7 +2538,8 @@ jobs:
 
   detect-ebpf-live-changes:
     name: Detect eBPF/Netns Live Changes
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.changes.outputs.changed }}
@@ -2540,7 +2626,8 @@ jobs:
 
   build-ebpf:
     name: Build eBPF Programs
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -2602,7 +2689,8 @@ jobs:
 
   build-ebpf-userspace:
     name: Build eBPF Userspace Loader
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -2872,16 +2960,15 @@ jobs:
 
       - name: Install pinned SPIRE server and agent
         env:
-          SPIRE_VERSION: 1.12.4
+          SPIRE_VERSION: 1.15.2
+          SPIRE_LINUX_AMD64_MUSL_SHA256: 3874d07ffeb6640bafb9fe6a538de06151f155d5ed2f8e8a51f138d2f51b8105
         run: |
           set -euo pipefail
           archive="spire-${SPIRE_VERSION}-linux-amd64-musl.tar.gz"
-          checksum="spire-${SPIRE_VERSION}-linux-amd64-musl_sha256sum.txt"
           base="https://github.com/spiffe/spire/releases/download/v${SPIRE_VERSION}"
           cd "$RUNNER_TEMP"
           curl -fsSLO "$base/$archive"
-          curl -fsSLO "$base/$checksum"
-          sha256sum --check "$checksum"
+          printf '%s  %s\n' "$SPIRE_LINUX_AMD64_MUSL_SHA256" "$archive" | sha256sum --check --strict
           tar -xzf "$archive"
           sudo install -m 0755 "spire-${SPIRE_VERSION}/bin/spire-server" /usr/local/bin/spire-server
           sudo install -m 0755 "spire-${SPIRE_VERSION}/bin/spire-agent" /usr/local/bin/spire-agent
@@ -2946,7 +3033,8 @@ jobs:
 
   performance-regression:
     name: Performance Regression Check
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -3125,7 +3213,8 @@ jobs:
 
   build-binaries:
     name: Build (${{ matrix.asset_name }})
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -3270,7 +3359,12 @@ jobs:
 
       - name: Install cross (Linux ARM64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cargo install cross
+        uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2
+        with:
+          # Preserve the current cross release while downloading its verified
+          # prebuilt binary instead of compiling cross and ~100 crates.
+          tool: cross@0.2.5
+          fallback: none
 
       - name: Build PR verification binary (cross)
         if: matrix.target == 'aarch64-unknown-linux-gnu' && github.event_name == 'pull_request'
