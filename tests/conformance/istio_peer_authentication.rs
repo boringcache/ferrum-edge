@@ -220,6 +220,7 @@ fn peer_auth_port_level_mtls_requires_selector() {
         notes = "Selector-less portLevelMtls entries are carried but ignored during effective-mode resolution.",
     );
     let pa = translate_one(json!({
+        "selector": null,
         "mtls": {"mode": "STRICT"},
         "portLevelMtls": {
             "8080": {"mode": "DISABLE"}

@@ -915,7 +915,10 @@ fn istio_policy_scope(
     selector: Option<&Value>,
 ) -> PolicyScope {
     let is_root_namespace = object.metadata.namespace == options.istio_root_namespace;
-    match selector {
+    // Kubernetes JSON can preserve an explicitly-null optional selector. Istio
+    // treats that the same as an omitted selector; only an actual selector
+    // object (including an explicit empty `{}` selector) creates workload scope.
+    match selector.filter(|selector| !selector.is_null()) {
         Some(selector) => PolicyScope::WorkloadSelector {
             selector: WorkloadSelector {
                 labels: selector_from_istio(Some(selector)),
@@ -5841,6 +5844,45 @@ mod tests {
             mesh.peer_authentications[0].scope,
             Some(PolicyScope::MeshWide)
         ));
+    }
+
+    #[test]
+    fn null_peer_authentication_selector_is_namespace_scoped() {
+        let result = translate_k8s_objects(
+            &[object(
+                "PeerAuthentication",
+                serde_json::json!({
+                    "selector": null,
+                    "mtls": {"mode": "STRICT"},
+                    "portLevelMtls": {
+                        "8080": {"mode": "DISABLE"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let peer_auth = &mesh.peer_authentications[0];
+        assert!(matches!(
+            &peer_auth.scope,
+            Some(PolicyScope::Namespace { namespace }) if namespace == "default"
+        ));
+        assert!(
+            peer_auth.selector.is_none(),
+            "a null selector must not become an empty workload selector"
+        );
+        assert_eq!(
+            crate::modes::mesh::slice::resolve_effective_mtls_mode(
+                std::slice::from_ref(peer_auth),
+                "default",
+                &HashMap::<String, String>::new(),
+                8080,
+            ),
+            MtlsMode::Strict,
+            "portLevelMtls must remain ignored when selector is explicitly null"
+        );
     }
 
     #[test]
