@@ -36847,6 +36847,36 @@ mod tests {
     }
 
     #[test]
+    fn direct_egress_gateway_effective_strict_posture_is_tls_only() {
+        use crate::modes::mesh::config::MtlsMode;
+
+        let tls = crate::tls::temporary_disabled_listener_tls_config()
+            .expect("temporary TLS config for selection test");
+        // EgressGateway PERMISSIVE is escalated while building the listener and
+        // published as the effective STRICT mode in MeshInboundTlsPolicy.
+        let policy = MeshInboundTlsPolicy {
+            default: Some(tls),
+            by_port: HashMap::new(),
+            default_mode: MtlsMode::Strict,
+            modes_by_port: std::collections::BTreeMap::new(),
+            app_port_by_orig_dst_port: std::collections::BTreeMap::new(),
+        };
+
+        let selected = select_mesh_inbound_tls(&policy, None);
+        assert!(selected.tls_config.is_some());
+        assert!(
+            !selected.accepts_plaintext,
+            "the topology-escalated egress posture must never enable direct plaintext demux"
+        );
+        assert!(mesh_inbound_selection_uses_tls(
+            true,
+            selected.accepts_plaintext,
+            false,
+            b'G'
+        ));
+    }
+
+    #[test]
     fn captured_permissive_stream_port_can_reach_plaintext_relay() {
         use crate::modes::mesh::config::MtlsMode;
 
