@@ -424,10 +424,144 @@ fn handle_validation_errors(
 
 #[cfg(test)]
 mod tests {
-    use super::{ValidationAction, ValidationPipeline, handle_validation_errors};
-    use crate::config::types::{GatewayConfig, PluginConfig, PluginScope, default_namespace};
+    use super::{
+        ValidationAction, ValidationPipeline, collect_rejecting_runtime_config_errors,
+        handle_validation_errors,
+    };
+    use crate::config::types::{
+        GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy, default_namespace,
+    };
     use chrono::Utc;
     use serde_json::json;
+
+    fn runtime_proxy(id: &str, listen_path: Option<&str>, backend_scheme: &str) -> Proxy {
+        serde_json::from_value(json!({
+            "id": id,
+            "listen_path": listen_path,
+            "backend_scheme": backend_scheme,
+            "backend_host": "localhost",
+            "backend_port": 3000
+        }))
+        .expect("minimal runtime proxy should deserialize")
+    }
+
+    fn rejecting_errors(mut config: GatewayConfig) -> Vec<String> {
+        config.normalize_fields();
+        config.resolve_upstream_tls();
+        collect_rejecting_runtime_config_errors(&config)
+    }
+
+    fn assert_single_rejecting_error(config: GatewayConfig, expected: &str) {
+        let errors = rejecting_errors(config);
+        assert_eq!(errors.len(), 1, "expected one rejecting error: {errors:?}");
+        assert!(errors[0].contains(expected), "unexpected error: {errors:?}");
+    }
+
+    #[test]
+    fn rejecting_runtime_contract_accepts_valid_config() {
+        let config = GatewayConfig {
+            proxies: vec![runtime_proxy("valid", Some("/valid"), "http")],
+            ..Default::default()
+        };
+
+        assert!(rejecting_errors(config).is_empty());
+    }
+
+    #[test]
+    fn rejecting_runtime_contract_includes_regex_listen_paths() {
+        let config = GatewayConfig {
+            proxies: vec![runtime_proxy("bad-regex", Some("~(invalid[regex"), "http")],
+            ..Default::default()
+        };
+
+        assert_single_rejecting_error(config, "invalid regex listen_path");
+    }
+
+    #[test]
+    fn rejecting_runtime_contract_includes_encoded_slashes() {
+        let config = GatewayConfig {
+            proxies: vec![runtime_proxy("encoded-slash", Some("/api%2Fadmin"), "http")],
+            ..Default::default()
+        };
+
+        assert_single_rejecting_error(config, "encoded slashes");
+    }
+
+    #[test]
+    fn rejecting_runtime_contract_includes_duplicate_listen_paths() {
+        let config = GatewayConfig {
+            proxies: vec![
+                runtime_proxy("duplicate-a", Some("/duplicate"), "http"),
+                runtime_proxy("duplicate-b", Some("/duplicate"), "http"),
+            ],
+            ..Default::default()
+        };
+
+        assert_single_rejecting_error(config, "Duplicate listen_path '/duplicate'");
+    }
+
+    #[test]
+    fn rejecting_runtime_contract_includes_stream_proxy_shapes() {
+        let config = GatewayConfig {
+            proxies: vec![runtime_proxy("missing-port", None, "tcp")],
+            ..Default::default()
+        };
+
+        assert_single_rejecting_error(config, "must have a listen_port");
+    }
+
+    #[test]
+    fn rejecting_runtime_contract_includes_dangling_upstream_references() {
+        let mut proxy = runtime_proxy("dangling-upstream", Some("/upstream"), "http");
+        proxy.upstream_id = Some("missing-upstream".to_string());
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            ..Default::default()
+        };
+
+        assert_single_rejecting_error(config, "non-existent upstream_id 'missing-upstream'");
+    }
+
+    #[test]
+    fn rejecting_runtime_contract_includes_invalid_plugin_references() {
+        let mut proxy = runtime_proxy("dangling-plugin", Some("/plugin"), "http");
+        proxy.plugins = vec![PluginAssociation {
+            plugin_config_id: "missing-plugin".to_string(),
+        }];
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            ..Default::default()
+        };
+
+        assert_single_rejecting_error(config, "non-existent plugin_config 'missing-plugin'");
+    }
+
+    #[test]
+    fn rejecting_runtime_contract_includes_mesh_dispatch_upstream_references() {
+        let config = GatewayConfig {
+            plugin_configs: vec![PluginConfig {
+                id: "mesh-dispatch".to_string(),
+                namespace: default_namespace(),
+                plugin_name: "mesh_route_dispatch".to_string(),
+                config: json!({
+                    "rules": [{
+                        "match": {"methods": ["GET"]},
+                        "destination": {"upstream_id": "missing-mesh-upstream"}
+                    }]
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+            ..Default::default()
+        };
+
+        assert_single_rejecting_error(config, "upstream_id 'missing-mesh-upstream'");
+    }
 
     #[test]
     fn collect_action_accumulates_errors() {
