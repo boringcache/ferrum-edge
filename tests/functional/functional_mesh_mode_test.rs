@@ -3829,43 +3829,39 @@ fn is_authoritative_cross_cluster_grpc_rejection(response: &GrpcEgressResponse) 
         && response.body.is_empty()
 }
 
-/// A gRPC route-miss from the source gateway before its outbound slice
-/// materializes: `normalize_reject_response(NOT_FOUND, grpc=true)` yields a
-/// Trailers-Only `grpc-status: 5` (NOT_FOUND) with no backend body. This is a
-/// convergence artifact — the mesh-mTLS rejection instead carries `grpc-status:
-/// 14` — so it is transient, never the authoritative answer.
+/// A cross-cluster gRPC route-miss emitted by the source gateway before its
+/// outbound slice materializes. Two shapes qualify: the
+/// `normalize_reject_response(NOT_FOUND, grpc=true)` Trailers-Only `grpc-status:
+/// 5` (NOT_FOUND) with no backend body, or a bare HTTP route-miss /
+/// upstream-overflow status (`404`/`503`/`502`) carrying NO gRPC trailers —
+/// symmetric with [`classify_cross_cluster_http`]'s transient 404/503/bare-502
+/// set. Any response that reached the routed / backend layer always carries a
+/// `grpc-status` (the mesh-mTLS rejection uses `grpc-status: 14`; a backend
+/// reply uses `grpc-status: 0`), so a genuinely routed-but-wrong result is never
+/// classified as a route-miss and is asserted immediately instead of retried.
 fn cross_cluster_grpc_is_route_miss(response: &GrpcEgressResponse) -> bool {
-    response.status == 200
-        && response
-            .headers
-            .get("grpc-status")
-            .or_else(|| response.trailers.get("grpc-status"))
-            .map(String::as_str)
-            == Some("5")
-        && response.body.is_empty()
+    let grpc_status = response
+        .headers
+        .get("grpc-status")
+        .or_else(|| response.trailers.get("grpc-status"))
+        .map(String::as_str);
+    if response.status == 200 && grpc_status == Some("5") && response.body.is_empty() {
+        return true;
+    }
+    matches!(response.status, 404 | 502 | 503) && grpc_status.is_none()
 }
 
-/// A cross-cluster gRPC backend success: HTTP 200 with either a `grpc-status: 0`
-/// trailer or the echoed request payload in the DATA frames.
-fn cross_cluster_grpc_is_backend_success(
-    response: &GrpcEgressResponse,
-    framed_body: &[u8],
-) -> bool {
-    response.status == 200
-        && (response.trailers.get("grpc-status").map(String::as_str) == Some("0")
-            || response
-                .body
-                .windows(framed_body.len())
-                .any(|window| window == framed_body))
-}
-
-/// gRPC counterpart of [`wait_for_authoritative_cross_cluster_http`]. The two
-/// authoritative outcomes are a backend success and the mesh-mTLS Trailers-Only
-/// UNAVAILABLE rejection; everything else (a NOT_FOUND route-miss or connection
-/// error while A's outbound slice materializes) is transient. The FIRST
-/// authoritative response is returned so the caller asserts it strictly, exactly
-/// once. Serves both the positive (asserts success) and negative (asserts the
-/// rejection) arms, preserving the round-1 negative signature.
+/// gRPC counterpart of [`wait_for_authoritative_cross_cluster_http`]. Retries
+/// ONLY the source gateway's route-miss shapes (see
+/// [`cross_cluster_grpc_is_route_miss`]) and connection/setup errors while A's
+/// outbound slice materializes. EVERY response that reached the routed / backend
+/// layer — the mesh-mTLS Trailers-Only UNAVAILABLE rejection, a backend success,
+/// or a genuinely routed-but-wrong result (an unexpected `grpc-status`, a 5xx, a
+/// missing trailer set) — is authoritative and returned so the caller asserts it
+/// strictly, exactly once. A real regression therefore fails loudly instead of
+/// being retried away into a timeout. Serves both the positive (asserts success)
+/// and negative (asserts the rejection) arms, preserving the round-1 negative
+/// signature.
 async fn wait_for_authoritative_cross_cluster_grpc(
     outbound_port: u16,
     framed_body: &[u8],
@@ -3881,13 +3877,10 @@ async fn wait_for_authoritative_cross_cluster_grpc(
         )
         .await
         {
-            Ok(response)
-                if is_authoritative_cross_cluster_grpc_rejection(&response)
-                    || cross_cluster_grpc_is_backend_success(&response, framed_body) =>
-            {
-                return Ok(response);
+            Ok(response) if cross_cluster_grpc_is_route_miss(&response) => {
+                format!("route not converged: {response:?}")
             }
-            Ok(response) => format!("route not converged: {response:?}"),
+            Ok(response) => return Ok(response),
             Err(error) => format!("request error: {error}"),
         };
 
@@ -3901,17 +3894,28 @@ async fn wait_for_authoritative_cross_cluster_grpc(
     }
 }
 
-fn is_cross_cluster_websocket_bad_gateway(error: &str) -> bool {
-    error.contains("HTTP error: 502") || error.contains("HTTP status 502")
+/// The live cross-cluster WebSocket route's authoritative mesh-mTLS rejection: a
+/// `502` upgrade failure whose body carries the HBONE/mTLS handshake-failure
+/// marker ([`CROSS_CLUSTER_TLS_REJECTION_BODY`]). Symmetric with
+/// [`classify_cross_cluster_http`], which likewise treats only a `502` carrying
+/// that body as authoritative — a BARE `502` (status without the marker body, or
+/// any other status) surfaced while gateway A's outbound route is still
+/// converging is transient and must be retried, not asserted. The body reaches
+/// this classifier because [`format_ws_handshake_error`] preserves it from the
+/// tungstenite `Http` error.
+fn is_authoritative_cross_cluster_ws_rejection(error: &str) -> bool {
+    (error.contains("HTTP error: 502") || error.contains("HTTP status 502"))
+        && error.contains(CROSS_CLUSTER_TLS_REJECTION_BODY)
 }
 
 /// Poll a cross-cluster WebSocket upgrade past A's route-apply window. A
 /// completed upgrade (`Ok`) and the live route's authoritative 502 backend-dial
 /// rejection are both returned immediately (the 502 as an `Err` carrying
 /// [`CROSS_CLUSTER_WS_REJECTION_MARKER`]); only route-miss / transient upgrade
-/// failures are retried. The FIRST authoritative outcome therefore cannot be
-/// retried away, so the positive arm fails loudly on an unexpected rejection and
-/// the negative arm fails loudly on an unexpected success.
+/// failures — including a BARE 502 emitted while the route materializes — are
+/// retried. The FIRST authoritative outcome therefore cannot be retried away, so
+/// the positive arm fails loudly on an unexpected rejection and the negative arm
+/// fails loudly on an unexpected success.
 async fn wait_for_authoritative_cross_cluster_ws(
     outbound_port: u16,
     payload: &str,
@@ -3938,7 +3942,7 @@ async fn wait_for_authoritative_cross_cluster_ws_path(
         .await
         {
             Ok(reply) => return Ok(reply),
-            Err(error) if is_cross_cluster_websocket_bad_gateway(&error) => {
+            Err(error) if is_authoritative_cross_cluster_ws_rejection(&error) => {
                 return Err(format!("{CROSS_CLUSTER_WS_REJECTION_MARKER}: {error}"));
             }
             Err(error) => error,
@@ -6635,6 +6639,28 @@ async fn mesh_websocket_echo_roundtrip_path(
     .await
 }
 
+/// Render a tungstenite handshake failure into a diagnostic string that, for an
+/// HTTP error response, INCLUDES the response body. `tokio_tungstenite`'s
+/// `Display` surfaces only the status line, dropping the JSON body that
+/// distinguishes the live route's authoritative mesh-mTLS rejection
+/// ([`CROSS_CLUSTER_TLS_REJECTION_BODY`]) from a bare setup `502`. Preserving the
+/// body lets the WS classifier stay symmetric with the HTTP one.
+fn format_ws_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> String {
+    use tokio_tungstenite::tungstenite::Error;
+    match error {
+        Error::Http(response) => {
+            let status = response.status();
+            let body = response
+                .body()
+                .as_ref()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_default();
+            format!("websocket handshake failed: HTTP status {status}; body: {body:?}")
+        }
+        other => format!("websocket handshake failed: {other}"),
+    }
+}
+
 async fn mesh_websocket_echo_roundtrip_to(
     address: SocketAddr,
     host: &str,
@@ -6666,7 +6692,7 @@ async fn mesh_websocket_echo_roundtrip_to(
     )
     .await
     .map_err(|_| "websocket handshake timed out".to_string())?
-    .map_err(|e| format!("websocket handshake failed: {e}"))?;
+    .map_err(format_ws_handshake_error)?;
 
     ws.send(Message::Text(payload.to_string().into()))
         .await
