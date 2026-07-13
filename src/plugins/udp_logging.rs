@@ -27,7 +27,9 @@ use tokio::net::UdpSocket;
 use tokio::time::Instant;
 use tracing::warn;
 
-use super::utils::log_schema::{SummaryLogEntryBatchView, SummarySchema, resolve_schema};
+use super::utils::log_schema::{
+    SchemaCapabilities, SummaryLogEntryBatchView, SummarySchema, resolve_schema,
+};
 use super::utils::{
     BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry,
     UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, parse_socket_host,
@@ -114,7 +116,7 @@ impl UdpLogging {
         };
         validate_batch_config(config, "udp_logging", batch_defaults)?;
 
-        let schema = resolve_schema(config, "udp_logging")?;
+        let schema = resolve_schema(config, "udp_logging", SchemaCapabilities::BASE)?;
         let flush_config = UdpFlushConfig {
             host: host.clone(),
             port: port as u16,

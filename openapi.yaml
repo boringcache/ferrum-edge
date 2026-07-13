@@ -9513,7 +9513,9 @@ components:
                   `response_status_code` (stream: `"none"`).
                   `backend_host`: hostname from `backend_target`
                   (port stripped, IPv6 brackets honored).
-                  `summary_kind`: `"http"` or `"stream"`.
+                  `summary_kind`: `"http"`, `"stream"`, or
+                  `"websocket_disconnect"` (the last only for `ws_logging`
+                  WebSocket disconnect entries).
                   `outcome`: `"ok"` / `"error"`.
         metadata:
           type: object
@@ -9872,9 +9874,15 @@ components:
           type: string
           description: >-
             Name of a schema registered by a `transaction_log_schema` plugin.
-            Mutually exclusive with `schema`. Note: WebSocket disconnect
-            entries are emitted in their native format regardless of schema
-            in v1. See docs/log_schema.md.
+            Mutually exclusive with `schema`. WebSocket disconnect entries are
+            serialized through the schema as well (`rename`, `omit`, `order`,
+            `static_fields`, `derived_fields`, and `metadata` all apply). Because
+            `ws_logging` opts into the WebSocket-disconnect capability, the
+            named schema is recompiled under that capability at resolve time, so
+            the WebSocket-disconnect native fields (`event`,
+            `frames_client_to_backend`, `frames_backend_to_client`, `direction`,
+            `io_side`, …) are available in addition to the shared HTTP fields.
+            See docs/log_schema.md.
 
     LokiLoggingConfig:
       type: object

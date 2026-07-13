@@ -740,7 +740,7 @@ site behind a schema branch:
 ```rust
 use std::sync::Arc;
 use crate::plugins::utils::log_schema::{
-    SchemaView, SummarySchema, resolve_schema,
+    SchemaCapabilities, SchemaView, SummarySchema, resolve_schema,
 };
 
 pub struct MyLogger {
@@ -750,7 +750,11 @@ pub struct MyLogger {
 
 impl MyLogger {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let schema = resolve_schema(config, "my_logger")?;
+        // Pass `SchemaCapabilities::BASE` for HTTP / stream logging. Only the
+        // built-in `ws_logging` plugin passes `SchemaCapabilities::WS_LOGGING`
+        // to opt into the WebSocket-disconnect native fields. The capability is
+        // honored for both inline `schema:` and `schema_ref:`.
+        let schema = resolve_schema(config, "my_logger", SchemaCapabilities::BASE)?;
         Ok(Self { schema /*, ... */ })
     }
 }
