@@ -5096,12 +5096,13 @@ impl DatabaseStore {
 
         let new_pool = self.build_pool_options().connect(&final_url).await?;
 
-        // Disable the configured primary-topology replica before exposing a
-        // failover pool. On failback, keep admin reads on the new primary pool
-        // until deferred migrations have also completed, then re-enable the
-        // already-connected replica snapshot below.
+        // Disable and close the configured primary-topology replica before
+        // exposing a failover pool. Keeping the dormant pool would make it
+        // look immediately available on failback and skip the one reconnect
+        // that refreshes its connections after the topology transition.
         if topology == DatabaseTopology::Failover {
             self.primary_topology_active.store(false, Ordering::Release);
+            self.suppress_read_replica_pool();
         }
 
         // Atomic swap — readers that already loaded the old pool keep using it.
@@ -5226,6 +5227,13 @@ impl DatabaseStore {
         sqlx::any::install_default_drivers();
         self.read_replica_url = Some(replica_url.to_string());
 
+        if !self.primary_topology_active.load(Ordering::Acquire) {
+            info!(
+                "Read replica configured but connection deferred while the database is failed over"
+            );
+            return Ok(());
+        }
+
         let final_url = Self::append_connect_timeout(
             replica_url,
             &self.db_type,
@@ -5303,6 +5311,21 @@ impl DatabaseStore {
         }
     }
 
+    /// Remove the primary-topology replica pool while failover is active.
+    /// The configured URL remains recorded so the scheduler reconnects it
+    /// once after primary failback makes the replica eligible again.
+    fn suppress_read_replica_pool(&self) {
+        let old_pool = self.read_replica_pool.swap(None);
+        if let Some(pool) = old_pool {
+            info!(
+                "Read replica pool suppressed while the database is failed over; it will reconnect after primary failback"
+            );
+            tokio::spawn(async move {
+                pool.close().await;
+            });
+        }
+    }
+
     /// Atomically replace the read replica pool with a freshly connected one.
     ///
     /// Called by the DB polling loop when DnsCache detects that the read
@@ -5310,6 +5333,11 @@ impl DatabaseStore {
     /// watcher, and after startup if the initial replica connection failed.
     pub async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
+
+        if !self.primary_topology_active.load(Ordering::Acquire) {
+            debug!("Read replica reconnect deferred while the database is failed over");
+            return Ok(());
+        }
 
         let final_url = Self::append_connect_timeout(
             replica_url,
@@ -5325,7 +5353,40 @@ impl DatabaseStore {
         let new_pool = self.build_pool_options().connect(&final_url).await?;
         sqlx::query("SELECT 1").fetch_one(&new_pool).await?;
 
+        // Failover may have started while the connection was opening. Do not
+        // publish a replica pool that admin reads must suppress; closing it
+        // leaves the post-failback scheduler responsible for one fresh retry.
+        if !self.primary_topology_active.load(Ordering::Acquire) {
+            new_pool.close().await;
+            debug!(
+                "Discarded read replica reconnect because the database failed over while it was opening"
+            );
+            return Ok(());
+        }
+
         let old_pool = self.read_replica_pool.swap(Some(Arc::new(new_pool)));
+
+        // Close the remaining race between the check above and publication:
+        // if failover flipped the topology and ran its first suppression just
+        // before this swap, remove the newly-published pool ourselves.
+        if !self.primary_topology_active.load(Ordering::Acquire) {
+            let raced_pool = self.read_replica_pool.swap(None);
+            if let Some(pool) = raced_pool {
+                tokio::spawn(async move {
+                    pool.close().await;
+                });
+            }
+            if let Some(pool) = old_pool {
+                tokio::spawn(async move {
+                    pool.close().await;
+                });
+            }
+            debug!(
+                "Discarded read replica reconnect because the database failed over while it was being published"
+            );
+            return Ok(());
+        }
+
         info!(
             "Read replica restored for admin reads (db_type={}). Old pool closing in background.",
             self.db_type,

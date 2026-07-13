@@ -3945,7 +3945,7 @@ impl EnvConfig {
     /// portion is inspected, so no credential/authority material is retained.
     fn mongodb_uri_tls_query_params(base_url: &str) -> Vec<String> {
         let tls_param_names = Self::db_tls_url_param_names("mongodb");
-        let Some((_, query)) = base_url.split_once('?') else {
+        let Some((_, query)) = base_url.rsplit_once('?') else {
             return Vec::new();
         };
         // Strip any fragment and split on the `&`/`;` option separators that
@@ -3953,15 +3953,10 @@ impl EnvConfig {
         let query = query.split('#').next().unwrap_or(query);
         let mut existing = Vec::new();
         for pair in query.split(|c: char| c == '&' || c == ';') {
-            if pair.is_empty() {
+            let Some((name, _)) = url::form_urlencoded::parse(pair.as_bytes()).next() else {
                 continue;
-            }
-            let name = pair
-                .split('=')
-                .next()
-                .unwrap_or(pair)
-                .trim()
-                .to_ascii_lowercase();
+            };
+            let name = name.trim().to_ascii_lowercase();
             if tls_param_names.iter().any(|known| name == *known) && !existing.contains(&name) {
                 existing.push(name);
             }

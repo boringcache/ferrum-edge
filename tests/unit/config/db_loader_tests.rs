@@ -509,7 +509,8 @@ async fn transient_connectivity_failure_stays_backup_eligible() {
 async fn read_replica_scheduling_state_tracks_failover_and_failback() {
     // Pin the exact flags the poll scheduler branches on: while failed over the
     // replica is suppressed (not broken) so no reconnect is scheduled; after
-    // failback it is eligible again.
+    // failback it becomes unavailable-but-eligible, prompting exactly one
+    // reconnect before subsequent cycles observe it as healthy.
     let temp_dir = tempfile::TempDir::new().unwrap();
     let primary_path = temp_dir.path().join("primary.db");
     let failover_path = temp_dir.path().join("failover.db");
@@ -541,7 +542,12 @@ async fn read_replica_scheduling_state_tracks_failover_and_failback() {
     let active_url = store.try_failover_reconnect(&primary_rw_url).await.unwrap();
     assert_eq!(active_url, primary_rw_url);
 
-    // Back on primary: the replica is eligible again and no longer suppressed.
+    // Back on primary: the dormant failover-era pool was discarded. The
+    // scheduler now sees one unavailable-but-eligible replica and reconnects
+    // it; after that, later cycles see it as available and do not retry.
+    assert!(!store.read_replica_available());
+    assert!(!store.read_replica_suppressed());
+    store.reconnect_read_replica(&replica_url).await.unwrap();
     assert!(store.read_replica_available());
     assert!(!store.read_replica_suppressed());
 }
@@ -583,6 +589,11 @@ async fn read_replica_tracks_primary_topology_across_failover_and_failback() {
     seed_sqlite_namespace(&primary_create_url, "primary-ns").await;
     let active_url = store.try_failover_reconnect(&primary_rw_url).await.unwrap();
     assert_eq!(active_url, primary_rw_url);
+    assert!(
+        !store.read_replica_available(),
+        "failback should require one fresh replica reconnect"
+    );
+    store.reconnect_read_replica(&replica_url).await.unwrap();
     assert_eq!(
         store.list_namespaces().await.unwrap(),
         vec!["replica-ns".to_string()],

@@ -733,6 +733,9 @@ pub async fn run(
 
             if let Some(ref replica_url) = effective_replica_url {
                 match store.connect_read_replica(replica_url).await {
+                    Ok(()) if store.read_replica_suppressed() => {
+                        info!("Read replica configured but suppressed until primary failback")
+                    }
                     Ok(()) => info!("Read replica connected for admin reads"),
                     Err(e) => {
                         let safe_error = db_backend::redact_error_text(&e, &[replica_url]);
