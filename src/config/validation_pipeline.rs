@@ -6,7 +6,6 @@ pub(crate) enum ValidationAction<'a> {
     Collect,
     Warn,
     FatalCount(&'a str),
-    FatalStatic(&'a str),
 }
 
 enum ValidationStep<'a> {
@@ -71,6 +70,39 @@ enum ValidationStep<'a> {
 pub(crate) struct ValidationPipeline<'a> {
     config: &'a mut GatewayConfig,
     steps: Vec<ValidationStep<'a>>,
+}
+
+/// Collect the rejecting runtime-config validation contract shared by
+/// database full loads and CP incremental updates.
+///
+/// Warning-only validation (for example certificate paths and consumer
+/// identity collisions) remains mode-specific and is intentionally excluded.
+pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    if let Err(found) = config.validate_regex_listen_paths() {
+        errors.extend(found);
+    }
+    if let Err(found) = config.validate_listen_path_encodings() {
+        errors.extend(found);
+    }
+    if let Err(found) = config.validate_unique_listen_paths() {
+        errors.extend(found);
+    }
+    if let Err(found) = config.validate_stream_proxies() {
+        errors.extend(found);
+    }
+    if let Err(found) = config.validate_upstream_references() {
+        errors.extend(found);
+    }
+    if let Err(found) = config.validate_plugin_references() {
+        errors.extend(found);
+    }
+    if let Err(found) = crate::proxy::validate_mesh_route_dispatch_upstream_references(config) {
+        errors.extend(found);
+    }
+
+    errors
 }
 
 impl<'a> ValidationPipeline<'a> {
@@ -216,7 +248,7 @@ impl<'a> ValidationPipeline<'a> {
     /// Execute each validation step in insertion order.
     ///
     /// `Collect` steps append into the returned vector until a fatal action
-    /// (`FatalCount` or `FatalStatic`) fires. At that point the pipeline bails
+    /// (`FatalCount`) fires. At that point the pipeline bails
     /// immediately and any previously collected warnings/errors are discarded in
     /// favor of the fatal summary, matching the original call-site behavior.
     pub(crate) fn run(self) -> Result<Vec<String>, anyhow::Error> {
@@ -387,12 +419,6 @@ fn handle_validation_errors(
             let summary = template.replacen("{}", &errors.len().to_string(), 1);
             anyhow::bail!(summary);
         }
-        ValidationAction::FatalStatic(summary) => {
-            for message in &errors {
-                error!("{}", message);
-            }
-            anyhow::bail!(summary.to_string());
-        }
     }
 }
 
@@ -447,21 +473,6 @@ mod tests {
     }
 
     #[test]
-    fn fatal_static_action_returns_verbatim_summary() {
-        let mut collected = Vec::new();
-
-        let err = handle_validation_errors(
-            ValidationAction::FatalStatic("Static summary"),
-            vec!["a".to_string()],
-            &mut collected,
-        )
-        .unwrap_err();
-
-        assert_eq!(err.to_string(), "Static summary");
-        assert!(collected.is_empty());
-    }
-
-    #[test]
     fn empty_error_list_is_a_noop_for_all_actions() {
         let mut collected = vec!["existing".to_string()];
 
@@ -473,13 +484,6 @@ mod tests {
             &mut collected,
         )
         .unwrap();
-        handle_validation_errors(
-            ValidationAction::FatalStatic("unused"),
-            Vec::new(),
-            &mut collected,
-        )
-        .unwrap();
-
         assert_eq!(collected, vec!["existing"]);
     }
 

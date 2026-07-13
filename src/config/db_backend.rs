@@ -150,6 +150,147 @@ pub struct DbPoolStatsInner {
     pub active: u32,
 }
 
+/// Atomicity mode used by a namespace-wide resource clear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteMode {
+    Atomic,
+    NonAtomic,
+}
+
+/// Authoritative resource counts used to resolve an ambiguous atomic clear.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NamespaceResourceCounts {
+    pub proxies: u64,
+    pub consumers: u64,
+    pub plugin_configs: u64,
+    pub upstreams: u64,
+    pub api_specs: u64,
+}
+
+impl NamespaceResourceCounts {
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicClearVerification {
+    ClearCommitted,
+    PriorConfigIntact,
+    UnknownOutcome,
+}
+
+pub fn classify_atomic_clear_verification<E>(
+    prior: NamespaceResourceCounts,
+    verification: Result<NamespaceResourceCounts, E>,
+) -> AtomicClearVerification {
+    match verification {
+        Ok(post_clear) if post_clear == prior => AtomicClearVerification::PriorConfigIntact,
+        Ok(post_clear) if post_clear.is_empty() => AtomicClearVerification::ClearCommitted,
+        Ok(_) | Err(_) => AtomicClearVerification::UnknownOutcome,
+    }
+}
+
+/// A row/document that exists but cannot be decoded into its resource type.
+///
+/// The display text is intentionally safe for admin responses: it identifies
+/// the resource without including serialized row contents or credential data.
+#[derive(Debug)]
+pub struct SnapshotDataIntegrityError {
+    resource_type: &'static str,
+    resource_id: Option<String>,
+    source: anyhow::Error,
+}
+
+impl SnapshotDataIntegrityError {
+    pub fn new(
+        resource_type: &'static str,
+        resource_id: Option<String>,
+        source: anyhow::Error,
+    ) -> Self {
+        Self {
+            resource_type,
+            resource_id,
+            source,
+        }
+    }
+}
+
+impl std::fmt::Display for SnapshotDataIntegrityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.resource_id.as_deref() {
+            Some(id) => write!(
+                formatter,
+                "data-integrity failure decoding {} resource '{}'",
+                self.resource_type, id
+            ),
+            None => write!(
+                formatter,
+                "data-integrity failure decoding {} resource (id unavailable)",
+                self.resource_type
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotDataIntegrityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+impl DeleteMode {
+    pub fn is_atomic(self) -> bool {
+        matches!(self, Self::Atomic)
+    }
+}
+
+/// A failed namespace clear, coupled to the exact mode that executed it.
+#[derive(Debug)]
+pub struct DeleteAllResourcesError {
+    mode: DeleteMode,
+    unknown_commit_result: bool,
+    source: anyhow::Error,
+}
+
+impl DeleteAllResourcesError {
+    pub fn new(mode: DeleteMode, source: anyhow::Error) -> Self {
+        Self {
+            mode,
+            unknown_commit_result: false,
+            source,
+        }
+    }
+
+    pub fn with_unknown_commit_result(mode: DeleteMode, source: anyhow::Error) -> Self {
+        Self {
+            mode,
+            unknown_commit_result: true,
+            source,
+        }
+    }
+
+    pub fn mode(&self) -> DeleteMode {
+        self.mode
+    }
+
+    pub fn has_unknown_commit_result(&self) -> bool {
+        self.unknown_commit_result
+    }
+}
+
+impl std::fmt::Display for DeleteAllResourcesError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for DeleteAllResourcesError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Unified database backend trait.
 ///
 /// This trait defines all operations needed by the admin API, operating modes,
@@ -212,6 +353,36 @@ pub trait DatabaseBackend: Send + Sync {
 
     /// Load the full gateway configuration from the database.
     async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error>;
+
+    /// Load a namespace's resources for a rollback snapshot WITHOUT running the
+    /// semantic validation pipeline that [`load_full_config`](Self::load_full_config)
+    /// applies.
+    ///
+    /// Restore captures the prior state with this before its destructive clear.
+    /// A rollback snapshot only needs the current rows in order to restore them,
+    /// not validation — so an *invalid-but-present* config (exactly what an
+    /// operator runs restore to *repair*) is still captured, keeping rollback
+    /// available during the repair. A genuine connectivity/timeout failure, by
+    /// contrast, surfaces as `Err`, letting the caller ABORT the destructive
+    /// restore instead of wiping a config that was merely transiently
+    /// unreachable.
+    ///
+    /// Reads MUST come from the authoritative primary — a rollback snapshot must
+    /// never be built from a possibly-stale read replica. `api_spec_id` ownership
+    /// tags are cleared (mirroring `load_full_config`): a rollback re-applies the
+    /// config resources as hand-managed, and the `api_specs` rows themselves are
+    /// captured separately by the caller.
+    async fn load_namespace_snapshot(
+        &self,
+        namespace: &str,
+    ) -> Result<GatewayConfig, anyhow::Error>;
+
+    /// Count namespace resources on the authoritative primary without
+    /// deserializing rows/documents.
+    async fn count_namespace_resources(
+        &self,
+        namespace: &str,
+    ) -> Result<NamespaceResourceCounts, anyhow::Error>;
 
     // -----------------------------------------------------------------------
     // Incremental polling
@@ -412,7 +583,21 @@ pub trait DatabaseBackend: Send + Sync {
         configs: &[PluginConfig],
     ) -> Result<usize, anyhow::Error>;
     async fn batch_create_upstreams(&self, upstreams: &[Upstream]) -> Result<usize, anyhow::Error>;
-    async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error>;
+    /// Clear all resources in a namespace and report the mode that actually ran.
+    ///
+    /// SQL backends run the clear inside a single transaction, so a failure
+    /// commits nothing and leaves the prior config fully intact. A replica-set
+    /// MongoDB deployment likewise runs it in a transaction. Standalone MongoDB
+    /// has no multi-document transactions, so it deletes collections one-by-one
+    /// and a mid-clear failure can leave a partially-cleared namespace.
+    ///
+    /// Failures carry the same mode captured by the operation before it starts,
+    /// so a MongoDB reconnect cannot make the caller classify the clear against
+    /// a different topology than the one whose branch actually executed.
+    async fn delete_all_resources(
+        &self,
+        namespace: &str,
+    ) -> Result<DeleteMode, DeleteAllResourcesError>;
 
     // -----------------------------------------------------------------------
     // Connection lifecycle (called from polling loops)
@@ -553,6 +738,11 @@ pub trait DatabaseBackend: Send + Sync {
         namespace: &str,
         filter: &ApiSpecListFilter,
     ) -> Result<PaginatedResult<ApiSpec>, anyhow::Error>;
+
+    /// Count ApiSpecs in a namespace using the authoritative primary read path.
+    ///
+    /// This count-only operation must not fetch or deserialize item metadata.
+    async fn count_api_specs(&self, namespace: &str) -> Result<u64, anyhow::Error>;
 
     /// Delete an ApiSpec and all resources it owns.
     ///

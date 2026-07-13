@@ -9581,12 +9581,21 @@ async fn serve_mesh_runtime(
         mesh_state.record_applied_slice(slice);
     }
     let startup_ready = Arc::new(AtomicBool::new(false));
-    let admin_handles = start_mesh_admin_listeners(
+    let serving_degraded = Arc::new(AtomicBool::new(false));
+    let serving_listener_failures = Arc::new(crate::startup::ServingListenerFailures::default());
+    let MeshAdminListeners {
+        handles: admin_handles,
+        startup_signals: admin_startup_signals,
+    } = start_mesh_admin_listeners(
         &env_config,
         &shutdown_tx,
         proxy_state.clone(),
         mesh_state.clone(),
-        startup_ready.clone(),
+        MeshServingSignals {
+            startup_ready: startup_ready.clone(),
+            serving_degraded: serving_degraded.clone(),
+            listener_failures: serving_listener_failures.clone(),
+        },
         &tls_policy,
         &crls,
     )?;
@@ -10094,7 +10103,10 @@ async fn serve_mesh_runtime(
         "Mesh listener plan prepared"
     );
     let mut listener_handles = Vec::new();
-    let mut startup_signals = Vec::new();
+    // Admin listeners are startup-critical in mesh mode just like traffic
+    // listeners. Keeping their bind signals in the same gate ensures a failed
+    // admin bind cannot be hidden by the unconditional readiness store below.
+    let mut startup_signals = admin_startup_signals;
     for listener in runtime.listener_plan() {
         let uses_mesh_inbound_tls = matches!(
             listener.kind,
@@ -10125,12 +10137,16 @@ async fn serve_mesh_runtime(
             );
         }
 
-        let label = format!("{:?} mesh listener", listener.direction);
+        let label = format!("{:?} {:?} mesh listener", listener.direction, listener.kind);
         let state = proxy_state.clone();
         let shutdown = shutdown_tx.subscribe();
         let addr = listener.addr;
         let direction = listener.direction;
         let kind = listener.kind;
+        let listener_startup_ready = startup_ready.clone();
+        let listener_serving_degraded = serving_degraded.clone();
+        let listener_failures = serving_listener_failures.clone();
+        let failure_label = label.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
             info!(
@@ -10184,12 +10200,13 @@ async fn serve_mesh_runtime(
                 .await
             };
             if let Err(e) = listener_result {
-                error!(
-                    direction = ?direction,
-                    kind = ?kind,
-                    addr = %addr,
-                    "Mesh listener error: {}",
-                    e
+                crate::startup::record_post_start_listener_failure(
+                    &listener_startup_ready,
+                    &listener_serving_degraded,
+                    &listener_failures,
+                    &failure_label,
+                    addr.port(),
+                    &e,
                 );
             }
         });
@@ -10267,15 +10284,34 @@ async fn serve_mesh_runtime(
     Ok(())
 }
 
+struct MeshAdminListeners {
+    handles: Vec<JoinHandle<()>>,
+    startup_signals: Vec<(String, tokio::sync::oneshot::Receiver<()>)>,
+}
+
+/// Shared readiness/degradation handles threaded from `serve_mesh_runtime`
+/// into the admin listeners so post-startup listener failures flip the same
+/// sticky serving state the traffic listeners use.
+struct MeshServingSignals {
+    startup_ready: Arc<AtomicBool>,
+    serving_degraded: Arc<AtomicBool>,
+    listener_failures: Arc<crate::startup::ServingListenerFailures>,
+}
+
 fn start_mesh_admin_listeners(
     env_config: &EnvConfig,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     proxy_state: ProxyState,
     mesh_state: MeshRuntimeState,
-    startup_ready: Arc<AtomicBool>,
+    serving_signals: MeshServingSignals,
     tls_policy: &TlsPolicy,
     crls: &tls::CrlList,
-) -> Result<Vec<JoinHandle<()>>, anyhow::Error> {
+) -> Result<MeshAdminListeners, anyhow::Error> {
+    let MeshServingSignals {
+        startup_ready,
+        serving_degraded,
+        listener_failures: serving_listener_failures,
+    } = serving_signals;
     let admin_allowed_cidrs = Arc::new(
         crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
             .map_err(|err| anyhow::anyhow!("Invalid FERRUM_ADMIN_ALLOWED_CIDRS: {err}"))?,
@@ -10306,7 +10342,9 @@ fn start_mesh_admin_listeners(
         mode: "mesh".to_string(),
         read_only: true,
         admin_audit_enabled: env_config.admin_audit_enabled,
-        startup_ready: Some(startup_ready),
+        startup_ready: Some(startup_ready.clone()),
+        serving_degraded: Some(serving_degraded.clone()),
+        serving_listener_failures: Some(serving_listener_failures.clone()),
         db_available: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
@@ -10325,6 +10363,7 @@ fn start_mesh_admin_listeners(
     };
 
     let mut handles = Vec::new();
+    let mut startup_signals = Vec::new();
     let admin_state_for_https = admin_state.clone();
     // Shared admin connection limiter (plaintext + HTTPS listeners share one
     // management-plane cap, independent of the data-plane FERRUM_MAX_CONNECTIONS).
@@ -10337,19 +10376,33 @@ fn start_mesh_admin_listeners(
         let admin_http_addr = env_config.admin_socket_addr(env_config.admin_http_port);
         let shutdown = shutdown_tx.subscribe();
         let admin_http_limiter = admin_conn_limiter.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let admin_startup_ready = startup_ready.clone();
+        let admin_serving_degraded = serving_degraded.clone();
+        let admin_failures = serving_listener_failures.clone();
         handles.push(tokio::spawn(async move {
             info!("Starting mesh admin HTTP listener on {}", admin_http_addr);
-            if let Err(err) = admin::start_admin_listener(
+            if let Err(err) = admin::start_admin_listener_with_tls_and_signal(
                 admin_http_addr,
                 admin_state,
                 shutdown,
+                None,
+                Some(started_tx),
                 admin_http_limiter,
             )
             .await
             {
-                error!("Mesh admin HTTP listener error: {}", err);
+                crate::startup::record_post_start_listener_failure(
+                    &admin_startup_ready,
+                    &admin_serving_degraded,
+                    &admin_failures,
+                    "Mesh admin HTTP listener",
+                    admin_http_addr.port(),
+                    &err,
+                );
             }
         }));
+        startup_signals.push(("Mesh admin HTTP listener".to_string(), started_rx));
     } else {
         info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext mesh admin HTTP listener disabled");
     }
@@ -10384,31 +10437,45 @@ fn start_mesh_admin_listeners(
         let admin_tls_slot = admin_reload_handles.slot.clone();
         let shutdown = shutdown_tx.subscribe();
         let admin_https_limiter = admin_conn_limiter.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let admin_startup_ready = startup_ready.clone();
+        let admin_serving_degraded = serving_degraded.clone();
+        let admin_failures = serving_listener_failures.clone();
         handles.push(tokio::spawn(async move {
             info!("Starting mesh admin HTTPS listener on {}", admin_https_addr);
             let result = if let Some(slot) = admin_tls_slot {
-                admin::start_admin_listener_with_dynamic_tls(
+                admin::start_admin_listener_with_dynamic_tls_and_signal(
                     admin_https_addr,
                     admin_state_for_https,
                     shutdown,
                     slot,
+                    Some(started_tx),
                     admin_https_limiter,
                 )
                 .await
             } else {
-                admin::start_admin_listener_with_tls(
+                admin::start_admin_listener_with_tls_and_signal(
                     admin_https_addr,
                     admin_state_for_https,
                     shutdown,
                     Some(admin_tls_config),
+                    Some(started_tx),
                     admin_https_limiter,
                 )
                 .await
             };
             if let Err(err) = result {
-                error!("Mesh admin HTTPS listener error: {}", err);
+                crate::startup::record_post_start_listener_failure(
+                    &admin_startup_ready,
+                    &admin_serving_degraded,
+                    &admin_failures,
+                    "Mesh admin HTTPS listener",
+                    admin_https_addr.port(),
+                    &err,
+                );
             }
         }));
+        startup_signals.push(("Mesh admin HTTPS listener".to_string(), started_rx));
     } else {
         info!("Mesh admin TLS not configured - HTTPS listener disabled");
     }
@@ -10419,7 +10486,10 @@ fn start_mesh_admin_listeners(
         );
     }
 
-    Ok(handles)
+    Ok(MeshAdminListeners {
+        handles,
+        startup_signals,
+    })
 }
 
 /// Resolve the workload-level mTLS fallback for the inbound TLS-terminating

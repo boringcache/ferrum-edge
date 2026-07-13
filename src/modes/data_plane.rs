@@ -334,6 +334,20 @@ pub async fn run(
     let mut handles = Vec::new();
     let mut startup_signals = Vec::new();
 
+    // Shared readiness flag. DP defers flipping it to `true` until the DP client
+    // applies the first CP snapshot (and classifies backend capabilities), but
+    // it is created here so every serving listener task below can capture a
+    // clone and flip it back to `false` if its serve future exits with an error
+    // after startup — otherwise a dead proxy/admin listener would leave the
+    // process reporting `ready` on `/health` while silently not serving.
+    let startup_ready = Arc::new(AtomicBool::new(false));
+    // Sticky serving-degradation flag: set true (never unset) if any serving
+    // listener task exits with an error after startup. The DP client re-stores
+    // `startup_ready = true` on every CP-reconnect snapshot, which would re-mask
+    // a listener death; because `serving_degraded` is monotonic, `/health` stays
+    // not-ready across those reconnect stores once a listener has failed.
+    let serving_degraded = Arc::new(AtomicBool::new(false));
+
     if let (Some(listener_slot), Some(operator_slot), Some(mut operator_revision_rx)) = (
         proxy_frontend_tls_slot.clone(),
         operator_frontend_tls_slot.clone(),
@@ -382,6 +396,8 @@ pub async fn run(
         let http_state = proxy_state.clone();
         let http_shutdown = shutdown_tx.subscribe();
         let (http_started_tx, http_started_rx) = tokio::sync::oneshot::channel();
+        let http_startup_ready = startup_ready.clone();
+        let http_serving_degraded = serving_degraded.clone();
         let http_handle = tokio::spawn(async move {
             info!("Starting HTTP proxy listener on {}", http_addr);
             if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
@@ -393,7 +409,12 @@ pub async fn run(
             )
             .await
             {
-                error!("HTTP proxy listener error: {}", e);
+                crate::startup::flip_ready_off_on_listener_failure(
+                    &http_startup_ready,
+                    &http_serving_degraded,
+                    "HTTP proxy listener",
+                    &e,
+                );
             }
         });
         handles.push(http_handle);
@@ -411,6 +432,8 @@ pub async fn run(
         let https_state = proxy_state.clone();
         let https_shutdown = shutdown_tx.subscribe();
         let (https_started_tx, https_started_rx) = tokio::sync::oneshot::channel();
+        let https_startup_ready = startup_ready.clone();
+        let https_serving_degraded = serving_degraded.clone();
         let https_handle = tokio::spawn(async move {
             info!("Starting HTTPS proxy listener on {}", https_addr);
             if let Err(e) = proxy::start_proxy_listener_with_dynamic_tls_and_signal(
@@ -422,7 +445,12 @@ pub async fn run(
             )
             .await
             {
-                error!("HTTPS proxy listener error: {}", e);
+                crate::startup::flip_ready_off_on_listener_failure(
+                    &https_startup_ready,
+                    &https_serving_degraded,
+                    "HTTPS proxy listener",
+                    &e,
+                );
             }
         });
         handles.push(https_handle);
@@ -455,6 +483,8 @@ pub async fn run(
                     revision_rx: proxy_frontend_tls_revision_rx.clone(),
                 }
             });
+            let h3_startup_ready = startup_ready.clone();
+            let h3_serving_degraded = serving_degraded.clone();
             let h3_handle = tokio::spawn(async move {
                 info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
                 if let Err(e) = crate::http3::server::start_http3_listener_with_signal(
@@ -473,7 +503,12 @@ pub async fn run(
                 )
                 .await
                 {
-                    error!("HTTP/3 proxy listener error: {}", e);
+                    crate::startup::flip_ready_off_on_listener_failure(
+                        &h3_startup_ready,
+                        &h3_serving_degraded,
+                        "HTTP/3 proxy listener",
+                        &e,
+                    );
                 }
             });
             handles.push(h3_handle);
@@ -501,7 +536,6 @@ pub async fn run(
     let jwt_manager = create_jwt_manager_from_env()
         .map_err(|e| anyhow::anyhow!("Failed to create JWT manager: {}", e))?;
     let reserved_ports = env_config.reserved_gateway_ports();
-    let startup_ready = Arc::new(AtomicBool::new(false));
     // Shared admin connection limiter (plaintext + HTTPS listeners share one
     // management-plane cap, independent of the data-plane FERRUM_MAX_CONNECTIONS).
     let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new(
@@ -517,6 +551,8 @@ pub async fn run(
         read_only: true, // DP admin API is always read-only
         admin_audit_enabled: env_config.admin_audit_enabled,
         startup_ready: Some(startup_ready.clone()),
+        serving_degraded: Some(serving_degraded.clone()),
+        serving_listener_failures: None,
         db_available: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
@@ -542,20 +578,37 @@ pub async fn run(
     // Admin HTTP listener (disabled when port is 0)
     if env_config.admin_http_port != 0 {
         let admin_http_limiter = admin_conn_limiter.clone();
+        let (admin_http_started_tx, admin_http_started_rx) = tokio::sync::oneshot::channel();
+        let admin_http_startup_ready = startup_ready.clone();
+        let admin_http_serving_degraded = serving_degraded.clone();
         let admin_http_handle = tokio::spawn(async move {
             info!("Starting Admin HTTP listener on {}", admin_http_addr);
-            if let Err(e) = admin::start_admin_listener(
+            // The admin listener is one of the DP's own operational inputs (its
+            // port comes from env, not CP-pushed config), so a bind failure is
+            // the operator's misconfiguration and is fatal at startup via the
+            // start signal below — consistent with the proxy listeners. A serve
+            // error after startup instead flips readiness to not-ready so the
+            // admin API being dead surfaces on `/health`.
+            if let Err(e) = admin::start_admin_listener_with_tls_and_signal(
                 admin_http_addr,
                 admin_state,
                 admin_shutdown,
+                None,
+                Some(admin_http_started_tx),
                 admin_http_limiter,
             )
             .await
             {
-                error!("Admin HTTP listener error: {}", e);
+                crate::startup::flip_ready_off_on_listener_failure(
+                    &admin_http_startup_ready,
+                    &admin_http_serving_degraded,
+                    "Admin HTTP listener",
+                    &e,
+                );
             }
         });
         handles.push(admin_http_handle);
+        startup_signals.push(("Admin HTTP listener".to_string(), admin_http_started_rx));
     } else {
         info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext admin HTTP listener disabled");
     }
@@ -615,33 +668,47 @@ pub async fn run(
         }
         let admin_tls_slot = admin_reload_handles.slot.clone();
         let admin_https_limiter = admin_conn_limiter.clone();
+        let (admin_https_started_tx, admin_https_started_rx) = tokio::sync::oneshot::channel();
+        let admin_https_startup_ready = startup_ready.clone();
+        let admin_https_serving_degraded = serving_degraded.clone();
 
         let admin_https_handle = tokio::spawn(async move {
             info!("Starting Admin HTTPS listener on {}", admin_https_addr);
+            // Bind failure is fatal at startup (start signal); a post-startup
+            // serve error flips readiness to not-ready. Same rationale as the
+            // plaintext admin listener above.
             let result = if let Some(slot) = admin_tls_slot {
-                admin::start_admin_listener_with_dynamic_tls(
+                admin::start_admin_listener_with_dynamic_tls_and_signal(
                     admin_https_addr,
                     admin_state_for_https,
                     admin_https_shutdown,
                     slot,
+                    Some(admin_https_started_tx),
                     admin_https_limiter,
                 )
                 .await
             } else {
-                admin::start_admin_listener_with_tls(
+                admin::start_admin_listener_with_tls_and_signal(
                     admin_https_addr,
                     admin_state_for_https,
                     admin_https_shutdown,
                     Some(admin_tls_config),
+                    Some(admin_https_started_tx),
                     admin_https_limiter,
                 )
                 .await
             };
             if let Err(e) = result {
-                error!("Admin HTTPS listener error: {}", e);
+                crate::startup::flip_ready_off_on_listener_failure(
+                    &admin_https_startup_ready,
+                    &admin_https_serving_degraded,
+                    "Admin HTTPS listener",
+                    &e,
+                );
             }
         });
         handles.push(admin_https_handle);
+        startup_signals.push(("Admin HTTPS listener".to_string(), admin_https_started_rx));
     } else {
         info!("Admin TLS not configured - HTTPS listener disabled");
     }
