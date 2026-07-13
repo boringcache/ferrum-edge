@@ -3952,7 +3952,7 @@ impl EnvConfig {
         // MongoDB connection strings accept.
         let query = query.split('#').next().unwrap_or(query);
         let mut existing = Vec::new();
-        for pair in query.split(|c: char| c == '&' || c == ';') {
+        for pair in query.split(['&', ';']) {
             let Some((name, _)) = url::form_urlencoded::parse(pair.as_bytes()).next() else {
                 continue;
             };

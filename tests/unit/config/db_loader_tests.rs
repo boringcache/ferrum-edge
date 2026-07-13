@@ -487,14 +487,17 @@ async fn transient_connectivity_failure_stays_backup_eligible() {
     let primary_url = format!("sqlite:{}?mode=rw", missing_path.to_string_lossy());
     let no_failover: Vec<String> = Vec::new();
 
-    let error = DatabaseStore::connect_with_failover(
+    let error = match DatabaseStore::connect_with_failover(
         "sqlite",
         &primary_url,
         &no_failover,
         DbPoolConfig::default(),
     )
     .await
-    .expect_err("opening a missing read-only sqlite database must fail");
+    {
+        Ok(_) => panic!("opening a missing read-only sqlite database must fail"),
+        Err(error) => error,
+    };
     assert!(
         !DatabaseStore::is_non_transient_init_error(&error),
         "a transient connectivity failure must remain backup-eligible: {error}"
