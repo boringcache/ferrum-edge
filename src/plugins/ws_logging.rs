@@ -77,6 +77,12 @@ struct WsDisconnectLogEntry {
 }
 
 impl SchemaSerializable for WsDisconnectLogEntry {
+    fn owns_native(&self, source: &str) -> bool {
+        super::utils::log_schema::WS_DISCONNECT_FIELDS
+            .iter()
+            .any(|f| f.name == source)
+    }
+
     fn serialize_native<S>(
         &self,
         source: &'static str,

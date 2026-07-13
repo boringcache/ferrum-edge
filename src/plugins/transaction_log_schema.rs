@@ -65,12 +65,17 @@ impl TransactionLogSchema {
             }
             // Compile (validates everything). Plugin name uses the schema
             // entry name so error messages point at the offending entry.
-            // Named schemas are process-global and portable across every
-            // logging plugin, so they compile under the base capability set
-            // — ws-only fields belong to inline `ws_logging` schemas only.
+            // Named schemas are process-global and are registered under the
+            // base capability set so ws-only field NAMES stay rejected in a
+            // portable definition. The raw definition is retained so a
+            // capability-bearing caller (`ws_logging`) can recompile it under
+            // its own capability at `schema_ref` resolve time (see
+            // `resolve_schema`), which is how disconnect fields reach parity
+            // with an inline `ws_logging` schema.
             let plugin_label = format!("transaction_log_schema[{name}]");
             let compiled =
                 SummarySchema::compile(schema_value, &plugin_label, SchemaCapabilities::BASE)?;
+            let raw = Arc::new(schema_value.clone());
 
             // Stage the local map FIRST so a defensive duplicate check can
             // short-circuit before the process-global registry is mutated.
@@ -86,7 +91,7 @@ impl TransactionLogSchema {
 
             // Register into the live staging area (no-op during validation;
             // populates during a loader reload bracket).
-            registry::register_named(name, compiled)?;
+            registry::register_named(name, raw, compiled)?;
         }
 
         Ok(Self { schemas })

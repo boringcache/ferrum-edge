@@ -11,7 +11,7 @@
 //! [`crate::plugins::utils::metadata_redaction`]; sensitive keys cannot be
 //! introduced via static or derived fields (the compiler rejects them).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -74,6 +74,14 @@ pub enum FieldSpec {
         /// The output JSON key. Equals `source` unless renamed.
         out_key: String,
         is_timestamp: bool,
+        /// `true` when this native field is present ONLY because the caller
+        /// opted into a capability beyond [`SchemaCapabilities::BASE`] (i.e.
+        /// a WebSocket-disconnect-exclusive field on a `ws_logging` schema).
+        /// Extension fields are treated per entry kind: they are exempt from
+        /// `order` completeness and only reserve an output key for the entry
+        /// kind that actually owns them. Always `false` for BASE callers, so
+        /// non-`ws_logging` plugins behave exactly as before.
+        extension: bool,
     },
     Static {
         out_key: String,
@@ -285,6 +293,17 @@ impl SummarySchema {
         // Build the unordered FieldSpec set.
         // ------------------------------------------------------------------
 
+        // Fields present under BASE for this summary_type. Any native field
+        // beyond this set is a capability-added "extension" field (only the
+        // WebSocket-disconnect family, via `ws_logging`). For BASE callers the
+        // extension set is empty, so every spec is `extension: false` and the
+        // per-entry-kind handling below is a no-op — identical to pre-WS.
+        let base_field_names: HashSet<&'static str> =
+            fields::fields_for(summary_type, SchemaCapabilities::BASE)
+                .into_iter()
+                .map(|f| f.name)
+                .collect();
+
         // Native fields, omit applied, rename applied. We preserve native
         // declaration order; reordering happens below if `order` is set.
         let native_specs: Vec<FieldSpec> = fields::fields_for(summary_type, caps)
@@ -306,6 +325,7 @@ impl SummarySchema {
                     source: f.name,
                     out_key,
                     is_timestamp: f.is_timestamp,
+                    extension: !base_field_names.contains(f.name),
                 }
             })
             .collect();
@@ -432,6 +452,20 @@ fn spec_out_key_and_kind(spec: &FieldSpec) -> (&str, &'static str) {
         FieldSpec::Static { out_key, .. } => (out_key.as_str(), "static_fields"),
         FieldSpec::Derived { out_key, .. } => (out_key.as_str(), "derived_fields"),
     }
+}
+
+/// `true` when a spec is a capability-added extension field (WebSocket
+/// disconnect only). Extension fields are exempt from `order` completeness so
+/// an operator's exhaustive HTTP/stream `order` predating the WS field family
+/// stays valid; they may still be listed to position them explicitly.
+fn spec_is_extension(spec: &FieldSpec) -> bool {
+    matches!(
+        spec,
+        FieldSpec::Native {
+            extension: true,
+            ..
+        }
+    )
 }
 
 fn unknown_field_error(
@@ -795,10 +829,14 @@ fn apply_order(
     }
 
     if !wildcard_seen {
+        // Completeness is evaluated per entry kind: extension (WebSocket
+        // disconnect-only) fields may be unlisted without `*` — they never
+        // serialize on ordinary HTTP/stream entries and are appended for the
+        // WS-disconnect entry below. Base fields must still all be listed.
         let missing: Vec<&str> = all
             .iter()
             .zip(listed.iter())
-            .filter(|(_, l)| !**l)
+            .filter(|(spec, l)| !**l && !spec_is_extension(spec))
             .map(|(spec, _)| spec_out_key_and_kind(spec).0)
             .collect();
         if !missing.is_empty() {
@@ -837,6 +875,23 @@ fn apply_order(
             }
         }
     }
+
+    // Without an explicit `*`, base fields were all required above, so the
+    // only remaining unlisted slots are exempt extension (WS-disconnect)
+    // fields. Append them in natural order so the WS entry still emits them
+    // even when the operator's `order` predates the WS field family. For BASE
+    // callers there are no extension fields, so this loop is a no-op.
+    if !wildcard_seen {
+        for (i, slot) in slots.iter_mut().enumerate() {
+            if listed[i] {
+                continue;
+            }
+            if let Some(spec) = slot.take() {
+                out.push(spec);
+            }
+        }
+    }
+
     Ok(out)
 }
 
@@ -848,16 +903,23 @@ fn apply_order(
 /// and return the compiled schema. Returns `Ok(None)` when neither key is
 /// present.
 ///
-/// `caps` is applied only to an inline `schema` (see
-/// [`SummarySchema::compile`]). A `schema_ref` resolves to a schema already
-/// compiled by `transaction_log_schema` under [`SchemaCapabilities::BASE`],
-/// so named schemas are portable across every logging plugin and never
-/// carry ws-only fields.
+/// `caps` is honored for BOTH an inline `schema` and a `schema_ref` (see
+/// [`SummarySchema::compile`]). A named schema is authored generically and
+/// registered under [`SchemaCapabilities::BASE`], so it can never reference
+/// ws-only field names; but when a capability-bearing caller (`ws_logging`)
+/// resolves it, the named schema's raw definition is recompiled under that
+/// caller's capability so `schema_ref` reaches parity with an inline schema —
+/// the WebSocket-disconnect field family applies to disconnect entries rather
+/// than being silently dropped. BASE callers keep sharing the single
+/// registered `Arc`, so non-`ws_logging` plugins are unaffected.
 ///
 /// Errors:
 /// - Both `schema` and `schema_ref` present.
 /// - `schema_ref` is not a string, or points to a name not registered.
 /// - Inline `schema` fails to compile (rules in [`SummarySchema::compile`]).
+/// - A `schema_ref` recompiled under a non-BASE capability collides (e.g. a
+///   `static_fields` key that becomes a reserved native name under `caps`) —
+///   the same error an equivalent inline schema would raise.
 pub fn resolve_schema(
     config: &Value,
     plugin_name: &str,
@@ -876,13 +938,25 @@ pub fn resolve_schema(
         let name = name
             .as_str()
             .ok_or_else(|| format!("{plugin_name}: 'schema_ref' must be a string"))?;
-        return registry::lookup_named(name)
-            .map(Some)
-            .ok_or_else(|| {
+        // BASE callers share the single compiled `Arc` registered by
+        // `transaction_log_schema` — zero recompile, identical to before.
+        if caps == SchemaCapabilities::BASE {
+            return registry::lookup_named(name).map(Some).ok_or_else(|| {
                 format!(
                     "{plugin_name}: 'schema_ref' references unknown schema '{name}' (define it in a 'transaction_log_schema' plugin)"
                 )
             });
+        }
+        // Capability-bearing caller (`ws_logging`): recompile the named
+        // schema's raw definition under this capability so disconnect fields
+        // apply. Recompilation happens once at plugin construction, not on the
+        // hot path.
+        let raw = registry::lookup_named_raw(name).ok_or_else(|| {
+            format!(
+                "{plugin_name}: 'schema_ref' references unknown schema '{name}' (define it in a 'transaction_log_schema' plugin)"
+            )
+        })?;
+        return SummarySchema::compile(&raw, plugin_name, caps).map(Some);
     }
 
     if let Some(inline) = inline {
@@ -1112,6 +1186,153 @@ mod tests {
             e.contains("unknown field 'frames_client_to_backend'"),
             "got: {e}"
         );
+    }
+
+    #[test]
+    fn ws_http_exhaustive_order_stays_valid_without_wildcard() {
+        // Regression for the Codex finding: an existing `ws_logging` schema
+        // whose `order` exhaustively lists the pre-WS HTTP fields (no `*`)
+        // must still compile once the native set grew to include the
+        // WebSocket-disconnect family. WS-only fields are exempt from
+        // completeness and appended after the listed keys.
+        let order: Vec<String> = fields::HTTP_FIELDS
+            .iter()
+            .map(|f| f.name.to_string())
+            .collect();
+        let s = ok_ws(json!({
+            "summary_type": "http",
+            "order": order,
+        }));
+        // Every listed HTTP key keeps its position at the front.
+        for (i, f) in fields::HTTP_FIELDS.iter().enumerate() {
+            assert!(
+                matches!(&s.fields[i], FieldSpec::Native { source, .. } if *source == f.name),
+                "HTTP field '{}' out of position at index {i}",
+                f.name
+            );
+        }
+        // WS-only fields were appended (not required, but still emitted for
+        // the disconnect entry).
+        assert!(s.fields.iter().any(|f| matches!(
+            f,
+            FieldSpec::Native {
+                source: "event",
+                ..
+            }
+        )));
+        assert!(s.fields.iter().any(|f| matches!(
+            f,
+            FieldSpec::Native {
+                source: "frames_client_to_backend",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn base_exhaustive_http_order_still_requires_every_field() {
+        // BASE is unchanged: with no `*`, omitting even one HTTP field is an
+        // error (there are no exempt extension fields under BASE).
+        let mut order: Vec<String> = fields::HTTP_FIELDS
+            .iter()
+            .map(|f| f.name.to_string())
+            .collect();
+        order.pop(); // drop the last field
+        let e = SummarySchema::compile(
+            &json!({ "summary_type": "http", "order": order }),
+            "http_logging",
+            SchemaCapabilities::BASE,
+        )
+        .expect_err("incomplete order should fail under BASE");
+        assert!(e.contains("missing entries"), "got: {e}");
+    }
+
+    #[test]
+    fn resolve_schema_ref_honors_ws_capability() {
+        // schema_ref parity: a portable named schema loses its WebSocket
+        // disconnect fields under BASE but regains them when `ws_logging`
+        // resolves it under the WS capability, while the portable rename
+        // still applies. BASE callers see the exact registered schema.
+        let _g = registry::lock_for_tests();
+        registry::reset_for_tests();
+        registry::begin_reload();
+        let raw = json!({ "summary_type": "http", "rename": { "proxy_id": "route_id" } });
+        let compiled = SummarySchema::compile(
+            &raw,
+            "transaction_log_schema[portable]",
+            SchemaCapabilities::BASE,
+        )
+        .expect("named schema compiles");
+        registry::register_named("portable", Arc::new(raw), compiled)
+            .expect("register named schema");
+        registry::commit_reload();
+
+        let cfg = json!({ "schema_ref": "portable" });
+        let base = resolve_schema(&cfg, "http_logging", SchemaCapabilities::BASE)
+            .expect("base resolve ok")
+            .expect("schema present");
+        let ws = resolve_schema(&cfg, "ws_logging", SchemaCapabilities::WS_LOGGING)
+            .expect("ws resolve ok")
+            .expect("schema present");
+
+        // BASE resolution carries no WebSocket-disconnect native field.
+        assert!(!base.fields.iter().any(|f| matches!(
+            f,
+            FieldSpec::Native {
+                source: "event",
+                ..
+            }
+        )));
+        // WS resolution DOES — disconnect fields are no longer silently
+        // dropped for schema_ref users.
+        assert!(ws.fields.iter().any(|f| matches!(
+            f,
+            FieldSpec::Native {
+                source: "event",
+                ..
+            }
+        )));
+        assert!(ws.fields.iter().any(|f| matches!(
+            f,
+            FieldSpec::Native {
+                source: "frames_client_to_backend",
+                ..
+            }
+        )));
+        // The portable rename applies under both capabilities.
+        for schema in [&base, &ws] {
+            assert!(schema.fields.iter().any(|f| matches!(
+                f,
+                FieldSpec::Native { source: "proxy_id", out_key, .. } if out_key == "route_id"
+            )));
+        }
+    }
+
+    #[test]
+    fn resolve_schema_ref_static_field_colliding_with_ws_native_rejected_for_ws() {
+        // A portable schema whose `static_fields` uses a name that is only a
+        // reserved native field under the WS capability compiles for BASE
+        // callers but is rejected for `ws_logging` — identical to the
+        // equivalent inline schema's collision error.
+        let _g = registry::lock_for_tests();
+        registry::reset_for_tests();
+        registry::begin_reload();
+        let raw = json!({ "summary_type": "http", "static_fields": { "event": "access" } });
+        let compiled = SummarySchema::compile(
+            &raw,
+            "transaction_log_schema[with_event]",
+            SchemaCapabilities::BASE,
+        )
+        .expect("named schema compiles under BASE");
+        registry::register_named("with_event", Arc::new(raw), compiled)
+            .expect("register named schema");
+        registry::commit_reload();
+
+        let cfg = json!({ "schema_ref": "with_event" });
+        assert!(resolve_schema(&cfg, "http_logging", SchemaCapabilities::BASE).is_ok());
+        let e = resolve_schema(&cfg, "ws_logging", SchemaCapabilities::WS_LOGGING)
+            .expect_err("ws recompile collides on reserved 'event'");
+        assert!(e.contains("duplicate output key 'event'"), "got: {e}");
     }
 
     #[test]

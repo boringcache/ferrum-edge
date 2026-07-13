@@ -12,7 +12,8 @@ use serde::Serializer;
 use serde::ser::{Serialize, SerializeMap};
 
 use super::{
-    CollisionMode, DerivedKind, FieldSpec, MetadataPolicy, SummarySchema, TimestampFormat,
+    CollisionMode, DerivedKind, FieldSpec, HTTP_FIELDS, MetadataPolicy, STREAM_FIELDS,
+    SummarySchema, TimestampFormat,
 };
 use crate::plugins::utils::log_helpers::SummaryLogEntry;
 use crate::plugins::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
@@ -35,6 +36,16 @@ pub trait SchemaSerializable {
     ) -> Result<(), S::Error>
     where
         S: SerializeMap;
+
+    /// `true` when `source` is a native field of THIS entry kind. Used to
+    /// scope emitted-key/collision accounting per entry kind: a capability
+    /// extension field (WebSocket disconnect only) reserves an output key
+    /// solely for the entry that owns it, so ordinary HTTP/stream entries in
+    /// `ws_logging` don't reserve — and then silently drop under flatten — a
+    /// metadata key that shares a WS-disconnect field name. Non-extension
+    /// (base) fields keep reserving unconditionally, so BASE callers are
+    /// unaffected.
+    fn owns_native(&self, source: &str) -> bool;
 
     /// Emit a derived value under `out_key`. Returns `Ok(false)` when the
     /// kind doesn't apply to this summary type (e.g. `StatusClass` on a
@@ -92,6 +103,7 @@ impl<'a, T: SchemaSerializable> Serialize for SchemaView<'a, T> {
                     source,
                     out_key,
                     is_timestamp,
+                    extension,
                 } => {
                     let ts_format = if *is_timestamp {
                         self.schema.timestamp_format
@@ -100,7 +112,14 @@ impl<'a, T: SchemaSerializable> Serialize for SchemaView<'a, T> {
                     };
                     self.summary
                         .serialize_native(source, out_key, ts_format, &mut map)?;
-                    if track_emitted {
+                    // Reserve the output key for flatten-collision detection.
+                    // Base fields reserve unconditionally (matches pre-WS
+                    // behavior for every plugin). A capability extension field
+                    // reserves only for the entry kind that actually owns it,
+                    // so an ordinary HTTP summary inside `ws_logging` doesn't
+                    // reserve — and thus doesn't drop — a metadata key named
+                    // like a WebSocket-disconnect field.
+                    if track_emitted && (!*extension || self.summary.owns_native(source)) {
                         emitted.insert(out_key.clone());
                     }
                 }
@@ -204,6 +223,10 @@ fn flatten_key(key: &str, prefix: Option<&str>) -> String {
 // ---------------------------------------------------------------------------
 
 impl SchemaSerializable for TransactionSummary {
+    fn owns_native(&self, source: &str) -> bool {
+        HTTP_FIELDS.iter().any(|f| f.name == source)
+    }
+
     fn serialize_native<S>(
         &self,
         source: &'static str,
@@ -383,6 +406,10 @@ impl SchemaSerializable for TransactionSummary {
 // ---------------------------------------------------------------------------
 
 impl SchemaSerializable for StreamTransactionSummary {
+    fn owns_native(&self, source: &str) -> bool {
+        STREAM_FIELDS.iter().any(|f| f.name == source)
+    }
+
     fn serialize_native<S>(
         &self,
         source: &'static str,
@@ -726,6 +753,65 @@ mod tests {
             schema: &schema,
         };
         serde_json::to_value(view).unwrap()
+    }
+
+    fn serialize_via_ws(summary: &TransactionSummary, raw_schema: Value) -> Value {
+        let schema = SummarySchema::compile(
+            &raw_schema,
+            "ws_logging",
+            super::super::SchemaCapabilities::WS_LOGGING,
+        )
+        .unwrap();
+        let view = SchemaView {
+            summary,
+            schema: &schema,
+        };
+        serde_json::to_value(view).unwrap()
+    }
+
+    #[test]
+    fn http_entry_in_ws_schema_does_not_reserve_ws_only_keys_for_flatten() {
+        // Regression for the Codex finding: under the WS capability the
+        // compiled fields vec carries native `event` / `direction` / `io_side`
+        // specs, but an ORDINARY HTTP summary never serializes them. Those
+        // specs must NOT reserve the output key, so a flattened metadata key
+        // sharing the name survives instead of being silently dropped.
+        let mut s = http_summary();
+        s.metadata
+            .insert("event".to_string(), "from-metadata".to_string());
+        s.metadata.insert("direction".to_string(), "up".to_string());
+        s.metadata.insert("io_side".to_string(), "read".to_string());
+        let v = serialize_via_ws(
+            &s,
+            json!({
+                "summary_type": "http",
+                "metadata": { "mode": "flatten", "on_collision": "skip" }
+            }),
+        );
+        assert_eq!(
+            v.get("event").and_then(Value::as_str),
+            Some("from-metadata")
+        );
+        assert_eq!(v.get("direction").and_then(Value::as_str), Some("up"));
+        assert_eq!(v.get("io_side").and_then(Value::as_str), Some("read"));
+    }
+
+    #[test]
+    fn base_native_key_still_reserved_in_flatten_collision() {
+        // BASE unchanged: a base native field that DID serialize reserves its
+        // key, so a flattened metadata key of the same name is skipped.
+        let mut s = http_summary();
+        s.metadata
+            .insert("namespace".to_string(), "from-metadata".to_string());
+        let v = serialize_via(
+            &s,
+            json!({
+                "summary_type": "http",
+                "metadata": { "mode": "flatten", "on_collision": "skip" }
+            }),
+        );
+        // Native namespace wins; the colliding metadata value is dropped.
+        assert_eq!(v.get("namespace").and_then(Value::as_str), Some("ferrum"));
     }
 
     #[test]

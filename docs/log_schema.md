@@ -163,10 +163,20 @@ Every other logging plugin (`http_logging`, `kafka_logging`,
 WebSocket-disconnect names are **rejected** in `omit` / `rename` / `order`
 and never reserve output keys, so a non-`ws_logging` schema is free to use
 names like `event` for a `static_fields` entry or a flattened metadata key.
-Named schemas defined via `transaction_log_schema` are process-global and
-compile without the WebSocket-disconnect family too, so they stay portable
-across every logging plugin; use an inline `ws_logging` `schema:` to shape
-disconnect-specific keys.
+
+Named schemas defined via `transaction_log_schema` are process-global and are
+registered without the WebSocket-disconnect family, so a portable definition
+can never name a ws-only field. When `ws_logging` resolves such a schema via
+`schema_ref:`, the named schema is recompiled under the `ws_logging`
+capability, so the WebSocket-disconnect fields **do** apply to disconnect
+entries (with their default names and order) — `schema_ref` reaches parity
+with an inline `ws_logging` `schema:` rather than dropping the disconnect
+fields. Because the named definition cannot reference ws-only field names, use
+an inline `ws_logging` `schema:` when you need to `rename` / `omit` / `order`
+the disconnect-specific keys themselves. (A `schema_ref` whose `static_fields`
+key or rename target collides with a now-reserved WebSocket-disconnect field
+name is rejected for `ws_logging` — the same error the equivalent inline
+schema raises.)
 
 ### Derived Kinds
 
@@ -392,11 +402,18 @@ behavior by importing:
 
 ```rust
 use ferrum_edge::plugins::utils::log_schema::{
-    SchemaView, SummaryLogEntryView, SummarySchema, resolve_schema,
+    SchemaCapabilities, SchemaView, SummaryLogEntryView, SummarySchema, resolve_schema,
 };
 ```
 
 Store `Option<Arc<SummarySchema>>` on the plugin struct; call
-`resolve_schema(config, "my_plugin")` in `new()`; wrap each
-`serde_json::to_string(summary)` call site in a `match self.schema { ... }`
-branch identical to the built-in plugins.
+`resolve_schema(config, "my_plugin", SchemaCapabilities::BASE)` in `new()`;
+wrap each `serde_json::to_string(summary)` call site in a
+`match self.schema { ... }` branch identical to the built-in plugins.
+
+`resolve_schema` takes a `SchemaCapabilities` argument that gates optional
+field families. Pass `SchemaCapabilities::BASE` unless your plugin serializes
+WebSocket-disconnect entries (only the built-in `ws_logging` plugin does, via
+`SchemaCapabilities::WS_LOGGING`). The capability is honored for both inline
+`schema:` and `schema_ref:` — a named schema is recompiled under your
+capability so `schema_ref` matches an inline schema.
