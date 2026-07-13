@@ -20,14 +20,20 @@
 use async_trait::async_trait;
 use futures_util::SinkExt;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::warn;
 use url::{Host, Url};
 
-use super::utils::log_schema::{SchemaView, SummarySchema, resolve_schema};
+use super::utils::log_schema::view::{
+    MetadataNested, extract_host_from_url, serialize_schema_metadata,
+};
+use super::utils::log_schema::{
+    DerivedKind, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView, SummarySchema,
+    TimestampFormat, resolve_schema,
+};
 use super::utils::{BatchConfigDefaults, PluginHttpClient, validate_batch_config};
 use super::{
     ALL_PROTOCOLS, Direction, Plugin, ProxyProtocol, StreamTransactionSummary, TransactionSummary,
@@ -44,14 +50,6 @@ enum LogEntry {
     WebSocket(WsDisconnectLogEntry),
 }
 
-// TODO: extend the customizable log schema to WsDisconnectLogEntry.
-// Today `schema:` / `schema_ref:` on ws_logging only customize HTTP and
-// Stream summaries; WebSocket-disconnect entries fall through with their
-// native field set. Tracked under "Per-Plugin Notes" in
-// docs/log_schema.md. Implementing this means teaching `SchemaView`
-// (or a sibling view) about a third summary kind keyed off the fields
-// in this struct, then routing it through `WsBatchView` like the other
-// two arms.
 #[derive(Clone, serde::Serialize)]
 struct WsDisconnectLogEntry {
     event: &'static str,
@@ -76,6 +74,102 @@ struct WsDisconnectLogEntry {
         serialize_with = "crate::plugins::utils::metadata_redaction::serialize_redacted_metadata"
     )]
     metadata: HashMap<String, String>,
+}
+
+impl SchemaSerializable for WsDisconnectLogEntry {
+    fn owns_native(&self, source: &str) -> bool {
+        super::utils::log_schema::WS_DISCONNECT_FIELDS
+            .iter()
+            .any(|f| f.name == source)
+    }
+
+    fn serialize_native<S>(
+        &self,
+        source: &'static str,
+        out_key: &str,
+        _ts_format: TimestampFormat,
+        map: &mut S,
+    ) -> Result<(), S::Error>
+    where
+        S: serde::ser::SerializeMap,
+    {
+        match source {
+            "event" => map.serialize_entry(out_key, self.event),
+            "namespace" => map.serialize_entry(out_key, &self.namespace),
+            "proxy_id" => map.serialize_entry(out_key, &self.proxy_id),
+            "proxy_name" => map.serialize_entry(out_key, &self.proxy_name),
+            "client_ip" => map.serialize_entry(out_key, &self.client_ip),
+            "consumer_username" => map.serialize_entry(out_key, &self.consumer_username),
+            "auth_method" => match self.auth_method {
+                Some(value) => map.serialize_entry(out_key, value),
+                None => Ok(()),
+            },
+            "backend_target" => map.serialize_entry(out_key, &self.backend_target),
+            "protocol" => map.serialize_entry(out_key, self.protocol),
+            "listen_port" => map.serialize_entry(out_key, &self.listen_port),
+            "duration_ms" => map.serialize_entry(out_key, &self.duration_ms),
+            "frames_client_to_backend" => {
+                map.serialize_entry(out_key, &self.frames_client_to_backend)
+            }
+            "frames_backend_to_client" => {
+                map.serialize_entry(out_key, &self.frames_backend_to_client)
+            }
+            "direction" => map.serialize_entry(out_key, &self.direction),
+            "io_side" => map.serialize_entry(out_key, &self.io_side),
+            "error_class" => map.serialize_entry(out_key, &self.error_class),
+            "metadata" => {
+                if !self.metadata.is_empty() {
+                    map.serialize_entry(out_key, &MetadataNested(&self.metadata))?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn serialize_derived<S>(
+        &self,
+        kind: DerivedKind,
+        out_key: &str,
+        map: &mut S,
+    ) -> Result<bool, S::Error>
+    where
+        S: serde::ser::SerializeMap,
+    {
+        match kind {
+            DerivedKind::StatusClass => map.serialize_entry(out_key, "none")?,
+            DerivedKind::BackendHost => {
+                let Some(host) = extract_host_from_url(&self.backend_target) else {
+                    return Ok(false);
+                };
+                map.serialize_entry(out_key, host)?;
+            }
+            DerivedKind::SummaryKind => {
+                map.serialize_entry(out_key, "websocket_disconnect")?;
+            }
+            DerivedKind::Outcome => {
+                let outcome = if self.error_class.is_some() {
+                    "error"
+                } else {
+                    "ok"
+                };
+                map.serialize_entry(out_key, outcome)?;
+            }
+        }
+        Ok(true)
+    }
+
+    fn serialize_metadata<S>(
+        &self,
+        policy: &MetadataPolicy,
+        emitted: &mut HashSet<String>,
+        map: &mut S,
+    ) -> Result<(), S::Error>
+    where
+        S: serde::ser::SerializeMap,
+    {
+        serialize_schema_metadata(&self.metadata, policy, emitted, map)
+    }
 }
 
 impl From<&WsDisconnectContext> for WsDisconnectLogEntry {
@@ -114,8 +208,7 @@ struct WsConfig {
 }
 
 /// Serialize-time wrapper: emits the LogEntry slice as a JSON array,
-/// applying `schema` to HTTP / Stream entries when its `summary_type`
-/// matches. WebSocket disconnect entries keep their native format.
+/// applying `schema` to entries when its `summary_type` matches.
 struct WsBatchView<'a> {
     entries: &'a [LogEntry],
     schema: Option<&'a SummarySchema>,
@@ -132,6 +225,14 @@ impl<'a> serde::Serialize for WsBatchView<'a> {
                 }
                 (LogEntry::Stream(summary), Some(schema)) if schema.applies_to_stream() => {
                     seq.serialize_element(&SchemaView { summary, schema })?;
+                }
+                (LogEntry::WebSocket(entry), Some(schema))
+                    if schema.applies_to_websocket_disconnect() =>
+                {
+                    seq.serialize_element(&SchemaView {
+                        summary: entry,
+                        schema,
+                    })?;
                 }
                 _ => seq.serialize_element(entry)?,
             }
@@ -214,7 +315,10 @@ impl WsLogging {
         let retry_delay_ms = optional_u64(config, "retry_delay_ms", batch_defaults.retry_delay_ms)?;
         let reconnect_delay_ms = optional_u64(config, "reconnect_delay_ms", 5000)?;
 
-        let schema = resolve_schema(config, "ws_logging")?;
+        // ws_logging is the only caller that serializes WebSocket-disconnect
+        // entries, so it opts into that field family. Every other logging
+        // plugin uses the shared compiler under `SchemaCapabilities::BASE`.
+        let schema = resolve_schema(config, "ws_logging", SchemaCapabilities::WS_LOGGING)?;
         let ws_config = WsConfig {
             endpoint_url,
             connector,
@@ -610,5 +714,92 @@ async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
             tokio::time::sleep(cfg.reconnect_delay).await;
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn disconnect_entry() -> WsDisconnectLogEntry {
+        WsDisconnectLogEntry {
+            event: "websocket_disconnect",
+            namespace: "ferrum".into(),
+            proxy_id: "p1".into(),
+            proxy_name: Some("things-ws".into()),
+            client_ip: "10.0.0.1".into(),
+            consumer_username: Some("alice".into()),
+            auth_method: None,
+            backend_target: "wss://backend.example.com:9000/ws".into(),
+            protocol: "websocket",
+            listen_port: 8080,
+            duration_ms: 42.0,
+            frames_client_to_backend: 3,
+            frames_backend_to_client: 5,
+            direction: None,
+            io_side: None,
+            error_class: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn serialize_disconnect(entry: &WsDisconnectLogEntry, raw_schema: Value) -> Value {
+        let schema =
+            SummarySchema::compile(&raw_schema, "ws_logging", SchemaCapabilities::WS_LOGGING)
+                .unwrap();
+        let view = SchemaView {
+            summary: entry,
+            schema: &schema,
+        };
+        serde_json::to_value(view).unwrap()
+    }
+
+    #[test]
+    fn ws_disconnect_flatten_keeps_metadata_named_like_unowned_http_natives() {
+        // Round-3 regression: a WebSocket-disconnect entry is serialized through
+        // a `summary_type: http` ws_logging schema, whose native specs include
+        // HTTP-only fields (`http_method`, `request_path`,
+        // `response_status_code`) that `WsDisconnectLogEntry::serialize_native`
+        // never emits. Those specs must NOT reserve the flatten output key, so
+        // disconnect metadata sharing the name survives under the default
+        // `on_collision: skip`.
+        let mut entry = disconnect_entry();
+        entry
+            .metadata
+            .insert("http_method".to_string(), "GET".to_string());
+        entry
+            .metadata
+            .insert("request_path".to_string(), "/live".to_string());
+        entry
+            .metadata
+            .insert("response_status_code".to_string(), "101".to_string());
+        // A metadata key colliding with a native the disconnect entry DOES own
+        // must still yield to the native value.
+        entry
+            .metadata
+            .insert("namespace".to_string(), "shadow".to_string());
+
+        let v = serialize_disconnect(
+            &entry,
+            json!({
+                "summary_type": "http",
+                "metadata": { "mode": "flatten", "on_collision": "skip" }
+            }),
+        );
+
+        assert_eq!(v.get("http_method").and_then(Value::as_str), Some("GET"));
+        assert_eq!(v.get("request_path").and_then(Value::as_str), Some("/live"));
+        assert_eq!(
+            v.get("response_status_code").and_then(Value::as_str),
+            Some("101")
+        );
+        // Owned + emitted native wins; the colliding metadata value is dropped.
+        assert_eq!(v.get("namespace").and_then(Value::as_str), Some("ferrum"));
+        // The disconnect's own native fields still serialize.
+        assert_eq!(
+            v.get("event").and_then(Value::as_str),
+            Some("websocket_disconnect")
+        );
     }
 }

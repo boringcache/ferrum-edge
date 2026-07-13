@@ -1182,6 +1182,43 @@ async fn run_available_plugin_config_crud(gateway: &TestGateway, backend_port: u
     .await;
 }
 
+/// Stable prefix of the admin API's DB-driven read-only 503 body. The health
+/// probe result is cached for up to 15s (`DB_HEALTH_CACHE_TTL`), so a brief
+/// database blip in the container environment can hold admin writes blocked
+/// well after the database itself recovers; the retry window must exceed that
+/// TTL (issue #2156).
+const DB_UNAVAILABLE_MARKER: &str = "Database is currently unavailable";
+
+/// Send an admin mutation, retrying only the transient DB-driven read-only
+/// 503 until it clears. Every other response (success or failure) is returned
+/// to the caller's normal assertion path on the first attempt, so real
+/// regressions still fail immediately.
+async fn send_retrying_db_unavailable<F, Fut>(mut send: F, context: &str) -> reqwest::Response
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let response = send()
+            .await
+            .unwrap_or_else(|err| panic!("{context}: {err}"));
+        if response.status() != StatusCode::SERVICE_UNAVAILABLE {
+            return response;
+        }
+        let body = response.text().await.unwrap_or_default();
+        assert!(
+            body.contains(DB_UNAVAILABLE_MARKER),
+            "{context} failed with 503 Service Unavailable: {body}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{context} still blocked by the DB-driven read-only guard after 30s: {body}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 async fn admin_post_json(
     client: &Client,
     gateway: &TestGateway,
@@ -1189,13 +1226,17 @@ async fn admin_post_json(
     auth: &str,
     body: Value,
 ) -> Value {
-    let response = client
-        .post(gateway.admin_url(path))
-        .header("Authorization", auth)
-        .json(&body)
-        .send()
-        .await
-        .unwrap_or_else(|err| panic!("POST {path}: {err}"));
+    let response = send_retrying_db_unavailable(
+        || {
+            client
+                .post(gateway.admin_url(path))
+                .header("Authorization", auth)
+                .json(&body)
+                .send()
+        },
+        &format!("POST {path}"),
+    )
+    .await;
     expect_json_success(response, &format!("POST {path}")).await
 }
 
@@ -1206,13 +1247,17 @@ async fn admin_put_json(
     auth: &str,
     body: Value,
 ) -> Value {
-    let response = client
-        .put(gateway.admin_url(path))
-        .header("Authorization", auth)
-        .json(&body)
-        .send()
-        .await
-        .unwrap_or_else(|err| panic!("PUT {path}: {err}"));
+    let response = send_retrying_db_unavailable(
+        || {
+            client
+                .put(gateway.admin_url(path))
+                .header("Authorization", auth)
+                .json(&body)
+                .send()
+        },
+        &format!("PUT {path}"),
+    )
+    .await;
     expect_json_success(response, &format!("PUT {path}")).await
 }
 
@@ -1227,12 +1272,16 @@ async fn admin_get_json(client: &Client, gateway: &TestGateway, path: &str, auth
 }
 
 async fn admin_delete(client: &Client, gateway: &TestGateway, path: &str, auth: &str) {
-    let response = client
-        .delete(gateway.admin_url(path))
-        .header("Authorization", auth)
-        .send()
-        .await
-        .unwrap_or_else(|err| panic!("DELETE {path}: {err}"));
+    let response = send_retrying_db_unavailable(
+        || {
+            client
+                .delete(gateway.admin_url(path))
+                .header("Authorization", auth)
+                .send()
+        },
+        &format!("DELETE {path}"),
+    )
+    .await;
     assert_success(response, &format!("DELETE {path}")).await;
 }
 

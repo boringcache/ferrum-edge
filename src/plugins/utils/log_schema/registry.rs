@@ -13,15 +13,27 @@ use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 
+use serde_json::Value;
+
 use super::SummarySchema;
+
+/// A registered named schema. Carries the raw definition alongside the
+/// BASE-compiled form so a capability-bearing caller (`ws_logging`) can
+/// recompile it under its own capability at resolve time (see
+/// [`super::resolve_schema`]), while BASE callers keep sharing `compiled`.
+#[derive(Clone)]
+struct NamedSchema {
+    raw: Arc<Value>,
+    compiled: Arc<SummarySchema>,
+}
 
 #[derive(Default)]
 struct RegistryState {
     /// Live map consulted by `lookup_named`.
-    schemas: HashMap<String, Arc<SummarySchema>>,
+    schemas: HashMap<String, NamedSchema>,
     /// Staging area built by `register_named` during reload; promoted on
     /// `commit_reload`.
-    staging: Option<HashMap<String, Arc<SummarySchema>>>,
+    staging: Option<HashMap<String, NamedSchema>>,
 }
 
 fn registry() -> &'static RwLock<RegistryState> {
@@ -168,7 +180,11 @@ pub fn begin_reload() {
 /// validation via `validate_plugin_config`), this is a no-op. Validation
 /// just needs `SummarySchema::compile` to succeed; the registry stays
 /// untouched and will be re-populated by the next config-reload pass.
-pub fn register_named(name: &str, schema: Arc<SummarySchema>) -> Result<(), String> {
+pub fn register_named(
+    name: &str,
+    raw: Arc<Value>,
+    compiled: Arc<SummarySchema>,
+) -> Result<(), String> {
     let mut state = write_lock();
     let Some(staging) = state.staging.as_mut() else {
         return Ok(()); // validation-mode no-op
@@ -178,7 +194,7 @@ pub fn register_named(name: &str, schema: Arc<SummarySchema>) -> Result<(), Stri
             "transaction_log_schema: named schema '{name}' registered more than once"
         ));
     }
-    staging.insert(name.to_string(), schema);
+    staging.insert(name.to_string(), NamedSchema { raw, compiled });
     Ok(())
 }
 
@@ -253,6 +269,18 @@ impl Drop for ReloadBracketTestGuard {
 /// live committed map, so the atomic-swap-at-commit semantic holds for
 /// every reader outside the reload.
 pub fn lookup_named(name: &str) -> Option<Arc<SummarySchema>> {
+    lookup_entry(name).map(|e| e.compiled)
+}
+
+/// Look up the RAW definition of a named schema. Used by
+/// [`super::resolve_schema`] so a capability-bearing caller can recompile the
+/// named schema under its own capability. Same staging-shadow semantics as
+/// [`lookup_named`].
+pub fn lookup_named_raw(name: &str) -> Option<Arc<Value>> {
+    lookup_entry(name).map(|e| e.raw)
+}
+
+fn lookup_entry(name: &str) -> Option<NamedSchema> {
     let on_reload_thread = KEEPER.with(|k| k.borrow().depth > 0);
     let state = read_lock();
     if on_reload_thread && let Some(staging) = &state.staging {
@@ -307,7 +335,12 @@ mod tests {
             fields: Vec::<FieldSpec>::new(),
             metadata: MetadataPolicy::Nested,
             timestamp_format: TimestampFormat::Rfc3339,
+            capability_scoped: false,
         })
+    }
+
+    fn raw_schema() -> Arc<Value> {
+        Arc::new(serde_json::json!({}))
     }
 
     #[test]
@@ -315,7 +348,7 @@ mod tests {
         let _g = lock();
         reset_for_tests();
         // No begin_reload — should succeed silently without registering.
-        assert!(register_named("x", empty_schema()).is_ok());
+        assert!(register_named("x", raw_schema(), empty_schema()).is_ok());
         assert!(lookup_named("x").is_none());
     }
 
@@ -324,7 +357,7 @@ mod tests {
         let _g = lock();
         reset_for_tests();
         begin_reload();
-        register_named("a", empty_schema()).unwrap();
+        register_named("a", raw_schema(), empty_schema()).unwrap();
         // The reload thread sees its own staging so plugin construction
         // in the second pass can resolve `schema_ref` before commit.
         assert!(lookup_named("a").is_some());
@@ -353,13 +386,13 @@ mod tests {
         // Seed a live schema so we can confirm it survives the aborted
         // reload.
         begin_reload();
-        register_named("keep", empty_schema()).unwrap();
+        register_named("keep", raw_schema(), empty_schema()).unwrap();
         commit_reload();
         assert!(lookup_named("keep").is_some());
 
         // Start a reload that registers a new schema, then abort.
         begin_reload();
-        register_named("transient", empty_schema()).unwrap();
+        register_named("transient", raw_schema(), empty_schema()).unwrap();
         abort_reload();
 
         // The aborted reload's staged schema must NOT leak into the live map.
@@ -379,8 +412,8 @@ mod tests {
         let _g = lock();
         reset_for_tests();
         begin_reload();
-        register_named("a", empty_schema()).unwrap();
-        let r = register_named("a", empty_schema());
+        register_named("a", raw_schema(), empty_schema()).unwrap();
+        let r = register_named("a", raw_schema(), empty_schema());
         assert!(r.is_err());
     }
 
@@ -390,13 +423,13 @@ mod tests {
         reset_for_tests();
         // First reload: register "a".
         begin_reload();
-        register_named("a", empty_schema()).unwrap();
+        register_named("a", raw_schema(), empty_schema()).unwrap();
         commit_reload();
         assert!(lookup_named("a").is_some());
 
         // Second reload: register only "b". "a" should vanish.
         begin_reload();
-        register_named("b", empty_schema()).unwrap();
+        register_named("b", raw_schema(), empty_schema()).unwrap();
         commit_reload();
         assert!(lookup_named("a").is_none());
         assert!(lookup_named("b").is_some());
@@ -407,9 +440,9 @@ mod tests {
         let _g = lock();
         reset_for_tests();
         begin_reload();
-        register_named("zebra", empty_schema()).unwrap();
-        register_named("alpha", empty_schema()).unwrap();
-        register_named("mango", empty_schema()).unwrap();
+        register_named("zebra", raw_schema(), empty_schema()).unwrap();
+        register_named("alpha", raw_schema(), empty_schema()).unwrap();
+        register_named("mango", raw_schema(), empty_schema()).unwrap();
         commit_reload();
         assert_eq!(registered_names(), vec!["alpha", "mango", "zebra"]);
     }

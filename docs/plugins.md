@@ -477,8 +477,16 @@ Sends transaction summaries as JSON to an external WebSocket endpoint. Like `htt
 | `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
 | `reconnect_delay_ms` | Integer | `5000` | Delay in milliseconds before reconnecting after connection failure |
 | `buffer_capacity` | Integer | `10000` | Channel capacity (minimum 1) — new entries are dropped on the proxy hot path when the in-memory buffer is full, with a warning log |
+| `schema` | Object | *(none)* | Inline customizable log schema; see [Customizing Transaction Log Output](log_schema.md) |
+| `schema_ref` | String | *(none)* | Name of a schema registered by `transaction_log_schema`; mutually exclusive with `schema` |
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is sent as a single JSON array text message over the WebSocket connection.
+
+Custom schemas apply to WebSocket disconnect records as well as ordinary
+HTTP/gRPC and TCP/UDP summaries. Disconnect-specific keys such as `event`,
+`frames_client_to_backend`, `frames_backend_to_client`, `direction`, and
+`io_side` can be renamed, omitted, or reordered; see the log-schema reference
+for the complete field list.
 
 `endpoint_url` must be a valid `ws://` or `wss://` URL with a hostname. Malformed or non-WebSocket URLs reject plugin creation at config load time.
 

@@ -26,7 +26,9 @@ use tokio::net::TcpStream;
 use tokio::time::Duration;
 use tracing::warn;
 
-use super::utils::log_schema::{SummaryLogEntryView, SummarySchema, resolve_schema};
+use super::utils::log_schema::{
+    SchemaCapabilities, SummaryLogEntryView, SummarySchema, resolve_schema,
+};
 use super::utils::{
     BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry, build_batch_config,
     parse_socket_host, resolve_tcp_endpoint, validate_batch_config,
@@ -111,7 +113,7 @@ impl TcpLogging {
         };
         validate_batch_config(config, "tcp_logging", batch_defaults)?;
 
-        let schema = resolve_schema(config, "tcp_logging")?;
+        let schema = resolve_schema(config, "tcp_logging", SchemaCapabilities::BASE)?;
         // Build the TLS connector once, here on the cold construction path. The
         // CA bundle is read + PEM-parsed synchronously inside
         // `build_tls_connector`; doing it now (rather than per reconnect inside
