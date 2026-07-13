@@ -8047,6 +8047,7 @@ async fn handle_websocket_request_authenticated(
     start_time: Instant,
     is_h2_websocket: bool,
     is_tls: bool,
+    mesh_inbound_pre_handshake_app_port: Option<u16>,
     cb_target_key: Option<String>,
     cb_is_half_open_probe: bool,
     requires_ws_frame_hooks: bool,
@@ -8520,6 +8521,36 @@ async fn handle_websocket_request_authenticated(
                         retry_cb_target_key =
                             Some(crate::circuit_breaker::target_key(&next.host, next.port));
                         retry_target = Some(next);
+                    }
+
+                    // A retry may rotate to a different app-port lane, and a
+                    // live PeerAuthentication reload may also tighten the
+                    // current lane during the retry backoff. Re-check before
+                    // acquiring any admission or circuit-breaker state for the
+                    // next target and before attempting its backend handshake.
+                    if let Some(mismatch) = mesh_inbound_peer_auth_transport_mismatch(
+                        &state,
+                        ctx.mesh_direction,
+                        mesh_inbound_pre_handshake_app_port,
+                        &proxy,
+                        retry_target.as_deref(),
+                        is_tls,
+                        ctx.tls_client_cert_der.is_some(),
+                    ) {
+                        return Ok(reject_mesh_inbound_peer_auth_transport_mismatch(
+                            &state,
+                            plugins.as_ref(),
+                            &mut ctx,
+                            &proxy,
+                            mismatch,
+                            is_tls,
+                            false,
+                            start_time,
+                            plugin_execution_ns,
+                            "mesh_inbound_peer_auth_retry_target_mismatch",
+                            Some(&original_request_path),
+                        )
+                        .await);
                     }
 
                     let mut retry_admitted_by_cb = true;
@@ -11545,8 +11576,8 @@ struct ListenerTlsSelection {
     /// posture; ordinary HTTPS listeners remain TLS-only.
     accepts_plaintext: bool,
     /// Captured app port used to select this TLS posture, after ingress alias
-    /// translation. Stashed on the connection so the post-route fast path
-    /// compares against the same port that governed the handshake.
+    /// translation. Stashed on the connection for mismatch diagnostics; the
+    /// request gate always consults the current live policy snapshot.
     mesh_inbound_pre_handshake_app_port: Option<u16>,
 }
 
@@ -11719,23 +11750,17 @@ fn mesh_inbound_peer_auth_app_port(proxy: &Proxy, upstream_target: Option<&Upstr
 
 fn mesh_inbound_requires_post_route_transport_gate(
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
-    pre_handshake_app_port: Option<u16>,
-    resolved_app_port: u16,
 ) -> bool {
-    if mesh_direction != Some(crate::modes::mesh::MeshTrafficDirection::Inbound) {
-        return false;
-    }
-    // A direct dial to a mesh inbound listener has no pre-routing app-port
-    // signal, so every resolved proxy needs the authoritative post-route check.
-    // Captured traffic additionally needs it whenever routing — including an
-    // operator-supplied explicit proxy — selects a different backend app port
-    // than the translated app port used to select the handshake posture.
-    pre_handshake_app_port.is_none()
-        || pre_handshake_app_port.is_some_and(|port| port != resolved_app_port)
+    // Every HTTP-family/HBONE request on a mesh inbound listener must consult
+    // the current atomic policy snapshot. In particular, a captured keep-alive
+    // connection may have completed its handshake under an older PERMISSIVE or
+    // DISABLE posture before live reload made the same app port STRICT.
+    mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
 }
 
 #[derive(Clone, Copy)]
 struct MeshInboundPeerAuthTransportMismatch {
+    pre_handshake_app_port: Option<u16>,
     resolved_app_port: u16,
     required_mode: crate::modes::mesh::config::MtlsMode,
 }
@@ -11750,11 +11775,7 @@ fn mesh_inbound_peer_auth_transport_mismatch(
     has_verified_peer_certificate: bool,
 ) -> Option<MeshInboundPeerAuthTransportMismatch> {
     let resolved_app_port = mesh_inbound_peer_auth_app_port(proxy, upstream_target);
-    if !mesh_inbound_requires_post_route_transport_gate(
-        mesh_direction,
-        pre_handshake_app_port,
-        resolved_app_port,
-    ) {
+    if !mesh_inbound_requires_post_route_transport_gate(mesh_direction) {
         return None;
     }
 
@@ -11766,6 +11787,7 @@ fn mesh_inbound_peer_auth_transport_mismatch(
         .unwrap_or(policy.default_mode);
     (!mesh_inbound_transport_satisfies_mode(required_mode, is_tls, has_verified_peer_certificate))
         .then_some(MeshInboundPeerAuthTransportMismatch {
+            pre_handshake_app_port,
             resolved_app_port,
             required_mode,
         })
@@ -11787,6 +11809,7 @@ async fn reject_mesh_inbound_peer_auth_transport_mismatch(
 ) -> Response<ProxyBody> {
     warn!(
         proxy_id = %proxy.id,
+        pre_handshake_app_port = ?mismatch.pre_handshake_app_port,
         resolved_app_port = mismatch.resolved_app_port,
         required_mode = ?mismatch.required_mode,
         transport_tls = is_tls,
@@ -15196,9 +15219,9 @@ async fn handle_proxy_request_inner(
 
     // The effective PeerAuthentication app port is not authoritative until
     // routing plugins have applied their overrides and load balancing has
-    // selected a concrete upstream target. Direct dials always require this
-    // gate. Captured connections skip it only when the final target port is the
-    // same translated app port that selected the pre-handshake TLS posture.
+    // selected a concrete upstream target. Re-check every inbound request
+    // against the current atomic policy snapshot so a keep-alive connection
+    // accepted before live reload cannot retain a weaker transport posture.
     if let Some(mismatch) = mesh_inbound_peer_auth_transport_mismatch(
         &state,
         ctx.mesh_direction,
@@ -15555,6 +15578,7 @@ async fn handle_proxy_request_inner(
             start_time,
             is_h2_ws,
             is_tls,
+            mesh_inbound_pre_handshake_app_port,
             cb_target_key,
             cb_is_half_open_probe,
             requires_ws_frame_hooks,
@@ -16413,6 +16437,36 @@ async fn handle_proxy_request_inner(
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
                     grpc_final_cb_key = grpc_current_cb_key.clone();
                     grpc_current_target = Some(next);
+                }
+
+                // Retry backoff and target rotation cross a fresh policy
+                // boundary: the selected app port may differ from the first
+                // attempt, and live reload may have tightened even the same
+                // port. Re-check before any retry-target breaker/admission
+                // state is acquired and before the gRPC pool can dispatch.
+                if let Some(mismatch) = mesh_inbound_peer_auth_transport_mismatch(
+                    &state,
+                    ctx.mesh_direction,
+                    mesh_inbound_pre_handshake_app_port,
+                    &proxy,
+                    grpc_current_target.as_deref(),
+                    is_tls,
+                    ctx.tls_client_cert_der.is_some(),
+                ) {
+                    return Ok(reject_mesh_inbound_peer_auth_transport_mismatch(
+                        &state,
+                        &plugins,
+                        &mut ctx,
+                        &proxy,
+                        mismatch,
+                        is_tls,
+                        true,
+                        start_time,
+                        plugin_execution_ns,
+                        "mesh_inbound_peer_auth_retry_target_mismatch",
+                        Some(&original_request_path),
+                    )
+                    .await);
                 }
 
                 // Re-screen the (possibly LB-rotated) retry target for mesh
@@ -18298,6 +18352,35 @@ async fn handle_proxy_request_inner(
                     current_dispatch_h3 = !requires_response_stream_inspection
                         && supports_native_http3_backend(&state, &proxy, current_target.as_deref());
                 }
+            }
+
+            // Re-evaluate the live PeerAuthentication snapshot for every
+            // retry attempt. The load balancer may have rotated to a target
+            // on another app-port lane, while even a same-target retry may
+            // follow a policy reload that tightened the current lane.
+            if let Some(mismatch) = mesh_inbound_peer_auth_transport_mismatch(
+                &state,
+                ctx.mesh_direction,
+                mesh_inbound_pre_handshake_app_port,
+                &proxy,
+                current_target.as_deref(),
+                is_tls,
+                ctx.tls_client_cert_der.is_some(),
+            ) {
+                return Ok(reject_mesh_inbound_peer_auth_transport_mismatch(
+                    &state,
+                    &plugins,
+                    &mut ctx,
+                    &proxy,
+                    mismatch,
+                    is_tls,
+                    is_grpc_request,
+                    start_time,
+                    plugin_execution_ns,
+                    "mesh_inbound_peer_auth_retry_target_mismatch",
+                    Some(&original_request_path),
+                )
+                .await);
             }
 
             if let Some(reason) =
@@ -37086,7 +37169,7 @@ mod tests {
         assert_eq!(
             selected.mesh_inbound_pre_handshake_app_port,
             Some(8080),
-            "the post-route comparison must retain the translated app port that selected TLS"
+            "rejection diagnostics must retain the translated app port that selected TLS"
         );
     }
 
@@ -37153,31 +37236,31 @@ mod tests {
 
         use crate::modes::mesh::MeshTrafficDirection;
 
-        assert!(mesh_inbound_requires_post_route_transport_gate(
-            Some(MeshTrafficDirection::Inbound),
-            None,
-            8080
-        ));
-        assert!(!mesh_inbound_requires_post_route_transport_gate(
-            Some(MeshTrafficDirection::Inbound),
-            Some(8080),
-            8080
-        ));
-        assert!(mesh_inbound_requires_post_route_transport_gate(
-            Some(MeshTrafficDirection::Inbound),
-            Some(9090),
-            8080
-        ));
-        assert!(mesh_inbound_requires_post_route_transport_gate(
-            Some(MeshTrafficDirection::Inbound),
-            Some(8080),
-            8443
-        ));
-        assert!(!mesh_inbound_requires_post_route_transport_gate(
-            Some(MeshTrafficDirection::Outbound),
-            None,
-            8080
-        ));
+        assert!(mesh_inbound_requires_post_route_transport_gate(Some(
+            MeshTrafficDirection::Inbound
+        )));
+        assert!(!mesh_inbound_requires_post_route_transport_gate(Some(
+            MeshTrafficDirection::Outbound
+        )));
+        assert!(!mesh_inbound_requires_post_route_transport_gate(None));
+
+        // Pin the shared retry trust boundary across the three target-rotation
+        // loops without constructing the full ProxyState needed by the live
+        // ArcSwap-backed policy check.
+        let src = include_str!("mod.rs");
+        let rotation_marker = ["backend_dispatch::select_next_", "retry_target("].concat();
+        let gate_marker = ["mesh_inbound_peer_auth_", "retry_target_mismatch"].concat();
+
+        let retry_rotation_count = src.matches(&rotation_marker).count();
+        let retry_gate_count = src.matches(&gate_marker).count();
+        assert_eq!(
+            retry_rotation_count, 3,
+            "update this guard when adding another HTTP/gRPC/WebSocket target-rotation loop"
+        );
+        assert_eq!(
+            retry_gate_count, retry_rotation_count,
+            "every backend target-rotation loop must re-check the effective app-port PeerAuthentication mode before retry dispatch"
+        );
     }
 
     /// The multi-port Sidecar egress authority rewrite: any client-supplied
