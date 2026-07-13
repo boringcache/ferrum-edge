@@ -97,15 +97,21 @@ streamPorts: []
 # crash-loops. A /0 CIDR is not protection; the chart rejects literal /0 entries
 # here, while the binary remains authoritative for equivalent permit-all unions.
 # If you set admin.allowedCidrs while using the computed exec probes, include the
-# exact 127.0.0.1/32 probe source so the admin TCP filter does not drop them.
+# exact probe source so the admin TCP filter does not drop them. The probe source
+# tracks admin.bindAddress: 127.0.0.1 for the empty default / 0.0.0.0, ::1 for ::,
+# and the configured address itself for any concrete bind (e.g. add 10.0.0.5/32
+# when admin.bindAddress=10.0.0.5).
 # -----------------------------------------------------------------------------
 admin:
   # Empty keeps the safe loopback default. Set to "0.0.0.0" or "::" to expose
   # admin through a Service (required when admin.service.enabled=true). Must be an
   # IP literal: the binary rejects any non-IP FERRUM_ADMIN_BIND_ADDRESS, so the
   # chart rejects hostnames ("localhost", "admin.internal", ...) at render — use
-  # "127.0.0.1" (or "::1") for loopback. An IPv6 loopback bind ("::1") also shifts
-  # the computed exec probes and the required probe-source allowlist entry to ::1.
+  # "127.0.0.1" (or "::1") for loopback. The admin listener binds ONLY this
+  # address, so the computed exec probes dial it directly: wildcard binds
+  # (0.0.0.0 / ::) probe loopback (127.0.0.1 / ::1), while a concrete bind (::1,
+  # 10.0.0.5, ...) is probed as-is — and any admin.allowedCidrs must then cover
+  # that same probe source.
   bindAddress: ""
   allowedCidrs: ""
   allowInsecureHttp: false
@@ -302,11 +308,21 @@ secretVolumeDefaultMode: 288
 secretFileMounts: []
 
 # Extra simple string env vars (map form). Reserved keys managed by first-class
-# values (FERRUM_MODE, FERRUM_DB_*, FERRUM_ADMIN_JWT_SECRET, etc.) are rejected.
+# values (FERRUM_MODE, FERRUM_DB_*, FERRUM_ADMIN_JWT_SECRET, etc.) are rejected,
+# as are their external-secret resolver suffixes (_VAULT/_AWS/_AZURE/_GCP/_FILE):
+# a suffixed source of a chart-managed base var resolves into that base var and
+# would collide with the chart's own source at startup. Use the dedicated value
+# (existingSecret / valueFrom / secretFileMounts) to source a managed secret.
 # Example: FERRUM_LOG_LEVEL: info
+# Enabling HTTP/3 (FERRUM_ENABLE_HTTP3: "true") makes the proxy Service publish
+# its HTTPS port on UDP too (QUIC); it needs frontend TLS (or dp mode) and a
+# nonzero ports.proxyHttps.
 env: {}
 
-# Extra raw env entries (list form) for valueFrom / fieldRef cases.
+# Extra raw env entries (list form) for valueFrom / fieldRef cases. The same
+# reserved-name guard (including the resolver suffixes above) applies. A
+# valueFrom-sourced FERRUM_ENABLE_HTTP3 cannot be inspected at render, so those
+# installs must hand-add the UDP Service/stream port for QUIC.
 #   - name: FERRUM_DB_CONFIG_BACKUP_PATH
 #     value: /etc/ferrum/backup-config.json
 extraEnv: []
@@ -403,7 +419,9 @@ topologySpreadConstraints: []
 # Proxy Service (front-door). Publishes proxyHttp; proxyHttps only when
 # tls.frontend is enabled with a Secret (file/database) or in dp mode where the
 # HTTPS listener binds on the port alone and hot-swaps CP-delivered TLS; plus any
-# streamPorts marked `service: true`.
+# streamPorts marked `service: true`. When HTTP/3 is enabled
+# (env.FERRUM_ENABLE_HTTP3: "true") the HTTPS port is also published on UDP
+# (QUIC) alongside the TCP entry.
 service:
   enabled: true
   type: ClusterIP

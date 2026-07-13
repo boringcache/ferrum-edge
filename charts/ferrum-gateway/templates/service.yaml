@@ -8,6 +8,9 @@
 {{- $httpsListenerActive := or (and $frontendTls.enabled $frontendTls.secretName) (eq .Values.mode "dp") -}}
 {{- $hasHttp := and (hasKey $ports "proxyHttp") (ne ($ports.proxyHttp | toString) "0") -}}
 {{- $hasHttps := and (hasKey $ports "proxyHttps") (ne ($ports.proxyHttps | toString) "0") $httpsListenerActive -}}
+{{/* HTTP/3 (QUIC) rides UDP on the SAME HTTPS port; when enabled the Service must
+     publish a UDP port next to the TCP one or kube-proxy drops the QUIC datagrams. */}}
+{{- $hasHttp3 := and $hasHttps (eq (include "ferrum-gateway.http3Enabled" .) "true") -}}
 {{- $hasStreamSvc := false -}}
 {{- range .Values.streamPorts -}}{{- if .service -}}{{- $hasStreamSvc = true -}}{{- end -}}{{- end -}}
 {{/* Skip the Service entirely when no port would be published — a ClusterIP with
@@ -40,6 +43,12 @@ spec:
       port: {{ .Values.service.httpsPort | default 443 }}
       targetPort: proxy-https
       protocol: TCP
+    {{- if $hasHttp3 }}
+    - name: https-quic
+      port: {{ .Values.service.httpsPort | default 443 }}
+      targetPort: proxy-h3-udp
+      protocol: UDP
+    {{- end }}
     {{- end }}
     {{- range .Values.streamPorts }}
     {{- if .service }}

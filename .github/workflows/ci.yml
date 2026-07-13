@@ -2557,6 +2557,97 @@ jobs:
             echo "::error title=Null minAvailable still rendered::minAvailable: null must fall through to maxUnavailable"
             exit 1
           fi
+          # A concrete non-loopback admin bind is probed at that exact address: the
+          # runtime binds admin only there, so dialing 127.0.0.1 would restart-loop.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set admin.bindAddress=10.0.0.5 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/concrete-bind.yaml"
+          concrete_probe="$(awk '/^[[:space:]]+readinessProbe:/{f=1} f{print} f&&/periodSeconds:/{exit}' "$RUNNER_TEMP/ferrum-gateway-helm-results/concrete-bind.yaml")"
+          if ! grep -q -- '- 10.0.0.5' <<<"$concrete_probe"; then
+            echo "::error title=Concrete bind probe host mismatch::admin.bindAddress=10.0.0.5 must produce a --host 10.0.0.5 probe"
+            exit 1
+          fi
+          # allowedCidrs must cover that concrete probe source or render fails.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set admin.bindAddress=10.0.0.5 \
+            --set-string admin.allowedCidrs=192.168.0.0/16 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/concrete-cidr-missing.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/concrete-cidr-missing.err"; then
+            echo "::error title=Probe source omitted from allowlist::a concrete-bind probe source must be required"
+            exit 1
+          fi
+          grep -F 'must include 10.0.0.5/32' "$RUNNER_TEMP/ferrum-gateway-helm-results/concrete-cidr-missing.err"
+          # The exact probe source (or a covering CIDR) satisfies the guard.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set admin.bindAddress=10.0.0.5 \
+            --set-string admin.allowedCidrs=10.0.0.5/32 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/concrete-cidr-present.yaml"
+          # A resolver-suffixed source of a chart-managed base var is reserved: it
+          # resolves into the base var and would collide with the chart's own
+          # source at secret resolution (resolve_all_env_secrets aborts startup).
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set-string env.FERRUM_ADMIN_JWT_SECRET_VAULT=secret/data/ferrum#admin \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/env-suffix-reserved.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/env-suffix-reserved.err"; then
+            echo "::error title=Reserved suffix env accepted::a resolver-suffixed managed var must be reserved"
+            exit 1
+          fi
+          grep -F 'env.FERRUM_ADMIN_JWT_SECRET_VAULT is managed by first-class' "$RUNNER_TEMP/ferrum-gateway-helm-results/env-suffix-reserved.err"
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set 'extraEnv[0].name=FERRUM_DB_URL_FILE' \
+            --set-string 'extraEnv[0].value=/etc/ferrum/db-url' \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/extraenv-suffix-reserved.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/extraenv-suffix-reserved.err"; then
+            echo "::error title=Reserved suffix extraEnv accepted::a resolver-suffixed managed var must be reserved"
+            exit 1
+          fi
+          grep -F 'extraEnv entry FERRUM_DB_URL_FILE is managed by first-class' "$RUNNER_TEMP/ferrum-gateway-helm-results/extraenv-suffix-reserved.err"
+          # HTTP/3 (QUIC) via the env passthrough publishes the HTTPS port on UDP
+          # too, and declares the UDP container port the Service targets by name.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set tls.frontend.enabled=true --set tls.frontend.secretName=ferrum-frontend-tls \
+            --set-string env.FERRUM_ENABLE_HTTP3=true \
+            --show-only templates/service.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/http3-service.yaml"
+          grep -Fq -- '- name: https-quic' "$RUNNER_TEMP/ferrum-gateway-helm-results/http3-service.yaml"
+          quic_block="$(awk '/- name: https-quic/{f=1} f{print} f&&/protocol:/{exit}' "$RUNNER_TEMP/ferrum-gateway-helm-results/http3-service.yaml")"
+          if ! grep -q 'protocol: UDP' <<<"$quic_block"; then
+            echo "::error title=QUIC Service port not UDP::https-quic must be protocol UDP"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set tls.frontend.enabled=true --set tls.frontend.secretName=ferrum-frontend-tls \
+            --set-string env.FERRUM_ENABLE_HTTP3=true \
+            --show-only templates/deployment.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/http3-deploy.yaml"
+          grep -Fq -- '- name: proxy-h3-udp' "$RUNNER_TEMP/ferrum-gateway-helm-results/http3-deploy.yaml"
+          # The binary bool also accepts "1" through extraEnv (list form).
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set tls.frontend.enabled=true --set tls.frontend.secretName=ferrum-frontend-tls \
+            --set 'extraEnv[0].name=FERRUM_ENABLE_HTTP3' --set-string 'extraEnv[0].value=1' \
+            --show-only templates/service.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/http3-extraenv-service.yaml"
+          grep -Fq -- '- name: https-quic' "$RUNNER_TEMP/ferrum-gateway-helm-results/http3-extraenv-service.yaml"
+          # Frontend TLS without HTTP/3 stays TCP-only (no dead UDP port).
+          if grep -Fq -- '- name: https-quic' "$RUNNER_TEMP/ferrum-gateway-helm-results/frontend-tls-rendered.yaml"; then
+            echo "::error title=QUIC port without HTTP/3::https-quic must only render when FERRUM_ENABLE_HTTP3 is enabled"
+            exit 1
+          fi
+          # HTTP/3 enabled without an active HTTPS listener publishes no UDP port
+          # (the QUIC listener needs frontend TLS / dp mode to start).
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set-string env.FERRUM_ENABLE_HTTP3=true \
+            --show-only templates/service.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/http3-no-tls-service.yaml"
+          if grep -Fq -- '- name: https-quic' "$RUNNER_TEMP/ferrum-gateway-helm-results/http3-no-tls-service.yaml"; then
+            echo "::error title=QUIC port without HTTPS listener::https-quic must require an active HTTPS listener"
+            exit 1
+          fi
 
       - name: Upload core gateway chart diagnostics
         if: always() && steps.helm_changes.outputs.changed == 'true'

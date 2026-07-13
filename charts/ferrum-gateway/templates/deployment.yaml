@@ -99,6 +99,13 @@ spec:
             - name: proxy-https
               containerPort: {{ $ports.proxyHttps }}
               protocol: TCP
+            {{- if eq (include "ferrum-gateway.http3Enabled" .) "true" }}
+            {{/* HTTP/3 (QUIC) listens on the same HTTPS port over UDP; declare the
+                 UDP container port the proxy Service targets by name. */}}
+            - name: proxy-h3-udp
+              containerPort: {{ $ports.proxyHttps }}
+              protocol: UDP
+            {{- end }}
             {{- end }}
             {{- if and (hasKey $ports "adminHttp") (ne ($ports.adminHttp | toString) "0") }}
             - name: admin-http

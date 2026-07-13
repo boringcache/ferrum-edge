@@ -79,8 +79,12 @@ node_agent, migrate) fails at template time with a pointer to the right chart.
   first-class values (mode, DB, JWTs, ports, bind address, allowlist, TLS paths,
   shutdown drain, DP URLs, gRPC plaintext opt-in, ...) is reserved: setting it
   through `env` or `extraEnv` fails render, so the process can never drift from
-  the rendered probes/Services/ports. Generated `<name>_FILE` vars from
-  `secretFileMounts` are reserved too, so `env`/`extraEnv` cannot shadow a
+  the rendered probes/Services/ports. Their external-secret resolver suffixes
+  (`_VAULT`/`_AWS`/`_AZURE`/`_GCP`/`_FILE`) are reserved too — a suffixed source
+  of a managed base var (e.g. `FERRUM_ADMIN_JWT_SECRET_VAULT`) resolves into that
+  base var and would collide with the chart's own source, aborting startup with
+  "Multiple secret sources configured". Generated `<name>_FILE` vars from
+  `secretFileMounts` are reserved as well, so `env`/`extraEnv` cannot shadow a
   required secret's file source.
 - **TLS and `_FILE` Secret mounts are non-root readable.** They default to mode
   `0440` with pod `fsGroup: 65532`, matching the distroless nonroot image. Both
@@ -104,6 +108,13 @@ means an alive-but-unready pod (e.g. a `dp` that has lost its `cp`) is dropped
 from Service endpoints **without** being restart-looped by liveness — never
 point liveness at `/health`. The defaults use the exec `ferrum-edge health`
 command and auto-switch to the TLS variant when `ports.adminHttp=0`.
+
+The exec probes dial the admin listener at its configured bind address, because
+the runtime binds admin ONLY to `admin.bindAddress`. Wildcard binds probe
+loopback (`0.0.0.0`→`127.0.0.1`, `::`→`::1`); a concrete bind is probed as-is
+(`::1`, `10.0.0.5`, ...). If you also set `admin.allowedCidrs`, it must cover
+that same probe source or the admin TCP allowlist drops the in-pod checks — the
+chart fails render otherwise.
 
 Liveness and readiness have **separate** override knobs so a custom handler
 cannot silently re-couple them. Replace only one probe's computed handler with
@@ -179,6 +190,15 @@ The admin Service publishes `admin-https` only when `tls.admin` is enabled with 
 Secret. If no proxy port would be published (all proxy ports `0`, no frontend
 TLS, no `service: true` stream port), the proxy Service is skipped entirely
 rather than rendering an API-server-rejected empty `ports:` block.
+
+Enabling HTTP/3 through the supported env passthrough (`env.FERRUM_ENABLE_HTTP3:
+"true"`) starts a QUIC listener on the same `ports.proxyHttps` port over UDP. The
+chart then adds a `proxy-h3-udp` container port and a `https-quic` UDP entry on
+the proxy Service next to the TCP `https` port, so kube-proxy forwards the QUIC
+datagrams (the UDP port renders only when the HTTPS listener is active — frontend
+TLS with a Secret, or `dp` mode, and a nonzero `ports.proxyHttps`). A
+`valueFrom`-sourced `FERRUM_ENABLE_HTTP3` can't be read at render, so those
+installs must hand-add the UDP port.
 Raw TCP/UDP stream proxy listeners are declared under `streamPorts` and, when
 `service: true`, are published on the proxy Service:
 

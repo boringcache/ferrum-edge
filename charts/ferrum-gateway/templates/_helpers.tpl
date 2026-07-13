@@ -104,18 +104,45 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- if hasKey $ports "adminHttps" -}}{{- $ports.adminHttps -}}{{- else -}}9443{{- end -}}
 {{- end -}}
 
-{{/* Loopback host the computed exec probes must dial. Any IPv6 bind form (::,
-     [::], ::1, [::1]) makes the admin listener bind [::]/[::1], which is not
-     guaranteed to accept IPv4-mapped 127.0.0.1 (v4-mapped acceptance depends on
-     IPV6_V6ONLY / dual-stack, which the runtime does not force), so the probe
-     (and any allowlist entry) must use IPv6 loopback ::1 for every IPv6 bind.
-     ::1 always reaches a listener bound to :: or ::1. IPv4 binds (0.0.0.0,
-     127.0.0.1) keep the 127.0.0.1 default. Detection: an IPv6 literal is the
-     only bind form containing ':'. */}}
+{{/* "true" when HTTP/3 (QUIC) is enabled through the supported env passthrough.
+     FERRUM_ENABLE_HTTP3 is not a chart first-class value, so operators set it via
+     env/extraEnv; when true (parsed like the binary's bool: trimmed, lowercased,
+     "true"/"1") the serving modes start a QUIC listener on FERRUM_PROXY_HTTPS_PORT
+     (docs/http3.md, src/modes/{database,file,data_plane}.rs). The proxy Service
+     must then publish that HTTPS port on UDP or kube-proxy won't forward QUIC.
+     valueFrom-sourced extraEnv values can't be inspected here — those installs
+     must hand-add the UDP Service port (documented in values.yaml/README). */}}
+{{- define "ferrum-gateway.http3Enabled" -}}
+{{- $enabled := false -}}
+{{- $env := .Values.env | default dict -}}
+{{- if hasKey $env "FERRUM_ENABLE_HTTP3" -}}
+{{- if has (lower (trim (toString (get $env "FERRUM_ENABLE_HTTP3")))) (list "true" "1") -}}{{- $enabled = true -}}{{- end -}}
+{{- end -}}
+{{- range $entry := .Values.extraEnv | default list -}}
+{{- if and (eq (toString $entry.name) "FERRUM_ENABLE_HTTP3") (has (lower (trim (toString ($entry.value | default "")))) (list "true" "1")) -}}{{- $enabled = true -}}{{- end -}}
+{{- end -}}
+{{- if $enabled -}}true{{- end -}}
+{{- end -}}
+
+{{/* Host the computed exec probes must dial. The admin listener binds ONLY the
+     configured FERRUM_ADMIN_BIND_ADDRESS, so a probe dialing 127.0.0.1 cannot
+     reach a listener bound to a concrete non-loopback address (a pod/host IP, or
+     even 127.0.0.2) — the kubelet then restart-loops the pod. Target the exact
+     configured bind whenever it is concrete, and fall back to loopback ONLY for
+     the wildcard forms:
+       - IPv4 wildcard 0.0.0.0 (and the empty default, which binds loopback) → 127.0.0.1
+       - IPv6 wildcard :: / [::] → ::1 (a [::]-bound listener is not guaranteed to
+         accept v4-mapped 127.0.0.1: acceptance depends on IPV6_V6ONLY / dual-stack,
+         which the runtime does not force; ::1 always reaches :: or ::1)
+       - any concrete literal (127.0.0.1, 127.0.0.2, 10.0.0.5, ::1, fd00::1, ...) →
+         itself; `ferrum-edge health --host` brackets bare IPv6 literals for us. */}}
 {{- define "ferrum-gateway.probeHost" -}}
 {{- $bind := (.Values.admin | default dict).bindAddress | default "" -}}
 {{- $bind = trimSuffix "]" (trimPrefix "[" $bind) -}}
-{{- if contains ":" $bind -}}::1{{- else -}}127.0.0.1{{- end -}}
+{{- if or (eq $bind "") (eq $bind "0.0.0.0") -}}127.0.0.1
+{{- else if eq $bind "::" -}}::1
+{{- else -}}{{ $bind }}
+{{- end -}}
 {{- end -}}
 
 {{/* "true" when the value parses as an IPv4 or IPv6 literal, else "". Mirrors
@@ -501,18 +528,22 @@ Validation: fail render on missing/unsafe configuration.
 {{- end -}}
 {{- end -}}
 {{- if and $admin.allowedCidrs (or $defaultLiveProbe $defaultReadyProbe) -}}
+{{/* The exec probes connect FROM the exact probe host (loopback for wildcard
+     binds, the configured concrete address otherwise), and the admin accept loop
+     applies allowedCidrs to that source like any other. Require the allowlist to
+     cover the same host the probes dial, keyed off ferrum-gateway.probeHost. */}}
 {{- $probeHost := include "ferrum-gateway.probeHost" . -}}
-{{- $hasProbeLoopback := false -}}
-{{- if eq $probeHost "::1" -}}
-{{- $hasProbeLoopback = regexMatch "(^|[[:space:],])\\[?::1\\]?(/128)?([[:space:],]|$)" $admin.allowedCidrs -}}
+{{- $probeIsV6 := contains ":" $probeHost -}}
+{{- $probeEscaped := $probeHost | replace "." "\\." -}}
+{{- $hasProbeSource := false -}}
+{{- if $probeIsV6 -}}
+{{- $hasProbeSource = regexMatch (printf "(^|[[:space:],])\\[?%s\\]?(/128)?([[:space:],]|$)" $probeEscaped) $admin.allowedCidrs -}}
 {{- else -}}
-{{- $hasProbeLoopback = regexMatch "(^|[[:space:],])127\\.0\\.0\\.1(/32)?([[:space:],]|$)" $admin.allowedCidrs -}}
+{{- $hasProbeSource = regexMatch (printf "(^|[[:space:],])%s(/32)?([[:space:],]|$)" $probeEscaped) $admin.allowedCidrs -}}
 {{- end -}}
-{{- if not $hasProbeLoopback -}}
-{{- if eq $probeHost "::1" -}}
-{{- fail "admin.allowedCidrs must include ::1/128 (or bare ::1) while the default exec probes are enabled with an IPv6 loopback admin.bindAddress; the admin TCP allowlist otherwise drops the in-pod health checks. Add the exact probe source or override/disable every computed probe handler." -}}
-{{- end -}}
-{{- fail "admin.allowedCidrs must include 127.0.0.1/32 (or bare 127.0.0.1) while the default exec probes are enabled; the admin TCP allowlist otherwise drops the in-pod health checks. Add the exact probe source or override/disable every computed probe handler." -}}
+{{- if not $hasProbeSource -}}
+{{- $probeCidr := ternary (printf "%s/128" $probeHost) (printf "%s/32" $probeHost) $probeIsV6 -}}
+{{- fail (printf "admin.allowedCidrs must include %s (or bare %s) while the default exec probes are enabled; the computed exec probes dial the admin.bindAddress %s and the admin TCP allowlist otherwise drops the in-pod health checks. Add the exact probe source (or a covering CIDR) or override/disable every computed probe handler." $probeCidr $probeHost $probeHost) -}}
 {{- end -}}
 {{- end -}}
 {{/* Graceful shutdown: give the pod time to drain plus the ~5s cleanup window.
@@ -734,9 +765,24 @@ FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRE
      can shadow a chart-managed FERRUM_* var. */}}
 {{- define "ferrum-gateway.userEnv" -}}
 {{- $reserved := splitList " " (include "ferrum-gateway.reservedEnv" .) -}}
+{{/* External-secret resolver suffixes (_VAULT/_AWS/_AZURE/_GCP/_FILE, see
+     src/secrets/registry.rs) of a chart-managed base var resolve INTO that base
+     var before config load. When the chart already renders the base directly
+     (existingSecret / valueFrom / value / structured), a user-supplied suffixed
+     source makes resolve_all_env_secrets() see multiple sources for one base key
+     and abort startup ("Multiple secret sources configured for ..."). Reserve
+     every suffixed form of every chart-managed FERRUM_* var so env/extraEnv
+     cannot introduce a second, conflicting source the render guards can't see. */}}
+{{- $suffixes := list "_VAULT" "_AWS" "_AZURE" "_GCP" "_FILE" -}}
+{{- range $name := (splitList " " (include "ferrum-gateway.reservedEnv" .)) -}}
+{{- range $sfx := $suffixes -}}
+{{- $reserved = append $reserved (printf "%s%s" $name $sfx) -}}
+{{- end -}}
+{{- end -}}
 {{/* secretFileMounts emit <name>_FILE env vars later in the container spec, so
      reserve those generated names too — otherwise env/extraEnv could shadow a
-     required secret's file source after the source guard already accepted it. */}}
+     required secret's file source after the source guard already accepted it.
+     (secretFileMounts names may be any FERRUM_* var, not only reserved ones.) */}}
 {{- range .Values.secretFileMounts -}}
 {{- if .name -}}{{- $reserved = append $reserved (printf "%s_FILE" .name) -}}{{- end -}}
 {{- end -}}
