@@ -28,8 +28,8 @@ use super::{
     proxy_for_route, request_termination_plugin_for_proxy, resource_id,
     route_backends_require_node_waypoint_authz, route_local_fault_value_for_rule,
     route_request_transformer_plugin_for_proxy, route_response_transformer_plugin_for_proxy,
-    selector_from_istio, sidecar_selector_from_istio, string_array, string_field, string_map,
-    upstream_for_route, workload_entry_service_key_from_host,
+    sidecar_selector_from_istio, string_array, string_field, string_map, upstream_for_route,
+    workload_entry_service_key_from_host, workload_selector_from_istio,
 };
 use crate::config::types::{
     BackendScheme, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
@@ -915,16 +915,9 @@ fn istio_policy_scope(
     selector: Option<&Value>,
 ) -> PolicyScope {
     let is_root_namespace = object.metadata.namespace == options.istio_root_namespace;
-    // Kubernetes JSON can preserve an explicitly-null optional selector. Istio
-    // treats that the same as an omitted selector; only an actual selector
-    // object (including an explicit empty `{}` selector) creates workload scope.
-    match selector.filter(|selector| !selector.is_null()) {
-        Some(selector) => PolicyScope::WorkloadSelector {
-            selector: WorkloadSelector {
-                labels: selector_from_istio(Some(selector)),
-                namespace: (!is_root_namespace).then(|| object.metadata.namespace.clone()),
-            },
-        },
+    let selector_namespace = (!is_root_namespace).then(|| object.metadata.namespace.clone());
+    match workload_selector_from_istio(selector, selector_namespace) {
+        Some(selector) => PolicyScope::WorkloadSelector { selector },
         None if is_root_namespace => PolicyScope::MeshWide,
         None => PolicyScope::Namespace {
             namespace: object.metadata.namespace.clone(),
@@ -5823,66 +5816,81 @@ mod tests {
     }
 
     #[test]
-    fn root_namespace_peer_authentication_without_selector_is_mesh_wide() {
-        let mut peer_auth = object(
-            "PeerAuthentication",
-            serde_json::json!({
+    fn root_namespace_peer_authentication_without_nonempty_selector_is_mesh_wide() {
+        for selector in [
+            None,
+            Some(Value::Null),
+            Some(serde_json::json!({"matchLabels": {}})),
+        ] {
+            let mut spec = serde_json::json!({
                 "mtls": {"mode": "STRICT"}
-            }),
-        );
-        peer_auth.metadata.namespace = "istio-config".to_string();
+            });
+            if let Some(selector) = selector {
+                spec["selector"] = selector;
+            }
+            let mut peer_auth = object("PeerAuthentication", spec);
+            peer_auth.metadata.namespace = "istio-config".to_string();
 
-        let result = translate_k8s_objects(
-            &[peer_auth],
-            options_for_namespace("istio-config")
-                .with_istio_root_namespace("istio-config".to_string()),
-        )
-        .expect("translation succeeds");
+            let result = translate_k8s_objects(
+                &[peer_auth],
+                options_for_namespace("istio-config")
+                    .with_istio_root_namespace("istio-config".to_string()),
+            )
+            .expect("translation succeeds");
 
-        let mesh = result.config.mesh.expect("mesh config");
-        assert!(matches!(
-            mesh.peer_authentications[0].scope,
-            Some(PolicyScope::MeshWide)
-        ));
+            let mesh = result.config.mesh.expect("mesh config");
+            assert!(matches!(
+                mesh.peer_authentications[0].scope,
+                Some(PolicyScope::MeshWide)
+            ));
+        }
     }
 
     #[test]
-    fn null_peer_authentication_selector_is_namespace_scoped() {
-        let result = translate_k8s_objects(
-            &[object(
-                "PeerAuthentication",
-                serde_json::json!({
-                    "selector": null,
-                    "mtls": {"mode": "STRICT"},
-                    "portLevelMtls": {
-                        "8080": {"mode": "DISABLE"}
-                    }
-                }),
-            )],
-            options(),
-        )
-        .expect("translation succeeds");
+    fn empty_peer_authentication_selectors_are_namespace_scoped() {
+        for (case, selector) in [
+            ("null", Value::Null),
+            ("empty matchLabels", serde_json::json!({"matchLabels": {}})),
+        ] {
+            let result = translate_k8s_objects(
+                &[object(
+                    "PeerAuthentication",
+                    serde_json::json!({
+                        "selector": selector,
+                        "mtls": {"mode": "STRICT"},
+                        "portLevelMtls": {
+                            "8080": {"mode": "DISABLE"}
+                        }
+                    }),
+                )],
+                options(),
+            )
+            .expect("translation succeeds");
 
-        let mesh = result.config.mesh.expect("mesh config");
-        let peer_auth = &mesh.peer_authentications[0];
-        assert!(matches!(
-            &peer_auth.scope,
-            Some(PolicyScope::Namespace { namespace }) if namespace == "default"
-        ));
-        assert!(
-            peer_auth.selector.is_none(),
-            "a null selector must not become an empty workload selector"
-        );
-        assert_eq!(
-            crate::modes::mesh::slice::resolve_effective_mtls_mode(
-                std::slice::from_ref(peer_auth),
-                "default",
-                &HashMap::<String, String>::new(),
-                8080,
-            ),
-            MtlsMode::Strict,
-            "portLevelMtls must remain ignored when selector is explicitly null"
-        );
+            let mesh = result.config.mesh.expect("mesh config");
+            let peer_auth = &mesh.peer_authentications[0];
+            assert!(
+                matches!(
+                    &peer_auth.scope,
+                    Some(PolicyScope::Namespace { namespace }) if namespace == "default"
+                ),
+                "{case} selector must use namespace scope"
+            );
+            assert!(
+                peer_auth.selector.is_none(),
+                "{case} selector must not become a workload selector"
+            );
+            assert_eq!(
+                crate::modes::mesh::slice::resolve_effective_mtls_mode(
+                    std::slice::from_ref(peer_auth),
+                    "default",
+                    &HashMap::<String, String>::new(),
+                    8080,
+                ),
+                MtlsMode::Strict,
+                "portLevelMtls must remain ignored for a {case} selector"
+            );
+        }
     }
 
     #[test]
