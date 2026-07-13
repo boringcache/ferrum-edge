@@ -3,19 +3,26 @@ use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 use tracing::warn;
 
 use crate::config::types::GatewayConfig;
 use crate::config_sources::k8s::{
     GatewayApiMaterializedRouteParent, GatewayApiRouteConflict, GatewayApiRouteConflictKey,
     K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslationOptions,
-    gateway_api_route_conflict_keys_with_context, resource_id,
-    secret_object_is_valid_tls_certificate, translate_k8s_objects_with_filter,
+    gateway_api_route_conflict_keys_with_context, secret_object_is_valid_tls_certificate,
+    translate_k8s_objects_with_filter,
 };
 
 pub const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
+/// Stable server-side-apply owner shared by every Ferrum controller replica.
+/// Using the Gateway API controller name keeps ownership stable across restarts
+/// and replicas without inventing a pod- or process-specific identity.
+const GATEWAY_API_STATUS_FIELD_MANAGER: &str = FERRUM_GATEWAY_CONTROLLER_NAME;
 const DEFAULT_FERRUM_GATEWAY_CLASS_NAME: &str = "ferrum";
 const GATEWAY_API_STATUS_PATCH_PARALLELISM: usize = 32;
+const ROUTE_STATUS_PATCH_MAX_ATTEMPTS: usize = 5;
+const ROUTE_STATUS_PATCH_RETRY_BASE_MS: u64 = 10;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GatewayApiStatusUpdate {
@@ -83,36 +90,11 @@ impl GatewayApiStatusWriter {
             let kind = update.kind.clone();
             let namespace = update.namespace.clone();
             Some(async move {
-                let result = async {
-                    let live_status = match api.get_status(&name).await {
-                        Ok(live) => live.data.get("status").cloned(),
-                        Err(error) => {
-                            warn!(
-                                api_version = %update.api_version,
-                                kind = %update.kind,
-                                namespace = %update.namespace,
-                                name = %update.name,
-                                error = %error,
-                                "Gateway API status read failed; attempting status patch from planned state"
-                            );
-                            None
-                        }
-                    };
-                    let patch = status_patch_for_update(&update, live_status.as_ref());
-                    // TODO(ssa): switch to Patch::Apply once the chart guarantees the
-                    // status subresource accepts server-side apply. JSON Merge Patch
-                    // (RFC 7396) replaces arrays wholesale, leaving a narrow TOCTOU
-                    // window between `get_status` and `patch_status` against other
-                    // controllers writing the same `parents[]` array.
-                    let params = PatchParams {
-                        field_manager: Some(FERRUM_GATEWAY_CONTROLLER_NAME.to_string()),
-                        ..PatchParams::default()
-                    };
-                    api.patch_status(&name, &params, &Patch::Merge(&patch))
-                        .await
-                        .map(|_| ())
-                }
-                .await;
+                let result = if route_status_kind(&update.kind) {
+                    patch_route_status_with_retry(&api, &update).await
+                } else {
+                    patch_gateway_status_with_apply(&api, &update).await
+                };
                 (kind, namespace, name, result)
             })
         });
@@ -140,6 +122,102 @@ impl GatewayApiStatusWriter {
             None => Ok(()),
         }
     }
+}
+
+async fn patch_gateway_status_with_apply(
+    api: &Api<DynamicObject>,
+    update: &GatewayApiStatusUpdate,
+) -> Result<(), kube::Error> {
+    let live_status = match api.get_status(&update.name).await {
+        Ok(live) => live.data.get("status").cloned(),
+        Err(error) => {
+            warn!(
+                api_version = %update.api_version,
+                kind = %update.kind,
+                namespace = %update.namespace,
+                name = %update.name,
+                error = %error,
+                "Gateway API status read failed; applying planned Gateway status"
+            );
+            None
+        }
+    };
+    let patch = gateway_status_apply_patch_for_update(update, live_status.as_ref());
+
+    // Gateway/GatewayClass condition and listener arrays are structural
+    // list-maps, so SSA can own Ferrum's keyed entries without copying fields
+    // owned by another manager. Force adopts Ferrum's legacy merge-patch fields;
+    // the apply document remains limited to the status fields Ferrum reconciles.
+    let params = gateway_api_status_apply_params();
+    api.patch_status(&update.name, &params, &Patch::Apply(&patch))
+        .await
+        .map(|_| ())
+}
+
+async fn patch_route_status_with_retry(
+    api: &Api<DynamicObject>,
+    update: &GatewayApiStatusUpdate,
+) -> Result<(), kube::Error> {
+    for attempt in 1..=ROUTE_STATUS_PATCH_MAX_ATTEMPTS {
+        let live = api.get_status(&update.name).await?;
+        let Some(resource_version) = live.metadata.resource_version.as_deref() else {
+            warn!(
+                api_version = %update.api_version,
+                kind = %update.kind,
+                namespace = %update.namespace,
+                name = %update.name,
+                "Gateway API route status read returned no resourceVersion; leaving resource for the next reconcile"
+            );
+            return Ok(());
+        };
+        let patch =
+            route_status_merge_patch_for_update(update, live.data.get("status"), resource_version);
+        let params = route_status_patch_params();
+        match api
+            .patch_status(&update.name, &params, &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if kube_error_is_conflict(&error) && attempt < ROUTE_STATUS_PATCH_MAX_ATTEMPTS =>
+            {
+                tokio::time::sleep(route_status_retry_delay(attempt)).await;
+            }
+            Err(error) if kube_error_is_conflict(&error) => {
+                warn!(
+                    api_version = %update.api_version,
+                    kind = %update.kind,
+                    namespace = %update.namespace,
+                    name = %update.name,
+                    attempts = ROUTE_STATUS_PATCH_MAX_ATTEMPTS,
+                    error = %error,
+                    "Gateway API route status remained conflicted; leaving resource for the next reconcile"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
+fn route_status_kind(kind: &str) -> bool {
+    matches!(kind, "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute")
+}
+
+fn kube_error_is_conflict(error: &kube::Error) -> bool {
+    matches!(error, kube::Error::Api(response) if response.code == 409)
+}
+
+fn route_status_retry_delay(attempt: usize) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(6) as u32;
+    let base_ms = ROUTE_STATUS_PATCH_RETRY_BASE_MS
+        .saturating_mul(1_u64 << exponent)
+        .min(100);
+    let jitter_window_ms = (base_ms / 2).max(1);
+    let jitter_ms = crate::util::backoff::random_backoff_entropy() % jitter_window_ms;
+    Duration::from_millis(base_ms.saturating_sub(base_ms / 4) + jitter_ms)
 }
 
 pub fn plan_gateway_api_status_updates(
@@ -1129,10 +1207,22 @@ fn route_status(
     route_conflicts: &[&GatewayApiRouteConflict],
     route_keys: &[GatewayApiRouteConflictKey],
 ) -> Value {
+    // The translator records this typed route -> parentRef relationship at
+    // the point where it emits HTTP, gRPC, TCP, or TLS proxies. Keep that
+    // forward mapping authoritative here: proxy IDs are operational names,
+    // not a status back-reference contract, and must never be parsed to
+    // reconstruct their source route.
+    let materialized_parent_refs: HashSet<String> = match result {
+        Ok(translation) => materialized_route_parent_refs_for_route(
+            &translation.materialized_route_parents,
+            object,
+        ),
+        Err(_) => HashSet::new(),
+    };
     let (accepted, resolved_refs, programmed, accepted_reason, resolved_refs_reason, message) =
         match result {
-            Ok(translation) => {
-                let programmed = route_programmed(objects, object, &translation.config);
+            Ok(_) => {
+                let programmed = !materialized_parent_refs.is_empty();
                 let unresolved_refs_reason = route_unresolved_backend_ref_reason(objects, object);
                 let resolved_refs = unresolved_refs_reason.is_none();
                 let resolved_refs_reason = unresolved_refs_reason.unwrap_or("ResolvedRefs");
@@ -1197,13 +1287,6 @@ fn route_status(
                 }
             }
         };
-    let materialized_parent_refs: HashSet<String> = match result {
-        Ok(translation) => materialized_route_parent_refs_for_route(
-            &translation.materialized_route_parents,
-            object,
-        ),
-        Err(_) => HashSet::new(),
-    };
 
     let mut parents = retained_existing_parent_statuses(&object.status);
     for parent_ref in managed_parent_refs {
@@ -1381,21 +1464,30 @@ fn materialized_route_parent_refs_for_route(
         .collect()
 }
 
-fn status_patch_for_update(update: &GatewayApiStatusUpdate, live_status: Option<&Value>) -> Value {
-    let fallback_status = &update.status;
-    let live_status_for_merge = live_status.unwrap_or(fallback_status);
+fn gateway_api_status_apply_params() -> PatchParams {
+    PatchParams::apply(GATEWAY_API_STATUS_FIELD_MANAGER).force()
+}
+
+fn route_status_patch_params() -> PatchParams {
+    PatchParams {
+        field_manager: Some(GATEWAY_API_STATUS_FIELD_MANAGER.to_string()),
+        ..PatchParams::default()
+    }
+}
+
+fn gateway_status_apply_patch_for_update(
+    update: &GatewayApiStatusUpdate,
+    live_status: Option<&Value>,
+) -> Value {
     let mut status_patch = serde_json::Map::new();
 
     match update.kind.as_str() {
         "GatewayClass" | "Gateway" => {
-            let desired_conditions =
-                desired_owned_conditions(&update.status, owned_condition_types(&update.kind));
-            let condition_source = match live_status {
-                Some(status) => existing_conditions(status),
-                None => existing_conditions(fallback_status),
-            };
-            let merged_conditions = merge_condition_entries(condition_source, desired_conditions);
-            status_patch.insert("conditions".to_string(), Value::Array(merged_conditions));
+            let desired_conditions = preserve_live_condition_transition_times(
+                desired_owned_conditions(&update.status, owned_condition_types(&update.kind)),
+                live_status.and_then(existing_conditions),
+            );
+            status_patch.insert("conditions".to_string(), Value::Array(desired_conditions));
             if update.kind == "Gateway" {
                 if update.patch_gateway_addresses
                     && let Some(addresses) = update.status.get("addresses").cloned()
@@ -1409,23 +1501,114 @@ fn status_patch_for_update(update: &GatewayApiStatusUpdate, live_status: Option<
                 }
             }
         }
-        "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => {
-            status_patch.insert(
-                "parents".to_string(),
-                Value::Array(merge_parent_statuses(
-                    live_status_for_merge,
-                    desired_ferrum_parent_statuses(&update.status),
-                )),
-            );
-        }
         _ => {
             status_patch = update.status.as_object().cloned().unwrap_or_default();
         }
     }
 
+    // Apply requests identify the target in the document as well as in the
+    // request URL. Keep namespace absent for the cluster-scoped GatewayClass.
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("name".to_string(), Value::String(update.name.clone()));
+    if update.kind != "GatewayClass" {
+        metadata.insert(
+            "namespace".to_string(),
+            Value::String(update.namespace.clone()),
+        );
+    }
+
     let mut patch = serde_json::Map::new();
+    patch.insert(
+        "apiVersion".to_string(),
+        Value::String(update.api_version.clone()),
+    );
+    patch.insert("kind".to_string(), Value::String(update.kind.clone()));
+    patch.insert("metadata".to_string(), Value::Object(metadata));
     patch.insert("status".to_string(), Value::Object(status_patch));
     Value::Object(patch)
+}
+
+fn route_status_merge_patch_for_update(
+    update: &GatewayApiStatusUpdate,
+    live_status: Option<&Value>,
+    resource_version: &str,
+) -> Value {
+    let desired_parents = desired_ferrum_parent_statuses(&update.status)
+        .into_iter()
+        .map(|parent| preserve_live_parent_condition_transition_times(update, parent, live_status))
+        .collect();
+    let parents = match live_status {
+        Some(status) => merge_parent_statuses(status, desired_parents),
+        None => desired_parents,
+    };
+
+    json!({
+        "metadata": {
+            "resourceVersion": resource_version,
+        },
+        "status": {
+            "parents": parents,
+        },
+    })
+}
+
+fn preserve_live_condition_transition_times(
+    desired_conditions: Vec<Value>,
+    live_conditions: Option<&[Value]>,
+) -> Vec<Value> {
+    desired_conditions
+        .into_iter()
+        .map(|desired| {
+            let Some(desired_type) = condition_type(&desired) else {
+                return desired;
+            };
+            let Some(existing) = live_conditions
+                .into_iter()
+                .flatten()
+                .find(|condition| condition_type(condition) == Some(desired_type))
+            else {
+                return desired;
+            };
+            preserve_unchanged_transition_time(desired, existing)
+        })
+        .collect()
+}
+
+fn preserve_live_parent_condition_transition_times(
+    update: &GatewayApiStatusUpdate,
+    mut desired_parent: Value,
+    live_status: Option<&Value>,
+) -> Value {
+    let Some(desired_parent_ref) = desired_parent.get("parentRef") else {
+        return desired_parent;
+    };
+    let desired_key = route_parent_ref_key_for_namespace(&update.namespace, desired_parent_ref);
+    let live_conditions = live_status
+        .and_then(|status| status.get("parents"))
+        .and_then(Value::as_array)
+        .and_then(|parents| {
+            parents.iter().find(|parent| {
+                parent.get("controllerName").and_then(Value::as_str)
+                    == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+                    && parent.get("parentRef").is_some_and(|parent_ref| {
+                        route_parent_ref_key_for_namespace(&update.namespace, parent_ref)
+                            == desired_key
+                    })
+            })
+        })
+        .and_then(|parent| parent.get("conditions"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice);
+    let desired_conditions = desired_parent
+        .get("conditions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let conditions = preserve_live_condition_transition_times(desired_conditions, live_conditions);
+    if let Value::Object(parent) = &mut desired_parent {
+        parent.insert("conditions".to_string(), Value::Array(conditions));
+    }
+    desired_parent
 }
 
 fn owned_condition_types(kind: &str) -> &'static [&'static str] {
@@ -1915,6 +2098,10 @@ fn endpoint_ready(endpoint: &Value) -> bool {
 }
 
 fn route_parent_ref_key(route: &K8sObject, parent_ref: &Value) -> String {
+    route_parent_ref_key_for_namespace(&route.metadata.namespace, parent_ref)
+}
+
+fn route_parent_ref_key_for_namespace(route_namespace: &str, parent_ref: &Value) -> String {
     let group = parent_ref
         .get("group")
         .and_then(Value::as_str)
@@ -1926,7 +2113,7 @@ fn route_parent_ref_key(route: &K8sObject, parent_ref: &Value) -> String {
     let namespace = parent_ref
         .get("namespace")
         .and_then(Value::as_str)
-        .unwrap_or(&route.metadata.namespace);
+        .unwrap_or(route_namespace);
     let name = parent_ref
         .get("name")
         .and_then(Value::as_str)
@@ -1971,111 +2158,6 @@ fn gateway_listener_programmed(
     mesh.services
         .iter()
         .any(|service| service.namespace == object.metadata.namespace && service.name == expected)
-}
-
-fn route_programmed(
-    objects: &[K8sObject],
-    object: &K8sObject,
-    config: &crate::config::types::GatewayConfig,
-) -> bool {
-    if matches!(object.kind.as_str(), "TCPRoute" | "TLSRoute") {
-        let prefix = format!(
-            "{}-",
-            resource_id(
-                "gwapi-l4",
-                &object.metadata.namespace,
-                &object.metadata.name,
-                "",
-            )
-        );
-        let listener_ports = l4_route_parent_listener_ports(objects, object);
-        return config.proxies.iter().any(|proxy| {
-            l4_route_proxy_matches(&proxy.id, proxy.listen_port, &prefix, &listener_ports)
-        });
-    }
-
-    // Route proxy IDs follow `gwapi-route-{ns}-{name}-{route_kind}-{rule_idx}[-{match_idx}][-host{host_idx}]`
-    // (see `gateway_api::http_route_resources`). Requiring the route_kind segment
-    // to be immediately followed by a digit disambiguates routes whose names
-    // start with another route's name (e.g. `api` vs `api-httproute`, where both
-    // proxy IDs share `gwapi-route-{ns}-api-httproute-`). This avoids
-    // materialising O(rules × matches × hostnames) candidate strings per route
-    // and per reconcile — the previous HashSet approach generated ~1500 strings
-    // for a 5-rule × 5-match × 50-hostname route just to membership-test them.
-    // TODO: replace this naming-convention reconstruction with a typed
-    // back-reference on `Proxy` (e.g., `Proxy.metadata.k8s_source`) populated by
-    // the translator. Until then, any change to `gateway_api::http_route_resources`
-    // proxy-id format must be mirrored here.
-    let route_kind = object.kind.to_ascii_lowercase();
-    let prefix = format!(
-        "{}-",
-        resource_id(
-            "gwapi-route",
-            &object.metadata.namespace,
-            &object.metadata.name,
-            &route_kind,
-        )
-    );
-    config.proxies.iter().any(|proxy| {
-        let Some(remainder) = proxy.id.strip_prefix(&prefix) else {
-            return false;
-        };
-        remainder
-            .as_bytes()
-            .first()
-            .is_some_and(|byte| byte.is_ascii_digit())
-    })
-}
-
-fn l4_route_proxy_matches(
-    proxy_id: &str,
-    proxy_listen_port: Option<u16>,
-    prefix: &str,
-    listener_ports: &std::collections::HashSet<u16>,
-) -> bool {
-    let Some(remainder) = proxy_id.strip_prefix(prefix) else {
-        return false;
-    };
-    if !remainder
-        .as_bytes()
-        .first()
-        .is_some_and(|byte| byte.is_ascii_digit())
-    {
-        return false;
-    }
-    proxy_listen_port.is_some_and(|port| listener_ports.contains(&port))
-}
-
-fn l4_route_parent_listener_ports(objects: &[K8sObject], route: &K8sObject) -> HashSet<u16> {
-    let mut ports = HashSet::new();
-    for parent_ref in route_parent_refs(route) {
-        if !parent_ref_targets_managed_gateway(objects, route, &parent_ref) {
-            continue;
-        }
-        for gateway in objects.iter().filter(|object| {
-            object.kind == "Gateway" && parent_ref_targets_gateway(route, &parent_ref, object)
-        }) {
-            let Some(listeners) = gateway.spec.get("listeners").and_then(Value::as_array) else {
-                continue;
-            };
-            for listener in listeners {
-                if !route_kind_allowed_by_listener(route, listener)
-                    || !parent_ref_matches_listener(&parent_ref, listener)
-                    || !route_allowed_by_listener(objects, route, gateway, listener)
-                    || !route_intersects_listener_hostname(route, listener)
-                {
-                    continue;
-                }
-                let Some(port) = listener.get("port").and_then(Value::as_u64) else {
-                    continue;
-                };
-                if let Ok(port) = u16::try_from(port) {
-                    ports.insert(port);
-                }
-            }
-        }
-    }
-    ports
 }
 
 fn route_unresolved_backend_ref_reason(
@@ -4673,7 +4755,7 @@ mod tests {
     }
 
     #[test]
-    fn status_patch_for_gateway_updates_only_owned_conditions_from_live_status() {
+    fn status_apply_patch_for_gateway_contains_only_ferrum_owned_fields() {
         let update = GatewayApiStatusUpdate {
             api_version: "gateway.networking.k8s.io/v1".to_string(),
             kind: "Gateway".to_string(),
@@ -4695,29 +4777,50 @@ mod tests {
         };
         let live_status = json!({
             "addresses": [{"type": "IPAddress", "value": "10.0.0.10"}],
-            "conditions": [{
-                "type": "example.com/CustomReady",
-                "status": "True",
-                "observedGeneration": 8,
-                "reason": "CustomReady",
-                "message": "fresh custom status",
-                "lastTransitionTime": "2026-03-01T00:00:00Z"
-            }]
+            "conditions": [
+                {
+                    "type": "Accepted",
+                    "status": "True",
+                    "observedGeneration": 7,
+                    "reason": "Accepted",
+                    "message": "Ferrum accepted this Gateway",
+                    "lastTransitionTime": "2026-03-01T00:00:00Z"
+                },
+                {
+                    "type": "example.com/CustomReady",
+                    "status": "True",
+                    "observedGeneration": 8,
+                    "reason": "CustomReady",
+                    "message": "fresh custom status",
+                    "lastTransitionTime": "2026-03-01T00:00:00Z"
+                }
+            ]
         });
 
-        let patch = status_patch_for_update(&update, Some(&live_status));
+        let patch = gateway_status_apply_patch_for_update(&update, Some(&live_status));
 
+        assert_eq!(
+            patch["apiVersion"].as_str(),
+            Some("gateway.networking.k8s.io/v1")
+        );
+        assert_eq!(patch["kind"].as_str(), Some("Gateway"));
+        assert_eq!(patch["metadata"]["name"].as_str(), Some("edge"));
+        assert_eq!(patch["metadata"]["namespace"].as_str(), Some("default"));
         assert!(patch["status"].get("addresses").is_none());
         let conditions = patch["status"]["conditions"].as_array().unwrap();
         assert_condition(conditions, "Accepted", "True");
+        assert_eq!(conditions.len(), 1);
         assert_eq!(
-            find_condition(conditions, "example.com/CustomReady")["message"].as_str(),
-            Some("fresh custom status")
+            conditions[0]["lastTransitionTime"].as_str(),
+            Some("2026-03-01T00:00:00Z")
         );
+        assert!(conditions.iter().all(|condition| {
+            condition.get("type").and_then(Value::as_str) != Some("example.com/CustomReady")
+        }));
     }
 
     #[test]
-    fn status_patch_for_route_merges_ferrum_parents_into_live_status() {
+    fn route_status_merge_patch_uses_live_parents_and_resource_version() {
         let update = GatewayApiStatusUpdate {
             api_version: "gateway.networking.k8s.io/v1".to_string(),
             kind: "HTTPRoute".to_string(),
@@ -4755,14 +4858,16 @@ mod tests {
             ]
         });
 
-        let patch = status_patch_for_update(&update, Some(&live_status));
+        let patch = route_status_merge_patch_for_update(&update, Some(&live_status), "42");
 
         let parents = patch["status"]["parents"].as_array().unwrap();
-        assert!(parents.iter().any(|parent| {
-            parent["controllerName"].as_str() == Some("example.com/fresh-controller")
-        }));
+        assert_eq!(patch["metadata"]["resourceVersion"].as_str(), Some("42"));
+        assert_eq!(parents.len(), 2);
         assert!(!parents.iter().any(|parent| {
             parent["controllerName"].as_str() == Some("example.com/stale-controller")
+        }));
+        assert!(parents.iter().any(|parent| {
+            parent["controllerName"].as_str() == Some("example.com/fresh-controller")
         }));
         assert!(!parents.iter().any(|parent| {
             parent["controllerName"].as_str() == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
@@ -4772,6 +4877,35 @@ mod tests {
             parent["controllerName"].as_str() == Some(FERRUM_GATEWAY_CONTROLLER_NAME)
                 && parent["parentRef"]["name"].as_str() == Some("edge")
         }));
+    }
+
+    #[test]
+    fn status_apply_uses_stable_forced_field_manager() {
+        let params = gateway_api_status_apply_params();
+
+        assert_eq!(
+            params.field_manager.as_deref(),
+            Some(FERRUM_GATEWAY_CONTROLLER_NAME)
+        );
+        assert!(params.force);
+    }
+
+    #[test]
+    fn gateway_class_apply_identity_is_cluster_scoped() {
+        let update = GatewayApiStatusUpdate {
+            api_version: "gateway.networking.k8s.io/v1".to_string(),
+            kind: "GatewayClass".to_string(),
+            namespace: String::new(),
+            name: "ferrum".to_string(),
+            status: json!({"conditions": []}),
+            patch_gateway_addresses: false,
+            patch_gateway_listeners: false,
+        };
+
+        let patch = gateway_status_apply_patch_for_update(&update, None);
+
+        assert_eq!(patch["metadata"]["name"].as_str(), Some("ferrum"));
+        assert!(patch["metadata"].get("namespace").is_none());
     }
 
     fn assert_condition(conditions: &[Value], condition_type: &str, status: &str) {
