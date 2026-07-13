@@ -11437,13 +11437,14 @@ pub async fn start_proxy_listener_with_mesh_inbound_tls_and_signal(
     state: ProxyState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    allows_plaintext: bool,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     start_proxy_listener_with_tls_source_and_signal(
         addr,
         state,
         shutdown,
-        ListenerTlsSource::MeshInbound,
+        ListenerTlsSource::MeshInbound { allows_plaintext },
         mesh_direction,
         started_tx,
     )
@@ -11462,7 +11463,7 @@ enum ListenerTlsSource {
     /// `ProxyState::mesh_inbound_tls_policy` on every accept so
     /// PeerAuthentication changes can hot-swap future handshakes without
     /// restarting the listener.
-    MeshInbound,
+    MeshInbound { allows_plaintext: bool },
     /// Dynamic frontend TLS loaded from a shared `ArcSwap` slot on every
     /// accept so a successful cert/key reload (opt-in via
     /// `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`) takes effect on the next
@@ -11489,9 +11490,9 @@ impl ListenerTlsSource {
                 tls_config: tls_config.clone(),
                 accepts_plaintext: false,
             },
-            Self::MeshInbound => {
+            Self::MeshInbound { allows_plaintext } => {
                 let policy = state.mesh_inbound_tls_policy.load();
-                select_mesh_inbound_tls(&policy, orig_dst)
+                select_mesh_inbound_tls_for_listener(&policy, orig_dst, *allows_plaintext)
             }
             Self::Dynamic { slot, .. } => ListenerTlsSelection {
                 tls_config: slot.load().as_ref().clone(),
@@ -11506,7 +11507,7 @@ impl ListenerTlsSource {
                 record_mesh_mtls_metric,
                 ..
             } => *record_mesh_mtls_metric,
-            Self::MeshInbound => true,
+            Self::MeshInbound { .. } => true,
             Self::Dynamic {
                 record_mesh_mtls_metric,
                 ..
@@ -11521,7 +11522,8 @@ impl ListenerTlsSource {
     /// without frontend TLS materials, so it must fall through to plaintext.
     fn requires_tls(&self) -> bool {
         match self {
-            Self::Static { .. } | Self::MeshInbound => false,
+            Self::Static { .. } => false,
+            Self::MeshInbound { allows_plaintext } => !allows_plaintext,
             Self::Dynamic { .. } => true,
         }
     }
@@ -11629,6 +11631,16 @@ fn select_mesh_inbound_tls(
         accepts_plaintext: mtls_mode_accepts_plaintext(policy.default_mode)
             || (has_different_port_mode && any_mode_accepts_plaintext && any_mode_accepts_tls),
     }
+}
+
+fn select_mesh_inbound_tls_for_listener(
+    policy: &MeshInboundTlsPolicy,
+    orig_dst: Option<SocketAddr>,
+    allows_plaintext: bool,
+) -> ListenerTlsSelection {
+    let mut selection = select_mesh_inbound_tls(policy, orig_dst);
+    selection.accepts_plaintext &= allows_plaintext;
+    selection
 }
 
 fn first_byte_is_tls_client_hello(first_byte: u8) -> bool {
@@ -36728,11 +36740,11 @@ mod tests {
     }
 
     /// `Dynamic` is only constructed for TLS-terminating HTTPS listeners and
-    /// must fail closed when its slot is empty. `MeshInbound` uses the same
-    /// slot shape for PeerAuthentication live reload, where `None` is a valid
-    /// plaintext state for DISABLE/permissive-without-materials.
+    /// must fail closed when its slot is empty. Sidecar dev listeners may use
+    /// `None` as an intentional plaintext state; HBONE and production mesh
+    /// listeners remain TLS-required.
     #[test]
-    fn listener_tls_source_dynamic_requires_tls_but_mesh_inbound_allows_plaintext() {
+    fn listener_tls_source_respects_mesh_plaintext_capability() {
         let slot = crate::tls::empty_frontend_tls_slot();
         let dynamic = ListenerTlsSource::Dynamic {
             slot,
@@ -36740,8 +36752,15 @@ mod tests {
         };
         assert!(dynamic.requires_tls());
 
-        let mesh = ListenerTlsSource::MeshInbound;
-        assert!(!mesh.requires_tls());
+        let sidecar_dev = ListenerTlsSource::MeshInbound {
+            allows_plaintext: true,
+        };
+        assert!(!sidecar_dev.requires_tls());
+
+        let hbone = ListenerTlsSource::MeshInbound {
+            allows_plaintext: false,
+        };
+        assert!(hbone.requires_tls());
     }
 
     #[test]
@@ -36874,6 +36893,28 @@ mod tests {
             false,
             b'G'
         ));
+    }
+
+    #[test]
+    fn hbone_permissive_listener_is_tls_only() {
+        use crate::modes::mesh::config::MtlsMode;
+
+        let tls = crate::tls::temporary_disabled_listener_tls_config()
+            .expect("temporary TLS config for selection test");
+        let policy = MeshInboundTlsPolicy {
+            default: Some(tls),
+            by_port: HashMap::new(),
+            default_mode: MtlsMode::Permissive,
+            modes_by_port: std::collections::BTreeMap::new(),
+            app_port_by_orig_dst_port: std::collections::BTreeMap::new(),
+        };
+
+        let selected = select_mesh_inbound_tls_for_listener(&policy, None, false);
+        assert!(selected.tls_config.is_some());
+        assert!(
+            !selected.accepts_plaintext,
+            "HBONE termination must never demux PERMISSIVE traffic to plaintext"
+        );
     }
 
     #[test]

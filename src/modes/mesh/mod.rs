@@ -9864,10 +9864,14 @@ async fn serve_mesh_runtime(
     // production flag is read once here and threaded into the live-reload gate
     // so it is fixed for the process lifetime.
     let mesh_production_mode = crate::identity::production_mode();
+    let effective_inbound_mtls_mode =
+        effective_inbound_mtls_mode_for_topology(inbound_mtls_mode, runtime.topology);
+    let effective_inbound_mtls_modes_by_port =
+        effective_inbound_mtls_modes_for_topology(&inbound_mtls_modes_by_port, runtime.topology);
     enforce_mesh_inbound_fail_closed(
         &runtime,
         &env_config,
-        inbound_mtls_mode,
+        effective_inbound_mtls_mode,
         frontend_tls.as_ref(),
         mesh_inbound_spiffe_slot.as_ref(),
         mesh_production_mode,
@@ -9876,7 +9880,7 @@ async fn serve_mesh_runtime(
         enforce_mesh_inbound_fail_closed(
             &runtime,
             &env_config,
-            inbound_mtls_modes_by_port[&port],
+            effective_inbound_mtls_modes_by_port[&port],
             tls_config.as_ref(),
             mesh_inbound_spiffe_slot.as_ref(),
             mesh_production_mode,
@@ -9885,13 +9889,14 @@ async fn serve_mesh_runtime(
     }
     if has_inbound_tls_termination_listener {
         crate::plugins::mesh::prometheus_helpers::set_mesh_inbound_plaintext_allowed(
-            mesh_inbound_mode_accepts_plaintext(inbound_mtls_mode)
-                || inbound_mtls_modes_by_port
-                    .values()
-                    .copied()
-                    .any(mesh_inbound_mode_accepts_plaintext)
-                || frontend_tls.is_none()
-                || frontend_tls_by_port.values().any(Option::is_none),
+            mesh_inbound_listener_allows_plaintext(runtime.topology, mesh_production_mode)
+                && (mesh_inbound_mode_accepts_plaintext(effective_inbound_mtls_mode)
+                    || effective_inbound_mtls_modes_by_port
+                        .values()
+                        .copied()
+                        .any(mesh_inbound_mode_accepts_plaintext)
+                    || frontend_tls.is_none()
+                    || frontend_tls_by_port.values().any(Option::is_none)),
         );
     }
     let any_inbound_tls_configured =
@@ -9908,14 +9913,8 @@ async fn serve_mesh_runtime(
         .store(Arc::new(crate::proxy::MeshInboundTlsPolicy {
             default: frontend_tls.clone(),
             by_port: frontend_tls_by_port,
-            default_mode: effective_inbound_mtls_mode_for_topology(
-                inbound_mtls_mode,
-                runtime.topology,
-            ),
-            modes_by_port: effective_inbound_mtls_modes_for_topology(
-                &inbound_mtls_modes_by_port,
-                runtime.topology,
-            ),
+            default_mode: effective_inbound_mtls_mode,
+            modes_by_port: effective_inbound_mtls_modes_by_port,
             app_port_by_orig_dst_port: inbound_app_port_by_orig_dst_port,
         }));
     proxy_state.mesh_inbound_spiffe_verifier_active.store(
@@ -10110,6 +10109,7 @@ async fn serve_mesh_runtime(
     // listeners. Keeping their bind signals in the same gate ensures a failed
     // admin bind cannot be hidden by the unconditional readiness store below.
     let mut startup_signals = admin_startup_signals;
+    let mesh_topology = runtime.topology;
     for listener in runtime.listener_plan() {
         let uses_mesh_inbound_tls = matches!(
             listener.kind,
@@ -10163,11 +10163,14 @@ async fn serve_mesh_runtime(
                 MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
             );
             let listener_result = if records_mesh_mtls_metric {
+                let allows_plaintext = kind == MeshListenerKind::MtlsTermination
+                    && mesh_inbound_listener_allows_plaintext(mesh_topology, mesh_production_mode);
                 proxy::start_proxy_listener_with_mesh_inbound_tls_and_signal(
                     addr,
                     state,
                     shutdown,
                     Some(direction),
+                    allows_plaintext,
                     Some(started_tx),
                 )
                 .await
@@ -10608,6 +10611,16 @@ fn resolve_inbound_mtls_modes_by_port(
         .iter()
         .flat_map(|policy| policy.port_overrides.keys().copied())
         .collect::<std::collections::BTreeSet<_>>();
+    // A shared-SPIFFE slice with ambiguous labels cannot reliably identify its
+    // local workload/service ports. Preserve every carried candidate override
+    // in that case so the fail-closed resolver below can apply the most
+    // restrictive candidate posture instead of silently dropping enforcement.
+    if slice.labels_ambiguous {
+        return carried_override_ports
+            .into_iter()
+            .map(|port| (port, slice.resolve_inbound_mtls_mode_fail_closed(port)))
+            .collect();
+    }
     let local_ports = selectable_inbound_peer_auth_ports(slice);
     carried_override_ports
         .into_iter()
@@ -10644,6 +10657,14 @@ fn effective_inbound_mtls_modes_for_topology(
             )
         })
         .collect()
+}
+
+fn mesh_inbound_listener_allows_plaintext(topology: MeshTopology, production: bool) -> bool {
+    !production
+        && matches!(
+            topology,
+            MeshTopology::Sidecar | MeshTopology::EgressGateway
+        )
 }
 
 /// Build the pre-handshake port-domain translation for captured Sidecar
@@ -12136,11 +12157,12 @@ fn mesh_inbound_mode_accepts_plaintext(mode: config::MtlsMode) -> bool {
 ///    [`load_mesh_frontend_server_identity`] already hard-errors a broken SVID
 ///    cert/key. (`ProxyState` construction's `load_gateway_svid_bundle` rejects
 ///    the same broken material independently; this is the inbound-local guard.)
-///  - **would-serve-plaintext**: a termination listener exists and either its
-///    effective PeerAuthentication mode admits plaintext (`PERMISSIVE` or
-///    `DISABLE`) or its resolved `ServerConfig` is `None` (no usable server
-///    identity). Refused under `production`; in dev allowed with a loud warning
-///    (intentional — see [`decide_mesh_inbound_fail_closed`]).
+///  - **would-serve-plaintext**: a termination listener exists but its resolved
+///    `ServerConfig` is `None` (DISABLE, or no usable server identity). Refused
+///    under `production`; in dev allowed with a loud warning. A usable
+///    PERMISSIVE config remains startup-compatible with the historical
+///    TLS-only production listener; listener-kind demux controls whether dev
+///    Sidecar traffic may additionally arrive as plaintext.
 ///
 /// Topologies without a TLS-terminating inbound listener (EastWestGateway does
 /// SNI passthrough — encrypted bytes are forwarded, never terminated) have no
@@ -12181,9 +12203,10 @@ fn enforce_mesh_inbound_fail_closed(
         ));
     }
 
-    // Otherwise the only remaining escape is a listener that would admit
-    // plaintext (PeerAuthentication PERMISSIVE/DISABLE, or no usable server
-    // identity).
+    // Otherwise the only remaining escape is a listener with no usable TLS
+    // config. PERMISSIVE with a valid config historically starts in production
+    // and remains TLS-only there; do not turn its optional client certificate
+    // posture into a new startup failure.
     let reason: &str = if mtls_mode == config::MtlsMode::Disable {
         "PeerAuthentication resolved to DISABLE, so the inbound mTLS/HBONE termination \
          listener would accept unauthenticated plaintext"
@@ -12195,10 +12218,7 @@ fn enforce_mesh_inbound_fail_closed(
          (set FERRUM_GATEWAY_SVID_CERT_PATH / KEY_PATH / TRUST_BUNDLE_PATH, or \
          FERRUM_FRONTEND_TLS_CERT_PATH / KEY_PATH), so it would accept unauthenticated plaintext"
     };
-    match decide_mesh_inbound_fail_closed(
-        mesh_inbound_mode_accepts_plaintext(mtls_mode) || frontend_tls.is_none(),
-        production,
-    ) {
+    match decide_mesh_inbound_fail_closed(frontend_tls.is_none(), production) {
         MeshInboundFailClosed::Ok => {
             crate::plugins::mesh::prometheus_helpers::set_mesh_inbound_plaintext_allowed(false);
             Ok(())
@@ -12491,14 +12511,20 @@ fn plan_mesh_inbound_tls_reload_with_federation(
             // warning (an explicit plaintext-capable mode is intentional).
             // Topologies without a TLS-terminating inbound listener (EastWestGateway
             // SNI passthrough) are exempt (`has_termination_listener` is false).
-            let accepts_plaintext = mesh_inbound_mode_accepts_plaintext(mtls_mode)
-                || next_snapshot
-                    .port_modes
-                    .values()
-                    .copied()
-                    .any(mesh_inbound_mode_accepts_plaintext)
-                || tls_config.is_none()
-                || tls_by_port.values().any(Option::is_none);
+            let effective_mode =
+                effective_inbound_mtls_mode_for_topology(mtls_mode, runtime.topology);
+            let effective_port_modes = effective_inbound_mtls_modes_for_topology(
+                &next_snapshot.port_modes,
+                runtime.topology,
+            );
+            let accepts_plaintext = tls_config.is_none()
+                || tls_by_port.values().any(Option::is_none)
+                || (mesh_inbound_listener_allows_plaintext(runtime.topology, production)
+                    && (mesh_inbound_mode_accepts_plaintext(effective_mode)
+                        || effective_port_modes
+                            .values()
+                            .copied()
+                            .any(mesh_inbound_mode_accepts_plaintext)));
             if has_termination_listener && accepts_plaintext {
                 match decide_mesh_inbound_fail_closed(true, production) {
                     MeshInboundFailClosed::Refuse => {
@@ -12564,6 +12590,7 @@ async fn apply_mesh_inbound_tls_reload(
     has_termination_listener: bool,
     spiffe_bundle_slot_configured: bool,
     topology: MeshTopology,
+    production: bool,
 ) {
     match plan {
         MeshInboundTlsReloadPlan::Unchanged { staged_spiffe } => {
@@ -12589,14 +12616,17 @@ async fn apply_mesh_inbound_tls_reload(
             tls_by_port,
             staged_spiffe,
         } => {
-            let plaintext_allowed = mesh_inbound_mode_accepts_plaintext(mtls_mode)
-                || snapshot
-                    .port_modes
-                    .values()
-                    .copied()
-                    .any(mesh_inbound_mode_accepts_plaintext)
-                || tls_config.is_none()
-                || tls_by_port.values().any(Option::is_none);
+            let effective_mode = effective_inbound_mtls_mode_for_topology(mtls_mode, topology);
+            let effective_port_modes =
+                effective_inbound_mtls_modes_for_topology(&snapshot.port_modes, topology);
+            let plaintext_allowed = mesh_inbound_listener_allows_plaintext(topology, production)
+                && (mesh_inbound_mode_accepts_plaintext(effective_mode)
+                    || effective_port_modes
+                        .values()
+                        .copied()
+                        .any(mesh_inbound_mode_accepts_plaintext)
+                    || tls_config.is_none()
+                    || tls_by_port.values().any(Option::is_none));
             let any_tls_configured =
                 tls_config.is_some() || tls_by_port.values().any(Option::is_some);
             // Publish the staged SPIFFE trust-bundle into the live slot first,
@@ -13080,6 +13110,7 @@ async fn apply_mesh_slice_generation(
                             has_termination_listener,
                             inbound_tls_reload.spiffe_bundle_slot.is_some(),
                             runtime.topology,
+                            inbound_tls_reload.production,
                         )
                         .await;
                     }
@@ -23536,8 +23567,7 @@ mod tests {
         mesh_state.install_slice(MeshSlice {
             version: "good-disable".to_string(),
             labels: [("app".to_string(), "good-baseline".to_string())].into(),
-            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
-                8080,
+            ..slice_with_peer_auths(vec![peer_auth_with_workload_mode(
                 config::MtlsMode::Disable,
             )])
         });
@@ -23546,10 +23576,7 @@ mod tests {
         mesh_state.install_slice(MeshSlice {
             version: "bad-strict".to_string(),
             labels: [("app".to_string(), "bad-tls".to_string())].into(),
-            ..slice_with_peer_auths(vec![peer_auth_with_port_override(
-                8080,
-                config::MtlsMode::Strict,
-            )])
+            ..slice_with_peer_auths(vec![peer_auth_with_workload_mode(config::MtlsMode::Strict)])
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -23598,10 +23625,8 @@ mod tests {
         let identity = load_mesh_frontend_server_identity(&env, &test_svid_slot_from_env(&env))
             .expect("server identity");
 
-        // Production rejects both plaintext-only DISABLE and dual-wire
-        // PERMISSIVE, even when PERMISSIVE can build a usable ServerConfig.
-        // plan() is None, which the apply task treats as "keep the last-good
-        // mTLS config".
+        // Production rejects plaintext-only DISABLE. plan() is None, which the
+        // apply task treats as "keep the last-good mTLS config".
         let plan = plan_mesh_inbound_tls_reload(
             &proxy_state,
             &runtime,
@@ -23631,8 +23656,8 @@ mod tests {
             true,
         );
         assert!(
-            plan.is_none(),
-            "production must reject a PERMISSIVE dual-wire inbound live reload"
+            plan.is_some(),
+            "production keeps historical TLS-only PERMISSIVE startup/reload behavior"
         );
 
         // Dev (non-production) tolerates the downgrade (warns + swaps to None) —
@@ -25535,11 +25560,11 @@ mod tests {
             "unexpected refusal message: {msg}"
         );
 
-        // A usable TLS config does not make PERMISSIVE production-safe: the
-        // mesh accept path can still demux plaintext on captured app ports.
+        // Historical production behavior permits a usable PERMISSIVE TLS
+        // config. The listener source suppresses plaintext demux in production.
         let permissive_tls =
             crate::tls::temporary_disabled_listener_tls_config().expect("temporary TLS config");
-        let err = enforce_mesh_inbound_fail_closed(
+        enforce_mesh_inbound_fail_closed(
             &runtime,
             &EnvConfig::default(),
             config::MtlsMode::Permissive,
@@ -25547,11 +25572,7 @@ mod tests {
             None,
             true,
         )
-        .expect_err("production must refuse PERMISSIVE even with server TLS material");
-        assert!(
-            err.to_string().contains("PERMISSIVE"),
-            "unexpected refusal message: {err}"
-        );
+        .expect("production accepts PERMISSIVE when a TLS config is usable");
 
         // Dev tolerates plaintext with a warning — here via the "no usable server
         // identity" reason path (PERMISSIVE, still no identity → `frontend_tls`
@@ -26129,6 +26150,18 @@ mod tests {
             ),
             config::MtlsMode::Permissive,
         );
+        assert!(mesh_inbound_listener_allows_plaintext(
+            MeshTopology::Sidecar,
+            false,
+        ));
+        assert!(!mesh_inbound_listener_allows_plaintext(
+            MeshTopology::Sidecar,
+            true,
+        ));
+        assert!(!mesh_inbound_listener_allows_plaintext(
+            MeshTopology::Ambient,
+            false,
+        ));
     }
 
     #[test]
@@ -26147,8 +26180,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ingress_alias_publish_is_independent_of_peer_auth_live_reload() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingress_alias_publish_is_independent_of_peer_auth_live_reload() {
         let env = EnvConfig {
             mesh_peer_auth_live_reload_enabled: false,
             ..EnvConfig::default()
@@ -26173,6 +26206,21 @@ mod tests {
                 .app_port_by_orig_dst_port,
             std::collections::BTreeMap::from([(8443, 8080)]),
             "accepted ingress aliases must refresh while PeerAuth TLS reload is disabled"
+        );
+    }
+
+    #[test]
+    fn ambiguous_slice_preserves_candidate_port_overrides_fail_closed() {
+        let mut slice = slice_with_peer_auths(vec![peer_auth_with_port_override(
+            8080,
+            config::MtlsMode::Strict,
+        )]);
+        slice.labels_ambiguous = true;
+
+        assert_eq!(
+            resolve_inbound_mtls_modes_by_port(Some(&slice)),
+            std::collections::BTreeMap::from([(8080, config::MtlsMode::Strict)]),
+            "ambiguous local workload resolution must retain candidate overrides"
         );
     }
 
