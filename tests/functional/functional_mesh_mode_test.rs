@@ -3896,28 +3896,58 @@ async fn wait_for_authoritative_cross_cluster_grpc(
     }
 }
 
-/// The live cross-cluster WebSocket route's authoritative mesh-mTLS rejection: a
-/// `502` upgrade failure whose body carries the HBONE/mTLS handshake-failure
-/// marker ([`CROSS_CLUSTER_TLS_REJECTION_BODY`]). Symmetric with
-/// [`classify_cross_cluster_http`], which likewise treats only a `502` carrying
-/// that body as authoritative — a BARE `502` (status without the marker body, or
-/// any other status) surfaced while gateway A's outbound route is still
-/// converging is transient and must be retried, not asserted. The body reaches
-/// this classifier because [`format_ws_handshake_error`] preserves it from the
-/// tungstenite `Http` error.
-fn is_authoritative_cross_cluster_ws_rejection(error: &str) -> bool {
-    (error.contains("HTTP error: 502") || error.contains("HTTP status 502"))
-        && error.contains(CROSS_CLUSTER_TLS_REJECTION_BODY)
+/// True when a tungstenite handshake failure rendered by
+/// [`format_ws_handshake_error`] is a `502` upgrade failure — the shape of the
+/// live cross-cluster route's mesh-mTLS rejection. This matches on STATUS only.
+/// The JSON marker body ([`CROSS_CLUSTER_TLS_REJECTION_BODY`]) may be ABSENT
+/// even on a genuine rejection: our patched tungstenite client fills
+/// `Error::Http`'s body from just the bytes already read after the response
+/// headers (`vendor/tungstenite-0.29.0-ferrum-patched/src/handshake/client.rs`),
+/// so a rejection whose JSON body lands in a later packet surfaces status-only.
+/// Body presence is therefore NOT a reliable authoritative signal on its own —
+/// [`wait_for_authoritative_cross_cluster_ws_path`] corroborates a status-only
+/// `502` against the shared HTTP classifier before treating it as authoritative,
+/// and still treats any non-`502` status as transient route-apply noise.
+fn cross_cluster_ws_error_is_502(error: &str) -> bool {
+    error.contains("HTTP status 502") || error.contains("HTTP error: 502")
+}
+
+/// Corroborate a status-only WebSocket `502` upgrade failure via the shared HTTP
+/// classifier: issue ONE plaintext HTTP GET through the SAME outbound port and
+/// cross-cluster route as the WebSocket upgrade. Unlike the tungstenite upgrade
+/// path, the HTTP client drains the full response body, so
+/// [`classify_cross_cluster_http`] deterministically distinguishes the live
+/// route's authoritative `502` HBONE/mTLS handshake-failure rejection (body
+/// carries [`CROSS_CLUSTER_TLS_REJECTION_BODY`]) from transient route-apply
+/// noise. Returns `true` ONLY for that authoritative `502` rejection; a `200`
+/// backend success or any transient route-miss / connection-setup outcome
+/// returns `false`, so the WebSocket `502` stays transient and the caller keeps
+/// polling. This never promotes a transient route-miss to authoritative, so it
+/// cannot manufacture a vacuous negative pass.
+async fn cross_cluster_route_http_rejection_confirmed(outbound_port: u16) -> bool {
+    matches!(
+        classify_cross_cluster_http(
+            plaintext_http_get(outbound_port, "svc-c.ferrum.svc.cluster.local", "/")
+                .await
+                .map_err(|error| error.to_string()),
+        ),
+        Ok((502, _))
+    )
 }
 
 /// Poll a cross-cluster WebSocket upgrade past A's route-apply window. A
 /// completed upgrade (`Ok`) and the live route's authoritative 502 backend-dial
 /// rejection are both returned immediately (the 502 as an `Err` carrying
-/// [`CROSS_CLUSTER_WS_REJECTION_MARKER`]); only route-miss / transient upgrade
-/// failures — including a BARE 502 emitted while the route materializes — are
-/// retried. The FIRST authoritative outcome therefore cannot be retried away, so
-/// the positive arm fails loudly on an unexpected rejection and the negative arm
-/// fails loudly on an unexpected success.
+/// [`CROSS_CLUSTER_WS_REJECTION_MARKER`]). A `502` counts as the authoritative
+/// rejection when its body carries [`CROSS_CLUSTER_TLS_REJECTION_BODY`] OR, when
+/// tungstenite surfaced the `502` status-only (body split into a later packet),
+/// when [`cross_cluster_route_http_rejection_confirmed`] corroborates it via the
+/// shared HTTP classifier on the same outbound route. Only route-miss / transient
+/// upgrade failures — including a status-only 502 emitted while the route
+/// materializes and NOT yet corroborated — are retried. The FIRST authoritative
+/// outcome therefore cannot be retried away, so the positive arm fails loudly on
+/// an unexpected rejection and the negative arm fails loudly on an unexpected
+/// success (and never passes vacuously on a transient setup 502).
 async fn wait_for_authoritative_cross_cluster_ws(
     outbound_port: u16,
     payload: &str,
@@ -3944,8 +3974,23 @@ async fn wait_for_authoritative_cross_cluster_ws_path(
         .await
         {
             Ok(reply) => return Ok(reply),
-            Err(error) if is_authoritative_cross_cluster_ws_rejection(&error) => {
-                return Err(format!("{CROSS_CLUSTER_WS_REJECTION_MARKER}: {error}"));
+            Err(error) if cross_cluster_ws_error_is_502(&error) => {
+                // A `502` upgrade failure is the shape of the live route's
+                // mesh-mTLS rejection. When tungstenite captured the JSON marker
+                // body we classify it directly; otherwise (the body split into a
+                // packet the handshake read never saw) corroborate the rejection
+                // via the shared HTTP classifier probe on the SAME outbound route
+                // — which drains the full body — before treating the `502` as
+                // authoritative. A `502` that neither carries the marker nor
+                // corroborates is transient route-apply noise and is retried, so
+                // a genuine rejection is never flaked away as a timeout and a
+                // transient setup `502` never manufactures a vacuous pass.
+                if error.contains(CROSS_CLUSTER_TLS_REJECTION_BODY)
+                    || cross_cluster_route_http_rejection_confirmed(outbound_port).await
+                {
+                    return Err(format!("{CROSS_CLUSTER_WS_REJECTION_MARKER}: {error}"));
+                }
+                format!("transient WebSocket 502 while route converges: {error}")
             }
             Err(error) => error,
         };
