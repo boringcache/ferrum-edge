@@ -210,8 +210,8 @@ pub struct AdminState {
     /// backend served a semantically-invalid snapshot) rather than failing on
     /// connectivity. Orthogonal to `db_available`: on a validation rejection the
     /// backend is reachable and admin writes are the in-band repair tool, so
-    /// `db_available` stays `true` while this flag rises. Cleared by the next
-    /// successful load. Surfaced only in the authenticated `/health` detail
+    /// `db_available` stays `true` while this flag rises. Cleared only by the
+    /// next accepted authoritative full reload. Surfaced only in the authenticated `/health` detail
     /// (`config_rejected`) and coarsely as a `"degraded"` status; `None` in
     /// modes without a database poll loop. See issue #2158.
     pub config_rejected: Option<Arc<AtomicBool>>,

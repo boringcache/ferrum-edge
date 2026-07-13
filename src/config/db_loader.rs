@@ -27,7 +27,8 @@ use crate::config::types::{
     ResponseBodyMode, RetryConfig, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
 use crate::config::validation_pipeline::{
-    ValidationAction, ValidationPipeline, collect_rejecting_runtime_config_errors,
+    ConfigValidationRejection, ValidationAction, ValidationPipeline,
+    collect_rejecting_runtime_config_errors,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -1305,13 +1306,23 @@ impl DatabaseStore {
         config: &GatewayConfig,
     ) -> Result<(), anyhow::Error> {
         if let Err(errors) = config.validate_plugin_references() {
-            return Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
-                format!(
-                    "operation={} resource=proxy_plugins: invalid proxy/plugin associations: {}",
-                    operation,
-                    errors.join("; ")
-                ),
-            )));
+            let context = format!(
+                "operation={} resource=proxy_plugins: invalid proxy/plugin associations: {}",
+                operation,
+                errors.join("; ")
+            );
+            // A malformed association graph is a semantic rejection from a
+            // reachable database, not a connectivity failure. Preserve the
+            // operation/resource detail as outer context while carrying the
+            // same typed marker used by the rest of the runtime validation
+            // contract so database-mode polling keeps admin writes available
+            // for in-band repair (issue #2158).
+            return Err(ConfigValidationRejection {
+                backend: "Database",
+                errors,
+            }
+            .into_anyhow()
+            .context(context));
         }
         Ok(())
     }

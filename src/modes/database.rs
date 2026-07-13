@@ -1036,46 +1036,57 @@ pub async fn run(
     // use config_changes immediately; backup loads intentionally start without
     // a cursor and force an authoritative DB reload after recovery.
     let backup_path = env_config.db_config_backup_path.clone();
-    let (config, initial_change_sequence) =
-        match load_full_config_with_sequence(&db, &env_config.namespace).await {
-            Ok((cfg, sequence)) => {
-                info!(
-                    "Database mode: loaded {} proxies, {} consumers",
-                    cfg.proxies.len(),
-                    cfg.consumers.len()
+    let mut startup_config_rejected = false;
+    let initial_load = load_full_config_with_sequence(&db, &env_config.namespace).await;
+    let (config, initial_change_sequence) = match initial_load {
+        Ok((cfg, sequence)) => {
+            info!(
+                "Database mode: loaded {} proxies, {} consumers",
+                cfg.proxies.len(),
+                cfg.consumers.len()
+            );
+            (cfg, Some(sequence))
+        }
+        Err(e) => {
+            // Initial database full load failed — try the configured backup
+            // for pod restart resilience.
+            if let Some(ref path) = backup_path {
+                warn!(
+                    "Database load failed ({}), attempting backup file: {}",
+                    e, path
                 );
-                (cfg, Some(sequence))
-            }
-            Err(e) => {
-                // Database unreachable — try backup file for pod restart resilience
-                if let Some(ref path) = backup_path {
-                    warn!(
-                        "Database load failed ({}), attempting backup file: {}",
-                        e, path
-                    );
-                    match load_config_backup(path) {
-                        Some(cfg) => {
-                            warn!(
-                                "Starting with backup config ({} proxies, {} consumers). \
-                                 Database polling will retry and update when DB recovers.",
-                                cfg.proxies.len(),
-                                cfg.consumers.len()
-                            );
-                            (cfg, None)
-                        }
-                        None => {
-                            return Err(anyhow::anyhow!(
-                                "Database load failed and no usable backup at {}: {}",
-                                path,
+                match load_config_backup(path) {
+                    Some(cfg) => {
+                        startup_config_rejected = is_poll_validation_rejection(&e);
+                        if startup_config_rejected {
+                            error!(
+                                "Initial database snapshot was rejected by runtime validation; \
+                                     starting with backup config, keeping admin writes enabled for \
+                                     in-band repair, and publishing config_rejected immediately: {}",
                                 e
-                            ));
+                            );
                         }
+                        warn!(
+                            "Starting with backup config ({} proxies, {} consumers). \
+                                 Database polling will retry and update when DB recovers.",
+                            cfg.proxies.len(),
+                            cfg.consumers.len()
+                        );
+                        (cfg, None)
                     }
-                } else {
-                    return Err(e);
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "Database load failed and no usable backup at {}: {}",
+                            path,
+                            e
+                        ));
+                    }
                 }
+            } else {
+                return Err(e);
             }
-        };
+        }
+    };
 
     // Validate stream proxy ports don't conflict with gateway reserved ports
     let reserved_ports = env_config.reserved_gateway_ports();
@@ -1558,14 +1569,20 @@ pub async fn run(
     // the cached config until the DB recovers. When we bootstrapped from a
     // backup file because every DB URL was down at startup, initialize to
     // `false` so `/health` and the admin API report the true state
-    // immediately — before the first polling tick runs.
+    // immediately — before the first polling tick runs. A typed validation
+    // rejection instead proves reachability, so keep writes enabled even if
+    // startup previously entered the offline-bootstrap path.
     let startup_ready = Arc::new(AtomicBool::new(false));
-    let db_available = Arc::new(AtomicBool::new(!bootstrap_from_backup));
+    let db_available = Arc::new(AtomicBool::new(initial_db_available(
+        bootstrap_from_backup,
+        startup_config_rejected,
+    )));
     // Raised by the poll loop when a full load is rejected by the runtime-config
     // validation contract (reachable backend, invalid snapshot). Distinct from
     // `db_available`: admin stays writable so the offending resource can be
-    // repaired in-band (issue #2158). Cleared on the next accepted load.
-    let config_rejected = Arc::new(AtomicBool::new(false));
+    // repaired in-band (issue #2158). Cleared only by an accepted authoritative
+    // full reload.
+    let config_rejected = Arc::new(AtomicBool::new(startup_config_rejected));
     let database_delta_poll_metrics = Arc::new(DatabaseDeltaPollMetrics::default());
     crate::plugins::prometheus_metrics::global_registry()
         .set_database_delta_poll_metrics(database_delta_poll_metrics.clone());
@@ -2351,14 +2368,29 @@ fn commit_full_reload_poll_state(
             clear_config_rejected_after_accepted_full_reload(config_rejected, context);
             true
         }
-        proxy::ConfigApplyOutcome::Rejected { .. } => {
-            warn!(
-                "Database configuration candidate rejected ({}); keeping previous runtime config and poll cursor",
-                context
-            );
+        proxy::ConfigApplyOutcome::Rejected { errors } => {
+            if !config_rejected.swap(true, Ordering::Relaxed) {
+                error!(
+                    "Database configuration candidate rejected during full apply ({}); \
+                     raising config_rejected and keeping previous runtime config and poll cursor: {}",
+                    context,
+                    errors.join("; ")
+                );
+            } else {
+                debug!(
+                    "Database configuration candidate still rejected during full apply ({}); \
+                     keeping previous runtime config and poll cursor: {}",
+                    context,
+                    errors.join("; ")
+                );
+            }
             false
         }
     }
+}
+
+fn initial_db_available(bootstrap_from_backup: bool, config_rejected: bool) -> bool {
+    !bootstrap_from_backup || config_rejected
 }
 
 /// Clear the standing config-rejection signal once a FULL config reload is
@@ -2549,12 +2581,13 @@ mod tests {
     }
 
     #[test]
-    fn full_reload_rejected_preserves_cursor_and_rejection_flag() {
-        // A rejected full-reload candidate keeps the previous cursor AND keeps a
-        // standing config_rejected set: the full snapshot is still invalid.
+    fn full_reload_rejected_preserves_cursor_and_raises_rejection_flag() {
+        // A rejected full-reload candidate keeps the previous cursor AND raises
+        // config_rejected even when the loader accepted the snapshot but the
+        // final runtime apply rejected it.
         let previous_sequence = Some(7);
         let mut last_change_sequence = previous_sequence;
-        let config_rejected = AtomicBool::new(true);
+        let config_rejected = AtomicBool::new(false);
 
         let accepted = commit_full_reload_poll_state(
             "test rejected",
@@ -2570,7 +2603,36 @@ mod tests {
         assert_eq!(last_change_sequence, previous_sequence);
         assert!(
             config_rejected.load(Ordering::Relaxed),
-            "a rejected full reload must keep config_rejected set"
+            "a rejected full apply must raise config_rejected"
+        );
+    }
+
+    #[test]
+    fn startup_validation_rejection_keeps_writes_enabled() {
+        assert!(
+            initial_db_available(false, true),
+            "a reachable validation rejection must keep admin writes enabled"
+        );
+        assert!(
+            initial_db_available(true, true),
+            "validation proof of reachability must override an earlier offline bootstrap state"
+        );
+        assert!(
+            !initial_db_available(true, false),
+            "a connectivity-only backup bootstrap must keep admin writes blocked"
+        );
+    }
+
+    #[test]
+    fn startup_backup_seeds_config_rejection_before_first_poll() {
+        let source = include_str!("database.rs");
+        assert!(
+            source.contains("startup_config_rejected = is_poll_validation_rejection(&e);"),
+            "backup startup must classify the initial full-load failure"
+        );
+        assert!(
+            source.contains("AtomicBool::new(startup_config_rejected)"),
+            "backup startup must expose config_rejected before the poll loop starts"
         );
     }
 
