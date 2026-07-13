@@ -505,6 +505,52 @@ async fn transient_connectivity_failure_stays_backup_eligible() {
     );
 }
 
+#[test]
+fn initial_config_load_validation_error_is_non_transient() {
+    // A schema/data/validation load failure that carries no transient
+    // sqlx/mongodb error must be marked non-transient so database::run refuses
+    // to bootstrap from FERRUM_DB_CONFIG_BACKUP_PATH and fails startup instead
+    // of masking a broken database with stale on-disk config.
+    let raw = anyhow::anyhow!("proxy 'api' references unknown upstream 'missing'");
+    let classified = DatabaseStore::classify_initial_config_load_error(raw);
+    assert!(
+        DatabaseStore::is_non_transient_init_error(&classified),
+        "a non-transient config-load error must be marked so backup bootstrap is refused: {classified}"
+    );
+}
+
+#[test]
+fn initial_config_load_transient_sqlx_error_stays_backup_eligible() {
+    // A connectivity failure during the initial full load (the DB became
+    // unreachable between connect and load) must stay backup-eligible so the
+    // gateway can still come up serving FERRUM_DB_CONFIG_BACKUP_PATH.
+    let raw = anyhow::Error::new(sqlx::Error::PoolTimedOut)
+        .context("load_full_config: initial database query failed");
+    let classified = DatabaseStore::classify_initial_config_load_error(raw);
+    assert!(
+        !DatabaseStore::is_non_transient_init_error(&classified),
+        "a transient connectivity load failure must remain backup-eligible: {classified}"
+    );
+}
+
+#[test]
+fn non_transient_load_error_message_preserves_driver_cause() {
+    // main logs fatal errors with `{}` (outermost anyhow context only), so the
+    // surfaced startup message must fold in the underlying driver cause instead
+    // of hiding it behind the generic non-transient explanation.
+    let raw = anyhow::anyhow!("relation \"proxies\" does not exist");
+    let classified = DatabaseStore::classify_initial_config_load_error(raw);
+    let rendered = classified.to_string();
+    assert!(
+        rendered.contains("non-transient"),
+        "expected the non-transient explanation in the surfaced message: {rendered}"
+    );
+    assert!(
+        rendered.contains("relation \"proxies\" does not exist"),
+        "the underlying driver cause must survive in the Display output: {rendered}"
+    );
+}
+
 #[tokio::test]
 async fn read_replica_scheduling_state_tracks_failover_and_failback() {
     // Pin the exact flags the poll scheduler branches on: while failed over the

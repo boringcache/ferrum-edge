@@ -462,13 +462,53 @@ impl std::fmt::Display for NonTransientDbInitError {
 impl std::error::Error for NonTransientDbInitError {}
 
 /// Wrap a non-transient failure with the [`NonTransientDbInitError`] marker
-/// (kept below `context` so the outer message is preserved) so callers can
-/// distinguish it from a transient connectivity/resource failure.
+/// and an outer message that folds in the redacted driver cause.
+///
+/// `main` logs fatal startup/reconnect errors with `{}` (Display), which for an
+/// `anyhow::Error` renders only the outermost context. Attaching just a static
+/// explanation would therefore hide the actionable driver cause (bad password,
+/// missing table, constraint failure, ...). We render the cause chain now —
+/// before the marker/context are attached — redact any connection URLs in
+/// `secrets`, and append it to the outer message so operators see what to fix.
+/// The marker is kept below the message so it stays discoverable via `anyhow`'s
+/// chained downcast.
 fn mark_non_transient(
     error: anyhow::Error,
-    context: impl std::fmt::Display + Send + Sync + 'static,
+    context: impl std::fmt::Display,
+    secrets: &[&str],
 ) -> anyhow::Error {
-    error.context(NonTransientDbInitError).context(context)
+    let cause = crate::config::db_backend::redact_error_text(format!("{error:#}"), secrets);
+    let message = format!("{context}: {cause}");
+    error.context(NonTransientDbInitError).context(message)
+}
+
+/// Returns true when a full-config load error is a transient
+/// connectivity/resource failure (SQL or MongoDB) a caller may recover from by
+/// serving `FERRUM_DB_CONFIG_BACKUP_PATH`. Schema drift, decode, query,
+/// authentication, and validation failures are non-transient and return false.
+fn is_transient_config_load_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        if let Some(sqlx_err) = source.downcast_ref::<sqlx::Error>() {
+            return is_transient_sqlx_error(sqlx_err);
+        }
+        if let Some(mongo_err) = source.downcast_ref::<mongodb::error::Error>() {
+            return is_transient_mongo_load_error(mongo_err);
+        }
+        false
+    })
+}
+
+/// MongoDB counterpart to [`is_transient_sqlx_error`] for the full-config load
+/// path: only network I/O, connection-pool, server-selection, and DNS failures
+/// are transient. Command/write/auth/decode failures are non-transient.
+fn is_transient_mongo_load_error(error: &mongodb::error::Error) -> bool {
+    matches!(
+        error.kind.as_ref(),
+        mongodb::error::ErrorKind::Io(_)
+            | mongodb::error::ErrorKind::ConnectionPoolCleared { .. }
+            | mongodb::error::ErrorKind::ServerSelection { .. }
+            | mongodb::error::ErrorKind::DnsResolve { .. }
+    )
 }
 
 fn is_transient_sqlx_error(error: &sqlx::Error) -> bool {
@@ -5163,6 +5203,7 @@ impl DatabaseStore {
                     return Err(mark_non_transient(
                         primary_err,
                         "Primary database initialization failed with a non-transient query, schema, data, constraint, authentication, or configuration error; failover was not attempted",
+                        &[primary_url],
                     ));
                 }
                 if failover_urls.is_empty() {
@@ -5197,6 +5238,7 @@ impl DatabaseStore {
                                         "Failover database #{} initialization returned a non-transient query, schema, data, constraint, authentication, or configuration error; no further failover URLs were attempted",
                                         i + 1
                                     ),
+                                    &[url.as_str()],
                                 ));
                             }
                             let safe_error =
@@ -5419,6 +5461,7 @@ impl DatabaseStore {
                 return Err(mark_non_transient(
                     error,
                     "Primary database reconnect returned a non-transient query, schema, data, constraint, authentication, or configuration error; failover was not attempted",
+                    &[primary_url],
                 ));
             }
             Err(error) => {
@@ -5449,6 +5492,7 @@ impl DatabaseStore {
                             "Failover database #{} reconnect returned a non-transient query, schema, data, constraint, authentication, or configuration error; no further failover URLs were attempted",
                             i + 1
                         ),
+                        &[url.as_str()],
                     ));
                 }
                 Err(error) => {
@@ -5486,6 +5530,29 @@ impl DatabaseStore {
     /// backup.
     pub fn is_non_transient_init_error(error: &anyhow::Error) -> bool {
         error.downcast_ref::<NonTransientDbInitError>().is_some()
+    }
+
+    /// Classify an initial full-config load failure for backup eligibility.
+    ///
+    /// `database::run` applies the same [`is_non_transient_init_error`] gate to
+    /// the initial load that it uses for connect failures: only transient
+    /// connectivity/resource failures may bootstrap from
+    /// `FERRUM_DB_CONFIG_BACKUP_PATH`. Schema drift, bad rows, decode, query,
+    /// authentication, and validation errors are marked non-transient here so
+    /// startup fails loudly instead of masking a broken database with stale
+    /// on-disk config. Works for both SQL and MongoDB backends.
+    ///
+    /// [`is_non_transient_init_error`]: Self::is_non_transient_init_error
+    pub fn classify_initial_config_load_error(error: anyhow::Error) -> anyhow::Error {
+        if is_transient_config_load_error(&error) {
+            error
+        } else {
+            mark_non_transient(
+                error,
+                "Initial database config load failed with a non-transient schema, data, query, decode, or validation error; refusing to bootstrap from FERRUM_DB_CONFIG_BACKUP_PATH",
+                &[],
+            )
+        }
     }
 
     /// Returns true if a read replica URL is configured.

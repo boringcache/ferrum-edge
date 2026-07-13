@@ -1057,8 +1057,19 @@ pub async fn run(
                 (cfg, Some(sequence))
             }
             Err(e) => {
-                // Database unreachable — try backup file for pod restart resilience
+                // Classify the load failure. A backup bootstrap is only safe
+                // for TRANSIENT connectivity/resource errors (DB became
+                // unreachable between connect and load). A non-transient
+                // schema-drift/bad-row/decode/query/validation error must fail
+                // startup instead of masking a broken database with stale
+                // on-disk config — the same policy the connect path applies
+                // above via `is_non_transient_init_error`.
+                let e = DatabaseStore::classify_initial_config_load_error(e);
                 if let Some(ref path) = backup_path {
+                    if DatabaseStore::is_non_transient_init_error(&e) {
+                        return Err(e);
+                    }
+                    // Database unreachable — try backup file for pod restart resilience
                     warn!(
                         "Database load failed ({}), attempting backup file: {}",
                         e, path
