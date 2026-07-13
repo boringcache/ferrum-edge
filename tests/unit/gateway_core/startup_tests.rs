@@ -1,6 +1,9 @@
 //! Tests for startup signal waiting.
 
-use ferrum_edge::startup::{flip_ready_off_on_listener_failure, wait_for_start_signals};
+use ferrum_edge::startup::{
+    ServingListenerFailures, flip_ready_off_on_listener_failure,
+    record_post_start_listener_failure, wait_for_start_signals,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -187,4 +190,45 @@ fn test_cp_admin_serve_failure_flips_effective_readiness() {
         !(ready.load(Ordering::Acquire) && !degraded.load(Ordering::Acquire)),
         "CP admin serve failure must remain visible after startup-ready is restored"
     );
+}
+
+#[test]
+fn mesh_post_start_listener_failure_is_sticky_and_recorded_safely() {
+    let ready = AtomicBool::new(true);
+    let degraded = AtomicBool::new(false);
+    let failures = ServingListenerFailures::default();
+
+    record_post_start_listener_failure(
+        &ready,
+        &degraded,
+        &failures,
+        "Mesh traffic listener",
+        15001,
+        &"secret=/operator/private/path",
+    );
+    ready.store(true, Ordering::Release);
+
+    assert!(degraded.load(Ordering::Acquire));
+    assert!(!(ready.load(Ordering::Acquire) && !degraded.load(Ordering::Acquire)));
+    let snapshot = failures.snapshot();
+    assert_eq!(snapshot.failures_total, 1);
+    assert_eq!(snapshot.failures[0].listener, "Mesh traffic listener");
+    assert_eq!(snapshot.failures[0].listen_port, 15001);
+    assert_eq!(
+        snapshot.failures[0].error,
+        "listener serve task exited after successful bind"
+    );
+    assert!(!snapshot.failures[0].error.contains("secret"));
+}
+
+#[test]
+fn healthy_mesh_listener_set_keeps_ready_and_has_no_failure_snapshot() {
+    let ready = AtomicBool::new(true);
+    let degraded = AtomicBool::new(false);
+    let failures = ServingListenerFailures::default();
+
+    assert!(ready.load(Ordering::Acquire) && !degraded.load(Ordering::Acquire));
+    let snapshot = failures.snapshot();
+    assert_eq!(snapshot.failures_total, 0);
+    assert!(snapshot.failures.is_empty());
 }

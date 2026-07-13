@@ -99,6 +99,7 @@ async fn build_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDir) {
         admin_audit_enabled: false,
         startup_ready: None,
         serving_degraded: None,
+        serving_listener_failures: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,

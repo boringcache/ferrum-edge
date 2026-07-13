@@ -177,7 +177,7 @@ pub struct AdminState {
     /// DP mode differs: it starts with an empty config and defers `startup_ready`
     /// until the first CP snapshot is applied + backend capabilities are classified.
     pub startup_ready: Option<Arc<AtomicBool>>,
-    /// Sticky serving-degradation signal (set only in CP/DP modes, which
+    /// Sticky serving-degradation signal (set in CP/DP/mesh modes, which
     /// supervise post-start listener/server tasks). Set once — and never unset —
     /// by [`crate::startup::flip_ready_off_on_listener_failure`] when a serving
     /// task (CP gRPC server; DP proxy/admin listeners) exits with an error after
@@ -186,9 +186,12 @@ pub struct AdminState {
     /// `true` once after the gRPC start signal and DP re-stores `true` on every
     /// CP-reconnect snapshot — this flag is monotonic, so a post-start serve
     /// failure stays visible even after a later readiness restore. `None` in
-    /// modes without post-start listener supervision (file/database/mesh/
-    /// node_agent), where readiness is governed by `startup_ready` alone.
+    /// modes without post-start listener supervision (file/database/node_agent),
+    /// where readiness is governed by `startup_ready` alone.
     pub serving_degraded: Option<Arc<AtomicBool>>,
+    /// Durable sanitized details for post-start listener failures. Populated by
+    /// mesh mode and exposed only on authenticated observability responses.
+    pub serving_listener_failures: Option<Arc<crate::startup::ServingListenerFailures>>,
     /// Dynamic flag set by the DB polling loop. When `false`, write operations
     /// are rejected early to preserve the cached config until the DB recovers.
     /// This flag is orthogonal to `startup_ready` — a gateway can be ready to
@@ -261,28 +264,6 @@ impl AdminState {
     }
 }
 
-/// Start the Admin API listener with dual-path handling.
-pub async fn start_admin_listener(
-    addr: SocketAddr,
-    state: AdminState,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-    conn_limiter: Arc<conn_limit::AdminConnLimiter>,
-) -> Result<(), anyhow::Error> {
-    start_admin_listener_with_tls_and_signal(addr, state, shutdown, None, None, conn_limiter).await
-}
-
-/// Start the Admin API listener with optional TLS support.
-pub async fn start_admin_listener_with_tls(
-    addr: SocketAddr,
-    state: AdminState,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-    tls_config: Option<Arc<rustls::ServerConfig>>,
-    conn_limiter: Arc<conn_limit::AdminConnLimiter>,
-) -> Result<(), anyhow::Error> {
-    start_admin_listener_with_tls_and_signal(addr, state, shutdown, tls_config, None, conn_limiter)
-        .await
-}
-
 /// Start the Admin API listener with optional TLS support and signal readiness
 /// after the TCP socket binds successfully.
 pub async fn start_admin_listener_with_tls_and_signal(
@@ -299,30 +280,6 @@ pub async fn start_admin_listener_with_tls_and_signal(
         let _ = started_tx.send(());
     }
     serve_admin_on_listener(listener, state, shutdown, tls_config, conn_limiter).await
-}
-
-/// Start the Admin API HTTPS listener with a hot-swappable frontend TLS
-/// slot. Used when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`. The
-/// frontend TLS watch task swaps the underlying `ArcSwap` after a validated
-/// cert/key reload; subsequent accepts pick up the new config without
-/// restarting the listener. Existing in-flight admin connections keep their
-/// original `ServerConfig`.
-pub async fn start_admin_listener_with_dynamic_tls(
-    addr: SocketAddr,
-    state: AdminState,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-    tls_slot: crate::tls::SharedFrontendTls,
-    conn_limiter: Arc<conn_limit::AdminConnLimiter>,
-) -> Result<(), anyhow::Error> {
-    start_admin_listener_with_dynamic_tls_and_signal(
-        addr,
-        state,
-        shutdown,
-        tls_slot,
-        None,
-        conn_limiter,
-    )
-    .await
 }
 
 /// Start the Admin API HTTPS listener with a hot-swappable frontend TLS slot
@@ -349,8 +306,8 @@ pub async fn start_admin_listener_with_dynamic_tls_and_signal(
 /// Useful for tests that allocate an ephemeral port up front: passing the
 /// listener through avoids the bind→drop→rebind window where another process
 /// can steal the port between releasing it and the listener task re-binding.
-/// Production callers go through [`start_admin_listener`] /
-/// [`start_admin_listener_with_tls`], which bind internally.
+/// Production callers go through [`start_admin_listener_with_tls_and_signal`],
+/// which binds internally and signals startup readiness.
 ///
 /// `file::serve` (the in-process gateway entry point) also calls this
 /// directly when a `ServeOptions::admin_http` / `admin_https` listener is
@@ -1025,7 +982,7 @@ pub async fn handle_admin_request(
             .as_ref()
             .is_none_or(|flag| flag.load(Ordering::Acquire));
         // Sticky serving-degradation overrides a readiness restore (issue
-        // #2117): once a CP/DP serving task dies after startup, `/health` stays
+        // #2117): once a CP/DP/mesh serving task dies after startup, `/health` stays
         // not-ready even though the mode's main task (CP) or a CP reconnect (DP)
         // later stores `startup_ready = true`. Only CP/DP populate this flag.
         let serving_degraded = state
@@ -1034,6 +991,14 @@ pub async fn handle_admin_request(
             .is_some_and(|flag| flag.load(Ordering::Acquire));
         let ready = startup_ready && !serving_degraded;
         health_status["ready"] = json!(ready);
+
+        if let Some(failures) = state.serving_listener_failures.as_ref() {
+            let snapshot = failures.snapshot();
+            if snapshot.failures_total > 0 {
+                health_status["listener_failures"] =
+                    serde_json::to_value(snapshot).unwrap_or_default();
+            }
+        }
 
         // Report cached config availability for resilience visibility
         if let Some(config) = state.cached_gateway_config() {
@@ -1144,6 +1109,12 @@ pub async fn handle_admin_request(
                     serde_json::to_value(proxy_state.stream_listener_manager.overload_snapshot())
                         .unwrap_or_default(),
                 );
+                if let Some(failures) = state.serving_listener_failures.as_ref() {
+                    obj.insert(
+                        "listener_failures".to_string(),
+                        serde_json::to_value(failures.snapshot()).unwrap_or_default(),
+                    );
+                }
             }
             if detailed {
                 return Ok(json_response(status, &snapshot_value));

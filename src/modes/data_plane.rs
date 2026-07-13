@@ -552,6 +552,7 @@ pub async fn run(
         admin_audit_enabled: env_config.admin_audit_enabled,
         startup_ready: Some(startup_ready.clone()),
         serving_degraded: Some(serving_degraded.clone()),
+        serving_listener_failures: None,
         db_available: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
