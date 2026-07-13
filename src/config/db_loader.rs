@@ -95,11 +95,22 @@ type PluginConfigRefs = HashMap<String, PluginConfigRef>;
 #[derive(Debug)]
 pub(crate) struct ProxyPluginAssociationLoadError {
     message: String,
+    source: Option<sqlx::Error>,
 }
 
 impl ProxyPluginAssociationLoadError {
     fn new(message: String) -> Self {
-        Self { message }
+        Self {
+            message,
+            source: None,
+        }
+    }
+
+    fn with_source(message: String, source: sqlx::Error) -> Self {
+        Self {
+            message,
+            source: Some(source),
+        }
     }
 }
 
@@ -109,7 +120,13 @@ impl std::fmt::Display for ProxyPluginAssociationLoadError {
     }
 }
 
-impl std::error::Error for ProxyPluginAssociationLoadError {}
+impl std::error::Error for ProxyPluginAssociationLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
 
 pub(crate) fn is_proxy_plugin_association_load_error(error: &anyhow::Error) -> bool {
     error
@@ -534,10 +551,14 @@ fn is_transient_sqlx_error(error: &sqlx::Error) -> bool {
 
 fn is_transient_database_code(code: &str) -> bool {
     code.starts_with("08")
-        || code.parse::<i32>().is_ok_and(|code| code & 0xff == 14)
+        || code
+            .parse::<i32>()
+            .is_ok_and(|code| matches!(code & 0xff, 5 | 6 | 14))
         || matches!(
             code,
-            // PostgreSQL shutdown and resource-exhaustion connection failures.
+            // SQLite base/extended codes 5/6 are lock contention and 14 is an
+            // unavailable database file. PostgreSQL shutdown and resource-
+            // exhaustion connection failures are listed explicitly below.
             "53300" | "57P01" | "57P02" | "57P03"
         )
 }
@@ -1120,7 +1141,7 @@ impl DatabaseStore {
     fn proxy_plugin_association_query_error(
         operation: &str,
         namespace: Option<&str>,
-        source: impl std::fmt::Display,
+        source: sqlx::Error,
     ) -> anyhow::Error {
         let message = match namespace {
             Some(namespace) => format!(
@@ -1136,9 +1157,11 @@ impl DatabaseStore {
             // Snapshot callers must distinguish an unavailable database from a
             // row-integrity failure. Query failures are availability failures;
             // decode/dangling-association paths retain the typed marker below.
-            anyhow::anyhow!(message)
+            anyhow::Error::new(source).context(message)
         } else {
-            anyhow::Error::new(ProxyPluginAssociationLoadError::new(message))
+            anyhow::Error::new(ProxyPluginAssociationLoadError::with_source(
+                message, source,
+            ))
         }
     }
 
@@ -1147,11 +1170,13 @@ impl DatabaseStore {
         operation: &str,
     ) -> Result<String, anyhow::Error> {
         row.try_get::<String, _>("proxy_id").map_err(|e| {
-            anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
-                "operation={} resource=proxy_plugins column=proxy_id: failed to decode proxy/plugin association row: {}",
-                operation,
-                e
-            )))
+            anyhow::Error::new(ProxyPluginAssociationLoadError::with_source(
+                format!(
+                    "operation={} resource=proxy_plugins column=proxy_id: failed to decode proxy/plugin association row: {}",
+                    operation, e
+                ),
+                e,
+            ))
         })
     }
 
@@ -1161,12 +1186,13 @@ impl DatabaseStore {
         proxy_id: &str,
     ) -> Result<String, anyhow::Error> {
         row.try_get::<String, _>("plugin_config_id").map_err(|e| {
-            anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
-                "operation={} resource=proxy_plugins proxy_id={} column=plugin_config_id: failed to decode proxy/plugin association row: {}",
-                operation,
-                proxy_id,
-                e
-            )))
+            anyhow::Error::new(ProxyPluginAssociationLoadError::with_source(
+                format!(
+                    "operation={} resource=proxy_plugins proxy_id={} column=plugin_config_id: failed to decode proxy/plugin association row: {}",
+                    operation, proxy_id, e
+                ),
+                e,
+            ))
         })
     }
 
@@ -1174,15 +1200,18 @@ impl DatabaseStore {
         operation: &str,
         namespace: &str,
         column: Option<&str>,
-        source: impl std::fmt::Display,
+        source: sqlx::Error,
     ) -> anyhow::Error {
         let column_context = column
             .map(|column| format!(" column=plugin_configs.{column}"))
             .unwrap_or_default();
-        anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
-            "operation={} resource=proxy_plugins namespace={}{}: failed to load plugin_config references for proxy/plugin association validation: {}",
-            operation, namespace, column_context, source
-        )))
+        anyhow::Error::new(ProxyPluginAssociationLoadError::with_source(
+            format!(
+                "operation={} resource=proxy_plugins namespace={}{}: failed to load plugin_config references for proxy/plugin association validation: {}",
+                operation, namespace, column_context, source
+            ),
+            source,
+        ))
     }
 
     fn push_proxy_plugin_association_row(

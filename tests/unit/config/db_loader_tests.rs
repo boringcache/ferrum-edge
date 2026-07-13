@@ -8,7 +8,50 @@ use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, Upstream, UpstreamTarget,
 };
 use serde_json::json;
+use sqlx::error::{DatabaseError, ErrorKind};
+use std::borrow::Cow;
 use std::collections::HashSet;
+use std::error::Error as StdError;
+use std::fmt;
+
+#[derive(Debug)]
+struct TestDatabaseError {
+    code: &'static str,
+}
+
+impl fmt::Display for TestDatabaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "test database error {}", self.code)
+    }
+}
+
+impl StdError for TestDatabaseError {}
+
+impl DatabaseError for TestDatabaseError {
+    fn message(&self) -> &str {
+        "test database error"
+    }
+
+    fn code(&self) -> Option<Cow<'_, str>> {
+        Some(Cow::Borrowed(self.code))
+    }
+
+    fn as_error(&self) -> &(dyn StdError + Send + Sync + 'static) {
+        self
+    }
+
+    fn as_error_mut(&mut self) -> &mut (dyn StdError + Send + Sync + 'static) {
+        self
+    }
+
+    fn into_error(self: Box<Self>) -> Box<dyn StdError + Send + Sync + 'static> {
+        self
+    }
+
+    fn kind(&self) -> ErrorKind {
+        ErrorKind::Other
+    }
+}
 
 fn make_upstream(id: &str) -> Upstream {
     Upstream {
@@ -533,6 +576,51 @@ fn initial_config_load_transient_sqlx_error_stays_backup_eligible() {
     assert!(
         !DatabaseStore::is_non_transient_init_error(&classified),
         "a transient connectivity load failure must remain backup-eligible: {classified}"
+    );
+}
+
+#[test]
+fn initial_config_load_sqlite_lock_codes_stay_backup_eligible() {
+    // SQLite reports base result codes in the low byte of extended codes.
+    // BUSY (5), LOCKED (6), BUSY_SNAPSHOT (517), and LOCKED_SHAREDCACHE
+    // (262) are temporary contention, not schema/data failures.
+    for code in ["5", "6", "517", "262"] {
+        let raw = anyhow::Error::new(sqlx::Error::Database(Box::new(TestDatabaseError { code })))
+            .context("load_full_config: SQLite query failed");
+        let classified = DatabaseStore::classify_initial_config_load_error(raw);
+        assert!(
+            !DatabaseStore::is_non_transient_init_error(&classified),
+            "SQLite lock code {code} must remain backup-eligible: {classified}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn proxy_plugin_query_wrapper_preserves_typed_sqlx_source() {
+    sqlx::any::install_default_drivers();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("proxy_plugin_source.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    sqlx::query("DROP TABLE proxy_plugins")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    let error = store.load_full_config("ferrum").await.unwrap_err();
+    assert!(
+        error
+            .chain()
+            .any(|source| source.downcast_ref::<sqlx::Error>().is_some()),
+        "the association-load wrapper must retain the typed sqlx source: {error:#}"
+    );
+
+    let classified = DatabaseStore::classify_initial_config_load_error(error);
+    assert!(
+        DatabaseStore::is_non_transient_init_error(&classified),
+        "a retained non-transient schema error must still refuse backup bootstrap: {classified}"
     );
 }
 
