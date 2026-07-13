@@ -2410,6 +2410,122 @@ jobs:
             --set probes.liveness.override.httpGet.port=admin-http \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/liveness-override.yaml"
           grep -Fq 'path: /live' "$RUNNER_TEMP/ferrum-gateway-helm-results/liveness-override.yaml"
+          # Admin mTLS (tls.admin.clientCaKey) + adminHttp=0 makes the computed exec
+          # probes fail the client-cert handshake, so render must require overrides.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set ports.adminHttp=0 \
+            --set tls.admin.enabled=true --set tls.admin.secretName=ferrum-admin-tls \
+            --set tls.admin.clientCaKey=ca.crt \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-mtls-probes.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-mtls-probes.err"; then
+            echo "::error title=Admin mTLS probes rendered::adminHttp=0 with admin mTLS must require probe overrides"
+            exit 1
+          fi
+          grep -F 'require a client certificate' "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-mtls-probes.err"
+          # Overriding both computed probes lets the admin mTLS + adminHttp=0 combo render.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set ports.adminHttp=0 \
+            --set tls.admin.enabled=true --set tls.admin.secretName=ferrum-admin-tls \
+            --set tls.admin.clientCaKey=ca.crt \
+            --set probes.liveness.override.httpGet.path=/live \
+            --set probes.readiness.override.httpGet.path=/health \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-mtls-probes-override.yaml"
+          # cp.grpcBindAddress must be an IP literal (SocketAddr::parse rejects hostnames).
+          if helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=cp --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set cp.grpcBindAddress=localhost \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-hostname-bind.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-hostname-bind.err"; then
+            echo "::error title=Hostname CP bind rendered::cp.grpcBindAddress must be an IP literal"
+            exit 1
+          fi
+          grep -F 'is not an IP literal' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-hostname-bind.err"
+          # An out-of-range IPv4 octet admin bind must be rejected at render.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set admin.bindAddress=999.999.999.999 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/octet-bind.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/octet-bind.err"; then
+            echo "::error title=Out-of-range IPv4 admin bind rendered::octets above 255 must be rejected"
+            exit 1
+          fi
+          grep -F 'is not an IP literal' "$RUNNER_TEMP/ferrum-gateway-helm-results/octet-bind.err"
+          # A DP CP URL with a valid scheme but no host (https://) must fail render.
+          if helm template ferrum-dp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=dp \
+            --set-string dp.cpGrpcUrls=https:// \
+            --set admin.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-hostless-url.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-hostless-url.err"; then
+            echo "::error title=Hostless DP CP URL rendered::a CP URL with no host must fail render"
+            exit 1
+          fi
+          grep -F 'has no host' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-hostless-url.err"
+          # failoverPrimaryRetrySeconds=0 disables primary retry and must render.
+          helm template ferrum-dp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=dp \
+            --set-string dp.cpGrpcUrls=https://ferrum-cp.example:50051 \
+            --set admin.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set dp.failoverPrimaryRetrySeconds=0 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-failover-zero.yaml"
+          retry_block="$(grep -A1 'name: FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-failover-zero.yaml")"
+          if ! grep -q '"0"' <<<"$retry_block"; then
+            echo "::error title=Zero primary retry dropped::failoverPrimaryRetrySeconds=0 must render the env"
+            exit 1
+          fi
+          # An admin Service with no publishable port must fail render (portless Service).
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set ports.adminHttp=0 \
+            --set admin.bindAddress=0.0.0.0 --set admin.service.enabled=true \
+            --set probes.startup.enabled=false \
+            --set probes.liveness.enabled=false \
+            --set probes.readiness.enabled=false \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/portless-admin-service.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/portless-admin-service.err"; then
+            echo "::error title=Portless admin Service rendered::an admin Service with no ports must fail render"
+            exit 1
+          fi
+          grep -F 'no admin Service port is publishable' "$RUNNER_TEMP/ferrum-gateway-helm-results/portless-admin-service.err"
+          # file mode: admin JWT is optional, but two sources for one base key conflict.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set-string admin.jwtSecret.value=this-inline-admin-secret-is-32-chars \
+            --set 'secretFileMounts[0].name=FERRUM_ADMIN_JWT_SECRET' \
+            --set 'secretFileMounts[0].secretName=ferrum-admin' \
+            --set 'secretFileMounts[0].secretKey=admin-jwt-secret' \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/file-admin-jwt-conflict.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/file-admin-jwt-conflict.err"; then
+            echo "::error title=Optional admin JWT source conflict rendered::two admin JWT sources must fail in file mode"
+            exit 1
+          fi
+          grep -F 'accepts at most one source' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-admin-jwt-conflict.err"
+          # A values file may use explicit nulls to omit shutdown drain and clear the
+          # PDB minAvailable default (the schema must accept null for both).
+          cat > "$RUNNER_TEMP/ferrum-gateway-helm-results/null-values.yaml" <<'NULLEOF'
+          mode: file
+          shutdownDrainSeconds: null
+          terminationGracePeriodSeconds: 10
+          podDisruptionBudget:
+            enabled: true
+            minAvailable: null
+            maxUnavailable: 1
+          NULLEOF
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            -f "$RUNNER_TEMP/ferrum-gateway-helm-results/null-values.yaml" \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/null-rendered.yaml"
+          if grep -Fq 'name: FERRUM_SHUTDOWN_DRAIN_SECONDS' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-rendered.yaml"; then
+            echo "::error title=Null shutdown drain still rendered::shutdownDrainSeconds: null must omit the env"
+            exit 1
+          fi
+          grep -Fq 'maxUnavailable: 1' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-rendered.yaml"
+          if grep -Fq 'minAvailable:' "$RUNNER_TEMP/ferrum-gateway-helm-results/null-rendered.yaml"; then
+            echo "::error title=Null minAvailable still rendered::minAvailable: null must fall through to maxUnavailable"
+            exit 1
+          fi
 
       - name: Upload core gateway chart diagnostics
         if: always() && steps.helm_changes.outputs.changed == 'true'

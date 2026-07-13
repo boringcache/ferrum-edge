@@ -122,7 +122,9 @@ admin:
   # Cluster-internal admin Service (ClusterIP). Only enable together with a
   # non-loopback admin.bindAddress and a NetworkPolicy restricting access. The
   # admin-https port is published only when tls.admin is enabled with a Secret
-  # (admin HTTPS does not serve otherwise), mirroring the proxy Service.
+  # (admin HTTPS does not serve otherwise), mirroring the proxy Service. If neither
+  # a plaintext admin port (ports.adminHttp>0) nor a usable admin HTTPS port is
+  # available the Service would have no ports, so the chart fails render instead.
   service:
     enabled: false
     type: ClusterIP
@@ -196,6 +198,9 @@ file:
 # -----------------------------------------------------------------------------
 cp:
   # gRPC listener bind host (combined with ports.cpGrpc for FERRUM_CP_GRPC_LISTEN_ADDR).
+  # Must be an IP literal: the runtime parses this as an IP:port socket address and
+  # rejects hostnames like "localhost" at boot, so the chart rejects non-IP binds at
+  # render. Use 0.0.0.0 or :: to expose the listener, or 127.0.0.1/::1 for loopback.
   # IPv6 literals are bracketed automatically ("::" -> "[::]:50051"). A loopback
   # bind (127.0.0.1/::1) is unreachable through cp.service, so the chart requires
   # cp.service.enabled=false with a loopback bind.
@@ -216,11 +221,14 @@ cp:
 dp:
   # Comma-separated CP gRPC URLs (FERRUM_DP_CP_GRPC_URLS). REQUIRED for dp.
   # e.g. "https://ferrum-cp-east:50051,https://ferrum-cp-west:50051"
-  # Each entry must use an http/https/grpc/grpcs scheme (the chart rejects typos
-  # and schemeless host:port at render); a non-loopback http:// URL additionally
-  # requires grpc.allowPlaintext=true.
+  # Each entry must use an http/https/grpc/grpcs scheme AND carry a non-empty host
+  # (the chart rejects typos, schemeless host:port, and host-less values such as
+  # "https://" at render); a non-loopback http:// URL additionally requires
+  # grpc.allowPlaintext=true.
   cpGrpcUrls: ""
   # Optional multi-CP failover primary retry seconds (FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS).
+  # 0 disables primary-CP retry and is rendered explicitly; "" (or null) omits the
+  # env and takes the binary's 300s default.
   failoverPrimaryRetrySeconds: ""
 
 # -----------------------------------------------------------------------------
@@ -245,6 +253,11 @@ tls:
     mountPath: /etc/ferrum/tls/admin
     certKey: tls.crt
     keyKey: tls.key
+    # Optional admin mTLS client CA bundle key. NOTE: setting this makes the admin
+    # HTTPS listener demand a client cert, which the computed exec probes cannot
+    # present. With ports.adminHttp=0 (TLS-only admin) the chart therefore requires
+    # you to override/disable the computed probes, or keep a plaintext loopback
+    # admin listener (ports.adminHttp>0) for them.
     clientCaKey: ""
   backend:
     enabled: false

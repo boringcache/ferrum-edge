@@ -47,7 +47,16 @@ node_agent, migrate) fails at template time with a pointer to the right chart.
   `tls.admin.enabled` + `tls.admin.secretName` in that combination (or that you
   override/disable the computed probes). Disabling **both** admin ports
   (`ports.adminHttp=0` and `ports.adminHttps=0`) leaves no admin listener for the
-  computed probes and is rejected unless every computed probe is overridden.
+  computed probes and is rejected unless every computed probe is overridden. Admin
+  **mTLS** (`tls.admin.clientCaKey` set) makes the admin HTTPS listener demand a
+  client cert the exec probes cannot present, so with `ports.adminHttp=0` the chart
+  requires you to override/disable the computed probes or keep a plaintext loopback
+  admin listener.
+- **Admin Service needs a publishable port.** With `admin.service.enabled=true`
+  the chart fails render if no admin Service port is available — a plaintext admin
+  port (`ports.adminHttp>0`) or admin HTTPS (`ports.adminHttps>0` with
+  `tls.admin.enabled` + `tls.admin.secretName`) — rather than ship a portless
+  Service the API server rejects.
 - **CP/DP gRPC transport.** The binary rejects a non-loopback **plaintext** CP
   gRPC bind (`cp` mode, default `cp.grpcBindAddress=0.0.0.0`) and a non-loopback
   `http://` CP URL (`dp` mode) unless gRPC TLS is configured or you set
@@ -57,8 +66,12 @@ node_agent, migrate) fails at template time with a pointer to the right chart.
   IPv6 CP binds are bracketed automatically (`::` → `[::]:50051`). A loopback CP
   bind is unreachable through `cp.service`, so the chart requires
   `cp.service.enabled=false` with it; `ports.cpGrpc=0` disables the CP gRPC
-  listener (the gRPC container port and CP Service are omitted). DP CP URL schemes
-  are validated (http/https/grpc/grpcs) so typos fail at render, not at boot.
+  listener (the gRPC container port and CP Service are omitted). `cp.grpcBindAddress`
+  must be an IP literal — the runtime parses `FERRUM_CP_GRPC_LISTEN_ADDR` as an
+  IP:port socket address and rejects hostnames like `localhost` at boot, so the
+  chart rejects non-IP binds at render. DP CP URLs are validated for both scheme
+  (http/https/grpc/grpcs) and a non-empty host, so typos and host-less values (e.g.
+  `https://`) fail at render, not at boot.
 - **Chart-managed env is protected.** Every `FERRUM_*` var the chart renders from
   first-class values (mode, DB, JWTs, ports, bind address, allowlist, TLS paths,
   shutdown drain, DP URLs, gRPC plaintext opt-in, ...) is reserved: setting it

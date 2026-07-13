@@ -114,11 +114,16 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 
 {{/* "true" when the value parses as an IPv4 or IPv6 literal, else "". Mirrors
      EnvConfig::validate() rejecting any non-IP FERRUM_ADMIN_BIND_ADDRESS. The
-     binary's IpAddr::parse remains authoritative; this is a best-effort guard. */}}
+     IPv4 arm enforces 0-255 octets (so 999.999.999.999 is rejected at render)
+     and the IPv6 arm requires a plausibly-shaped literal (hextets, at most one
+     "::", optional embedded IPv4). The binary's IpAddr::parse remains
+     authoritative for exotic forms this best-effort guard does not classify. */}}
 {{- define "ferrum-gateway.isIpLiteral" -}}
 {{- $v := . | toString -}}
-{{- if regexMatch "^([0-9]{1,3}\\.){3}[0-9]{1,3}$" $v -}}true
-{{- else if and (contains ":" $v) (regexMatch "^[0-9A-Fa-f:.]+$" $v) -}}true
+{{- $octet := "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)" -}}
+{{- $ipv4 := printf "^%s\\.%s\\.%s\\.%s$" $octet $octet $octet $octet -}}
+{{- if regexMatch $ipv4 $v -}}true
+{{- else if and (contains ":" $v) (regexMatch "^[0-9A-Fa-f:.]+$" $v) (not (regexMatch "::.*::" $v)) (not (regexMatch "[0-9A-Fa-f]{5,}" $v)) (or (contains "::" $v) (eq (len (splitList ":" $v)) 8)) -}}true
 {{- end -}}
 {{- end -}}
 
@@ -160,6 +165,27 @@ authoritative for hosts this best-effort regex does not classify.
 {{- $bad -}}
 {{- end -}}
 
+{{/* First DP CP URL that carries a scheme but no host (e.g. "https://",
+     "grpc://:50051"), or "". The DP runtime parses every FERRUM_DP_CP_GRPC_URLS
+     entry with url::Url and rejects a URL whose host is empty, so a scheme-only
+     value renders cleanly yet fails at boot. Strip the scheme and any userinfo,
+     then require a non-empty host before the port/path/query/fragment. */}}
+{{- define "ferrum-gateway.dpHostlessUrl" -}}
+{{- $bad := "" -}}
+{{- range $u := splitList "," (.Values.dp.cpGrpcUrls | default "") -}}
+{{- $url := trim $u -}}
+{{- if and $url (regexMatch "(?i)^[a-z0-9+.-]+://" $url) -}}
+{{- $rest := regexReplaceAll "(?i)^[a-z0-9+.-]+://" $url "" -}}
+{{- $rest = regexReplaceAll "^[^/?#@]*@" $rest "" -}}
+{{- $host := regexFind "^[^:/?#]*" $rest -}}
+{{- if not $host -}}
+{{- if not $bad -}}{{- $bad = $url -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $bad -}}
+{{- end -}}
+
 {{/* True when a secret source (value / existingSecret.name / valueFrom) is set. */}}
 {{- define "ferrum-gateway.sourceConfigured" -}}
 {{- $source := . | default dict -}}
@@ -179,9 +205,13 @@ authoritative for hosts this best-effort regex does not classify.
 {{- end -}}
 
 {{/*
-Validate a single required secret source: exactly one of value,
-existingSecret.name, valueFrom, or the matching secretFileMounts/_FILE source,
-and (optionally) a minimum inline-value length.
+Validate a secret source: at most one of value, existingSecret.name, valueFrom,
+or the matching secretFileMounts/_FILE source, and (optionally) a minimum
+inline-value length. When .optional is truthy the credential may be omitted
+entirely (count 0 is allowed) but supplying more than one source is still a
+render-time conflict — the binary rejects multiple sources for one base key even
+where the credential itself is optional (e.g. the file-mode admin JWT). When
+.optional is falsy exactly one source is required.
 */}}
 {{- define "ferrum-gateway.validateOneSource" -}}
 {{- $label := .label -}}
@@ -193,8 +223,14 @@ and (optionally) a minimum inline-value length.
 {{- if $existing.name -}}{{- $count = add $count 1 -}}{{- end -}}
 {{- $fileCount := include "ferrum-gateway.secretFileSourceCount" (dict "root" .root "envName" .envName) | int -}}
 {{- $count = add $count $fileCount -}}
+{{- if .optional -}}
+{{- if gt $count 1 -}}
+{{- fail (printf "%s accepts at most one source, but %d are configured; the binary rejects multiple sources for one base key. Set only one of value, existingSecret.name, valueFrom, or a secretFileMounts entry name=%s (it is optional in this mode)." $label $count .envName) -}}
+{{- end -}}
+{{- else -}}
 {{- if ne $count 1 -}}
 {{- fail (printf "%s requires exactly one of value, existingSecret.name, valueFrom, or secretFileMounts entry name=%s" $label .envName) -}}
+{{- end -}}
 {{- end -}}
 {{- if and $source.value .minLength (lt (len $source.value) (.minLength | int)) -}}
 {{- fail (printf "%s.value must be at least %d characters" $label (.minLength | int)) -}}
@@ -319,6 +355,13 @@ Validation: fail render on missing/unsafe configuration.
 {{- end -}}
 {{- if or (eq $mode "database") (eq $mode "cp") (eq $mode "dp") -}}
 {{- include "ferrum-gateway.validateOneSource" (dict "label" "admin.jwtSecret" "source" (.Values.admin.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_ADMIN_JWT_SECRET") -}}
+{{- else if eq $mode "file" -}}
+{{/* file mode generates a random read-only admin JWT when none is supplied, so
+     the credential is optional — but if BOTH admin.jwtSecret.* and a
+     secretFileMounts entry for FERRUM_ADMIN_JWT_SECRET are configured the chart
+     would render both FERRUM_ADMIN_JWT_SECRET and _FILE, and startup rejects
+     multiple sources for one base key. Enforce the same at-most-one conflict. */}}
+{{- include "ferrum-gateway.validateOneSource" (dict "label" "admin.jwtSecret" "source" (.Values.admin.jwtSecret | default dict) "minLength" 32 "optional" true "root" . "envName" "FERRUM_ADMIN_JWT_SECRET") -}}
 {{- end -}}
 {{- $grpc := .Values.grpc | default dict -}}
 {{- $tlsAll := .Values.tls | default dict -}}
@@ -327,6 +370,16 @@ Validation: fail render on missing/unsafe configuration.
 {{/* The binary rejects a non-loopback PLAINTEXT CP gRPC bind (no TLS) unless
      FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true (src/config/env_config.rs). */}}
 {{- $cpBind := .Values.cp.grpcBindAddress | default "0.0.0.0" -}}
+{{/* The runtime parses FERRUM_CP_GRPC_LISTEN_ADDR with SocketAddr::parse
+     (cp_grpc_socket_addr, src/config/env_config.rs), which requires an IP
+     literal host and rejects hostnames like "localhost" — so a hostname bind
+     renders cleanly and then exits at boot. Reject any non-IP host at render.
+     Brackets on an IPv6 literal are stripped first (the listen-addr helper
+     re-adds them). */}}
+{{- $cpBindHost := $cpBind | trimPrefix "[" | trimSuffix "]" -}}
+{{- if not (include "ferrum-gateway.isIpLiteral" $cpBindHost) -}}
+{{- fail (printf "cp.grpcBindAddress=%q is not an IP literal: the runtime parses FERRUM_CP_GRPC_LISTEN_ADDR as an IP:port socket address and rejects hostnames (localhost, ferrum-cp, ...) at boot. Use an IP literal — 0.0.0.0 or :: to expose the CP gRPC listener, or 127.0.0.1/::1 for a loopback bind." $cpBind) -}}
+{{- end -}}
 {{- $cpGrpcPort := include "ferrum-gateway.cpGrpcPort" . -}}
 {{- $cpLoopback := or (hasPrefix "127." $cpBind) (eq $cpBind "::1") (eq $cpBind "[::1]") -}}
 {{- $cpGrpcTls := $tlsAll.cpGrpc | default dict -}}
@@ -352,6 +405,12 @@ Validation: fail render on missing/unsafe configuration.
 {{- $badScheme := include "ferrum-gateway.dpInvalidSchemeUrl" . -}}
 {{- if $badScheme -}}
 {{- fail (printf "dp.cpGrpcUrls entry %q has an unsupported scheme; each CP URL must start with https:// (TLS, recommended) or http:///grpc:// (plaintext, loopback or grpc.allowPlaintext only). The binary rejects other schemes at startup." $badScheme) -}}
+{{- end -}}
+{{/* The DP runtime rejects a CP URL with an empty host (e.g. "https://") even
+     though it is not plaintext, so validate host presence for every scheme. */}}
+{{- $hostless := include "ferrum-gateway.dpHostlessUrl" . -}}
+{{- if $hostless -}}
+{{- fail (printf "dp.cpGrpcUrls entry %q has no host; the DP runtime rejects a CP URL with an empty host at startup. Provide scheme://host[:port] (e.g. https://ferrum-cp:50051)." $hostless) -}}
 {{- end -}}
 {{/* The binary rejects a non-loopback PLAINTEXT (http://) CP URL unless
      FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true (src/config/env_config.rs). */}}
@@ -425,6 +484,14 @@ Validation: fail render on missing/unsafe configuration.
 {{- end -}}
 {{- if not (and $adminTls.enabled $adminTls.secretName) -}}
 {{- fail "ports.adminHttp=0 makes the computed probes target admin HTTPS (:9443), but admin HTTPS only serves when admin TLS is configured. Set tls.admin.enabled=true with tls.admin.secretName, or override/disable every computed probe (probes.liveness.override + probes.readiness.override, or disable startup/liveness/readiness)." -}}
+{{- end -}}
+{{/* Admin mTLS (tls.admin.clientCaKey set) makes the admin HTTPS listener demand
+     a client certificate during the handshake, but the computed exec probes run
+     `ferrum-edge health --tls --tls-no-verify` and the CLI cannot present one, so
+     every liveness/readiness probe fails the handshake and the pod restart-loops.
+     Require the operator to override/disable the computed probes in that combo. */}}
+{{- if $adminTls.clientCaKey -}}
+{{- fail "ports.adminHttp=0 with admin mTLS (tls.admin.clientCaKey set) makes the admin HTTPS listener require a client certificate, but the computed exec probes run `ferrum-edge health --tls` and cannot present one, so they fail the handshake and restart-loop the pod. Override every computed probe with a handler that presents a client cert (probes.liveness.override + probes.readiness.override), disable startup/liveness/readiness, or keep a plaintext loopback admin listener (ports.adminHttp>0)." -}}
 {{- end -}}
 {{- end -}}
 {{- if and $admin.allowedCidrs (or $defaultLiveProbe $defaultReadyProbe) -}}
@@ -503,7 +570,10 @@ FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRE
 {{- if include "ferrum-gateway.sourceConfigured" (.Values.grpc.jwtSecret | default dict) }}
 {{ include "ferrum-gateway.renderSecretEnv" (dict "name" "FERRUM_CP_DP_GRPC_JWT_SECRET" "source" (.Values.grpc.jwtSecret | default dict) "defaultKey" "cp-dp-grpc-jwt-secret") }}
 {{- end }}
-{{- if .Values.dp.failoverPrimaryRetrySeconds }}
+{{/* Presence, not truthiness: failoverPrimaryRetrySeconds=0 disables primary-CP
+     retry and must render, else the binary falls back to its 300s default. An
+     empty string means "unset" (the value default) and is also omitted. */}}
+{{- if and (not (kindIs "invalid" .Values.dp.failoverPrimaryRetrySeconds)) (ne (.Values.dp.failoverPrimaryRetrySeconds | toString) "") }}
 - name: FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS
   value: {{ .Values.dp.failoverPrimaryRetrySeconds | quote }}
 {{- end }}

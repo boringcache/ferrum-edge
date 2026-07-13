@@ -25,7 +25,7 @@
         "pullSecrets": { "type": "array" }
       }
     },
-    "shutdownDrainSeconds": { "type": "integer", "minimum": 0 },
+    "shutdownDrainSeconds": { "type": ["integer", "null"], "minimum": 0 },
     "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
     "secretVolumeDefaultMode": {
       "type": "integer",
@@ -165,15 +165,18 @@
       "properties": {
         "enabled": { "type": "boolean" },
         "minAvailable": {
+          "description": "Set to null to clear the default and select maxUnavailable instead.",
           "oneOf": [
             { "type": "integer", "minimum": 0 },
-            { "type": "string", "pattern": "^[0-9]+%$" }
+            { "type": "string", "pattern": "^[0-9]+%$" },
+            { "type": "null" }
           ]
         },
         "maxUnavailable": {
           "oneOf": [
             { "type": "integer", "minimum": 0 },
-            { "type": "string", "pattern": "^[0-9]+%$" }
+            { "type": "string", "pattern": "^[0-9]+%$" },
+            { "type": "null" }
           ]
         }
       }
