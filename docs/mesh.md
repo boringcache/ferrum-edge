@@ -894,9 +894,10 @@ mTLS modes:
 | `permissive` (default) | Accept both mTLS and plaintext. |
 | `disable` | Disable mTLS. Accept plaintext only. |
 
-`portLevelMtls` applies only to a `PeerAuthentication` that explicitly carries
-a workload selector; selector-less namespace- or mesh-wide policies use only
-their workload-level `mtls` mode. Applicable overrides are enforced at the
+`portLevelMtls` applies only to a `PeerAuthentication` whose workload selector
+contains at least one `matchLabels` entry. Omitted, `null`, and explicitly empty
+selectors are namespace- or mesh-wide policies and use only their workload-level
+`mtls` mode. Applicable overrides are enforced at the
 earliest point where the workload app port is known. For REDIRECT-captured
 connections, the inbound accept loop reads
 `SO_ORIGINAL_DST` once and selects the prebuilt per-port `rustls::ServerConfig`
@@ -946,9 +947,10 @@ port_overrides:
   8081: permissive
 ```
 
-Selector-less `PeerAuthentication` applies its workload-level mode to all
-workloads in its namespace (or mesh-wide if namespace-scoped), but its
-`portLevelMtls`/`port_overrides` entries are ignored.
+A `PeerAuthentication` with an omitted, `null`, or empty selector applies its
+workload-level mode to all workloads in its namespace (or mesh-wide when rooted
+in the Istio root namespace), but its `portLevelMtls`/`port_overrides` entries
+are ignored.
 
 ### Resolution and listener wiring
 

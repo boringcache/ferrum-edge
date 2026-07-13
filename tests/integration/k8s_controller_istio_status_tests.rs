@@ -585,6 +585,7 @@ fn peer_authentication_selectorless_port_level_mtls_is_reported_ignored() {
         "PeerAuthentication",
         "namespace-strict",
         json!({
+            "selector": { "matchLabels": {} },
             "mtls": { "mode": "STRICT" },
             "portLevelMtls": {
                 "8080": { "mode": "DISABLE" }
@@ -600,6 +601,7 @@ fn peer_authentication_selectorless_port_level_mtls_is_reported_ignored() {
     assert!(condition["message"].as_str().unwrap().contains("ignored"));
 
     let translation = &update.ferrum_detail.as_ref().unwrap()["translation"];
+    assert_eq!(translation["scope"].as_str(), Some("Namespace"));
     assert!(
         translation["port_level_overrides"]
             .as_array()
@@ -607,7 +609,7 @@ fn peer_authentication_selectorless_port_level_mtls_is_reported_ignored() {
             .is_empty()
     );
     assert_eq!(
-        translation["port_level_overrides_ignored_without_selector"].as_bool(),
+        translation["port_level_overrides_ignored_without_nonempty_selector"].as_bool(),
         Some(true)
     );
 }

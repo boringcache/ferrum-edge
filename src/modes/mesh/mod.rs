@@ -10612,7 +10612,7 @@ fn resolve_inbound_mtls_modes_by_port(
     let carried_override_ports = slice
         .peer_authentications
         .iter()
-        .filter(|policy| slice::peer_auth_has_workload_selector(policy))
+        .filter(|policy| policy.has_workload_selector())
         .flat_map(|policy| policy.port_overrides.keys().copied())
         .collect::<std::collections::BTreeSet<_>>();
     // A shared-SPIFFE slice with ambiguous labels cannot reliably identify its
@@ -26371,24 +26371,30 @@ mod tests {
     }
 
     #[test]
-    fn selectorless_port_overrides_are_absent_from_inbound_table() {
+    fn empty_selector_port_overrides_are_absent_from_inbound_table() {
+        let empty_selector = config::WorkloadSelector {
+            labels: HashMap::new(),
+            namespace: Some("default".to_string()),
+        };
         let slice = slice_with_peer_auths(vec![config::PeerAuthentication {
             name: "namespace-strict".to_string(),
             namespace: "default".to_string(),
-            scope: None,
-            selector: None,
+            scope: Some(config::PolicyScope::WorkloadSelector {
+                selector: empty_selector.clone(),
+            }),
+            selector: Some(empty_selector),
             mtls_mode: config::MtlsMode::Strict,
             port_overrides: HashMap::from([(8080, config::MtlsMode::Disable)]),
         }]);
 
         assert!(
             resolve_inbound_mtls_modes_by_port_for_test(&slice).is_empty(),
-            "Istio ignores portLevelMtls when PeerAuthentication has no workload selector"
+            "Istio ignores portLevelMtls when PeerAuthentication has an empty workload selector"
         );
         assert_eq!(
             slice.resolve_inbound_mtls_mode_fail_closed(8080),
             config::MtlsMode::Strict,
-            "the selector-less policy's workload-level mode remains authoritative"
+            "the empty-selector policy's workload-level mode remains authoritative"
         );
     }
 
