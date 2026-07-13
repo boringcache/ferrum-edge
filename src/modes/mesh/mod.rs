@@ -12578,17 +12578,29 @@ fn plan_mesh_inbound_tls_reload_with_federation(
     }
 }
 
+/// Reload-invariant context for [`apply_mesh_inbound_tls_reload`], bundled so
+/// the per-slice call passes one value alongside the slice-specific plan.
+struct MeshInboundTlsReloadCtx {
+    has_termination_listener: bool,
+    spiffe_bundle_slot_configured: bool,
+    topology: MeshTopology,
+    production: bool,
+}
+
 async fn apply_mesh_inbound_tls_reload(
     proxy_state: &ProxyState,
     slice: &MeshSlice,
     mtls_mode: config::MtlsMode,
     plan: MeshInboundTlsReloadPlan,
     last_snapshot: &mut Option<MeshInboundTlsReloadSnapshot>,
-    has_termination_listener: bool,
-    spiffe_bundle_slot_configured: bool,
-    topology: MeshTopology,
-    production: bool,
+    ctx: MeshInboundTlsReloadCtx,
 ) {
+    let MeshInboundTlsReloadCtx {
+        has_termination_listener,
+        spiffe_bundle_slot_configured,
+        topology,
+        production,
+    } = ctx;
     match plan {
         MeshInboundTlsReloadPlan::Unchanged { staged_spiffe } => {
             // Listener TLS config is unchanged, but a federated trust-domain
@@ -13104,10 +13116,14 @@ async fn apply_mesh_slice_generation(
                             mtls_mode,
                             plan,
                             &mut inbound_tls_reload.last_snapshot,
-                            has_termination_listener,
-                            inbound_tls_reload.spiffe_bundle_slot.is_some(),
-                            runtime.topology,
-                            inbound_tls_reload.production,
+                            MeshInboundTlsReloadCtx {
+                                has_termination_listener,
+                                spiffe_bundle_slot_configured: inbound_tls_reload
+                                    .spiffe_bundle_slot
+                                    .is_some(),
+                                topology: runtime.topology,
+                                production: inbound_tls_reload.production,
+                            },
                         )
                         .await;
                     }
