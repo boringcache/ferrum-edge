@@ -3448,6 +3448,36 @@ fn test_env_config_db_tls_rejects_mongodb_failover_uri_tls_conflict() {
 }
 
 #[test]
+fn test_env_config_db_tls_rejects_mongodb_seed_list_uri_tls_conflict() {
+    // Multi-host seed lists are unparseable by `url::Url`; the conflict must
+    // still be caught by MongoDB-aware query parsing.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "mongodb"),
+            (
+                "FERRUM_DB_URL",
+                "mongodb://db0:27017,db1:27017/ferrum?tls=true",
+            ),
+            ("FERRUM_DB_TLS_MODE", "disable"),
+        ],
+        || {
+            let error = EnvConfig::from_env().unwrap_err();
+            assert!(
+                error.contains("conflicts with MongoDB URI TLS settings"),
+                "seed-list TLS option was not detected: {error}"
+            );
+            assert!(error.contains("tls"));
+            assert!(error.contains("exactly one source"));
+        },
+    );
+}
+
+#[test]
 fn test_env_config_db_tls_accepts_mongodb_combined_client_pem() {
     with_env_vars(
         &[

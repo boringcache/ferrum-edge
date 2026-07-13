@@ -925,7 +925,14 @@ pub async fn run(
                     // so the gateway can still come up serving from the
                     // on-disk backup. The polling loop will retry the primary
                     // URL and flip `db_available` to true when it recovers.
-                    if env_config.db_config_backup_path.is_some() {
+                    //
+                    // Backup bootstrap is reserved for TRANSIENT connectivity/
+                    // resource/connect-timeout failures. A non-transient
+                    // schema/auth/config/query error must fail startup instead
+                    // of masking a broken primary by serving a stale backup.
+                    if env_config.db_config_backup_path.is_some()
+                        && !DatabaseStore::is_non_transient_init_error(&e)
+                    {
                         warn!(
                             "All database URLs failed ({}). \
                              FERRUM_DB_CONFIG_BACKUP_PATH is set — bootstrapping \

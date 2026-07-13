@@ -97,8 +97,10 @@ When Ferrum Edge starts in `database`, `cp`, or `migrate` mode, it runs the **Mi
 The applied-version read happens after the lock is acquired. When two replicas
 start together, the waiter therefore observes the winner's committed tracking
 row and skips the migration instead of racing the tracking insert. MongoDB
-index migration uses a renewable lease document in
-`_ferrum_migration_locks`; a crashed owner stops renewing and its lease expires.
+index migration uses a renewable lease document in `_ferrum_migration_locks`.
+Lease expiry and renewal are evaluated with the MongoDB server clock (`$$NOW`),
+so client clock skew cannot let one replica take over another's still-active
+lease; a crashed owner stops renewing and its lease expires server-side.
 
 ### Migration Tracking Table
 

@@ -2,6 +2,7 @@ use ferrum_edge::_test_support::{
     DbPoolConfig, db_append_connect_timeout, db_diff_removed, parse_auth_mode, parse_scheme,
     statement_timeout_sql,
 };
+use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, Upstream, UpstreamTarget,
@@ -464,9 +465,85 @@ async fn failover_does_not_mask_non_transient_schema_errors() {
         "unexpected failover classification: {error}"
     );
     assert!(
+        DatabaseStore::is_non_transient_init_error(&error),
+        "a non-transient schema error must be classified so database::run refuses backup bootstrap: {error}"
+    );
+    assert!(
         !failover_path.exists(),
         "the failover database must not be opened for a permanent primary schema error"
     );
+}
+
+#[tokio::test]
+async fn transient_connectivity_failure_stays_backup_eligible() {
+    // database::run may only bootstrap from FERRUM_DB_CONFIG_BACKUP_PATH for
+    // TRANSIENT failures; pin that a plain connectivity failure is classified
+    // transient (not marked non-transient) so backup bootstrap stays eligible.
+    sqlx::any::install_default_drivers();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let missing_path = temp_dir.path().join("missing-primary.db");
+    // mode=rw refuses to create the file, so opening a missing database is a
+    // transient connectivity failure (SQLITE_CANTOPEN).
+    let primary_url = format!("sqlite:{}?mode=rw", missing_path.to_string_lossy());
+    let no_failover: Vec<String> = Vec::new();
+
+    let error = DatabaseStore::connect_with_failover(
+        "sqlite",
+        &primary_url,
+        &no_failover,
+        DbPoolConfig::default(),
+    )
+    .await
+    .expect_err("opening a missing read-only sqlite database must fail");
+    assert!(
+        !DatabaseStore::is_non_transient_init_error(&error),
+        "a transient connectivity failure must remain backup-eligible: {error}"
+    );
+    assert!(
+        !missing_path.exists(),
+        "mode=rw must not create the database file"
+    );
+}
+
+#[tokio::test]
+async fn read_replica_scheduling_state_tracks_failover_and_failback() {
+    // Pin the exact flags the poll scheduler branches on: while failed over the
+    // replica is suppressed (not broken) so no reconnect is scheduled; after
+    // failback it is eligible again.
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("primary.db");
+    let failover_path = temp_dir.path().join("failover.db");
+    let replica_path = temp_dir.path().join("replica.db");
+    let primary_rw_url = format!("sqlite:{}?mode=rw", primary_path.to_string_lossy());
+    let primary_create_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+    let replica_url = format!("sqlite:{}?mode=rwc", replica_path.to_string_lossy());
+
+    // The primary (mode=rw) does not exist yet, so the store comes up on the
+    // failover topology.
+    let mut store = DatabaseStore::connect_with_failover(
+        "sqlite",
+        &primary_rw_url,
+        std::slice::from_ref(&failover_url),
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+    store.connect_read_replica(&replica_url).await.unwrap();
+
+    // Failed over: the replica belongs to the down primary topology. It must
+    // report as suppressed, not available, so the scheduler skips reconnects.
+    assert!(!store.read_replica_available());
+    assert!(store.read_replica_suppressed());
+
+    // Fail back to the now-reachable primary.
+    seed_sqlite_namespace(&primary_create_url, "primary-ns").await;
+    let active_url = store.try_failover_reconnect(&primary_rw_url).await.unwrap();
+    assert_eq!(active_url, primary_rw_url);
+
+    // Back on primary: the replica is eligible again and no longer suppressed.
+    assert!(store.read_replica_available());
+    assert!(!store.read_replica_suppressed());
 }
 
 #[tokio::test]

@@ -957,12 +957,57 @@ mod inner {
             self.connection.load_full()
         }
 
-        fn migration_lease_expiry() -> BsonDateTime {
-            BsonDateTime::from_millis(
-                Utc::now()
-                    .timestamp_millis()
-                    .saturating_add(MONGO_MIGRATION_LEASE_DURATION_MILLIS),
-            )
+        /// Aggregation-pipeline update that takes or holds the migration lease
+        /// using MongoDB SERVER time (`$$NOW`). Clock skew on the connecting
+        /// client can never enter the expiry comparison: the server both
+        /// evaluates whether the existing lease is expired and stamps the new
+        /// expiry/renewal timestamps in a single consistent `$$NOW` snapshot.
+        /// The lease is (re)claimed only when it is missing, server-expired, or
+        /// already owned by us; otherwise every field is left untouched so an
+        /// active owner is never stomped.
+        fn migration_lease_acquire_pipeline(owner: &str) -> Vec<Document> {
+            vec![
+                doc! {
+                    "$set": {
+                        "_ferrum_claimable": {
+                            "$or": [
+                                { "$eq": [ { "$type": "$expires_at" }, "missing" ] },
+                                { "$lte": [ "$expires_at", "$$NOW" ] },
+                                { "$eq": [ "$owner", owner ] },
+                            ],
+                        },
+                    },
+                },
+                doc! {
+                    "$set": {
+                        "owner": { "$cond": [ "$_ferrum_claimable", owner, "$owner" ] },
+                        "expires_at": {
+                            "$cond": [
+                                "$_ferrum_claimable",
+                                { "$add": [ "$$NOW", MONGO_MIGRATION_LEASE_DURATION_MILLIS ] },
+                                "$expires_at",
+                            ],
+                        },
+                        "updated_at": {
+                            "$cond": [ "$_ferrum_claimable", "$$NOW", "$updated_at" ],
+                        },
+                        "created_at": { "$ifNull": [ "$created_at", "$$NOW" ] },
+                    },
+                },
+                doc! { "$unset": "_ferrum_claimable" },
+            ]
+        }
+
+        /// Aggregation-pipeline update that renews the lease with a fresh
+        /// server-time (`$$NOW`) expiry. The owner match stays in the query
+        /// filter so a renewal that no longer owns the lock matches nothing.
+        fn migration_lease_renew_pipeline() -> Vec<Document> {
+            vec![doc! {
+                "$set": {
+                    "expires_at": { "$add": [ "$$NOW", MONGO_MIGRATION_LEASE_DURATION_MILLIS ] },
+                    "updated_at": "$$NOW",
+                },
+            }]
         }
 
         async fn acquire_migration_lease(&self) -> Result<MongoMigrationLease, anyhow::Error> {
@@ -972,31 +1017,23 @@ mod inner {
             loop {
                 let result = collection
                     .find_one_and_update(
-                        doc! {
-                            "_id": MONGO_MIGRATION_LOCK_ID,
-                            "$or": [
-                                { "expires_at": { "$lte": BsonDateTime::now() } },
-                                { "expires_at": { "$exists": false } },
-                            ],
-                        },
-                        doc! {
-                            "$set": {
-                                "owner": &owner,
-                                "expires_at": Self::migration_lease_expiry(),
-                                "updated_at": BsonDateTime::now(),
-                            },
-                            "$setOnInsert": {
-                                "created_at": BsonDateTime::now(),
-                            },
-                        },
+                        doc! { "_id": MONGO_MIGRATION_LOCK_ID },
+                        Self::migration_lease_acquire_pipeline(&owner),
                     )
                     .upsert(true)
                     .return_document(ReturnDocument::After)
                     .await;
 
                 match result {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {}
+                    // The server-evaluated pipeline only writes our owner when
+                    // the lease was claimable; a returned document owned by
+                    // someone else means a still-valid lease we must wait on.
+                    Ok(Some(document))
+                        if document.get_str("owner").ok() == Some(owner.as_str()) =>
+                    {
+                        break;
+                    }
+                    Ok(_) => {}
                     Err(error) if is_duplicate_key(&error) => {}
                     Err(error) => return Err(error.into()),
                 }
@@ -1027,12 +1064,7 @@ mod inner {
                                     "_id": MONGO_MIGRATION_LOCK_ID,
                                     "owner": &renew_owner,
                                 },
-                                doc! {
-                                    "$set": {
-                                        "expires_at": MongoStore::migration_lease_expiry(),
-                                        "updated_at": BsonDateTime::now(),
-                                    },
-                                },
+                                MongoStore::migration_lease_renew_pipeline(),
                             )
                             .await;
                         match renewal {

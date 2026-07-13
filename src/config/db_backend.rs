@@ -338,6 +338,17 @@ pub trait DatabaseBackend: Send + Sync {
         self.has_read_replica()
     }
 
+    /// Returns true when a configured read replica is intentionally suppressed
+    /// rather than broken — e.g. the SQL store is serving on a failover
+    /// topology and the replica belongs to the (currently unavailable) primary
+    /// topology. A suppressed replica reports `read_replica_available() ==
+    /// false`, but the poll scheduler MUST NOT treat it as a pool to repair:
+    /// reconnecting it every cycle can never converge while admin reads stay on
+    /// the failover pool. It becomes eligible again on primary failback.
+    fn read_replica_suppressed(&self) -> bool {
+        false
+    }
+
     /// Return connection pool statistics for observability.
     ///
     /// Returns `None` when the backend does not expose pool internals

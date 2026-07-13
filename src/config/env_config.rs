@@ -3925,7 +3925,7 @@ impl EnvConfig {
     }
 
     fn mongodb_uri_tls_source(base_url: &str) -> Option<String> {
-        let explicit = Self::existing_db_tls_url_params(base_url, "mongodb");
+        let explicit = Self::mongodb_uri_tls_query_params(base_url);
         if !explicit.is_empty() {
             return Some(explicit.join(","));
         }
@@ -3936,6 +3936,37 @@ impl EnvConfig {
             return Some("mongodb+srv implicit TLS".to_string());
         }
         None
+    }
+
+    /// Extract MongoDB TLS/SSL query option names from a connection string
+    /// without going through `url::Url`, which rejects the common multi-host
+    /// seed-list authority (`mongodb://db0:27017,db1:27017/ferrum?tls=true`) as
+    /// unparseable and would silently miss the TLS option. Only the query
+    /// portion is inspected, so no credential/authority material is retained.
+    fn mongodb_uri_tls_query_params(base_url: &str) -> Vec<String> {
+        let tls_param_names = Self::db_tls_url_param_names("mongodb");
+        let Some((_, query)) = base_url.split_once('?') else {
+            return Vec::new();
+        };
+        // Strip any fragment and split on the `&`/`;` option separators that
+        // MongoDB connection strings accept.
+        let query = query.split('#').next().unwrap_or(query);
+        let mut existing = Vec::new();
+        for pair in query.split(|c: char| c == '&' || c == ';') {
+            if pair.is_empty() {
+                continue;
+            }
+            let name = pair
+                .split('=')
+                .next()
+                .unwrap_or(pair)
+                .trim()
+                .to_ascii_lowercase();
+            if tls_param_names.iter().any(|known| name == *known) && !existing.contains(&name) {
+                existing.push(name);
+            }
+        }
+        existing
     }
 
     fn db_tls_url_param_names(db_type: &str) -> &'static [&'static str] {

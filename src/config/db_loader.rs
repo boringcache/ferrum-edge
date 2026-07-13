@@ -30,7 +30,6 @@ use crate::config::validation_pipeline::{
     ValidationAction, ValidationPipeline, collect_rejecting_runtime_config_errors,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
-use anyhow::Context;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -445,6 +444,31 @@ fn is_transient_failover_error(error: &anyhow::Error) -> bool {
         .chain()
         .find_map(|source| source.downcast_ref::<sqlx::Error>())
         .is_some_and(is_transient_sqlx_error)
+}
+
+/// Marker carried by a database-initialization/reconnect error that a
+/// failover or backup caller must treat as permanent (non-transient). Attached
+/// under the human-readable context so the message is unchanged while the
+/// classification stays discoverable via `anyhow`'s chained downcast.
+#[derive(Debug)]
+struct NonTransientDbInitError;
+
+impl std::fmt::Display for NonTransientDbInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("non-transient database initialization error")
+    }
+}
+
+impl std::error::Error for NonTransientDbInitError {}
+
+/// Wrap a non-transient failure with the [`NonTransientDbInitError`] marker
+/// (kept below `context` so the outer message is preserved) so callers can
+/// distinguish it from a transient connectivity/resource failure.
+fn mark_non_transient(
+    error: anyhow::Error,
+    context: impl std::fmt::Display + Send + Sync + 'static,
+) -> anyhow::Error {
+    error.context(NonTransientDbInitError).context(context)
 }
 
 fn is_transient_sqlx_error(error: &sqlx::Error) -> bool {
@@ -5135,7 +5159,8 @@ impl DatabaseStore {
             }
             Err(primary_err) => {
                 if !is_transient_failover_error(&primary_err) {
-                    return Err(primary_err.context(
+                    return Err(mark_non_transient(
+                        primary_err,
                         "Primary database initialization failed with a non-transient query, schema, data, constraint, authentication, or configuration error; failover was not attempted",
                     ));
                 }
@@ -5165,10 +5190,13 @@ impl DatabaseStore {
                         }
                         Err(e) => {
                             if !is_transient_failover_error(&e) {
-                                return Err(e.context(format!(
-                                    "Failover database #{} initialization returned a non-transient query, schema, data, constraint, authentication, or configuration error; no further failover URLs were attempted",
-                                    i + 1
-                                )));
+                                return Err(mark_non_transient(
+                                    e,
+                                    format!(
+                                        "Failover database #{} initialization returned a non-transient query, schema, data, constraint, authentication, or configuration error; no further failover URLs were attempted",
+                                        i + 1
+                                    ),
+                                ));
                             }
                             let safe_error =
                                 crate::config::db_backend::redact_error_text(&e, &[url]);
@@ -5327,7 +5355,8 @@ impl DatabaseStore {
                 return Ok(primary_url.to_string());
             }
             Err(error) if !is_transient_failover_error(&error) => {
-                return Err(error.context(
+                return Err(mark_non_transient(
+                    error,
                     "Primary database reconnect returned a non-transient query, schema, data, constraint, authentication, or configuration error; failover was not attempted",
                 ));
             }
@@ -5353,10 +5382,13 @@ impl DatabaseStore {
                     return Ok(url.clone());
                 }
                 Err(error) if !is_transient_failover_error(&error) => {
-                    return Err(error.context(format!(
-                        "Failover database #{} reconnect returned a non-transient query, schema, data, constraint, authentication, or configuration error; no further failover URLs were attempted",
-                        i + 1
-                    )));
+                    return Err(mark_non_transient(
+                        error,
+                        format!(
+                            "Failover database #{} reconnect returned a non-transient query, schema, data, constraint, authentication, or configuration error; no further failover URLs were attempted",
+                            i + 1
+                        ),
+                    ));
                 }
                 Err(error) => {
                     let safe_error = crate::config::db_backend::redact_error_text(&error, &[url]);
@@ -5381,6 +5413,18 @@ impl DatabaseStore {
     /// Delegates to [`crate::config::db_backend::redact_url`].
     pub fn redact_url(url: &str) -> String {
         crate::config::db_backend::redact_url(url)
+    }
+
+    /// Classify a [`connect_with_failover`](Self::connect_with_failover) (or
+    /// reconnect) error as permanent/non-transient.
+    ///
+    /// `database::run` uses this to decide backup eligibility: only transient
+    /// connectivity/resource/connect-timeout failures may bootstrap from
+    /// `FERRUM_DB_CONFIG_BACKUP_PATH`. A non-transient schema/auth/config/query
+    /// error must fail startup instead of silently serving a stale on-disk
+    /// backup.
+    pub fn is_non_transient_init_error(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<NonTransientDbInitError>().is_some()
     }
 
     /// Returns true if a read replica URL is configured.
@@ -6990,6 +7034,13 @@ impl DatabaseBackend for DatabaseStore {
                 .read_replica_pool
                 .load_full()
                 .is_some_and(|pool| !pool.is_closed())
+    }
+
+    fn read_replica_suppressed(&self) -> bool {
+        // A configured replica is suppressed (not broken) precisely while the
+        // active write/runtime pool points at a failover URL. The scheduler
+        // skips reconnects in this state; failback re-enables eligibility.
+        self.read_replica_url.is_some() && !self.primary_topology_active.load(Ordering::Acquire)
     }
 
     fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {
