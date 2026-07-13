@@ -87,10 +87,18 @@ path, not for routine build-out schema work.
 
 When Ferrum Edge starts in `database`, `cp`, or `migrate` mode, it runs the **MigrationRunner** which:
 
-1. Creates the `_ferrum_migrations` tracking table if it doesn't exist
-2. Checks which migrations have been applied by reading `_ferrum_migrations`
-3. Runs any pending migrations in order
-4. Records each applied migration with its version, name, timestamp, checksum, and execution time
+1. Acquires a cross-process migration lock (`pg_advisory_lock` on PostgreSQL,
+   `GET_LOCK` on MySQL, and `BEGIN IMMEDIATE` on SQLite)
+2. Creates the `_ferrum_migrations` tracking table if it doesn't exist
+3. Checks which migrations have been applied by reading `_ferrum_migrations`
+4. Runs any pending migrations in order
+5. Records each applied migration with its version, name, timestamp, checksum, and execution time
+
+The applied-version read happens after the lock is acquired. When two replicas
+start together, the waiter therefore observes the winner's committed tracking
+row and skips the migration instead of racing the tracking insert. MongoDB
+index migration uses a renewable lease document in
+`_ferrum_migration_locks`; a crashed owner stops renewing and its lease expires.
 
 ### Migration Tracking Table
 
@@ -126,7 +134,13 @@ Each migration is a Rust function that can dispatch different SQL based on the d
 
 ### Checksum Validation
 
-Each migration has a compile-time checksum. When the gateway starts, it compares the checksum of each applied migration against the expected checksum in the code. If a mismatch is detected (indicating the migration source was modified after being applied), a warning is logged. This is a diagnostic aid, not a hard error.
+Each migration has a checksum. V001 uses a `sha256:<hex>` digest derived from
+the V001 wrapper and dialect schema source, so changing the baseline changes the
+stored value and makes later source tampering visible. When the gateway starts,
+it compares the checksum of each applied migration against the expected
+checksum in the code. If a mismatch is detected, a warning is logged. This is a
+diagnostic aid, not a hard error. During build-out there is deliberately no
+compatibility shim for the former fixed `v001_initial_schema` label.
 
 ## Custom Plugin Migrations
 
@@ -276,6 +290,10 @@ FERRUM_MODE=migrate \
   ferrum-edge
 ```
 
+`status` is strictly read-only. If the core or plugin tracking table does not
+exist, Ferrum reports every known migration as pending without creating either
+tracking table.
+
 ### Check Migration Status
 
 ```bash
@@ -291,7 +309,7 @@ Example output:
 === Ferrum Edge Migration Status ===
 
 Applied migrations:
-  V1: initial_schema (applied: 2025-01-15T10:30:00Z, checksum: v001_initial_schema)
+  V1: initial_schema (applied: 2025-01-15T10:30:00Z, checksum: sha256:<64 hex characters>)
 
 Pending migrations: (none — schema is up to date)
 
@@ -324,6 +342,9 @@ FERRUM_MODE=migrate \
   FERRUM_DB_URL=sqlite://ferrum.db \
   ferrum-edge
 ```
+
+Database dry-run uses the same read-only status path: it does not create core
+or custom-plugin tracking tables, schema objects, collections, or indexes.
 
 ## Environment Variables Reference
 

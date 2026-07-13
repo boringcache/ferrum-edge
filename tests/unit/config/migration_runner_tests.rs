@@ -360,6 +360,10 @@ async fn test_migration_status() {
     let status = runner.status().await.unwrap();
     assert!(status.applied.is_empty());
     assert_eq!(status.pending.len(), 1);
+    assert!(
+        !table_exists(&pool, "_ferrum_migrations").await,
+        "status must not create the core migration tracking table"
+    );
 
     // Run migrations
     runner.run_pending().await.unwrap();
@@ -368,6 +372,54 @@ async fn test_migration_status() {
     let status = runner.status().await.unwrap();
     assert_eq!(status.applied.len(), 1);
     assert!(status.pending.is_empty());
+}
+
+#[tokio::test]
+async fn test_v001_checksum_is_content_derived_sha256() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool, "sqlite".to_string());
+
+    let applied = runner.run_pending().await.unwrap();
+    let checksum = &applied[0].checksum;
+    assert!(checksum.starts_with("sha256:"));
+    assert_eq!(checksum.len(), "sha256:".len() + 64);
+    assert_ne!(checksum, "v001_initial_schema");
+}
+
+#[tokio::test]
+async fn concurrent_sqlite_runners_serialize_and_loser_skips_tracking_insert() {
+    sqlx::any::install_default_drivers();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("concurrent_migrations.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let pool_one = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url)
+        .await
+        .unwrap();
+    let pool_two = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url)
+        .await
+        .unwrap();
+    let runner_one = MigrationRunner::new(pool_one.clone(), "sqlite".to_string());
+    let runner_two = MigrationRunner::new(pool_two.clone(), "sqlite".to_string());
+
+    let (first, second) = tokio::join!(runner_one.run_pending(), runner_two.run_pending());
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(
+        first.len() + second.len(),
+        1,
+        "exactly one process-equivalent runner should apply V001"
+    );
+
+    let row = sqlx::query("SELECT COUNT(*) AS count FROM _ferrum_migrations")
+        .fetch_one(&pool_one)
+        .await
+        .unwrap();
+    let count: i64 = row.try_get("count").unwrap();
+    assert_eq!(count, 1, "the tracking insert must not race or duplicate");
 }
 
 #[tokio::test]

@@ -1,11 +1,159 @@
 pub(crate) mod sql_dialect;
 pub mod v001_initial_schema;
 
+use anyhow::Context;
 use chrono::Utc;
 use sqlx::any::AnyRow;
-use sqlx::{AnyPool, Row};
-use std::time::Instant;
+use sqlx::pool::PoolConnection;
+use sqlx::{Any, AnyConnection, AnyPool, Connection, Row};
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+const POSTGRES_MIGRATION_LOCK_ID: i64 = 0x4645_5252_554D_4D47;
+const MYSQL_MIGRATION_LOCK_NAME: &str = "ferrum-edge:migrations";
+
+/// One cross-process migration lock held on a dedicated database connection.
+///
+/// PostgreSQL advisory locks and MySQL named locks are session-scoped. SQLite
+/// has no advisory-lock primitive, so `BEGIN IMMEDIATE` holds the file's write
+/// reservation for the entire migration and tracking-row update. Keeping all
+/// migration work on this same connection is required for the SQLite lock to
+/// serialize competing processes rather than deadlock against our own pool.
+struct MigrationConnectionLock {
+    connection: PoolConnection<Any>,
+    db_type: String,
+    active: bool,
+}
+
+impl MigrationConnectionLock {
+    async fn acquire(pool: &AnyPool, db_type: &str) -> Result<Self, anyhow::Error> {
+        let mut connection = pool.acquire().await?;
+
+        match db_type {
+            "postgres" => {
+                sqlx::query("SELECT pg_advisory_lock($1)")
+                    .bind(POSTGRES_MIGRATION_LOCK_ID)
+                    .execute(&mut *connection)
+                    .await?;
+            }
+            "mysql" => loop {
+                let row = sqlx::query(
+                    "SELECT CAST(GET_LOCK(?, 30) AS SIGNED) AS migration_lock_acquired",
+                )
+                .bind(MYSQL_MIGRATION_LOCK_NAME)
+                .fetch_one(&mut *connection)
+                .await?;
+                match row.try_get::<Option<i64>, _>("migration_lock_acquired")? {
+                    Some(1) => break,
+                    Some(0) => continue,
+                    _ => {
+                        anyhow::bail!("MySQL GET_LOCK returned NULL for the Ferrum migration lock")
+                    }
+                }
+            },
+            "sqlite" => {
+                sqlx::query("PRAGMA foreign_keys = ON")
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("PRAGMA busy_timeout = 5000")
+                    .execute(&mut *connection)
+                    .await?;
+                loop {
+                    match sqlx::query("BEGIN IMMEDIATE")
+                        .execute(&mut *connection)
+                        .await
+                    {
+                        Ok(_) => break,
+                        Err(error) if is_sqlite_lock_contention(&error) => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            other => anyhow::bail!("Unsupported database type for migrations: {other}"),
+        }
+
+        Ok(Self {
+            connection,
+            db_type: db_type.to_string(),
+            active: true,
+        })
+    }
+
+    fn connection(&mut self) -> &mut AnyConnection {
+        &mut self.connection
+    }
+
+    async fn finish(mut self, commit: bool) -> Result<(), anyhow::Error> {
+        match self.db_type.as_str() {
+            "postgres" => {
+                sqlx::query("SELECT pg_advisory_unlock($1)")
+                    .bind(POSTGRES_MIGRATION_LOCK_ID)
+                    .execute(&mut *self.connection)
+                    .await?;
+            }
+            "mysql" => {
+                let row = sqlx::query(
+                    "SELECT CAST(RELEASE_LOCK(?) AS SIGNED) AS migration_lock_released",
+                )
+                .bind(MYSQL_MIGRATION_LOCK_NAME)
+                .fetch_one(&mut *self.connection)
+                .await?;
+                if row.try_get::<Option<i64>, _>("migration_lock_released")? != Some(1) {
+                    anyhow::bail!("MySQL RELEASE_LOCK did not release the Ferrum migration lock");
+                }
+            }
+            "sqlite" => {
+                let statement = if commit { "COMMIT" } else { "ROLLBACK" };
+                sqlx::query(statement)
+                    .execute(&mut *self.connection)
+                    .await?;
+            }
+            _ => {}
+        }
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for MigrationConnectionLock {
+    fn drop(&mut self) {
+        if self.active {
+            // Session-scoped locks must never leak back into the pool if the
+            // migration future is cancelled, panics, or lock cleanup fails.
+            // Closing releases PostgreSQL/MySQL locks and rolls back an
+            // unfinished SQLite transaction at the server boundary.
+            self.connection.close_on_drop();
+        }
+    }
+}
+
+fn is_sqlite_lock_contention(error: &sqlx::Error) -> bool {
+    let Some(database_error) = error.as_database_error() else {
+        return false;
+    };
+    database_error
+        .code()
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+        || database_error.message().contains("database is locked")
+        || database_error.message().contains("database is busy")
+}
+
+fn finish_locked_operation<T>(
+    operation: Result<T, anyhow::Error>,
+    release: Result<(), anyhow::Error>,
+) -> Result<T, anyhow::Error> {
+    match (operation, release) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(release_error)) => Err(release_error),
+        (Err(operation_error), Ok(())) => Err(operation_error),
+        (Err(operation_error), Err(release_error)) => Err(operation_error.context(format!(
+            "migration lock cleanup also failed: {release_error}"
+        ))),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Custom plugin migration support
@@ -188,7 +336,10 @@ impl MigrationRunner {
     ///
     /// MySQL's `TEXT` type is reported as `BLOB` by the `Any` driver, which
     /// prevents `try_get::<String>()`. Use `VARCHAR` for MySQL compatibility.
-    async fn ensure_tracking_table(&self) -> Result<(), anyhow::Error> {
+    async fn ensure_tracking_table(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
         let sql = if self.db_type == "mysql" {
             r#"
             CREATE TABLE IF NOT EXISTS _ferrum_migrations (
@@ -210,8 +361,36 @@ impl MigrationRunner {
             )
             "#
         };
-        sqlx::query(sql).execute(&self.pool).await?;
+        sqlx::query(sql).execute(&mut *connection).await?;
         Ok(())
+    }
+
+    async fn tracking_table_exists(
+        &self,
+        connection: &mut AnyConnection,
+        plugin_tracking: bool,
+    ) -> Result<bool, anyhow::Error> {
+        let table = if plugin_tracking {
+            "_ferrum_plugin_migrations"
+        } else {
+            "_ferrum_migrations"
+        };
+        let sql = match self.db_type.as_str() {
+            "postgres" => format!(
+                "SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = '{table}' LIMIT 1"
+            ),
+            "mysql" => format!(
+                "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = '{table}' LIMIT 1"
+            ),
+            "sqlite" => format!(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{table}' LIMIT 1"
+            ),
+            other => anyhow::bail!("Unsupported database type for migrations: {other}"),
+        };
+        Ok(sqlx::query(&sql)
+            .fetch_optional(&mut *connection)
+            .await?
+            .is_some())
     }
 
     /// Return the migration INSERT statement with the correct bind parameter
@@ -225,10 +404,13 @@ impl MigrationRunner {
     }
 
     /// Get all applied migration versions from the tracking table.
-    async fn applied_versions(&self) -> Result<Vec<MigrationRecord>, anyhow::Error> {
+    async fn applied_versions(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<Vec<MigrationRecord>, anyhow::Error> {
         let rows: Vec<AnyRow> =
             sqlx::query("SELECT version, name, applied_at, checksum, execution_time_ms FROM _ferrum_migrations ORDER BY version")
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *connection)
                 .await?;
 
         let mut records = Vec::new();
@@ -246,9 +428,23 @@ impl MigrationRunner {
 
     /// Run all pending migrations in order. Returns the list of newly applied migrations.
     pub async fn run_pending(&self) -> Result<Vec<MigrationRecord>, anyhow::Error> {
-        self.ensure_tracking_table().await?;
+        let mut migration_lock =
+            MigrationConnectionLock::acquire(&self.pool, &self.db_type).await?;
+        let operation = self.run_pending_locked(migration_lock.connection()).await;
+        let release = migration_lock.finish(operation.is_ok()).await;
+        finish_locked_operation(operation, release)
+    }
 
-        let applied = self.applied_versions().await?;
+    async fn run_pending_locked(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<Vec<MigrationRecord>, anyhow::Error> {
+        self.ensure_tracking_table(connection).await?;
+
+        // This read deliberately happens only after acquiring the cross-process
+        // lock. A process that waited for another replica therefore observes
+        // the winner's committed tracking rows and skips them cleanly.
+        let applied = self.applied_versions(connection).await?;
         let applied_versions: Vec<i64> = applied.iter().map(|r| r.version).collect();
 
         // Validate checksums of applied migrations
@@ -284,7 +480,7 @@ impl MigrationRunner {
             );
 
             let start = Instant::now();
-            migration.run_up(&self.pool, &self.db_type).await?;
+            migration.run_up(connection, &self.db_type).await?;
             let elapsed_ms = start.elapsed().as_millis() as i64;
 
             let now = Utc::now().to_rfc3339();
@@ -295,7 +491,7 @@ impl MigrationRunner {
                 .bind(&now)
                 .bind(migration.checksum())
                 .bind(elapsed_ms as i32)
-                .execute(&self.pool)
+                .execute(&mut *connection)
                 .await?;
 
             let record = MigrationRecord {
@@ -323,7 +519,7 @@ impl MigrationRunner {
         // `CREATE TABLE IF NOT EXISTS` statements, so it is a no-op on fresh
         // databases that just applied V001 in full.
         sql_dialect::V001SqlBuilder::new(&self.db_type)
-            .ensure_compatibility_tables(&self.pool)
+            .ensure_compatibility_tables(connection)
             .await?;
 
         Ok(newly_applied)
@@ -331,9 +527,12 @@ impl MigrationRunner {
 
     /// Get current migration status (applied and pending).
     pub async fn status(&self) -> Result<MigrationStatus, anyhow::Error> {
-        self.ensure_tracking_table().await?;
-
-        let applied = self.applied_versions().await?;
+        let mut connection = self.pool.acquire().await?;
+        let applied = if self.tracking_table_exists(&mut connection, false).await? {
+            self.applied_versions(&mut connection).await?
+        } else {
+            Vec::new()
+        };
         let applied_versions: Vec<i64> = applied.iter().map(|r| r.version).collect();
 
         let all_migrations = self.all_migrations();
@@ -359,7 +558,10 @@ impl MigrationRunner {
     /// migrations and custom plugin migrations have independent version spaces.
     /// The composite primary key `(plugin_name, version)` allows each plugin
     /// to maintain its own migration sequence.
-    async fn ensure_plugin_tracking_table(&self) -> Result<(), anyhow::Error> {
+    async fn ensure_plugin_tracking_table(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
         let sql = if self.db_type == "mysql" {
             r#"
             CREATE TABLE IF NOT EXISTS _ferrum_plugin_migrations (
@@ -385,7 +587,7 @@ impl MigrationRunner {
             )
             "#
         };
-        sqlx::query(sql).execute(&self.pool).await?;
+        sqlx::query(sql).execute(&mut *connection).await?;
         Ok(())
     }
 
@@ -399,10 +601,13 @@ impl MigrationRunner {
     }
 
     /// Get all applied plugin migration records.
-    async fn applied_plugin_versions(&self) -> Result<Vec<PluginMigrationRecord>, anyhow::Error> {
+    async fn applied_plugin_versions(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<Vec<PluginMigrationRecord>, anyhow::Error> {
         let rows: Vec<AnyRow> =
             sqlx::query("SELECT plugin_name, version, name, applied_at, checksum, execution_time_ms FROM _ferrum_plugin_migrations ORDER BY plugin_name, version")
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *connection)
                 .await?;
 
         let mut records = Vec::new();
@@ -436,9 +641,25 @@ impl MigrationRunner {
             return Ok(Vec::new());
         }
 
-        self.ensure_plugin_tracking_table().await?;
+        let mut migration_lock =
+            MigrationConnectionLock::acquire(&self.pool, &self.db_type).await?;
+        let operation = self
+            .run_plugin_pending_locked(plugin_migrations, migration_lock.connection())
+            .await;
+        let release = migration_lock.finish(operation.is_ok()).await;
+        finish_locked_operation(operation, release)
+    }
 
-        let applied = self.applied_plugin_versions().await?;
+    async fn run_plugin_pending_locked(
+        &self,
+        plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
+        connection: &mut AnyConnection,
+    ) -> Result<Vec<PluginMigrationRecord>, anyhow::Error> {
+        self.ensure_plugin_tracking_table(connection).await?;
+
+        // Re-read only after the cross-process lock is held so a waiter sees
+        // and skips every tracking row committed by the winner.
+        let applied = self.applied_plugin_versions(connection).await?;
         let mut newly_applied = Vec::new();
 
         for (plugin_name, migrations) in plugin_migrations {
@@ -488,7 +709,7 @@ impl MigrationRunner {
                     for statement in sql.split(';') {
                         let trimmed = statement.trim();
                         if !trimmed.is_empty() {
-                            sqlx::query(trimmed).execute(&self.pool).await?;
+                            sqlx::query(trimmed).execute(&mut *connection).await?;
                         }
                     }
                     now = Utc::now().to_rfc3339();
@@ -501,12 +722,37 @@ impl MigrationRunner {
                         .bind(&now)
                         .bind(migration.checksum)
                         .bind(elapsed_ms as i32)
-                        .execute(&self.pool)
+                        .execute(&mut *connection)
+                        .await?;
+                } else if self.db_type == "sqlite" {
+                    // The cross-process SQLite lock is itself a
+                    // `BEGIN IMMEDIATE` transaction. Execute body + tracking
+                    // directly on that connection; `finish(true)` commits the
+                    // complete locked operation and `finish(false)` rolls it
+                    // back on any error.
+                    for statement in sql.split(';') {
+                        let trimmed = statement.trim();
+                        if !trimmed.is_empty() {
+                            sqlx::query(trimmed).execute(&mut *connection).await?;
+                        }
+                    }
+                    now = Utc::now().to_rfc3339();
+                    let elapsed_ms = start.elapsed().as_millis() as i64;
+                    let insert_sql = Self::plugin_migration_insert_sql(&self.db_type);
+                    sqlx::query(&insert_sql)
+                        .bind(*plugin_name)
+                        .bind(migration.version as i32)
+                        .bind(migration.name)
+                        .bind(&now)
+                        .bind(migration.checksum)
+                        .bind(elapsed_ms as i32)
+                        .execute(&mut *connection)
                         .await?;
                 } else {
                     // Default path: migration statements and tracking remain
-                    // atomic in one transaction.
-                    let mut tx = self.pool.begin().await?;
+                    // atomic in one transaction on the same session that owns
+                    // the PostgreSQL/MySQL migration lock.
+                    let mut tx = connection.begin().await?;
                     for statement in sql.split(';') {
                         let trimmed = statement.trim();
                         if !trimmed.is_empty() {
@@ -556,9 +802,12 @@ impl MigrationRunner {
         &self,
         plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
     ) -> Result<PluginMigrationStatus, anyhow::Error> {
-        self.ensure_plugin_tracking_table().await?;
-
-        let applied = self.applied_plugin_versions().await?;
+        let mut connection = self.pool.acquire().await?;
+        let applied = if self.tracking_table_exists(&mut connection, true).await? {
+            self.applied_plugin_versions(&mut connection).await?
+        } else {
+            Vec::new()
+        };
 
         let mut pending = Vec::new();
         for (plugin_name, migrations) in plugin_migrations {
@@ -595,7 +844,7 @@ trait MigrationEntry: Send + Sync {
     fn checksum(&self) -> &str;
     fn run_up<'a>(
         &'a self,
-        pool: &'a AnyPool,
+        connection: &'a mut AnyConnection,
         db_type: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'a>>;
 }
@@ -615,10 +864,10 @@ impl MigrationEntry for MigrationEntryV001 {
     }
     fn run_up<'a>(
         &'a self,
-        pool: &'a AnyPool,
+        connection: &'a mut AnyConnection,
         db_type: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'a>>
     {
-        Box::pin(self.0.up(pool, db_type))
+        Box::pin(self.0.up(connection, db_type))
     }
 }

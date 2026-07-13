@@ -414,3 +414,101 @@ async fn consumer_credential_index_updates_on_consumer_update() {
             .unwrap()
     );
 }
+
+async fn seed_sqlite_namespace(db_url: &str, namespace: &str) {
+    let store = DatabaseStore::connect_with_pool_config("sqlite", db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO upstreams (id, namespace, name, targets) VALUES (?, ?, ?, '[]')")
+        .bind(format!("{namespace}-upstream"))
+        .bind(namespace)
+        .bind(format!("{namespace}-name"))
+        .execute(&store.pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn failover_does_not_mask_non_transient_schema_errors() {
+    sqlx::any::install_default_drivers();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("broken-primary.db");
+    let failover_path = temp_dir.path().join("healthy-failover.db");
+    let primary_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+
+    let raw_pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&primary_url)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE proxies (id TEXT PRIMARY KEY)")
+        .execute(&raw_pool)
+        .await
+        .unwrap();
+    raw_pool.close().await;
+
+    let result = DatabaseStore::connect_with_failover(
+        "sqlite",
+        &primary_url,
+        std::slice::from_ref(&failover_url),
+        DbPoolConfig::default(),
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("schema/query errors must stop instead of selecting failover"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("non-transient"),
+        "unexpected failover classification: {error}"
+    );
+    assert!(
+        !failover_path.exists(),
+        "the failover database must not be opened for a permanent primary schema error"
+    );
+}
+
+#[tokio::test]
+async fn read_replica_tracks_primary_topology_across_failover_and_failback() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("primary.db");
+    let failover_path = temp_dir.path().join("failover.db");
+    let replica_path = temp_dir.path().join("replica.db");
+    let primary_rw_url = format!("sqlite:{}?mode=rw", primary_path.to_string_lossy());
+    let primary_create_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+    let replica_url = format!("sqlite:{}?mode=rwc", replica_path.to_string_lossy());
+
+    let mut store = DatabaseStore::connect_with_failover(
+        "sqlite",
+        &primary_rw_url,
+        std::slice::from_ref(&failover_url),
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO upstreams (id, namespace, name, targets) VALUES ('failover-upstream', 'failover-ns', 'failover-name', '[]')",
+    )
+    .execute(&store.pool())
+    .await
+    .unwrap();
+
+    seed_sqlite_namespace(&replica_url, "replica-ns").await;
+    store.connect_read_replica(&replica_url).await.unwrap();
+    assert_eq!(
+        store.list_namespaces().await.unwrap(),
+        vec!["failover-ns".to_string()],
+        "admin reads must stay on the active failover topology"
+    );
+
+    seed_sqlite_namespace(&primary_create_url, "primary-ns").await;
+    let active_url = store.try_failover_reconnect(&primary_rw_url).await.unwrap();
+    assert_eq!(active_url, primary_rw_url);
+    assert_eq!(
+        store.list_namespaces().await.unwrap(),
+        vec!["replica-ns".to_string()],
+        "the configured read replica should become eligible again after primary failback"
+    );
+}

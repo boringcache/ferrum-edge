@@ -83,8 +83,14 @@ mod inner {
     const MONGO_ERR_INDEX_ALREADY_EXISTS: i32 = 68;
     const MONGO_ERR_INDEX_OPTIONS_CONFLICT: i32 = 85;
     const MONGO_ERR_INDEX_KEY_SPECS_CONFLICT: i32 = 86;
+    const MONGO_ERR_DUPLICATE_KEY: i32 = 11_000;
     const CHANGE_LOG_BATCH_LIMIT: i64 = 10_000;
     const CHANGE_LOG_RETAIN_PER_NAMESPACE: u64 = 100_000;
+    const MONGO_MIGRATION_LOCK_ID: &str = "global";
+    const MONGO_MIGRATION_LEASE_DURATION: Duration = Duration::from_secs(120);
+    const MONGO_MIGRATION_LEASE_DURATION_MILLIS: i64 = 120_000;
+    const MONGO_MIGRATION_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
+    const MONGO_MIGRATION_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
     #[derive(Clone, Copy)]
     struct ConfigChangeWrite<'a> {
@@ -178,6 +184,16 @@ mod inner {
         is_mongo_command_error_with_code(err, MONGO_ERR_INDEX_ALREADY_EXISTS)
     }
 
+    fn is_duplicate_key(err: &mongodb::error::Error) -> bool {
+        is_mongo_command_error_with_code(err, MONGO_ERR_DUPLICATE_KEY)
+            || matches!(
+                err.kind.as_ref(),
+                mongodb::error::ErrorKind::Write(
+                    mongodb::error::WriteFailure::WriteError(write_error)
+                ) if write_error.code == MONGO_ERR_DUPLICATE_KEY
+            )
+    }
+
     fn mesh_route_dispatch_references_upstream_id(
         plugin: &PluginConfig,
         upstream_id: &str,
@@ -247,6 +263,72 @@ mod inner {
         // Own generated TLS PEM files for exactly as long as this driver
         // client can open new sockets using their paths.
         _tls_temp_paths: Vec<tempfile::TempPath>,
+    }
+
+    struct MongoMigrationLease {
+        collection: Collection<Document>,
+        owner: String,
+        stop_tx: Option<tokio::sync::watch::Sender<bool>>,
+        renew_task: Option<tokio::task::JoinHandle<()>>,
+        valid: Arc<AtomicBool>,
+        released: bool,
+    }
+
+    impl MongoMigrationLease {
+        async fn release(&mut self) -> Result<(), anyhow::Error> {
+            if let Some(stop_tx) = self.stop_tx.take() {
+                let _ = stop_tx.send(true);
+            }
+            if let Some(renew_task) = self.renew_task.take() {
+                renew_task.await.map_err(|error| {
+                    anyhow::anyhow!("MongoDB migration lease renewal task failed: {error}")
+                })?;
+            }
+
+            let result = self
+                .collection
+                .delete_one(doc! {
+                    "_id": MONGO_MIGRATION_LOCK_ID,
+                    "owner": &self.owner,
+                })
+                .await?;
+            self.released = true;
+            if !self.valid.load(Ordering::Acquire) {
+                anyhow::bail!("MongoDB migration lease expired or was lost while migrations ran");
+            }
+            if result.deleted_count != 1 {
+                anyhow::bail!("MongoDB migration lease release did not match the owning document");
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for MongoMigrationLease {
+        fn drop(&mut self) {
+            if self.released {
+                return;
+            }
+            if let Some(stop_tx) = self.stop_tx.take() {
+                let _ = stop_tx.send(true);
+            }
+
+            let collection = self.collection.clone();
+            let owner = self.owner.clone();
+            let renew_task = self.renew_task.take();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let _cleanup_task = runtime.spawn(async move {
+                    if let Some(renew_task) = renew_task {
+                        let _ = renew_task.await;
+                    }
+                    let _ = collection
+                        .delete_one(doc! {
+                            "_id": MONGO_MIGRATION_LOCK_ID,
+                            "owner": owner,
+                        })
+                        .await;
+                });
+            }
+        }
     }
 
     impl MongoConnectionBundle {
@@ -397,9 +479,10 @@ mod inner {
         ///   separate cert/key files (MongoDB requires a single file)
         /// - `FERRUM_DB_TLS_MODE=require` → `TlsOptions::allow_invalid_certificates`
         ///
-        /// TLS can also be configured directly via connection string options
-        /// (`tls=true&tlsCAFile=...`), which takes precedence over the programmatic
-        /// config when both are set.
+        /// TLS can alternatively be configured directly via connection string
+        /// options (`tls=true&tlsCAFile=...`) when `FERRUM_DB_TLS_MODE` is
+        /// unset. Mixing the two sources is rejected so URI options cannot
+        /// silently override the canonical environment policy.
         #[allow(clippy::too_many_arguments)]
         pub async fn connect(
             mongo_url: &str,
@@ -480,6 +563,17 @@ mod inner {
             tls_insecure: bool,
         ) -> Result<(MongoConnectionBundle, bool), anyhow::Error> {
             let mut client_options = ClientOptions::parse(mongo_url).await?;
+            if (tls_enabled
+                || tls_ca_cert_path.is_some()
+                || tls_client_cert_path.is_some()
+                || tls_client_key_path.is_some()
+                || tls_insecure)
+                && client_options.tls.is_some()
+            {
+                anyhow::bail!(
+                    "MongoDB URI TLS options conflict with FERRUM_DB_TLS_MODE; configure TLS in exactly one source"
+                );
+            }
             if client_options.selection_criteria.is_some() {
                 warn!(
                     "MongoDB readPreference from FERRUM_DB_URL is ignored; authoritative config reads use primary"
@@ -509,11 +603,10 @@ mod inner {
             client_options.connect_timeout =
                 Some(Duration::from_secs(settings.connect_timeout_secs));
 
-            // Configure TLS via the canonical database TLS env vars.
-            // Only set programmatic TLS if the connection string doesn't already
-            // include TLS options (connection string takes precedence).
+            // Configure TLS via the canonical database TLS env vars. URI TLS
+            // settings were rejected above whenever the canonical mode is set.
             let mut tls_temp_paths: Vec<tempfile::TempPath> = Vec::new();
-            if tls_enabled && client_options.tls.is_none() {
+            if tls_enabled {
                 let ca = tls_ca_cert_path
                     .map(|ca_path| {
                         Self::materialize_tls_source_to_file(
@@ -862,6 +955,137 @@ mod inner {
         /// from it.
         fn connection(&self) -> Arc<MongoConnectionBundle> {
             self.connection.load_full()
+        }
+
+        fn migration_lease_expiry() -> BsonDateTime {
+            BsonDateTime::from_millis(
+                Utc::now()
+                    .timestamp_millis()
+                    .saturating_add(MONGO_MIGRATION_LEASE_DURATION_MILLIS),
+            )
+        }
+
+        async fn acquire_migration_lease(&self) -> Result<MongoMigrationLease, anyhow::Error> {
+            let collection = self.db().collection::<Document>("_ferrum_migration_locks");
+            let owner = Uuid::new_v4().to_string();
+
+            loop {
+                let result = collection
+                    .find_one_and_update(
+                        doc! {
+                            "_id": MONGO_MIGRATION_LOCK_ID,
+                            "$or": [
+                                { "expires_at": { "$lte": BsonDateTime::now() } },
+                                { "expires_at": { "$exists": false } },
+                            ],
+                        },
+                        doc! {
+                            "$set": {
+                                "owner": &owner,
+                                "expires_at": Self::migration_lease_expiry(),
+                                "updated_at": BsonDateTime::now(),
+                            },
+                            "$setOnInsert": {
+                                "created_at": BsonDateTime::now(),
+                            },
+                        },
+                    )
+                    .upsert(true)
+                    .return_document(ReturnDocument::After)
+                    .await;
+
+                match result {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {}
+                    Err(error) if is_duplicate_key(&error) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                tokio::time::sleep(MONGO_MIGRATION_LEASE_RETRY_INTERVAL).await;
+            }
+
+            let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+            let renew_collection = collection.clone();
+            let renew_owner = owner.clone();
+            let valid = Arc::new(AtomicBool::new(true));
+            let renew_valid = valid.clone();
+            let renew_task = tokio::spawn(async move {
+                let mut valid_until = tokio::time::Instant::now() + MONGO_MIGRATION_LEASE_DURATION;
+                loop {
+                    tokio::select! {
+                        changed = stop_rx.changed() => {
+                            if changed.is_err() || *stop_rx.borrow() {
+                                return;
+                            }
+                        }
+                        _ = tokio::time::sleep(MONGO_MIGRATION_LEASE_RENEW_INTERVAL) => {}
+                    }
+
+                    loop {
+                        let renewal = renew_collection
+                            .update_one(
+                                doc! {
+                                    "_id": MONGO_MIGRATION_LOCK_ID,
+                                    "owner": &renew_owner,
+                                },
+                                doc! {
+                                    "$set": {
+                                        "expires_at": MongoStore::migration_lease_expiry(),
+                                        "updated_at": BsonDateTime::now(),
+                                    },
+                                },
+                            )
+                            .await;
+                        match renewal {
+                            Ok(result) if result.matched_count == 1 => {
+                                valid_until =
+                                    tokio::time::Instant::now() + MONGO_MIGRATION_LEASE_DURATION;
+                                break;
+                            }
+                            Ok(_) => {
+                                renew_valid.store(false, Ordering::Release);
+                                error!(
+                                    "MongoDB migration lease renewal lost the owning lock document"
+                                );
+                                return;
+                            }
+                            Err(error) => {
+                                if tokio::time::Instant::now()
+                                    + MONGO_MIGRATION_LEASE_RETRY_INTERVAL
+                                    >= valid_until
+                                {
+                                    renew_valid.store(false, Ordering::Release);
+                                    error!(
+                                        "MongoDB migration lease expired after renewal failures: {}",
+                                        error
+                                    );
+                                    return;
+                                }
+                                debug!(
+                                    "MongoDB migration lease renewal failed; retrying before expiry: {}",
+                                    error
+                                );
+                                tokio::select! {
+                                    changed = stop_rx.changed() => {
+                                        if changed.is_err() || *stop_rx.borrow() {
+                                            return;
+                                        }
+                                    }
+                                    _ = tokio::time::sleep(MONGO_MIGRATION_LEASE_RETRY_INTERVAL) => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            Ok(MongoMigrationLease {
+                collection,
+                owner,
+                stop_tx: Some(stop_tx),
+                renew_task: Some(renew_task),
+                valid,
+                released: false,
+            })
         }
 
         /// Snapshot of the current `Database` handle, tied to the bundle that
@@ -6395,6 +6619,7 @@ mod inner {
         }
 
         async fn run_migrations(&self) -> Result<(), anyhow::Error> {
+            let mut migration_lease = self.acquire_migration_lease().await?;
             // MongoDB doesn't use SQL migrations. Instead, ensure indexes exist.
             // createIndex is idempotent — no-op if the index already exists.
 
@@ -6846,6 +7071,7 @@ mod inner {
                 .await?;
 
             info!("MongoDB indexes ensured");
+            migration_lease.release().await?;
             Ok(())
         }
 

@@ -497,6 +497,16 @@ async fn test_plugin_status_shows_applied_and_pending() {
     assert_eq!(status.pending[0].plugin_name, "status_plugin");
     assert_eq!(status.pending[0].version, 1);
     assert_eq!(status.pending[1].version, 2);
+    let tracking_table = sqlx::query(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_ferrum_plugin_migrations'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert!(
+        tracking_table.is_none(),
+        "plugin status must not create its tracking table"
+    );
 
     // Apply V1 only
     let v1_only = vec![(

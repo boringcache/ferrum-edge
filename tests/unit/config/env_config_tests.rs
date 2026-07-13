@@ -3379,6 +3379,75 @@ fn test_env_config_db_tls_accepts_mongodb_verify_full() {
 }
 
 #[test]
+fn test_env_config_db_tls_rejects_mongodb_uri_tls_conflict() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "mongodb"),
+            (
+                "FERRUM_DB_URL",
+                "mongodb://localhost:27017/ferrum?tls=false",
+            ),
+            ("FERRUM_DB_TLS_MODE", "verify-full"),
+        ],
+        || {
+            let error = EnvConfig::from_env().unwrap_err();
+            assert!(error.contains("conflicts with MongoDB URI TLS settings"));
+            assert!(error.contains("exactly one source"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_tls_rejects_mongodb_srv_implicit_tls_conflict() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "mongodb"),
+            ("FERRUM_DB_URL", "mongodb+srv://cluster.example.test/ferrum"),
+            ("FERRUM_DB_TLS_MODE", "disable"),
+        ],
+        || {
+            let error = EnvConfig::from_env().unwrap_err();
+            assert!(error.contains("mongodb+srv implicit TLS"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_tls_rejects_mongodb_failover_uri_tls_conflict() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "mongodb"),
+            ("FERRUM_DB_URL", "mongodb://primary:27017/ferrum"),
+            (
+                "FERRUM_DB_FAILOVER_URLS",
+                "mongodb://secondary:27017/ferrum?tls=true",
+            ),
+            ("FERRUM_DB_TLS_MODE", "require"),
+        ],
+        || {
+            let error = EnvConfig::from_env().unwrap_err();
+            assert!(error.contains("secondary:27017"));
+            assert!(error.contains("conflicts with MongoDB URI TLS settings"));
+        },
+    );
+}
+
+#[test]
 fn test_env_config_db_tls_accepts_mongodb_combined_client_pem() {
     with_env_vars(
         &[

@@ -3737,6 +3737,15 @@ impl EnvConfig {
             return Ok(base_url.to_string());
         };
 
+        if db_type == "mongodb"
+            && let Some(source) = Self::mongodb_uri_tls_source(base_url)
+        {
+            return Err(format!(
+                "FERRUM_DB_TLS_MODE conflicts with MongoDB URI TLS settings ({source}) in {}. Configure MongoDB TLS in exactly one source",
+                redact_url(base_url)
+            ));
+        }
+
         Self::warn_on_existing_db_tls_url_params(base_url, db_type);
 
         let Some(params) = self.db_tls_params(db_type, mode)? else {
@@ -3891,12 +3900,6 @@ impl EnvConfig {
                 existing_tls_params = %existing_tls_params,
                 "FERRUM_DB_TLS_MODE is set but the database URL already contains potentially TLS-related query parameters; env-derived TLS parameters will be appended and duplicate or overlapping driver options can be ambiguous. Remove URL TLS parameters or unset FERRUM_DB_TLS_MODE"
             ),
-            "mongodb" => tracing::warn!(
-                db_type,
-                url = %redacted_url,
-                existing_tls_params = %existing_tls_params,
-                "FERRUM_DB_TLS_MODE is set but the MongoDB URL already contains TLS options; MongoDB URI TLS options take precedence over env-derived FERRUM_DB_TLS_* settings. Remove URI TLS options or unset FERRUM_DB_TLS_MODE"
-            ),
             _ => {}
         }
     }
@@ -3919,6 +3922,20 @@ impl EnvConfig {
             }
         }
         existing
+    }
+
+    fn mongodb_uri_tls_source(base_url: &str) -> Option<String> {
+        let explicit = Self::existing_db_tls_url_params(base_url, "mongodb");
+        if !explicit.is_empty() {
+            return Some(explicit.join(","));
+        }
+        if base_url
+            .get(..14)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("mongodb+srv://"))
+        {
+            return Some("mongodb+srv implicit TLS".to_string());
+        }
+        None
     }
 
     fn db_tls_url_param_names(db_type: &str) -> &'static [&'static str] {
@@ -4074,6 +4091,14 @@ impl EnvConfig {
                         "MongoDB supports FERRUM_DB_TLS_MODE values: disable, require, verify-full. Use MongoDB URI TLS options for more specialized policies"
                             .into(),
                     );
+                }
+                for url in self.db_url.iter().chain(self.db_failover_urls.iter()) {
+                    if let Some(source) = Self::mongodb_uri_tls_source(url) {
+                        return Err(format!(
+                            "FERRUM_DB_TLS_MODE conflicts with MongoDB URI TLS settings ({source}) in {}. Configure MongoDB TLS in exactly one source",
+                            redact_url(url)
+                        ));
+                    }
                 }
             }
             "sqlite" => {
