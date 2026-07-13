@@ -27,6 +27,12 @@
     },
     "shutdownDrainSeconds": { "type": "integer", "minimum": 0 },
     "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+    "secretVolumeDefaultMode": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 511,
+      "description": "Kubernetes Secret projection mode in decimal. Defaults to 288 (octal 0440) so fsGroup can read TLS and _FILE material."
+    },
     "ports": {
       "type": "object",
       "properties": {
@@ -51,10 +57,121 @@
         }
       }
     },
+    "admin": {
+      "type": "object",
+      "properties": {
+        "bindAddress": { "type": "string" },
+        "allowedCidrs": {
+          "type": "string",
+          "description": "Comma-separated admin source allowlist. Literal /0 entries do not protect plaintext; computed exec probes require exact 127.0.0.1/32 or bare 127.0.0.1. Runtime CIDR canonicalization is authoritative."
+        },
+        "allowInsecureHttp": { "type": "boolean" },
+        "jwtSecret": {
+          "type": "object",
+          "description": "Required in database/cp/dp unless supplied by secretFileMounts name=FERRUM_ADMIN_JWT_SECRET.",
+          "properties": {
+            "value": { "type": "string", "minLength": 32 },
+            "existingSecret": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "type": "string" }
+              }
+            },
+            "valueFrom": { "type": "object" }
+          }
+        },
+        "service": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "type": { "type": "string" },
+            "annotations": { "type": "object" }
+          }
+        }
+      }
+    },
+    "grpc": {
+      "type": "object",
+      "properties": {
+        "jwtSecret": {
+          "type": "object",
+          "description": "Required in cp/dp unless supplied by secretFileMounts name=FERRUM_CP_DP_GRPC_JWT_SECRET.",
+          "properties": {
+            "value": { "type": "string", "minLength": 32 },
+            "existingSecret": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "type": "string" }
+              }
+            },
+            "valueFrom": { "type": "object" }
+          }
+        }
+      }
+    },
     "database": {
       "type": "object",
       "properties": {
         "type": { "type": "string", "enum": ["", "sqlite", "postgres", "mysql", "mongodb"] }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "description": "TLS Secret mounts. The proxy Service publishes HTTPS only when frontend is enabled with a secretName.",
+      "properties": {
+        "frontend": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "secretName": { "type": "string" },
+            "mountPath": { "type": "string" },
+            "certKey": { "type": "string" },
+            "keyKey": { "type": "string" },
+            "clientCaKey": { "type": "string" }
+          }
+        },
+        "admin": { "type": "object" },
+        "backend": { "type": "object" },
+        "cpGrpc": { "type": "object" },
+        "dpGrpc": { "type": "object" }
+      }
+    },
+    "secretFileMounts": {
+      "type": "array",
+      "description": "Secret keys exposed through <name>_FILE. Matching entries satisfy required DB/JWT source guards.",
+      "items": {
+        "type": "object",
+        "required": ["name", "secretName"],
+        "properties": {
+          "name": { "type": "string", "pattern": "^FERRUM_[A-Z0-9_]+$" },
+          "secretName": { "type": "string", "minLength": 1 },
+          "secretKey": { "type": "string", "minLength": 1 },
+          "mountPath": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "podSecurityContext": {
+      "type": "object",
+      "description": "Pod security context. Defaults pin UID/GID/fsGroup 65532 so the distroless nonroot runtime can read group-readable Secret projections."
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "string", "pattern": "^[0-9]+%$" }
+          ]
+        },
+        "maxUnavailable": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "string", "pattern": "^[0-9]+%$" }
+          ]
+        }
       }
     },
     "probes": {

@@ -13,15 +13,12 @@ DATABASE MODE (read/write admin + proxy)
 - Proxy Service: {{ include "ferrum-gateway.fullname" . }} (ports http/https)
 - Admin binds to loopback by default; reach it in-pod:
     kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "ferrum-gateway.fullname" . }} -- /app/ferrum-edge health
-{{- if not (include "ferrum-gateway.sourceConfigured" (.Values.admin.jwtSecret | default dict)) }}
-- WARNING: admin.jwtSecret is not set. database mode requires FERRUM_ADMIN_JWT_SECRET (>=32 chars).
-{{- end }}
 {{- end }}
 
 {{- if eq .Values.mode "file" }}
 
 FILE MODE (read-only admin + proxy)
-- Config source: {{ if .Values.file.existingConfigMap }}existing ConfigMap {{ .Values.file.existingConfigMap }}{{ else }}inline ConfigMap {{ include "ferrum-gateway.fullname" . }}-config{{ end }}
+- Config source: {{ if .Values.file.existingConfigMap }}existing ConfigMap {{ .Values.file.existingConfigMap }}{{ else }}inline ConfigMap {{ include "ferrum-gateway.configMapName" . }}{{ end }}
   mounted at {{ include "ferrum-gateway.fileConfigPath" . }}
 - Kubernetes does not SIGHUP on ConfigMap change. After editing config:
     kubectl -n {{ .Release.Namespace }} rollout restart deployment/{{ include "ferrum-gateway.fullname" . }}
@@ -32,9 +29,9 @@ FILE MODE (read-only admin + proxy)
 CONTROL-PLANE MODE (read/write admin, no proxy, gRPC distribution)
 - gRPC Service for data planes:
 {{- if .Values.cp.service.enabled }}
-    {{ include "ferrum-gateway.fullname" . }}-grpc:{{ include "ferrum-gateway.cpGrpcPort" . }}
+    {{ include "ferrum-gateway.cpGrpcServiceName" . }}:{{ include "ferrum-gateway.cpGrpcPort" . }}
 - Point data planes at:
-    FERRUM_DP_CP_GRPC_URLS = http(s)://{{ include "ferrum-gateway.fullname" . }}-grpc.{{ .Release.Namespace }}.svc:{{ include "ferrum-gateway.cpGrpcPort" . }}
+    FERRUM_DP_CP_GRPC_URLS = http(s)://{{ include "ferrum-gateway.cpGrpcServiceName" . }}.{{ .Release.Namespace }}.svc:{{ include "ferrum-gateway.cpGrpcPort" . }}
 {{- else }}
     (cp.service.enabled=false — no gRPC Service rendered)
 {{- end }}
@@ -54,7 +51,7 @@ DATA-PLANE MODE (read-only admin + proxy, config from CP)
 
 {{- if .Values.admin.service.enabled }}
 
-Admin Service is ENABLED ({{ printf "%s-admin" (include "ferrum-gateway.fullname" .) }}). Ensure a NetworkPolicy
+Admin Service is ENABLED ({{ include "ferrum-gateway.adminServiceName" . }}). Ensure a NetworkPolicy
 restricts access to the admin port(s).
 {{- end }}
 

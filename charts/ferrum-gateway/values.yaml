@@ -91,8 +91,10 @@ streamPorts: []
 #   - admin TLS (tls.admin.enabled=true) with ports.adminHttp=0 (drop plaintext)
 #   - admin.allowInsecureHttp=true (local/dev; always pair with a NetworkPolicy)
 # The chart mirrors this and fails render early instead of shipping a pod that
-# crash-loops. If you set admin.allowedCidrs, INCLUDE 127.0.0.1/32 and ::1/128
-# so the in-pod exec health probe is not dropped.
+# crash-loops. A /0 CIDR is not protection; the chart rejects literal /0 entries
+# here, while the binary remains authoritative for equivalent permit-all unions.
+# If you set admin.allowedCidrs while using the computed exec probes, include the
+# exact 127.0.0.1/32 probe source so the admin TCP filter does not drop them.
 # -----------------------------------------------------------------------------
 admin:
   # Empty keeps the safe loopback default. Set to "0.0.0.0" or "::" to expose
@@ -101,8 +103,9 @@ admin:
   allowedCidrs: ""
   allowInsecureHttp: false
   # Admin JWT secret (FERRUM_ADMIN_JWT_SECRET). REQUIRED and >=32 chars for
-  # database and cp modes. Optional for file (a random read-only secret is
-  # generated at startup) and dp (read-only admin). The chart never mints it.
+  # database, cp, and dp modes. Optional for file (a random read-only secret is
+  # generated at startup). A matching secretFileMounts entry may supply it via
+  # FERRUM_ADMIN_JWT_SECRET_FILE instead. The chart never mints it.
   jwtSecret:
     # value: "at-least-32-characters-long-dev-only"
     existingSecret:
@@ -201,7 +204,9 @@ dp:
 # -----------------------------------------------------------------------------
 # TLS material. Each enabled surface mounts a Secret (standard tls.crt/tls.key/
 # ca.crt keys) read-only and sets the matching FERRUM_*_TLS_*_PATH env vars.
-# cpGrpc applies only in cp mode; dpGrpc only in dp mode.
+# cpGrpc applies only in cp mode; dpGrpc only in dp mode. Secret files default
+# to group-readable 0440 (decimal 288); podSecurityContext.fsGroup grants the
+# non-root runtime that group. Both settings are operator-overridable.
 # -----------------------------------------------------------------------------
 tls:
   frontend:
@@ -239,6 +244,10 @@ tls:
     caKey: ca.crt
     clientCertKey: ""
     clientKeyKey: tls.key
+
+# Kubernetes Secret projection mode in decimal (288 = octal 0440). Used for
+# both tls.* and secretFileMounts volumes.
+secretVolumeDefaultMode: 288
 
 # -----------------------------------------------------------------------------
 # External-secret _FILE suffix mounts. Ferrum resolves any FERRUM_* env var with
@@ -330,6 +339,10 @@ updateStrategy:
 # runtime for a distroless, non-root image.
 podSecurityContext:
   runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
   seccompProfile:
     type: RuntimeDefault
 securityContext:
@@ -346,8 +359,9 @@ tolerations: []
 affinity: {}
 topologySpreadConstraints: []
 
-# Proxy Service (front-door). Publishes proxyHttp/proxyHttps and any streamPorts
-# marked `service: true`.
+# Proxy Service (front-door). Publishes proxyHttp, proxyHttps only when
+# tls.frontend is enabled with a Secret, and any streamPorts marked
+# `service: true`.
 service:
   enabled: true
   type: ClusterIP

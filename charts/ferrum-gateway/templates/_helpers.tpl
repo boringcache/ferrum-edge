@@ -26,6 +26,19 @@ Design notes:
 {{- end -}}
 {{- end -}}
 
+{{/* Names with suffixes must be truncated after the suffix is appended. */}}
+{{- define "ferrum-gateway.cpGrpcServiceName" -}}
+{{- printf "%s-grpc" (include "ferrum-gateway.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "ferrum-gateway.adminServiceName" -}}
+{{- printf "%s-admin" (include "ferrum-gateway.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "ferrum-gateway.configMapName" -}}
+{{- printf "%s-config" (include "ferrum-gateway.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
 {{- define "ferrum-gateway.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
@@ -82,9 +95,21 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- if or $source.value $source.valueFrom $existing.name -}}true{{- end -}}
 {{- end -}}
 
+{{/* Count secretFileMounts entries that resolve one required base env var. */}}
+{{- define "ferrum-gateway.secretFileSourceCount" -}}
+{{- $count := 0 -}}
+{{- range .root.Values.secretFileMounts -}}
+{{- if eq (.name | default "") $.envName -}}
+{{- $count = add $count 1 -}}
+{{- end -}}
+{{- end -}}
+{{- $count -}}
+{{- end -}}
+
 {{/*
-Validate a single secret source: exactly one of value, existingSecret.name, or
-valueFrom, and (optionally) a minimum inline-value length.
+Validate a single required secret source: exactly one of value,
+existingSecret.name, valueFrom, or the matching secretFileMounts/_FILE source,
+and (optionally) a minimum inline-value length.
 */}}
 {{- define "ferrum-gateway.validateOneSource" -}}
 {{- $label := .label -}}
@@ -94,8 +119,10 @@ valueFrom, and (optionally) a minimum inline-value length.
 {{- if $source.value -}}{{- $count = add $count 1 -}}{{- end -}}
 {{- if $source.valueFrom -}}{{- $count = add $count 1 -}}{{- end -}}
 {{- if $existing.name -}}{{- $count = add $count 1 -}}{{- end -}}
+{{- $fileCount := include "ferrum-gateway.secretFileSourceCount" (dict "root" .root "envName" .envName) | int -}}
+{{- $count = add $count $fileCount -}}
 {{- if ne $count 1 -}}
-{{- fail (printf "%s requires exactly one of value, existingSecret.name, or valueFrom" $label) -}}
+{{- fail (printf "%s requires exactly one of value, existingSecret.name, valueFrom, or secretFileMounts entry name=%s" $label .envName) -}}
 {{- end -}}
 {{- if and $source.value .minLength (lt (len $source.value) (.minLength | int)) -}}
 {{- fail (printf "%s.value must be at least %d characters" $label (.minLength | int)) -}}
@@ -185,13 +212,15 @@ Validation: fail render on missing/unsafe configuration.
 {{- $urlCount := 0 -}}
 {{- $existing := $db.existingSecret | default dict -}}
 {{- $sqlite := $db.sqlite | default dict -}}
+{{- $dbUrlFileCount := include "ferrum-gateway.secretFileSourceCount" (dict "root" . "envName" "FERRUM_DB_URL") | int -}}
 {{- if $db.url -}}{{- $urlCount = add $urlCount 1 -}}{{- end -}}
 {{- if $db.urlFrom -}}{{- $urlCount = add $urlCount 1 -}}{{- end -}}
 {{- if $existing.name -}}{{- $urlCount = add $urlCount 1 -}}{{- end -}}
 {{- if and (eq $db.type "sqlite") $sqlite.path -}}{{- $urlCount = add $urlCount 1 -}}{{- end -}}
 {{- if $db.host -}}{{- $urlCount = add $urlCount 1 -}}{{- end -}}
+{{- $urlCount = add $urlCount $dbUrlFileCount -}}
 {{- if ne $urlCount 1 -}}
-{{- fail "database requires exactly one URL source: url, urlFrom, existingSecret.name, sqlite.path, or structured host settings" -}}
+{{- fail "database requires exactly one URL source: url, urlFrom, existingSecret.name, sqlite.path, structured host settings, or secretFileMounts entry name=FERRUM_DB_URL" -}}
 {{- end -}}
 {{- if and (ne $db.type "sqlite") $sqlite.path -}}
 {{- fail "database.sqlite.path is valid only when database.type=sqlite" -}}
@@ -215,13 +244,15 @@ Validation: fail render on missing/unsafe configuration.
 {{- end -}}
 {{- if or (eq $mode "database") (eq $mode "cp") -}}
 {{- include "ferrum-gateway.validateDatabase" . -}}
-{{- include "ferrum-gateway.validateOneSource" (dict "label" "admin.jwtSecret" "source" (.Values.admin.jwtSecret | default dict) "minLength" 32) -}}
+{{- end -}}
+{{- if or (eq $mode "database") (eq $mode "cp") (eq $mode "dp") -}}
+{{- include "ferrum-gateway.validateOneSource" (dict "label" "admin.jwtSecret" "source" (.Values.admin.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_ADMIN_JWT_SECRET") -}}
 {{- end -}}
 {{- if eq $mode "cp" -}}
-{{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" (.Values.grpc.jwtSecret | default dict) "minLength" 32) -}}
+{{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" (.Values.grpc.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_CP_DP_GRPC_JWT_SECRET") -}}
 {{- end -}}
 {{- if eq $mode "dp" -}}
-{{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" (.Values.grpc.jwtSecret | default dict) "minLength" 32) -}}
+{{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" (.Values.grpc.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_CP_DP_GRPC_JWT_SECRET") -}}
 {{- if not .Values.dp.cpGrpcUrls -}}
 {{- fail "dp.cpGrpcUrls is required for mode=dp (comma-separated CP gRPC URLs, e.g. https://ferrum-cp:50051)" -}}
 {{- end -}}
@@ -245,10 +276,30 @@ Validation: fail render on missing/unsafe configuration.
 {{- fail "admin.service.enabled=true requires admin.bindAddress to be a non-loopback address (e.g. 0.0.0.0 or ::); a loopback-bound admin listener is not reachable through a Service" -}}
 {{- end -}}
 {{- if and (not $loopback) (or (eq $mode "database") (eq $mode "cp")) (ne ($adminHttpPort | toString) "0") -}}
-{{- $tlsAdmin := (.Values.tls | default dict).admin | default dict -}}
-{{- $hasProtection := or $admin.allowedCidrs (and $tlsAdmin.enabled $tlsAdmin.secretName) $admin.allowInsecureHttp -}}
+{{- $allowedCidrs := $admin.allowedCidrs | default "" -}}
+{{- $containsCatchAll := regexMatch "(^|[[:space:],])[^[:space:],]+/0([[:space:],]|$)" $allowedCidrs -}}
+{{- $hasEffectiveAllowlist := and $allowedCidrs (not $containsCatchAll) -}}
+{{- $hasProtection := or $hasEffectiveAllowlist $admin.allowInsecureHttp -}}
 {{- if not $hasProtection -}}
+{{- if $containsCatchAll -}}
+{{- fail "admin.allowedCidrs contains a /0 catch-all CIDR, which does not restrict a non-loopback plaintext admin listener. Use a narrower allowlist, TLS-only admin with ports.adminHttp=0, or admin.allowInsecureHttp=true for local development. The binary remains authoritative for equivalent permit-all CIDR unions." -}}
+{{- end -}}
 {{- fail (printf "mode=%s hard-fails on a non-loopback plaintext admin bind. Set one of: admin.allowedCidrs, admin TLS (tls.admin.enabled + ports.adminHttp=0), or admin.allowInsecureHttp=true with a NetworkPolicy" $mode) -}}
+{{- end -}}
+{{- end -}}
+{{/* The default exec probes connect from 127.0.0.1, and the admin accept loop
+     applies allowedCidrs to loopback like every other source. Require the exact
+     probe source whenever at least one computed handler is active. */}}
+{{- $probes := .Values.probes | default dict -}}
+{{- $startup := $probes.startup | default dict -}}
+{{- $liveness := $probes.liveness | default dict -}}
+{{- $readiness := $probes.readiness | default dict -}}
+{{- $defaultLiveProbe := and (or $startup.enabled $liveness.enabled) (not ($liveness.override | default dict)) -}}
+{{- $defaultReadyProbe := and $readiness.enabled (not ($readiness.override | default dict)) -}}
+{{- if and $admin.allowedCidrs (or $defaultLiveProbe $defaultReadyProbe) -}}
+{{- $hasProbeLoopback := regexMatch "(^|[[:space:],])127\\.0\\.0\\.1(/32)?([[:space:],]|$)" $admin.allowedCidrs -}}
+{{- if not $hasProbeLoopback -}}
+{{- fail "admin.allowedCidrs must include 127.0.0.1/32 (or bare 127.0.0.1) while the default exec probes are enabled; the admin TCP allowlist otherwise drops the in-pod health checks. Add the exact probe source or override/disable every computed probe handler." -}}
 {{- end -}}
 {{- end -}}
 {{/* Graceful shutdown: give the pod time to drain plus the ~5s cleanup window. */}}
@@ -277,13 +328,18 @@ FERRUM_MODE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GR
 {{- if or (eq $mode "database") (eq $mode "cp") }}
 - name: FERRUM_DB_TYPE
   value: {{ .Values.database.type | quote }}
+{{- $dbUrlFileCount := include "ferrum-gateway.secretFileSourceCount" (dict "root" . "envName" "FERRUM_DB_URL") | int }}
+{{- if eq $dbUrlFileCount 0 }}
 {{ include "ferrum-gateway.renderDbUrlEnv" . }}
-{{ include "ferrum-gateway.renderSecretEnv" (dict "name" "FERRUM_ADMIN_JWT_SECRET" "source" (.Values.admin.jwtSecret | default dict) "defaultKey" "admin-jwt-secret") }}
-{{- else if include "ferrum-gateway.sourceConfigured" (.Values.admin.jwtSecret | default dict) }}
+{{- end }}
+{{- end }}
+{{- if include "ferrum-gateway.sourceConfigured" (.Values.admin.jwtSecret | default dict) }}
 {{ include "ferrum-gateway.renderSecretEnv" (dict "name" "FERRUM_ADMIN_JWT_SECRET" "source" (.Values.admin.jwtSecret | default dict) "defaultKey" "admin-jwt-secret") }}
 {{- end }}
 {{- if eq $mode "cp" }}
+{{- if include "ferrum-gateway.sourceConfigured" (.Values.grpc.jwtSecret | default dict) }}
 {{ include "ferrum-gateway.renderSecretEnv" (dict "name" "FERRUM_CP_DP_GRPC_JWT_SECRET" "source" (.Values.grpc.jwtSecret | default dict) "defaultKey" "cp-dp-grpc-jwt-secret") }}
+{{- end }}
 - name: FERRUM_CP_GRPC_LISTEN_ADDR
   value: {{ printf "%s:%v" (.Values.cp.grpcBindAddress | default "0.0.0.0") (include "ferrum-gateway.cpGrpcPort" .) | quote }}
 {{- if .Values.cp.namespaces }}
@@ -298,7 +354,9 @@ FERRUM_MODE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GR
 {{- if eq $mode "dp" }}
 - name: FERRUM_DP_CP_GRPC_URLS
   value: {{ .Values.dp.cpGrpcUrls | quote }}
+{{- if include "ferrum-gateway.sourceConfigured" (.Values.grpc.jwtSecret | default dict) }}
 {{ include "ferrum-gateway.renderSecretEnv" (dict "name" "FERRUM_CP_DP_GRPC_JWT_SECRET" "source" (.Values.grpc.jwtSecret | default dict) "defaultKey" "cp-dp-grpc-jwt-secret") }}
+{{- end }}
 {{- if .Values.dp.failoverPrimaryRetrySeconds }}
 - name: FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS
   value: {{ .Values.dp.failoverPrimaryRetrySeconds | quote }}
@@ -449,7 +507,7 @@ Volumes / mounts.
 - name: {{ printf "tls-%s" ($key | kebabcase) }}
   secret:
     secretName: {{ $s.secretName | quote }}
-    defaultMode: 0400
+    defaultMode: {{ $.Values.secretVolumeDefaultMode | default 288 }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -475,7 +533,7 @@ Volumes / mounts.
 - name: {{ printf "secret-file-%d" $i }}
   secret:
     secretName: {{ $m.secretName | quote }}
-    defaultMode: 0400
+    defaultMode: {{ $.Values.secretVolumeDefaultMode | default 288 }}
     items:
       - key: {{ ($m.secretKey | default "value") | quote }}
         path: {{ ($m.secretKey | default "value") | quote }}

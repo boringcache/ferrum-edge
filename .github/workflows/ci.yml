@@ -1905,10 +1905,27 @@ jobs:
             -f ./charts/ferrum-gateway/examples/dp-values.yaml \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-rendered.yaml"
           grep -Fq 'name: FERRUM_DP_CP_GRPC_URLS' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-rendered.yaml"
+          grep -Fq 'http://ferrum-cp-ferrum-gateway-grpc.ferrum.svc:50051' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-rendered.yaml"
+          grep -Fq 'name: ferrum-cp-ferrum-gateway-grpc' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-rendered.yaml"
+          long_name="$(printf 'a%.0s' {1..63})"
+          helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            -f ./charts/ferrum-gateway/examples/cp-values.yaml \
+            --set-string fullnameOverride="$long_name" \
+            --show-only templates/service-cp-grpc.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/long-cp-service.yaml"
+          grpc_service_name="$(awk '/^  name:/{print $2; exit}' "$RUNNER_TEMP/ferrum-gateway-helm-results/long-cp-service.yaml")"
+          if [ "${#grpc_service_name}" -gt 63 ]; then
+            echo "::error title=CP gRPC Service name exceeds DNS label limit::suffix must be included before truncation"
+            exit 1
+          fi
           # Secret-backed modes render env via valueFrom, never inline secrets.
           for name in FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET; do
             if ! grep -A5 "name: ${name}" "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-rendered.yaml" | grep -q 'valueFrom:'; then
               echo "::error title=Gateway CP secret not via valueFrom::${name} must be a Secret reference in cp-values.yaml"
+              exit 1
+            fi
+            if ! grep -A5 "name: ${name}" "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-rendered.yaml" | grep -q 'valueFrom:'; then
+              echo "::error title=Gateway DP secret not via valueFrom::${name} must use a Secret reference in dp-values.yaml"
               exit 1
             fi
           done
@@ -1922,6 +1939,43 @@ jobs:
             exit 1
           fi
           grep -F 'admin.jwtSecret requires exactly one of' "$RUNNER_TEMP/ferrum-gateway-helm-results/missing-admin-jwt.err"
+          # DP also creates the admin JWT manager at startup and must not render
+          # without an admin JWT source.
+          if helm template ferrum-dp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=dp \
+            --set-string dp.cpGrpcUrls=https://ferrum-cp.example:50051 \
+            --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-missing-admin-jwt.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-missing-admin-jwt.err"; then
+            echo "::error title=Missing DP admin JWT rendered successfully::dp mode must require an admin JWT source"
+            exit 1
+          fi
+          grep -F 'admin.jwtSecret requires exactly one of' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-missing-admin-jwt.err"
+          # Required JWTs may be supplied through the documented _FILE path.
+          helm template ferrum-dp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=dp \
+            --set-string dp.cpGrpcUrls=https://ferrum-cp.example:50051 \
+            --set 'secretFileMounts[0].name=FERRUM_ADMIN_JWT_SECRET' \
+            --set 'secretFileMounts[0].secretName=ferrum-admin' \
+            --set 'secretFileMounts[0].secretKey=admin-jwt-secret' \
+            --set 'secretFileMounts[1].name=FERRUM_CP_DP_GRPC_JWT_SECRET' \
+            --set 'secretFileMounts[1].secretName=ferrum-grpc' \
+            --set 'secretFileMounts[1].secretKey=cp-dp-grpc-jwt-secret' \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-file-jwts.yaml"
+          grep -Fq 'name: FERRUM_ADMIN_JWT_SECRET_FILE' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-file-jwts.yaml"
+          grep -Fq 'name: FERRUM_CP_DP_GRPC_JWT_SECRET_FILE' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-file-jwts.yaml"
+          # Database URL and admin JWT can both use the same generic _FILE path.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database --set database.type=postgres \
+            --set 'secretFileMounts[0].name=FERRUM_DB_URL' \
+            --set 'secretFileMounts[0].secretName=ferrum-db' \
+            --set 'secretFileMounts[0].secretKey=url' \
+            --set 'secretFileMounts[1].name=FERRUM_ADMIN_JWT_SECRET' \
+            --set 'secretFileMounts[1].secretName=ferrum-admin' \
+            --set 'secretFileMounts[1].secretKey=admin-jwt-secret' \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/database-file-secrets.yaml"
+          grep -Fq 'name: FERRUM_DB_URL_FILE' "$RUNNER_TEMP/ferrum-gateway-helm-results/database-file-secrets.yaml"
+          grep -Fq 'name: FERRUM_ADMIN_JWT_SECRET_FILE' "$RUNNER_TEMP/ferrum-gateway-helm-results/database-file-secrets.yaml"
           # A non-loopback plaintext admin bind in database mode must fail render
           # (the binary hard-fails on this at boot).
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
@@ -1935,6 +1989,74 @@ jobs:
             exit 1
           fi
           grep -F 'hard-fails on a non-loopback plaintext admin bind' "$RUNNER_TEMP/ferrum-gateway-helm-results/unsafe-admin-bind.err"
+          # Admin TLS on 9443 does not protect a live plaintext listener on 9000.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-gateway-credentials \
+            --set admin.bindAddress=0.0.0.0 \
+            --set tls.admin.enabled=true --set tls.admin.secretName=ferrum-admin-tls \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/tls-with-plaintext-admin.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/tls-with-plaintext-admin.err"; then
+            echo "::error title=TLS guard left plaintext admin enabled::ports.adminHttp must be 0 when TLS is the protection"
+            exit 1
+          fi
+          grep -F 'tls.admin.enabled + ports.adminHttp=0' "$RUNNER_TEMP/ferrum-gateway-helm-results/tls-with-plaintext-admin.err"
+          # A literal /0 allowlist is unrestricted and cannot satisfy the guard.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-gateway-credentials \
+            --set admin.bindAddress=0.0.0.0 \
+            --set-string 'admin.allowedCidrs=0.0.0.0/0\,127.0.0.1/32' \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/catch-all-admin-cidr.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/catch-all-admin-cidr.err"; then
+            echo "::error title=Catch-all admin CIDR rendered successfully::a /0 allowlist must not satisfy the plaintext guard"
+            exit 1
+          fi
+          grep -F 'contains a /0 catch-all CIDR' "$RUNNER_TEMP/ferrum-gateway-helm-results/catch-all-admin-cidr.err"
+          # The runtime allowlist filters loopback too, so computed exec probes
+          # require their exact 127.0.0.1 source.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-gateway-credentials \
+            --set admin.bindAddress=0.0.0.0 \
+            --set-string admin.allowedCidrs=10.0.0.0/8 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/probe-loopback-missing.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/probe-loopback-missing.err"; then
+            echo "::error title=Probe loopback omitted from admin allowlist::computed exec probes would be dropped"
+            exit 1
+          fi
+          grep -F 'must include 127.0.0.1/32' "$RUNNER_TEMP/ferrum-gateway-helm-results/probe-loopback-missing.err"
+          # Default Services do not advertise dead HTTPS; TLS enables it. The
+          # mounted Secret is group-readable by the default distroless fsGroup.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --show-only templates/service.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/default-service.yaml"
+          if grep -Fq -- '- name: https' "$RUNNER_TEMP/ferrum-gateway-helm-results/default-service.yaml"; then
+            echo "::error title=HTTPS Service port rendered without frontend TLS::default port 443 would target an unbound listener"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set tls.frontend.enabled=true --set tls.frontend.secretName=ferrum-frontend-tls \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/frontend-tls-rendered.yaml"
+          grep -Fq -- '- name: https' "$RUNNER_TEMP/ferrum-gateway-helm-results/frontend-tls-rendered.yaml"
+          grep -Fq 'defaultMode: 288' "$RUNNER_TEMP/ferrum-gateway-helm-results/frontend-tls-rendered.yaml"
+          grep -Fq 'fsGroup: 65532' "$RUNNER_TEMP/ferrum-gateway-helm-results/frontend-tls-rendered.yaml"
+          # Key-presence checks preserve valid zero-valued PDB limits.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set podDisruptionBudget.enabled=true --set podDisruptionBudget.minAvailable=0 \
+            --show-only templates/pdb.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/pdb-zero.yaml"
+          grep -Fq 'minAvailable: 0' "$RUNNER_TEMP/ferrum-gateway-helm-results/pdb-zero.yaml"
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set podDisruptionBudget.enabled=true \
+            --set podDisruptionBudget.minAvailable=null \
+            --set podDisruptionBudget.maxUnavailable=0 \
+            --show-only templates/pdb.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/pdb-max-zero.yaml"
+          grep -Fq 'maxUnavailable: 0' "$RUNNER_TEMP/ferrum-gateway-helm-results/pdb-max-zero.yaml"
           # Liveness/startup must probe /live (--live) and readiness must probe
           # /health (no --live) — the two probe commands must stay distinct so an
           # alive-but-unready pod is not restart-looped.

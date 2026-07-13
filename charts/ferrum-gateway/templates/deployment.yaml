@@ -174,7 +174,7 @@ spec:
         {{- if eq .Values.mode "file" }}
         - name: ferrum-config
           configMap:
-            name: {{ .Values.file.existingConfigMap | default (printf "%s-config" (include "ferrum-gateway.fullname" .)) }}
+            name: {{ .Values.file.existingConfigMap | default (include "ferrum-gateway.configMapName" .) }}
         {{- end }}
         {{- include "ferrum-gateway.tlsVolumes" . | nindent 8 }}
         {{- include "ferrum-gateway.secretFileVolumes" . | nindent 8 }}

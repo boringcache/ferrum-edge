@@ -1,5 +1,6 @@
 {{- if and .Values.service.enabled (ne .Values.mode "cp") }}
 {{- $ports := .Values.ports | default dict -}}
+{{- $frontendTls := (.Values.tls | default dict).frontend | default dict -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -22,7 +23,7 @@ spec:
       targetPort: proxy-http
       protocol: TCP
     {{- end }}
-    {{- if and (hasKey $ports "proxyHttps") (ne ($ports.proxyHttps | toString) "0") }}
+    {{- if and (hasKey $ports "proxyHttps") (ne ($ports.proxyHttps | toString) "0") $frontendTls.enabled $frontendTls.secretName }}
     - name: https
       port: {{ .Values.service.httpsPort | default 443 }}
       targetPort: proxy-https

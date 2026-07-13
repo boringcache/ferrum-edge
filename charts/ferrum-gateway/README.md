@@ -11,7 +11,7 @@ conventions so they feel like one product.
 | Database | `database` | yes | read/write | `database.*`, `admin.jwtSecret` (>=32) |
 | File | `file` | yes | read-only | `file.inlineConfig` or `file.existingConfigMap` |
 | Control plane | `cp` | no | read/write | `database.*`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32) |
-| Data plane | `dp` | yes | read-only | `dp.cpGrpcUrls`, `grpc.jwtSecret` (>=32) |
+| Data plane | `dp` | yes | read-only | `dp.cpGrpcUrls`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32) |
 
 The `mode` value is first-class and required; any other value (mesh, injector,
 node_agent, migrate) fails at template time with a pointer to the right chart.
@@ -20,9 +20,10 @@ node_agent, migrate) fails at template time with a pointer to the right chart.
 
 - **Secrets are never generated or rendered into ConfigMaps.** Admin JWT, DB
   URL, and CP/DP gRPC JWT material come from inline values (dev only) or Secret
-  references you own. The chart validates that database and cp modes have a
-  `>=32`-char admin JWT secret, and that cp/dp modes have a `>=32`-char gRPC JWT
-  secret, before it will render.
+  references you own. The chart validates that database, cp, and dp modes have
+  a `>=32`-char admin JWT secret, and that cp/dp modes have a `>=32`-char gRPC
+  JWT secret, before it will render. Required DB/JWT values may instead come
+  from matching `secretFileMounts` entries and Ferrum's `_FILE` resolver.
 - **Admin binds to loopback by default.** Probes use the in-pod exec
   `ferrum-edge health` check, which works with the loopback default (a kubelet
   `httpGet` targets the pod IP and would miss a loopback listener). To expose
@@ -30,9 +31,16 @@ node_agent, migrate) fails at template time with a pointer to the right chart.
   `admin.service.enabled=true`. In the write-capable `database`/`cp` modes the
   binary hard-fails on a non-loopback **plaintext** admin bind unless you also
   set one of `admin.allowedCidrs`, admin TLS (`tls.admin.enabled` +
-  `ports.adminHttp=0`), or `admin.allowInsecureHttp=true`; the chart mirrors this
-  and fails render early. If you use `admin.allowedCidrs`, include `127.0.0.1/32`
-  and `::1/128` so the exec health probe is not dropped.
+  `ports.adminHttp=0`), or `admin.allowInsecureHttp=true`; TLS on 9443 does not
+  protect a still-live plaintext listener on 9000. Literal `/0` CIDRs are
+  rejected as ineffective protection; the binary is authoritative for other
+  permit-all CIDR unions. If computed exec probes are enabled,
+  `admin.allowedCidrs` must include exact source `127.0.0.1/32` (or the bare IP)
+  because the admin TCP filter does not special-case loopback.
+- **TLS and `_FILE` Secret mounts are non-root readable.** They default to mode
+  `0440` with pod `fsGroup: 65532`, matching the distroless nonroot image. Both
+  `secretVolumeDefaultMode` and `podSecurityContext` are overridable for images
+  with a different runtime identity.
 - **Graceful shutdown** wires `terminationGracePeriodSeconds` to the
   `FERRUM_SHUTDOWN_DRAIN_SECONDS` drain window (grace must exceed drain + ~5s
   cleanup, enforced at render).
@@ -96,18 +104,22 @@ helm install ferrum-dp ./charts/ferrum-gateway -n ferrum \
   -f charts/ferrum-gateway/examples/dp-values.yaml
 ```
 
-The CP renders a gRPC `Service` (`<release>-grpc:50051`) for data planes; point
-`dp.cpGrpcUrls` at it. Production control planes should serve gRPC over TLS
-(`tls.cpGrpc`) and DPs should pin CP trust (`tls.dpGrpc`) rather than relying on
-plaintext.
+The CP example release renders the gRPC Service
+`ferrum-cp-ferrum-gateway-grpc:50051`; the paired DP example targets that exact
+DNS name. In general the name is `<chart-fullname>-grpc`, truncated as one DNS
+label. The quickstart pair explicitly opts into plaintext ClusterIP gRPC for
+development. Production control planes should remove that opt-in, serve gRPC
+over TLS (`tls.cpGrpc`), and have DPs pin CP trust (`tls.dpGrpc`).
 
 ## Ports and stream listeners
 
 `ports.{proxyHttp,proxyHttps,adminHttp,adminHttps,cpGrpc}` drive both the
 container ports and the `FERRUM_*_PORT` env; a value of `0` disables that
-listener (e.g. `ports.adminHttp=0` for TLS-only admin). Raw TCP/UDP stream
-proxy listeners are declared under `streamPorts` and, when `service: true`, are
-published on the proxy Service:
+listener (e.g. `ports.adminHttp=0` for TLS-only admin). The proxy Service only
+publishes its HTTPS port when `tls.frontend.enabled=true` and a frontend TLS
+Secret is configured, so default installs do not advertise an unbound 443.
+Raw TCP/UDP stream proxy listeners are declared under `streamPorts` and, when
+`service: true`, are published on the proxy Service:
 
 ```yaml
 streamPorts:
@@ -126,7 +138,9 @@ streamPorts:
 Each surface under `tls.*` (`frontend`, `admin`, `backend`, `cpGrpc`, `dpGrpc`)
 mounts a Secret read-only and sets the matching `FERRUM_*_TLS_*_PATH` env vars.
 For the external-secret `_FILE` suffix pattern, use `secretFileMounts` to mount
-an arbitrary Secret key and expose `<VAR>_FILE` pointing at it.
+an arbitrary Secret key and expose `<VAR>_FILE` pointing at it. Required sources
+are matched by base name, for example `name: FERRUM_ADMIN_JWT_SECRET` renders
+`FERRUM_ADMIN_JWT_SECRET_FILE` and satisfies the admin JWT render guard.
 
 See [`values.yaml`](values.yaml) for the fully commented value surface and
 [`docs/kubernetes_deployment.md`](../../docs/kubernetes_deployment.md) for the

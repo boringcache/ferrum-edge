@@ -37,6 +37,12 @@ cp:
     enabled: true
     type: ClusterIP
 
+# This paired quickstart uses plaintext gRPC inside the cluster, so both sides
+# make the binary's explicit development opt-in. Remove this and configure
+# tls.cpGrpc/tls.dpGrpc for production.
+env:
+  FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"
+
 # Production control planes should serve gRPC over TLS. Provide a Secret with
 # tls.crt/tls.key (and optionally ca.crt for mTLS) and enable it here:
 # tls:

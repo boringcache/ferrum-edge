@@ -2,7 +2,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ printf "%s-config" (include "ferrum-gateway.fullname" .) }}
+  name: {{ include "ferrum-gateway.configMapName" . }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "ferrum-gateway.labels" . | nindent 4 }}
