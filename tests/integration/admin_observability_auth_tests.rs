@@ -21,6 +21,7 @@ use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const JWT_SECRET: &str = "observability-auth-test-secret-key-000000";
 const JWT_ISSUER: &str = "ferrum-edge-obs-test";
@@ -67,6 +68,8 @@ fn admin_state(metrics_auth: MetricsAuthPolicy) -> AdminState {
         read_only: true,
         admin_audit_enabled: false,
         startup_ready: None,
+        serving_degraded: None,
+        serving_listener_failures: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
@@ -160,6 +163,52 @@ async fn health_unauthenticated_omits_detailed_fields() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body.get("mode").and_then(|v| v.as_str()), Some("file"));
     assert!(body.get("cached_config").is_some(), "detailed body: {body}");
+}
+
+#[tokio::test]
+async fn mesh_listener_failure_details_require_observability_auth() {
+    let mut state = admin_state(MetricsAuthPolicy::default());
+    let ready = Arc::new(AtomicBool::new(true));
+    let degraded = Arc::new(AtomicBool::new(false));
+    let failures = Arc::new(ferrum_edge::startup::ServingListenerFailures::default());
+    ferrum_edge::startup::record_post_start_listener_failure(
+        &ready,
+        &degraded,
+        &failures,
+        "Mesh admin HTTPS listener",
+        9443,
+        &"private=/secret/path",
+    );
+    ready.store(true, Ordering::Release);
+    state.mode = "mesh".to_string();
+    state.startup_ready = Some(ready);
+    state.serving_degraded = Some(degraded);
+    state.serving_listener_failures = Some(failures);
+    let (base, _sd) = start_admin(state).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, json!({"status": "unavailable", "ready": false}));
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/status"))
+        .header("Authorization", format!("Bearer {}", admin_token()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["listener_failures"]["failures_total"], 1);
+    assert_eq!(
+        body["listener_failures"]["failures"][0]["error"],
+        "listener serve task exited after successful bind"
+    );
+    assert!(!body.to_string().contains("/secret/path"));
 }
 
 #[tokio::test]

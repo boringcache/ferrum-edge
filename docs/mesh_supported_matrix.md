@@ -146,6 +146,20 @@ need them, or because they are blocked upstream / architecturally:
   it is not projected as effective policy. Use `http2MaxRequests`.
   (`http1MaxPendingRequests` IS enforced — a 503-on-overflow pending-request gate
   on the HTTP/1.1 dispatch path; see the DR table in `docs/mesh.md`.)
+- **PeerAuthentication `portLevelMtls` (per-app-port mTLS)** — parsing and
+  validation are **Supported**; per-app-port enforcement is **Deferred**. The
+  inbound mesh listener terminates
+  mTLS on a single transport port (Sidecar `15006` / Ambient `15008` /
+  EgressGateway `15090`), and one `rustls::ServerConfig` per listener cannot vary
+  STRICT/PERMISSIVE per app port without pre-handshake `SO_ORIGINAL_DST` demux.
+  The whole listener normally resolves against the winning policy's **top-level
+  `mtls_mode`**; app-port overrides are dropped. If an app port numerically
+  equals the topology's transport port, that override instead governs the whole
+  listener. This is surfaced (translator warning +
+  `status.ferrum.translation.deferred_fields` + a runtime `warn!` on every
+  config source), so `FerrumAccepted=True` does not imply per-port enforcement —
+  but operators MUST configure the listener-wide posture they need. Full
+  per-app-port enforcement is an owed deferral (see index below).
 - **LB `MAGLEV` / `PASSTHROUGH`** — niche; `PASSTHROUGH` approximates to round-robin.
 - **VirtualService `tcp[]` source/dest-CIDR L4 routing** — uncommon; model with a
   stream `Proxy` or east-west SNI passthrough (TLS-SNI L4 routing is on the roadmap).
@@ -167,6 +181,7 @@ ledger unless they change the support contract.
 | Deferral | Issue | Doc anchor |
 |---|---|---|
 | Live UDP/raw-TCP **source-capture** e2e (`netns-capture-live`). The Ambient per-pod-netns UDP capture producer is now **implemented** (rule generation, reconcile, and registry publishing are unit-tested; matrix UDP/DTLS Ambient rows are `Supported (Experimental)`); the remaining deferral is only the privileged live datapath e2e (TPROXY → tunnel → return-source spoofing). | [#2013](https://github.com/ferrum-edge/ferrum-edge/issues/2013) | `docs/mesh.md` matrix UDP/DTLS rows + note [10], UDP TPROXY capture section |
+| **Per-app-port PeerAuthentication (`portLevelMtls`) enforcement.** Parsing and validation are Supported; enforcement is Deferred (translator warning + `status.ferrum.translation.deferred_fields` + runtime `warn!`). The winning policy normally supplies its top-level mode listener-wide; if an app port collides with transport port `15006` / `15008` / `15090`, that override governs the whole listener. Full enforcement needs pre-handshake `SO_ORIGINAL_DST` demux + per-app-port `ServerConfig` selection. | [#2126](https://github.com/ferrum-edge/ferrum-edge/issues/2126) | `docs/mesh.md` PeerAuthentication per-app-port box + resolution-port table; `docs/mesh_supported_matrix.md` out-of-scope `portLevelMtls` bullet |
 
 ## How a feature graduates
 

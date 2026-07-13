@@ -34,7 +34,10 @@ use crate::admin::backup::{
     parse_backup_resources, parse_restore_confirm,
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
-use crate::config::db_backend::DatabaseBackend;
+use crate::config::db_backend::{
+    AtomicClearVerification, DatabaseBackend, NamespaceResourceCounts, SnapshotDataIntegrityError,
+    classify_atomic_clear_verification,
+};
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,
 };
@@ -174,6 +177,21 @@ pub struct AdminState {
     /// DP mode differs: it starts with an empty config and defers `startup_ready`
     /// until the first CP snapshot is applied + backend capabilities are classified.
     pub startup_ready: Option<Arc<AtomicBool>>,
+    /// Sticky serving-degradation signal (set in CP/DP/mesh modes, which
+    /// supervise post-start listener/server tasks). Set once — and never unset —
+    /// by [`crate::startup::flip_ready_off_on_listener_failure`] when a serving
+    /// task (CP gRPC server; DP proxy/admin listeners) exits with an error after
+    /// startup. `/health` reports not-ready when this is `true` OR
+    /// `startup_ready` is `false`. Unlike `startup_ready` — which CP stores
+    /// `true` once after the gRPC start signal and DP re-stores `true` on every
+    /// CP-reconnect snapshot — this flag is monotonic, so a post-start serve
+    /// failure stays visible even after a later readiness restore. `None` in
+    /// modes without post-start listener supervision (file/database/node_agent),
+    /// where readiness is governed by `startup_ready` alone.
+    pub serving_degraded: Option<Arc<AtomicBool>>,
+    /// Durable sanitized details for post-start listener failures. Populated by
+    /// mesh mode and exposed only on authenticated observability responses.
+    pub serving_listener_failures: Option<Arc<crate::startup::ServingListenerFailures>>,
     /// Dynamic flag set by the DB polling loop. When `false`, write operations
     /// are rejected early to preserve the cached config until the DB recovers.
     /// This flag is orthogonal to `startup_ready` — a gateway can be ready to
@@ -246,28 +264,6 @@ impl AdminState {
     }
 }
 
-/// Start the Admin API listener with dual-path handling.
-pub async fn start_admin_listener(
-    addr: SocketAddr,
-    state: AdminState,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-    conn_limiter: Arc<conn_limit::AdminConnLimiter>,
-) -> Result<(), anyhow::Error> {
-    start_admin_listener_with_tls_and_signal(addr, state, shutdown, None, None, conn_limiter).await
-}
-
-/// Start the Admin API listener with optional TLS support.
-pub async fn start_admin_listener_with_tls(
-    addr: SocketAddr,
-    state: AdminState,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-    tls_config: Option<Arc<rustls::ServerConfig>>,
-    conn_limiter: Arc<conn_limit::AdminConnLimiter>,
-) -> Result<(), anyhow::Error> {
-    start_admin_listener_with_tls_and_signal(addr, state, shutdown, tls_config, None, conn_limiter)
-        .await
-}
-
 /// Start the Admin API listener with optional TLS support and signal readiness
 /// after the TCP socket binds successfully.
 pub async fn start_admin_listener_with_tls_and_signal(
@@ -284,30 +280,6 @@ pub async fn start_admin_listener_with_tls_and_signal(
         let _ = started_tx.send(());
     }
     serve_admin_on_listener(listener, state, shutdown, tls_config, conn_limiter).await
-}
-
-/// Start the Admin API HTTPS listener with a hot-swappable frontend TLS
-/// slot. Used when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`. The
-/// frontend TLS watch task swaps the underlying `ArcSwap` after a validated
-/// cert/key reload; subsequent accepts pick up the new config without
-/// restarting the listener. Existing in-flight admin connections keep their
-/// original `ServerConfig`.
-pub async fn start_admin_listener_with_dynamic_tls(
-    addr: SocketAddr,
-    state: AdminState,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-    tls_slot: crate::tls::SharedFrontendTls,
-    conn_limiter: Arc<conn_limit::AdminConnLimiter>,
-) -> Result<(), anyhow::Error> {
-    start_admin_listener_with_dynamic_tls_and_signal(
-        addr,
-        state,
-        shutdown,
-        tls_slot,
-        None,
-        conn_limiter,
-    )
-    .await
 }
 
 /// Start the Admin API HTTPS listener with a hot-swappable frontend TLS slot
@@ -334,8 +306,8 @@ pub async fn start_admin_listener_with_dynamic_tls_and_signal(
 /// Useful for tests that allocate an ephemeral port up front: passing the
 /// listener through avoids the bind→drop→rebind window where another process
 /// can steal the port between releasing it and the listener task re-binding.
-/// Production callers go through [`start_admin_listener`] /
-/// [`start_admin_listener_with_tls`], which bind internally.
+/// Production callers go through [`start_admin_listener_with_tls_and_signal`],
+/// which binds internally and signals startup readiness.
 ///
 /// `file::serve` (the in-process gateway entry point) also calls this
 /// directly when a `ServeOptions::admin_http` / `admin_https` listener is
@@ -1009,7 +981,24 @@ pub async fn handle_admin_request(
             .startup_ready
             .as_ref()
             .is_none_or(|flag| flag.load(Ordering::Acquire));
-        health_status["ready"] = json!(startup_ready);
+        // Sticky serving-degradation overrides a readiness restore (issue
+        // #2117): once a CP/DP/mesh serving task dies after startup, `/health` stays
+        // not-ready even though the mode's main task (CP) or a CP reconnect (DP)
+        // later stores `startup_ready = true`. Only CP/DP populate this flag.
+        let serving_degraded = state
+            .serving_degraded
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire));
+        let ready = startup_ready && !serving_degraded;
+        health_status["ready"] = json!(ready);
+
+        if let Some(failures) = state.serving_listener_failures.as_ref() {
+            let snapshot = failures.snapshot();
+            if snapshot.failures_total > 0 {
+                health_status["listener_failures"] =
+                    serde_json::to_value(snapshot).unwrap_or_default();
+            }
+        }
 
         // Report cached config availability for resilience visibility
         if let Some(config) = state.cached_gateway_config() {
@@ -1067,8 +1056,18 @@ pub async fn handle_admin_request(
             });
         }
 
-        let response_code = if !startup_ready {
-            health_status["status"] = json!("starting");
+        let response_code = if !ready {
+            // Distinguish "never became ready" (still starting up) from "was
+            // ready, then a serving listener died after startup" (degraded).
+            // `serving_degraded` is the authoritative signal: the flip helper
+            // sets it true AND best-effort clears `startup_ready`, so keying the
+            // status off `!startup_ready` would mislabel a post-start
+            // degradation as "starting". Use the sticky flag instead.
+            health_status["status"] = json!(if serving_degraded {
+                "unavailable"
+            } else {
+                "starting"
+            });
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::OK
@@ -1110,6 +1109,12 @@ pub async fn handle_admin_request(
                     serde_json::to_value(proxy_state.stream_listener_manager.overload_snapshot())
                         .unwrap_or_default(),
                 );
+                if let Some(failures) = state.serving_listener_failures.as_ref() {
+                    obj.insert(
+                        "listener_failures".to_string(),
+                        serde_json::to_value(failures.snapshot()).unwrap_or_default(),
+                    );
+                }
             }
             if detailed {
                 return Ok(json_response(status, &snapshot_value));
@@ -2676,6 +2681,68 @@ fn hash_payload_consumers(consumers: &mut [Consumer], errors: &mut Vec<String>) 
     }
 }
 
+fn restore_payload_from_config(config: GatewayConfig) -> RestorePayload {
+    RestorePayload {
+        version: config.version,
+        proxies: config.proxies,
+        consumers: config.consumers,
+        plugin_configs: config.plugin_configs,
+        upstreams: config.upstreams,
+    }
+}
+
+/// Snapshot of a namespace captured before a destructive restore so a failed
+/// import — or a failed clear — can be compensated back to the prior state on
+/// every database backend.
+struct RestoreSnapshot {
+    /// Prior config resources (proxies/consumers/plugin_configs/upstreams).
+    payload: RestorePayload,
+    /// Authoritative count of `api_specs` in the namespace at snapshot time.
+    api_specs_total: usize,
+}
+
+impl RestoreSnapshot {
+    fn resource_counts(&self) -> NamespaceResourceCounts {
+        NamespaceResourceCounts {
+            proxies: u64::try_from(self.payload.proxies.len()).unwrap_or(u64::MAX),
+            consumers: u64::try_from(self.payload.consumers.len()).unwrap_or(u64::MAX),
+            plugin_configs: u64::try_from(self.payload.plugin_configs.len()).unwrap_or(u64::MAX),
+            upstreams: u64::try_from(self.payload.upstreams.len()).unwrap_or(u64::MAX),
+            api_specs: u64::try_from(self.api_specs_total).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+/// Capture an authoritative snapshot of `namespace` for restore rollback.
+///
+/// It does not fail semantic validation of an invalid-but-present config, but
+/// it does fail closed for either database unavailability or row/document
+/// integrity errors that prevent an exact rollback snapshot.
+///
+/// Both the config resources and the `api_specs` count are read from the
+/// PRIMARY (never a lagging read replica) so the recovery report is authoritative.
+async fn snapshot_namespace_for_rollback(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+) -> Result<RestoreSnapshot, anyhow::Error> {
+    // Non-validating raw load from the primary. Invalid-but-present config still
+    // snapshots; a real DB error propagates so the caller aborts.
+    let config = db.load_namespace_snapshot(namespace).await?;
+    let payload = restore_payload_from_config(config);
+
+    // `api_specs` are not part of `GatewayConfig`. Capture only their
+    // authoritative count from the PRIMARY: recovery requires the original
+    // documents to be re-submitted, and enumerating identities with OFFSET
+    // pagination adds no recovery value while introducing ordering hazards.
+    let api_specs_total =
+        usize::try_from(db.count_api_specs(namespace).await?).unwrap_or(usize::MAX);
+
+    Ok(RestoreSnapshot {
+        payload,
+        api_specs_total,
+    })
+}
+
 #[derive(Default)]
 struct PersistCounts {
     proxies: usize,
@@ -2896,6 +2963,171 @@ async fn persist_payload_resources(
     }
 
     (counts, errors)
+}
+
+async fn rollback_failed_restore(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    snapshot: &RestorePayload,
+) -> Result<(), Vec<String>> {
+    if let Err(error) = db.delete_all_resources(namespace).await {
+        return Err(vec![format!(
+            "failed to clear partially imported config: {}",
+            error
+        )]);
+    }
+
+    let (_, errors) = persist_payload_resources(db, snapshot, false).await;
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Finalize a failed restore. Attempts a best-effort rollback to the pre-restore
+/// snapshot, records the audit event, and builds the operator-facing `500`
+/// response. Shared by the delete-failure and import-failure paths so both roll
+/// back identically. The caller always holds a snapshot here — restore aborts
+/// with `503` before touching durable state when one cannot be captured — so
+/// there is no "rollback unavailable" branch.
+async fn finish_failed_restore(
+    state: &AdminState,
+    db: Arc<dyn DatabaseBackend>,
+    actor: &AuditActor,
+    namespace: &str,
+    restore_errors: Vec<String>,
+    snapshot: &RestoreSnapshot,
+) -> Response<Full<Bytes>> {
+    let (rollback_status, rollback_errors) =
+        match rollback_failed_restore(db.as_ref(), namespace, &snapshot.payload).await {
+            Ok(()) => ("completed", None),
+            Err(errors) => {
+                error!(
+                    "Restore: rollback failed for namespace '{}': {}",
+                    namespace,
+                    errors.join("; ")
+                );
+                ("incomplete", Some(errors))
+            }
+        };
+
+    let event = audit::AuditEvent::new(
+        actor,
+        "restore",
+        "gateway_config",
+        namespace,
+        namespace,
+        audit::update_diff(
+            json!({"replaced_namespace": namespace}),
+            json!({"rollback": rollback_status}),
+        ),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+        log_audit_enqueue_failure(&error);
+    }
+
+    let error_message = match rollback_status {
+        "completed" => "Restore failed; restore rolled back and prior config retained",
+        // "incomplete"
+        _ => "Restore failed and rollback of prior config was incomplete; manual recovery required",
+    };
+
+    let mut response = json!({
+        "error": error_message,
+        "restore_errors": restore_errors,
+        "rollback": rollback_status,
+    });
+    if let Some(rollback_errors) = rollback_errors {
+        response["rollback_errors"] = json!(rollback_errors);
+    }
+
+    // A config rollback restores proxies/consumers/plugin_configs/upstreams but
+    // NOT `api_specs` (admin-only metadata outside `GatewayConfig`). When the
+    // prior namespace carried specs, give the operator a genuinely usable
+    // recovery path: report the authoritative number removed and direct the
+    // operator to list the currently stored specs and re-submit the originals.
+    if snapshot.api_specs_total > 0 {
+        // Preserve the authoritative affected count.
+        let total = snapshot.api_specs_total;
+        warn!(
+            namespace = %namespace,
+            api_spec_count = total,
+            "Restore: rollback restored config resources but NOT api_specs; operator must re-submit affected API specs"
+        );
+        response["api_specs_not_restored"] = json!(total);
+        let note = format!(
+            "{total} API spec(s) were removed and are not part of config restore or rollback. Re-submit the original documents via POST /api-specs; list specs currently stored in the namespace with GET /api-specs."
+        );
+        response["api_specs_note"] = json!(note);
+    }
+
+    json_response(StatusCode::INTERNAL_SERVER_ERROR, &response)
+}
+
+/// Finalize a restore whose atomic clear definitively aborted.
+async fn finish_atomic_delete_failure(
+    state: &AdminState,
+    db: Arc<dyn DatabaseBackend>,
+    actor: &AuditActor,
+    namespace: &str,
+    delete_error: String,
+) -> Response<Full<Bytes>> {
+    let event = audit::AuditEvent::new(
+        actor,
+        "restore",
+        "gateway_config",
+        namespace,
+        namespace,
+        audit::update_diff(
+            json!({"replaced_namespace": namespace}),
+            json!({"rollback": "not_needed"}),
+        ),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+        log_audit_enqueue_failure(&error);
+    }
+
+    json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &json!({
+            "error": "Restore failed while clearing existing config; the clear is atomic, so the prior config was retained",
+            "restore_errors": [format!("failed to clear existing config: {}", delete_error)],
+            "rollback": "not_needed",
+        }),
+    )
+}
+
+async fn finish_unknown_atomic_delete_failure(
+    state: &AdminState,
+    db: Arc<dyn DatabaseBackend>,
+    actor: &AuditActor,
+    namespace: &str,
+    delete_error: String,
+) -> Response<Full<Bytes>> {
+    let event = audit::AuditEvent::new(
+        actor,
+        "restore",
+        "gateway_config",
+        namespace,
+        namespace,
+        audit::update_diff(
+            json!({"replaced_namespace": namespace}),
+            json!({"rollback": "unknown_outcome"}),
+        ),
+    );
+    if let Err(error) = audit::record(state.admin_audit_enabled, db, event) {
+        log_audit_enqueue_failure(&error);
+    }
+
+    json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &json!({
+            "error": "Restore failed while clearing existing config; the atomic clear outcome could not be verified. Manual recovery is required.",
+            "restore_errors": [format!("failed to clear existing config: {}", delete_error)],
+            "rollback": "unknown_outcome",
+        }),
+    )
 }
 
 /// Allowed credential types for consumer authentication plugins.
@@ -4283,13 +4515,138 @@ async fn handle_restore(
         }
     }
 
-    // Phase 3: Delete all existing resources in the namespace (safe: payload is validated)
-    if let Err(e) = db.delete_all_resources(namespace).await {
-        error!("Restore: failed to delete existing resources: {}", e);
+    // Complete all fallible payload preparation before changing durable state.
+    let mut payload = payload;
+    let mut preparation_errors = Vec::new();
+    normalize_restore_payload_timestamps(&mut payload, Utc::now());
+    apply_payload_namespace(&mut payload, namespace);
+    hash_payload_consumers(&mut payload.consumers, &mut preparation_errors);
+    if !preparation_errors.is_empty() {
         return Ok(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({"error": format!("Failed to clear existing config: {}", e)}),
+            &json!({
+                "error": "Restore preparation failed; existing config was not changed and prior config retained",
+                "restore_errors": preparation_errors,
+            }),
         ));
+    }
+
+    // Snapshot the namespace before deletion so a failure in any independently
+    // committed import chunk (or a partial clear) can be compensated on every
+    // database backend. The snapshot loads RAW rows from the primary without the
+    // fatal validation pipeline, so an invalid-but-present config (exactly what
+    // restore is used to repair) still snapshots and keeps rollback available.
+    //
+    // Fail-safe: abort before delete if either the primary is unavailable or a
+    // corrupt row/document prevents an exact rollback snapshot.
+    let snapshot = match snapshot_namespace_for_rollback(db.as_ref(), namespace).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let data_integrity = error
+                .downcast_ref::<SnapshotDataIntegrityError>()
+                .map(ToString::to_string);
+            error!(
+                namespace = %namespace,
+                error = %error,
+                "Restore: aborting — prior config could not be snapshotted for rollback; existing config NOT deleted"
+            );
+            if let Some(integrity_error) = data_integrity {
+                return Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({
+                        "error": "Restore aborted: the prior configuration contains a data-integrity error and could not be snapshotted for rollback. Existing config was NOT deleted; repair the identified stored resource before retrying.",
+                        "restore_errors": [integrity_error],
+                        "failure_class": "data_integrity",
+                    }),
+                ));
+            }
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": "Restore aborted: the prior configuration could not be snapshotted for rollback (database unavailable). Existing config was NOT deleted; retry once the database is reachable.",
+                    "restore_errors": [format!("failed to snapshot prior config for rollback: {}", error)],
+                    "failure_class": "connectivity",
+                }),
+            ));
+        }
+    };
+
+    // Phase 3: Delete all existing resources in the namespace (safe: payload is
+    // validated and the prior state has been snapshotted from the primary above).
+    if let Err(e) = db.delete_all_resources(namespace).await {
+        error!("Restore: failed to delete existing resources: {}", e);
+        if e.mode().is_atomic() {
+            if e.has_unknown_commit_result() {
+                let verification = db.count_namespace_resources(namespace).await;
+                if let Err(error) = &verification {
+                    error!(
+                        namespace = %namespace,
+                        error = %error,
+                        "Restore: failed to verify ambiguous atomic clear outcome"
+                    );
+                }
+                return Ok(
+                    match classify_atomic_clear_verification(
+                        snapshot.resource_counts(),
+                        verification,
+                    ) {
+                        AtomicClearVerification::ClearCommitted => {
+                            finish_failed_restore(
+                                state,
+                                db.clone(),
+                                actor,
+                                namespace,
+                                vec![format!("failed to clear existing config: {}", e)],
+                                &snapshot,
+                            )
+                            .await
+                        }
+                        AtomicClearVerification::PriorConfigIntact => {
+                            finish_atomic_delete_failure(
+                                state,
+                                db.clone(),
+                                actor,
+                                namespace,
+                                e.to_string(),
+                            )
+                            .await
+                        }
+                        AtomicClearVerification::UnknownOutcome => {
+                            finish_unknown_atomic_delete_failure(
+                                state,
+                                db.clone(),
+                                actor,
+                                namespace,
+                                e.to_string(),
+                            )
+                            .await
+                        }
+                    },
+                );
+            }
+            // A definitive atomic abort retains the prior config, including
+            // api_specs. Preserve the short-circuit and do not re-clear it.
+            return Ok(finish_atomic_delete_failure(
+                state,
+                db.clone(),
+                actor,
+                namespace,
+                e.to_string(),
+            )
+            .await);
+        }
+        // Non-atomic clear (standalone Mongo deletes collections one-by-one) can
+        // leave the namespace in a mixed state, so attempt the same best-effort
+        // rollback the import-failure path uses.
+        return Ok(finish_failed_restore(
+            state,
+            db.clone(),
+            actor,
+            namespace,
+            vec![format!("failed to clear existing config: {}", e)],
+            &snapshot,
+        )
+        .await);
     }
 
     info!("Restore: cleared existing config, beginning import");
@@ -4297,21 +4654,14 @@ async fn handle_restore(
     // Phase 3: Import resources in dependency order.
     // Each batch_create_* method internally chunks into 1,000-record
     // transactions to keep WAL/redo size bounded.
-    let mut payload = payload;
-    let mut errors = Vec::new();
-    normalize_restore_payload_timestamps(&mut payload, Utc::now());
-    apply_payload_namespace(&mut payload, namespace);
-    hash_payload_consumers(&mut payload.consumers, &mut errors);
-    let (created, mut persist_errors) =
-        persist_payload_resources(db.as_ref(), &payload, false).await;
-    errors.append(&mut persist_errors);
+    let (created, errors) = persist_payload_resources(db.as_ref(), &payload, false).await;
 
     info!(
         "Restore: imported {} proxies, {} consumers, {} plugin_configs, {} upstreams",
         created.proxies, created.consumers, created.plugin_configs, created.upstreams
     );
 
-    let mut response = json!({
+    let response = json!({
         "restored": {
             "proxies": created.proxies,
             "consumers": created.consumers,
@@ -4321,25 +4671,14 @@ async fn handle_restore(
     });
 
     if !errors.is_empty() {
-        response["errors"] = json!(errors);
-        // Restore always wipes the namespace before re-inserting (Phase 3 above),
-        // so even a zero-success-count restore must produce an audit row — the
-        // namespace state has already changed regardless of which inserts failed.
-        let event = audit::AuditEvent::new(
-            actor,
-            "restore",
-            "gateway_config",
+        error!(
+            "Restore: import failed; rolling back namespace '{}': {}",
             namespace,
-            namespace,
-            audit::update_diff(
-                json!({"replaced_namespace": namespace}),
-                response["restored"].clone(),
-            ),
+            errors.join("; ")
         );
-        if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-            log_audit_enqueue_failure(&error);
-        }
-        return Ok(json_response(StatusCode::MULTI_STATUS, &response));
+        return Ok(
+            finish_failed_restore(state, db.clone(), actor, namespace, errors, &snapshot).await,
+        );
     }
 
     let event = audit::AuditEvent::new(

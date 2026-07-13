@@ -24,7 +24,9 @@
 //! Field-by-field assertions live in the inline unit tests; this file
 //! sticks to integration-level invariants.
 
-use ferrum_edge::config_sources::k8s::{K8sMetadata, K8sObject, K8sTranslationOptions};
+use ferrum_edge::config_sources::k8s::{
+    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+};
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::k8s_controller::istio_status::{IstioStatusUpdate, plan_istio_status_updates};
 use serde_json::{Value, json};
@@ -492,6 +494,138 @@ fn peer_authentication_port_level_overrides_visible_in_detail() {
         .unwrap();
     assert_eq!(overrides.len(), 1);
     assert!(overrides[0].as_str().unwrap().contains("PERMISSIVE"));
+}
+
+/// Regression for #2119: a PeerAuthentication carrying `portLevelMtls` is still
+/// accepted (`FerrumAccepted=True`, top-level mode applied), but the per-app-port
+/// intent that the runtime CANNOT enforce per app port must be surfaced as a
+/// `status.ferrum.translation.deferred_fields` entry (and in the condition
+/// message) so `FerrumAccepted=True` no longer implies per-port enforcement.
+#[test]
+fn peer_authentication_port_level_mtls_surfaces_as_deferred() {
+    let obj = object(
+        "security.istio.io/v1",
+        "PeerAuthentication",
+        "mixed-mode",
+        json!({
+            "mtls": { "mode": "STRICT" },
+            "portLevelMtls": {
+                "8080": { "mode": "PERMISSIVE" }
+            }
+        }),
+    );
+    let updates = plan_istio_status_updates(&[obj], options());
+    let update = &updates[0];
+
+    // Still accepted — this is honest-surface, not a rejection.
+    let condition = find_condition(
+        update.status["conditions"].as_array().unwrap(),
+        "FerrumAccepted",
+    );
+    assert_eq!(condition["status"].as_str(), Some("True"));
+    assert_eq!(condition["reason"].as_str(), Some("Accepted"));
+    assert!(
+        condition["message"]
+            .as_str()
+            .unwrap()
+            .contains("deferred fields"),
+        "accepted message should mention deferred fields, got {:?}",
+        condition["message"]
+    );
+
+    let detail = update.ferrum_detail.as_ref().unwrap();
+    let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+        .as_array()
+        .expect("deferred_fields array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        deferred.iter().any(|f| f.contains("portLevelMtls")),
+        "deferred_fields should surface portLevelMtls, got {deferred:?}"
+    );
+}
+
+/// A PeerAuthentication with NO `portLevelMtls` must NOT gain a spurious
+/// deferred-field entry — the honest-surface warning is only for the
+/// unenforceable per-app-port case.
+#[test]
+fn peer_authentication_without_port_level_mtls_has_no_deferred_fields() {
+    let obj = object(
+        "security.istio.io/v1",
+        "PeerAuthentication",
+        "plain-strict",
+        json!({ "mtls": { "mode": "STRICT" } }),
+    );
+    let updates = plan_istio_status_updates(&[obj], options());
+    let detail = updates[0].ferrum_detail.as_ref().unwrap();
+    let deferred = detail["translation"]["deferred_fields"]
+        .as_array()
+        .expect("deferred_fields array");
+    assert!(
+        deferred.is_empty(),
+        "no deferred fields expected without portLevelMtls, got {deferred:?}"
+    );
+}
+
+/// The K8s translator emits a structured warning (surfaced by the reconciler as
+/// a `warn!`) when a PeerAuthentication carries `portLevelMtls`, so operators see
+/// the unenforced per-app-port intent in gateway logs, not just CRD status.
+#[test]
+fn peer_authentication_port_level_mtls_emits_translator_warning() {
+    let obj = object(
+        "security.istio.io/v1",
+        "PeerAuthentication",
+        "mixed-mode",
+        json!({
+            "mtls": { "mode": "STRICT" },
+            "portLevelMtls": {
+                "8080": { "mode": "PERMISSIVE" },
+                "9090": { "mode": "DISABLE" }
+            }
+        }),
+    );
+    let translation = translate_k8s_objects(&[obj], options()).expect("translation should succeed");
+    assert!(
+        translation
+            .warnings
+            .iter()
+            .any(|w| { w.contains("portLevelMtls") && w.contains("NOT enforced per app port") }),
+        "expected a portLevelMtls non-enforcement warning, got {:?}",
+        translation.warnings
+    );
+}
+
+#[test]
+fn peer_authentication_transport_port_collision_warning_is_listener_wide() {
+    let obj = object(
+        "security.istio.io/v1",
+        "PeerAuthentication",
+        "transport-collision",
+        json!({
+            "mtls": { "mode": "STRICT" },
+            "portLevelMtls": { "15006": { "mode": "PERMISSIVE" } }
+        }),
+    );
+    let translation = translate_k8s_objects(std::slice::from_ref(&obj), options())
+        .expect("translation should succeed");
+    let warning = translation
+        .warnings
+        .iter()
+        .find(|warning| warning.contains("portLevelMtls"))
+        .expect("portLevelMtls warning");
+    assert!(warning.contains("override key equals that topology's transport port"));
+    assert!(warning.contains("override's mode governs the whole listener"));
+    assert!(warning.contains("NOT enforced per app port"));
+
+    let updates = plan_istio_status_updates(&[obj], options());
+    let deferred = updates[0].ferrum_detail.as_ref().unwrap()["translation"]["deferred_fields"]
+        .as_array()
+        .expect("deferred_fields array");
+    let deferred_text = deferred[0].as_str().expect("deferred field text");
+    assert!(deferred_text.contains("top-level mtls.mode governs the whole listener unless"));
+    assert!(deferred_text.contains("override key equals the transport port"));
+    assert!(deferred_text.contains("that override governs the whole listener"));
 }
 
 #[test]

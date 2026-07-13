@@ -158,7 +158,12 @@ paths:
         complete it returns `200 OK` with `status` set to `"ok"` or
         `"degraded"` (DB disconnected / admin writes blocked / database
         incremental polling repeatedly rejecting the same delta while serving
-        last known-good config).
+        last known-good config). In CP/DP/mesh modes, if a supervised serving
+        listener later exits with an error, `/health` returns `503` with
+        `status: "unavailable"`, `ready: false` durably (sticky across a later
+        readiness restore). Mesh traffic and admin listener failures use the
+        same sticky state; authenticated responses include a sanitized
+        `listener_failures` snapshot.
       tags: [Health]
       security: []
       responses:
@@ -169,7 +174,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
         "503":
-          description: Gateway is still starting (status `starting`, `ready=false`)
+          description: Gateway not ready (status `starting` during startup, or `unavailable` after a supervised serving-listener failure); `ready=false`
           content:
             application/json:
               schema:
@@ -189,7 +194,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
         "503":
-          description: Gateway is still starting (status `starting`, `ready=false`)
+          description: Gateway not ready (status `starting` or `unavailable`, `ready=false`)
           content:
             application/json:
               schema:
@@ -3202,9 +3207,22 @@ paths:
       operationId: restoreConfig
       summary: Replace all configuration from a backup
       description: |
-        **Destructive operation** — deletes ALL existing resources and imports
-        the provided configuration. Requires `?confirm=true` query parameter
-        to prevent accidental invocation.
+        **Replacement operation** — snapshots the current namespace, deletes
+        all existing resources, and imports the provided configuration. If any
+        import (or the delete) step fails, Ferrum clears the partial state and
+        reapplies the snapshot. Requires `?confirm=true` query parameter to
+        prevent accidental invocation.
+
+        The recovery snapshot uses a **non-validating raw load** from the
+        primary, so an already-invalid-but-present namespace (the case an
+        operator runs restore to *repair*) still snapshots and keeps rollback
+        available. If the snapshot cannot be taken, restore aborts before any
+        delete: connectivity failures return `503`, while corrupt/undecodable
+        stored resources return `500` with `failure_class: data_integrity` and
+        a safe resource type/id when available. `api_specs` are admin-only metadata outside the config and
+        are NOT restored by rollback; a failed restore reports the authoritative
+        total number that must be re-submitted via `POST /api-specs` (list the
+        namespace's current specs with `GET /api-specs`).
 
         Accepts the same JSON format produced by `GET /backup`. Resources are
         imported in dependency order (consumers & upstreams first, then proxies,
@@ -3248,19 +3266,65 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/RestoreResponse"
-        "207":
-          description: Partial success — some resource types failed during import
+        "500":
+          description: >-
+            Restore failed (import, delete, or preparation). The prior
+            configuration was reapplied, or the response warns that the
+            best-effort rollback was incomplete. Also returned when a stored
+            row/document cannot be decoded for the pre-delete rollback snapshot;
+            that fail-safe response has `failure_class: data_integrity` and no
+            delete is attempted.
           content:
             application/json:
               schema:
-                allOf:
-                  - $ref: "#/components/schemas/RestoreResponse"
-                  - type: object
-                    properties:
-                      errors:
-                        type: array
-                        items:
-                          type: string
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                  restore_errors:
+                    type: array
+                    items:
+                      type: string
+                    description: Persistence or preparation errors that caused the restore to fail
+                  rollback:
+                    type: string
+                    enum: [completed, incomplete, not_needed, unknown_outcome]
+                    description: >-
+                      Outcome of the best-effort rollback. `completed` — prior
+                      config reapplied; `incomplete` — reapply failed (see
+                      `rollback_errors`); `not_needed` — the clear failed
+                      atomically (SQL / replica-set MongoDB), so nothing was
+                      deleted and the prior config was retained without any
+                      compensating re-import; `unknown_outcome` — an ambiguous
+                      MongoDB commit result could not be resolved by authoritative
+                      post-state counts, so manual recovery is required.
+                  failure_class:
+                    type: string
+                    enum: [data_integrity]
+                    description: >-
+                      Present on a pre-delete snapshot abort caused by a corrupt
+                      or otherwise undecodable stored resource. The existing
+                      configuration was not deleted. `restore_errors` identifies
+                      the resource type/id when safely available.
+                  rollback_errors:
+                    type: array
+                    items:
+                      type: string
+                    description: Present only when reapplying the prior configuration was incomplete
+                  api_specs_not_restored:
+                    type: integer
+                    description: >-
+                      Authoritative count of API specs present before the restore
+                      that a config rollback cannot restore. Present only when the
+                      namespace carried specs.
+                  api_specs_note:
+                    type: string
+                    description: >-
+                      Operator guidance to recover the affected API specs
+                      (re-submit original documents via POST /api-specs and list
+                      current specs with GET /api-specs). Present only when
+                      `api_specs_not_restored` is set.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -3270,7 +3334,28 @@ paths:
         "413":
           description: Request body too large (default max 100 MiB, configurable via FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB)
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          description: >-
+            Restore aborted because the prior configuration could not be
+            snapshotted for rollback (database/connectivity failure). Existing
+            config was NOT deleted; retry once the database is reachable. Also
+            returned when the admin API is otherwise unavailable.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                  failure_class:
+                    type: string
+                    enum: [connectivity]
+                    description: Distinguishes a retryable snapshot availability failure from stored-data corruption.
+                  restore_errors:
+                    type: array
+                    items:
+                      type: string
+                    description: The snapshot/connectivity error that caused the abort
 
   # ── Proxies ─────────────────────────────────────────────────────────
   /proxies:
@@ -8161,14 +8246,15 @@ components:
       description: |
         Tiered: unauthenticated callers receive only `status` and `ready`. The
         remaining detailed fields (`timestamp`, `mode`, `database`,
-        `admin_writes_enabled`, `cached_config`, `database_polling`, `mesh`) are
+        `admin_writes_enabled`, `cached_config`, `database_polling`, `mesh`,
+        `listener_failures`) are
         present only when the caller is authenticated (admin JWT, metrics bearer
         token, or allowlisted CIDR).
       required: [status, ready]
       properties:
         status:
           type: [string, "null"]
-          enum: [ok, degraded, starting]
+          enum: [ok, degraded, starting, unavailable]
           description: |
             Aggregate gateway health.
             `ok` — fully ready and healthy (200). Also returned for
@@ -8181,11 +8267,21 @@ components:
             `degraded`.
             `starting` — startup not yet complete (returned with 503 and
             `ready: false`).
+            `unavailable` — the gateway became ready but a serving listener
+            task later exited with an error (CP gRPC or admin HTTP/HTTPS
+            server, a DP proxy/admin listener, or a mesh traffic/admin
+            listener). This is a sticky, monotonic
+            degradation: it stays set across a later readiness restore
+            (returned with 503 and `ready: false`). CP, DP, and mesh modes
+            report it.
         ready:
           type: boolean
           description: |
-            `true` once the gateway has finished startup. While `false`, the
-            endpoint returns `503 Service Unavailable`.
+            `true` once the gateway has finished startup AND no supervised
+            serving listener has failed since. While `false`, the endpoint
+            returns `503 Service Unavailable`. In CP/DP/mesh modes a post-startup
+            serving-listener failure sets `ready: false` durably (sticky) even
+            though internal startup completed.
         admin_writes_enabled:
           type: boolean
           description: |
@@ -8272,6 +8368,36 @@ components:
               description: Present only when `available` is true
         database_polling:
           $ref: "#/components/schemas/DatabaseDeltaPollingHealth"
+        listener_failures:
+          $ref: "#/components/schemas/ServingListenerFailureSnapshot"
+
+    ServingListenerFailureSnapshot:
+      type: object
+      description: |
+        Sticky process-lifetime snapshot of supervised listeners that exited
+        after successful bind. Error text is intentionally sanitized.
+      required: [failures_total, failures]
+      properties:
+        failures_total:
+          type: integer
+          format: uint64
+        failures:
+          type: array
+          items:
+            type: object
+            required: [listener, listen_port, error, kind]
+            properties:
+              listener:
+                type: string
+              listen_port:
+                type: integer
+                format: uint16
+              error:
+                type: string
+                enum: [listener serve task exited after successful bind]
+              kind:
+                type: string
+                enum: [serve_failed]
 
     # ── Overload ──────────────────────────────────────────────────
     OverloadNoProxyState:
@@ -8390,6 +8516,85 @@ components:
             reject_new_requests:
               type: boolean
               description: Whether new requests/streams are being rejected with 503
+        stream_listeners:
+          type: object
+          description: |
+            Stream-listener (TCP/UDP/DTLS) diagnostics. Present only when the
+            gateway has a proxy state (absent in control-plane mode).
+          required: [dtls_demux_sessions_total, dtls_demux_sessions, bind_failures_total, bind_failures]
+          properties:
+            dtls_demux_sessions_total:
+              type: integer
+              format: uint64
+              description: Total pre-handshake DTLS demux sessions across all UDP+DTLS listeners (eventually consistent).
+            dtls_demux_sessions:
+              type: array
+              description: Per-listener pre-handshake DTLS demux session counts.
+              items:
+                type: object
+                required: [listener_key, listen_port, sessions]
+                properties:
+                  listener_key:
+                    type: string
+                  listen_port:
+                    type: integer
+                    format: uint16
+                  sessions:
+                    type: integer
+                    format: uint64
+            bind_failures_total:
+              type: integer
+              description: |
+                Number of configured stream-listener resources that are NOT
+                serving after the most recent config reconcile or a subsequent
+                asynchronous listener-task failure — hard bind failures PLUS
+                listeners deferred/degraded for a config reason (e.g. a
+                `frontend_tls` listener still waiting for TLS material).
+                In DP mode these binds are intentionally non-fatal (a bad
+                CP-pushed config must not brick the data plane), so this count
+                surfaces the non-serving listeners beyond the warn log. `0` once
+                every configured stream listener is serving. Each entry's `kind`
+                distinguishes a hard failure from a deferral.
+            bind_failures:
+              type: array
+              description: |
+                Structured per-resource stream-listener non-serving reasons from
+                the most recent reconcile plus subsequent asynchronous listener-task
+                failures, classified by `kind`. Shared SNI listener failures emit one
+                entry per affected proxy ID. Empty once every configured stream
+                listener is serving.
+              items:
+                type: object
+                required: [proxy_id, listen_port, error, kind]
+                properties:
+                  proxy_id:
+                    type: string
+                    description: ID of the proxy whose stream listener is not serving.
+                  listen_port:
+                    type: integer
+                    format: uint16
+                    description: The listen port that could not be bound or is deferred.
+                  error:
+                    type: string
+                    description: 'Human-readable reason (e.g. "port already in use", "Deferred: frontend_tls TCP listener requires a rustls ServerConfig").'
+                  kind:
+                    type: string
+                    enum:
+                      - bind_failed
+                      - backend_tls_invalid
+                      - backend_tls_rotation_invalid
+                      - frontend_tls_deferred
+                      - frontend_dtls_deferred
+                      - frontend_dtls_build_failed
+                    description: |
+                      Classification of why the listener is not serving.
+                      `bind_failed`, `backend_tls_invalid`, and
+                      `backend_tls_rotation_invalid` are hard failures (the
+                      startup path treats these as fatal in file/database mode);
+                      the `frontend_*` variants are non-fatal deferrals/degradations
+                      that clear once TLS material is loaded or corrected.
+        listener_failures:
+          $ref: "#/components/schemas/ServingListenerFailureSnapshot"
 
     # ── Runtime metrics ─────────────────────────────────────────────
     RuntimeMetricsSnapshot:
@@ -9172,12 +9377,6 @@ components:
             upstreams:
               type: integer
               description: Number of upstreams restored
-        errors:
-          type: array
-          items:
-            type: string
-          description: Present only on 207 Multi-Status; lists per-type error messages
-
     # ── Shared: Transaction-Log Schema Customization ──────────────────
     # Shape of the `schema:` block (and the entries inside
     # `transaction_log_schema.schemas`). See docs/log_schema.md for the
