@@ -33,9 +33,6 @@ Non-negotiables:
 
 ## Effort selection
 
-Tiers bumped up 2026-07-13 after the models were nerfed — everything shifts one
-level higher than the old medium/high split.
-
 - **high** — default. Handles scoped fixes, review rounds, test work, and doc
   reconciliation (clean codex rounds, correct root-causing) at reasonable
   latency/cost.
