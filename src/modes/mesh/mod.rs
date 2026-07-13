@@ -9831,19 +9831,23 @@ async fn serve_mesh_runtime(
             .and_then(|snapshot| snapshot.client_ca_bundle.as_ref()),
         mesh_inbound_spiffe_slot.as_ref(),
     )?;
-    let frontend_tls_by_port = load_mesh_frontend_tls_by_port(
-        &env_config,
-        &tls_policy,
-        &crls,
-        &inbound_mtls_modes_by_port,
-        runtime.topology,
-        mesh_frontend_identity.as_deref(),
-        initial_inbound_tls_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.client_ca_bundle.as_ref()),
-        mesh_inbound_spiffe_slot.as_ref(),
-    )?;
     let has_inbound_tls_termination_listener = runtime.has_inbound_tls_termination_listener();
+    let frontend_tls_by_port = if has_inbound_tls_termination_listener {
+        load_mesh_frontend_tls_by_port(
+            &env_config,
+            &tls_policy,
+            &crls,
+            &inbound_mtls_modes_by_port,
+            runtime.topology,
+            mesh_frontend_identity.as_deref(),
+            initial_inbound_tls_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.client_ca_bundle.as_ref()),
+            mesh_inbound_spiffe_slot.as_ref(),
+        )?
+    } else {
+        HashMap::new()
+    };
     // Runtime fail-closed enforcement (issue #1523): #1522's config-time gate
     // only checks that identity material is *named*. Here the inbound listener's
     // actual resolved posture is known, so a production mesh refuses to come up
@@ -9874,7 +9878,13 @@ async fn serve_mesh_runtime(
     }
     if has_inbound_tls_termination_listener {
         crate::plugins::mesh::prometheus_helpers::set_mesh_inbound_plaintext_allowed(
-            frontend_tls.is_none() || frontend_tls_by_port.values().any(Option::is_none),
+            mesh_inbound_mode_accepts_plaintext(inbound_mtls_mode)
+                || inbound_mtls_modes_by_port
+                    .values()
+                    .copied()
+                    .any(mesh_inbound_mode_accepts_plaintext)
+                || frontend_tls.is_none()
+                || frontend_tls_by_port.values().any(Option::is_none),
         );
     }
     let any_inbound_tls_configured =
@@ -11879,7 +11889,7 @@ fn load_mesh_frontend_tls_by_port(
 /// `production` — never routing it through this decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MeshInboundFailClosed {
-    /// Listener is mTLS-capable (or there is nothing to enforce); proceed.
+    /// Listener enforces mTLS (or there is nothing to enforce); proceed.
     Ok,
     /// Insecure posture tolerated in dev/test; proceed after a loud warning.
     AllowWithWarning,
@@ -11895,6 +11905,13 @@ fn decide_mesh_inbound_fail_closed(trigger: bool, production: bool) -> MeshInbou
     } else {
         MeshInboundFailClosed::AllowWithWarning
     }
+}
+
+fn mesh_inbound_mode_accepts_plaintext(mode: config::MtlsMode) -> bool {
+    matches!(
+        mode,
+        config::MtlsMode::Permissive | config::MtlsMode::Disable
+    )
 }
 
 /// Fail closed when the *resolved* mesh inbound listener would not actually
@@ -11917,11 +11934,11 @@ fn decide_mesh_inbound_fail_closed(trigger: bool, production: bool) -> MeshInbou
 ///    [`load_mesh_frontend_server_identity`] already hard-errors a broken SVID
 ///    cert/key. (`ProxyState` construction's `load_gateway_svid_bundle` rejects
 ///    the same broken material independently; this is the inbound-local guard.)
-///  - **would-serve-plaintext**: a termination listener exists but the resolved
-///    inbound `ServerConfig` is `None` (PeerAuthentication DISABLE, or no usable
-///    server identity), so the listener would accept unauthenticated plaintext.
-///    Refused under `production`; in dev allowed with a loud warning (intentional
-///    — see [`decide_mesh_inbound_fail_closed`]).
+///  - **would-serve-plaintext**: a termination listener exists and either its
+///    effective PeerAuthentication mode admits plaintext (`PERMISSIVE` or
+///    `DISABLE`) or its resolved `ServerConfig` is `None` (no usable server
+///    identity). Refused under `production`; in dev allowed with a loud warning
+///    (intentional — see [`decide_mesh_inbound_fail_closed`]).
 ///
 /// Topologies without a TLS-terminating inbound listener (EastWestGateway does
 /// SNI passthrough — encrypted bytes are forwarded, never terminated) have no
@@ -11962,17 +11979,24 @@ fn enforce_mesh_inbound_fail_closed(
         ));
     }
 
-    // Otherwise the only remaining escape is a listener that would serve
-    // plaintext (PeerAuthentication DISABLE, or no usable server identity).
+    // Otherwise the only remaining escape is a listener that would admit
+    // plaintext (PeerAuthentication PERMISSIVE/DISABLE, or no usable server
+    // identity).
     let reason: &str = if mtls_mode == config::MtlsMode::Disable {
         "PeerAuthentication resolved to DISABLE, so the inbound mTLS/HBONE termination \
          listener would accept unauthenticated plaintext"
+    } else if mtls_mode == config::MtlsMode::Permissive {
+        "PeerAuthentication resolved to PERMISSIVE, so the inbound mTLS/HBONE termination \
+         listener would accept unauthenticated plaintext alongside TLS"
     } else {
         "the inbound mTLS/HBONE termination listener resolved to no usable TLS server identity \
          (set FERRUM_GATEWAY_SVID_CERT_PATH / KEY_PATH / TRUST_BUNDLE_PATH, or \
          FERRUM_FRONTEND_TLS_CERT_PATH / KEY_PATH), so it would accept unauthenticated plaintext"
     };
-    match decide_mesh_inbound_fail_closed(frontend_tls.is_none(), production) {
+    match decide_mesh_inbound_fail_closed(
+        mesh_inbound_mode_accepts_plaintext(mtls_mode) || frontend_tls.is_none(),
+        production,
+    ) {
         MeshInboundFailClosed::Ok => {
             crate::plugins::mesh::prometheus_helpers::set_mesh_inbound_plaintext_allowed(false);
             Ok(())
@@ -12226,16 +12250,20 @@ fn plan_mesh_inbound_tls_reload_with_federation(
         spiffe_bundle_slot,
     ) {
         Ok(tls_config) => {
-            let tls_by_port = match load_mesh_frontend_tls_by_port(
-                &proxy_state.env_config,
-                tls_policy,
-                &proxy_state.crls,
-                &next_snapshot.port_modes,
-                runtime.topology,
-                server_identity,
-                next_snapshot.client_ca_bundle.as_ref(),
-                spiffe_bundle_slot,
-            ) {
+            let tls_by_port = match if has_termination_listener {
+                load_mesh_frontend_tls_by_port(
+                    &proxy_state.env_config,
+                    tls_policy,
+                    &proxy_state.crls,
+                    &next_snapshot.port_modes,
+                    runtime.topology,
+                    server_identity,
+                    next_snapshot.client_ca_bundle.as_ref(),
+                    spiffe_bundle_slot,
+                )
+            } else {
+                Ok(HashMap::new())
+            } {
                 Ok(configs) => configs,
                 Err(error) => {
                     warn!(
@@ -12248,20 +12276,27 @@ fn plan_mesh_inbound_tls_reload_with_federation(
             // Runtime fail-closed for PeerAuthentication LIVE RELOAD (issue
             // #1523): the startup gate (`enforce_mesh_inbound_fail_closed`) only
             // sees the initial slice. A later accepted update that resolves the
-            // inbound termination listener to plaintext — e.g. PeerAuthentication
-            // DISABLE makes `load_mesh_frontend_tls` return `None`, which
+            // inbound termination listener to a plaintext-capable posture —
+            // PERMISSIVE admits plaintext beside TLS, while DISABLE makes
+            // `load_mesh_frontend_tls` return `None`, which
             // `apply_mesh_inbound_tls_reload` would store, clearing the inbound +
             // shared-stream TLS slots — would silently downgrade a running
-            // production sidecar to plaintext. Reject the slice instead (return
-            // `None` → the apply task keeps the last-good mTLS config in its
-            // entirety; fail-closed by retention, never crashing a live data
-            // plane). Same posture as startup: refused under production; dev allows
-            // it with a warning (an explicit DISABLE is an intentional choice).
+            // production sidecar. Reject the slice instead (return `None` → the
+            // apply task keeps the last-good mTLS config in its entirety;
+            // fail-closed by retention, never crashing a live data plane). Same
+            // posture as startup: refused under production; dev allows it with a
+            // warning (an explicit plaintext-capable mode is intentional).
             // Topologies without a TLS-terminating inbound listener (EastWestGateway
             // SNI passthrough) are exempt (`has_termination_listener` is false).
-            if has_termination_listener
-                && (tls_config.is_none() || tls_by_port.values().any(Option::is_none))
-            {
+            let accepts_plaintext = mesh_inbound_mode_accepts_plaintext(mtls_mode)
+                || next_snapshot
+                    .port_modes
+                    .values()
+                    .copied()
+                    .any(mesh_inbound_mode_accepts_plaintext)
+                || tls_config.is_none()
+                || tls_by_port.values().any(Option::is_none);
+            if has_termination_listener && accepts_plaintext {
                 match decide_mesh_inbound_fail_closed(true, production) {
                     MeshInboundFailClosed::Refuse => {
                         warn!(
@@ -12269,8 +12304,8 @@ fn plan_mesh_inbound_tls_reload_with_federation(
                             ?mtls_mode,
                             topology = runtime.topology.as_str(),
                             "Rejecting mesh slice: this PeerAuthentication update resolves the \
-                             inbound mTLS/HBONE termination listener to plaintext (no TLS server \
-                             config), which a production mesh must not serve. Keeping the last-good \
+                             inbound mTLS/HBONE termination listener to a plaintext-capable \
+                             posture, which a production mesh must not serve. Keeping the last-good \
                              mTLS config in its entirety (no authz/policy/ServiceEntry/endpoint \
                              update from this slice is applied)."
                         );
@@ -12350,8 +12385,14 @@ async fn apply_mesh_inbound_tls_reload(
             tls_by_port,
             staged_spiffe,
         } => {
-            let plaintext_allowed =
-                tls_config.is_none() || tls_by_port.values().any(Option::is_none);
+            let plaintext_allowed = mesh_inbound_mode_accepts_plaintext(mtls_mode)
+                || snapshot
+                    .port_modes
+                    .values()
+                    .copied()
+                    .any(mesh_inbound_mode_accepts_plaintext)
+                || tls_config.is_none()
+                || tls_by_port.values().any(Option::is_none);
             let any_tls_configured =
                 tls_config.is_some() || tls_by_port.values().any(Option::is_some);
             // Publish the staged SPIFFE trust-bundle into the live slot first,
@@ -23326,8 +23367,10 @@ mod tests {
         let identity = load_mesh_frontend_server_identity(&env, &test_svid_slot_from_env(&env))
             .expect("server identity");
 
-        // Production rejects the plaintext (DISABLE) downgrade: plan() is None,
-        // which the apply task treats as "keep the last-good mTLS config".
+        // Production rejects both plaintext-only DISABLE and dual-wire
+        // PERMISSIVE, even when PERMISSIVE can build a usable ServerConfig.
+        // plan() is None, which the apply task treats as "keep the last-good
+        // mTLS config".
         let plan = plan_mesh_inbound_tls_reload(
             &proxy_state,
             &runtime,
@@ -23343,6 +23386,22 @@ mod tests {
         assert!(
             plan.is_none(),
             "production must reject a DISABLE (plaintext) inbound live reload"
+        );
+        let plan = plan_mesh_inbound_tls_reload(
+            &proxy_state,
+            &runtime,
+            &disable_slice,
+            config::MtlsMode::Permissive,
+            identity.as_deref(),
+            None,
+            None,
+            None,
+            true,
+            true,
+        );
+        assert!(
+            plan.is_none(),
+            "production must reject a PERMISSIVE dual-wire inbound live reload"
         );
 
         // Dev (non-production) tolerates the downgrade (warns + swaps to None) —
@@ -25243,6 +25302,24 @@ mod tests {
         assert!(
             msg.contains("FERRUM_MESH_PRODUCTION_MODE=true") && msg.contains("DISABLE"),
             "unexpected refusal message: {msg}"
+        );
+
+        // A usable TLS config does not make PERMISSIVE production-safe: the
+        // mesh accept path can still demux plaintext on captured app ports.
+        let permissive_tls =
+            crate::tls::temporary_disabled_listener_tls_config().expect("temporary TLS config");
+        let err = enforce_mesh_inbound_fail_closed(
+            &runtime,
+            &EnvConfig::default(),
+            config::MtlsMode::Permissive,
+            Some(&permissive_tls),
+            None,
+            true,
+        )
+        .expect_err("production must refuse PERMISSIVE even with server TLS material");
+        assert!(
+            err.to_string().contains("PERMISSIVE"),
+            "unexpected refusal message: {err}"
         );
 
         // Dev tolerates plaintext with a warning — here via the "no usable server

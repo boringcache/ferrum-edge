@@ -606,18 +606,6 @@ impl MeshSlice {
         )
     }
 
-    /// Resolve the workload-level PeerAuthentication mode without consulting
-    /// `portLevelMtls`. Listener-wide fallback policy must use this resolver:
-    /// mesh transport ports (15006/15008/15090) are not workload app ports.
-    pub fn resolve_workload_mtls_mode(&self) -> MtlsMode {
-        resolve_peer_auth_mtls_mode(
-            &self.peer_authentications,
-            &self.namespace,
-            &self.labels,
-            |pa| pa.mtls_mode,
-        )
-    }
-
     /// Resolve the effective inbound mTLS mode for `port`, FAILING CLOSED on an
     /// ambiguous shared-SPIFFE slice whose partial label intersection cannot
     /// confirm a candidate-only selector PeerAuthentication.
@@ -642,6 +630,9 @@ impl MeshSlice {
     /// resolved its authoritative labels) is enforcement-IDENTICAL to the plain
     /// resolver.
     pub fn resolve_inbound_mtls_mode_fail_closed(&self, port: u16) -> MtlsMode {
+        if !self.labels_ambiguous {
+            return self.resolve_effective_mtls_mode(port);
+        }
         self.resolve_inbound_mtls_mode_fail_closed_with(|pa| peer_auth_effective_mode(pa, port))
     }
 
