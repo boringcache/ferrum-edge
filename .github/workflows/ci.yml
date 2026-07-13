@@ -2099,6 +2099,20 @@ jobs:
             exit 1
           fi
           grep -F 'contains a /0 catch-all CIDR' "$RUNNER_TEMP/ferrum-gateway-helm-results/catch-all-admin-cidr.err"
+          # The runtime canonicalizes a mapped IPv6 /96 into IPv4 /0, which is
+          # equally unrestricted and cannot satisfy the plaintext guard.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-gateway-credentials \
+            --set admin.bindAddress=0.0.0.0 \
+            --set-string admin.allowedCidrs=::ffff:0.0.0.0/96 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/mapped-catch-all-admin-cidr.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/mapped-catch-all-admin-cidr.err"; then
+            echo "::error title=Mapped catch-all admin CIDR rendered successfully::a mapped /96 allowlist canonicalizes to IPv4 /0"
+            exit 1
+          fi
+          grep -F 'IPv4-mapped /96' "$RUNNER_TEMP/ferrum-gateway-helm-results/mapped-catch-all-admin-cidr.err"
           # The runtime allowlist filters loopback too, so computed exec probes
           # require an entry that contains their 127.0.0.1 source.
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
@@ -2329,6 +2343,17 @@ jobs:
             exit 1
           fi
           grep -F 'uses bracketed IPv6 syntax' "$RUNNER_TEMP/ferrum-gateway-helm-results/bracketed-ipv6-cidr.err"
+          # Every allowlist entry is parsed strictly at mode startup. A typo must
+          # fail Helm even when other entries still protect plaintext and probes.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set-string 'admin.allowedCidrs=10.0.0.0/8\,not-a-cidr\,127.0.0.1/32' \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/invalid-admin-cidr.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/invalid-admin-cidr.err"; then
+            echo "::error title=Invalid admin CIDR rendered::the runtime strict parser would reject the deployment at boot"
+            exit 1
+          fi
+          grep -F 'admin.allowedCidrs entry "not-a-cidr" is not a valid IP address or CIDR' "$RUNNER_TEMP/ferrum-gateway-helm-results/invalid-admin-cidr.err"
           # Both admin ports disabled leaves no admin listener for the probes: fail.
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=file --set ports.adminHttp=0 --set ports.adminHttps=0 \
@@ -2461,6 +2486,17 @@ jobs:
           grep -Fq -- '- name: https' "$RUNNER_TEMP/ferrum-gateway-helm-results/frontend-tls-rendered.yaml"
           grep -Fq 'defaultMode: 288' "$RUNNER_TEMP/ferrum-gateway-helm-results/frontend-tls-rendered.yaml"
           grep -Fq 'fsGroup: 65532' "$RUNNER_TEMP/ferrum-gateway-helm-results/frontend-tls-rendered.yaml"
+          # Frontend cert/key SOURCE envs are complete TLS inputs too (for example
+          # cert-manager k8s:// sources), so Service HTTPS/QUIC must stay reachable.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set-string 'env.FERRUM_FRONTEND_TLS_CERT_SOURCE=k8s://ferrum/frontend-tls#tls.crt' \
+            --set-string 'env.FERRUM_FRONTEND_TLS_KEY_SOURCE=k8s://ferrum/frontend-tls#tls.key' \
+            --set-string env.FERRUM_ENABLE_HTTP3=true \
+            --show-only templates/service.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/frontend-source-service.yaml"
+          grep -Fq -- '- name: https' "$RUNNER_TEMP/ferrum-gateway-helm-results/frontend-source-service.yaml"
+          grep -Fq -- '- name: https-quic' "$RUNNER_TEMP/ferrum-gateway-helm-results/frontend-source-service.yaml"
           # Key-presence checks preserve valid zero-valued PDB limits.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set podDisruptionBudget.enabled=true --set podDisruptionBudget.minAvailable=0 \
@@ -2521,6 +2557,18 @@ jobs:
             exit 1
           fi
           grep -F 'require a client certificate' "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-mtls-probes.err"
+          # The equivalent *_SOURCE env resolves into the admin client-CA path
+          # and must trigger the same computed-probe mTLS guard.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set ports.adminHttp=0 \
+            --set tls.admin.enabled=true --set tls.admin.secretName=ferrum-admin-tls \
+            --set-string env.FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_SOURCE=file:///etc/ferrum/admin-client-ca.pem \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-mtls-source-probes.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-mtls-source-probes.err"; then
+            echo "::error title=Admin mTLS SOURCE probes rendered::source-backed client CA must require probe overrides"
+            exit 1
+          fi
+          grep -F 'FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_SOURCE set' "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-mtls-source-probes.err"
           # Overriding both computed probes lets the admin mTLS + adminHttp=0 combo render.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=file --set ports.adminHttp=0 \
@@ -2670,6 +2718,16 @@ jobs:
             --set mode=file --set admin.bindAddress=10.0.0.5 \
             --set-string admin.allowedCidrs=10.0.0.0/8 \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/concrete-covering-cidr.yaml"
+          # CidrSet folds IPv4-mapped IPv6 rules into their embedded IPv4
+          # network, so the chart's probe-source guard must do the same.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set admin.bindAddress=10.0.0.5 \
+            --set-string admin.allowedCidrs=::ffff:10.0.0.0/104 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/mapped-ipv4-covering-cidr.yaml"
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set admin.bindAddress=10.0.0.5 \
+            --set-string admin.allowedCidrs=::ffff:10.0.0.5 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/mapped-ipv4-exact.yaml"
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=file --set admin.bindAddress=fd00::5 \
             --set-string admin.allowedCidrs=fd00::/8 \

@@ -94,8 +94,11 @@ streamPorts: []
 #   - admin TLS (tls.admin.enabled=true) with ports.adminHttp=0 (drop plaintext)
 #   - admin.allowInsecureHttp=true (local/dev; always pair with a NetworkPolicy)
 # The chart mirrors this and fails render early instead of shipping a pod that
-# crash-loops. A /0 CIDR is not protection; the chart rejects literal /0 entries
-# here, while the binary remains authoritative for equivalent permit-all unions.
+# crash-loops. Every comma-separated allowlist entry is strictly validated; a
+# typo or empty segment fails render. A /0 CIDR is not protection; the chart
+# rejects literal /0 entries and mapped IPv6 /96 spellings that canonicalize to
+# IPv4 /0, while the binary remains authoritative for equivalent permit-all
+# unions.
 # If you set admin.allowedCidrs while using the computed exec probes, include the
 # probe source (directly or through a covering CIDR) so the admin TCP filter does
 # not drop them. The probe source tracks admin.bindAddress: 127.0.0.1 for the
@@ -255,6 +258,9 @@ dp:
 # -----------------------------------------------------------------------------
 tls:
   frontend:
+    # Alternatively, a complete FERRUM_FRONTEND_TLS_CERT_SOURCE /
+    # FERRUM_FRONTEND_TLS_KEY_SOURCE pair in env/extraEnv starts frontend TLS and
+    # makes the chart publish the HTTPS (and enabled HTTP/3) Service ports.
     enabled: false
     secretName: ""
     mountPath: /etc/ferrum/tls/frontend
@@ -268,11 +274,12 @@ tls:
     mountPath: /etc/ferrum/tls/admin
     certKey: tls.crt
     keyKey: tls.key
-    # Optional admin mTLS client CA bundle key. NOTE: setting this makes the admin
-    # HTTPS listener demand a client cert, which the computed exec probes cannot
-    # present. With ports.adminHttp=0 (TLS-only admin) the chart therefore requires
-    # you to override/disable the computed probes, or keep a plaintext loopback
-    # admin listener (ports.adminHttp>0) for them.
+    # Optional admin mTLS client CA bundle key. NOTE: setting this, or supplying
+    # FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_SOURCE through env/extraEnv, makes the
+    # admin HTTPS listener demand a client cert, which the computed exec probes
+    # cannot present. With ports.adminHttp=0 (TLS-only admin) the chart therefore
+    # requires you to override/disable the computed probes, or keep a plaintext
+    # loopback admin listener (ports.adminHttp>0) for them.
     clientCaKey: ""
   backend:
     enabled: false
@@ -324,7 +331,8 @@ secretFileMounts: []
 # Example: FERRUM_LOG_LEVEL: info
 # Enabling HTTP/3 (FERRUM_ENABLE_HTTP3: "true") makes the proxy Service publish
 # its HTTPS port on UDP too (QUIC); it needs frontend TLS (or dp mode) and a
-# nonzero ports.proxyHttps.
+# nonzero ports.proxyHttps. Frontend TLS may come from tls.frontend or a complete
+# FERRUM_FRONTEND_TLS_CERT_SOURCE / FERRUM_FRONTEND_TLS_KEY_SOURCE pair here.
 env: {}
 
 # Extra raw env entries (list form) for valueFrom / fieldRef cases. The same

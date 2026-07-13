@@ -124,6 +124,42 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- if $enabled -}}true{{- end -}}
 {{- end -}}
 
+{{/* "true" when a TLS *_SOURCE variable is supplied through env/extraEnv or
+     through one of Ferrum's external-secret resolver suffixes. A matching
+     secretFileMounts base emits <name>_FILE and resolves into the same source
+     variable before EnvConfig is parsed, so it counts too. Literal empty values
+     do not configure a source; valueFrom entries are conservatively treated as
+     configured because their runtime value is intentionally opaque to Helm. */}}
+{{- define "ferrum-gateway.tlsSourceConfigured" -}}
+{{- $root := .root -}}
+{{- $base := .name -}}
+{{- $configured := false -}}
+{{- $candidates := list $base -}}
+{{- range $suffix := list "_VAULT" "_AWS" "_AZURE" "_GCP" "_FILE" -}}
+{{- $candidates = append $candidates (printf "%s%s" $base $suffix) -}}
+{{- end -}}
+{{- $env := $root.Values.env | default dict -}}
+{{- range $name := $candidates -}}
+{{- if and (hasKey $env $name) (ne (trim (toString (get $env $name))) "") -}}
+{{- $configured = true -}}
+{{- end -}}
+{{- end -}}
+{{- range $entry := $root.Values.extraEnv | default list -}}
+{{- $name := toString ($entry.name | default "") -}}
+{{- $hasValue := and (hasKey $entry "value") (ne (trim (toString (get $entry "value"))) "") -}}
+{{- $hasValueFrom := and (hasKey $entry "valueFrom") (not (empty (get $entry "valueFrom"))) -}}
+{{- if and (has $name $candidates) (or $hasValue $hasValueFrom) -}}
+{{- $configured = true -}}
+{{- end -}}
+{{- end -}}
+{{- range $mount := $root.Values.secretFileMounts | default list -}}
+{{- if eq (toString ($mount.name | default "")) $base -}}
+{{- $configured = true -}}
+{{- end -}}
+{{- end -}}
+{{- if $configured -}}true{{- end -}}
+{{- end -}}
+
 {{/* Host the computed exec probes must dial. The admin listener binds ONLY the
      configured FERRUM_ADMIN_BIND_ADDRESS, so a probe dialing 127.0.0.1 cannot
      reach a listener bound to a concrete non-loopback address (a pod/host IP, or
@@ -163,7 +199,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
      authoritative for exotic forms this best-effort guard does not classify. */}}
 {{- define "ferrum-gateway.isIpLiteral" -}}
 {{- $v := . | toString -}}
-{{- $octet := "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)" -}}
+{{- $octet := "(0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])" -}}
 {{- $ipv4 := printf "^%s\\.%s\\.%s\\.%s$" $octet $octet $octet $octet -}}
 {{- if regexMatch $ipv4 $v -}}true
 {{- else if and (contains ":" $v) (regexMatch "^[0-9A-Fa-f:.]+$" $v) (not (regexMatch "::.*::" $v)) (not (regexMatch "[0-9A-Fa-f]{5,}" $v)) (or (contains "::" $v) (eq (len (splitList ":" $v)) 8)) -}}true
@@ -240,34 +276,118 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- if and $valid (eq (len $decimal) 8) -}}{{- join "," $decimal -}}{{- end -}}
 {{- end -}}
 
+{{/* Return the embedded IPv4 integer for an IPv4-mapped IPv6 literal. */}}
+{{- define "ferrum-gateway.ipv4MappedToInt" -}}
+{{- $hextets := include "ferrum-gateway.ipv6Hextets" (. | toString) -}}
+{{- if $hextets -}}
+{{- $h := splitList "," $hextets -}}
+{{- if and (eq (index $h 0 | int) 0) (eq (index $h 1 | int) 0) (eq (index $h 2 | int) 0) (eq (index $h 3 | int) 0) (eq (index $h 4 | int) 0) (eq (index $h 5 | int) 65535) -}}
+{{- add (mul (index $h 6 | int64) 65536) (index $h 7 | int64) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Strictly validate one admin allowlist entry using the same accepted shapes
+     as CidrSet::parse_strict: a bare IPv4/IPv6 literal or one literal plus a
+     decimal prefix in the family range. IPv4-mapped IPv6 CIDRs require a prefix
+     of at least 96 because the runtime canonicalizes them to IPv4. */}}
+{{- define "ferrum-gateway.validAdminCidrEntry" -}}
+{{- $entry := trim (. | toString) -}}
+{{- $parts := splitList "/" $entry -}}
+{{- $valid := false -}}
+{{- if and $entry (or (eq (len $parts) 1) (eq (len $parts) 2)) -}}
+{{- $network := trim (index $parts 0) -}}
+{{- $ipValid := false -}}
+{{- $isV6 := contains ":" $network -}}
+{{- $mappedV6 := false -}}
+{{- if $isV6 -}}
+{{- $hextets := include "ferrum-gateway.ipv6Hextets" $network -}}
+{{- if $hextets -}}
+{{- $ipValid = true -}}
+{{- $h := splitList "," $hextets -}}
+{{- $mappedV6 = and (eq (index $h 0 | int) 0) (eq (index $h 1 | int) 0) (eq (index $h 2 | int) 0) (eq (index $h 3 | int) 0) (eq (index $h 4 | int) 0) (eq (index $h 5 | int) 65535) -}}
+{{- end -}}
+{{- else -}}
+{{- $ipv4 := include "ferrum-gateway.ipv4ToInt" $network -}}
+{{- if ne $ipv4 "" -}}{{- $ipValid = true -}}{{- end -}}
+{{- end -}}
+{{- if $ipValid -}}
+{{- if eq (len $parts) 1 -}}
+{{- $valid = true -}}
+{{- else -}}
+{{- $prefixText := trim (index $parts 1) -}}
+{{- if regexMatch "^[0-9]+$" $prefixText -}}
+{{- $normalizedPrefix := regexReplaceAll "^0+" $prefixText "" -}}
+{{- if eq $normalizedPrefix "" -}}{{- $normalizedPrefix = "0" -}}{{- end -}}
+{{- if le (len $normalizedPrefix) 3 -}}
+{{- $prefix := atoi $normalizedPrefix -}}
+{{- if and (not $isV6) (le $prefix 32) -}}{{- $valid = true -}}{{- end -}}
+{{- if and $isV6 (le $prefix 128) (or (not $mappedV6) (ge $prefix 96)) -}}{{- $valid = true -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $valid -}}true{{- end -}}
+{{- end -}}
+
+{{/* "true" when one validated entry is unrestricted after the runtime's CIDR
+     canonicalization: an ordinary /0 or an IPv4-mapped IPv6 /96. */}}
+{{- define "ferrum-gateway.adminAllowlistContainsCatchAll" -}}
+{{- $found := false -}}
+{{- range $raw := splitList "," (. | toString) -}}
+{{- $parts := splitList "/" (trim $raw) -}}
+{{- if eq (len $parts) 2 -}}
+{{- $network := trim (index $parts 0) -}}
+{{- $prefixText := trim (index $parts 1) -}}
+{{- if regexMatch "^[0-9]+$" $prefixText -}}
+{{- $prefix := atoi $prefixText -}}
+{{- if or (eq $prefix 0) (and (include "ferrum-gateway.ipv4MappedToInt" $network) (eq $prefix 96)) -}}
+{{- $found = true -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $found -}}true{{- end -}}
+{{- end -}}
+
 {{/* Return "true" when one comma-separated allowlist entry contains the supplied
      probe source. This mirrors IpNet::contains for both IP families so ordinary
      covering subnets (127.0.0.0/8, 10.0.0.0/8, fd00::/8, ...) are accepted. */}}
 {{- define "ferrum-gateway.adminAllowlistContainsIp" -}}
 {{- $target := .ip | toString | trimPrefix "[" | trimSuffix "]" | lower -}}
+{{- $targetV4 := include "ferrum-gateway.ipv4ToInt" $target -}}
+{{- if eq $targetV4 "" -}}{{- $targetV4 = include "ferrum-gateway.ipv4MappedToInt" $target -}}{{- end -}}
+{{- $targetV6 := include "ferrum-gateway.ipv6Hextets" $target -}}
 {{- $found := false -}}
 {{- range $raw := splitList "," (.allowedCidrs | default "") -}}
 {{- $entry := trim $raw | lower -}}
 {{- $parts := splitList "/" $entry -}}
-{{- $network := index $parts 0 -}}
-{{- if and (eq (len $parts) 1) (eq $network $target) -}}
+{{- $network := trim (index $parts 0) -}}
+{{- $networkV4 := include "ferrum-gateway.ipv4ToInt" $network -}}
+{{- $networkMappedV4 := include "ferrum-gateway.ipv4MappedToInt" $network -}}
+{{- if and (eq $networkV4 "") $networkMappedV4 -}}{{- $networkV4 = $networkMappedV4 -}}{{- end -}}
+{{- $networkV6 := include "ferrum-gateway.ipv6Hextets" $network -}}
+{{- if eq (len $parts) 1 -}}
+{{- if and (ne $targetV4 "") (ne $networkV4 "") (eq ($targetV4 | int64) ($networkV4 | int64)) -}}
 {{- $found = true -}}
-{{- else if and (eq (len $parts) 2) (regexMatch "^[0-9]+$" (index $parts 1)) -}}
-{{- $prefix := index $parts 1 | int -}}
-{{- if and (not (contains ":" $target)) (not (contains ":" $network)) (ge $prefix 0) (le $prefix 32) -}}
-{{- $targetInt := include "ferrum-gateway.ipv4ToInt" $target -}}
-{{- $networkInt := include "ferrum-gateway.ipv4ToInt" $network -}}
-{{- if and (ne $targetInt "") (ne $networkInt "") -}}
-{{- $blockSize := 1 | int64 -}}
-{{- range until (sub 32 $prefix | int) -}}{{- $blockSize = mul $blockSize 2 -}}{{- end -}}
-{{- if eq (div ($targetInt | int64) $blockSize) (div ($networkInt | int64) $blockSize) -}}{{- $found = true -}}{{- end -}}
+{{- else if and $targetV6 $networkV6 (eq $targetV6 $networkV6) -}}
+{{- $found = true -}}
 {{- end -}}
-{{- else if and (contains ":" $target) (contains ":" $network) (ge $prefix 0) (le $prefix 128) -}}
-{{- $targetHextets := include "ferrum-gateway.ipv6Hextets" $target -}}
-{{- $networkHextets := include "ferrum-gateway.ipv6Hextets" $network -}}
-{{- if and $targetHextets $networkHextets -}}
-{{- $targetParts := splitList "," $targetHextets -}}
-{{- $networkParts := splitList "," $networkHextets -}}
+{{- else if and (eq (len $parts) 2) (regexMatch "^[0-9]+$" (trim (index $parts 1))) -}}
+{{- $prefix := atoi (trim (index $parts 1)) -}}
+{{- $v4Prefix := $prefix -}}
+{{- if $networkMappedV4 -}}{{- $v4Prefix = sub $prefix 96 | int -}}{{- end -}}
+{{- if and (ne $targetV4 "") (ne $networkV4 "") (ge $v4Prefix 0) (le $v4Prefix 32) -}}
+{{- $blockSize := 1 | int64 -}}
+{{- range until (sub 32 $v4Prefix | int) -}}{{- $blockSize = mul $blockSize 2 -}}{{- end -}}
+{{- if eq (div ($targetV4 | int64) $blockSize) (div ($networkV4 | int64) $blockSize) -}}{{- $found = true -}}{{- end -}}
+{{- end -}}
+{{/* A mapped IPv6 query still matches ordinary IPv6 rules at runtime. Mapped
+     networks are excluded here because the runtime folds those into IPv4. */}}
+{{- if and (not $networkMappedV4) $targetV6 $networkV6 (ge $prefix 0) (le $prefix 128) -}}
+{{- $targetParts := splitList "," $targetV6 -}}
+{{- $networkParts := splitList "," $networkV6 -}}
 {{- $matches := true -}}
 {{- $fullHextets := div $prefix 16 | int -}}
 {{- range $i := until $fullHextets -}}
@@ -280,7 +400,6 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- if ne (div (index $targetParts $fullHextets | int) $blockSize) (div (index $networkParts $fullHextets | int) $blockSize) -}}{{- $matches = false -}}{{- end -}}
 {{- end -}}
 {{- if $matches -}}{{- $found = true -}}{{- end -}}
-{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -606,13 +725,19 @@ Validation: fail render on missing/unsafe configuration.
 {{/* Admin bind safety. The binary binds admin to loopback by default. */}}
 {{- $admin := .Values.admin | default dict -}}
 {{- $bind := $admin.bindAddress | default "" -}}
-{{/* CidrSet::parse_strict accepts bare IPv6 IPs/CIDRs, not URL-style brackets.
-     Reject brackets even when probes are overridden/disabled so the rendered
-     pod cannot pass Helm validation and then exit during EnvConfig parsing. */}}
-{{- range $raw := splitList "," ($admin.allowedCidrs | default "") -}}
+{{/* CidrSet::parse_strict rejects every malformed IP/CIDR and empty comma
+     segment. Validate before treating the allowlist as a plaintext guard so a
+     typo cannot render successfully and then CrashLoop during mode startup. */}}
+{{- if $admin.allowedCidrs -}}
+{{- range $raw := splitList "," $admin.allowedCidrs -}}
 {{- $entry := trim $raw -}}
 {{- if or (contains "[" $entry) (contains "]" $entry) -}}
 {{- fail (printf "admin.allowedCidrs entry %q uses bracketed IPv6 syntax, but the runtime requires bare IPv6 addresses/CIDRs (for example fd00::/8 or ::1/128)" $entry) -}}
+{{- end -}}
+{{- if not (include "ferrum-gateway.validAdminCidrEntry" $entry) -}}
+{{- $display := $entry | default "<empty>" -}}
+{{- fail (printf "admin.allowedCidrs entry %q is not a valid IP address or CIDR; expected forms such as 10.0.0.0/8, 192.168.1.1, ::1, or fd00::/8" $display) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{/* EnvConfig::validate() rejects any FERRUM_ADMIN_BIND_ADDRESS that is not an
@@ -634,12 +759,12 @@ Validation: fail render on missing/unsafe configuration.
 {{- end -}}
 {{- if and (not $loopback) (or (eq $mode "database") (eq $mode "cp")) (ne ($adminHttpPort | toString) "0") -}}
 {{- $allowedCidrs := $admin.allowedCidrs | default "" -}}
-{{- $containsCatchAll := regexMatch "(^|[[:space:],])[^[:space:],]+/0([[:space:],]|$)" $allowedCidrs -}}
+{{- $containsCatchAll := include "ferrum-gateway.adminAllowlistContainsCatchAll" $allowedCidrs -}}
 {{- $hasEffectiveAllowlist := and $allowedCidrs (not $containsCatchAll) -}}
 {{- $hasProtection := or $hasEffectiveAllowlist $admin.allowInsecureHttp -}}
 {{- if not $hasProtection -}}
 {{- if $containsCatchAll -}}
-{{- fail "admin.allowedCidrs contains a /0 catch-all CIDR, which does not restrict a non-loopback plaintext admin listener. Use a narrower allowlist, TLS-only admin with ports.adminHttp=0, or admin.allowInsecureHttp=true for local development. The binary remains authoritative for equivalent permit-all CIDR unions." -}}
+{{- fail "admin.allowedCidrs contains a /0 catch-all CIDR (including an IPv4-mapped /96 that canonicalizes to IPv4 /0), which does not restrict a non-loopback plaintext admin listener. Use a narrower allowlist, TLS-only admin with ports.adminHttp=0, or admin.allowInsecureHttp=true for local development. The binary remains authoritative for equivalent permit-all CIDR unions." -}}
 {{- end -}}
 {{- fail (printf "mode=%s hard-fails on a non-loopback plaintext admin bind. Set one of: admin.allowedCidrs, admin TLS (tls.admin.enabled + ports.adminHttp=0), or admin.allowInsecureHttp=true with a NetworkPolicy" $mode) -}}
 {{- end -}}
@@ -668,13 +793,12 @@ Validation: fail render on missing/unsafe configuration.
 {{- if not (and $adminTls.enabled $adminTls.secretName) -}}
 {{- fail "ports.adminHttp=0 makes the computed probes target admin HTTPS (:9443), but admin HTTPS only serves when admin TLS is configured. Set tls.admin.enabled=true with tls.admin.secretName, or override/disable every computed probe (probes.liveness.override + probes.readiness.override, or disable startup/liveness/readiness)." -}}
 {{- end -}}
-{{/* Admin mTLS (tls.admin.clientCaKey set) makes the admin HTTPS listener demand
-     a client certificate during the handshake, but the computed exec probes run
-     `ferrum-edge health --tls --tls-no-verify` and the CLI cannot present one, so
-     every liveness/readiness probe fails the handshake and the pod restart-loops.
-     Require the operator to override/disable the computed probes in that combo. */}}
-{{- if $adminTls.clientCaKey -}}
-{{- fail "ports.adminHttp=0 with admin mTLS (tls.admin.clientCaKey set) makes the admin HTTPS listener require a client certificate, but the computed exec probes run `ferrum-edge health --tls` and cannot present one, so they fail the handshake and restart-loop the pod. Override every computed probe with a handler that presents a client cert (probes.liveness.override + probes.readiness.override), disable startup/liveness/readiness, or keep a plaintext loopback admin listener (ports.adminHttp>0)." -}}
+{{/* Admin mTLS configured either by the chart's Secret key or through the
+     supported *_SOURCE env makes the HTTPS listener demand a client certificate.
+     The computed CLI probes cannot present one, so require custom handlers. */}}
+{{- $adminClientCaSource := include "ferrum-gateway.tlsSourceConfigured" (dict "root" . "name" "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_SOURCE") -}}
+{{- if or $adminTls.clientCaKey $adminClientCaSource -}}
+{{- fail "ports.adminHttp=0 with admin mTLS (tls.admin.clientCaKey or FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_SOURCE set) makes the admin HTTPS listener require a client certificate, but the computed exec probes run `ferrum-edge health --tls` and cannot present one, so they fail the handshake and restart-loop the pod. Override every computed probe with a handler that presents a client cert (probes.liveness.override + probes.readiness.override), disable startup/liveness/readiness, or keep a plaintext loopback admin listener (ports.adminHttp>0)." -}}
 {{- end -}}
 {{- end -}}
 {{- if and $admin.allowedCidrs (or $defaultLiveProbe $defaultReadyProbe) -}}

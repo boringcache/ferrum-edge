@@ -33,8 +33,11 @@ node_agent, migrate) fails at template time with a pointer to the right chart.
   set one of `admin.allowedCidrs`, admin TLS (`tls.admin.enabled` +
   `ports.adminHttp=0`), or `admin.allowInsecureHttp=true`; TLS on 9443 does not
   protect a still-live plaintext listener on 9000. Literal `/0` CIDRs are
-  rejected as ineffective protection; the binary is authoritative for other
-  permit-all CIDR unions. If computed exec probes are enabled,
+  rejected as ineffective protection (including mapped IPv6 `/96` spellings
+  that canonicalize to IPv4 `/0`), and every entry is strictly validated so a
+  typo fails at render instead of crash-looping the pod; the binary is
+  authoritative for other permit-all CIDR unions. If computed exec probes are
+  enabled,
   `admin.allowedCidrs` must contain source `127.0.0.1` (for example
   `127.0.0.0/8`, `127.0.0.1/32`, or the bare IP)
   because the admin TCP filter does not special-case loopback. Any IPv6 bind form
@@ -194,9 +197,12 @@ over TLS (`tls.cpGrpc`), and have DPs pin CP trust (`tls.dpGrpc`).
 container ports and the `FERRUM_*_PORT` env; a value of `0` disables that
 listener (e.g. `ports.adminHttp=0` for TLS-only admin). The proxy Service
 publishes its HTTPS port when `tls.frontend.enabled=true` with a frontend TLS
-Secret (file/database modes), or in `dp` mode whenever `ports.proxyHttps` is
-nonzero — a DP binds HTTPS on the port alone and hot-swaps CP-delivered Gateway
-TLS. Default file/database installs therefore do not advertise an unbound 443.
+Secret, or when a complete `FERRUM_FRONTEND_TLS_{CERT,KEY}_SOURCE` pair is
+supplied through `env`/`extraEnv` (file/database modes). Resolver-suffixed and
+`valueFrom` source entries count too. In `dp` mode, any nonzero
+`ports.proxyHttps` is published because the DP binds HTTPS on the port alone and
+hot-swaps CP-delivered Gateway TLS. Default file/database installs therefore do
+not advertise an unbound 443.
 The admin Service publishes `admin-https` only when `tls.admin` is enabled with a
 Secret. If no proxy port would be published (all proxy ports `0`, no frontend
 TLS, no `service: true` stream port), the proxy Service is skipped entirely
@@ -207,7 +213,8 @@ Enabling HTTP/3 through the supported env passthrough (`env.FERRUM_ENABLE_HTTP3:
 chart then adds a `proxy-h3-udp` container port and a `https-quic` UDP entry on
 the proxy Service next to the TCP `https` port, so kube-proxy forwards the QUIC
 datagrams (the UDP port renders only when the HTTPS listener is active — frontend
-TLS with a Secret, or `dp` mode, and a nonzero `ports.proxyHttps`). A
+TLS with a Secret or complete cert/key SOURCE pair, or `dp` mode, and a nonzero
+`ports.proxyHttps`). A
 `valueFrom`-sourced `FERRUM_ENABLE_HTTP3` can't be read at render, so those
 installs must hand-add the UDP port.
 Raw TCP/UDP stream proxy listeners are declared under `streamPorts` and, when
@@ -229,6 +236,10 @@ streamPorts:
 
 Each surface under `tls.*` (`frontend`, `admin`, `backend`, `cpGrpc`, `dpGrpc`)
 mounts a Secret read-only and sets the matching `FERRUM_*_TLS_*_PATH` env vars.
+Ferrum's supported TLS `*_SOURCE` siblings may instead be supplied through
+`env`/`extraEnv`; frontend cert/key sources participate in Service HTTPS/QUIC
+gating. An admin client-CA SOURCE enables mTLS just like `tls.admin.clientCaKey`,
+so TLS-only admin requires custom client-certificate-capable probes.
 For the external-secret `_FILE` suffix pattern, use `secretFileMounts` to mount
 an arbitrary Secret key and expose `<VAR>_FILE` pointing at it. Required sources
 are matched by base name, for example `name: FERRUM_ADMIN_JWT_SECRET` renders
