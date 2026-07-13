@@ -1,4 +1,3 @@
-{{- if and .Values.service.enabled (ne .Values.mode "cp") }}
 {{- $ports := .Values.ports | default dict -}}
 {{- $frontendTls := (.Values.tls | default dict).frontend | default dict -}}
 {{/* file/database only start the HTTPS proxy listener when frontend TLS material
@@ -7,6 +6,13 @@
      with CP-delivered Gateway TLS, src/modes/data_plane.rs), so its Service
      HTTPS port tracks the port alone. */}}
 {{- $httpsListenerActive := or (and $frontendTls.enabled $frontendTls.secretName) (eq .Values.mode "dp") -}}
+{{- $hasHttp := and (hasKey $ports "proxyHttp") (ne ($ports.proxyHttp | toString) "0") -}}
+{{- $hasHttps := and (hasKey $ports "proxyHttps") (ne ($ports.proxyHttps | toString) "0") $httpsListenerActive -}}
+{{- $hasStreamSvc := false -}}
+{{- range .Values.streamPorts -}}{{- if .service -}}{{- $hasStreamSvc = true -}}{{- end -}}{{- end -}}
+{{/* Skip the Service entirely when no port would be published — a ClusterIP with
+     an empty ports block is rejected by the API server. */}}
+{{- if and .Values.service.enabled (ne .Values.mode "cp") (or $hasHttp $hasHttps $hasStreamSvc) }}
 apiVersion: v1
 kind: Service
 metadata:

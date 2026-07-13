@@ -2142,14 +2142,53 @@ jobs:
             exit 1
           fi
           grep -F 'non-loopback PLAINTEXT gRPC bind' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-plaintext-grpc.err"
-          # A loopback CP gRPC bind renders without the opt-in.
+          # A loopback CP gRPC bind renders without the opt-in when the (unreachable)
+          # CP Service is disabled.
           helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
             --set mode=cp --set database.type=sqlite \
             --set-string database.sqlite.path=/data/ferrum.db \
             --set admin.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
             --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
             --set cp.grpcBindAddress=127.0.0.1 \
+            --set cp.service.enabled=false \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-loopback-grpc.yaml"
+          # A loopback CP bind with the CP Service still enabled must fail: the
+          # Service routes to the pod IP, not the container loopback.
+          if helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=cp --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set cp.grpcBindAddress=127.0.0.1 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-loopback-service.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-loopback-service.err"; then
+            echo "::error title=Loopback CP Service rendered::a loopback CP gRPC bind must not publish a Service"
+            exit 1
+          fi
+          grep -F 'unreachable with a loopback cp.grpcBindAddress' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-loopback-service.err"
+          # An IPv6 CP gRPC bind is bracketed for SocketAddr::parse ([::]:50051).
+          helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=cp --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set-string cp.grpcBindAddress=:: --set grpc.allowPlaintext=true \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-ipv6-grpc.yaml"
+          grep -F 'value: "[::]:50051"' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-ipv6-grpc.yaml"
+          # ports.cpGrpc=0 disables the CP gRPC listener: render succeeds, no gRPC
+          # container port, and the CP Service is suppressed (would be portless).
+          helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=cp --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set ports.cpGrpc=0 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-grpc-disabled.yaml"
+          grep -Fq 'value: "0.0.0.0:0"' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-grpc-disabled.yaml"
+          if grep -Eq '^\s+- name: grpc$' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-grpc-disabled.yaml"; then
+            echo "::error title=Disabled CP gRPC still published a port::ports.cpGrpc=0 must omit the gRPC container/Service port"
+            exit 1
+          fi
           # The example CP renders because grpc.allowPlaintext=true emits the opt-in env.
           grep -Fq 'name: FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-rendered.yaml"
           grep -Fq 'name: FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-rendered.yaml"
@@ -2165,6 +2204,30 @@ jobs:
             exit 1
           fi
           grep -F 'PLAINTEXT to a non-loopback host' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-plaintext-url.err"
+          # dp mode: a CP URL with an unsupported scheme (typo) must fail render.
+          if helm template ferrum-dp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=dp \
+            --set-string dp.cpGrpcUrls=htt://ferrum-cp.ferrum.svc:50051 \
+            --set admin.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-bad-scheme.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-bad-scheme.err"; then
+            echo "::error title=Bad DP CP URL scheme rendered::an unsupported CP URL scheme must fail render"
+            exit 1
+          fi
+          grep -F 'has an unsupported scheme' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-bad-scheme.err"
+          # dp mode: an uppercase plaintext scheme is still caught by the guard.
+          if helm template ferrum-dp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=dp \
+            --set-string dp.cpGrpcUrls=HTTP://ferrum-cp.ferrum.svc:50051 \
+            --set admin.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-upper-scheme.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-upper-scheme.err"; then
+            echo "::error title=Uppercase plaintext CP URL rendered::HTTP:// to a non-loopback host must fail render"
+            exit 1
+          fi
+          grep -F 'PLAINTEXT to a non-loopback host' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-upper-scheme.err"
           # admin.bindAddress=localhost is not an IP literal and must be rejected.
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=file --set admin.bindAddress=localhost \
@@ -2174,6 +2237,55 @@ jobs:
             exit 1
           fi
           grep -F 'admin.bindAddress=localhost is rejected' "$RUNNER_TEMP/ferrum-gateway-helm-results/localhost-bind.err"
+          # Any non-IP admin.bindAddress (hostname) must be rejected, not just localhost.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set admin.bindAddress=admin.internal \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/hostname-bind.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/hostname-bind.err"; then
+            echo "::error title=Hostname admin bind rendered::a non-IP admin.bindAddress must be rejected"
+            exit 1
+          fi
+          grep -F 'is not an IP literal' "$RUNNER_TEMP/ferrum-gateway-helm-results/hostname-bind.err"
+          # An IPv6 loopback admin bind shifts the computed probes to --host ::1.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set admin.bindAddress=::1 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv6-loopback-bind.yaml"
+          probe_block="$(awk '/^[[:space:]]+readinessProbe:/{f=1} f{print} f&&/periodSeconds:/{exit}' "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv6-loopback-bind.yaml")"
+          if ! grep -q -- '- ::1' <<<"$probe_block"; then
+            echo "::error title=IPv6 probe host mismatch::admin.bindAddress=::1 must produce a --host ::1 probe"
+            exit 1
+          fi
+          # Both admin ports disabled leaves no admin listener for the probes: fail.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set ports.adminHttp=0 --set ports.adminHttps=0 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-ports-disabled.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-ports-disabled.err"; then
+            echo "::error title=No admin listener for probes::adminHttp=0 and adminHttps=0 must fail computed probes"
+            exit 1
+          fi
+          grep -F 'disable every admin listener' "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-ports-disabled.err"
+          # A generated _FILE env name cannot be shadowed through env/extraEnv.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set 'secretFileMounts[0].name=FERRUM_ADMIN_JWT_SECRET' \
+            --set 'secretFileMounts[0].secretName=ferrum-admin' \
+            --set 'secretFileMounts[0].secretKey=admin-jwt-secret' \
+            --set-string env.FERRUM_ADMIN_JWT_SECRET_FILE=/tmp/override \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/file-env-collision.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/file-env-collision.err"; then
+            echo "::error title=Generated _FILE env shadowed::a secretFileMounts _FILE var must be reserved"
+            exit 1
+          fi
+          grep -F 'env.FERRUM_ADMIN_JWT_SECRET_FILE is managed by first-class' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-env-collision.err"
+          # A proxy Service with no publishable ports is skipped (empty ports is
+          # rejected by the API server).
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set ports.proxyHttp=0 --set ports.proxyHttps=0 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/no-proxy-ports.yaml"
+          if grep -Eq '^kind: Service$' "$RUNNER_TEMP/ferrum-gateway-helm-results/no-proxy-ports.yaml"; then
+            echo "::error title=Portless proxy Service rendered::a Service with no ports must be suppressed"
+            exit 1
+          fi
           # env/extraEnv cannot override a chart-managed FERRUM_* var (ports here).
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=file --set env.FERRUM_ADMIN_HTTP_PORT=0 \

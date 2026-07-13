@@ -7,9 +7,12 @@ metadata:
   labels:
     {{- include "ferrum-gateway.labels" . | nindent 4 }}
 spec:
-  {{- if hasKey .Values.podDisruptionBudget "minAvailable" }}
+  {{- /* Presence, not hasKey: values.yaml ships a default minAvailable: 1, so an
+         operator selects maxUnavailable by setting minAvailable: null. A null/
+         absent minAvailable falls through instead of rendering `<no value>`. */}}
+  {{- if not (kindIs "invalid" .Values.podDisruptionBudget.minAvailable) }}
   minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
-  {{- else if hasKey .Values.podDisruptionBudget "maxUnavailable" }}
+  {{- else if not (kindIs "invalid" .Values.podDisruptionBudget.maxUnavailable) }}
   maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
   {{- end }}
   selector:

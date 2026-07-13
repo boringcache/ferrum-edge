@@ -98,6 +98,30 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- if hasKey $ports "adminHttp" -}}{{- $ports.adminHttp -}}{{- else -}}9000{{- end -}}
 {{- end -}}
 
+{{/* Admin HTTPS port (0 disables admin HTTPS). */}}
+{{- define "ferrum-gateway.adminHttpsPort" -}}
+{{- $ports := .Values.ports | default dict -}}
+{{- if hasKey $ports "adminHttps" -}}{{- $ports.adminHttps -}}{{- else -}}9443{{- end -}}
+{{- end -}}
+
+{{/* Loopback host the computed exec probes must dial. The admin listener binds
+     IPv6 loopback only for ::1, so the probe (and any allowlist entry) must match
+     that family instead of the IPv4 127.0.0.1 default. */}}
+{{- define "ferrum-gateway.probeHost" -}}
+{{- $bind := (.Values.admin | default dict).bindAddress | default "" -}}
+{{- if eq $bind "::1" -}}::1{{- else -}}127.0.0.1{{- end -}}
+{{- end -}}
+
+{{/* "true" when the value parses as an IPv4 or IPv6 literal, else "". Mirrors
+     EnvConfig::validate() rejecting any non-IP FERRUM_ADMIN_BIND_ADDRESS. The
+     binary's IpAddr::parse remains authoritative; this is a best-effort guard. */}}
+{{- define "ferrum-gateway.isIpLiteral" -}}
+{{- $v := . | toString -}}
+{{- if regexMatch "^([0-9]{1,3}\\.){3}[0-9]{1,3}$" $v -}}true
+{{- else if and (contains ":" $v) (regexMatch "^[0-9A-Fa-f:.]+$" $v) -}}true
+{{- end -}}
+{{- end -}}
+
 {{/*
 Return the first DP CP URL that is PLAINTEXT to a non-loopback host, or "" if
 none. Mirrors cp_dp_grpc_url_is_nonloopback_plaintext() in
@@ -109,8 +133,26 @@ authoritative for hosts this best-effort regex does not classify.
 {{- $bad := "" -}}
 {{- range $u := splitList "," (.Values.dp.cpGrpcUrls | default "") -}}
 {{- $url := trim $u -}}
-{{- if and $url (regexMatch "^(http|grpc)://" $url) -}}
-{{- if not (regexMatch "^(http|grpc)://(127\\.[0-9]+\\.[0-9]+\\.[0-9]+|localhost|[^/@:]*\\.localhost|\\[::1\\])(:[0-9]+)?(/|$)" $url) -}}
+{{- if and $url (regexMatch "(?i)^(http|grpc)://" $url) -}}
+{{- if not (regexMatch "(?i)^(http|grpc)://(127\\.[0-9]+\\.[0-9]+\\.[0-9]+|localhost|[^/@:]*\\.localhost|\\[::1\\])(:[0-9]+)?(/|$)" $url) -}}
+{{- if not $bad -}}{{- $bad = $url -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $bad -}}
+{{- end -}}
+
+{{/* First DP CP URL whose scheme is not one the binary accepts, or "". The DP
+     runtime parses every FERRUM_DP_CP_GRPC_URLS entry and rejects any scheme
+     other than http/https/grpc/grpcs at startup, so surface typos (htt://,
+     schemeless host:port) and uppercase variants at render time. */}}
+{{- define "ferrum-gateway.dpInvalidSchemeUrl" -}}
+{{- $bad := "" -}}
+{{- range $u := splitList "," (.Values.dp.cpGrpcUrls | default "") -}}
+{{- $url := trim $u -}}
+{{- if $url -}}
+{{- $scheme := lower (regexFind "^[a-zA-Z0-9+.-]*" $url) -}}
+{{- if not (has $scheme (list "http" "https" "grpc" "grpcs")) -}}
 {{- if not $bad -}}{{- $bad = $url -}}{{- end -}}
 {{- end -}}
 {{- end -}}
@@ -292,11 +334,24 @@ Validation: fail render on missing/unsafe configuration.
 {{- if and (ne ($cpGrpcPort | toString) "0") (not $cpLoopback) (not $cpGrpcTlsSet) (not $grpc.allowPlaintext) -}}
 {{- fail (printf "mode=cp hard-fails on a non-loopback PLAINTEXT gRPC bind (%s:%v). Set one of: gRPC TLS (tls.cpGrpc.enabled + tls.cpGrpc.secretName), a loopback cp.grpcBindAddress (127.0.0.1), or grpc.allowPlaintext=true to explicitly permit plaintext config sync (dev only; pair with a NetworkPolicy)." $cpBind $cpGrpcPort) -}}
 {{- end -}}
+{{/* A ClusterIP Service routes to the pod IP + targetPort, never the container's
+     loopback, so a loopback-bound CP gRPC listener published through the Service
+     black-holes every DP connection even though Helm rendered cleanly. */}}
+{{- $cpSvc := .Values.cp.service | default dict -}}
+{{- if and $cpSvc.enabled $cpLoopback (ne ($cpGrpcPort | toString) "0") -}}
+{{- fail (printf "cp.service.enabled=true is unreachable with a loopback cp.grpcBindAddress (%s): a Service routes to the pod IP, not the container loopback, so DPs cannot reach the CP gRPC listener. Bind a non-loopback address (0.0.0.0 or ::) with gRPC TLS or grpc.allowPlaintext, or set cp.service.enabled=false." $cpBind) -}}
+{{- end -}}
 {{- end -}}
 {{- if eq $mode "dp" -}}
 {{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" ($grpc.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_CP_DP_GRPC_JWT_SECRET") -}}
 {{- if not .Values.dp.cpGrpcUrls -}}
 {{- fail "dp.cpGrpcUrls is required for mode=dp (comma-separated CP gRPC URLs, e.g. https://ferrum-cp:50051)" -}}
+{{- end -}}
+{{/* The DP runtime rejects any CP URL whose scheme is not http/https/grpc/grpcs
+     (case-insensitive), so catch typos and schemeless host:port before boot. */}}
+{{- $badScheme := include "ferrum-gateway.dpInvalidSchemeUrl" . -}}
+{{- if $badScheme -}}
+{{- fail (printf "dp.cpGrpcUrls entry %q has an unsupported scheme; each CP URL must start with https:// (TLS, recommended) or http:///grpc:// (plaintext, loopback or grpc.allowPlaintext only). The binary rejects other schemes at startup." $badScheme) -}}
 {{- end -}}
 {{/* The binary rejects a non-loopback PLAINTEXT (http://) CP URL unless
      FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true (src/config/env_config.rs). */}}
@@ -320,10 +375,14 @@ Validation: fail render on missing/unsafe configuration.
 {{- $admin := .Values.admin | default dict -}}
 {{- $bind := $admin.bindAddress | default "" -}}
 {{/* EnvConfig::validate() rejects any FERRUM_ADMIN_BIND_ADDRESS that is not an
-     IP literal (src/config/env_config.rs), so the common `localhost` spelling
-     boots and then exits. Reject it at render with the IP to use instead. */}}
+     IP literal (src/config/env_config.rs), so a hostname (localhost,
+     admin.internal, host.docker.internal, ...) boots and then exits. Reject any
+     non-IP value at render with the IP to use instead. */}}
 {{- if eq (lower $bind) "localhost" -}}
 {{- fail "admin.bindAddress=localhost is rejected: the binary requires FERRUM_ADMIN_BIND_ADDRESS to be an IP literal and exits otherwise. Use 127.0.0.1 (or ::1) for the loopback default, or 0.0.0.0/:: to expose admin through a Service." -}}
+{{- end -}}
+{{- if and $bind (not (include "ferrum-gateway.isIpLiteral" $bind)) -}}
+{{- fail (printf "admin.bindAddress=%q is not an IP literal: the binary requires FERRUM_ADMIN_BIND_ADDRESS to parse as an IP address (e.g. 127.0.0.1, ::1, 0.0.0.0, ::) and exits otherwise. Use an IP literal, not a hostname." $bind) -}}
 {{- end -}}
 {{- $loopback := has $bind (list "" "127.0.0.1" "::1") -}}
 {{- $adminHttpPort := include "ferrum-gateway.adminHttpPort" . -}}
@@ -358,13 +417,28 @@ Validation: fail render on missing/unsafe configuration.
      listener and the kubelet restart-loops the pod. Require admin TLS. */}}
 {{- if and (eq ($adminHttpPort | toString) "0") (or $defaultLiveProbe $defaultReadyProbe) -}}
 {{- $adminTls := $tlsAll.admin | default dict -}}
+{{/* Both admin ports disabled means no admin listener at all, yet the computed
+     probes still run `health --tls` and dial a nonexistent admin port, so the
+     kubelet restart-loops the pod. Require an active admin listener. */}}
+{{- if eq (include "ferrum-gateway.adminHttpsPort" . | toString) "0" -}}
+{{- fail "ports.adminHttp=0 and ports.adminHttps=0 disable every admin listener, but the computed probes still run `ferrum-edge health` against the admin API and would restart-loop the pod. Enable an admin listener (ports.adminHttp or ports.adminHttps), or override/disable every computed probe (probes.liveness.override + probes.readiness.override, or disable startup/liveness/readiness)." -}}
+{{- end -}}
 {{- if not (and $adminTls.enabled $adminTls.secretName) -}}
 {{- fail "ports.adminHttp=0 makes the computed probes target admin HTTPS (:9443), but admin HTTPS only serves when admin TLS is configured. Set tls.admin.enabled=true with tls.admin.secretName, or override/disable every computed probe (probes.liveness.override + probes.readiness.override, or disable startup/liveness/readiness)." -}}
 {{- end -}}
 {{- end -}}
 {{- if and $admin.allowedCidrs (or $defaultLiveProbe $defaultReadyProbe) -}}
-{{- $hasProbeLoopback := regexMatch "(^|[[:space:],])127\\.0\\.0\\.1(/32)?([[:space:],]|$)" $admin.allowedCidrs -}}
+{{- $probeHost := include "ferrum-gateway.probeHost" . -}}
+{{- $hasProbeLoopback := false -}}
+{{- if eq $probeHost "::1" -}}
+{{- $hasProbeLoopback = regexMatch "(^|[[:space:],])\\[?::1\\]?(/128)?([[:space:],]|$)" $admin.allowedCidrs -}}
+{{- else -}}
+{{- $hasProbeLoopback = regexMatch "(^|[[:space:],])127\\.0\\.0\\.1(/32)?([[:space:],]|$)" $admin.allowedCidrs -}}
+{{- end -}}
 {{- if not $hasProbeLoopback -}}
+{{- if eq $probeHost "::1" -}}
+{{- fail "admin.allowedCidrs must include ::1/128 (or bare ::1) while the default exec probes are enabled with an IPv6 loopback admin.bindAddress; the admin TCP allowlist otherwise drops the in-pod health checks. Add the exact probe source or override/disable every computed probe handler." -}}
+{{- end -}}
 {{- fail "admin.allowedCidrs must include 127.0.0.1/32 (or bare 127.0.0.1) while the default exec probes are enabled; the admin TCP allowlist otherwise drops the in-pod health checks. Add the exact probe source or override/disable every computed probe handler." -}}
 {{- end -}}
 {{- end -}}
@@ -413,7 +487,7 @@ FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRE
 {{ include "ferrum-gateway.renderSecretEnv" (dict "name" "FERRUM_CP_DP_GRPC_JWT_SECRET" "source" (.Values.grpc.jwtSecret | default dict) "defaultKey" "cp-dp-grpc-jwt-secret") }}
 {{- end }}
 - name: FERRUM_CP_GRPC_LISTEN_ADDR
-  value: {{ printf "%s:%v" (.Values.cp.grpcBindAddress | default "0.0.0.0") (include "ferrum-gateway.cpGrpcPort" .) | quote }}
+  value: {{ include "ferrum-gateway.cpGrpcListenAddr" . | quote }}
 {{- if .Values.cp.namespaces }}
 - name: FERRUM_CP_NAMESPACES
   value: {{ .Values.cp.namespaces | quote }}
@@ -446,7 +520,18 @@ FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRE
 
 {{- define "ferrum-gateway.cpGrpcPort" -}}
 {{- $ports := .Values.ports | default dict -}}
-{{- $ports.cpGrpc | default 50051 -}}
+{{- if hasKey $ports "cpGrpc" -}}{{- $ports.cpGrpc -}}{{- else -}}50051{{- end -}}
+{{- end -}}
+
+{{/* FERRUM_CP_GRPC_LISTEN_ADDR. IPv6 literal binds MUST be bracketed: the runtime
+     parses this with SocketAddr::parse (cp_grpc_socket_addr), which requires
+     [::]:50051, not :::50051. Port 0 keeps the listener disabled per the runtime. */}}
+{{- define "ferrum-gateway.cpGrpcListenAddr" -}}
+{{- $host := .Values.cp.grpcBindAddress | default "0.0.0.0" -}}
+{{- if and (contains ":" $host) (not (hasPrefix "[" $host)) -}}
+{{- $host = printf "[%s]" $host -}}
+{{- end -}}
+{{- printf "%s:%v" $host (include "ferrum-gateway.cpGrpcPort" .) -}}
 {{- end -}}
 
 {{/* Proxy / admin port + bind env. Ports set to 0 disable the listener. */}}
@@ -566,6 +651,12 @@ FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRE
      can shadow a chart-managed FERRUM_* var. */}}
 {{- define "ferrum-gateway.userEnv" -}}
 {{- $reserved := splitList " " (include "ferrum-gateway.reservedEnv" .) -}}
+{{/* secretFileMounts emit <name>_FILE env vars later in the container spec, so
+     reserve those generated names too — otherwise env/extraEnv could shadow a
+     required secret's file source after the source guard already accepted it. */}}
+{{- range .Values.secretFileMounts -}}
+{{- if .name -}}{{- $reserved = append $reserved (printf "%s_FILE" .name) -}}{{- end -}}
+{{- end -}}
 {{- range $entry := .Values.extraEnv }}
 {{- if has $entry.name $reserved }}
 {{- fail (printf "extraEnv entry %s is managed by first-class chart values; set it through the dedicated value instead of extraEnv" $entry.name) }}

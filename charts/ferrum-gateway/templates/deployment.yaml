@@ -7,14 +7,15 @@
   MUST stay distinct commands: coupling them makes an alive-but-unready pod fail
   liveness and restart-loop instead of merely leaving Service endpoints.
 */}}
+{{- $probeHost := include "ferrum-gateway.probeHost" . -}}
 {{- $liveCmd := list "/app/ferrum-edge" "health" "--live" -}}
 {{- $readyCmd := list "/app/ferrum-edge" "health" -}}
 {{- if eq ($adminHttp | toString) "0" -}}
-{{- $liveCmd = list "/app/ferrum-edge" "health" "--live" "--tls" "--tls-no-verify" -}}
-{{- $readyCmd = list "/app/ferrum-edge" "health" "--tls" "--tls-no-verify" -}}
+{{- $liveCmd = list "/app/ferrum-edge" "health" "--live" "--tls" "--tls-no-verify" "--host" $probeHost -}}
+{{- $readyCmd = list "/app/ferrum-edge" "health" "--tls" "--tls-no-verify" "--host" $probeHost -}}
 {{- else -}}
-{{- $liveCmd = list "/app/ferrum-edge" "health" "--live" "-p" ($adminHttp | toString) "--host" "127.0.0.1" -}}
-{{- $readyCmd = list "/app/ferrum-edge" "health" "-p" ($adminHttp | toString) "--host" "127.0.0.1" -}}
+{{- $liveCmd = list "/app/ferrum-edge" "health" "--live" "-p" ($adminHttp | toString) "--host" $probeHost -}}
+{{- $readyCmd = list "/app/ferrum-edge" "health" "-p" ($adminHttp | toString) "--host" $probeHost -}}
 {{- end -}}
 {{- $liveHandler := .Values.probes.liveness.override | default dict -}}
 {{- if not $liveHandler }}{{- $liveHandler = dict "exec" (dict "command" $liveCmd) -}}{{- end -}}
@@ -109,7 +110,7 @@ spec:
               containerPort: {{ $ports.adminHttps }}
               protocol: TCP
             {{- end }}
-            {{- if eq .Values.mode "cp" }}
+            {{- if and (eq .Values.mode "cp") (ne (include "ferrum-gateway.cpGrpcPort" . | toString) "0") }}
             - name: grpc
               containerPort: {{ include "ferrum-gateway.cpGrpcPort" . }}
               protocol: TCP

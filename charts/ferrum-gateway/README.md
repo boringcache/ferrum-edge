@@ -36,25 +36,36 @@ node_agent, migrate) fails at template time with a pointer to the right chart.
   rejected as ineffective protection; the binary is authoritative for other
   permit-all CIDR unions. If computed exec probes are enabled,
   `admin.allowedCidrs` must include exact source `127.0.0.1/32` (or the bare IP)
-  because the admin TCP filter does not special-case loopback. `admin.bindAddress`
-  must be an IP literal — `localhost` is rejected at render (the binary requires
-  an IP); use `127.0.0.1` or `::1`.
+  because the admin TCP filter does not special-case loopback (an `::1` bind
+  requires `::1/128` instead, and shifts the computed probes to `--host ::1`).
+  `admin.bindAddress` must be an IP literal — any hostname (`localhost`,
+  `admin.internal`, ...) is rejected at render (the binary requires an IP); use
+  `127.0.0.1` or `::1`.
 - **Probes and admin HTTPS.** When `ports.adminHttp=0` the computed exec probes
   auto-switch to `ferrum-edge health --tls` against admin HTTPS (`:9443`), which
   only serves when admin TLS material is configured. The chart therefore requires
   `tls.admin.enabled` + `tls.admin.secretName` in that combination (or that you
-  override/disable the computed probes).
+  override/disable the computed probes). Disabling **both** admin ports
+  (`ports.adminHttp=0` and `ports.adminHttps=0`) leaves no admin listener for the
+  computed probes and is rejected unless every computed probe is overridden.
 - **CP/DP gRPC transport.** The binary rejects a non-loopback **plaintext** CP
   gRPC bind (`cp` mode, default `cp.grpcBindAddress=0.0.0.0`) and a non-loopback
   `http://` CP URL (`dp` mode) unless gRPC TLS is configured or you set
   `grpc.allowPlaintext=true` (renders `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT`). The
   chart mirrors that guard at render. Prefer `tls.cpGrpc`/`tls.dpGrpc` for
   production; the dev opt-in flows through the first-class `grpc.allowPlaintext`.
+  IPv6 CP binds are bracketed automatically (`::` → `[::]:50051`). A loopback CP
+  bind is unreachable through `cp.service`, so the chart requires
+  `cp.service.enabled=false` with it; `ports.cpGrpc=0` disables the CP gRPC
+  listener (the gRPC container port and CP Service are omitted). DP CP URL schemes
+  are validated (http/https/grpc/grpcs) so typos fail at render, not at boot.
 - **Chart-managed env is protected.** Every `FERRUM_*` var the chart renders from
   first-class values (mode, DB, JWTs, ports, bind address, allowlist, TLS paths,
   shutdown drain, DP URLs, gRPC plaintext opt-in, ...) is reserved: setting it
   through `env` or `extraEnv` fails render, so the process can never drift from
-  the rendered probes/Services/ports.
+  the rendered probes/Services/ports. Generated `<name>_FILE` vars from
+  `secretFileMounts` are reserved too, so `env`/`extraEnv` cannot shadow a
+  required secret's file source.
 - **TLS and `_FILE` Secret mounts are non-root readable.** They default to mode
   `0440` with pod `fsGroup: 65532`, matching the distroless nonroot image. Both
   `secretVolumeDefaultMode` and `podSecurityContext` are overridable for images
@@ -141,7 +152,9 @@ Secret (file/database modes), or in `dp` mode whenever `ports.proxyHttps` is
 nonzero — a DP binds HTTPS on the port alone and hot-swaps CP-delivered Gateway
 TLS. Default file/database installs therefore do not advertise an unbound 443.
 The admin Service publishes `admin-https` only when `tls.admin` is enabled with a
-Secret.
+Secret. If no proxy port would be published (all proxy ports `0`, no frontend
+TLS, no `service: true` stream port), the proxy Service is skipped entirely
+rather than rendering an API-server-rejected empty `ports:` block.
 Raw TCP/UDP stream proxy listeners are declared under `streamPorts` and, when
 `service: true`, are published on the proxy Service:
 
