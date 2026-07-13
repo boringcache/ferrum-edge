@@ -151,11 +151,12 @@ python3 scripts/check_coverage_thresholds.py \
   --min-changed-plugins-line 84.98
 ```
 
-The normal PR `CI` workflow also includes required plugin hardening regression
-jobs:
+The normal full-mode PR `CI` workflow also includes required plugin hardening
+regressions:
 
-- `Plugin Hardening Unit Regressions`: cache byte accounting and
-  last-known-good plugin reload regressions.
+- The `Unit Tests` job runs the cache byte-accounting and last-known-good plugin
+  reload regressions explicitly before the complete unit suite. Keeping both
+  invocations in one job reuses the compiled `unit_tests` binary.
 - `Plugin Hardening Redis Regression`: multi-instance Redis request
   deduplication with `FERRUM_REDIS_REQUIRED=1`, so Redis startup failures cannot
   silently skip the regression.
