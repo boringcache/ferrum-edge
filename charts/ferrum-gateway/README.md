@@ -36,14 +36,34 @@ node_agent, migrate) fails at template time with a pointer to the right chart.
   rejected as ineffective protection; the binary is authoritative for other
   permit-all CIDR unions. If computed exec probes are enabled,
   `admin.allowedCidrs` must include exact source `127.0.0.1/32` (or the bare IP)
-  because the admin TCP filter does not special-case loopback.
+  because the admin TCP filter does not special-case loopback. `admin.bindAddress`
+  must be an IP literal — `localhost` is rejected at render (the binary requires
+  an IP); use `127.0.0.1` or `::1`.
+- **Probes and admin HTTPS.** When `ports.adminHttp=0` the computed exec probes
+  auto-switch to `ferrum-edge health --tls` against admin HTTPS (`:9443`), which
+  only serves when admin TLS material is configured. The chart therefore requires
+  `tls.admin.enabled` + `tls.admin.secretName` in that combination (or that you
+  override/disable the computed probes).
+- **CP/DP gRPC transport.** The binary rejects a non-loopback **plaintext** CP
+  gRPC bind (`cp` mode, default `cp.grpcBindAddress=0.0.0.0`) and a non-loopback
+  `http://` CP URL (`dp` mode) unless gRPC TLS is configured or you set
+  `grpc.allowPlaintext=true` (renders `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT`). The
+  chart mirrors that guard at render. Prefer `tls.cpGrpc`/`tls.dpGrpc` for
+  production; the dev opt-in flows through the first-class `grpc.allowPlaintext`.
+- **Chart-managed env is protected.** Every `FERRUM_*` var the chart renders from
+  first-class values (mode, DB, JWTs, ports, bind address, allowlist, TLS paths,
+  shutdown drain, DP URLs, gRPC plaintext opt-in, ...) is reserved: setting it
+  through `env` or `extraEnv` fails render, so the process can never drift from
+  the rendered probes/Services/ports.
 - **TLS and `_FILE` Secret mounts are non-root readable.** They default to mode
   `0440` with pod `fsGroup: 65532`, matching the distroless nonroot image. Both
   `secretVolumeDefaultMode` and `podSecurityContext` are overridable for images
   with a different runtime identity.
 - **Graceful shutdown** wires `terminationGracePeriodSeconds` to the
   `FERRUM_SHUTDOWN_DRAIN_SECONDS` drain window (grace must exceed drain + ~5s
-  cleanup, enforced at render).
+  cleanup, enforced at render). `shutdownDrainSeconds: 0` is a valid "skip
+  draining" value and is rendered explicitly; set it to `null` to fall back to
+  the binary's 30s default.
 
 ## Probes
 
@@ -115,9 +135,13 @@ over TLS (`tls.cpGrpc`), and have DPs pin CP trust (`tls.dpGrpc`).
 
 `ports.{proxyHttp,proxyHttps,adminHttp,adminHttps,cpGrpc}` drive both the
 container ports and the `FERRUM_*_PORT` env; a value of `0` disables that
-listener (e.g. `ports.adminHttp=0` for TLS-only admin). The proxy Service only
-publishes its HTTPS port when `tls.frontend.enabled=true` and a frontend TLS
-Secret is configured, so default installs do not advertise an unbound 443.
+listener (e.g. `ports.adminHttp=0` for TLS-only admin). The proxy Service
+publishes its HTTPS port when `tls.frontend.enabled=true` with a frontend TLS
+Secret (file/database modes), or in `dp` mode whenever `ports.proxyHttps` is
+nonzero — a DP binds HTTPS on the port alone and hot-swaps CP-delivered Gateway
+TLS. Default file/database installs therefore do not advertise an unbound 443.
+The admin Service publishes `admin-https` only when `tls.admin` is enabled with a
+Secret.
 Raw TCP/UDP stream proxy listeners are declared under `streamPorts` and, when
 `service: true`, are published on the proxy Service:
 

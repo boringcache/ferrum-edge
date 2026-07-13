@@ -26,17 +26,27 @@ Design notes:
 {{- end -}}
 {{- end -}}
 
-{{/* Names with suffixes must be truncated after the suffix is appended. */}}
+{{/*
+Suffixed names must leave room for the suffix BEFORE truncation, otherwise a
+fullname already at the 63-char DNS-label limit drops the suffix and two
+Services collide. Truncate the base to (63 - len(suffix)) first, then append.
+*/}}
+{{- define "ferrum-gateway.suffixedName" -}}
+{{- $suffix := .suffix -}}
+{{- $base := .base | trunc (int (sub 63 (len $suffix))) | trimSuffix "-" -}}
+{{- printf "%s%s" $base $suffix | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
 {{- define "ferrum-gateway.cpGrpcServiceName" -}}
-{{- printf "%s-grpc" (include "ferrum-gateway.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- include "ferrum-gateway.suffixedName" (dict "base" (include "ferrum-gateway.fullname" .) "suffix" "-grpc") -}}
 {{- end -}}
 
 {{- define "ferrum-gateway.adminServiceName" -}}
-{{- printf "%s-admin" (include "ferrum-gateway.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- include "ferrum-gateway.suffixedName" (dict "base" (include "ferrum-gateway.fullname" .) "suffix" "-admin") -}}
 {{- end -}}
 
 {{- define "ferrum-gateway.configMapName" -}}
-{{- printf "%s-config" (include "ferrum-gateway.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- include "ferrum-gateway.suffixedName" (dict "base" (include "ferrum-gateway.fullname" .) "suffix" "-config") -}}
 {{- end -}}
 
 {{- define "ferrum-gateway.chart" -}}
@@ -86,6 +96,26 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- define "ferrum-gateway.adminHttpPort" -}}
 {{- $ports := .Values.ports | default dict -}}
 {{- if hasKey $ports "adminHttp" -}}{{- $ports.adminHttp -}}{{- else -}}9000{{- end -}}
+{{- end -}}
+
+{{/*
+Return the first DP CP URL that is PLAINTEXT to a non-loopback host, or "" if
+none. Mirrors cp_dp_grpc_url_is_nonloopback_plaintext() in
+src/config/env_config.rs: http:// or grpc:// scheme to a host that is not
+127.0.0.0/8, ::1, or (a subdomain of) localhost. The binary remains
+authoritative for hosts this best-effort regex does not classify.
+*/}}
+{{- define "ferrum-gateway.dpPlaintextUrl" -}}
+{{- $bad := "" -}}
+{{- range $u := splitList "," (.Values.dp.cpGrpcUrls | default "") -}}
+{{- $url := trim $u -}}
+{{- if and $url (regexMatch "^(http|grpc)://" $url) -}}
+{{- if not (regexMatch "^(http|grpc)://(127\\.[0-9]+\\.[0-9]+\\.[0-9]+|localhost|[^/@:]*\\.localhost|\\[::1\\])(:[0-9]+)?(/|$)" $url) -}}
+{{- if not $bad -}}{{- $bad = $url -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $bad -}}
 {{- end -}}
 
 {{/* True when a secret source (value / existingSecret.name / valueFrom) is set. */}}
@@ -248,13 +278,33 @@ Validation: fail render on missing/unsafe configuration.
 {{- if or (eq $mode "database") (eq $mode "cp") (eq $mode "dp") -}}
 {{- include "ferrum-gateway.validateOneSource" (dict "label" "admin.jwtSecret" "source" (.Values.admin.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_ADMIN_JWT_SECRET") -}}
 {{- end -}}
+{{- $grpc := .Values.grpc | default dict -}}
+{{- $tlsAll := .Values.tls | default dict -}}
 {{- if eq $mode "cp" -}}
-{{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" (.Values.grpc.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_CP_DP_GRPC_JWT_SECRET") -}}
+{{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" ($grpc.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_CP_DP_GRPC_JWT_SECRET") -}}
+{{/* The binary rejects a non-loopback PLAINTEXT CP gRPC bind (no TLS) unless
+     FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true (src/config/env_config.rs). */}}
+{{- $cpBind := .Values.cp.grpcBindAddress | default "0.0.0.0" -}}
+{{- $cpGrpcPort := include "ferrum-gateway.cpGrpcPort" . -}}
+{{- $cpLoopback := or (hasPrefix "127." $cpBind) (eq $cpBind "::1") (eq $cpBind "[::1]") -}}
+{{- $cpGrpcTls := $tlsAll.cpGrpc | default dict -}}
+{{- $cpGrpcTlsSet := and $cpGrpcTls.enabled $cpGrpcTls.secretName -}}
+{{- if and (ne ($cpGrpcPort | toString) "0") (not $cpLoopback) (not $cpGrpcTlsSet) (not $grpc.allowPlaintext) -}}
+{{- fail (printf "mode=cp hard-fails on a non-loopback PLAINTEXT gRPC bind (%s:%v). Set one of: gRPC TLS (tls.cpGrpc.enabled + tls.cpGrpc.secretName), a loopback cp.grpcBindAddress (127.0.0.1), or grpc.allowPlaintext=true to explicitly permit plaintext config sync (dev only; pair with a NetworkPolicy)." $cpBind $cpGrpcPort) -}}
+{{- end -}}
 {{- end -}}
 {{- if eq $mode "dp" -}}
-{{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" (.Values.grpc.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_CP_DP_GRPC_JWT_SECRET") -}}
+{{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" ($grpc.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_CP_DP_GRPC_JWT_SECRET") -}}
 {{- if not .Values.dp.cpGrpcUrls -}}
 {{- fail "dp.cpGrpcUrls is required for mode=dp (comma-separated CP gRPC URLs, e.g. https://ferrum-cp:50051)" -}}
+{{- end -}}
+{{/* The binary rejects a non-loopback PLAINTEXT (http://) CP URL unless
+     FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true (src/config/env_config.rs). */}}
+{{- if not $grpc.allowPlaintext -}}
+{{- $badUrl := include "ferrum-gateway.dpPlaintextUrl" . -}}
+{{- if $badUrl -}}
+{{- fail (printf "dp.cpGrpcUrls entry %q is PLAINTEXT to a non-loopback host; the DP JWT and config data would cross the network in cleartext. Use an https:// URL (with tls.dpGrpc for CA pinning), target a loopback host, or set grpc.allowPlaintext=true to explicitly permit plaintext config sync (dev only)." $badUrl) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- if eq $mode "file" -}}
@@ -269,7 +319,13 @@ Validation: fail render on missing/unsafe configuration.
 {{/* Admin bind safety. The binary binds admin to loopback by default. */}}
 {{- $admin := .Values.admin | default dict -}}
 {{- $bind := $admin.bindAddress | default "" -}}
-{{- $loopback := has $bind (list "" "127.0.0.1" "::1" "localhost") -}}
+{{/* EnvConfig::validate() rejects any FERRUM_ADMIN_BIND_ADDRESS that is not an
+     IP literal (src/config/env_config.rs), so the common `localhost` spelling
+     boots and then exits. Reject it at render with the IP to use instead. */}}
+{{- if eq (lower $bind) "localhost" -}}
+{{- fail "admin.bindAddress=localhost is rejected: the binary requires FERRUM_ADMIN_BIND_ADDRESS to be an IP literal and exits otherwise. Use 127.0.0.1 (or ::1) for the loopback default, or 0.0.0.0/:: to expose admin through a Service." -}}
+{{- end -}}
+{{- $loopback := has $bind (list "" "127.0.0.1" "::1") -}}
 {{- $adminHttpPort := include "ferrum-gateway.adminHttpPort" . -}}
 {{- $adminSvc := $admin.service | default dict -}}
 {{- if and $adminSvc.enabled $loopback -}}
@@ -296,16 +352,28 @@ Validation: fail render on missing/unsafe configuration.
 {{- $readiness := $probes.readiness | default dict -}}
 {{- $defaultLiveProbe := and (or $startup.enabled $liveness.enabled) (not ($liveness.override | default dict)) -}}
 {{- $defaultReadyProbe := and $readiness.enabled (not ($readiness.override | default dict)) -}}
+{{/* ports.adminHttp=0 switches the computed exec probes to `health --tls`
+     (admin HTTPS :9443), but the serving modes only start admin HTTPS when admin
+     TLS material is configured (src/modes/*.rs). Without it there is no admin
+     listener and the kubelet restart-loops the pod. Require admin TLS. */}}
+{{- if and (eq ($adminHttpPort | toString) "0") (or $defaultLiveProbe $defaultReadyProbe) -}}
+{{- $adminTls := $tlsAll.admin | default dict -}}
+{{- if not (and $adminTls.enabled $adminTls.secretName) -}}
+{{- fail "ports.adminHttp=0 makes the computed probes target admin HTTPS (:9443), but admin HTTPS only serves when admin TLS is configured. Set tls.admin.enabled=true with tls.admin.secretName, or override/disable every computed probe (probes.liveness.override + probes.readiness.override, or disable startup/liveness/readiness)." -}}
+{{- end -}}
+{{- end -}}
 {{- if and $admin.allowedCidrs (or $defaultLiveProbe $defaultReadyProbe) -}}
 {{- $hasProbeLoopback := regexMatch "(^|[[:space:],])127\\.0\\.0\\.1(/32)?([[:space:],]|$)" $admin.allowedCidrs -}}
 {{- if not $hasProbeLoopback -}}
 {{- fail "admin.allowedCidrs must include 127.0.0.1/32 (or bare 127.0.0.1) while the default exec probes are enabled; the admin TCP allowlist otherwise drops the in-pod health checks. Add the exact probe source or override/disable every computed probe handler." -}}
 {{- end -}}
 {{- end -}}
-{{/* Graceful shutdown: give the pod time to drain plus the ~5s cleanup window. */}}
+{{/* Graceful shutdown: give the pod time to drain plus the ~5s cleanup window.
+     Use presence (not truthiness) checks so an intentional drain of 0 (skip
+     draining, per docs/configuration.md) is honored instead of dropped. */}}
 {{- $drain := .Values.shutdownDrainSeconds -}}
 {{- $grace := .Values.terminationGracePeriodSeconds -}}
-{{- if and $drain $grace (lt (int $grace) (add (int $drain) 5)) -}}
+{{- if and (not (kindIs "invalid" $drain)) (not (kindIs "invalid" $grace)) (lt (int $grace) (add (int $drain) 5)) -}}
 {{- fail (printf "terminationGracePeriodSeconds (%d) must be at least shutdownDrainSeconds + 5s cleanup (%d)" (int $grace) (add (int $drain) 5)) -}}
 {{- end -}}
 {{- end -}}
@@ -313,8 +381,12 @@ Validation: fail render on missing/unsafe configuration.
 {{/* ---------------------------------------------------------------------------
 Env assembly.
 --------------------------------------------------------------------------- */}}
+{{/* Canonical set of every FERRUM_* env the chart renders from first-class
+     values. Overriding any of these through env/extraEnv desyncs the rendered
+     probes, Services, ports, or Secret wiring from the running process, so both
+     env passthroughs reject them. Keep this list the single source of truth. */}}
 {{- define "ferrum-gateway.reservedEnv" -}}
-FERRUM_MODE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET FERRUM_DP_CP_GRPC_URLS FERRUM_FILE_CONFIG_PATH FERRUM_CP_GRPC_LISTEN_ADDR
+FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT FERRUM_DP_CP_GRPC_URLS FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS FERRUM_CP_GRPC_LISTEN_ADDR FERRUM_CP_NAMESPACES FERRUM_CP_REQUIRE_NAMESPACE_CLAIM FERRUM_FILE_CONFIG_PATH FERRUM_PROXY_HTTP_PORT FERRUM_PROXY_HTTPS_PORT FERRUM_ADMIN_HTTP_PORT FERRUM_ADMIN_HTTPS_PORT FERRUM_ADMIN_BIND_ADDRESS FERRUM_ADMIN_ALLOWED_CIDRS FERRUM_ALLOW_INSECURE_ADMIN_HTTP FERRUM_SHUTDOWN_DRAIN_SECONDS FERRUM_FRONTEND_TLS_CERT_PATH FERRUM_FRONTEND_TLS_KEY_PATH FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_ADMIN_TLS_CERT_PATH FERRUM_ADMIN_TLS_KEY_PATH FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_BACKEND_TLS_CLIENT_CERT_PATH FERRUM_BACKEND_TLS_CLIENT_KEY_PATH FERRUM_CP_GRPC_TLS_CERT_PATH FERRUM_CP_GRPC_TLS_KEY_PATH FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH FERRUM_DP_GRPC_TLS_CA_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
 {{- end -}}
 
 {{- define "ferrum-gateway.modeEnv" -}}
@@ -362,6 +434,10 @@ FERRUM_MODE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GR
   value: {{ .Values.dp.failoverPrimaryRetrySeconds | quote }}
 {{- end }}
 {{- end }}
+{{- if and (or (eq $mode "cp") (eq $mode "dp")) (.Values.grpc | default dict).allowPlaintext }}
+- name: FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT
+  value: "true"
+{{- end }}
 {{- if eq $mode "file" }}
 - name: FERRUM_FILE_CONFIG_PATH
   value: {{ include "ferrum-gateway.fileConfigPath" . | quote }}
@@ -407,9 +483,11 @@ FERRUM_MODE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GR
 {{- end }}
 {{- end -}}
 
-{{/* Shutdown drain env (pairs with terminationGracePeriodSeconds). */}}
+{{/* Shutdown drain env (pairs with terminationGracePeriodSeconds). Presence, not
+     truthiness: a documented 0 (skip draining) must still emit the env, else the
+     binary falls back to its 30s default. */}}
 {{- define "ferrum-gateway.shutdownEnv" -}}
-{{- if .Values.shutdownDrainSeconds }}
+{{- if not (kindIs "invalid" .Values.shutdownDrainSeconds) }}
 - name: FERRUM_SHUTDOWN_DRAIN_SECONDS
   value: {{ .Values.shutdownDrainSeconds | quote }}
 {{- end }}
@@ -483,9 +561,16 @@ FERRUM_MODE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GR
 {{- end }}
 {{- end -}}
 
-{{/* User-supplied simple string env, with reserved keys rejected. */}}
+{{/* User-supplied simple string env, with reserved keys rejected. The same
+     reserved set is enforced against extraEnv (list form) so neither passthrough
+     can shadow a chart-managed FERRUM_* var. */}}
 {{- define "ferrum-gateway.userEnv" -}}
 {{- $reserved := splitList " " (include "ferrum-gateway.reservedEnv" .) -}}
+{{- range $entry := .Values.extraEnv }}
+{{- if has $entry.name $reserved }}
+{{- fail (printf "extraEnv entry %s is managed by first-class chart values; set it through the dedicated value instead of extraEnv" $entry.name) }}
+{{- end }}
+{{- end }}
 {{- range $name, $value := .Values.env }}
 {{- if has $name $reserved }}
 {{- fail (printf "env.%s is managed by first-class chart values; set it through the dedicated value instead of env" $name) }}

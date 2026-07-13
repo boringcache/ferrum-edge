@@ -44,7 +44,9 @@ ferrumNamespace: ""
 # Graceful shutdown. terminationGracePeriodSeconds must be >= shutdownDrainSeconds
 # + ~5s cleanup or the chart fails render. On SIGTERM the gateway stops accept
 # loops, marks itself draining, adds `Connection: close`, and waits up to
-# FERRUM_SHUTDOWN_DRAIN_SECONDS for in-flight work before exiting.
+# FERRUM_SHUTDOWN_DRAIN_SECONDS for in-flight work before exiting. A value of 0
+# is honored (skip draining) and rendered explicitly; set to null to omit the
+# env and take the binary's 30s default.
 shutdownDrainSeconds: 30
 terminationGracePeriodSeconds: 40
 
@@ -98,7 +100,9 @@ streamPorts: []
 # -----------------------------------------------------------------------------
 admin:
   # Empty keeps the safe loopback default. Set to "0.0.0.0" or "::" to expose
-  # admin through a Service (required when admin.service.enabled=true).
+  # admin through a Service (required when admin.service.enabled=true). Must be an
+  # IP literal: the binary rejects a non-IP FERRUM_ADMIN_BIND_ADDRESS, so the
+  # chart rejects "localhost" at render — use "127.0.0.1" (or "::1") for loopback.
   bindAddress: ""
   allowedCidrs: ""
   allowInsecureHttp: false
@@ -113,7 +117,9 @@ admin:
       key: admin-jwt-secret
     valueFrom: {}
   # Cluster-internal admin Service (ClusterIP). Only enable together with a
-  # non-loopback admin.bindAddress and a NetworkPolicy restricting access.
+  # non-loopback admin.bindAddress and a NetworkPolicy restricting access. The
+  # admin-https port is published only when tls.admin is enabled with a Secret
+  # (admin HTTPS does not serve otherwise), mirroring the proxy Service.
   service:
     enabled: false
     type: ClusterIP
@@ -128,6 +134,13 @@ grpc:
       name: ""
       key: cp-dp-grpc-jwt-secret
     valueFrom: {}
+  # Explicitly permit PLAINTEXT CP/DP config sync (FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT).
+  # The binary hard-fails on a non-loopback plaintext CP gRPC bind (cp mode) or a
+  # non-loopback http:// CP URL (dp mode) unless gRPC TLS is configured or this is
+  # true. The chart mirrors that guard at render. Dev/in-cluster only; for
+  # production configure tls.cpGrpc (CP) and tls.dpGrpc (DP) instead of enabling
+  # this, and pair any plaintext use with a NetworkPolicy.
+  allowPlaintext: false
 
 # -----------------------------------------------------------------------------
 # Database settings (database and cp modes). Provide EXACTLY ONE URL source:
@@ -359,9 +372,10 @@ tolerations: []
 affinity: {}
 topologySpreadConstraints: []
 
-# Proxy Service (front-door). Publishes proxyHttp, proxyHttps only when
-# tls.frontend is enabled with a Secret, and any streamPorts marked
-# `service: true`.
+# Proxy Service (front-door). Publishes proxyHttp; proxyHttps only when
+# tls.frontend is enabled with a Secret (file/database) or in dp mode where the
+# HTTPS listener binds on the port alone and hot-swaps CP-delivered TLS; plus any
+# streamPorts marked `service: true`.
 service:
   enabled: true
   type: ClusterIP

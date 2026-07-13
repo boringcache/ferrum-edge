@@ -108,6 +108,10 @@
             },
             "valueFrom": { "type": "object" }
           }
+        },
+        "allowPlaintext": {
+          "type": "boolean",
+          "description": "Explicitly permit plaintext CP/DP config sync (FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT). Required for a non-loopback plaintext CP gRPC bind or a non-loopback http:// DP CP URL; dev only. Prefer tls.cpGrpc/tls.dpGrpc for production."
         }
       }
     },
@@ -119,7 +123,7 @@
     },
     "tls": {
       "type": "object",
-      "description": "TLS Secret mounts. The proxy Service publishes HTTPS only when frontend is enabled with a secretName.",
+      "description": "TLS Secret mounts. The proxy Service publishes HTTPS when frontend is enabled with a secretName (file/database) or in dp mode (CP-delivered TLS). The admin Service publishes admin-https only when tls.admin is enabled with a secretName.",
       "properties": {
         "frontend": {
           "type": "object",

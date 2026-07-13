@@ -1,5 +1,6 @@
 {{- if .Values.admin.service.enabled }}
 {{- $ports := .Values.ports | default dict -}}
+{{- $adminTls := (.Values.tls | default dict).admin | default dict -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -23,7 +24,7 @@ spec:
       targetPort: admin-http
       protocol: TCP
     {{- end }}
-    {{- if and (hasKey $ports "adminHttps") (ne ($ports.adminHttps | toString) "0") }}
+    {{- if and (hasKey $ports "adminHttps") (ne ($ports.adminHttps | toString) "0") $adminTls.enabled $adminTls.secretName }}
     - name: admin-https
       port: {{ $ports.adminHttps }}
       targetPort: admin-https

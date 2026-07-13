@@ -22,6 +22,10 @@ grpc:
     existingSecret:
       name: ferrum-grpc-credentials
       key: cp-dp-grpc-jwt-secret
+  # Must match the CP example's explicit plaintext development opt-in (the
+  # http:// CP URL above is non-loopback plaintext). Remove this and configure
+  # tls.cpGrpc/tls.dpGrpc for production.
+  allowPlaintext: true
 
 admin:
   jwtSecret:
@@ -31,11 +35,6 @@ admin:
 
 service:
   type: LoadBalancer
-
-# Must match the CP example's explicit plaintext development opt-in. Remove
-# this and configure tls.cpGrpc/tls.dpGrpc for production.
-env:
-  FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"
 
 # For production, pin CP trust with DP gRPC TLS:
 # tls:

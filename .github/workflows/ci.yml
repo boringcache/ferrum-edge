@@ -2107,6 +2107,134 @@ jobs:
             exit 1
           fi
           grep -F 'must include 127.0.0.1/32' "$RUNNER_TEMP/ferrum-gateway-helm-results/probe-loopback-missing.err"
+          # ports.adminHttp=0 switches computed probes to admin HTTPS, which only
+          # serves with admin TLS material; render must fail without it.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-gateway-credentials \
+            --set ports.adminHttp=0 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-tls-only-no-material.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-tls-only-no-material.err"; then
+            echo "::error title=TLS-only admin probes without admin TLS::adminHttp=0 must require tls.admin"
+            exit 1
+          fi
+          grep -F 'admin HTTPS only serves when admin TLS is configured' "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-tls-only-no-material.err"
+          # With admin TLS material, TLS-only admin (adminHttp=0) renders.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-gateway-credentials \
+            --set ports.adminHttp=0 \
+            --set tls.admin.enabled=true --set tls.admin.secretName=ferrum-admin-tls \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-tls-only.yaml"
+          grep -Fq 'name: FERRUM_ADMIN_TLS_CERT_PATH' "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-tls-only.yaml"
+          # cp mode: a non-loopback PLAINTEXT gRPC bind (chart defaults) must fail
+          # unless gRPC TLS or grpc.allowPlaintext is set (mirrors the binary).
+          if helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=cp --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-plaintext-grpc.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-plaintext-grpc.err"; then
+            echo "::error title=Plaintext CP gRPC rendered::non-loopback plaintext CP gRPC must fail without opt-in"
+            exit 1
+          fi
+          grep -F 'non-loopback PLAINTEXT gRPC bind' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-plaintext-grpc.err"
+          # A loopback CP gRPC bind renders without the opt-in.
+          helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=cp --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set cp.grpcBindAddress=127.0.0.1 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-loopback-grpc.yaml"
+          # The example CP renders because grpc.allowPlaintext=true emits the opt-in env.
+          grep -Fq 'name: FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-rendered.yaml"
+          grep -Fq 'name: FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-rendered.yaml"
+          # dp mode: a non-loopback http:// CP URL must fail without the opt-in.
+          if helm template ferrum-dp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=dp \
+            --set-string dp.cpGrpcUrls=http://ferrum-cp.ferrum.svc:50051 \
+            --set admin.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-plaintext-url.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-plaintext-url.err"; then
+            echo "::error title=Plaintext DP CP URL rendered::non-loopback http:// CP URL must fail without opt-in"
+            exit 1
+          fi
+          grep -F 'PLAINTEXT to a non-loopback host' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-plaintext-url.err"
+          # admin.bindAddress=localhost is not an IP literal and must be rejected.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set admin.bindAddress=localhost \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/localhost-bind.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/localhost-bind.err"; then
+            echo "::error title=localhost admin bind rendered::the binary requires an IP literal"
+            exit 1
+          fi
+          grep -F 'admin.bindAddress=localhost is rejected' "$RUNNER_TEMP/ferrum-gateway-helm-results/localhost-bind.err"
+          # env/extraEnv cannot override a chart-managed FERRUM_* var (ports here).
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set env.FERRUM_ADMIN_HTTP_PORT=0 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/env-reserved.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/env-reserved.err"; then
+            echo "::error title=Reserved env accepted::env must not shadow a chart-managed FERRUM_* var"
+            exit 1
+          fi
+          grep -F 'env.FERRUM_ADMIN_HTTP_PORT is managed by first-class' "$RUNNER_TEMP/ferrum-gateway-helm-results/env-reserved.err"
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set 'extraEnv[0].name=FERRUM_PROXY_HTTP_PORT' \
+            --set-string 'extraEnv[0].value=1' \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/extraenv-reserved.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/extraenv-reserved.err"; then
+            echo "::error title=Reserved extraEnv accepted::extraEnv must not shadow a chart-managed FERRUM_* var"
+            exit 1
+          fi
+          grep -F 'extraEnv entry FERRUM_PROXY_HTTP_PORT is managed by first-class' "$RUNNER_TEMP/ferrum-gateway-helm-results/extraenv-reserved.err"
+          # shutdownDrainSeconds=0 is a valid skip-draining value and must render.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set shutdownDrainSeconds=0 \
+            --set terminationGracePeriodSeconds=10 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/shutdown-zero.yaml"
+          drain_block="$(grep -A1 'name: FERRUM_SHUTDOWN_DRAIN_SECONDS' "$RUNNER_TEMP/ferrum-gateway-helm-results/shutdown-zero.yaml")"
+          if ! grep -q '"0"' <<<"$drain_block"; then
+            echo "::error title=Zero drain dropped::shutdownDrainSeconds=0 must render FERRUM_SHUTDOWN_DRAIN_SECONDS=0"
+            exit 1
+          fi
+          # Suffixed admin Service name also stays within the DNS label limit.
+          long_name="$(printf 'a%.0s' {1..63})"
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set admin.bindAddress=0.0.0.0 --set admin.allowInsecureHttp=true \
+            --set admin.service.enabled=true \
+            --set-string fullnameOverride="$long_name" \
+            --show-only templates/service-admin.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/long-admin-service.yaml"
+          admin_service_name="$(awk '/^  name:/{print $2; exit}' "$RUNNER_TEMP/ferrum-gateway-helm-results/long-admin-service.yaml")"
+          if [ "${#admin_service_name}" -gt 63 ]; then
+            echo "::error title=Admin Service name exceeds DNS label limit::suffix must be reserved before truncation"
+            exit 1
+          fi
+          # admin-https Service port is gated on admin TLS.
+          if grep -Fq 'admin-https' "$RUNNER_TEMP/ferrum-gateway-helm-results/long-admin-service.yaml"; then
+            echo "::error title=admin-https published without admin TLS::admin HTTPS Service port must require tls.admin"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file \
+            --set admin.bindAddress=0.0.0.0 --set admin.allowInsecureHttp=true \
+            --set admin.service.enabled=true \
+            --set tls.admin.enabled=true --set tls.admin.secretName=ferrum-admin-tls \
+            --show-only templates/service-admin.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-service-tls.yaml"
+          grep -Fq 'admin-https' "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-service-tls.yaml"
+          # dp mode publishes the HTTPS Service port on the port alone (CP-managed TLS).
+          helm template ferrum-dp ./charts/ferrum-gateway --namespace ferrum \
+            -f ./charts/ferrum-gateway/examples/dp-values.yaml \
+            --show-only templates/service.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-service.yaml"
+          grep -Fq -- '- name: https' "$RUNNER_TEMP/ferrum-gateway-helm-results/dp-service.yaml"
           # Default Services do not advertise dead HTTPS; TLS enables it. The
           # mounted Secret is group-readable by the default distroless fsGroup.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
