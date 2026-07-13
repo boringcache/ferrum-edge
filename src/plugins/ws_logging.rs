@@ -716,3 +716,90 @@ async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn disconnect_entry() -> WsDisconnectLogEntry {
+        WsDisconnectLogEntry {
+            event: "websocket_disconnect",
+            namespace: "ferrum".into(),
+            proxy_id: "p1".into(),
+            proxy_name: Some("things-ws".into()),
+            client_ip: "10.0.0.1".into(),
+            consumer_username: Some("alice".into()),
+            auth_method: None,
+            backend_target: "wss://backend.example.com:9000/ws".into(),
+            protocol: "websocket",
+            listen_port: 8080,
+            duration_ms: 42.0,
+            frames_client_to_backend: 3,
+            frames_backend_to_client: 5,
+            direction: None,
+            io_side: None,
+            error_class: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn serialize_disconnect(entry: &WsDisconnectLogEntry, raw_schema: Value) -> Value {
+        let schema =
+            SummarySchema::compile(&raw_schema, "ws_logging", SchemaCapabilities::WS_LOGGING)
+                .unwrap();
+        let view = SchemaView {
+            summary: entry,
+            schema: &schema,
+        };
+        serde_json::to_value(view).unwrap()
+    }
+
+    #[test]
+    fn ws_disconnect_flatten_keeps_metadata_named_like_unowned_http_natives() {
+        // Round-3 regression: a WebSocket-disconnect entry is serialized through
+        // a `summary_type: http` ws_logging schema, whose native specs include
+        // HTTP-only fields (`http_method`, `request_path`,
+        // `response_status_code`) that `WsDisconnectLogEntry::serialize_native`
+        // never emits. Those specs must NOT reserve the flatten output key, so
+        // disconnect metadata sharing the name survives under the default
+        // `on_collision: skip`.
+        let mut entry = disconnect_entry();
+        entry
+            .metadata
+            .insert("http_method".to_string(), "GET".to_string());
+        entry
+            .metadata
+            .insert("request_path".to_string(), "/live".to_string());
+        entry
+            .metadata
+            .insert("response_status_code".to_string(), "101".to_string());
+        // A metadata key colliding with a native the disconnect entry DOES own
+        // must still yield to the native value.
+        entry
+            .metadata
+            .insert("namespace".to_string(), "shadow".to_string());
+
+        let v = serialize_disconnect(
+            &entry,
+            json!({
+                "summary_type": "http",
+                "metadata": { "mode": "flatten", "on_collision": "skip" }
+            }),
+        );
+
+        assert_eq!(v.get("http_method").and_then(Value::as_str), Some("GET"));
+        assert_eq!(v.get("request_path").and_then(Value::as_str), Some("/live"));
+        assert_eq!(
+            v.get("response_status_code").and_then(Value::as_str),
+            Some("101")
+        );
+        // Owned + emitted native wins; the colliding metadata value is dropped.
+        assert_eq!(v.get("namespace").and_then(Value::as_str), Some("ferrum"));
+        // The disconnect's own native fields still serialize.
+        assert_eq!(
+            v.get("event").and_then(Value::as_str),
+            Some("websocket_disconnect")
+        );
+    }
+}

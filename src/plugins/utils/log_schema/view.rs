@@ -38,13 +38,16 @@ pub trait SchemaSerializable {
         S: SerializeMap;
 
     /// `true` when `source` is a native field of THIS entry kind. Used to
-    /// scope emitted-key/collision accounting per entry kind: a capability
-    /// extension field (WebSocket disconnect only) reserves an output key
-    /// solely for the entry that owns it, so ordinary HTTP/stream entries in
-    /// `ws_logging` don't reserve — and then silently drop under flatten — a
-    /// metadata key that shares a WS-disconnect field name. Non-extension
-    /// (base) fields keep reserving unconditionally, so BASE callers are
-    /// unaffected.
+    /// scope flatten-collision reservation per entry kind under a
+    /// capability schema, where one `summary_type` is shared by more than one
+    /// entry kind. A native spec reserves its flatten output key only when the
+    /// concrete entry owns it, so a field owned by *another* entry kind — a
+    /// WebSocket-disconnect field (`event`, `direction`, `io_side`) on an HTTP
+    /// summary, or an HTTP-only field (`http_method`, `request_path`,
+    /// `response_status_code`) on a WebSocket-disconnect entry — does not
+    /// reserve, and a flattened metadata key of that name survives instead of
+    /// being silently dropped. BASE schemas reserve every native key
+    /// unconditionally and never consult this, so BASE callers are unaffected.
     fn owns_native(&self, source: &str) -> bool;
 
     /// Emit a derived value under `out_key`. Returns `Ok(false)` when the
@@ -103,7 +106,10 @@ impl<'a, T: SchemaSerializable> Serialize for SchemaView<'a, T> {
                     source,
                     out_key,
                     is_timestamp,
-                    extension,
+                    // `extension` is consulted only by `order` completeness in
+                    // compilation; flatten reservation below keys off
+                    // `owns_native`, which subsumes it.
+                    extension: _,
                 } => {
                     let ts_format = if *is_timestamp {
                         self.schema.timestamp_format
@@ -113,13 +119,34 @@ impl<'a, T: SchemaSerializable> Serialize for SchemaView<'a, T> {
                     self.summary
                         .serialize_native(source, out_key, ts_format, &mut map)?;
                     // Reserve the output key for flatten-collision detection.
-                    // Base fields reserve unconditionally (matches pre-WS
-                    // behavior for every plugin). A capability extension field
-                    // reserves only for the entry kind that actually owns it,
-                    // so an ordinary HTTP summary inside `ws_logging` doesn't
-                    // reserve — and thus doesn't drop — a metadata key named
-                    // like a WebSocket-disconnect field.
-                    if track_emitted && (!*extension || self.summary.owns_native(source)) {
+                    //
+                    // A BASE schema (`capability_scoped == false`) is only ever
+                    // applied to the single entry kind its `summary_type`
+                    // names, so every native key reserves unconditionally —
+                    // byte-identical to pre-capability behavior for every
+                    // non-`ws_logging` plugin.
+                    //
+                    // A capability schema (`ws_logging`) shares one
+                    // `summary_type` (`http` / `both`) across more than one
+                    // entry kind: a `WsDisconnectLogEntry` flows through an
+                    // `http` schema whose native specs include HTTP-only fields
+                    // (`http_method`, `request_path`, `response_status_code`, …)
+                    // that the disconnect entry never serializes — and,
+                    // symmetrically, an ordinary HTTP summary flows through the
+                    // same schema whose specs include WebSocket-disconnect
+                    // fields (`event`, `direction`, `io_side`, …) it never
+                    // serializes. Reserve a key only when the concrete entry
+                    // actually owns it, so a flattened metadata key sharing a
+                    // native name owned by *another* entry kind survives
+                    // instead of being silently dropped under `on_collision:
+                    // skip`. `extension` is unused here (kept for `order`
+                    // completeness) because `owns_native` subsumes it.
+                    let reserve = if self.schema.capability_scoped {
+                        self.summary.owns_native(source)
+                    } else {
+                        true
+                    };
+                    if track_emitted && reserve {
                         emitted.insert(out_key.clone());
                     }
                 }
@@ -812,6 +839,55 @@ mod tests {
         );
         // Native namespace wins; the colliding metadata value is dropped.
         assert_eq!(v.get("namespace").and_then(Value::as_str), Some("ferrum"));
+    }
+
+    #[test]
+    fn http_entry_in_ws_both_schema_does_not_reserve_unowned_base_keys_for_flatten() {
+        // Round-3 regression: under the WS capability a `both` schema carries
+        // native specs for BOTH entry kinds — including stream-only base
+        // fields such as `protocol` that an ordinary HTTP summary never
+        // serializes. Those specs must NOT reserve the flatten output key, so
+        // a metadata key sharing the name survives; a native the HTTP entry
+        // DOES own still wins.
+        let mut s = http_summary();
+        s.metadata
+            .insert("protocol".to_string(), "from-metadata".to_string());
+        s.metadata
+            .insert("namespace".to_string(), "shadow".to_string());
+        let v = serialize_via_ws(
+            &s,
+            json!({
+                "summary_type": "both",
+                "metadata": { "mode": "flatten", "on_collision": "skip" }
+            }),
+        );
+        // Stream-only native the HTTP entry does not own → metadata survives.
+        assert_eq!(
+            v.get("protocol").and_then(Value::as_str),
+            Some("from-metadata")
+        );
+        // Owned + emitted native → native value wins, metadata dropped.
+        assert_eq!(v.get("namespace").and_then(Value::as_str), Some("ferrum"));
+    }
+
+    #[test]
+    fn base_both_schema_reserves_unowned_native_key_for_flatten() {
+        // BASE stays byte-identical to pre-capability behavior: EVERY native
+        // spec reserves its flatten key unconditionally, even a stream-only
+        // field the HTTP entry never serializes. The colliding metadata value
+        // is therefore dropped (and no top-level `protocol` is written), exactly
+        // as on `main`.
+        let mut s = http_summary();
+        s.metadata
+            .insert("protocol".to_string(), "from-metadata".to_string());
+        let v = serialize_via(
+            &s,
+            json!({
+                "summary_type": "both",
+                "metadata": { "mode": "flatten", "on_collision": "skip" }
+            }),
+        );
+        assert!(v.get("protocol").is_none());
     }
 
     #[test]

@@ -63,6 +63,17 @@ pub struct SummarySchema {
     pub fields: Vec<FieldSpec>,
     pub metadata: MetadataPolicy,
     pub timestamp_format: TimestampFormat,
+    /// `true` when this schema was compiled under a capability beyond
+    /// [`SchemaCapabilities::BASE`] (i.e. `ws_logging`). Under such a schema a
+    /// single `summary_type` (`http` / `both`) is shared by more than one
+    /// entry kind (`TransactionSummary` and `WsDisconnectLogEntry`), so
+    /// flatten-collision reservation is scoped to the fields the concrete
+    /// entry actually owns: a native spec reserves its output key only when
+    /// `SchemaSerializable::owns_native` is true for the entry being
+    /// serialized. BASE schemas keep reserving every native key
+    /// unconditionally, so non-`ws_logging` plugins are byte-identical to
+    /// pre-capability behavior.
+    pub capability_scoped: bool,
 }
 
 /// Compiled output-field spec.
@@ -394,6 +405,7 @@ impl SummarySchema {
             fields,
             metadata,
             timestamp_format,
+            capability_scoped: caps != SchemaCapabilities::BASE,
         }))
     }
 
