@@ -68,7 +68,7 @@ use tracing::warn;
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
     service_entry_port_protocol_is_udp, sidecar_selector_from_istio,
-    translate_k8s_objects_with_filter,
+    translate_k8s_objects_with_filter, workload_selector_from_istio,
 };
 
 /// Field manager used on every `patch_status` call. Kubernetes uses this
@@ -515,11 +515,8 @@ fn peer_authentication_status(
                 .collect()
         })
         .unwrap_or_default();
-    let has_workload_selector = object
-        .spec
-        .get("selector")
-        .is_some_and(|selector| !selector.is_null());
-    let port_overrides_ignored_without_selector =
+    let has_workload_selector = scope == "WorkloadSelector";
+    let port_overrides_ignored_without_nonempty_selector =
         !has_workload_selector && !configured_port_overrides.is_empty();
     let port_overrides = if has_workload_selector {
         configured_port_overrides
@@ -538,8 +535,8 @@ fn peer_authentication_status(
             } else {
                 resolved_mode.as_str()
             };
-            let ignored_suffix = if port_overrides_ignored_without_selector {
-                "; portLevelMtls ignored because no workload selector is specified"
+            let ignored_suffix = if port_overrides_ignored_without_nonempty_selector {
+                "; portLevelMtls ignored because no non-empty workload selector is specified"
             } else {
                 ""
             };
@@ -551,7 +548,7 @@ fn peer_authentication_status(
                     "scope": scope,
                     "configured_mtls_mode": resolved_mode,
                     "port_level_overrides": port_overrides,
-                    "port_level_overrides_ignored_without_selector": port_overrides_ignored_without_selector,
+                    "port_level_overrides_ignored_without_nonempty_selector": port_overrides_ignored_without_nonempty_selector,
                 }
             });
             (true, "Accepted", message, Some(detail))
@@ -1362,10 +1359,10 @@ fn telemetry_status(
 
 /// Resolve the Istio policy scope label for selector-driven CRDs
 /// (`RequestAuthentication`, etc.) the same way the translator's
-/// `istio_policy_scope` does: a `selector` means `WorkloadSelector`, the
-/// root namespace means `MeshWide`, otherwise `Namespace`.
+/// `istio_policy_scope` does: a non-empty selector means `WorkloadSelector`,
+/// the root namespace means `MeshWide`, otherwise `Namespace`.
 fn istio_policy_scope_label(object: &K8sObject, istio_root_namespace: &str) -> &'static str {
-    if object.spec.get("selector").is_some() {
+    if workload_selector_from_istio(object.spec.get("selector"), None).is_some() {
         "WorkloadSelector"
     } else if object.metadata.namespace == istio_root_namespace
         || object.metadata.namespace.is_empty()

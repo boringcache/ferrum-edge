@@ -2721,13 +2721,23 @@ fn classify_peer_auth_scope(pa: &PeerAuthentication) -> PeerAuthScope {
         return match scope {
             PolicyScope::MeshWide => PeerAuthScope::MeshWide,
             PolicyScope::Namespace { .. } => PeerAuthScope::Namespace,
-            PolicyScope::WorkloadSelector { .. } => PeerAuthScope::WorkloadSelector,
+            PolicyScope::WorkloadSelector { .. } if pa.has_workload_selector() => {
+                PeerAuthScope::WorkloadSelector
+            }
+            // Defensive normalization for native/file slices: an empty
+            // selector is a namespace default when namespace-constrained and a
+            // mesh default when it has no namespace constraint.
+            PolicyScope::WorkloadSelector { selector } if selector.namespace.is_none() => {
+                PeerAuthScope::MeshWide
+            }
+            PolicyScope::WorkloadSelector { .. } => PeerAuthScope::Namespace,
         };
     }
 
-    match &pa.selector {
-        Some(selector) if !selector.labels.is_empty() => PeerAuthScope::WorkloadSelector,
-        _ => PeerAuthScope::Namespace,
+    if pa.has_workload_selector() {
+        PeerAuthScope::WorkloadSelector
+    } else {
+        PeerAuthScope::Namespace
     }
 }
 
@@ -2771,24 +2781,12 @@ fn peer_auth_applies_to_workload<L: WorkloadLabels + ?Sized>(
             .is_none_or(|selector| workload_selector_matches(selector, namespace, labels))
 }
 
-/// Istio applies `portLevelMtls` only when the PeerAuthentication explicitly
-/// carries a workload selector. Keep both the canonical `PolicyScope` form and
-/// the legacy `selector` form so native/file slices and translated K8s slices
-/// share the same rule. An explicitly present empty selector still counts.
-pub(super) fn peer_auth_has_workload_selector(pa: &PeerAuthentication) -> bool {
-    match pa.scope.as_ref() {
-        Some(PolicyScope::WorkloadSelector { .. }) => true,
-        Some(PolicyScope::MeshWide | PolicyScope::Namespace { .. }) => false,
-        None => pa.selector.is_some(),
-    }
-}
-
 /// Effective inbound mTLS mode a single PeerAuthentication yields for `port`: a
 /// per-port override on a selector-scoped policy takes precedence over the
 /// policy's top-level `mtls_mode`. Selector-less namespace/mesh-wide policies
 /// ignore `port_overrides`, matching Istio's `portLevelMtls` contract.
 fn peer_auth_effective_mode(pa: &PeerAuthentication, port: u16) -> MtlsMode {
-    if peer_auth_has_workload_selector(pa) {
+    if pa.has_workload_selector() {
         pa.port_overrides
             .get(&port)
             .copied()
@@ -5161,6 +5159,45 @@ mod tests {
             ),
             MtlsMode::Strict,
             "portLevelMtls must not alter a selector-less namespace policy"
+        );
+    }
+
+    #[test]
+    fn empty_selector_is_not_workload_scoped_and_ignores_port_override() {
+        let policy = pa(
+            "empty-selector",
+            "default",
+            Some(WorkloadSelector::default()),
+            MtlsMode::Strict,
+            HashMap::from([(8080, MtlsMode::Disable)]),
+        );
+
+        assert!(!policy.has_workload_selector());
+        assert_eq!(classify_peer_auth_scope(&policy), PeerAuthScope::Namespace);
+        assert_eq!(
+            resolve_effective_mtls_mode(
+                std::slice::from_ref(&policy),
+                "default",
+                &HashMap::<String, String>::new(),
+                8080,
+            ),
+            MtlsMode::Strict,
+            "an explicit empty selector is a namespace default and cannot activate portLevelMtls"
+        );
+
+        let mesh_policy = pa_with_scope(
+            "empty-root-selector",
+            "istio-system",
+            PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector::default(),
+            },
+            MtlsMode::Strict,
+        );
+        assert!(!mesh_policy.has_workload_selector());
+        assert_eq!(
+            classify_peer_auth_scope(&mesh_policy),
+            PeerAuthScope::MeshWide,
+            "an empty root selector is a mesh default, not workload scope"
         );
     }
 

@@ -217,22 +217,24 @@ fn peer_auth_port_level_mtls_requires_selector() {
         category = CATEGORY,
         feature = "portLevelMtls requires workload selector",
         status = Status::Supported,
-        notes = "Selector-less portLevelMtls entries are carried but ignored during effective-mode resolution.",
+        notes = "Omitted, null, and empty-matchLabels portLevelMtls entries are carried but ignored during effective-mode resolution.",
     );
-    let pa = translate_one(json!({
-        "selector": null,
-        "mtls": {"mode": "STRICT"},
-        "portLevelMtls": {
-            "8080": {"mode": "DISABLE"}
-        }
-    }));
     let labels = HashMap::<String, String>::new();
+    for selector in [Value::Null, json!({"matchLabels": {}})] {
+        let pa = translate_one(json!({
+            "selector": selector,
+            "mtls": {"mode": "STRICT"},
+            "portLevelMtls": {
+                "8080": {"mode": "DISABLE"}
+            }
+        }));
 
-    assert_eq!(
-        resolve_effective_mtls_mode(std::slice::from_ref(&pa), "default", &labels, 8080),
-        MtlsMode::Strict,
-        "selector-less portLevelMtls must not override the workload-level mode"
-    );
+        assert_eq!(
+            resolve_effective_mtls_mode(std::slice::from_ref(&pa), "default", &labels, 8080),
+            MtlsMode::Strict,
+            "null/empty-selector portLevelMtls must not override the workload-level mode"
+        );
+    }
 }
 
 /// Single-winner precedence: a WorkloadSelector-scoped PA beats a Namespace-
