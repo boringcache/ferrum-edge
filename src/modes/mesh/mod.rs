@@ -10540,7 +10540,7 @@ fn selectable_inbound_peer_auth_ports(slice: &MeshSlice) -> std::collections::BT
                             && !listener.owner_namespace.is_empty()
                             && !listener.owner_service.is_empty()
                     })
-                    .flat_map(|listener| [listener.port, listener.endpoint_port])
+                    .map(|listener| listener.endpoint_port)
                     .filter(|port| *port != 0)
                     .collect();
             };
@@ -10586,7 +10586,6 @@ fn selectable_inbound_peer_auth_ports(slice: &MeshSlice) -> std::collections::BT
             && !listener.owner_namespace.is_empty()
             && !listener.owner_service.is_empty()
         {
-            ports.insert(listener.port);
             ports.insert(listener.endpoint_port);
         }
     }
@@ -26149,7 +26148,7 @@ mod tests {
     }
 
     #[test]
-    fn inbound_mtls_modes_by_port_include_ingress_alias_ports() {
+    fn inbound_mtls_modes_by_port_include_ingress_backend_ports_only() {
         let mut listener = ingress_listener(8443, "127.0.0.1", 8080);
         listener.owner_namespace = "default".to_string();
         listener.owner_service = "api".to_string();
@@ -26171,10 +26170,8 @@ mod tests {
 
         assert_eq!(
             resolve_inbound_mtls_modes_by_port(Some(&slice)),
-            std::collections::BTreeMap::from([
-                (8080, config::MtlsMode::Strict),
-                (8443, config::MtlsMode::Permissive),
-            ])
+            std::collections::BTreeMap::from([(8080, config::MtlsMode::Strict)]),
+            "PeerAuthentication keys ingress overrides by the backend container port, not the listener port"
         );
     }
 

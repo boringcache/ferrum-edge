@@ -11700,7 +11700,6 @@ fn mesh_inbound_peer_auth_app_port(proxy: &Proxy) -> u16 {
 
 fn mesh_inbound_requires_post_route_transport_gate(
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
-    proxy_id: &str,
     orig_dst: Option<SocketAddr>,
     resolved_app_port: u16,
 ) -> bool {
@@ -11708,13 +11707,11 @@ fn mesh_inbound_requires_post_route_transport_gate(
         return false;
     }
     // A direct dial to a mesh inbound listener has no pre-routing app-port
-    // signal, so every resolved proxy — including an operator-supplied explicit
-    // proxy that replaced a generated mesh route — needs the authoritative
-    // post-route check. Captured generated routes additionally need it when
-    // Host routing selected a different app port than SO_ORIGINAL_DST.
-    orig_dst.is_none()
-        || (crate::modes::mesh::is_mesh_inbound_route_id(proxy_id)
-            && orig_dst.is_some_and(|dst| dst.port() != resolved_app_port))
+    // signal, so every resolved proxy needs the authoritative post-route check.
+    // Captured traffic additionally needs it whenever routing — including an
+    // operator-supplied explicit proxy — selects a different backend app port
+    // than SO_ORIGINAL_DST selected before the handshake.
+    orig_dst.is_none() || orig_dst.is_some_and(|dst| dst.port() != resolved_app_port)
 }
 
 struct TlsConnectionMetadata {
@@ -14491,7 +14488,6 @@ async fn handle_proxy_request_inner(
     let resolved_app_port = mesh_inbound_peer_auth_app_port(&proxy);
     if mesh_inbound_requires_post_route_transport_gate(
         ctx.mesh_direction,
-        &proxy.id,
         ctx.orig_dst,
         resolved_app_port,
     ) {
@@ -37050,25 +37046,21 @@ mod tests {
 
         assert!(mesh_inbound_requires_post_route_transport_gate(
             Some(MeshTrafficDirection::Inbound),
-            "operator-explicit-inbound",
             None,
             8080
         ));
         assert!(!mesh_inbound_requires_post_route_transport_gate(
             Some(MeshTrafficDirection::Inbound),
-            "__mesh-inbound-default-reviews-8080",
             Some("10.0.0.8:8080".parse().expect("socket addr")),
             8080
         ));
         assert!(mesh_inbound_requires_post_route_transport_gate(
             Some(MeshTrafficDirection::Inbound),
-            "__mesh-inbound-default-reviews-8080",
             Some("10.0.0.8:9090".parse().expect("socket addr")),
             8080
         ));
         assert!(!mesh_inbound_requires_post_route_transport_gate(
             Some(MeshTrafficDirection::Outbound),
-            "operator-explicit-inbound",
             None,
             8080
         ));
