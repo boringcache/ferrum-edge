@@ -149,7 +149,7 @@ fn emit_timestamp<S: SerializeMap>(
     }
 }
 
-fn extract_host_from_url(s: &str) -> Option<&str> {
+pub(crate) fn extract_host_from_url(s: &str) -> Option<&str> {
     // Strip scheme.
     let after_scheme = if let Some(idx) = s.find("://") {
         &s[idx + 3..]
@@ -374,20 +374,7 @@ impl SchemaSerializable for TransactionSummary {
     where
         S: SerializeMap,
     {
-        match policy {
-            MetadataPolicy::Nested => Ok(()), // already emitted in main loop
-            MetadataPolicy::Omit => Ok(()),
-            MetadataPolicy::Flatten {
-                prefix,
-                on_collision,
-            } => flatten_metadata(
-                &self.metadata,
-                prefix.as_deref(),
-                *on_collision,
-                emitted,
-                map,
-            ),
-        }
+        serialize_schema_metadata(&self.metadata, policy, emitted, map)
     }
 }
 
@@ -516,20 +503,7 @@ impl SchemaSerializable for StreamTransactionSummary {
     where
         S: SerializeMap,
     {
-        match policy {
-            MetadataPolicy::Nested => Ok(()),
-            MetadataPolicy::Omit => Ok(()),
-            MetadataPolicy::Flatten {
-                prefix,
-                on_collision,
-            } => flatten_metadata(
-                &self.metadata,
-                prefix.as_deref(),
-                *on_collision,
-                emitted,
-                map,
-            ),
-        }
+        serialize_schema_metadata(&self.metadata, policy, emitted, map)
     }
 }
 
@@ -539,7 +513,7 @@ impl SchemaSerializable for StreamTransactionSummary {
 
 /// Wrapper that serializes a metadata HashMap with redaction. Used when
 /// metadata is emitted as a nested object.
-struct MetadataNested<'a>(&'a std::collections::HashMap<String, String>);
+pub(crate) struct MetadataNested<'a>(pub(crate) &'a std::collections::HashMap<String, String>);
 
 impl<'a> Serialize for MetadataNested<'a> {
     fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
@@ -576,6 +550,29 @@ where
         emitted.insert(out_key);
     }
     Ok(())
+}
+
+/// Apply the compiled metadata policy for a schema-serializable entry.
+///
+/// The nested form is emitted by `serialize_native`; this helper owns the
+/// omit / flatten behavior shared by the built-in summary types and
+/// WebSocket disconnect entries.
+pub(crate) fn serialize_schema_metadata<S>(
+    metadata: &std::collections::HashMap<String, String>,
+    policy: &MetadataPolicy,
+    emitted: &mut HashSet<String>,
+    map: &mut S,
+) -> Result<(), S::Error>
+where
+    S: SerializeMap,
+{
+    match policy {
+        MetadataPolicy::Nested | MetadataPolicy::Omit => Ok(()),
+        MetadataPolicy::Flatten {
+            prefix,
+            on_collision,
+        } => flatten_metadata(metadata, prefix.as_deref(), *on_collision, emitted, map),
+    }
 }
 
 // ---------------------------------------------------------------------------

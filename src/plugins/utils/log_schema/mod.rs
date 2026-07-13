@@ -2,7 +2,8 @@
 //!
 //! Operators configure a `schema:` (or `schema_ref:`) block on any logging
 //! plugin to rename, omit, reorder, or augment the fields in
-//! [`crate::plugins::TransactionSummary`] / [`crate::plugins::StreamTransactionSummary`].
+//! [`crate::plugins::TransactionSummary`], [`crate::plugins::StreamTransactionSummary`],
+//! and `ws_logging` WebSocket disconnect entries.
 //!
 //! Apply order at serialization time is driven by the compiled
 //! [`SummarySchema::fields`] vec. Metadata redaction is preserved by routing
@@ -25,7 +26,7 @@ pub mod view;
 // future admin endpoints). The binary itself reaches these through their
 // submodule paths so an `unused_imports` lint would otherwise fire.
 #[allow(unused_imports)]
-pub use fields::{FieldMeta, HTTP_FIELDS, STREAM_FIELDS};
+pub use fields::{FieldMeta, HTTP_FIELDS, STREAM_FIELDS, WS_DISCONNECT_FIELDS};
 #[allow(unused_imports)]
 pub use view::{SchemaSerializable, SchemaView, SummaryLogEntryBatchView, SummaryLogEntryView};
 
@@ -92,11 +93,13 @@ pub enum DerivedKind {
     /// Hostname extracted from `backend_target` (HTTP) or
     /// `backend_target` (stream).
     BackendHost,
-    /// `"http"` or `"stream"` — useful for unified pipelines.
+    /// `"http"`, `"stream"`, or `"websocket_disconnect"` — useful for
+    /// unified pipelines.
     SummaryKind,
     /// `"ok"` / `"error"`. HTTP: status ≥ 500 or `error_class.is_some()` →
     /// `error`. Stream: any of `connection_error`, `error_class`,
-    /// `disconnect_cause: BackendError` → `error`.
+    /// `disconnect_cause: BackendError` → `error`. WebSocket disconnect:
+    /// `error_class.is_some()` → `error`.
     Outcome,
 }
 
@@ -365,6 +368,14 @@ impl SummarySchema {
     /// summaries.
     pub fn applies_to_stream(&self) -> bool {
         matches!(self.summary_type, SummaryType::Stream | SummaryType::Both)
+    }
+
+    /// `true` when this schema covers WebSocket disconnect entries.
+    ///
+    /// WebSocket upgrades belong to the HTTP / WebSocket summary family;
+    /// `summary_type: stream` remains reserved for TCP/UDP/DTLS summaries.
+    pub fn applies_to_websocket_disconnect(&self) -> bool {
+        self.applies_to_http()
     }
 
     /// Look up the rename target for a native field by source name.
@@ -956,9 +967,12 @@ mod tests {
     fn http_schema_rejects_stream_only_field() {
         let e = err(json!({
             "summary_type": "http",
-            "omit": ["protocol"]
+            "omit": ["timestamp_connected"]
         }));
-        assert!(e.contains("unknown field 'protocol'"), "got: {e}");
+        assert!(
+            e.contains("unknown field 'timestamp_connected'"),
+            "got: {e}"
+        );
     }
 
     #[test]
@@ -1055,8 +1069,8 @@ mod tests {
             .count();
         assert_eq!(ns_count, 1, "namespace appears exactly once");
         assert_eq!(status_count, 1, "response_status_code appears exactly once");
-        // And the schema must still cover every native HTTP field.
-        assert_eq!(s.fields.len(), fields::HTTP_FIELDS.len());
+        // And the schema must still cover every native HTTP / WebSocket field.
+        assert_eq!(s.fields.len(), fields::fields_for(SummaryType::Http).len());
     }
 
     #[test]

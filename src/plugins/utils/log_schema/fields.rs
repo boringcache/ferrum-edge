@@ -1,5 +1,5 @@
-//! Static registry of native field names for [`TransactionSummary`] and
-//! [`StreamTransactionSummary`].
+//! Static registry of native field names for [`TransactionSummary`],
+//! [`StreamTransactionSummary`], and WebSocket disconnect log entries.
 //!
 //! The schema customization layer validates operator-supplied field names
 //! (in `omit`, `rename`, `order`, derived `from`) against these tables.
@@ -225,37 +225,124 @@ pub const STREAM_FIELDS: &[FieldMeta] = &[
     },
 ];
 
+/// Fields on the `ws_logging` WebSocket disconnect entry in declaration order.
+///
+/// WebSocket disconnect entries are part of the HTTP / WebSocket summary
+/// family, so these fields are visible to `summary_type: http` and `both`.
+pub const WS_DISCONNECT_FIELDS: &[FieldMeta] = &[
+    FieldMeta {
+        name: "event",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "namespace",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "proxy_id",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "proxy_name",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "client_ip",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "consumer_username",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "auth_method",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "backend_target",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "protocol",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "listen_port",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "duration_ms",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "frames_client_to_backend",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "frames_backend_to_client",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "direction",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "io_side",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "error_class",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "metadata",
+        is_timestamp: false,
+    },
+];
+
 /// Look up a field by name for the given summary type.
 ///
-/// For [`SummaryType::Both`] the field must exist on either struct.
+/// For [`SummaryType::Both`] the field may exist on any registered entry type.
 pub fn lookup(summary_type: SummaryType, name: &str) -> Option<FieldMeta> {
     match summary_type {
-        SummaryType::Http => HTTP_FIELDS.iter().find(|f| f.name == name).copied(),
+        SummaryType::Http => HTTP_FIELDS
+            .iter()
+            .chain(WS_DISCONNECT_FIELDS.iter())
+            .find(|f| f.name == name)
+            .copied(),
         SummaryType::Stream => STREAM_FIELDS.iter().find(|f| f.name == name).copied(),
         SummaryType::Both => HTTP_FIELDS
             .iter()
             .chain(STREAM_FIELDS.iter())
+            .chain(WS_DISCONNECT_FIELDS.iter())
             .find(|f| f.name == name)
             .copied(),
     }
 }
 
 /// All field names visible for the given summary type, in declaration order,
-/// deduplicated for `Both`.
+/// deduplicated across entry types.
 pub fn fields_for(summary_type: SummaryType) -> Vec<FieldMeta> {
     match summary_type {
-        SummaryType::Http => HTTP_FIELDS.to_vec(),
+        SummaryType::Http => union_fields(&[HTTP_FIELDS, WS_DISCONNECT_FIELDS]),
         SummaryType::Stream => STREAM_FIELDS.to_vec(),
-        SummaryType::Both => {
-            let mut out: Vec<FieldMeta> = HTTP_FIELDS.to_vec();
-            for stream in STREAM_FIELDS {
-                if !out.iter().any(|f| f.name == stream.name) {
-                    out.push(*stream);
-                }
+        SummaryType::Both => union_fields(&[HTTP_FIELDS, STREAM_FIELDS, WS_DISCONNECT_FIELDS]),
+    }
+}
+
+fn union_fields(field_sets: &[&[FieldMeta]]) -> Vec<FieldMeta> {
+    let mut out = Vec::new();
+    for fields in field_sets {
+        for field in *fields {
+            if !out
+                .iter()
+                .any(|existing: &FieldMeta| existing.name == field.name)
+            {
+                out.push(*field);
             }
-            out
         }
     }
+    out
 }
 
 /// Suggest the closest known field name to a misspelling, when the
@@ -263,9 +350,9 @@ pub fn fields_for(summary_type: SummaryType) -> Vec<FieldMeta> {
 /// ≤ 3 for long names).
 pub fn levenshtein_suggest(summary_type: SummaryType, name: &str) -> Option<&'static str> {
     let candidates: &[&[FieldMeta]] = match summary_type {
-        SummaryType::Http => &[HTTP_FIELDS],
+        SummaryType::Http => &[HTTP_FIELDS, WS_DISCONNECT_FIELDS],
         SummaryType::Stream => &[STREAM_FIELDS],
-        SummaryType::Both => &[HTTP_FIELDS, STREAM_FIELDS],
+        SummaryType::Both => &[HTTP_FIELDS, STREAM_FIELDS, WS_DISCONNECT_FIELDS],
     };
     let mut best: Option<(usize, &'static str)> = None;
     for set in candidates {
@@ -343,11 +430,17 @@ mod tests {
     }
 
     #[test]
-    fn lookup_stream_field_not_on_http() {
-        // protocol is only on StreamTransactionSummary.
-        assert!(lookup(SummaryType::Http, "protocol").is_none());
-        assert!(lookup(SummaryType::Stream, "protocol").is_some());
-        assert!(lookup(SummaryType::Both, "protocol").is_some());
+    fn lookup_stream_only_field_not_on_http() {
+        assert!(lookup(SummaryType::Http, "timestamp_connected").is_none());
+        assert!(lookup(SummaryType::Stream, "timestamp_connected").is_some());
+        assert!(lookup(SummaryType::Both, "timestamp_connected").is_some());
+    }
+
+    #[test]
+    fn lookup_websocket_disconnect_field_as_http() {
+        assert!(lookup(SummaryType::Http, "frames_client_to_backend").is_some());
+        assert!(lookup(SummaryType::Stream, "frames_client_to_backend").is_none());
+        assert!(lookup(SummaryType::Both, "frames_client_to_backend").is_some());
     }
 
     #[test]
@@ -370,12 +463,8 @@ mod tests {
         assert_eq!(namespaces, 1);
         let proxy_ids = all.iter().filter(|f| f.name == "proxy_id").count();
         assert_eq!(proxy_ids, 1);
-        // Total = HTTP_FIELDS.len() + (stream fields not in http).
-        let stream_only = STREAM_FIELDS
-            .iter()
-            .filter(|s| !HTTP_FIELDS.iter().any(|h| h.name == s.name))
-            .count();
-        assert_eq!(all.len(), HTTP_FIELDS.len() + stream_only);
+        let expected = union_fields(&[HTTP_FIELDS, STREAM_FIELDS, WS_DISCONNECT_FIELDS]);
+        assert_eq!(all, expected);
     }
 
     #[test]
@@ -407,5 +496,10 @@ mod tests {
     #[test]
     fn stream_fields_match_expected_count() {
         assert_eq!(STREAM_FIELDS.len(), 21);
+    }
+
+    #[test]
+    fn websocket_disconnect_fields_match_expected_count() {
+        assert_eq!(WS_DISCONNECT_FIELDS.len(), 17);
     }
 }

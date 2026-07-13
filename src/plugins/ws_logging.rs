@@ -20,14 +20,20 @@
 use async_trait::async_trait;
 use futures_util::SinkExt;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::warn;
 use url::{Host, Url};
 
-use super::utils::log_schema::{SchemaView, SummarySchema, resolve_schema};
+use super::utils::log_schema::view::{
+    MetadataNested, extract_host_from_url, serialize_schema_metadata,
+};
+use super::utils::log_schema::{
+    DerivedKind, MetadataPolicy, SchemaSerializable, SchemaView, SummarySchema, TimestampFormat,
+    resolve_schema,
+};
 use super::utils::{BatchConfigDefaults, PluginHttpClient, validate_batch_config};
 use super::{
     ALL_PROTOCOLS, Direction, Plugin, ProxyProtocol, StreamTransactionSummary, TransactionSummary,
@@ -44,14 +50,6 @@ enum LogEntry {
     WebSocket(WsDisconnectLogEntry),
 }
 
-// TODO: extend the customizable log schema to WsDisconnectLogEntry.
-// Today `schema:` / `schema_ref:` on ws_logging only customize HTTP and
-// Stream summaries; WebSocket-disconnect entries fall through with their
-// native field set. Tracked under "Per-Plugin Notes" in
-// docs/log_schema.md. Implementing this means teaching `SchemaView`
-// (or a sibling view) about a third summary kind keyed off the fields
-// in this struct, then routing it through `WsBatchView` like the other
-// two arms.
 #[derive(Clone, serde::Serialize)]
 struct WsDisconnectLogEntry {
     event: &'static str,
@@ -76,6 +74,96 @@ struct WsDisconnectLogEntry {
         serialize_with = "crate::plugins::utils::metadata_redaction::serialize_redacted_metadata"
     )]
     metadata: HashMap<String, String>,
+}
+
+impl SchemaSerializable for WsDisconnectLogEntry {
+    fn serialize_native<S>(
+        &self,
+        source: &'static str,
+        out_key: &str,
+        _ts_format: TimestampFormat,
+        map: &mut S,
+    ) -> Result<(), S::Error>
+    where
+        S: serde::ser::SerializeMap,
+    {
+        match source {
+            "event" => map.serialize_entry(out_key, self.event),
+            "namespace" => map.serialize_entry(out_key, &self.namespace),
+            "proxy_id" => map.serialize_entry(out_key, &self.proxy_id),
+            "proxy_name" => map.serialize_entry(out_key, &self.proxy_name),
+            "client_ip" => map.serialize_entry(out_key, &self.client_ip),
+            "consumer_username" => map.serialize_entry(out_key, &self.consumer_username),
+            "auth_method" => match self.auth_method {
+                Some(value) => map.serialize_entry(out_key, value),
+                None => Ok(()),
+            },
+            "backend_target" => map.serialize_entry(out_key, &self.backend_target),
+            "protocol" => map.serialize_entry(out_key, self.protocol),
+            "listen_port" => map.serialize_entry(out_key, &self.listen_port),
+            "duration_ms" => map.serialize_entry(out_key, &self.duration_ms),
+            "frames_client_to_backend" => {
+                map.serialize_entry(out_key, &self.frames_client_to_backend)
+            }
+            "frames_backend_to_client" => {
+                map.serialize_entry(out_key, &self.frames_backend_to_client)
+            }
+            "direction" => map.serialize_entry(out_key, &self.direction),
+            "io_side" => map.serialize_entry(out_key, &self.io_side),
+            "error_class" => map.serialize_entry(out_key, &self.error_class),
+            "metadata" => {
+                if !self.metadata.is_empty() {
+                    map.serialize_entry(out_key, &MetadataNested(&self.metadata))?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn serialize_derived<S>(
+        &self,
+        kind: DerivedKind,
+        out_key: &str,
+        map: &mut S,
+    ) -> Result<bool, S::Error>
+    where
+        S: serde::ser::SerializeMap,
+    {
+        match kind {
+            DerivedKind::StatusClass => map.serialize_entry(out_key, "none")?,
+            DerivedKind::BackendHost => {
+                let Some(host) = extract_host_from_url(&self.backend_target) else {
+                    return Ok(false);
+                };
+                map.serialize_entry(out_key, host)?;
+            }
+            DerivedKind::SummaryKind => {
+                map.serialize_entry(out_key, "websocket_disconnect")?;
+            }
+            DerivedKind::Outcome => {
+                let outcome = if self.error_class.is_some() {
+                    "error"
+                } else {
+                    "ok"
+                };
+                map.serialize_entry(out_key, outcome)?;
+            }
+        }
+        Ok(true)
+    }
+
+    fn serialize_metadata<S>(
+        &self,
+        policy: &MetadataPolicy,
+        emitted: &mut HashSet<String>,
+        map: &mut S,
+    ) -> Result<(), S::Error>
+    where
+        S: serde::ser::SerializeMap,
+    {
+        serialize_schema_metadata(&self.metadata, policy, emitted, map)
+    }
 }
 
 impl From<&WsDisconnectContext> for WsDisconnectLogEntry {
@@ -114,8 +202,7 @@ struct WsConfig {
 }
 
 /// Serialize-time wrapper: emits the LogEntry slice as a JSON array,
-/// applying `schema` to HTTP / Stream entries when its `summary_type`
-/// matches. WebSocket disconnect entries keep their native format.
+/// applying `schema` to entries when its `summary_type` matches.
 struct WsBatchView<'a> {
     entries: &'a [LogEntry],
     schema: Option<&'a SummarySchema>,
@@ -132,6 +219,14 @@ impl<'a> serde::Serialize for WsBatchView<'a> {
                 }
                 (LogEntry::Stream(summary), Some(schema)) if schema.applies_to_stream() => {
                     seq.serialize_element(&SchemaView { summary, schema })?;
+                }
+                (LogEntry::WebSocket(entry), Some(schema))
+                    if schema.applies_to_websocket_disconnect() =>
+                {
+                    seq.serialize_element(&SchemaView {
+                        summary: entry,
+                        schema,
+                    })?;
                 }
                 _ => seq.serialize_element(entry)?,
             }

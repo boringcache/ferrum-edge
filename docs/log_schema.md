@@ -139,14 +139,31 @@ caveat applies only to incremental admin-API edits.
 | `metadata` | object | `{mode: nested}` | How to render the `metadata` map: `nested` / `omit` / `flatten`. |
 | `timestamp_format` | `rfc3339` / `epoch_ms` / `epoch_s` | `rfc3339` | Conversion for timestamp string fields. Parse failures fall back to the raw string. |
 
+### WebSocket Disconnect Fields
+
+`ws_logging` applies `summary_type: http` and `summary_type: both` schemas
+to the record emitted when a WebSocket session disconnects. The native keys
+available to `omit`, `rename`, and `order` are:
+
+`event`, `namespace`, `proxy_id`, `proxy_name`, `client_ip`,
+`consumer_username`, `auth_method`, `backend_target`, `protocol`,
+`listen_port`, `duration_ms`, `frames_client_to_backend`,
+`frames_backend_to_client`, `direction`, `io_side`, `error_class`, and
+`metadata`.
+
+The disconnect-specific keys are `event`, `frames_client_to_backend`,
+`frames_backend_to_client`, `direction`, and `io_side`. A
+`summary_type: stream` schema remains limited to TCP, UDP, and DTLS entries;
+WebSocket disconnects retain their native shape under that setting.
+
 ### Derived Kinds
 
-| `kind` | HTTP / WS summary | Stream summary |
-|---|---|---|
-| `status_class` | `"1xx"` / `"2xx"` / `"3xx"` / `"4xx"` / `"5xx"` / `"other"` from `response_status_code` | always `"none"` |
-| `backend_host` | hostname from `backend_target` (port stripped, IPv6 brackets honored) | hostname from `backend_target` (port stripped, IPv6 brackets honored) |
-| `summary_kind` | `"http"` | `"stream"` |
-| `outcome` | `"error"` when `response_status_code >= 500` or any error_class is set; else `"ok"` | `"error"` when `connection_error`, `error_class`, or `disconnect_cause: backend_error` is set; else `"ok"` |
+| `kind` | HTTP / WS summary | WebSocket disconnect | Stream summary |
+|---|---|---|---|
+| `status_class` | `"1xx"` / `"2xx"` / `"3xx"` / `"4xx"` / `"5xx"` / `"other"` from `response_status_code` | always `"none"` | always `"none"` |
+| `backend_host` | hostname from `backend_target` (port stripped, IPv6 brackets honored) | hostname from `backend_target` (port stripped, IPv6 brackets honored) | hostname from `backend_target` (port stripped, IPv6 brackets honored) |
+| `summary_kind` | `"http"` | `"websocket_disconnect"` | `"stream"` |
+| `outcome` | `"error"` when `response_status_code >= 500` or any error_class is set; else `"ok"` | `"error"` when `error_class` is set; else `"ok"` | `"error"` when `connection_error`, `error_class`, or `disconnect_cause: backend_error` is set; else `"ok"` |
 
 ### Metadata Modes
 
@@ -221,7 +238,7 @@ reload.
 | `http_logging` | Full | Batched JSON array. |
 | `tcp_logging` | Full | NDJSON, one line per entry. |
 | `udp_logging` | Full | Batched JSON array per UDP datagram. Operators should keep per-summary size under MTU. |
-| `ws_logging` | Full for HTTP / stream summaries; WebSocket disconnect entries are out of scope in v1 | A future release may extend the schema to `WsDisconnectLogEntry`. |
+| `ws_logging` | Full | HTTP / WebSocket entries use `summary_type: http`; TCP / UDP / DTLS entries use `summary_type: stream`. WebSocket disconnect fields and derived-value behavior are documented above. |
 | `kafka_logging` | Full | One JSON message per summary. Partition key (`client_ip` / `proxy_id`) still reads typed fields, so partition keys are NOT affected by `rename:`. |
 | `loki_logging` | Full | Schema-customized JSON appears inside the Loki log line. Loki **labels** (`build_http_labels` / `build_stream_labels`) keep reading typed fields, so labels are NOT affected by `rename:`. |
 | `statsd_logging` | Tag rename / omit only | Static / derived / flatten / timestamp parts of a schema are no-ops here (statsd is line protocol, not JSON). When an inline `schema:` carries any of those keys, the plugin emits a `warn!` at construction time so operators don't ship a schema that silently throws fields away (per-referrer warnings would be noisy, so `schema_ref:` is not inspected — verify the shared schema's intent at the `transaction_log_schema` definition). The schema's `rename` and `omit` operate on the native field names backing the statsd tags. The supported mappings are: HTTP — `http_method`↔`method`, `response_status_code`↔`status`, `proxy_id`↔`proxy`. Stream — `protocol`↔`protocol`, `proxy_id`↔`proxy`, `disconnect_cause`↔`cause`, `disconnect_direction`↔`direction`. Computed statsd tags without native-field backing (`status_class`, `error`) are always emitted with their default names — `omit` and `rename` have no effect on them since they are derived at format time, not read from a summary field. |
@@ -267,10 +284,10 @@ For named schemas:
 - Schema parsing happens once at plugin construction. The compiled
   `Vec<FieldSpec>` lives behind an `Arc` and is shared cheaply.
 - At log time, `SchemaView` walks the compiled vec and forwards each
-  field through the typed summary. No `serde_json::Value` is built; no
-  per-request `HashMap` is allocated. Default-configured plugins (no
-  schema) go through the identical pre-existing serde path with zero
-  added cost.
+  field through the typed HTTP, stream, or WebSocket-disconnect entry. No
+  `serde_json::Value` is built; no per-request `HashMap` is allocated.
+  Default-configured plugins (no schema) go through the identical
+  pre-existing serde path with zero added cost.
 - The named-schemas registry is read-only on the hot path; `schema_ref`
   resolution is a one-shot `Arc::clone` at plugin construction.
 - The existing hot-path guard `if !plugins.is_empty()` (proxy.rs) still
