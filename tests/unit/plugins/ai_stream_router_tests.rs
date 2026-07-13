@@ -7,7 +7,7 @@ use ferrum_edge::plugins::ai_stream_router::AiStreamRouter;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
     ResponseStreamAction, ResponseStreamInspector, ResponseStreamInspectorStage,
-    chain_response_stream_inspectors, priority,
+    chain_response_stream_inspectors, priority, validate_plugin_config,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -164,6 +164,16 @@ fn test_config_rejects_missing_providers() {
         .err()
         .unwrap();
     assert!(err.contains("providers"), "{err}");
+}
+
+#[test]
+fn test_shared_validation_rejects_invalid_ai_stream_router_config() {
+    let err = validate_plugin_config("ai_stream_router", &json!({"enabled": true}))
+        .expect_err("shared plugin validation must require a providers array");
+    assert_eq!(
+        err,
+        "ai_stream_router: 'providers' must be a non-empty array"
+    );
 }
 
 #[test]
