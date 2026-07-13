@@ -40,7 +40,7 @@ use crate::config::types::{
     UPSTREAM_TARGET_SERVICE_PORT_TAG, Upstream, UpstreamTarget, default_namespace,
 };
 use crate::identity::spiffe::TrustDomain;
-use crate::modes::mesh::config::MeshConfig;
+use crate::modes::mesh::config::{MeshConfig, WorkloadSelector};
 
 const MAX_FAULT_DELAY_MS: u64 = 3_600_000;
 const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
@@ -1142,6 +1142,22 @@ pub(crate) fn selector_from_istio(value: Option<&Value>) -> HashMap<String, Stri
         .and_then(|selector| selector.get("matchLabels"))
         .map(string_map)
         .unwrap_or_default()
+}
+
+/// Parse an Istio `selector` only when it contains at least one match label.
+/// Istio classifies both JSON `null` and an explicit empty `matchLabels` map as
+/// namespace/mesh scope; centralizing that rule keeps translation and status
+/// reporting aligned.
+pub(crate) fn workload_selector_from_istio(
+    value: Option<&Value>,
+    namespace: Option<String>,
+) -> Option<WorkloadSelector> {
+    let value = value.filter(|selector| !selector.is_null())?;
+    let selector = WorkloadSelector {
+        labels: selector_from_istio(Some(value)),
+        namespace,
+    };
+    selector.has_labels().then_some(selector)
 }
 
 pub(crate) fn sidecar_selector_from_istio(value: Option<&Value>) -> HashMap<String, String> {

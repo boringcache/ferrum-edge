@@ -1352,6 +1352,9 @@ pub async fn handle_admin_request(
             return api_specs::handlers::handle_list_api_specs(req, &state, &namespace).await;
         }
         (Method::GET, ["api-specs", "by-proxy", proxy_id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
             if let Err(e) = crate::config::types::validate_resource_id(proxy_id) {
                 return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
             }
@@ -1362,6 +1365,9 @@ pub async fn handle_admin_request(
             .await;
         }
         (Method::GET, ["api-specs", id]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
             if let Err(e) = crate::config::types::validate_resource_id(id) {
                 return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
             }
@@ -2632,6 +2638,15 @@ fn parse_json_value(body: &[u8]) -> Result<Value, Box<Response<Full<Bytes>>>> {
     })
 }
 
+fn validate_path_resource_id(id: &str) -> Result<(), Box<Response<Full<Bytes>>>> {
+    crate::config::types::validate_resource_id(id).map_err(|error| {
+        Box::new(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": error}),
+        ))
+    })
+}
+
 fn extend_prefixed_errors(
     validation_errors: &mut Vec<String>,
     kind: &str,
@@ -3257,6 +3272,10 @@ async fn handle_update_credentials(
         return Ok(resp);
     }
 
+    if let Err(resp) = validate_path_resource_id(consumer_id) {
+        return Ok(*resp);
+    }
+
     if !ALLOWED_CREDENTIAL_TYPES.contains(&cred_type) {
         return Ok(invalid_credential_type_response(cred_type));
     }
@@ -3327,6 +3346,10 @@ async fn handle_delete_credentials(
         return Ok(resp);
     }
 
+    if let Err(resp) = validate_path_resource_id(consumer_id) {
+        return Ok(*resp);
+    }
+
     if !ALLOWED_CREDENTIAL_TYPES.contains(&cred_type) {
         return Ok(invalid_credential_type_response(cred_type));
     }
@@ -3374,6 +3397,10 @@ async fn handle_append_credential(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(resp) = state.check_write_allowed() {
         return Ok(resp);
+    }
+
+    if let Err(resp) = validate_path_resource_id(consumer_id) {
+        return Ok(*resp);
     }
 
     if !ALLOWED_CREDENTIAL_TYPES.contains(&cred_type) {
@@ -3477,6 +3504,10 @@ async fn handle_delete_credential_by_index(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(resp) = state.check_write_allowed() {
         return Ok(resp);
+    }
+
+    if let Err(resp) = validate_path_resource_id(consumer_id) {
+        return Ok(*resp);
     }
 
     if !ALLOWED_CREDENTIAL_TYPES.contains(&cred_type) {

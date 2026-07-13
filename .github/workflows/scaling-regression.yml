@@ -1,0 +1,170 @@
+name: Scheduled Scaling Regression
+
+# Weekly coverage for the large functional stress tests intentionally excluded
+# from the pull-request functional shards in ci.yml. Each variant runs in its
+# own matrix job so one backend failure does not hide the remaining signals.
+
+on:
+  schedule:
+    # Saturdays 04:00 UTC, away from the Sunday and Monday maintenance crons.
+    - cron: "0 4 * * 6"
+  workflow_dispatch:
+
+concurrency:
+  group: scaling-regression
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
+jobs:
+  scaling-regression:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 30k proxy scale (SQLite)
+            backend: sqlite
+            test: functional::functional_scale_perf_test::test_scale_perf_30k_proxies
+          - name: 30k proxy scale (PostgreSQL)
+            backend: postgres-scale
+            test: functional::functional_scale_perf_test::test_scale_perf_30k_proxies_postgres
+          - name: 30k proxy scale (MongoDB)
+            backend: mongodb
+            test: functional::functional_scale_perf_test::test_scale_perf_30k_proxies_mongodb
+          - name: 10k proxy load stress (PostgreSQL)
+            backend: postgres-load
+            test: functional::functional_load_stress_test::test_load_stress_10k_proxies
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-scaling-regression"
+
+      - name: Install PostgreSQL client
+        if: matrix.backend == 'postgres-scale'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client
+
+      - name: Install wrk
+        if: matrix.backend == 'postgres-load'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wrk
+
+      - name: Start scale-test PostgreSQL
+        if: matrix.backend == 'postgres-scale'
+        run: |
+          set -euo pipefail
+          docker run -d --name ferrum-scale-test-pg \
+            -e POSTGRES_USER=ferrum \
+            -e POSTGRES_PASSWORD=ferrum-scale-test \
+            -e POSTGRES_DB=ferrum_scale \
+            -p 25432:5432 \
+            postgres:16
+
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in $(seq 1 30); do
+            if docker exec ferrum-scale-test-pg pg_isready -U ferrum 2>/dev/null; then
+              echo "PostgreSQL container ready"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "::error::PostgreSQL did not become ready in 30 seconds"
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Start scale-test MongoDB
+        if: matrix.backend == 'mongodb'
+        run: |
+          set -euo pipefail
+          docker run -d --name ferrum-scale-test-mongo \
+            -p 27117:27017 \
+            mongo:7
+
+          echo "Waiting for MongoDB to be ready..."
+          for i in $(seq 1 30); do
+            if docker exec ferrum-scale-test-mongo \
+              mongosh --quiet --eval 'db.runCommand({ ping: 1 })' >/dev/null 2>&1; then
+              echo "MongoDB container ready"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "::error::MongoDB did not become ready in 30 seconds"
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Start load-test PostgreSQL
+        if: matrix.backend == 'postgres-load'
+        run: |
+          set -euo pipefail
+          docker run -d --name ferrum-load-test-pg \
+            -e POSTGRES_USER=ferrum \
+            -e POSTGRES_PASSWORD=ferrum-load-test \
+            -e POSTGRES_DB=ferrum_load \
+            -p 25433:5432 \
+            postgres:16
+
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in $(seq 1 30); do
+            if docker exec ferrum-load-test-pg pg_isready -U ferrum 2>/dev/null; then
+              echo "PostgreSQL container ready"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "::error::PostgreSQL did not become ready in 30 seconds"
+              exit 1
+            fi
+            sleep 1
+          done
+
+      # Both suites select target/release/ferrum-edge when it is present. The
+      # load-stress test also invokes this build internally; prebuilding makes
+      # that second invocation a fast fingerprint check.
+      - name: Build release gateway binary
+        run: cargo build --release --bin ferrum-edge
+
+      - name: Run scheduled scaling regression
+        run: |
+          set -euo pipefail
+          cargo test --test functional_tests -- \
+            --ignored \
+            --exact "${{ matrix.test }}" \
+            --nocapture 2>&1 | tee scaling-regression.log
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Summarize scaling regression
+        if: always()
+        run: |
+          {
+            echo "## ${{ matrix.name }}"
+            echo ""
+            echo "- Test: \`${{ matrix.test }}\`"
+            echo "- Backend: \`${{ matrix.backend }}\`"
+            echo "- Job status: **${{ job.status }}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload scaling regression log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: scaling-regression-${{ matrix.backend }}-${{ github.sha }}
+          path: scaling-regression.log
+          retention-days: 30
+          if-no-files-found: ignore

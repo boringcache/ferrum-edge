@@ -2,7 +2,7 @@
 
 use ferrum_edge::plugins::{
     Plugin, ProxyProtocol, RequestContext, StreamTransactionSummary,
-    transaction_debugger::TransactionDebugger,
+    transaction_debugger::TransactionDebugger, validate_plugin_config,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -288,6 +288,16 @@ fn test_transaction_debugger_invalid_config_shapes_rejected() {
         let err = TransactionDebugger::new(&config).err().unwrap();
         assert!(err.contains(needle), "needle={needle}, got: {err}");
     }
+}
+
+#[test]
+fn test_shared_validation_rejects_invalid_transaction_debugger_config() {
+    let err = validate_plugin_config("transaction_debugger", &json!({"log_request_body": "yes"}))
+        .expect_err("shared plugin validation must reject a non-boolean log_request_body");
+    assert_eq!(
+        err,
+        "transaction_debugger: 'log_request_body' must be a boolean"
+    );
 }
 
 #[tokio::test]

@@ -68,7 +68,7 @@ use tracing::warn;
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
     service_entry_port_protocol_is_udp, sidecar_selector_from_istio,
-    translate_k8s_objects_with_filter,
+    translate_k8s_objects_with_filter, workload_selector_from_istio,
 };
 
 /// Field manager used on every `patch_status` call. Kubernetes uses this
@@ -502,7 +502,7 @@ fn peer_authentication_status(
         .unwrap_or("UNSET")
         .to_string();
     let scope = istio_policy_scope_label(object, istio_root_namespace);
-    let port_overrides: Vec<String> = object
+    let configured_port_overrides: Vec<String> = object
         .spec
         .get("portLevelMtls")
         .and_then(Value::as_object)
@@ -515,6 +515,14 @@ fn peer_authentication_status(
                 .collect()
         })
         .unwrap_or_default();
+    let has_workload_selector = scope == "WorkloadSelector";
+    let port_overrides_ignored_without_nonempty_selector =
+        !has_workload_selector && !configured_port_overrides.is_empty();
+    let port_overrides = if has_workload_selector {
+        configured_port_overrides
+    } else {
+        Vec::new()
+    };
 
     let (accepted, reason, message, detail) = match result {
         Ok(_translation) => {
@@ -527,45 +535,20 @@ fn peer_authentication_status(
             } else {
                 resolved_mode.as_str()
             };
-            // `portLevelMtls` is imported verbatim (app-port keyed) but the
-            // inbound mesh listener terminates mTLS on a single transport port
-            // and cannot vary STRICT/PERMISSIVE per app port without
-            // SO_ORIGINAL_DST demux. The runtime applies the top-level mode to
-            // the whole listener unless an override key equals the transport
-            // port, in which case that override applies listener-wide. Either
-            // way, the per-app-port intent is NOT enforced.
-            // FerrumAccepted stays True (the policy is otherwise valid and its
-            // listener-wide mode is applied), but the gap MUST be visible so
-            // FerrumAccepted=True no longer implies per-port enforcement. Keep
-            // this in sync with the translator warning in
-            // `src/config_sources/k8s/istio.rs`.
-            let mut deferred: Vec<&'static str> = Vec::new();
-            if !port_overrides.is_empty() {
-                deferred.push(
-                    "portLevelMtls (per-app-port mTLS not enforced: the inbound mesh listener \
-                     terminates mTLS on a single transport port; the top-level mtls.mode governs \
-                     the whole listener unless an override key equals the transport port, in \
-                     which case that override governs the whole listener; per-app-port \
-                     enforcement via SO_ORIGINAL_DST demux is tracked separately)",
-                );
-            }
-            let message = if deferred.is_empty() {
-                format!(
-                    "Ferrum accepted this PeerAuthentication (scope: {scope}; resolved mTLS mode: {effective_mode})"
-                )
+            let ignored_suffix = if port_overrides_ignored_without_nonempty_selector {
+                "; portLevelMtls ignored because no non-empty workload selector is specified"
             } else {
-                format!(
-                    "Ferrum accepted this PeerAuthentication (scope: {scope}; resolved mTLS mode: \
-                     {effective_mode}); deferred fields: {}",
-                    deferred.join(", ")
-                )
+                ""
             };
+            let message = format!(
+                "Ferrum accepted this PeerAuthentication (scope: {scope}; resolved mTLS mode: {effective_mode}{ignored_suffix})"
+            );
             let detail = json!({
                 "translation": {
                     "scope": scope,
                     "configured_mtls_mode": resolved_mode,
                     "port_level_overrides": port_overrides,
-                    "deferred_fields": deferred,
+                    "port_level_overrides_ignored_without_nonempty_selector": port_overrides_ignored_without_nonempty_selector,
                 }
             });
             (true, "Accepted", message, Some(detail))
@@ -1376,10 +1359,10 @@ fn telemetry_status(
 
 /// Resolve the Istio policy scope label for selector-driven CRDs
 /// (`RequestAuthentication`, etc.) the same way the translator's
-/// `istio_policy_scope` does: a `selector` means `WorkloadSelector`, the
-/// root namespace means `MeshWide`, otherwise `Namespace`.
+/// `istio_policy_scope` does: a non-empty selector means `WorkloadSelector`,
+/// the root namespace means `MeshWide`, otherwise `Namespace`.
 fn istio_policy_scope_label(object: &K8sObject, istio_root_namespace: &str) -> &'static str {
-    if object.spec.get("selector").is_some() {
+    if workload_selector_from_istio(object.spec.get("selector"), None).is_some() {
         "WorkloadSelector"
     } else if object.metadata.namespace == istio_root_namespace
         || object.metadata.namespace.is_empty()
@@ -1772,6 +1755,7 @@ mod tests {
             "PeerAuthentication",
             "mixed-modes",
             json!({
+                "selector": { "matchLabels": { "app": "api" } },
                 "mtls": { "mode": "STRICT" },
                 "portLevelMtls": {
                     "8080": { "mode": "PERMISSIVE" },
