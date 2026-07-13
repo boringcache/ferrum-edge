@@ -630,7 +630,30 @@ impl MeshSlice {
     /// resolved its authoritative labels) is enforcement-IDENTICAL to the plain
     /// resolver.
     pub fn resolve_inbound_mtls_mode_fail_closed(&self, port: u16) -> MtlsMode {
-        let resolved = self.resolve_effective_mtls_mode(port);
+        if !self.labels_ambiguous {
+            return self.resolve_effective_mtls_mode(port);
+        }
+        self.resolve_inbound_mtls_mode_fail_closed_with(|pa| peer_auth_effective_mode(pa, port))
+    }
+
+    /// Workload-level counterpart to
+    /// [`Self::resolve_inbound_mtls_mode_fail_closed`]. This preserves the
+    /// ambiguous-label fail-closed escalation while deliberately excluding
+    /// every app-port override from the listener-wide fallback.
+    pub fn resolve_inbound_workload_mtls_mode_fail_closed(&self) -> MtlsMode {
+        self.resolve_inbound_mtls_mode_fail_closed_with(|pa| pa.mtls_mode)
+    }
+
+    fn resolve_inbound_mtls_mode_fail_closed_with(
+        &self,
+        mode_for: impl Fn(&PeerAuthentication) -> MtlsMode + Copy,
+    ) -> MtlsMode {
+        let resolved = resolve_peer_auth_mtls_mode(
+            &self.peer_authentications,
+            &self.namespace,
+            &self.labels,
+            mode_for,
+        );
         if !self.labels_ambiguous {
             return resolved;
         }
@@ -660,7 +683,7 @@ impl MeshSlice {
             if !peer_auth_selector_namespace_matches(pa, &self.namespace) {
                 continue;
             }
-            let candidate = peer_auth_effective_mode(pa, port);
+            let candidate = mode_for(pa);
             if peer_auth_mtls_restrictiveness(candidate) < peer_auth_mtls_restrictiveness(effective)
             {
                 effective = candidate;
@@ -668,7 +691,6 @@ impl MeshSlice {
         }
         if effective != resolved {
             tracing::warn!(
-                port,
                 resolved = ?resolved,
                 fail_closed = ?effective,
                 "mesh PeerAuthentication: ambiguous shared-SPIFFE slice carries a candidate-only \
@@ -679,49 +701,6 @@ impl MeshSlice {
             );
         }
         effective
-    }
-
-    /// PeerAuthentications considered by inbound resolution carrying
-    /// `port_overrides` (Istio `portLevelMtls`). On an ambiguous-label slice
-    /// this includes candidate-only selector policies considered by fail-closed
-    /// resolution.
-    ///
-    /// Those overrides are NOT enforced today: one `rustls::ServerConfig` per
-    /// listener cannot vary STRICT/PERMISSIVE per app port without pre-handshake
-    /// SO_ORIGINAL_DST demux, so [`Self::resolve_effective_mtls_mode`] resolves
-    /// one mode for the whole listener. Normally the top-level `mtls_mode` wins;
-    /// when a key equals the transport resolution port, that override wins
-    /// listener-wide rather than per app port. This does NOT change that
-    /// resolution — it only reports the dropped intent so startup can surface it (fail-open / fail-closed
-    /// visibility) for EVERY config source (native `MeshSubscribe`, xDS, file),
-    /// not just the K8s translator/status path. Full per-app-port enforcement is
-    /// tracked as a separate architectural item.
-    ///
-    /// Returns `(policy_namespace/name, sorted_unenforced_ports)` for each
-    /// offending applicable policy; empty when nothing is dropped.
-    pub fn unenforced_peer_auth_port_overrides(&self) -> Vec<(String, Vec<u16>)> {
-        let mut reported = Vec::new();
-        for pa in &self.peer_authentications {
-            let applies = peer_auth_applies_to_workload(pa, &self.namespace, &self.labels);
-            let ambiguous_candidate = self.labels_ambiguous
-                && classify_peer_auth_scope(pa) == PeerAuthScope::WorkloadSelector
-                && peer_auth_selector_namespace_matches(pa, &self.namespace);
-            if !applies && !ambiguous_candidate {
-                continue;
-            }
-            // Istio portLevelMtls keys are workload app/container ports. Report
-            // every key, including one whose number happens to equal the mesh
-            // transport listener port: that collision applies the selected mode
-            // listener-wide and still does not honor the operator's per-app-port
-            // intent.
-            let mut ports: Vec<u16> = pa.port_overrides.keys().copied().collect();
-            if ports.is_empty() {
-                continue;
-            }
-            ports.sort_unstable();
-            reported.push((format!("{}/{}", pa.namespace, pa.name), ports));
-        }
-        reported
     }
 
     /// Returns the most-specific applicable [`MeshProxyConfig`] for this slice's
@@ -2742,13 +2721,23 @@ fn classify_peer_auth_scope(pa: &PeerAuthentication) -> PeerAuthScope {
         return match scope {
             PolicyScope::MeshWide => PeerAuthScope::MeshWide,
             PolicyScope::Namespace { .. } => PeerAuthScope::Namespace,
-            PolicyScope::WorkloadSelector { .. } => PeerAuthScope::WorkloadSelector,
+            PolicyScope::WorkloadSelector { .. } if pa.has_workload_selector() => {
+                PeerAuthScope::WorkloadSelector
+            }
+            // Defensive normalization for native/file slices: an empty
+            // selector is a namespace default when namespace-constrained and a
+            // mesh default when it has no namespace constraint.
+            PolicyScope::WorkloadSelector { selector } if selector.namespace.is_none() => {
+                PeerAuthScope::MeshWide
+            }
+            PolicyScope::WorkloadSelector { .. } => PeerAuthScope::Namespace,
         };
     }
 
-    match &pa.selector {
-        Some(selector) if !selector.labels.is_empty() => PeerAuthScope::WorkloadSelector,
-        _ => PeerAuthScope::Namespace,
+    if pa.has_workload_selector() {
+        PeerAuthScope::WorkloadSelector
+    } else {
+        PeerAuthScope::Namespace
     }
 }
 
@@ -2793,12 +2782,18 @@ fn peer_auth_applies_to_workload<L: WorkloadLabels + ?Sized>(
 }
 
 /// Effective inbound mTLS mode a single PeerAuthentication yields for `port`: a
-/// per-port override takes precedence over the policy's top-level `mtls_mode`.
+/// per-port override on a selector-scoped policy takes precedence over the
+/// policy's top-level `mtls_mode`. Selector-less namespace/mesh-wide policies
+/// ignore `port_overrides`, matching Istio's `portLevelMtls` contract.
 fn peer_auth_effective_mode(pa: &PeerAuthentication, port: u16) -> MtlsMode {
-    pa.port_overrides
-        .get(&port)
-        .copied()
-        .unwrap_or(pa.mtls_mode)
+    if pa.has_workload_selector() {
+        pa.port_overrides
+            .get(&port)
+            .copied()
+            .unwrap_or(pa.mtls_mode)
+    } else {
+        pa.mtls_mode
+    }
 }
 
 /// Fail-secure restrictiveness rank used to resolve SAME-tier
@@ -2827,6 +2822,17 @@ pub fn resolve_effective_mtls_mode<L: WorkloadLabels + ?Sized>(
     labels: &L,
     port: u16,
 ) -> MtlsMode {
+    resolve_peer_auth_mtls_mode(peer_auths, namespace, labels, |pa| {
+        peer_auth_effective_mode(pa, port)
+    })
+}
+
+fn resolve_peer_auth_mtls_mode<'a, L: WorkloadLabels + ?Sized>(
+    peer_auths: &'a [PeerAuthentication],
+    namespace: &str,
+    labels: &L,
+    mode_for: impl Fn(&'a PeerAuthentication) -> MtlsMode,
+) -> MtlsMode {
     let mut best: Option<(PeerAuthScope, &PeerAuthentication)> = None;
 
     for pa in peer_auths {
@@ -2854,10 +2860,8 @@ pub fn resolve_effective_mtls_mode<L: WorkloadLabels + ?Sized>(
                 Ordering::Greater => true,
                 Ordering::Less => false,
                 Ordering::Equal => {
-                    let candidate =
-                        peer_auth_mtls_restrictiveness(peer_auth_effective_mode(pa, port));
-                    let current =
-                        peer_auth_mtls_restrictiveness(peer_auth_effective_mode(current_pa, port));
+                    let candidate = peer_auth_mtls_restrictiveness(mode_for(pa));
+                    let current = peer_auth_mtls_restrictiveness(mode_for(current_pa));
                     match candidate.cmp(&current) {
                         Ordering::Less => true,
                         Ordering::Greater => false,
@@ -2875,7 +2879,7 @@ pub fn resolve_effective_mtls_mode<L: WorkloadLabels + ?Sized>(
     }
 
     match best {
-        Some((_, pa)) => peer_auth_effective_mode(pa, port),
+        Some((_, pa)) => mode_for(pa),
         None => MtlsMode::Permissive,
     }
 }
@@ -5119,27 +5123,82 @@ mod tests {
         let policies = vec![pa(
             "ns-strict",
             "default",
+            Some(WorkloadSelector {
+                labels: HashMap::from([("app".into(), "api".into())]),
+                namespace: None,
+            }),
+            MtlsMode::Strict,
+            HashMap::from([(8080, MtlsMode::Disable)]),
+        )];
+        let labels = HashMap::from([("app".to_string(), "api".to_string())]);
+        // Port 8080 has an override to Disable.
+        let mode = resolve_effective_mtls_mode(&policies, "default", &labels, 8080);
+        assert_eq!(mode, MtlsMode::Disable);
+
+        // Port 443 uses the top-level mode.
+        let mode = resolve_effective_mtls_mode(&policies, "default", &labels, 443);
+        assert_eq!(mode, MtlsMode::Strict);
+    }
+
+    #[test]
+    fn selectorless_port_override_is_ignored() {
+        let policies = vec![pa(
+            "namespace-strict",
+            "default",
             None,
             MtlsMode::Strict,
             HashMap::from([(8080, MtlsMode::Disable)]),
         )];
-        // Port 8080 has an override to Disable.
-        let mode = resolve_effective_mtls_mode(
-            &policies,
-            "default",
-            &HashMap::<String, String>::new(),
-            8080,
-        );
-        assert_eq!(mode, MtlsMode::Disable);
 
-        // Port 443 uses the top-level mode.
-        let mode = resolve_effective_mtls_mode(
-            &policies,
-            "default",
-            &HashMap::<String, String>::new(),
-            443,
+        assert_eq!(
+            resolve_effective_mtls_mode(
+                &policies,
+                "default",
+                &HashMap::<String, String>::new(),
+                8080,
+            ),
+            MtlsMode::Strict,
+            "portLevelMtls must not alter a selector-less namespace policy"
         );
-        assert_eq!(mode, MtlsMode::Strict);
+    }
+
+    #[test]
+    fn empty_selector_is_not_workload_scoped_and_ignores_port_override() {
+        let policy = pa(
+            "empty-selector",
+            "default",
+            Some(WorkloadSelector::default()),
+            MtlsMode::Strict,
+            HashMap::from([(8080, MtlsMode::Disable)]),
+        );
+
+        assert!(!policy.has_workload_selector());
+        assert_eq!(classify_peer_auth_scope(&policy), PeerAuthScope::Namespace);
+        assert_eq!(
+            resolve_effective_mtls_mode(
+                std::slice::from_ref(&policy),
+                "default",
+                &HashMap::<String, String>::new(),
+                8080,
+            ),
+            MtlsMode::Strict,
+            "an explicit empty selector is a namespace default and cannot activate portLevelMtls"
+        );
+
+        let mesh_policy = pa_with_scope(
+            "empty-root-selector",
+            "istio-system",
+            PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector::default(),
+            },
+            MtlsMode::Strict,
+        );
+        assert!(!mesh_policy.has_workload_selector());
+        assert_eq!(
+            classify_peer_auth_scope(&mesh_policy),
+            PeerAuthScope::MeshWide,
+            "an empty root selector is a mesh default, not workload scope"
+        );
     }
 
     #[test]
