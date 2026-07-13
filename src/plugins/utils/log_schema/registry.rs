@@ -335,6 +335,7 @@ mod tests {
             fields: Vec::<FieldSpec>::new(),
             metadata: MetadataPolicy::Nested,
             timestamp_format: TimestampFormat::Rfc3339,
+            capability_scoped: false,
         })
     }
 
