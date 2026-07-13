@@ -9769,7 +9769,7 @@ async fn serve_mesh_runtime(
     let mesh_frontend_identity =
         load_mesh_frontend_server_identity(&env_config, &proxy_state.gateway_svid_bundle)?;
     let inbound_mtls_modes_by_port =
-        resolve_inbound_mtls_modes_by_port(initial_applied_mesh_slice.as_deref());
+        resolve_inbound_mtls_modes_by_port(initial_applied_mesh_slice.as_deref(), &runtime);
     let inbound_app_port_by_orig_dst_port =
         resolve_inbound_app_ports_by_orig_dst_port(initial_applied_mesh_slice.as_deref());
     let has_inbound_tls_termination_listener = runtime.has_inbound_tls_termination_listener();
@@ -10521,41 +10521,46 @@ fn resolve_inbound_mtls_mode(
 /// Return every local app/listener port that can select a PeerAuthentication
 /// override for this slice. Carried namespace policies may mention ports served
 /// by unrelated workloads, so their raw key union is not a safe listener table.
-fn selectable_inbound_peer_auth_ports(slice: &MeshSlice) -> std::collections::BTreeSet<u16> {
+fn selectable_inbound_peer_auth_ports(
+    slice: &MeshSlice,
+    runtime: &MeshRuntimeConfig,
+) -> std::collections::BTreeSet<u16> {
     let mut ports = std::collections::BTreeSet::new();
-    let (services, local_workloads): (
+    let (services, local_workload_src): (
         &[crate::modes::mesh::config::MeshService],
-        Vec<&crate::modes::mesh::config::Workload>,
+        &[crate::modes::mesh::config::Workload],
     ) = match slice.local_inbound_workloads.as_deref() {
-        Some(workloads) => (
-            slice.local_inbound_services.as_slice(),
-            workloads.iter().collect(),
-        ),
-        None => {
-            let Some(local_spiffe) = slice.workload_spiffe_id.as_deref() else {
-                return slice
-                    .local_ingress_listeners
-                    .iter()
-                    .filter(|listener| {
-                        listener.endpoint_is_valid()
-                            && !listener.owner_namespace.is_empty()
-                            && !listener.owner_service.is_empty()
-                    })
-                    .map(|listener| listener.endpoint_port)
-                    .filter(|port| *port != 0)
-                    .collect();
-            };
-            (
-                slice.services.as_slice(),
-                crate::modes::mesh::slice::resolve_local_workloads(
-                    &slice.workloads,
-                    local_spiffe,
-                    &slice.labels,
-                    None,
-                ),
-            )
-        }
+        Some(workloads) => (slice.local_inbound_services.as_slice(), workloads),
+        None => (slice.services.as_slice(), slice.workloads.as_slice()),
     };
+    let Some(local_spiffe) = runtime.workload_spiffe_id.as_deref() else {
+        return slice
+            .local_ingress_listeners
+            .iter()
+            .filter(|listener| {
+                listener.endpoint_is_valid()
+                    && !listener.owner_namespace.is_empty()
+                    && !listener.owner_service.is_empty()
+            })
+            .map(|listener| listener.endpoint_port)
+            .filter(|port| *port != 0)
+            .collect();
+    };
+    // Keep the policy table's selectable port domain identical to the inbound
+    // route materializer. In particular, a cluster-tagged local workload must
+    // be matched with the slice-declared local cluster rather than rejected as
+    // remote, and the process runtime's SPIFFE identity is authoritative over
+    // a stale or differently sourced identity carried in the slice.
+    let local_cluster = slice
+        .multi_cluster
+        .as_ref()
+        .and_then(|multi_cluster| multi_cluster.local_cluster.as_deref());
+    let local_workloads = crate::modes::mesh::slice::resolve_local_workloads(
+        local_workload_src,
+        local_spiffe,
+        &slice.labels,
+        local_cluster,
+    );
 
     for workload in local_workloads {
         ports.extend(
@@ -10599,6 +10604,7 @@ fn selectable_inbound_peer_auth_ports(slice: &MeshSlice) -> std::collections::BT
 /// each individual port.
 fn resolve_inbound_mtls_modes_by_port(
     slice: Option<&MeshSlice>,
+    runtime: &MeshRuntimeConfig,
 ) -> std::collections::BTreeMap<u16, config::MtlsMode> {
     let Some(slice) = slice else {
         return std::collections::BTreeMap::new();
@@ -10618,7 +10624,7 @@ fn resolve_inbound_mtls_modes_by_port(
             .map(|port| (port, slice.resolve_inbound_mtls_mode_fail_closed(port)))
             .collect();
     }
-    let local_ports = selectable_inbound_peer_auth_ports(slice);
+    let local_ports = selectable_inbound_peer_auth_ports(slice, runtime);
     carried_override_ports
         .into_iter()
         .filter(|port| local_ports.contains(port))
@@ -10739,7 +10745,7 @@ fn startup_inbound_mtls_mode(
 ) -> Result<config::MtlsMode, anyhow::Error> {
     let resolved = resolve_inbound_mtls_mode(initial_slice, runtime);
     validate_inbound_mtls_mode_for_topology(runtime, resolved)?;
-    for (port, mode) in resolve_inbound_mtls_modes_by_port(initial_slice) {
+    for (port, mode) in resolve_inbound_mtls_modes_by_port(initial_slice, runtime) {
         validate_inbound_mtls_mode_for_topology(runtime, mode).with_context(|| {
             format!("PeerAuthentication portLevelMtls[{port}] is invalid for this topology")
         })?;
@@ -10762,7 +10768,7 @@ fn live_reload_inbound_mtls_mode(
         );
         return None;
     }
-    for (port, mode) in resolve_inbound_mtls_modes_by_port(Some(slice)) {
+    for (port, mode) in resolve_inbound_mtls_modes_by_port(Some(slice), runtime) {
         if let Err(error) = validate_inbound_mtls_mode_for_topology(runtime, mode) {
             warn!(
                 mesh_slice_version = %slice.version,
@@ -12409,7 +12415,7 @@ fn plan_mesh_inbound_tls_reload_with_federation(
     // path does not re-derive `runtime.listener_plan()` on every slice apply.
     has_termination_listener: bool,
 ) -> Option<MeshInboundTlsReloadPlan> {
-    let port_modes = resolve_inbound_mtls_modes_by_port(Some(slice));
+    let port_modes = resolve_inbound_mtls_modes_by_port(Some(slice), runtime);
     let mut next_snapshot = match mesh_inbound_tls_reload_snapshot_for_listener(
         &proxy_state.env_config,
         mtls_mode,
@@ -18029,6 +18035,10 @@ mod tests {
             version: "test".to_string(),
             workloads: vec![local],
             services: vec![http_mesh_service("reviews", 8080, spiffe)],
+            peer_authentications: vec![peer_auth_with_port_override(
+                8080,
+                config::MtlsMode::Strict,
+            )],
             multi_cluster: Some(MultiClusterConfig {
                 local_cluster: Some("cluster-a".to_string()),
                 ..MultiClusterConfig::default()
@@ -18044,6 +18054,11 @@ mod tests {
                 .iter()
                 .any(|p| p.id == "__mesh-inbound-default-reviews-8080"),
             "a workload tagged with the local cluster name must materialize a route"
+        );
+        assert_eq!(
+            resolve_inbound_mtls_modes_by_port(Some(&slice), &runtime),
+            std::collections::BTreeMap::from([(8080, config::MtlsMode::Strict)]),
+            "the exact runtime identity and local-cluster context used to materialize the route must also retain its portLevelMtls posture"
         );
     }
 
@@ -26058,6 +26073,16 @@ mod tests {
         }
     }
 
+    fn resolve_inbound_mtls_modes_by_port_for_test(
+        slice: &MeshSlice,
+    ) -> std::collections::BTreeMap<u16, config::MtlsMode> {
+        let runtime = MeshRuntimeConfig {
+            workload_spiffe_id: slice.workload_spiffe_id.clone(),
+            ..runtime_with_topology(MeshTopology::Sidecar)
+        };
+        resolve_inbound_mtls_modes_by_port(Some(slice), &runtime)
+    }
+
     #[test]
     fn inbound_mtls_modes_by_port_resolve_mixed_policy_independently() {
         let mut local = workload("reviews", "reviews");
@@ -26083,7 +26108,7 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_inbound_mtls_modes_by_port(Some(&slice)),
+            resolve_inbound_mtls_modes_by_port_for_test(&slice),
             std::collections::BTreeMap::from([
                 (8080, config::MtlsMode::Strict),
                 (9090, config::MtlsMode::Permissive),
@@ -26111,7 +26136,7 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_inbound_mtls_modes_by_port(Some(&slice)),
+            resolve_inbound_mtls_modes_by_port_for_test(&slice),
             std::collections::BTreeMap::from([(8080, config::MtlsMode::Strict)]),
             "an unrelated namespace-wide override must not alter this listener posture"
         );
@@ -26142,7 +26167,7 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_inbound_mtls_modes_by_port(Some(&slice)),
+            resolve_inbound_mtls_modes_by_port_for_test(&slice),
             std::collections::BTreeMap::from([(8080, config::MtlsMode::Strict)]),
             "PeerAuthentication keys only on the resolved workload/container app port"
         );
@@ -26170,7 +26195,7 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_inbound_mtls_modes_by_port(Some(&slice)),
+            resolve_inbound_mtls_modes_by_port_for_test(&slice),
             std::collections::BTreeMap::from([(8080, config::MtlsMode::Strict)]),
             "PeerAuthentication keys ingress overrides by the backend container port, not the listener port"
         );
@@ -26260,7 +26285,7 @@ mod tests {
         slice.labels_ambiguous = true;
 
         assert_eq!(
-            resolve_inbound_mtls_modes_by_port(Some(&slice)),
+            resolve_inbound_mtls_modes_by_port_for_test(&slice),
             std::collections::BTreeMap::from([(8080, config::MtlsMode::Strict)]),
             "ambiguous local workload resolution must retain candidate overrides"
         );
@@ -26283,7 +26308,8 @@ mod tests {
                 mtls_mode: config::MtlsMode::Strict,
                 port_overrides: HashMap::from([(transport_port, config::MtlsMode::Permissive)]),
             }]);
-            let runtime = runtime_with_topology(topology);
+            let mut runtime = runtime_with_topology(topology);
+            runtime.workload_spiffe_id = slice.workload_spiffe_id.clone();
 
             assert_eq!(
                 resolve_inbound_mtls_mode(Some(&slice), &runtime),
@@ -26291,7 +26317,8 @@ mod tests {
                 "{topology:?} transport port must not become the listener-wide app-port fallback",
             );
             assert!(
-                !resolve_inbound_mtls_modes_by_port(Some(&slice)).contains_key(&transport_port),
+                !resolve_inbound_mtls_modes_by_port(Some(&slice), &runtime)
+                    .contains_key(&transport_port),
                 "a mesh transport port with no local app/listener alias must be ignored",
             );
         }
