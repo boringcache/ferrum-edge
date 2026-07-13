@@ -10319,6 +10319,53 @@ mod inner {
         }
 
         #[test]
+        fn load_full_config_rejects_after_normalization_and_identity_quarantine() {
+            let source = include_str!("mongo_store.rs");
+            let load_start = source
+                .find(
+                    "async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error>",
+                )
+                .expect("Mongo load_full_config function");
+            let load_path = &source[load_start..];
+            let snapshot_start = load_path
+                .find("async fn load_namespace_snapshot(")
+                .expect("load_namespace_snapshot following load_full_config");
+            let load_body = &load_path[..snapshot_start];
+
+            let normalize = load_body
+                .find("config.normalize_fields();")
+                .expect("load_full_config normalization");
+            let quarantine = load_body
+                .find("config.quarantine_colliding_consumer_identities()")
+                .expect("load_full_config identity quarantine");
+            let rejecting_validation = load_body
+                .find("collect_rejecting_runtime_config_errors(&config)")
+                .expect("load_full_config shared rejecting validation");
+            let non_empty_guard = load_body
+                .find("if !validation_errors.is_empty() {")
+                .expect("load_full_config non-empty validation guard");
+            let rejection = load_body
+                .find("anyhow::bail!(")
+                .expect("load_full_config rejecting bail");
+            let success = load_body
+                .find("Ok(config)")
+                .expect("load_full_config success return");
+
+            assert!(
+                normalize < quarantine && quarantine < rejecting_validation,
+                "load_full_config must run shared rejecting validation after normalization and \
+                 consumer identity quarantine"
+            );
+            assert!(
+                rejecting_validation < non_empty_guard
+                    && non_empty_guard < rejection
+                    && rejection < success,
+                "non-empty rejecting validation errors must bail before load_full_config can \
+                 return Ok(config)"
+            );
+        }
+
+        #[test]
         fn update_paths_preserve_api_spec_id_in_replacement_doc() {
             let source = include_str!("mongo_store.rs");
             let update_proxy_start = source
