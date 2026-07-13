@@ -10573,9 +10573,6 @@ fn selectable_inbound_peer_auth_ports(slice: &MeshSlice) -> std::collections::BT
                     .any(|candidate| candidate.spiffe_id == workload.spiffe_id)
         }) {
             for service_port in &service.ports {
-                if service_port.port != 0 {
-                    ports.insert(service_port.port);
-                }
                 if let Some(app_port) = resolve_sidecar_inbound_backend_port(service_port, workload)
                     .filter(|port| *port != 0)
                 {
@@ -26101,6 +26098,37 @@ mod tests {
             resolve_inbound_mtls_modes_by_port(Some(&slice)),
             std::collections::BTreeMap::from([(8080, config::MtlsMode::Strict)]),
             "an unrelated namespace-wide override must not alter this listener posture"
+        );
+    }
+
+    #[test]
+    fn inbound_mtls_modes_by_port_exclude_service_ports() {
+        let local = workload("reviews", "reviews");
+        let mut service = http_mesh_service("reviews", 80, local.spiffe_id.as_str());
+        service.ports[0].target_port = Some(ServiceTargetPort::Number(8080));
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workload_spiffe_id: Some(local.spiffe_id.to_string()),
+            workloads: vec![local],
+            services: vec![service],
+            peer_authentications: vec![config::PeerAuthentication {
+                name: "service-port-is-not-an-app-port".to_string(),
+                namespace: "default".to_string(),
+                scope: None,
+                selector: None,
+                mtls_mode: config::MtlsMode::Permissive,
+                port_overrides: HashMap::from([
+                    (80, config::MtlsMode::Disable),
+                    (8080, config::MtlsMode::Strict),
+                ]),
+            }],
+            ..MeshSlice::default()
+        };
+
+        assert_eq!(
+            resolve_inbound_mtls_modes_by_port(Some(&slice)),
+            std::collections::BTreeMap::from([(8080, config::MtlsMode::Strict)]),
+            "PeerAuthentication keys only on the resolved workload/container app port"
         );
     }
 

@@ -901,20 +901,22 @@ before the handshake. Direct mesh-transport dials have no original destination,
 so a policy whose app ports span TLS and plaintext wire postures uses a
 PERMISSIVE-style acceptor: it peeks without consuming the first record and can
 admit either verified TLS or plaintext far enough to route the request. After
-HTTP authority, HBONE CONNECT target, or an east-west per-port SNI route
-resolves the app port, Ferrum verifies that the connection's actual transport
-satisfies that port's effective mode. `STRICT` requires a verified peer
+HTTP authority or an HBONE CONNECT target resolves the app port, Ferrum verifies
+that the connection's actual transport satisfies that port's effective mode.
+`STRICT` requires a verified peer
 certificate, `DISABLE` requires plaintext, and `PERMISSIVE` admits either. The
 acceptor is not an authorization bypass: a mismatch is rejected before the
 plugin/backend path with a structured warning and a protocol-appropriate 403
 response (including normalized gRPC rejection).
 
-`FERRUM_MESH_PRODUCTION_MODE=true` permits only `STRICT` on inbound
-TLS-terminating topologies. Startup refuses a workload-level or per-app-port
-`PERMISSIVE`/`DISABLE` posture even when usable server TLS material exists, and
-live reload rejects the entire plaintext-capable slice while retaining the
-last-good policy. East-west gateways are exempt because they do SNI passthrough
-and build no inbound terminating `ServerConfig`.
+`FERRUM_MESH_PRODUCTION_MODE=true` never enables plaintext on inbound
+TLS-terminating listeners. A `PERMISSIVE` policy with usable server TLS material
+is accepted at startup and on live reload, but the production listener is
+coerced to TLS-only (client certificates remain optional for non-egress
+topologies). If the workload-level mode or any per-app-port mode cannot produce
+a usable TLS config, startup fails closed; live reload rejects the entire slice
+and retains the last-good policy. East-west gateways are exempt because they do
+SNI passthrough and build no inbound terminating `ServerConfig`.
 
 The following policy requires a client certificate on port 8080 while allowing
 optional client authentication on port 8081:
@@ -964,7 +966,7 @@ Frontend cert/key paths are independently controlled by `FERRUM_FRONTEND_TLS_LIV
 - **ServiceWaypoint**: service-scoped Ambient waypoint traffic arrives as HBONE over mTLS. Use `permissive` or `strict`.
 - **EgressGateway**: the egress listener must verify sidecar client certificates. Use `permissive` or `strict`. Note that on this topology `permissive` does not mean optional client auth: it is escalated to require a client cert (see "EgressGateway requires client certificates" above), because the egress boundary must authenticate every client.
 
-Invalid startup mode fails closed with or without live reload. With live reload enabled, invalid incoming slices are rejected and the last good config stays active. `Sidecar` and `EastWestGateway` accept any resolved mode (`Disable` on Sidecar produces a plaintext inbound listener; on EastWestGateway the resolved mode is unused because there is no TLS termination).
+Invalid startup mode fails closed with or without live reload. With live reload enabled, invalid incoming slices are rejected and the last good config stays active. In development, `Sidecar` accepts any resolved mode (`Disable` produces a plaintext inbound listener). In production, Sidecar `PERMISSIVE` with usable TLS is accepted but runs TLS-only, while a mode that cannot produce usable TLS (including `Disable`) fails closed. `EastWestGateway` accepts any resolved mode because it performs SNI passthrough and does not use the resolved terminating-TLS mode.
 
 ### NodeWaypoint cgroup-inode lifecycle binding
 

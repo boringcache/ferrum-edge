@@ -11699,10 +11699,22 @@ fn mesh_inbound_peer_auth_app_port(proxy: &Proxy) -> u16 {
 }
 
 fn mesh_inbound_requires_post_route_transport_gate(
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+    proxy_id: &str,
     orig_dst: Option<SocketAddr>,
     resolved_app_port: u16,
 ) -> bool {
-    orig_dst.is_none_or(|dst| dst.port() != resolved_app_port)
+    if mesh_direction != Some(crate::modes::mesh::MeshTrafficDirection::Inbound) {
+        return false;
+    }
+    // A direct dial to a mesh inbound listener has no pre-routing app-port
+    // signal, so every resolved proxy — including an operator-supplied explicit
+    // proxy that replaced a generated mesh route — needs the authoritative
+    // post-route check. Captured generated routes additionally need it when
+    // Host routing selected a different app port than SO_ORIGINAL_DST.
+    orig_dst.is_none()
+        || (crate::modes::mesh::is_mesh_inbound_route_id(proxy_id)
+            && orig_dst.is_some_and(|dst| dst.port() != resolved_app_port))
 }
 
 struct TlsConnectionMetadata {
@@ -14476,47 +14488,48 @@ async fn handle_proxy_request_inner(
     // its effective PeerAuthentication mode for direct dials and captured-port
     // mismatches. A certificate present here has already passed the rustls
     // verifier selected for the connection.
-    if ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
-        && crate::modes::mesh::is_mesh_inbound_route_id(&proxy.id)
-    {
-        let resolved_app_port = mesh_inbound_peer_auth_app_port(&proxy);
+    let resolved_app_port = mesh_inbound_peer_auth_app_port(&proxy);
+    if mesh_inbound_requires_post_route_transport_gate(
+        ctx.mesh_direction,
+        &proxy.id,
+        ctx.orig_dst,
+        resolved_app_port,
+    ) {
         // Direct dials always require the authoritative post-route gate because
         // they have no app-port signal at handshake time. Captured traffic was
         // already selected by SO_ORIGINAL_DST; keep its hot path unchanged when
         // that port is the app port routing serves, but re-check mismatches so a
         // Host-routed single-port service cannot inherit a weaker captured
         // port's transport posture.
-        if mesh_inbound_requires_post_route_transport_gate(ctx.orig_dst, resolved_app_port) {
-            let policy = state.mesh_inbound_tls_policy.load();
-            let required_mode = policy
-                .modes_by_port
-                .get(&resolved_app_port)
-                .copied()
-                .unwrap_or(policy.default_mode);
-            if !mesh_inbound_transport_satisfies_mode(
-                required_mode,
-                is_tls,
-                ctx.tls_client_cert_der.is_some(),
-            ) {
-                warn!(
-                    proxy_id = %proxy.id,
-                    resolved_app_port,
-                    ?required_mode,
-                    transport_tls = is_tls,
-                    verified_peer_certificate = ctx.tls_client_cert_der.is_some(),
-                    client_ip = %ctx.client_ip,
-                    "Rejecting mesh inbound request because its transport does not satisfy the resolved app-port PeerAuthentication mode"
-                );
-                state.request_count.fetch_add(1, Ordering::Relaxed);
-                let reject = normalize_reject_response(
-                    StatusCode::FORBIDDEN,
-                    br#"{"error":"Mesh inbound transport does not satisfy PeerAuthentication for the resolved application port"}"#,
-                    &EMPTY_HEADERS,
-                    request_uses_grpc_content_type,
-                );
-                record_status(&state, reject.http_status.as_u16());
-                return Ok(build_response_from_normalized_reject(reject));
-            }
+        let policy = state.mesh_inbound_tls_policy.load();
+        let required_mode = policy
+            .modes_by_port
+            .get(&resolved_app_port)
+            .copied()
+            .unwrap_or(policy.default_mode);
+        if !mesh_inbound_transport_satisfies_mode(
+            required_mode,
+            is_tls,
+            ctx.tls_client_cert_der.is_some(),
+        ) {
+            warn!(
+                proxy_id = %proxy.id,
+                resolved_app_port,
+                ?required_mode,
+                transport_tls = is_tls,
+                verified_peer_certificate = ctx.tls_client_cert_der.is_some(),
+                client_ip = %ctx.client_ip,
+                "Rejecting mesh inbound request because its transport does not satisfy the resolved app-port PeerAuthentication mode"
+            );
+            state.request_count.fetch_add(1, Ordering::Relaxed);
+            let reject = normalize_reject_response(
+                StatusCode::FORBIDDEN,
+                br#"{"error":"Mesh inbound transport does not satisfy PeerAuthentication for the resolved application port"}"#,
+                &EMPTY_HEADERS,
+                request_uses_grpc_content_type,
+            );
+            record_status(&state, reject.http_status.as_u16());
+            return Ok(build_response_from_normalized_reject(reject));
         }
     }
 
@@ -37033,13 +37046,30 @@ mod tests {
             true
         ));
 
-        assert!(mesh_inbound_requires_post_route_transport_gate(None, 8080));
+        use crate::modes::mesh::MeshTrafficDirection;
+
+        assert!(mesh_inbound_requires_post_route_transport_gate(
+            Some(MeshTrafficDirection::Inbound),
+            "operator-explicit-inbound",
+            None,
+            8080
+        ));
         assert!(!mesh_inbound_requires_post_route_transport_gate(
+            Some(MeshTrafficDirection::Inbound),
+            "__mesh-inbound-default-reviews-8080",
             Some("10.0.0.8:8080".parse().expect("socket addr")),
             8080
         ));
         assert!(mesh_inbound_requires_post_route_transport_gate(
+            Some(MeshTrafficDirection::Inbound),
+            "__mesh-inbound-default-reviews-8080",
             Some("10.0.0.8:9090".parse().expect("socket addr")),
+            8080
+        ));
+        assert!(!mesh_inbound_requires_post_route_transport_gate(
+            Some(MeshTrafficDirection::Outbound),
+            "operator-explicit-inbound",
+            None,
             8080
         ));
     }
