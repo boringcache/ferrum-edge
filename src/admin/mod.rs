@@ -1887,7 +1887,7 @@ pub async fn handle_admin_request(
         let response_body = if method == Method::POST
             && matches!(
                 segments.as_slice(),
-                ["admin", "tls", _] | ["admin", "tls", "acme", _]
+                ["admin", "tls", _] | ["admin", "tls", "acme", _] | ["admin", "tls", "rotate", _]
             ) {
             http_response
                 .body()
