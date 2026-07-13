@@ -1907,7 +1907,6 @@ pub async fn run(
                                 mark_db_available_after_successful_poll_load(
                                     &db_poll,
                                     &db_available_poll,
-                                    &config_rejected_poll,
                                     "full reload after DB DNS reconnect",
                                 )
                                 .await;
@@ -1917,6 +1916,7 @@ pub async fn run(
                                     outcome,
                                     &mut last_change_sequence,
                                     sequence,
+                                    &config_rejected_poll,
                                 ) {
                                     force_full_reload = false;
                                     rejected_delta_tracker.record_accepted();
@@ -1926,6 +1926,7 @@ pub async fn run(
                             Err(e) => {
                                 if is_poll_validation_rejection(&e) {
                                     record_config_validation_rejection(
+                                        &db_available_poll,
                                         &config_rejected_poll,
                                         &e,
                                         "full reload after DB DNS reconnect",
@@ -1949,7 +1950,6 @@ pub async fn run(
                                 mark_db_available_after_successful_poll_load(
                                     &db_poll,
                                     &db_available_poll,
-                                    &config_rejected_poll,
                                     "incremental poll",
                                 )
                                 .await;
@@ -1989,7 +1989,6 @@ pub async fn run(
                                                     mark_db_available_after_successful_poll_load(
                                                         &db_poll,
                                                         &db_available_poll,
-                                                        &config_rejected_poll,
                                                         "rejected-delta escalation full reload",
                                                     )
                                                     .await;
@@ -2000,6 +1999,7 @@ pub async fn run(
                                                         outcome,
                                                         &mut last_change_sequence,
                                                         sequence,
+                                                        &config_rejected_poll,
                                                     ) {
                                                         rejected_delta_tracker.record_accepted();
                                                         recovered_by_full_reload = true;
@@ -2018,6 +2018,7 @@ pub async fn run(
                                                     // last known-good config + admin writable.
                                                     if is_poll_validation_rejection(&e) {
                                                         record_config_validation_rejection(
+                                                            &db_available_poll,
                                                             &config_rejected_poll,
                                                             &e,
                                                             "rejected-delta escalation full reload",
@@ -2044,7 +2045,6 @@ pub async fn run(
                                                                         mark_db_available_after_successful_poll_load(
                                                                             &db_poll,
                                                                             &db_available_poll,
-                                                                            &config_rejected_poll,
                                                                             "rejected-delta escalation failover reload",
                                                                         )
                                                                         .await;
@@ -2055,6 +2055,7 @@ pub async fn run(
                                                                             outcome,
                                                                             &mut last_change_sequence,
                                                                             sequence,
+                                                                            &config_rejected_poll,
                                                                         ) {
                                                                             rejected_delta_tracker
                                                                                 .record_accepted();
@@ -2068,6 +2069,7 @@ pub async fn run(
                                                                     Err(e2) => {
                                                                         if is_poll_validation_rejection(&e2) {
                                                                             record_config_validation_rejection(
+                                                                                &db_available_poll,
                                                                                 &config_rejected_poll,
                                                                                 &e2,
                                                                                 "rejected-delta escalation failover reload",
@@ -2116,7 +2118,6 @@ pub async fn run(
                                         mark_db_available_after_successful_poll_load(
                                             &db_poll,
                                             &db_available_poll,
-                                            &config_rejected_poll,
                                             "full fallback reload",
                                         )
                                         .await;
@@ -2126,6 +2127,7 @@ pub async fn run(
                                             outcome,
                                             &mut last_change_sequence,
                                             sequence,
+                                            &config_rejected_poll,
                                         ) {
                                             rejected_delta_tracker.record_accepted();
                                         }
@@ -2138,6 +2140,7 @@ pub async fn run(
                                         // failover (issue #2158).
                                         if is_poll_validation_rejection(&e2) {
                                             record_config_validation_rejection(
+                                                &db_available_poll,
                                                 &config_rejected_poll,
                                                 &e2,
                                                 "full fallback reload",
@@ -2158,7 +2161,6 @@ pub async fn run(
                                                             mark_db_available_after_successful_poll_load(
                                                                 &db_poll,
                                                                 &db_available_poll,
-                                                                &config_rejected_poll,
                                                                 "failover full reload",
                                                             )
                                                             .await;
@@ -2169,6 +2171,7 @@ pub async fn run(
                                                                 outcome,
                                                                 &mut last_change_sequence,
                                                                 sequence,
+                                                                &config_rejected_poll,
                                                             ) {
                                                                 rejected_delta_tracker.record_accepted();
                                                             }
@@ -2176,6 +2179,7 @@ pub async fn run(
                                                         Err(e3) => {
                                                             if is_poll_validation_rejection(&e3) {
                                                                 record_config_validation_rejection(
+                                                                    &db_available_poll,
                                                                     &config_rejected_poll,
                                                                     &e3,
                                                                     "failover full reload",
@@ -2210,7 +2214,6 @@ pub async fn run(
                                 mark_db_available_after_successful_poll_load(
                                     &db_poll,
                                     &db_available_poll,
-                                    &config_rejected_poll,
                                     "first full reload",
                                 )
                                 .await;
@@ -2220,6 +2223,7 @@ pub async fn run(
                                     outcome,
                                     &mut last_change_sequence,
                                     sequence,
+                                    &config_rejected_poll,
                                 ) {
                                     rejected_delta_tracker.record_accepted();
                                 }
@@ -2227,6 +2231,7 @@ pub async fn run(
                             Err(e) => {
                                 if is_poll_validation_rejection(&e) {
                                     record_config_validation_rejection(
+                                        &db_available_poll,
                                         &config_rejected_poll,
                                         &e,
                                         "initial full poll",
@@ -2328,16 +2333,22 @@ fn commit_full_reload_poll_state(
     outcome: proxy::ConfigApplyOutcome,
     last_change_sequence: &mut Option<u64>,
     sequence: u64,
+    config_rejected: &AtomicBool,
 ) -> bool {
     match outcome {
         proxy::ConfigApplyOutcome::Applied => {
             *last_change_sequence = Some(sequence);
             info!("Configuration applied from database ({})", context);
+            clear_config_rejected_after_accepted_full_reload(config_rejected, context);
             true
         }
         proxy::ConfigApplyOutcome::Unchanged => {
             *last_change_sequence = Some(sequence);
             debug!("Database configuration valid but unchanged ({})", context);
+            // An Unchanged outcome still means the freshly-loaded FULL snapshot
+            // passed loader validation and matches the running config, so the
+            // full snapshot is proven valid again.
+            clear_config_rejected_after_accepted_full_reload(config_rejected, context);
             true
         }
         proxy::ConfigApplyOutcome::Rejected { .. } => {
@@ -2350,22 +2361,33 @@ fn commit_full_reload_poll_state(
     }
 }
 
-async fn mark_db_available_after_successful_poll_load(
-    db: &Arc<dyn DatabaseBackend>,
-    db_available: &AtomicBool,
-    config_rejected: &AtomicBool,
-    context: &str,
-) {
-    // A load that reached this point produced an accepted snapshot: clear any
-    // standing config-rejection signal (issue #2158). Logs the recovery only on
-    // the transition out of the rejected state to avoid per-poll spam.
+/// Clear the standing config-rejection signal once a FULL config reload is
+/// accepted (issue #2158). This is the ONLY site that clears `config_rejected`:
+/// an accepted incremental/delta poll does not re-validate the whole snapshot,
+/// so it must leave the flag set until a full reload proves the offending row is
+/// gone. Logs the recovery only on the transition out of the rejected state to
+/// avoid per-poll spam.
+fn clear_config_rejected_after_accepted_full_reload(config_rejected: &AtomicBool, context: &str) {
     if config_rejected.swap(false, Ordering::Relaxed) {
         info!(
-            "Database full config load accepted after a prior validation rejection ({}); \
+            "Full database config snapshot accepted after a prior validation rejection ({}); \
              config_rejected cleared",
             context
         );
     }
+}
+
+async fn mark_db_available_after_successful_poll_load(
+    db: &Arc<dyn DatabaseBackend>,
+    db_available: &AtomicBool,
+    context: &str,
+) {
+    // Any load that reaches this point proved the backend is reachable, so
+    // re-enable admin writes. Note this does NOT clear `config_rejected`: an
+    // accepted incremental poll on top of a validation-rejected full snapshot
+    // does not prove the full snapshot is valid again. `config_rejected` is
+    // cleared only by [`clear_config_rejected_after_accepted_full_reload`], which
+    // fires exclusively from an accepted FULL reload (issue #2158).
     match db.maybe_apply_deferred_migrations().await {
         Ok(_) => db_available.store(true, Ordering::Relaxed),
         Err(e) => {
@@ -2386,8 +2408,9 @@ async fn mark_db_available_after_successful_poll_load(
 ///
 /// When it returns `true` the caller must:
 ///   - call [`record_config_validation_rejection`] instead of flipping
-///     `db_available` — the backend is reachable and admin writes are the
-///     in-band repair tool, so admin must stay writable; and
+///     `db_available` to `false` — the backend is reachable and admin writes are
+///     the in-band repair tool, so admin must stay writable (the helper forces
+///     `db_available = true`, re-enabling writes even after a prior outage); and
 ///   - SKIP any failover reconnect — the same invalid snapshot lives on every
 ///     replica, so failover cannot help and must not be allowed to flip
 ///     `db_available` to `false` on a subsequent reconnect error.
@@ -2399,17 +2422,26 @@ fn is_poll_validation_rejection(err: &anyhow::Error) -> bool {
 }
 
 /// Raise the config-rejection signal for a full load rejected by the
-/// runtime-config VALIDATION contract (issue #2158). Deliberately leaves
-/// `db_available` untouched: the backend is reachable, so admin stays writable
-/// as the in-band repair path and the last known-good runtime config keeps
-/// serving (the caches were never rebuilt — the load returned `Err`). Logs
-/// loudly only on the transition INTO the rejected state; repeats log at debug
-/// to avoid per-poll spam.
+/// runtime-config VALIDATION contract (issue #2158). A validation rejection is
+/// positive proof the backend is REACHABLE — the loader read the snapshot and
+/// only the runtime-config contract rejected it — so this forces
+/// `db_available = true` regardless of its prior value. That matters when a
+/// preceding connectivity failure (or backup bootstrap) had already set
+/// `db_available = false`: without re-enabling writes the admin API would stay
+/// read-only and the operator could never repair the offending resource
+/// in-band, recreating the exact read-only wedge this change exists to prevent.
+/// The last known-good runtime config keeps serving (the caches were never
+/// rebuilt — the load returned `Err`). Logs loudly only on the transition INTO
+/// the rejected state; repeats log at debug to avoid per-poll spam.
 fn record_config_validation_rejection(
+    db_available: &AtomicBool,
     config_rejected: &AtomicBool,
     err: &anyhow::Error,
     context: &str,
 ) {
+    // Reachability is proven: re-enable admin writes so the invalid resource can
+    // be repaired in-band, even if a prior outage had blocked writes.
+    db_available.store(true, Ordering::Relaxed);
     if !config_rejected.swap(true, Ordering::Relaxed) {
         error!(
             "Full config load rejected by validation ({}); backend is reachable so KEEPING \
@@ -2469,25 +2501,60 @@ mod tests {
     }
 
     #[test]
-    fn full_reload_unchanged_commits_sequence_cursor() {
+    fn full_reload_unchanged_commits_cursor_and_clears_rejection() {
+        // An Unchanged outcome still means the freshly-loaded FULL snapshot
+        // passed loader validation, so a standing config_rejected must clear
+        // (issue #2158, P2).
         let mut last_change_sequence = Some(7);
         let sequence = 42;
+        let config_rejected = AtomicBool::new(true);
 
         let accepted = commit_full_reload_poll_state(
             "test unchanged",
             proxy::ConfigApplyOutcome::Unchanged,
             &mut last_change_sequence,
             sequence,
+            &config_rejected,
         );
 
         assert!(accepted);
         assert_eq!(last_change_sequence, Some(sequence));
+        assert!(
+            !config_rejected.load(Ordering::Relaxed),
+            "an accepted full reload (even Unchanged) must clear config_rejected"
+        );
     }
 
     #[test]
-    fn full_reload_rejected_preserves_sequence_cursor() {
+    fn full_reload_applied_clears_standing_config_rejection() {
+        // The primary clearing site: an accepted FULL reload proves the offending
+        // row is gone (issue #2158, P2).
+        let mut last_change_sequence = None;
+        let config_rejected = AtomicBool::new(true);
+
+        let accepted = commit_full_reload_poll_state(
+            "test applied",
+            proxy::ConfigApplyOutcome::Applied,
+            &mut last_change_sequence,
+            99,
+            &config_rejected,
+        );
+
+        assert!(accepted);
+        assert_eq!(last_change_sequence, Some(99));
+        assert!(
+            !config_rejected.load(Ordering::Relaxed),
+            "an accepted full reload must clear config_rejected"
+        );
+    }
+
+    #[test]
+    fn full_reload_rejected_preserves_cursor_and_rejection_flag() {
+        // A rejected full-reload candidate keeps the previous cursor AND keeps a
+        // standing config_rejected set: the full snapshot is still invalid.
         let previous_sequence = Some(7);
         let mut last_change_sequence = previous_sequence;
+        let config_rejected = AtomicBool::new(true);
 
         let accepted = commit_full_reload_poll_state(
             "test rejected",
@@ -2496,27 +2563,36 @@ mod tests {
             },
             &mut last_change_sequence,
             42,
+            &config_rejected,
         );
 
         assert!(!accepted);
         assert_eq!(last_change_sequence, previous_sequence);
+        assert!(
+            config_rejected.load(Ordering::Relaxed),
+            "a rejected full reload must keep config_rejected set"
+        );
     }
 
-    #[test]
-    fn validation_rejection_keeps_db_available_and_raises_config_rejected() {
-        // Issue #2158: a reachable-backend validation rejection must NOT flip
-        // db_available (admin stays writable to repair the config in-band); it
-        // raises config_rejected for the authenticated /health detail.
-        let db_available = AtomicBool::new(true);
-        let config_rejected = AtomicBool::new(false);
-        let err = crate::config::validation_pipeline::ConfigValidationRejection {
+    fn validation_rejection_error() -> anyhow::Error {
+        crate::config::validation_pipeline::ConfigValidationRejection {
             backend: "MongoDB",
             errors: vec!["dangling upstream reference".to_string()],
         }
-        .into_anyhow();
+        .into_anyhow()
+    }
+
+    #[test]
+    fn validation_rejection_keeps_writes_enabled_and_raises_config_rejected() {
+        // Issue #2158: a reachable-backend validation rejection keeps db_available
+        // true (admin stays writable to repair the config in-band) and raises
+        // config_rejected for the authenticated /health detail.
+        let db_available = AtomicBool::new(true);
+        let config_rejected = AtomicBool::new(false);
+        let err = validation_rejection_error();
 
         assert!(is_poll_validation_rejection(&err));
-        record_config_validation_rejection(&config_rejected, &err, "unit test");
+        record_config_validation_rejection(&db_available, &config_rejected, &err, "unit test");
 
         assert!(
             config_rejected.load(Ordering::Relaxed),
@@ -2524,7 +2600,30 @@ mod tests {
         );
         assert!(
             db_available.load(Ordering::Relaxed),
-            "validation rejection must leave db_available untouched"
+            "validation rejection must keep admin writable"
+        );
+    }
+
+    #[test]
+    fn validation_rejection_reenables_writes_after_prior_outage() {
+        // Issue #2158, P1: db_available was already false from a connectivity
+        // failure. A later load that reaches the backend but fails only
+        // validation PROVES the backend is reachable again, so writes must be
+        // re-enabled — otherwise admin could never repair the invalid config, the
+        // exact read-only wedge this change exists to prevent.
+        let db_available = AtomicBool::new(false);
+        let config_rejected = AtomicBool::new(false);
+        let err = validation_rejection_error();
+
+        record_config_validation_rejection(&db_available, &config_rejected, &err, "post-outage");
+
+        assert!(
+            db_available.load(Ordering::Relaxed),
+            "a validation rejection must re-enable writes even after a prior outage"
+        );
+        assert!(
+            config_rejected.load(Ordering::Relaxed),
+            "validation rejection must raise config_rejected"
         );
     }
 
@@ -2537,18 +2636,52 @@ mod tests {
     }
 
     #[test]
-    fn successful_load_clears_a_standing_config_rejection() {
-        // Lifecycle: the poll loop clears config_rejected on the next accepted
-        // load via mark_db_available_after_successful_poll_load. Exercise the
-        // clear-on-success semantics directly on the shared flag.
-        let config_rejected = AtomicBool::new(true);
-        // swap(false) mirrors what the success helper does; the return value is
-        // the transition detector used to log recovery exactly once.
-        let was_rejected = config_rejected.swap(false, Ordering::Relaxed);
-        assert!(was_rejected, "flag was standing before the accepted load");
+    fn rejected_full_then_incremental_keeps_flag_until_next_full_reload() {
+        // Issue #2158, P2 lifecycle: a validation-rejected FULL snapshot raises
+        // config_rejected; an accepted incremental must NOT clear it (it does not
+        // re-validate the whole snapshot); only an accepted FULL reload clears it.
+        let db_available = AtomicBool::new(true);
+        let config_rejected = AtomicBool::new(false);
+
+        // 1) Rejected full snapshot raises the flag.
+        record_config_validation_rejection(
+            &db_available,
+            &config_rejected,
+            &validation_rejection_error(),
+            "full poll",
+        );
+        assert!(config_rejected.load(Ordering::Relaxed));
+
+        // 2) An accepted incremental keeps the flag set. The incremental-success
+        //    path calls only mark_db_available_after_successful_poll_load, whose
+        //    signature carries no config_rejected handle, so it cannot clear the
+        //    flag. Assert that structural guarantee against the source.
+        let source = include_str!("database.rs");
+        let sig_start = source
+            .find("async fn mark_db_available_after_successful_poll_load(")
+            .expect("incremental-success helper must exist");
+        let sig_end = sig_start
+            + source[sig_start..]
+                .find(") {")
+                .expect("incremental-success helper signature must terminate");
+        assert!(
+            !source[sig_start..sig_end].contains("config_rejected"),
+            "the incremental-success helper must not carry a config_rejected handle"
+        );
+
+        // 3) An accepted full reload clears the flag.
+        let mut cursor = Some(1);
+        let accepted = commit_full_reload_poll_state(
+            "full reload",
+            proxy::ConfigApplyOutcome::Applied,
+            &mut cursor,
+            2,
+            &config_rejected,
+        );
+        assert!(accepted);
         assert!(
             !config_rejected.load(Ordering::Relaxed),
-            "an accepted load must clear config_rejected"
+            "an accepted full reload must clear config_rejected"
         );
     }
 
