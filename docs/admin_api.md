@@ -16,8 +16,8 @@ Most endpoints require a valid HS256 JWT in the `Authorization: Bearer <token>` 
 | Endpoint | Unauthenticated | Authenticated |
 | --- | --- | --- |
 | `/live` | `{"status":"ok"}` (always; minimal liveness) | same |
-| `/health`, `/status` | `status` + `ready` only, with the correct status code (200 / 503 starting) | full diagnostics (mode, DB/pool, cached-config counts, polling degradation, mesh state) |
-| `/overload` | coarse `{level}` + status code (503 at critical) | full pressure/counter snapshot |
+| `/health`, `/status` | `status` + `ready` only, with the correct status code (200 / 503 starting or unavailable) | full diagnostics (mode, DB/pool, cached-config counts, polling degradation, mesh state, sanitized listener failures) |
+| `/overload` | coarse `{level}` + status code (503 at critical) | full pressure/counter and sanitized listener-failure snapshots |
 | `/metrics` | **401** unless the client IP is in `FERRUM_METRICS_ALLOWED_CIDRS` | 200 Prometheus text |
 
 "Authenticated" here means **any** of: a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`. This lets Prometheus scrape with a dedicated token or from an allowlisted subnet without minting admin JWTs, while operational internals are not exposed by default. `/metrics/runtime` and `/charges` always require a full admin JWT (process/host diagnostics and customer/billing data respectively).
@@ -73,12 +73,13 @@ curl http://localhost:9000/health
 # Authenticated: full diagnostics.
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/health
 # Returns: {"status","timestamp","mode","database":{...},"admin_writes_enabled",
-#           "ready","cached_config":{"proxy_count":...},"database_polling":{...}, ...}
+#           "ready","cached_config":{"proxy_count":...},"database_polling":{...},
+#           "listener_failures":{"failures_total":...}, ...}
 ```
 
-Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. The detailed diagnostics (DB type/pool stats, cached-config proxy/consumer counts, `database_polling` degradation, mesh state) require an admin JWT, `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS` source IP. In database mode the authenticated response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` (also visible unauthenticated) while the gateway keeps serving the last known-good config.
+Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. The detailed diagnostics (DB type/pool stats, cached-config proxy/consumer counts, `database_polling` degradation, mesh state, sanitized listener failures) require an admin JWT, `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS` source IP. In database mode the authenticated response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` (also visible unauthenticated) while the gateway keeps serving the last known-good config.
 
-In **CP and DP modes**, if a supervised serving-listener task exits with an error *after* the gateway became ready (the CP gRPC server, or a DP proxy/admin HTTP/HTTPS/H3 listener), `/health` returns 503 with `status: "unavailable"` and `ready: false`. This is a **sticky** signal: it is set once and never cleared, so it survives a later readiness restore (the CP main task's one-time `ready` store, or a DP re-store on every CP-reconnect snapshot). The process does not silently keep reporting `ready` while a serving surface is dead.
+In **CP, DP, and mesh modes**, if a supervised serving-listener task exits with an error *after* the gateway became ready (the CP gRPC server; a DP proxy/admin HTTP/HTTPS/H3 listener; or a mesh traffic/admin listener), `/health` returns 503 with `status: "unavailable"` and `ready: false`. This is a **sticky** signal: it is set once and never cleared, so it survives a later readiness restore. Mesh authenticated `/health`/`/status` and `/overload` responses include `listener_failures` with `failures_total` and per-listener `listener`, `listen_port`, `kind`, and a deliberately sanitized `error`; raw error strings are not retained. Unauthenticated health/status responses remain exactly `status` plus `ready`, and unauthenticated overload remains `{level}`.
 
 **Recommended split:** point liveness at `/live` and readiness at `/health`; route detailed diagnostics scraping through an authenticated path.
 

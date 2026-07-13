@@ -36,7 +36,7 @@ use chrono::Utc;
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
-    start_admin_listener,
+    start_admin_listener_with_tls_and_signal,
 };
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
@@ -187,6 +187,7 @@ fn build_cp_admin_state(
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
+        serving_listener_failures: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
@@ -228,6 +229,7 @@ fn build_dp_admin_state(
         admin_require_namespace_claim: false,
         startup_ready: None,
         serving_degraded: None,
+        serving_listener_failures: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
@@ -259,10 +261,12 @@ async fn spawn_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<b
     let shutdown_rx_clone = shutdown_rx.clone();
     tokio::spawn(async move {
         let admin_addr: SocketAddr = addr;
-        let _ = start_admin_listener(
+        let _ = start_admin_listener_with_tls_and_signal(
             admin_addr,
             state_clone,
             shutdown_rx_clone,
+            None,
+            None,
             ferrum_edge::admin::AdminConnLimiter::unlimited(),
         )
         .await;

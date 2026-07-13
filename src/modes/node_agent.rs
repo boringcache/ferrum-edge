@@ -642,6 +642,7 @@ async fn start_node_agent_admin_listeners(
         // node_agent mode has no post-start listener supervision that flips
         // readiness; readiness is governed by `startup_ready` alone.
         serving_degraded: None,
+        serving_listener_failures: None,
         db_available: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
