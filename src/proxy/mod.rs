@@ -7472,14 +7472,14 @@ impl ProxyState {
                 .retain(|p| !removed.contains(p.id.as_str()));
         }
         if !result.removed_consumer_ids.is_empty() {
-            let removed: std::collections::HashSet<&str> = result
+            let removed: std::collections::HashSet<(&str, &str)> = result
                 .removed_consumer_ids
                 .iter()
-                .map(|s| s.as_str())
+                .map(|key| (key.namespace.as_str(), key.id.as_str()))
                 .collect();
-            new_config
-                .consumers
-                .retain(|c| !removed.contains(c.id.as_str()));
+            new_config.consumers.retain(|consumer| {
+                !removed.contains(&(consumer.namespace.as_str(), consumer.id.as_str()))
+            });
         }
         if !result.removed_plugin_config_ids.is_empty() {
             let removed: std::collections::HashSet<&str> = result
@@ -7528,17 +7528,18 @@ impl ProxyState {
         }
 
         if !result.added_or_modified_consumers.is_empty() {
-            let mut idx: std::collections::HashMap<String, usize> = new_config
+            let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .consumers
                 .iter()
                 .enumerate()
-                .map(|(i, c)| (c.id.clone(), i))
+                .map(|(i, consumer)| ((consumer.namespace.clone(), consumer.id.clone()), i))
                 .collect();
             for consumer in result.added_or_modified_consumers {
-                if let Some(&pos) = idx.get(&consumer.id) {
+                let key = (consumer.namespace.clone(), consumer.id.clone());
+                if let Some(&pos) = idx.get(&key) {
                     new_config.consumers[pos] = consumer;
                 } else {
-                    idx.insert(consumer.id.clone(), new_config.consumers.len());
+                    idx.insert(key, new_config.consumers.len());
                     new_config.consumers.push(consumer);
                 }
             }

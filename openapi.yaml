@@ -37,6 +37,14 @@ info:
     namespace-filtered unless their operation explicitly declares the namespace
     header. Discover all known resource namespaces via `GET /namespaces`.
 
+    When the gateway is started with `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`,
+    namespace-scoped resource endpoints additionally require the admin JWT to
+    carry an `ns` claim (a single string or an array of strings, the same claim
+    shapes as the CP/DP gRPC plane) that includes the requested
+    `X-Ferrum-Namespace` value; requests outside the claimed namespaces are
+    rejected with `403 Forbidden`. With the flag unset (default), any valid
+    admin JWT may address any namespace.
+
     ## Caching and read-only mode
 
     When the primary database is unavailable, read endpoints transparently fall
@@ -44,8 +52,11 @@ info:
     `X-Data-Source: cached` response header. Write operations require a live
     database and return `503 Service Unavailable` when one is not present.
 
-    The Admin API can be placed in **read-only mode**, in which case all POST,
-    PUT, and DELETE operations return `403 Forbidden`.
+    The Admin API can be placed in **read-only mode**, in which case persisted
+    configuration and database mutations return `403 Forbidden`. Authenticated
+    operational POST endpoints that do not persist configuration remain
+    available, including mesh egress-scope dry-runs, backend capability
+    refreshes, and forced TLS source reloads.
 
     ## Request body size limits
 
@@ -1156,6 +1167,9 @@ paths:
       summary: Force an active TLS source watcher to re-pull sources
       description: |
         Enqueues an immediate source poll for an active TLS source watcher.
+        This is an operational reload rather than a persisted configuration
+        mutation, so it is available in read-only file, DP, and mesh modes with
+        an operator or admin JWT.
         Supported surfaces are `proxy_https`, `backend_tls`, `admin_https`,
         `dtls`, `database_tls`, `cp_grpc`, `dp_grpc`, `svid`, and `all`. Aliases
         `frontend`, `backend`, `admin`, `frontend_dtls`, `db`, `database`,
@@ -1652,6 +1666,10 @@ paths:
         can issue `GET /backend-capabilities` immediately afterward to
         observe the post-refresh state.
 
+        This operational recovery action does not persist configuration and is
+        available in read-only file, DP, and mesh modes with standard JWT
+        authentication.
+
         Use cases:
         - Protocol rollouts (e.g., freshly enabled HTTP/3 on a fleet).
         - Recovery after a live downgrade (`mark_h3_unsupported`,
@@ -2036,7 +2054,8 @@ paths:
       summary: Dry-run a candidate destination against the current Sidecar egress scope
       description: |
         Tests whether a candidate destination is admitted by the current
-        resolved Sidecar egress scope. Never mutates slice state.
+        resolved Sidecar egress scope. Never mutates slice state and remains
+        available in read-only mesh and DP modes with standard JWT authentication.
 
         Useful to validate critical destinations before flipping
         `FERRUM_MESH_SIDECAR_ENFORCED=true` on the control plane.
@@ -3168,6 +3187,8 @@ paths:
             type: string
             example: "proxies,upstreams"
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Full configuration backup
           headers:
@@ -3362,6 +3383,8 @@ paths:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Paginated proxy objects
           headers:
@@ -3429,6 +3452,8 @@ paths:
       summary: Get a proxy
       tags: [Proxies]
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Proxy object
           headers:
@@ -3472,6 +3497,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "409":
           description: Conflict — `listen_path` already exists on another proxy, or stream proxy `listen_port` conflicts with another proxy, a gateway reserved port, or is not available on the host
           content:
@@ -3511,6 +3538,8 @@ paths:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Paginated consumer objects
           headers:
@@ -3574,6 +3603,8 @@ paths:
       summary: Get a consumer
       tags: [Consumers]
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Consumer object
           headers:
@@ -3613,6 +3644,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -3918,6 +3951,8 @@ paths:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Paginated plugin configurations
           headers:
@@ -3976,6 +4011,8 @@ paths:
       summary: Get a plugin configuration
       tags: [Plugins]
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Plugin configuration object
           headers:
@@ -4015,6 +4052,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -4048,6 +4087,8 @@ paths:
         - $ref: "#/components/parameters/PaginationOffset"
         - $ref: "#/components/parameters/PaginationLimit"
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Paginated upstream objects
           headers:
@@ -4106,6 +4147,8 @@ paths:
       summary: Get an upstream by ID
       tags: [Upstreams]
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Upstream object
           headers:
@@ -4299,6 +4342,8 @@ paths:
             type: string
           description: Namespace to operate in. Defaults to `FERRUM_NAMESPACE` when omitted.
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Paginated list of API spec summaries
           content:
@@ -4536,6 +4581,8 @@ paths:
             type: string
           description: ETag from a previous response. Returns 304 if the spec is unchanged.
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Spec document
           headers:
@@ -4780,6 +4827,8 @@ paths:
             type: string
           description: ETag from a previous response. Returns 304 if the spec is unchanged.
       responses:
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Spec document for the given proxy
           headers:
@@ -4946,13 +4995,13 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     Forbidden:
-      description: Authenticated token lacks the required admin role
+      description: Authenticated token lacks the required admin role or its namespace claim does not authorize the selected namespace
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
     ReadOnly:
-      description: Admin API is in read-only mode or the token role cannot perform this mutation
+      description: Admin API is in read-only mode, the token role cannot perform this mutation, or its namespace claim does not authorize the selected namespace
       content:
         application/json:
           schema:
@@ -11005,8 +11054,8 @@ components:
           description: Require an exp claim; expiration is always validated when present
         require_nbf:
           type: boolean
-          default: true
-          description: Require an nbf claim and validate it
+          default: false
+          description: Require an nbf claim; when present, nbf is always validated
         leeway_secs:
           type: integer
           format: uint64

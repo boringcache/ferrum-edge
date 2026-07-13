@@ -487,7 +487,7 @@ List responses always use the pagination envelope shown above.
 
 ## Database Considerations
 
-The batch API works with all supported databases (PostgreSQL, MySQL, SQLite). Each resource type's batch is wrapped in a single database transaction:
+The batch API works with all supported databases (PostgreSQL, MySQL, SQLite). Large resource batches are committed in chunks of up to 1,000 rows, so a failure after an earlier chunk commits can leave a partially applied batch:
 
 - **PostgreSQL/MySQL**: Handles concurrent batch writes well. Recommended for production workloads with high write throughput.
 - **SQLite**: Single-writer lock means batch writes are serialized. Still significantly faster than individual API calls due to reduced transaction overhead, but PostgreSQL is preferred for write-heavy workloads.

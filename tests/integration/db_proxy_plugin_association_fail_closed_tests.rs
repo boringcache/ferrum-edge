@@ -138,7 +138,7 @@ async fn successful_association_loading_remains_unchanged() {
     assert_eq!(incremental_proxy.plugins[0].plugin_config_id, "plugin-1");
 
     let admin_proxy = store
-        .get_proxy("proxy-1")
+        .get_proxy("ferrum", "proxy-1")
         .await
         .expect("admin get_proxy must succeed")
         .expect("proxy must exist");
@@ -259,7 +259,7 @@ async fn admin_proxy_reads_fail_closed_on_association_query_failure() {
     seed_proxy_with_plugin(&store).await;
     drop_proxy_plugins_table(&store).await;
 
-    let get_message = error_text(store.get_proxy("proxy-1").await);
+    let get_message = error_text(store.get_proxy("ferrum", "proxy-1").await);
     assert_association_error_context(&get_message, "get_proxy");
 
     let list_message = error_text(store.list_proxies_paginated("ferrum", 25, 0).await);
@@ -272,7 +272,7 @@ async fn admin_proxy_reads_wrap_plugin_config_lookup_failures_as_association_err
     seed_proxy_with_plugin(&store).await;
     drop_plugin_configs_table(&store).await;
 
-    let get_message = error_text(store.get_proxy("proxy-1").await);
+    let get_message = error_text(store.get_proxy("ferrum", "proxy-1").await);
     assert_association_error_context(&get_message, "get_proxy");
     assert!(
         get_message.contains("failed to load plugin_config references"),
@@ -314,7 +314,7 @@ async fn admin_proxy_reads_reject_incomplete_cross_namespace_associations() {
         .await
         .expect("cross-namespace association insert must succeed");
 
-    let get_message = error_text(store.get_proxy("proxy-1").await);
+    let get_message = error_text(store.get_proxy("ferrum", "proxy-1").await);
     assert_association_error_context(&get_message, "get_proxy");
     assert!(get_message.contains("plugin-other"));
     assert!(!get_message.contains("X-Secret-Key"));
@@ -352,7 +352,7 @@ async fn admin_proxy_reads_reject_global_plugin_associations() {
         .await
         .expect("global association insert must succeed");
 
-    let get_message = error_text(store.get_proxy("proxy-1").await);
+    let get_message = error_text(store.get_proxy("ferrum", "proxy-1").await);
     assert_association_error_context(&get_message, "get_proxy");
     assert!(get_message.contains("plugin-global"));
     assert!(!get_message.contains("X-Global-Key"));
@@ -390,7 +390,7 @@ async fn admin_proxy_reads_reject_proxy_group_plugin_with_proxy_id() {
         .await
         .expect("proxy-group association insert must succeed");
 
-    let get_message = error_text(store.get_proxy("proxy-1").await);
+    let get_message = error_text(store.get_proxy("ferrum", "proxy-1").await);
     assert_association_error_context(&get_message, "get_proxy");
     assert!(get_message.contains("plugin-group-corrupt"));
     assert!(!get_message.contains("X-Group-Key"));
@@ -428,12 +428,12 @@ async fn proxy_write_precheck_can_repair_invalid_associations() {
         .await
         .expect("global association insert must succeed");
 
-    let read_message = error_text(store.get_proxy("proxy-1").await);
+    let read_message = error_text(store.get_proxy("ferrum", "proxy-1").await);
     assert_association_error_context(&read_message, "get_proxy");
     assert!(read_message.contains("plugin-global"));
 
     let mut repair_proxy = store
-        .get_proxy_for_write("proxy-1")
+        .get_proxy_for_write("ferrum", "proxy-1")
         .await
         .expect("write precheck get must succeed")
         .expect("proxy must exist");
@@ -446,7 +446,7 @@ async fn proxy_write_precheck_can_repair_invalid_associations() {
         .expect("update should repair proxy_plugins rows");
 
     let repaired = store
-        .get_proxy("proxy-1")
+        .get_proxy("ferrum", "proxy-1")
         .await
         .expect("repaired proxy read must succeed")
         .expect("proxy must still exist");

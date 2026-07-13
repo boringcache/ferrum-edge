@@ -111,6 +111,14 @@ fn required_grpc_claims() -> HashSet<String> {
 /// to legacy scope-only authorization on multi-namespace CPs.
 #[allow(clippy::result_large_err)]
 fn extract_ns_claim(claims: &Value) -> Result<AllowedNamespaces, Status> {
+    parse_ns_claim(claims).map_err(Status::unauthenticated)
+}
+
+/// Transport-agnostic `ns` claim parser shared by the CP/DP gRPC surface and
+/// the REST admin API (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`). Both planes
+/// must accept identical claim shapes so one operator-minted token can carry
+/// tenancy for either surface without drift.
+pub(crate) fn parse_ns_claim(claims: &Value) -> Result<AllowedNamespaces, String> {
     let raw = match claims.get("ns") {
         Some(v) => v,
         None => return Ok(AllowedNamespaces::empty()),
@@ -119,9 +127,7 @@ fn extract_ns_claim(claims: &Value) -> Result<AllowedNamespaces, Status> {
     if let Some(s) = raw.as_str() {
         let trimmed = s.trim();
         if trimmed.is_empty() {
-            return Err(Status::unauthenticated(
-                "JWT `ns` claim must not be an empty string",
-            ));
+            return Err("JWT `ns` claim must not be an empty string".to_string());
         }
         let mut set = HashSet::new();
         set.insert(trimmed.to_string());
@@ -132,24 +138,18 @@ fn extract_ns_claim(claims: &Value) -> Result<AllowedNamespaces, Status> {
         let mut set = HashSet::new();
         for value in arr {
             let Some(raw) = value.as_str() else {
-                return Err(Status::unauthenticated(
-                    "JWT `ns` array claim must contain only strings",
-                ));
+                return Err("JWT `ns` array claim must contain only strings".to_string());
             };
             let trimmed = raw.trim();
             if trimmed.is_empty() {
-                return Err(Status::unauthenticated(
-                    "JWT `ns` array claim must not contain empty strings",
-                ));
+                return Err("JWT `ns` array claim must not contain empty strings".to_string());
             }
             set.insert(trimmed.to_string());
         }
         return Ok(AllowedNamespaces(Some(set)));
     }
 
-    Err(Status::unauthenticated(
-        "JWT `ns` claim must be a string or an array of strings",
-    ))
+    Err("JWT `ns` claim must be a string or an array of strings".to_string())
 }
 
 #[cfg(test)]

@@ -81,7 +81,7 @@ const RESPONSE_SHAPE_FIELDS: &[&str] = &[
 ];
 
 /// A cached LLM response.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CacheEntry {
     status_code: u16,
     headers: HashMap<String, String>,
@@ -98,7 +98,7 @@ struct CachedResponse {
     body: Bytes,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct SemanticConfig {
     provider: EmbeddingProvider,
     endpoint: String,

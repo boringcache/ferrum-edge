@@ -220,9 +220,12 @@ def main() -> int:
     if changed is None:
         summary_lines.append("| changed src/plugins lines | n/a | n/a | n/a |")
     elif int(changed["count"]) == 0:
-        summary_lines.append(
-            f"| changed src/plugins lines | 0/0 | n/a | {args.min_changed_plugins_line:.2f}% |"
+        threshold_cell = (
+            f"{args.min_changed_plugins_line:.2f}%"
+            if args.min_changed_plugins_line is not None
+            else "n/a"
         )
+        summary_lines.append(f"| changed src/plugins lines | 0/0 | n/a | {threshold_cell} |")
     else:
         summary_lines.append(
             format_metric(

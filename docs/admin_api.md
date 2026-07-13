@@ -26,6 +26,17 @@ The whole admin listener can additionally be restricted at the TCP layer with `F
 
 Admin JWTs must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER` (default `ferrum-edge`), `exp - iat` must not exceed `FERRUM_ADMIN_JWT_MAX_TTL` (default `3600` seconds), and `nbf`/`exp` are validated. When `FERRUM_ADMIN_JWT_AUDIENCE` is set, tokens must also carry a matching `aud` claim. When unset (default), tokens without an `aud` claim are accepted, but tokens that carry `aud` are rejected per RFC 7519 §4.1.3 (no acceptable audience is configured) — if your token minter stamps `aud`, set `FERRUM_ADMIN_JWT_AUDIENCE` to that value.
 
+### Per-namespace tenancy (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`)
+
+By default, admin JWTs are **global**: the `X-Ferrum-Namespace` header is a routing selector, not an authorization boundary — any valid Operator/Admin token can address any namespace. On multi-namespace deployments (e.g. a CP with `FERRUM_CP_NAMESPACES="prod,staging"`), set `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` to make namespace-scoped admin routes require the JWT to carry an `ns` claim authorizing the requested namespace, mirroring the CP↔DP gRPC plane's `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM`:
+
+- The `ns` claim accepts the same shapes as the gRPC plane: a single string (`"ns": "prod"`) or an array of strings (`"ns": ["prod", "staging"]`).
+- A request whose `X-Ferrum-Namespace` (or the `ferrum` default when the header is omitted) is not in the token's `ns` set is rejected with `403 Forbidden`. With enforcement on, tokens without an `ns` claim are rejected on namespace-scoped routes — tenancy intent must be explicit.
+- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/restore`, and `/audit`. Global surfaces (observability, `/cluster`, `/namespaces`, TLS management, backend capabilities, mesh introspection, `GET /plugins` type listing) are not tenant-selected and are unaffected.
+- Malformed `ns` claims (non-string entries, empty strings) are rejected at authentication time regardless of the flag — a garbled tenancy claim never widens access.
+
+With the flag off (default), behavior is unchanged and back-compatible.
+
 | Role | Access |
 | --- | --- |
 | `viewer` | Read-only endpoints |
@@ -86,6 +97,10 @@ The response is paginated and includes each source's non-secret provenance, mate
 Exact `/metrics` also refreshes this inventory at scrape time and emits `ferrum_tls_cert_expiry_seconds` and `ferrum_tls_cert_not_before_seconds` gauges for loaded certificate entries.
 
 TLS inventory, event listing, inline validation, and forced reload endpoints require an `operator` or `admin` token. Endpoints that create, replace, delete, import, finalize, or renew persisted TLS/ACME material require an `admin` token because they can alter private keys, certificate chains, trust bundles, revocation data, JWKS records, or ACME account-backed state.
+
+Forced reload is an operational action rather than a persisted configuration
+mutation, so `POST /admin/tls/rotate/{surface}` remains available in file, DP,
+and mesh modes when authenticated with an `operator` or `admin` JWT.
 
 ## TLS Events
 
@@ -302,6 +317,8 @@ The Admin API validates `listen_port` at creation and update time:
 In **CP mode**, the gateway reserved port and OS-level checks are skipped since stream proxies run on remote Data Plane nodes.
 
 ## Consumers
+
+Consumer identity is one keyspace per namespace: `id`, `username`, and `custom_id` must all be mutually unique across every consumer in a namespace (a consumer whose own `custom_id` equals its own `id`/`username` is fine). Cross-field collisions — e.g. one consumer's `username` equalling another's `custom_id` — are rejected with `409 Conflict`, enforced both by the admission precheck and by a persistence-level unique constraint (`consumer_identity_index`), so concurrent writes cannot race a collision in. Consumer `id` values are scoped per namespace: the same id may exist in two namespaces.
 
 ```bash
 # List consumers
@@ -829,6 +846,10 @@ Use cases:
 
 Force an immediate, synchronous classification pass over every HTTP-family backend in the current config. Blocks until every probe completes (bounded by `FERRUM_POOL_WARMUP_CONCURRENCY` parallelism + per-probe timeout).
 
+This operational recovery endpoint is available in every proxy-serving mode,
+including read-only file, DP, and mesh admin states. It does not persist a
+configuration or database mutation and still requires a valid admin JWT.
+
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:9000/backend-capabilities/refresh
 ```
@@ -1053,6 +1074,9 @@ Returns `503 Service Unavailable` when proxy state is not yet available, `404 No
 ### `POST /mesh/egress-scope/test`
 
 Dry-runs a candidate destination against the current scope. Accepts a JSON object with `host` (required) and `port` (optional). Returns whether the destination is admitted by the resolved scope. Never mutates slice state.
+
+Because this is a non-mutating diagnostic, it remains available in read-only
+mesh and DP admin states with the standard admin JWT authentication.
 
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" \

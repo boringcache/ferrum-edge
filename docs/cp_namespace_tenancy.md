@@ -23,6 +23,7 @@ when neither new env var is set.
 |---|---|---|
 | `FERRUM_CP_NAMESPACES` | unset | Scope. Empty/unset = back-compat single namespace (`FERRUM_NAMESPACE`). `*` = cluster-wide CP (discovers namespaces dynamically). CSV (`prod,staging`) = explicit set. |
 | `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` | `false` | When `true`, every CP/DP configuration JWT must carry an `ns` claim. This remains optional only for `Single` scope; `Set` and `All` scopes require `ns` claims automatically even when this flag is `false`. |
+| `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` | `false` | REST-plane counterpart (issue #2120): when `true`, namespace-scoped **admin API** routes require the admin JWT (signed with `FERRUM_ADMIN_JWT_SECRET`) to carry an `ns` claim authorizing the `X-Ferrum-Namespace` value; violations are 403. Same claim shapes as the gRPC plane. Without it, admin JWTs are global and the namespace header is only a routing selector — set both flags for tenancy enforcement on both planes. See `docs/admin_api.md`. |
 
 Both vars live in `[cp_dp]` of `ferrum.conf` next to
 `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`. The scope is also surfaced in the

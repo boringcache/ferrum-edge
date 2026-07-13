@@ -26,18 +26,27 @@
 //!
 //! ## Foreign key constraints
 //!
-//! All four FK constraints are semantically identical across Postgres, MySQL,
+//! All six FK constraints are semantically identical across Postgres, MySQL,
 //! and SQLite. The surface syntax differs — MySQL uses explicit
-//! `CONSTRAINT <name> FOREIGN KEY (<col>) REFERENCES ...` while Postgres and
-//! SQLite use inline `<col> TYPE REFERENCES ...` — but the referenced tables,
-//! columns, ON DELETE actions, and nullability match exactly:
+//! `CONSTRAINT <name> FOREIGN KEY (<cols>) REFERENCES ...` while Postgres and
+//! SQLite use inline `<col> TYPE REFERENCES ...` for single-column FKs and
+//! table-level `FOREIGN KEY (<cols>) REFERENCES ...` for composite FKs — but
+//! the referenced tables, columns, ON DELETE actions, and nullability match
+//! exactly:
 //!
-//! | Table          | Column           | References             | ON DELETE |
-//! |----------------|------------------|------------------------|-----------|
-//! | proxies        | upstream_id      | upstreams(id)          | RESTRICT  |
-//! | plugin_configs | proxy_id         | proxies(id)            | CASCADE   |
-//! | proxy_plugins  | proxy_id         | proxies(id)            | CASCADE   |
-//! | proxy_plugins  | plugin_config_id | plugin_configs(id)     | CASCADE   |
+//! | Table                     | Column(s)                | References                | ON DELETE |
+//! |---------------------------|--------------------------|---------------------------|-----------|
+//! | proxies                   | upstream_id              | upstreams(id)             | RESTRICT  |
+//! | plugin_configs            | proxy_id                 | proxies(id)               | CASCADE   |
+//! | proxy_plugins             | proxy_id                 | proxies(id)               | CASCADE   |
+//! | proxy_plugins             | plugin_config_id         | plugin_configs(id)        | CASCADE   |
+//! | consumer_credential_index | (namespace, consumer_id) | consumers(namespace, id)  | CASCADE   |
+//! | consumer_identity_index   | (namespace, consumer_id) | consumers(namespace, id)  | CASCADE   |
+//!
+//! `consumers` uses a composite `PRIMARY KEY (namespace, id)` (issue #2121):
+//! consumer ids are unique per namespace, so the same id may exist in two
+//! namespaces. Both consumer index tables therefore reference the composite
+//! key.
 //!
 //! Named constraints on MySQL (e.g. `fk_proxies_upstream`) are cosmetic; they
 //! aid `ALTER TABLE DROP CONSTRAINT` but do not change enforcement behavior.
@@ -133,6 +142,7 @@ impl V001SqlBuilder {
             self.create_upstreams_sql(),
             self.create_consumers_sql(),
             self.create_consumer_credential_index_sql(),
+            self.create_consumer_identity_index_sql(),
             self.create_proxies_sql(),
             self.create_proxy_route_locks_sql(),
             self.create_plugin_configs_sql(),
@@ -169,6 +179,10 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_proxies_ns_updated ON proxies (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_consumers_ns_updated ON consumers (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_consumer_credential_index_consumer_id ON consumer_credential_index (consumer_id)",
+            // Serves the per-consumer identity-row rewrite on consumer
+            // update/delete and satisfies MySQL's FK-column index requirement
+            // for the composite (namespace, consumer_id) foreign key.
+            "CREATE INDEX IF NOT EXISTS idx_consumer_identity_index_consumer_id ON consumer_identity_index (namespace, consumer_id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_updated ON plugin_configs (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_updated ON upstreams (namespace, updated_at)",
             // Full config loads use keyset pagination with
@@ -369,30 +383,35 @@ impl V001SqlBuilder {
     }
 
     fn create_consumers_sql(&self) -> &'static str {
+        // Composite PRIMARY KEY (namespace, id): consumer ids are unique per
+        // namespace (issue #2121), so the same id may exist in two namespaces.
+        // Both consumer index tables FK the composite key.
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS consumers (
-                id VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
+                id VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
                 namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT 'ferrum',
                 username VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
                 custom_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
                 credentials MEDIUMTEXT NOT NULL,
                 acl_groups MEDIUMTEXT NOT NULL,
                 created_at VARCHAR(64) NOT NULL,
-                updated_at VARCHAR(64) NOT NULL
+                updated_at VARCHAR(64) NOT NULL,
+                PRIMARY KEY (namespace, id)
             )
             "#
         } else {
             r#"
             CREATE TABLE IF NOT EXISTS consumers (
-                id TEXT PRIMARY KEY,
+                id TEXT NOT NULL,
                 namespace TEXT NOT NULL DEFAULT 'ferrum',
                 username TEXT NOT NULL,
                 custom_id TEXT,
                 credentials TEXT NOT NULL DEFAULT '{}',
                 acl_groups TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (namespace, id)
             )
             "#
         }
@@ -407,7 +426,7 @@ impl V001SqlBuilder {
                 credential_hash VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
                 consumer_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
                 PRIMARY KEY (namespace, credential_type, credential_hash),
-                CONSTRAINT fk_consumer_credential_index_consumer FOREIGN KEY (consumer_id) REFERENCES consumers(id) ON DELETE CASCADE
+                CONSTRAINT fk_consumer_credential_index_consumer FOREIGN KEY (namespace, consumer_id) REFERENCES consumers(namespace, id) ON DELETE CASCADE
             )
             "#
         } else {
@@ -416,8 +435,42 @@ impl V001SqlBuilder {
                 namespace TEXT NOT NULL,
                 credential_type TEXT NOT NULL,
                 credential_hash TEXT NOT NULL,
-                consumer_id TEXT NOT NULL REFERENCES consumers(id) ON DELETE CASCADE,
-                PRIMARY KEY (namespace, credential_type, credential_hash)
+                consumer_id TEXT NOT NULL,
+                PRIMARY KEY (namespace, credential_type, credential_hash),
+                FOREIGN KEY (namespace, consumer_id) REFERENCES consumers(namespace, id) ON DELETE CASCADE
+            )
+            "#
+        }
+    }
+
+    fn create_consumer_identity_index_sql(&self) -> &'static str {
+        // Persistence-level cross-field consumer identity uniqueness (issue
+        // #2121): one row per identity value (id, username, custom_id) a
+        // consumer claims within its namespace. The composite PK is the
+        // enforcement — two consumers in one namespace cannot claim the same
+        // identity value across *any* of those fields. Self-collisions (a
+        // consumer whose custom_id equals its own id/username) are allowed;
+        // the writer dedupes its own values before insert.
+        if self.is_mysql() {
+            r#"
+            CREATE TABLE IF NOT EXISTS consumer_identity_index (
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                identity_value VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                consumer_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                created_at VARCHAR(64) NOT NULL,
+                PRIMARY KEY (namespace, identity_value),
+                CONSTRAINT fk_consumer_identity_index_consumer FOREIGN KEY (namespace, consumer_id) REFERENCES consumers(namespace, id) ON DELETE CASCADE
+            )
+            "#
+        } else {
+            r#"
+            CREATE TABLE IF NOT EXISTS consumer_identity_index (
+                namespace TEXT NOT NULL,
+                identity_value TEXT NOT NULL,
+                consumer_id TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (namespace, identity_value),
+                FOREIGN KEY (namespace, consumer_id) REFERENCES consumers(namespace, id) ON DELETE CASCADE
             )
             "#
         }
@@ -1169,6 +1222,17 @@ mod tests {
     }
 
     #[test]
+    fn test_mysql_consumer_identity_index_collation_on_identifier_columns() {
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_consumer_identity_index_sql();
+        assert_columns_have_collation(
+            sql,
+            "consumer_identity_index",
+            &["namespace", "identity_value", "consumer_id"],
+        );
+    }
+
+    #[test]
     fn test_mysql_plugin_configs_collation_on_identifier_columns() {
         let builder = V001SqlBuilder::new("mysql");
         let sql = builder.create_plugin_configs_sql();
@@ -1217,6 +1281,8 @@ mod tests {
             for sql in [
                 builder.create_upstreams_sql(),
                 builder.create_consumers_sql(),
+                builder.create_consumer_credential_index_sql(),
+                builder.create_consumer_identity_index_sql(),
                 builder.create_proxies_sql(),
                 builder.create_proxy_route_locks_sql(),
                 builder.create_plugin_configs_sql(),
@@ -1312,14 +1378,38 @@ mod tests {
     }
 
     #[test]
+    fn test_fk_consumer_index_tables_consistent_across_dialects() {
+        // Both consumer index tables must FK the composite consumers PK
+        // (namespace, id) with ON DELETE CASCADE in every dialect.
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            assert_fk_present(
+                builder.create_consumer_credential_index_sql(),
+                "consumers",
+                "namespace, id",
+                "CASCADE",
+            );
+            assert_fk_present(
+                builder.create_consumer_identity_index_sql(),
+                "consumers",
+                "namespace, id",
+                "CASCADE",
+            );
+        }
+    }
+
+    #[test]
     fn test_fk_count_matches_across_dialects() {
-        // Every dialect must define exactly 4 FK references (counted by
-        // occurrences of "REFERENCES" in the combined CREATE TABLE SQL).
+        // Every dialect must define exactly 6 FK references (counted by
+        // occurrences of "REFERENCES" in the combined CREATE TABLE SQL):
+        // the 4 proxy/plugin FKs plus the two composite consumer-index FKs.
         for dialect in ["postgres", "mysql", "sqlite"] {
             let builder = V001SqlBuilder::new(dialect);
             let all_sql = [
                 builder.create_upstreams_sql(),
                 builder.create_consumers_sql(),
+                builder.create_consumer_credential_index_sql(),
+                builder.create_consumer_identity_index_sql(),
                 builder.create_proxies_sql(),
                 builder.create_plugin_configs_sql(),
                 builder.create_proxy_plugins_sql(),
@@ -1328,9 +1418,53 @@ mod tests {
 
             let count = all_sql.matches("REFERENCES").count();
             assert_eq!(
-                count, 4,
-                "{dialect} dialect has {count} FK REFERENCES clauses, expected 4"
+                count, 6,
+                "{dialect} dialect has {count} FK REFERENCES clauses, expected 6"
             );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Per-namespace consumer identity schema (issue #2121)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_consumers_primary_key_is_composite_across_dialects() {
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            let sql = builder.create_consumers_sql();
+            assert!(
+                sql.contains("PRIMARY KEY (namespace, id)"),
+                "{dialect} consumers table must declare a composite PRIMARY KEY (namespace, id)"
+            );
+            assert!(
+                !sql.contains("id TEXT PRIMARY KEY")
+                    && !sql.contains("COLLATE utf8mb4_0900_as_cs PRIMARY KEY"),
+                "{dialect} consumers table must not keep a single-column id PRIMARY KEY"
+            );
+        }
+    }
+
+    #[test]
+    fn test_consumer_identity_index_table_shape_across_dialects() {
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            let sql = builder.create_consumer_identity_index_sql();
+            assert!(
+                sql.contains("consumer_identity_index"),
+                "{dialect} must create the consumer_identity_index table"
+            );
+            assert!(
+                sql.contains("PRIMARY KEY (namespace, identity_value)"),
+                "{dialect} consumer_identity_index PK must be (namespace, identity_value) so \
+                 cross-field identity collisions are rejected at persistence level"
+            );
+            for column in ["namespace", "identity_value", "consumer_id", "created_at"] {
+                assert!(
+                    sql.contains(column),
+                    "{dialect} consumer_identity_index must carry the {column} column"
+                );
+            }
         }
     }
 }

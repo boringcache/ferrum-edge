@@ -96,9 +96,9 @@ impl ConfigDelta {
             removed_proxy_ids: diff_removed_ids(&old.proxies, &new.proxies),
             modified_proxies: diff_modified(&old.proxies, &new.proxies),
 
-            added_consumers: diff_added(&old.consumers, &new.consumers),
-            removed_consumer_ids: diff_removed_ids(&old.consumers, &new.consumers),
-            modified_consumers: diff_modified(&old.consumers, &new.consumers),
+            added_consumers: diff_added_consumers(&old.consumers, &new.consumers),
+            removed_consumer_ids: diff_removed_consumer_ids(&old.consumers, &new.consumers),
+            modified_consumers: diff_modified_consumers(&old.consumers, &new.consumers),
 
             added_plugin_configs,
             removed_plugin_config_ids,
@@ -330,6 +330,43 @@ fn diff_modified<T: HasIdAndTimestamp + Clone>(old: &[T], new: &[T]) -> Vec<T> {
         .collect()
 }
 
+type ConsumerKey<'a> = (&'a str, &'a str);
+
+fn consumer_key(consumer: &Consumer) -> ConsumerKey<'_> {
+    (consumer.namespace.as_str(), consumer.id.as_str())
+}
+
+fn diff_added_consumers(old: &[Consumer], new: &[Consumer]) -> Vec<Consumer> {
+    let old_keys: HashSet<ConsumerKey<'_>> = old.iter().map(consumer_key).collect();
+    new.iter()
+        .filter(|consumer| !old_keys.contains(&consumer_key(consumer)))
+        .cloned()
+        .collect()
+}
+
+fn diff_removed_consumer_ids(old: &[Consumer], new: &[Consumer]) -> Vec<String> {
+    let new_keys: HashSet<ConsumerKey<'_>> = new.iter().map(consumer_key).collect();
+    old.iter()
+        .filter(|consumer| !new_keys.contains(&consumer_key(consumer)))
+        .map(|consumer| consumer.id.clone())
+        .collect()
+}
+
+fn diff_modified_consumers(old: &[Consumer], new: &[Consumer]) -> Vec<Consumer> {
+    let old_map: HashMap<ConsumerKey<'_>, DateTime<Utc>> = old
+        .iter()
+        .map(|consumer| (consumer_key(consumer), consumer.updated_at))
+        .collect();
+    new.iter()
+        .filter(|consumer| {
+            old_map
+                .get(&consumer_key(consumer))
+                .is_some_and(|old_ts| consumer.updated_at != *old_ts)
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +474,19 @@ mod tests {
         }
     }
 
+    fn consumer(namespace: &str, id: &str, updated_at: DateTime<Utc>) -> Consumer {
+        Consumer {
+            id: id.to_string(),
+            namespace: namespace.to_string(),
+            username: format!("{namespace}-{id}"),
+            custom_id: None,
+            credentials: HashMap::new(),
+            acl_groups: Vec::new(),
+            created_at: updated_at,
+            updated_at,
+        }
+    }
+
     #[test]
     fn diff_modified_treats_backward_timestamp_drift_as_change() {
         let old = vec![TestResource {
@@ -491,6 +541,29 @@ mod tests {
             vec!["modified"]
         );
         assert!(!delta.is_empty());
+    }
+
+    #[test]
+    fn compute_keys_consumers_by_namespace_and_id() {
+        let mut old = config(vec![], vec![]);
+        old.consumers = vec![
+            consumer("prod", "c1", ts(10)),
+            consumer("staging", "c1", ts(10)),
+        ];
+        let mut new = config(vec![], vec![]);
+        new.consumers = vec![
+            consumer("prod", "c1", ts(10)),
+            consumer("staging", "c1", ts(11)),
+        ];
+
+        let modified = ConfigDelta::compute(&old, &new);
+        assert_eq!(modified.modified_consumers.len(), 1);
+        assert_eq!(modified.modified_consumers[0].namespace, "staging");
+
+        new.consumers
+            .retain(|consumer| consumer.namespace == "prod");
+        let removed = ConfigDelta::compute(&old, &new);
+        assert_eq!(removed.removed_consumer_ids, vec!["c1"]);
     }
 
     #[test]

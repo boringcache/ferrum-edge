@@ -6,7 +6,7 @@
 //! all SQL backends behind dialect-specific SQL rendering.
 
 use chrono::Utc;
-use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig, NamespacedResourceId};
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, LoadBalancerAlgorithm, PluginAssociation, PluginConfig,
     PluginScope, Proxy, Upstream, UpstreamTarget, default_namespace,
@@ -194,7 +194,7 @@ async fn incremental_poll_uses_durable_sequence_for_create_update_delete() {
     assert!(updated.sequence_cursor > created.sequence_cursor);
 
     store
-        .delete_upstream("sequence-upstream")
+        .delete_upstream("ferrum", "sequence-upstream")
         .await
         .expect("upstream delete must succeed");
     let deleted = store
@@ -294,7 +294,10 @@ async fn incremental_delete_records_drive_removals_without_resource_row_scans() 
 
     assert_eq!(result.sequence_cursor, 4);
     assert_eq!(result.removed_proxy_ids, vec!["deleted-proxy"]);
-    assert_eq!(result.removed_consumer_ids, vec!["deleted-consumer"]);
+    assert_eq!(
+        result.removed_consumer_ids,
+        vec![NamespacedResourceId::new("ferrum", "deleted-consumer")]
+    );
     assert_eq!(result.removed_plugin_config_ids, vec!["deleted-plugin"]);
     assert_eq!(result.removed_upstream_ids, vec!["deleted-upstream"]);
     assert!(result.added_or_modified_proxies.is_empty());
