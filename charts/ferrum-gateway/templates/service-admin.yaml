@@ -1,6 +1,7 @@
 {{- if .Values.admin.service.enabled }}
 {{- $ports := .Values.ports | default dict -}}
 {{- $adminTls := (.Values.tls | default dict).admin | default dict -}}
+{{- $adminTlsSet := include "ferrum-gateway.serverTlsConfigured" (dict "root" . "surface" $adminTls "certSource" "FERRUM_ADMIN_TLS_CERT_SOURCE" "keySource" "FERRUM_ADMIN_TLS_KEY_SOURCE") -}}
 {{/* Fail render rather than ship a portless admin Service (rejected by the API
      server) when the operator explicitly asked for one but no admin port is
      publishable: adminHttp disabled AND no usable admin HTTPS port (adminHttps=0
@@ -8,9 +9,9 @@
      computed probes are overridden/disabled. Mirror the proxy Service's
      port-availability requirement with actionable guidance. */}}
 {{- $hasAdminHttp := and (hasKey $ports "adminHttp") (ne ($ports.adminHttp | toString) "0") -}}
-{{- $hasAdminHttps := and (hasKey $ports "adminHttps") (ne ($ports.adminHttps | toString) "0") $adminTls.enabled $adminTls.secretName -}}
+{{- $hasAdminHttps := and (hasKey $ports "adminHttps") (ne ($ports.adminHttps | toString) "0") $adminTlsSet -}}
 {{- if not (or $hasAdminHttp $hasAdminHttps) -}}
-{{- fail "admin.service.enabled=true but no admin Service port is publishable: enable a plaintext admin listener (ports.adminHttp>0) or admin HTTPS (ports.adminHttps>0 with tls.admin.enabled + tls.admin.secretName). A Service with no ports is rejected by the API server; set admin.service.enabled=false if you do not need it." -}}
+{{- fail "admin.service.enabled=true but no admin Service port is publishable: enable a plaintext admin listener (ports.adminHttp>0) or admin HTTPS (ports.adminHttps>0 with a tls.admin Secret or complete FERRUM_ADMIN_TLS_{CERT,KEY}_SOURCE pair). A Service with no ports is rejected by the API server; set admin.service.enabled=false if you do not need it." -}}
 {{- end -}}
 apiVersion: v1
 kind: Service
@@ -35,7 +36,7 @@ spec:
       targetPort: admin-http
       protocol: TCP
     {{- end }}
-    {{- if and (hasKey $ports "adminHttps") (ne ($ports.adminHttps | toString) "0") $adminTls.enabled $adminTls.secretName }}
+    {{- if and (hasKey $ports "adminHttps") (ne ($ports.adminHttps | toString) "0") $adminTlsSet }}
     - name: admin-https
       port: {{ $ports.adminHttps }}
       targetPort: admin-https

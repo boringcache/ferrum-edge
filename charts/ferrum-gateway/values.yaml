@@ -91,14 +91,14 @@ streamPorts: []
 # SAFETY: in the write-capable database and cp modes the binary HARD-FAILS on a
 # non-loopback PLAINTEXT admin bind unless you also supply one of:
 #   - admin.allowedCidrs (an IP allowlist)
-#   - admin TLS (tls.admin.enabled=true) with ports.adminHttp=0 (drop plaintext)
+#   - admin TLS (tls.admin Secret or complete cert/key SOURCE pair) with
+#     ports.adminHttp=0 (drop plaintext)
 #   - admin.allowInsecureHttp=true (local/dev; always pair with a NetworkPolicy)
 # The chart mirrors this and fails render early instead of shipping a pod that
 # crash-loops. Every comma-separated allowlist entry is strictly validated; a
-# typo or empty segment fails render. A /0 CIDR is not protection; the chart
-# rejects literal /0 entries and mapped IPv6 /96 spellings that canonicalize to
-# IPv4 /0, while the binary remains authoritative for equivalent permit-all
-# unions.
+# typo or empty segment fails render. Any list that covers a whole address family
+# is not protection; the chart rejects /0 entries, mapped IPv6 /96 spellings that
+# canonicalize to IPv4 /0, and full-coverage CIDR unions.
 # If you set admin.allowedCidrs while using the computed exec probes, include the
 # probe source (directly or through a covering CIDR) so the admin TCP filter does
 # not drop them. The probe source tracks admin.bindAddress: 127.0.0.1 for the
@@ -133,10 +133,10 @@ admin:
     valueFrom: {}
   # Cluster-internal admin Service (ClusterIP). Only enable together with a
   # non-loopback admin.bindAddress and a NetworkPolicy restricting access. The
-  # admin-https port is published only when tls.admin is enabled with a Secret
-  # (admin HTTPS does not serve otherwise), mirroring the proxy Service. If neither
-  # a plaintext admin port (ports.adminHttp>0) nor a usable admin HTTPS port is
-  # available the Service would have no ports, so the chart fails render instead.
+  # admin-https is published when tls.admin is enabled with a Secret or a complete
+  # FERRUM_ADMIN_TLS_CERT_SOURCE / FERRUM_ADMIN_TLS_KEY_SOURCE pair is supplied.
+  # If neither a plaintext admin port (ports.adminHttp>0) nor usable admin HTTPS
+  # is available the Service would have no ports, so the chart fails render.
   service:
     enabled: false
     type: ClusterIP
@@ -155,8 +155,10 @@ grpc:
   # The binary hard-fails on a non-loopback plaintext CP gRPC bind (cp mode) or a
   # non-loopback http:// CP URL (dp mode) unless gRPC TLS is configured or this is
   # true. The chart mirrors that guard at render. Dev/in-cluster only; for
-  # production configure tls.cpGrpc (CP) and tls.dpGrpc (DP) instead of enabling
-  # this, and pair any plaintext use with a NetworkPolicy.
+  # production configure tls.cpGrpc (CP), or a complete
+  # FERRUM_CP_GRPC_TLS_CERT_SOURCE / FERRUM_CP_GRPC_TLS_KEY_SOURCE pair, plus
+  # tls.dpGrpc trust on the DP instead of enabling this. Pair any plaintext use
+  # with a NetworkPolicy.
   allowPlaintext: false
 
 # -----------------------------------------------------------------------------
@@ -252,6 +254,8 @@ dp:
 # -----------------------------------------------------------------------------
 # TLS material. Each enabled surface mounts a Secret (standard tls.crt/tls.key/
 # ca.crt keys) read-only and sets the matching FERRUM_*_TLS_*_PATH env vars.
+# Complete server cert/key SOURCE pairs in env/extraEnv are supported alternatives
+# for frontend, admin, and CP gRPC TLS and participate in listener/Service guards.
 # cpGrpc applies only in cp mode; dpGrpc only in dp mode. Secret files default
 # to group-readable 0440 (decimal 288); podSecurityContext.fsGroup grants the
 # non-root runtime that group. Both settings are operator-overridable.
@@ -269,6 +273,9 @@ tls:
     # Optional mTLS client CA bundle key within the same Secret.
     clientCaKey: ""
   admin:
+    # Alternatively, a complete FERRUM_ADMIN_TLS_CERT_SOURCE /
+    # FERRUM_ADMIN_TLS_KEY_SOURCE pair in env/extraEnv starts admin HTTPS and is
+    # recognized by TLS-only probes and the optional admin Service.
     enabled: false
     secretName: ""
     mountPath: /etc/ferrum/tls/admin
@@ -288,6 +295,8 @@ tls:
     clientCertKey: tls.crt
     clientKeyKey: tls.key
   cpGrpc:
+    # Alternatively, a complete FERRUM_CP_GRPC_TLS_CERT_SOURCE /
+    # FERRUM_CP_GRPC_TLS_KEY_SOURCE pair in env/extraEnv secures the CP listener.
     enabled: false
     secretName: ""
     mountPath: /etc/ferrum/tls/cp-grpc
@@ -433,9 +442,10 @@ affinity: {}
 topologySpreadConstraints: []
 
 # Proxy Service (front-door). Publishes proxyHttp; proxyHttps only when
-# tls.frontend is enabled with a Secret (file/database) or in dp mode where the
-# HTTPS listener binds on the port alone and hot-swaps CP-delivered TLS; plus any
-# streamPorts marked `service: true`. When HTTP/3 is enabled
+# tls.frontend is enabled with a Secret or a complete frontend cert/key SOURCE
+# pair is set (file/database), or in dp mode where the HTTPS listener binds on
+# the port alone and hot-swaps CP-delivered TLS; plus any streamPorts marked
+# `service: true`. When HTTP/3 is enabled
 # (env.FERRUM_ENABLE_HTTP3: "true") the HTTPS port is also published on UDP
 # (QUIC) alongside the TCP entry.
 service:

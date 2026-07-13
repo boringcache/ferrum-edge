@@ -7,12 +7,8 @@
      valueFrom forms). A dp binds the HTTPS listener whenever the port is nonzero
      (empty dynamic slot hot-swapped with CP-delivered Gateway TLS,
      src/modes/data_plane.rs), so its Service HTTPS port tracks the port alone. */}}
-{{- $frontendPathTls := and $frontendTls.enabled $frontendTls.secretName -}}
-{{- $frontendCertSource := include "ferrum-gateway.tlsSourceConfigured" (dict "root" . "name" "FERRUM_FRONTEND_TLS_CERT_SOURCE") -}}
-{{- $frontendKeySource := include "ferrum-gateway.tlsSourceConfigured" (dict "root" . "name" "FERRUM_FRONTEND_TLS_KEY_SOURCE") -}}
-{{- $frontendCertConfigured := or $frontendPathTls $frontendCertSource -}}
-{{- $frontendKeyConfigured := or $frontendPathTls $frontendKeySource -}}
-{{- $httpsListenerActive := or (and $frontendCertConfigured $frontendKeyConfigured) (eq .Values.mode "dp") -}}
+{{- $frontendTlsSet := include "ferrum-gateway.serverTlsConfigured" (dict "root" . "surface" $frontendTls "certSource" "FERRUM_FRONTEND_TLS_CERT_SOURCE" "keySource" "FERRUM_FRONTEND_TLS_KEY_SOURCE") -}}
+{{- $httpsListenerActive := or $frontendTlsSet (eq .Values.mode "dp") -}}
 {{- $hasHttp := and (hasKey $ports "proxyHttp") (ne ($ports.proxyHttp | toString) "0") -}}
 {{- $hasHttps := and (hasKey $ports "proxyHttps") (ne ($ports.proxyHttps | toString) "0") $httpsListenerActive -}}
 {{/* HTTP/3 (QUIC) rides UDP on the SAME HTTPS port; when enabled the Service must

@@ -35,9 +35,12 @@ CONTROL-PLANE MODE (read/write admin, no proxy, gRPC distribution)
 {{- else }}
     (cp.service.enabled=false — no gRPC Service rendered)
 {{- end }}
-{{- if not (and (.Values.tls.cpGrpc).enabled (.Values.tls.cpGrpc).secretName) }}
-- NOTE: CP gRPC TLS is not configured (tls.cpGrpc). Configure it before serving
-  DPs on the non-loopback listener; do not rely on plaintext outside local dev.
+{{- $cpGrpcTls := (.Values.tls | default dict).cpGrpc | default dict }}
+{{- $cpGrpcTlsSet := include "ferrum-gateway.serverTlsConfigured" (dict "root" . "surface" $cpGrpcTls "certSource" "FERRUM_CP_GRPC_TLS_CERT_SOURCE" "keySource" "FERRUM_CP_GRPC_TLS_KEY_SOURCE") }}
+{{- if not $cpGrpcTlsSet }}
+- NOTE: CP gRPC TLS is not configured (tls.cpGrpc or cert/key SOURCE pair).
+  Configure it before serving DPs on the non-loopback listener; do not rely on
+  plaintext outside local dev.
 {{- end }}
 {{- end }}
 

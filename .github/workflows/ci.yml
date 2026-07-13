@@ -2085,8 +2085,9 @@ jobs:
             echo "::error title=TLS guard left plaintext admin enabled::ports.adminHttp must be 0 when TLS is the protection"
             exit 1
           fi
-          grep -F 'tls.admin.enabled + ports.adminHttp=0' "$RUNNER_TEMP/ferrum-gateway-helm-results/tls-with-plaintext-admin.err"
-          # A literal /0 allowlist is unrestricted and cannot satisfy the guard.
+          grep -F 'ports.adminHttp=0' "$RUNNER_TEMP/ferrum-gateway-helm-results/tls-with-plaintext-admin.err"
+          # Any allowlist that covers a whole address family is unrestricted and
+          # cannot satisfy the guard, whether coverage comes from /0 or a union.
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=database --set database.type=sqlite \
             --set-string database.sqlite.path=/data/ferrum.db \
@@ -2098,7 +2099,7 @@ jobs:
             echo "::error title=Catch-all admin CIDR rendered successfully::a /0 allowlist must not satisfy the plaintext guard"
             exit 1
           fi
-          grep -F 'contains a /0 catch-all CIDR' "$RUNNER_TEMP/ferrum-gateway-helm-results/catch-all-admin-cidr.err"
+          grep -F 'permits every address in an IP family' "$RUNNER_TEMP/ferrum-gateway-helm-results/catch-all-admin-cidr.err"
           # The runtime canonicalizes a mapped IPv6 /96 into IPv4 /0, which is
           # equally unrestricted and cannot satisfy the plaintext guard.
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
@@ -2113,6 +2114,30 @@ jobs:
             exit 1
           fi
           grep -F 'IPv4-mapped /96' "$RUNNER_TEMP/ferrum-gateway-helm-results/mapped-catch-all-admin-cidr.err"
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-gateway-credentials \
+            --set admin.bindAddress=0.0.0.0 \
+            --set-string 'admin.allowedCidrs=0.0.0.0/1\,128.0.0.0/1' \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv4-union-admin-cidr.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv4-union-admin-cidr.err"; then
+            echo "::error title=Full IPv4 union rendered successfully::two /1 entries jointly cover every IPv4 address"
+            exit 1
+          fi
+          grep -F 'full-coverage CIDR union' "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv4-union-admin-cidr.err"
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=database --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-gateway-credentials \
+            --set admin.bindAddress=0.0.0.0 \
+            --set-string 'admin.allowedCidrs=::/1\,8000::/1' \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv6-union-admin-cidr.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv6-union-admin-cidr.err"; then
+            echo "::error title=Full IPv6 union rendered successfully::two /1 entries jointly cover every IPv6 address"
+            exit 1
+          fi
+          grep -F 'full-coverage CIDR union' "$RUNNER_TEMP/ferrum-gateway-helm-results/ipv6-union-admin-cidr.err"
           # The runtime allowlist filters loopback too, so computed exec probes
           # require an entry that contains their 127.0.0.1 source.
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
@@ -2152,7 +2177,7 @@ jobs:
             echo "::error title=TLS-only admin probes without admin TLS::adminHttp=0 must require tls.admin"
             exit 1
           fi
-          grep -F 'admin HTTPS only serves when admin TLS is configured' "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-tls-only-no-material.err"
+          grep -F 'admin HTTPS only serves when a complete cert/key pair is configured' "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-tls-only-no-material.err"
           # With admin TLS material, TLS-only admin (adminHttp=0) renders.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=database --set database.type=sqlite \
@@ -2162,6 +2187,12 @@ jobs:
             --set tls.admin.enabled=true --set tls.admin.secretName=ferrum-admin-tls \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-tls-only.yaml"
           grep -Fq 'name: FERRUM_ADMIN_TLS_CERT_PATH' "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-tls-only.yaml"
+          # Admin cert/key SOURCE envs are a complete HTTPS input too.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set ports.adminHttp=0 \
+            --set-string env.FERRUM_ADMIN_TLS_CERT_SOURCE=file:///etc/ferrum/admin.crt \
+            --set-string env.FERRUM_ADMIN_TLS_KEY_SOURCE=file:///etc/ferrum/admin.key \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-source-tls-only.yaml"
           # cp mode: a non-loopback PLAINTEXT gRPC bind (chart defaults) must fail
           # unless gRPC TLS or grpc.allowPlaintext is set (mirrors the binary).
           if helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
@@ -2175,6 +2206,15 @@ jobs:
             exit 1
           fi
           grep -F 'non-loopback PLAINTEXT gRPC bind' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-plaintext-grpc.err"
+          # CP cert/key SOURCE envs configure server TLS just like tls.cpGrpc.
+          helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=cp --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set-string env.FERRUM_CP_GRPC_TLS_CERT_SOURCE=file:///etc/ferrum/cp.crt \
+            --set-string env.FERRUM_CP_GRPC_TLS_KEY_SOURCE=file:///etc/ferrum/cp.key \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-source-tls.yaml"
           # A loopback CP gRPC bind renders without the opt-in when the (unreachable)
           # CP Service is disabled.
           helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
@@ -2208,6 +2248,14 @@ jobs:
             --set-string cp.grpcBindAddress=:: --set grpc.allowPlaintext=true \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-ipv6-grpc.yaml"
           grep -F 'value: "[::]:50051"' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-ipv6-grpc.yaml"
+          helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=cp --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set-string 'cp.grpcBindAddress=[::]' --set grpc.allowPlaintext=true \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-bracketed-ipv6-grpc.yaml"
+          grep -F 'value: "[::]:50051"' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-bracketed-ipv6-grpc.yaml"
           # ports.cpGrpc=0 disables the CP gRPC listener: render succeeds, no gRPC
           # container port, and the CP Service is suppressed (would be portless).
           helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
@@ -2279,6 +2327,14 @@ jobs:
             exit 1
           fi
           grep -F 'is not an IP literal' "$RUNNER_TEMP/ferrum-gateway-helm-results/hostname-bind.err"
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set-string admin.bindAddress=2001:db8:::1 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/malformed-ipv6-admin-bind.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/malformed-ipv6-admin-bind.err"; then
+            echo "::error title=Malformed IPv6 admin bind rendered::strict hextet parsing must reject repeated separators"
+            exit 1
+          fi
+          grep -F 'is not an IP literal' "$RUNNER_TEMP/ferrum-gateway-helm-results/malformed-ipv6-admin-bind.err"
           # An IPv6 loopback admin bind shifts the computed probes to --host ::1.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=file --set admin.bindAddress=::1 \
@@ -2569,6 +2625,19 @@ jobs:
             exit 1
           fi
           grep -F 'FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_SOURCE set' "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-mtls-source-probes.err"
+          # The same mTLS guard applies when the admin server cert/key are also
+          # supplied entirely through SOURCE envs.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set ports.adminHttp=0 \
+            --set-string env.FERRUM_ADMIN_TLS_CERT_SOURCE=file:///etc/ferrum/admin.crt \
+            --set-string env.FERRUM_ADMIN_TLS_KEY_SOURCE=file:///etc/ferrum/admin.key \
+            --set-string env.FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_SOURCE=file:///etc/ferrum/admin-client-ca.pem \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-all-source-mtls-probes.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-all-source-mtls-probes.err"; then
+            echo "::error title=All-SOURCE admin mTLS probes rendered::source-backed server and client-CA material must require probe overrides"
+            exit 1
+          fi
+          grep -F 'require a client certificate' "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-all-source-mtls-probes.err"
           # Overriding both computed probes lets the admin mTLS + adminHttp=0 combo render.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=file --set ports.adminHttp=0 \
@@ -2590,6 +2659,30 @@ jobs:
             exit 1
           fi
           grep -F 'is not an IP literal' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-hostname-bind.err"
+          if helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=cp --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set-string cp.grpcBindAddress=::: \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-malformed-ipv6-bind.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-malformed-ipv6-bind.err"; then
+            echo "::error title=Malformed IPv6 CP bind rendered::strict hextet parsing must reject :::"
+            exit 1
+          fi
+          grep -F 'is not an IP literal' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-malformed-ipv6-bind.err"
+          if helm template ferrum-cp ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=cp --set database.type=sqlite \
+            --set-string database.sqlite.path=/data/ferrum.db \
+            --set admin.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set grpc.jwtSecret.existingSecret.name=ferrum-grpc-credentials \
+            --set-string cp.grpcBindAddress='[::' \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-mismatched-bracket-bind.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-mismatched-bracket-bind.err"; then
+            echo "::error title=Mismatched CP IPv6 brackets rendered::bracketed bind literals must be balanced"
+            exit 1
+          fi
+          grep -F 'mismatched IPv6 brackets' "$RUNNER_TEMP/ferrum-gateway-helm-results/cp-mismatched-bracket-bind.err"
           # An out-of-range IPv4 octet admin bind must be rejected at render.
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=file --set admin.bindAddress=999.999.999.999 \
@@ -2637,6 +2730,15 @@ jobs:
             exit 1
           fi
           grep -F 'no admin Service port is publishable' "$RUNNER_TEMP/ferrum-gateway-helm-results/portless-admin-service.err"
+          # A complete admin cert/key SOURCE pair makes admin HTTPS publishable.
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=file --set ports.adminHttp=0 \
+            --set admin.bindAddress=0.0.0.0 --set admin.service.enabled=true \
+            --set-string env.FERRUM_ADMIN_TLS_CERT_SOURCE=file:///etc/ferrum/admin.crt \
+            --set-string env.FERRUM_ADMIN_TLS_KEY_SOURCE=file:///etc/ferrum/admin.key \
+            --show-only templates/service-admin.yaml \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-source-service.yaml"
+          grep -Fq -- '- name: admin-https' "$RUNNER_TEMP/ferrum-gateway-helm-results/admin-source-service.yaml"
           # file mode: admin JWT is optional, but two sources for one base key conflict.
           if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             --set mode=file \

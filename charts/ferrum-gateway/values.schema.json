@@ -63,7 +63,7 @@
         "bindAddress": { "type": "string" },
         "allowedCidrs": {
           "type": "string",
-          "description": "Comma-separated admin source allowlist using strict bare IP/CIDR syntax; malformed entries, empty comma segments, and bracketed IPv6 are rejected. Literal /0 entries and mapped IPv6 /96 spellings that canonicalize to IPv4 /0 do not protect plaintext; computed exec probes require an entry containing their observed TCP source (for example 127.0.0.0/8, 127.0.0.1/32, or bare 127.0.0.1). Runtime CIDR canonicalization is authoritative."
+          "description": "Comma-separated admin source allowlist using strict bare IP/CIDR syntax; malformed entries, empty comma segments, and bracketed IPv6 are rejected. Lists covering a whole family (including /0, mapped IPv6 /96 to IPv4 /0, and full-coverage unions) do not protect plaintext; computed exec probes require an entry containing their observed TCP source (for example 127.0.0.0/8, 127.0.0.1/32, or bare 127.0.0.1)."
         },
         "allowInsecureHttp": { "type": "boolean" },
         "jwtSecret": {
@@ -111,7 +111,7 @@
         },
         "allowPlaintext": {
           "type": "boolean",
-          "description": "Explicitly permit plaintext CP/DP config sync (FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT). Required for a non-loopback plaintext CP gRPC bind or a non-loopback http:// DP CP URL; dev only. Prefer tls.cpGrpc/tls.dpGrpc for production."
+          "description": "Explicitly permit plaintext CP/DP config sync (FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT). Required for a non-loopback plaintext CP gRPC bind or a non-loopback http:// DP CP URL; dev only. Prefer tls.cpGrpc or a complete CP cert/key SOURCE pair plus tls.dpGrpc trust for production."
         }
       }
     },
@@ -123,7 +123,7 @@
     },
     "tls": {
       "type": "object",
-      "description": "TLS Secret mounts. The proxy Service publishes HTTPS when frontend is enabled with a secretName (file/database) or in dp mode (CP-delivered TLS). The admin Service publishes admin-https only when tls.admin is enabled with a secretName.",
+      "description": "TLS Secret mounts. Equivalent complete cert/key SOURCE pairs supplied through env/extraEnv are also recognized for frontend, admin, and CP gRPC listener gating. The DP proxy HTTPS listener may also use CP-delivered TLS.",
       "properties": {
         "frontend": {
           "type": "object",

@@ -30,50 +30,56 @@ node_agent, migrate) fails at template time with a pointer to the right chart.
   admin through a Service set `admin.bindAddress=0.0.0.0` **and**
   `admin.service.enabled=true`. In the write-capable `database`/`cp` modes the
   binary hard-fails on a non-loopback **plaintext** admin bind unless you also
-  set one of `admin.allowedCidrs`, admin TLS (`tls.admin.enabled` +
-  `ports.adminHttp=0`), or `admin.allowInsecureHttp=true`; TLS on 9443 does not
-  protect a still-live plaintext listener on 9000. Literal `/0` CIDRs are
-  rejected as ineffective protection (including mapped IPv6 `/96` spellings
-  that canonicalize to IPv4 `/0`), and every entry is strictly validated so a
-  typo fails at render instead of crash-looping the pod; the binary is
-  authoritative for other permit-all CIDR unions. If computed exec probes are
-  enabled,
+  set one of `admin.allowedCidrs`, admin TLS (`tls.admin` or a complete
+  `FERRUM_ADMIN_TLS_{CERT,KEY}_SOURCE` pair, with `ports.adminHttp=0`), or
+  `admin.allowInsecureHttp=true`; TLS on 9443 does not protect a still-live
+  plaintext listener on 9000. Any allowlist that covers a whole address family
+  is rejected as ineffective protection, including `/0`, mapped IPv6 `/96`
+  spellings that canonicalize to IPv4 `/0`, and full-coverage CIDR unions.
+  Every entry is strictly validated so a typo fails at render instead of
+  crash-looping the pod. If computed exec probes are enabled,
   `admin.allowedCidrs` must contain source `127.0.0.1` (for example
   `127.0.0.0/8`, `127.0.0.1/32`, or the bare IP)
-  because the admin TCP filter does not special-case loopback. Any IPv6 bind form
-  (`::`, `[::]`, `::1`, `[::1]`) instead shifts the computed probes to `--host ::1`
-  and requires an entry containing `::1` (such as `::/127`, `::1/128`, or bare
-  `::1`) — an unspecified IPv6 bind is not guaranteed to accept v4-mapped
-  `127.0.0.1`, so the probes use IPv6 loopback for every IPv6 bind.
+  because the admin TCP filter does not special-case loopback. An IPv6 wildcard
+  or loopback bind (`::` or `::1`) shifts probes to `--host ::1` and requires an
+  entry containing `::1` (such as `::/127`, `::1/128`, or bare `::1`) — an
+  unspecified IPv6 bind is not guaranteed to accept v4-mapped `127.0.0.1`.
+  A concrete IPv6 bind is dialed directly and its concrete source must be allowed.
   IPv6 allowlist entries use bare address syntax (`fd00::/8`, `::1/128`), not
   URL-style brackets (`[fd00::]/8`), matching the runtime's strict CIDR parser.
   `admin.bindAddress` must be an IP literal — any hostname (`localhost`,
-  `admin.internal`, ...) is rejected at render (the binary requires an IP); use
-  `127.0.0.1` or `::1`.
+  `admin.internal`, ...) or malformed IPv6 literal is rejected at render (the
+  binary requires an IP); use `127.0.0.1` or `::1`.
 - **Probes and admin HTTPS.** When `ports.adminHttp=0` the computed exec probes
   auto-switch to `ferrum-edge health --tls` against admin HTTPS (`:9443`), which
   only serves when admin TLS material is configured. The chart therefore requires
-  `tls.admin.enabled` + `tls.admin.secretName` in that combination (or that you
+  `tls.admin.enabled` + `tls.admin.secretName` or a complete
+  `FERRUM_ADMIN_TLS_{CERT,KEY}_SOURCE` pair in that combination (or that you
   override/disable the computed probes). Disabling **both** admin ports
   (`ports.adminHttp=0` and `ports.adminHttps=0`) leaves no admin listener for the
   computed probes and is rejected unless every computed probe is overridden. Admin
-  **mTLS** (`tls.admin.clientCaKey` set) makes the admin HTTPS listener demand a
-  client cert the exec probes cannot present, so with `ports.adminHttp=0` the chart
-  requires you to override/disable the computed probes or keep a plaintext loopback
-  admin listener.
+  **mTLS** (`tls.admin.clientCaKey` or
+  `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_SOURCE`) makes the admin HTTPS listener
+  demand a client cert the exec probes cannot present, so with
+  `ports.adminHttp=0` the chart requires you to override/disable the computed
+  probes or keep a plaintext loopback admin listener.
 - **Admin Service needs a publishable port.** With `admin.service.enabled=true`
   the chart fails render if no admin Service port is available — a plaintext admin
-  port (`ports.adminHttp>0`) or admin HTTPS (`ports.adminHttps>0` with
-  `tls.admin.enabled` + `tls.admin.secretName`) — rather than ship a portless
-  Service the API server rejects.
+  port (`ports.adminHttp>0`) or admin HTTPS (`ports.adminHttps>0` with a
+  `tls.admin` Secret or complete admin cert/key SOURCE pair) — rather than ship
+  a portless Service the API server rejects.
 - **CP/DP gRPC transport.** The binary rejects a non-loopback **plaintext** CP
   gRPC bind (`cp` mode, default `cp.grpcBindAddress=0.0.0.0`) and a non-loopback
   `http://` CP URL (`dp` mode) unless gRPC TLS is configured or you set
   `grpc.allowPlaintext=true` (renders `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT`). The
-  chart mirrors that guard at render. Prefer `tls.cpGrpc`/`tls.dpGrpc` for
-  production; the dev opt-in flows through the first-class `grpc.allowPlaintext`.
+  chart mirrors that guard at render. CP server TLS may come from `tls.cpGrpc`
+  or a complete `FERRUM_CP_GRPC_TLS_{CERT,KEY}_SOURCE` pair. Prefer TLS plus
+  `tls.dpGrpc` trust pinning for production; the dev opt-in flows through the
+  first-class `grpc.allowPlaintext`.
   IPv6 CP binds are bracketed automatically (`::` → `[::]:50051`). A loopback CP
-  bind is unreachable through `cp.service`, so the chart requires
+  Both bare and balanced bracketed IPv6 are accepted; malformed literals and
+  mismatched brackets fail at render. A loopback CP bind is unreachable through
+  `cp.service`, so the chart requires
   `cp.service.enabled=false` with it; `ports.cpGrpc=0` disables the CP gRPC
   listener (the gRPC container port and CP Service are omitted). `cp.grpcBindAddress`
   must be an IP literal — the runtime parses `FERRUM_CP_GRPC_LISTEN_ADDR` as an
@@ -189,7 +195,8 @@ The CP example release renders the gRPC Service
 DNS name. In general the name is `<chart-fullname>-grpc`, truncated as one DNS
 label. The quickstart pair explicitly opts into plaintext ClusterIP gRPC for
 development. Production control planes should remove that opt-in, serve gRPC
-over TLS (`tls.cpGrpc`), and have DPs pin CP trust (`tls.dpGrpc`).
+over TLS (`tls.cpGrpc` or a complete CP cert/key SOURCE pair), and have DPs pin
+CP trust (`tls.dpGrpc`).
 
 ## Ports and stream listeners
 
@@ -203,10 +210,11 @@ supplied through `env`/`extraEnv` (file/database modes). Resolver-suffixed and
 `ports.proxyHttps` is published because the DP binds HTTPS on the port alone and
 hot-swaps CP-delivered Gateway TLS. Default file/database installs therefore do
 not advertise an unbound 443.
-The admin Service publishes `admin-https` only when `tls.admin` is enabled with a
-Secret. If no proxy port would be published (all proxy ports `0`, no frontend
-TLS, no `service: true` stream port), the proxy Service is skipped entirely
-rather than rendering an API-server-rejected empty `ports:` block.
+The admin Service publishes `admin-https` when `tls.admin` is enabled with a
+Secret or a complete admin cert/key SOURCE pair is configured. If no proxy port
+would be published (all proxy ports `0`, no frontend TLS, no `service: true`
+stream port), the proxy Service is skipped entirely rather than rendering an
+API-server-rejected empty `ports:` block.
 
 Enabling HTTP/3 through the supported env passthrough (`env.FERRUM_ENABLE_HTTP3:
 "true"`) starts a QUIC listener on the same `ports.proxyHttps` port over UDP. The
