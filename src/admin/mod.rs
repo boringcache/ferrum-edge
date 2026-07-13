@@ -1948,12 +1948,17 @@ fn tls_mutation_audit_descriptor(
         ["admin", "tls", "acme", "orders", id, "finalize"] => (*id).to_string(),
         ["admin", "tls", "acme", "renew", certificate_id] => (*certificate_id).to_string(),
         ["admin", "tls", "rotate", surface] => (*surface).to_string(),
-        ["admin", "tls", _, id] | ["admin", "tls", "acme", _, id] => (*id).to_string(),
+        // Every 4-segment ACME path is a collection (accounts/orders/
+        // certificates), so creates take the created resource's id from the
+        // response body — this arm must come before the generic
+        // `["admin", "tls", _, id]` arm, which would otherwise bind the
+        // collection name as the id.
         ["admin", "tls", _] | ["admin", "tls", "acme", _] => response_body
             .and_then(|body| body.get("id"))
             .and_then(Value::as_str)
             .unwrap_or("new")
             .to_string(),
+        ["admin", "tls", _, id] | ["admin", "tls", "acme", _, id] => (*id).to_string(),
         _ => segments.last().copied().unwrap_or("new").to_string(),
     };
     Some((action, resource_type, resource_id))
