@@ -1,5 +1,6 @@
-//! Drift detection between `HTTP_FIELDS` / `STREAM_FIELDS` registries and
-//! the actual `TransactionSummary` / `StreamTransactionSummary` structs.
+//! Drift detection between `HTTP_FIELDS` / `STREAM_FIELDS` /
+//! `WS_DISCONNECT_FIELDS` registries and the actual `TransactionSummary` /
+//! `StreamTransactionSummary` / `WsDisconnectLogEntry` serializers.
 //!
 //! If you add a field to either summary struct and forget to add it to the
 //! corresponding registry, this test fails with the missing field name.
@@ -11,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ferrum_edge::plugins::utils::log_schema::{HTTP_FIELDS, STREAM_FIELDS};
+use ferrum_edge::plugins::utils::log_schema::{HTTP_FIELDS, STREAM_FIELDS, WS_DISCONNECT_FIELDS};
 use ferrum_edge::plugins::{
     Direction, DisconnectCause, StreamTransactionSummary, TransactionSummary,
 };
@@ -158,4 +159,59 @@ fn stream_fields_declaration_order_matches_struct() {
             registry_order[i]
         );
     }
+}
+
+/// Drift guard for the WebSocket-disconnect field registry.
+///
+/// Unlike `TransactionSummary` / `StreamTransactionSummary`, the backing
+/// `WsDisconnectLogEntry` in `src/plugins/ws_logging.rs` is a private struct
+/// with a hand-written `SchemaSerializable::serialize_native` (and matching
+/// `owns_native`), so it cannot be serialized from an integration test to diff
+/// its keys. Instead we pin the exact ordered `WS_DISCONNECT_FIELDS` name list.
+///
+/// If you add, remove, or reorder a `serialize_native` arm (or the struct
+/// fields feeding it) in `WsDisconnectLogEntry`, update both the registry and
+/// this expected list. Keeping them in lockstep is what stops the schema
+/// compiler from accepting stale or missing WebSocket-disconnect field names in
+/// `omit` / `rename` / `order`.
+#[test]
+fn ws_disconnect_fields_registry_matches_expected() {
+    // Declaration order mirrors `WsDisconnectLogEntry::serialize_native`.
+    let expected: &[&str] = &[
+        "event",
+        "namespace",
+        "proxy_id",
+        "proxy_name",
+        "client_ip",
+        "consumer_username",
+        "auth_method",
+        "backend_target",
+        "protocol",
+        "listen_port",
+        "duration_ms",
+        "frames_client_to_backend",
+        "frames_backend_to_client",
+        "direction",
+        "io_side",
+        "error_class",
+        "metadata",
+    ];
+
+    let registered: Vec<&str> = WS_DISCONNECT_FIELDS.iter().map(|f| f.name).collect();
+
+    assert_eq!(
+        registered, expected,
+        "WS_DISCONNECT_FIELDS <-> WsDisconnectLogEntry drift detected.\n  \
+         Registry: {registered:?}\n  Expected: {expected:?}\n  \
+         Update WS_DISCONNECT_FIELDS and WsDisconnectLogEntry::serialize_native \
+         together (see src/plugins/ws_logging.rs)."
+    );
+
+    // No duplicate output keys — mirrors the uniqueness the compiler relies on.
+    let unique: HashSet<&str> = registered.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        registered.len(),
+        "WS_DISCONNECT_FIELDS contains duplicate field names"
+    );
 }
