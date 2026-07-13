@@ -53,7 +53,9 @@ jobs:
 
           if [ "$EVENT_NAME" = "pull_request" ]; then
             base_ref="origin/${BASE_REF}"
-            git diff --name-only "${base_ref}...HEAD" | sort > "$changed_files"
+            # Disable rename detection so moving a full-CI input to an allowed
+            # lightweight path reports both the deleted source and destination.
+            git diff --name-only --no-renames "${base_ref}...HEAD" | sort > "$changed_files"
 
             # A PR that edits only the planner must not be able to classify
             # itself as light. Use the base branch's trusted planner when it

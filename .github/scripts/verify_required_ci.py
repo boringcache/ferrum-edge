@@ -7,6 +7,13 @@ import re
 import sys
 from pathlib import Path
 
+from live_suite_path_filter import (
+    LIVE_SUITE_DOCUMENTATION_PATHS,
+    SUITE_PATTERNS,
+    exact_path_patterns,
+)
+from pr_ci_plan import FULL_CI_DOCUMENTATION_PATHS
+
 
 REQUIRED_JOBS = {
     "ci-plan",
@@ -98,6 +105,18 @@ def extract_job_body(ci_yml: str, job: str) -> str:
     return match.group("body")
 
 
+def extract_documentation_paths(workflow_yml: str) -> set[str]:
+    paths = set(
+        re.findall(
+            r"(?m)^\s+-\s+[\"']?(docs/[^\"'\s]+)[\"']?\s*$",
+            workflow_yml,
+        )
+    )
+    if not paths:
+        raise RuntimeError("could not find documentation paths in live workflow")
+    return paths
+
+
 def main() -> int:
     ci_path = Path(".github/workflows/ci.yml")
     ci_yml = ci_path.read_text(encoding="utf-8")
@@ -113,10 +132,41 @@ def main() -> int:
         if "needs.ci-plan.outputs.mode == 'full'" not in body:
             planner_errors.append(f"jobs.{job} must require full CI mode")
 
+    ci_plan_body = extract_job_body(ci_yml, "ci-plan")
+    if 'git diff --name-only --no-renames "${base_ref}...HEAD"' not in ci_plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must disable rename detection when collecting changed files"
+        )
+
+    node_waypoint_yml = Path(
+        ".github/workflows/node-waypoint-ebpf-live.yml"
+    ).read_text(encoding="utf-8")
+    required_full_ci_docs = LIVE_SUITE_DOCUMENTATION_PATHS | extract_documentation_paths(
+        node_waypoint_yml
+    )
+    configured_live_doc_patterns = {
+        pattern
+        for patterns in SUITE_PATTERNS.values()
+        for pattern in patterns
+        if "docs/" in pattern
+    }
+    declared_live_doc_patterns = set(
+        exact_path_patterns(LIVE_SUITE_DOCUMENTATION_PATHS)
+    )
+    if configured_live_doc_patterns != declared_live_doc_patterns:
+        planner_errors.append(
+            "live-suite documentation patterns must use the shared exact-path sets"
+        )
+    for path in sorted(required_full_ci_docs - FULL_CI_DOCUMENTATION_PATHS):
+        planner_errors.append(
+            f"PR planner must keep live-suite documentation `{path}` on full CI"
+        )
+
     if not missing and not extra and not planner_errors:
         print(
             f"Required CI aggregate covers {len(REQUIRED_JOBS)} jobs; "
-            f"{len(DIRECT_FULL_CI_JOBS)} roots enforce the CI plan."
+            f"{len(DIRECT_FULL_CI_JOBS)} roots and "
+            f"{len(required_full_ci_docs)} live-suite docs enforce the CI plan."
         )
         return 0
 

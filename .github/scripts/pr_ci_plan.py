@@ -20,20 +20,30 @@ LIGHTWEIGHT_PATTERNS = [
     re.compile(r"^LICENSE(?:-[^/]+)?$"),
 ]
 
-# These Markdown files deliberately trigger one or more live datapath suites.
-# Keep them on full CI so the Tests aggregate continues mirroring those suites
-# instead of treating a contract/runbook change as ordinary documentation.
-FULL_CI_DOCUMENTATION_PATTERNS = [
-    re.compile(
-        r"^docs/(ci_cd|configuration|mesh|mesh_multicluster_federation_runbook|"
-        r"mesh_supported_matrix|node_agent|spire_deployment)\.md$"
-    ),
-    re.compile(r"^docs/plans/node_waypoint_transport_adr\.md$"),
-]
+# Markdown under vendor/ participates in VENDOR_INTEGRITY.sha256 and must run
+# the vendored-patch and integration guards even when a manifest update was
+# accidentally omitted.
+FULL_CI_PREFIXES = ("vendor/",)
+
+# These files deliberately trigger one or more live datapath suites. The
+# required-CI verifier mechanically checks this set against both
+# live_suite_path_filter.py and node-waypoint-ebpf-live.yml.
+FULL_CI_DOCUMENTATION_PATHS = frozenset(
+    {
+        "docs/ci_cd.md",
+        "docs/configuration.md",
+        "docs/mesh.md",
+        "docs/mesh_multicluster_federation_runbook.md",
+        "docs/mesh_supported_matrix.md",
+        "docs/node_agent.md",
+        "docs/plans/node_waypoint_transport_adr.md",
+        "docs/spire_deployment.md",
+    }
+)
 
 
 def is_lightweight_path(path: str) -> bool:
-    if any(pattern.search(path) for pattern in FULL_CI_DOCUMENTATION_PATTERNS):
+    if path.startswith(FULL_CI_PREFIXES) or path in FULL_CI_DOCUMENTATION_PATHS:
         return False
     return any(pattern.search(path) for pattern in LIGHTWEIGHT_PATTERNS)
 
@@ -73,6 +83,12 @@ def self_test() -> int:
         ("pull_request", ["docs/mesh.md"], "full"),
         ("pull_request", ["docs/configuration.md"], "full"),
         ("pull_request", ["docs/plans/node_waypoint_transport_adr.md"], "full"),
+        (
+            "pull_request",
+            ["vendor/tungstenite-0.29.0-ferrum-patched/README.md"],
+            "full",
+        ),
+        ("pull_request", ["src/proxy/legacy.rs", "notes.md"], "full"),
         ("pull_request", ["src/proxy/mod.rs"], "full"),
         ("pull_request", ["docs/admin_api.md", "Cargo.lock"], "full"),
         ("pull_request", [".github/workflows/ci.yml"], "full"),

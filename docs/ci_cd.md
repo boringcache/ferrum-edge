@@ -92,16 +92,20 @@ Push tag v* (e.g., v0.2.0)
 The CI workflow is triggered by every pull request and every push to `main`.
 The `CI Plan` job first selects `full` or `light` mode. Pull requests whose
 entire diff is limited to ordinary documentation, `.agents/**`, `.claude/**`,
-Markdown, or license files use light mode and preserve a fast `Tests` aggregate
-without starting the Rust/build matrix. Documentation that deliberately
-triggers a live datapath suite (including the mesh, SPIRE, configuration,
-NodeWaypoint, and CI contract/runbook files) remains full mode. The planner
-still runs `git diff --check` for PR diff hygiene. Any unrecognized path, an
-empty/unavailable diff, a mixed code-and-docs change, a push to `main`, or a
-manual run fails over to full mode. The decision table and its executable
-examples live in `.github/scripts/pr_ci_plan.py`. PR decisions use the planner
-from the base branch when available, so a planner-only edit cannot classify
-itself as light; edits to the planner therefore receive the full matrix.
+Markdown outside `vendor/`, or license files use light mode and preserve a fast
+`Tests` aggregate without starting the Rust/build matrix. Documentation that
+deliberately triggers a live datapath suite (including the mesh, SPIRE,
+configuration, NodeWaypoint, and CI contract/runbook files) remains full mode.
+The planner runs `git diff --check` for PR diff hygiene and disables rename
+detection when classifying paths, so both the source and destination of a rename
+are checked.
+Any unrecognized path, an empty/unavailable diff, a mixed code-and-docs change,
+a push to `main`, or a manual run fails over to full mode. The decision table
+and its executable examples live in `.github/scripts/pr_ci_plan.py`. PR
+decisions use the planner from the base branch when available, so a planner-only
+edit cannot classify itself as light; edits to the planner therefore receive
+the full matrix. The required-CI verifier also checks that documentation paths
+used by live-suite filters remain in the planner's full-CI set.
 
 In full mode, the `Tests` aggregate waits for format, test shards, lint,
 dependency audit, vendored patch regressions, the Coverage workflow mirror,
