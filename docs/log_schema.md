@@ -258,7 +258,11 @@ suggestion where applicable):
 For named schemas:
 
 17. `transaction_log_schema` with `scope: proxy` or `scope: proxy_group`
-    is rejected by `validate_plugin_references`.
+    is rejected at the admin write path (`PluginConfig::validate_fields`,
+    returning a `400`) and by the runtime rejecting contract
+    (`validate_plugin_references`). Both surfaces agree so an admitted write can
+    never be rejected by a later full-config load (which would wedge the DB poll
+    loop read-only — see issue #2158).
 18. Two `transaction_log_schema` plugins in the same config defining the
     same name.
 

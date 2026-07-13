@@ -453,6 +453,7 @@ jobs:
             # consumers. Heavier per-test setup (k8s clients, telemetry
             # collectors) balances the smaller test count.
             filters: |
+              integration::k8s_controller_gateway_status_tests
               integration::k8s_controller_istio_status_tests
               integration::mesh_telemetry_k8s_provider_lookup_tests
               integration::mesh_telemetry_tracing_tests

@@ -4000,3 +4000,152 @@ fn locality_preference_same_zone_requires_zone_present() {
     assert!(a.same_region(&b));
     assert!(!a.same_zone(&b));
 }
+
+// ---- Admin/runtime validation-contract consistency (issue #2158) ----
+//
+// The admin write path (`PluginConfig::validate_fields`) and the runtime
+// rejecting contract shared by database full-loads / CP broadcasts
+// (`GatewayConfig::validate_plugin_references`, invoked via
+// `collect_rejecting_runtime_config_errors`) MUST agree on which plugin-config
+// shapes are admissible. If admin admits a shape the full-load then rejects, the
+// database-mode poll loop flips `db_available=false` and wedges the entire admin
+// API read-only — the self-DoS in #2158, first surfaced by the
+// `test_admin_mongodb_runtime_resource_crud_matrix` functional test which
+// created `transaction_log_schema` at proxy_group scope.
+
+fn transaction_log_schema_pc(scope: PluginScope, proxy_id: Option<&str>) -> PluginConfig {
+    PluginConfig {
+        id: "tls-schema".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "transaction_log_schema".into(),
+        config: serde_json::json!({ "schemas": { "default": { "summary_type": "both" } } }),
+        scope,
+        proxy_id: proxy_id.map(str::to_string),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[test]
+fn transaction_log_schema_global_scope_admitted_by_both_surfaces() {
+    let pc = transaction_log_schema_pc(PluginScope::Global, None);
+    assert!(
+        pc.validate_fields().is_ok(),
+        "admin write path should admit transaction_log_schema at global scope"
+    );
+
+    let mut config = empty_config();
+    config.plugin_configs = vec![pc];
+    assert!(
+        config.validate_plugin_references().is_ok(),
+        "runtime rejecting contract should admit transaction_log_schema at global scope"
+    );
+}
+
+#[test]
+fn transaction_log_schema_proxy_group_scope_rejected_by_both_surfaces() {
+    let pc = transaction_log_schema_pc(PluginScope::ProxyGroup, None);
+
+    // Admin write path must fail closed at write time (4xx), mirroring the
+    // runtime rejecting contract — this is the fix for #2158. Before the fix
+    // `validate_fields` admitted this shape and only the full-load rejected it,
+    // wedging the DB poll loop.
+    let field_errors = pc
+        .validate_fields()
+        .expect_err("admin write path must reject transaction_log_schema at proxy_group scope");
+    assert!(
+        field_errors
+            .iter()
+            .any(|m| m.contains("transaction_log_schema") && m.contains("scope 'global'")),
+        "unexpected validate_fields errors: {field_errors:?}"
+    );
+
+    let mut config = empty_config();
+    config.plugin_configs = vec![pc];
+    let ref_errors = config.validate_plugin_references().expect_err(
+        "runtime rejecting contract must reject transaction_log_schema at proxy_group scope",
+    );
+    assert!(
+        ref_errors
+            .iter()
+            .any(|m| m.contains("transaction_log_schema") && m.contains("scope 'global'")),
+        "unexpected validate_plugin_references errors: {ref_errors:?}"
+    );
+}
+
+#[test]
+fn transaction_log_schema_proxy_scope_rejected_by_both_surfaces() {
+    // proxy_id points at an existing proxy so the ONLY disagreement under test
+    // is the transaction_log_schema global-scope invariant, not a dangling ref.
+    let pc = transaction_log_schema_pc(PluginScope::Proxy, Some("p1"));
+
+    let field_errors = pc
+        .validate_fields()
+        .expect_err("admin write path must reject transaction_log_schema at proxy scope");
+    assert!(
+        field_errors
+            .iter()
+            .any(|m| m.contains("transaction_log_schema") && m.contains("scope 'global'")),
+        "unexpected validate_fields errors: {field_errors:?}"
+    );
+
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "/api")];
+    config.plugin_configs = vec![pc];
+    let ref_errors = config
+        .validate_plugin_references()
+        .expect_err("runtime rejecting contract must reject transaction_log_schema at proxy scope");
+    assert!(
+        ref_errors
+            .iter()
+            .any(|m| m.contains("transaction_log_schema") && m.contains("scope 'global'")),
+        "unexpected validate_plugin_references errors: {ref_errors:?}"
+    );
+}
+
+#[test]
+fn admin_admitted_plugin_scope_implies_runtime_reference_admit() {
+    // Invariant guarding the whole functional CRUD matrix: for the proxy_group
+    // scope the matrix assigns to every plugin, if the admin write path admits a
+    // plugin config, the runtime rejecting contract must admit it too. This is
+    // the per-plugin form of "admin-accept implies fullload-accept" and would
+    // catch any future single-resource plugin-scope rule that lands in
+    // `validate_plugin_references` but not in `validate_fields`.
+    for plugin_name in ferrum_edge::plugins::available_plugins() {
+        let pc = PluginConfig {
+            id: format!("pc-{plugin_name}"),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            plugin_name: plugin_name.to_string(),
+            // Field/reference validation does not schema-check `config`; an empty
+            // object exercises the scope/reference contract without per-plugin
+            // fixtures.
+            config: serde_json::json!({}),
+            scope: PluginScope::ProxyGroup,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        if pc.validate_fields().is_err() {
+            // Admin rejects this shape (e.g. transaction_log_schema at
+            // proxy_group scope after the #2158 fix); the implication holds
+            // vacuously, and the runtime is free to reject it too.
+            continue;
+        }
+
+        let mut config = empty_config();
+        config.plugin_configs = vec![pc];
+        assert!(
+            config.validate_plugin_references().is_ok(),
+            "plugin '{plugin_name}' is admitted by the admin write path at proxy_group scope but \
+             rejected by the runtime rejecting contract — this admit/reject skew wedges the DB \
+             poll loop (issue #2158)"
+        );
+    }
+}
