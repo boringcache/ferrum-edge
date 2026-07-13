@@ -39,9 +39,9 @@ With the flag off (default), behavior is unchanged and back-compatible.
 
 | Role | Access |
 | --- | --- |
-| `viewer` | Read-only endpoints |
+| `viewer` | Read-only endpoints, including API spec metadata listing |
 | `operator` | Read-only endpoints plus proxy, upstream, plugin config, backend capability refresh, TLS inventory/events/validation/forced reload, and mesh egress-scope test operations |
-| `admin` | Full access, including consumers, credentials, API specs, TLS material and ACME state management, batch/restore, and audit logs |
+| `admin` | Full access, including consumers, credentials, raw API spec retrieval and mutations, TLS material and ACME state management, batch/restore, and audit logs |
 
 Tokens without a valid `role` claim are rejected.
 
@@ -448,7 +448,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9000/restore?confirm=true"
 ```
 
-The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Before replacement, restore snapshots the current namespace with a non-validating raw load from the primary, so an already-invalid-but-present config still snapshots and keeps rollback available while it is repaired. If that snapshot cannot be taken at all — a genuine database/connectivity failure — restore **aborts with `503` before deleting anything** and leaves the prior config intact (retry once the database is reachable). Database inserts are chunked into 1,000-record transactions for large-scale imports; if the delete or any insert fails, Ferrum clears the partial state, reapplies the snapshot, and returns `500 Internal Server Error` with a `rollback` field (`completed` / `incomplete` / `not_needed`). `not_needed` means the clear failed atomically (SQL / replica-set MongoDB), so nothing was deleted and the prior config was retained without any re-import. API specs are admin-only metadata outside the backup/restore payload: a successful restore deletes them, and a config rollback cannot recreate them. Re-submit original documents via `POST /api-specs`; use `GET /api-specs` to list specs currently stored in the namespace. Failed restores report the authoritative affected count in `api_specs_not_restored`.
+The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Before replacement, restore snapshots the current namespace with a non-validating raw load from the primary, so an already-invalid-but-present config still snapshots and keeps rollback available while it is repaired. If that snapshot cannot be taken at all — a genuine database/connectivity failure — restore **aborts with `503` before deleting anything** and leaves the prior config intact (retry once the database is reachable). Database inserts are chunked into 1,000-record transactions for large-scale imports; if the delete or any insert fails, Ferrum clears the partial state, reapplies the snapshot, and returns `500 Internal Server Error` with a `rollback` field (`completed` / `incomplete` / `not_needed`). `not_needed` means the clear failed atomically (SQL / replica-set MongoDB), so nothing was deleted and the prior config was retained without any re-import. API specs are admin-plane-only metadata outside the backup/restore payload: a successful restore deletes them, and a config rollback cannot recreate them. Re-submit original documents via `POST /api-specs`; use `GET /api-specs` to list specs currently stored in the namespace. Failed restores report the authoritative affected count in `api_specs_not_restored`.
 
 See [admin_backup_restore.md](admin_backup_restore.md) for details.
 
@@ -678,18 +678,18 @@ Each `api_chargeback` plugin instance owns its own `currency` and `namespace` (p
 
 ## API Spec Management
 
-Ferrum Edge can ingest an OpenAPI 2.0 (Swagger), 3.0.x, 3.1.x, or 3.2.x specification document and atomically provision a proxy, optional upstream, and proxy-scoped plugins as a single bundle. This is an admin-only feature; specs are stored as compressed metadata and the gateway runtime never reads them — submitting or updating a spec has no effect on in-flight requests. See [docs/api_specs.md](api_specs.md) for the full extension contract, worked examples, and curl recipes.
+Ferrum Edge can ingest an OpenAPI 2.0 (Swagger), 3.0.x, 3.1.x, or 3.2.x specification document and atomically provision a proxy, optional upstream, and proxy-scoped plugins as a single bundle. Specs are admin-plane-only metadata and the gateway runtime never reads them — submitting or updating a spec has no effect on in-flight requests. Authenticated `viewer`, `operator`, and `admin` tokens can list non-secret spec metadata. Retrieving an original spec document requires `admin` because it can contain sensitive upstream or plugin configuration that the normal Viewer/Operator resource responses redact. Creating, replacing, or deleting a spec also requires `admin`. See [docs/api_specs.md](api_specs.md) for the full extension contract, worked examples, and curl recipes.
 
 **Endpoints at a glance:**
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api-specs` | Submit new spec; create proxy + upstream + plugins |
-| `GET` | `/api-specs` | List spec metadata (paginated, no content) |
-| `GET` | `/api-specs/{id}` | Retrieve spec document (content negotiation + ETag) |
-| `PUT` | `/api-specs/{id}` | Replace spec; recreate spec-owned resources |
-| `DELETE` | `/api-specs/{id}` | Delete spec; cascade proxy + plugins + upstream |
-| `GET` | `/api-specs/by-proxy/{proxy_id}` | Look up spec by proxy ID |
+| Method | Path | Minimum role | Description |
+|--------|------|--------------|-------------|
+| `POST` | `/api-specs` | `admin` | Submit new spec; create proxy + upstream + plugins |
+| `GET` | `/api-specs` | `viewer` | List spec metadata (paginated, no content) |
+| `GET` | `/api-specs/{id}` | `admin` | Retrieve spec document (content negotiation + ETag) |
+| `PUT` | `/api-specs/{id}` | `admin` | Replace spec; recreate spec-owned resources |
+| `DELETE` | `/api-specs/{id}` | `admin` | Delete spec; cascade proxy + plugins + upstream |
+| `GET` | `/api-specs/by-proxy/{proxy_id}` | `admin` | Look up spec by proxy ID |
 
 ### `POST /api-specs`
 

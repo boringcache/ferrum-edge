@@ -2,6 +2,7 @@
 
 use ferrum_edge::plugins::{
     Plugin, PluginResult, ProxyProtocol, StreamTransactionSummary, stdout_logging::StdoutLogging,
+    validate_plugin_config,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -91,6 +92,13 @@ fn test_stdout_logging_accepts_null_config_as_defaults() {
 fn test_stdout_logging_rejects_non_object_config() {
     let err = StdoutLogging::new(&json!("bad")).err().unwrap();
     assert!(err.contains("config must be an object"), "got: {err}");
+}
+
+#[test]
+fn test_shared_validation_rejects_invalid_stdout_logging_config() {
+    let err = validate_plugin_config("stdout_logging", &json!({"filter": "errors"}))
+        .expect_err("shared plugin validation must reject a non-object filter");
+    assert_eq!(err, "stdout_logging: filter must be an object");
 }
 
 #[tokio::test]

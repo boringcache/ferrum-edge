@@ -271,6 +271,13 @@ pub(crate) async fn handle_get<R: AdminResource>(
     role: AdminRole,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if let Err(message) = validate_resource_id(id) {
+        return Ok(super::json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": message}),
+        ));
+    }
+
     if let Some(ref db) = state.db {
         match R::db_get(db.as_ref(), namespace, id).await {
             Ok(Some(resource)) => {
@@ -339,6 +346,13 @@ pub(crate) async fn handle_delete<R: AdminResource>(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(response) = state.check_write_allowed() {
         return Ok(response);
+    }
+
+    if let Err(message) = validate_resource_id(id) {
+        return Ok(super::json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": message}),
+        ));
     }
 
     let db_arc = match state.db.as_ref() {
@@ -2186,6 +2200,15 @@ async fn handle_write<R: AdminResource>(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(response) = state.check_write_allowed() {
         return Ok(response);
+    }
+
+    if let WriteAction::Update { id } = action
+        && let Err(message) = validate_resource_id(id)
+    {
+        return Ok(super::json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": message}),
+        ));
     }
 
     let db_arc = match state.db.as_ref() {
