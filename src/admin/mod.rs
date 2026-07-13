@@ -1947,7 +1947,14 @@ fn tls_mutation_audit_descriptor(
     let resource_id = match segments {
         ["admin", "tls", "acme", "orders", id, "finalize"] => (*id).to_string(),
         ["admin", "tls", "acme", "renew", certificate_id] => (*certificate_id).to_string(),
-        ["admin", "tls", "rotate", surface] => (*surface).to_string(),
+        // Prefer the normalized surface from the handler's response body so
+        // documented aliases (e.g. /rotate/frontend vs the canonical watcher
+        // name) audit under the surface that was actually rotated.
+        ["admin", "tls", "rotate", surface] => response_body
+            .and_then(|body| body.get("surface"))
+            .and_then(Value::as_str)
+            .unwrap_or(surface)
+            .to_string(),
         // Every 4-segment ACME path is a collection (accounts/orders/
         // certificates), so creates take the created resource's id from the
         // response body — this arm must come before the generic
@@ -5043,6 +5050,16 @@ mod tests {
         )
         .expect("ACME order finalize should be audited");
         assert_eq!(finalize_id, "edge-order");
+
+        let rotated =
+            json!({"accepted": true, "requested_surface": "frontend", "surface": "frontend_tls"});
+        let (_, _, rotate_id) = tls_mutation_audit_descriptor(
+            &Method::POST,
+            &["admin", "tls", "rotate", "frontend"],
+            Some(&rotated),
+        )
+        .expect("TLS rotation should be audited");
+        assert_eq!(rotate_id, "frontend_tls");
     }
 
     #[test]
