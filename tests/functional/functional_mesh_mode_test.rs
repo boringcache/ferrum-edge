@@ -66,8 +66,13 @@ use crate::scaffolding::ports::reserve_port;
 const GRPC_SECRET: &str = "ferrum-edge-functional-mesh-grpc-secret00";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const RETRY_ATTEMPTS: u32 = 3;
-const CROSS_CLUSTER_NEGATIVE_TIMEOUT: Duration = Duration::from_secs(15);
-const CROSS_CLUSTER_NEGATIVE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+// Cross-cluster gateway A's outbound slice/routes can still be materializing
+// after its listener binds (and, in the live matrix, after the source sidecar
+// consumes its CP slice). Both the positive and negative arms therefore poll for
+// the FIRST authoritative routed response, retrying only transient setup /
+// route-not-converged outcomes, bounded by this deadline.
+const CROSS_CLUSTER_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(15);
+const CROSS_CLUSTER_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CROSS_CLUSTER_TLS_REJECTION_BODY: &str = "HBONE backend unavailable: TLS handshake failed";
 const CROSS_CLUSTER_WS_REJECTION_MARKER: &str =
     "authoritative cross-cluster WebSocket mTLS rejection";
@@ -3764,37 +3769,55 @@ async fn wait_for_cross_cluster_destination_ready(
     }
 }
 
-/// Poll an untrusted cross-cluster HTTP request until gateway A has installed
-/// the route and its secured-transport dial reaches the expected TLS rejection.
-/// Transient route misses / 503s do not prove fail-closed behavior and therefore
-/// cannot satisfy a negative assertion. A 200 is returned immediately so a real
-/// security regression is never hidden behind the bounded poll.
-async fn wait_for_authoritative_cross_cluster_http_rejection(
+/// Classify one cross-cluster HTTP attempt into an AUTHORITATIVE routed response
+/// (`Ok`) versus a TRANSIENT setup / route-not-converged outcome (`Err`) to
+/// retry. The two authoritative outcomes are a `200` backend success and the
+/// live route's `502` `HBONE ... TLS handshake failed` mesh-mTLS rejection;
+/// everything else — a connection/TLS-handshake establishment error or the
+/// source gateway's route-miss / upstream-overflow statuses (404/503/bare 502)
+/// while its outbound slice is still materializing — is transient. The
+/// authoritative response is returned so the caller asserts it strictly, exactly
+/// once. Shared by the positive (asserts `== 200`) and negative (asserts the
+/// `502` rejection / `!= 200`) arms, preserving the round-1 negative signature so
+/// neither retries an authoritative-but-wrong response.
+fn classify_cross_cluster_http(
+    result: Result<(u16, String), String>,
+) -> Result<(u16, String), String> {
+    match result {
+        Ok((200, body)) => Ok((200, body)),
+        Ok((502, body)) if body.contains(CROSS_CLUSTER_TLS_REJECTION_BODY) => Ok((502, body)),
+        Ok((status, body)) => Err(format!("route not converged: HTTP {status}: {body:?}")),
+        Err(error) => Err(format!("request error: {error}")),
+    }
+}
+
+/// Poll a cross-cluster HTTP request until gateway A's outbound route converges
+/// and returns an AUTHORITATIVE response (see [`classify_cross_cluster_http`]).
+/// The FIRST authoritative response is returned so the caller asserts it
+/// strictly, exactly once — a regression is never retried away — while only
+/// transient route-miss / setup outcomes are retried until the route
+/// materializes. Serves both the positive and negative arms.
+async fn wait_for_authoritative_cross_cluster_http(
     outbound_port: u16,
     request_label: &str,
 ) -> Result<(u16, String), String> {
-    let deadline = Instant::now() + CROSS_CLUSTER_NEGATIVE_TIMEOUT;
+    let deadline = Instant::now() + CROSS_CLUSTER_CONVERGENCE_TIMEOUT;
 
     loop {
-        let last_observation =
-            match plaintext_http_get(outbound_port, "svc-c.ferrum.svc.cluster.local", "/").await {
-                Ok((status, body))
-                    if status == 502 && body.contains(CROSS_CLUSTER_TLS_REJECTION_BODY) =>
-                {
-                    return Ok((status, body));
-                }
-                Ok((status, body)) if status == 200 => return Ok((status, body)),
-                Ok((status, body)) => format!("HTTP {status}: {body:?}"),
-                Err(error) => format!("request error: {error}"),
-            };
+        let last_observation = match classify_cross_cluster_http(
+            plaintext_http_get(outbound_port, "svc-c.ferrum.svc.cluster.local", "/").await,
+        ) {
+            Ok((status, body)) => return Ok((status, body)),
+            Err(transient) => transient,
+        };
 
         if Instant::now() >= deadline {
             return Err(format!(
-                "{request_label} route never reached the authoritative mTLS rejection within \
-                 {CROSS_CLUSTER_NEGATIVE_TIMEOUT:?}; last observation: {last_observation}"
+                "{request_label} route never reached an authoritative response within \
+                 {CROSS_CLUSTER_CONVERGENCE_TIMEOUT:?}; last observation: {last_observation}"
             ));
         }
-        tokio::time::sleep(CROSS_CLUSTER_NEGATIVE_POLL_INTERVAL).await;
+        tokio::time::sleep(CROSS_CLUSTER_CONVERGENCE_POLL_INTERVAL).await;
     }
 }
 
@@ -3806,15 +3829,48 @@ fn is_authoritative_cross_cluster_grpc_rejection(response: &GrpcEgressResponse) 
         && response.body.is_empty()
 }
 
-/// gRPC counterpart of the HTTP negative gate. A route miss does not carry the
-/// mesh transport's Trailers-Only UNAVAILABLE signature, while a live route
-/// whose untrusted mTLS dial is rejected does. Return a backend success
-/// immediately so the caller's security assertion fails without retry masking.
-async fn wait_for_authoritative_cross_cluster_grpc_rejection(
+/// A gRPC route-miss from the source gateway before its outbound slice
+/// materializes: `normalize_reject_response(NOT_FOUND, grpc=true)` yields a
+/// Trailers-Only `grpc-status: 5` (NOT_FOUND) with no backend body. This is a
+/// convergence artifact — the mesh-mTLS rejection instead carries `grpc-status:
+/// 14` — so it is transient, never the authoritative answer.
+fn cross_cluster_grpc_is_route_miss(response: &GrpcEgressResponse) -> bool {
+    response.status == 200
+        && response
+            .headers
+            .get("grpc-status")
+            .or_else(|| response.trailers.get("grpc-status"))
+            .map(String::as_str)
+            == Some("5")
+        && response.body.is_empty()
+}
+
+/// A cross-cluster gRPC backend success: HTTP 200 with either a `grpc-status: 0`
+/// trailer or the echoed request payload in the DATA frames.
+fn cross_cluster_grpc_is_backend_success(
+    response: &GrpcEgressResponse,
+    framed_body: &[u8],
+) -> bool {
+    response.status == 200
+        && (response.trailers.get("grpc-status").map(String::as_str) == Some("0")
+            || response
+                .body
+                .windows(framed_body.len())
+                .any(|window| window == framed_body))
+}
+
+/// gRPC counterpart of [`wait_for_authoritative_cross_cluster_http`]. The two
+/// authoritative outcomes are a backend success and the mesh-mTLS Trailers-Only
+/// UNAVAILABLE rejection; everything else (a NOT_FOUND route-miss or connection
+/// error while A's outbound slice materializes) is transient. The FIRST
+/// authoritative response is returned so the caller asserts it strictly, exactly
+/// once. Serves both the positive (asserts success) and negative (asserts the
+/// rejection) arms, preserving the round-1 negative signature.
+async fn wait_for_authoritative_cross_cluster_grpc(
     outbound_port: u16,
     framed_body: &[u8],
 ) -> Result<GrpcEgressResponse, String> {
-    let deadline = Instant::now() + CROSS_CLUSTER_NEGATIVE_TIMEOUT;
+    let deadline = Instant::now() + CROSS_CLUSTER_CONVERGENCE_TIMEOUT;
 
     loop {
         let last_observation = match grpc_egress_request(
@@ -3825,30 +3881,23 @@ async fn wait_for_authoritative_cross_cluster_grpc_rejection(
         )
         .await
         {
-            Ok(response) if is_authoritative_cross_cluster_grpc_rejection(&response) => {
-                return Ok(response);
-            }
             Ok(response)
-                if response.status == 200
-                    && (response.trailers.get("grpc-status").map(String::as_str) == Some("0")
-                        || response
-                            .body
-                            .windows(framed_body.len())
-                            .any(|window| window == framed_body)) =>
+                if is_authoritative_cross_cluster_grpc_rejection(&response)
+                    || cross_cluster_grpc_is_backend_success(&response, framed_body) =>
             {
                 return Ok(response);
             }
-            Ok(response) => format!("{response:?}"),
+            Ok(response) => format!("route not converged: {response:?}"),
             Err(error) => format!("request error: {error}"),
         };
 
         if Instant::now() >= deadline {
             return Err(format!(
-                "cross-cluster gRPC route never reached the authoritative mTLS rejection within \
-                 {CROSS_CLUSTER_NEGATIVE_TIMEOUT:?}; last observation: {last_observation}"
+                "cross-cluster gRPC route never reached an authoritative response within \
+                 {CROSS_CLUSTER_CONVERGENCE_TIMEOUT:?}; last observation: {last_observation}"
             ));
         }
-        tokio::time::sleep(CROSS_CLUSTER_NEGATIVE_POLL_INTERVAL).await;
+        tokio::time::sleep(CROSS_CLUSTER_CONVERGENCE_POLL_INTERVAL).await;
     }
 }
 
@@ -3856,20 +3905,34 @@ fn is_cross_cluster_websocket_bad_gateway(error: &str) -> bool {
     error.contains("HTTP error: 502") || error.contains("HTTP status 502")
 }
 
-/// Poll an untrusted cross-cluster WebSocket upgrade past A's route-apply
-/// window. Once the route is live, the secured backend dial produces a 502;
-/// route misses / transient 503s are ignored. Any successful upgrade is
-/// returned immediately so the negative test fails instead of retrying it away.
-async fn wait_for_authoritative_cross_cluster_ws_rejection(
+/// Poll a cross-cluster WebSocket upgrade past A's route-apply window. A
+/// completed upgrade (`Ok`) and the live route's authoritative 502 backend-dial
+/// rejection are both returned immediately (the 502 as an `Err` carrying
+/// [`CROSS_CLUSTER_WS_REJECTION_MARKER`]); only route-miss / transient upgrade
+/// failures are retried. The FIRST authoritative outcome therefore cannot be
+/// retried away, so the positive arm fails loudly on an unexpected rejection and
+/// the negative arm fails loudly on an unexpected success.
+async fn wait_for_authoritative_cross_cluster_ws(
     outbound_port: u16,
     payload: &str,
 ) -> Result<String, String> {
-    let deadline = Instant::now() + CROSS_CLUSTER_NEGATIVE_TIMEOUT;
+    wait_for_authoritative_cross_cluster_ws_path(outbound_port, "/", payload).await
+}
+
+/// [`wait_for_authoritative_cross_cluster_ws`] on an arbitrary request path, for
+/// the path-preservation positive drive.
+async fn wait_for_authoritative_cross_cluster_ws_path(
+    outbound_port: u16,
+    path: &str,
+    payload: &str,
+) -> Result<String, String> {
+    let deadline = Instant::now() + CROSS_CLUSTER_CONVERGENCE_TIMEOUT;
 
     loop {
-        let last_observation = match mesh_websocket_echo_roundtrip(
+        let last_observation = match mesh_websocket_echo_roundtrip_path(
             outbound_port,
             "svc-c.ferrum.svc.cluster.local",
+            path,
             payload,
         )
         .await
@@ -3883,11 +3946,11 @@ async fn wait_for_authoritative_cross_cluster_ws_rejection(
 
         if Instant::now() >= deadline {
             return Err(format!(
-                "cross-cluster WebSocket route never reached the authoritative mTLS rejection \
-                 within {CROSS_CLUSTER_NEGATIVE_TIMEOUT:?}; last observation: {last_observation}"
+                "cross-cluster WebSocket route never reached an authoritative response \
+                 within {CROSS_CLUSTER_CONVERGENCE_TIMEOUT:?}; last observation: {last_observation}"
             ));
         }
-        tokio::time::sleep(CROSS_CLUSTER_NEGATIVE_POLL_INTERVAL).await;
+        tokio::time::sleep(CROSS_CLUSTER_CONVERGENCE_POLL_INTERVAL).await;
     }
 }
 
@@ -4391,22 +4454,16 @@ async fn drive_cross_cluster_egress(client_trusted: bool) -> Result<(u16, String
             continue;
         }
 
-        // Trusted requests stay one-shot after the B/C readiness gate so a
-        // positive-path regression cannot be hidden. The untrusted negative
-        // additionally waits for A's route to become live and requires the
-        // authoritative TLS-rejection response rather than accepting a
-        // transient route miss / 503 as proof of fail-closed behavior.
-        let last = if client_trusted {
-            plaintext_http_get(a_outbound_port, "svc-c.ferrum.svc.cluster.local", "/")
-                .await
-                .map_err(|error| format!("cross-cluster egress GET failed: {error}"))
-        } else {
-            wait_for_authoritative_cross_cluster_http_rejection(
-                a_outbound_port,
-                "cross-cluster egress",
-            )
-            .await
-        };
+        // Both arms poll for A's FIRST authoritative routed response past the
+        // outbound slice/route-apply window (the B/C readiness gate only proves
+        // the B->C path is mTLS-ready, not that A's route has converged),
+        // retrying only transient route-miss / setup outcomes. The trusted arm
+        // then asserts `== 200` and the untrusted arm `!= 200`; neither can
+        // retry an authoritative-but-wrong response, so a regression is never
+        // hidden and a transient route miss never masquerades as fail-closed.
+        let last =
+            wait_for_authoritative_cross_cluster_http(a_outbound_port, "cross-cluster egress")
+                .await;
 
         let output_a = captured_output(&temp_a);
         let output_b = captured_output(&temp_b);
@@ -4792,19 +4849,13 @@ async fn drive_cross_cluster_grpc_egress(
             continue;
         };
 
-        let last = if client_trusted {
-            grpc_egress_request(
-                fixture.a_outbound_port,
-                "svc-c.ferrum.svc.cluster.local",
-                "/echo.Mesh/Call",
-                &framed,
-            )
-            .await
-            .map_err(|error| format!("cross-cluster gRPC egress request failed: {error}"))
-        } else {
-            wait_for_authoritative_cross_cluster_grpc_rejection(fixture.a_outbound_port, &framed)
-                .await
-        };
+        // Both arms poll for A's FIRST authoritative gRPC response past the
+        // route-apply window (only the NOT_FOUND route-miss / connection errors
+        // are retried); the trusted arm asserts success and the untrusted arm
+        // asserts the mesh-mTLS rejection, so neither retries an
+        // authoritative-but-wrong response.
+        let last =
+            wait_for_authoritative_cross_cluster_grpc(fixture.a_outbound_port, &framed).await;
 
         let logs = fixture.logs();
         fixture.shutdown().await;
@@ -4909,20 +4960,14 @@ async fn drive_cross_cluster_ws_egress(client_trusted: bool) -> Result<(String, 
             continue;
         };
 
-        let last = if client_trusted {
-            mesh_websocket_echo_roundtrip(
-                fixture.a_outbound_port,
-                "svc-c.ferrum.svc.cluster.local",
-                "mesh-xc-ws-hello",
-            )
-            .await
-        } else {
-            wait_for_authoritative_cross_cluster_ws_rejection(
-                fixture.a_outbound_port,
-                "mesh-xc-ws-hello",
-            )
-            .await
-        };
+        // Both arms poll for A's FIRST authoritative WS outcome past the
+        // route-apply window (only route-miss / transient upgrade failures are
+        // retried); a completed upgrade or the live 502 rejection returns at
+        // once, so the trusted arm fails loudly on an unexpected rejection and
+        // the untrusted arm fails loudly on an unexpected success.
+        let last =
+            wait_for_authoritative_cross_cluster_ws(fixture.a_outbound_port, "mesh-xc-ws-hello")
+                .await;
 
         let logs = fixture.logs();
         fixture.shutdown().await;
@@ -5464,20 +5509,16 @@ async fn drive_ambient_cross_cluster_egress(
             continue;
         }
 
-        // Keep the trusted positive one-shot. The untrusted negative must first
-        // observe A's live route and its TLS-rejection body; a transient route
-        // miss / 503 is not an acceptable fail-closed result.
-        let last = if client_trusted {
-            plaintext_http_get(a_outbound_port, "svc-c.ferrum.svc.cluster.local", "/")
-                .await
-                .map_err(|error| format!("ambient cross-cluster egress GET failed: {error}"))
-        } else {
-            wait_for_authoritative_cross_cluster_http_rejection(
-                a_outbound_port,
-                "ambient cross-cluster egress",
-            )
-            .await
-        };
+        // Both arms poll for A's FIRST authoritative routed response past the
+        // outbound route-apply window, retrying only transient route-miss / setup
+        // outcomes; the trusted arm asserts `== 200` and the untrusted `!= 200`,
+        // so neither retries an authoritative-but-wrong response and a transient
+        // route miss never masquerades as fail-closed.
+        let last = wait_for_authoritative_cross_cluster_http(
+            a_outbound_port,
+            "ambient cross-cluster egress",
+        )
+        .await;
 
         let output_a = captured_output(&temp_a);
         let output_b = captured_output(&temp_b);
@@ -5853,20 +5894,15 @@ async fn drive_ambient_cross_cluster_ws_egress(
             continue;
         };
 
-        let last = if client_trusted {
-            mesh_websocket_echo_roundtrip(
-                fixture.a_outbound_port,
-                "svc-c.ferrum.svc.cluster.local",
-                "mesh-amb-xc-ws-hello",
-            )
-            .await
-        } else {
-            wait_for_authoritative_cross_cluster_ws_rejection(
-                fixture.a_outbound_port,
-                "mesh-amb-xc-ws-hello",
-            )
-            .await
-        };
+        // Both arms poll for A's FIRST authoritative WS outcome past the
+        // route-apply window (only route-miss / transient upgrade failures are
+        // retried); the trusted arm fails loudly on an unexpected rejection and
+        // the untrusted arm fails loudly on an unexpected success.
+        let last = wait_for_authoritative_cross_cluster_ws(
+            fixture.a_outbound_port,
+            "mesh-amb-xc-ws-hello",
+        )
+        .await;
 
         let logs = fixture.logs();
         fixture.shutdown().await;
@@ -5945,9 +5981,11 @@ async fn drive_ambient_cross_cluster_ws_path_egress() -> Result<(String, String)
             continue;
         };
 
-        let last = mesh_websocket_echo_roundtrip_path(
+        // Poll for A's FIRST authoritative WS outcome on the non-root path past
+        // the route-apply window, retrying only transient route-miss / upgrade
+        // failures so the positive path-preservation assertion runs exactly once.
+        let last = wait_for_authoritative_cross_cluster_ws_path(
             fixture.a_outbound_port,
-            "svc-c.ferrum.svc.cluster.local",
             CLIENT_PATH,
             "mesh-amb-xc-ws-path-hello",
         )
@@ -10235,17 +10273,29 @@ async fn live_xc_test_http(fixture: &LiveTwoClusterFixture) {
     let destination = format!("{LIVE_XC_MULTI_VIP}:{LIVE_XC_HTTP_PORT}")
         .parse()
         .expect("HTTP VIP");
-    let (status, body) = live_xc_http_get_from_vip(
-        fixture.source.pod.pid(),
-        destination,
-        "live-matrix.ferrum.svc.cluster.local:18080",
-    )
-    .unwrap_or_else(|error| {
-        panic!(
-            "HTTP did not cross the live east-west/destination-capture path: {error}\n{}",
-            fixture.diagnostics()
-        )
-    });
+    // The fixture only proves listener binds, SVID issuance, and TCP
+    // reachability — not that the source sidecar consumed its CP slice and
+    // materialized the route. Poll for the FIRST authoritative response,
+    // retrying only transient route-miss / setup outcomes, then assert once.
+    let deadline = Instant::now() + CROSS_CLUSTER_CONVERGENCE_TIMEOUT;
+    let (status, body) = loop {
+        let transient = match classify_cross_cluster_http(live_xc_http_get_from_vip(
+            fixture.source.pod.pid(),
+            destination,
+            "live-matrix.ferrum.svc.cluster.local:18080",
+        )) {
+            Ok(response) => break response,
+            Err(transient) => transient,
+        };
+        if Instant::now() >= deadline {
+            panic!(
+                "HTTP did not cross the live east-west/destination-capture path within \
+                 {CROSS_CLUSTER_CONVERGENCE_TIMEOUT:?}; last transient error: {transient}\n{}",
+                fixture.diagnostics()
+            );
+        }
+        tokio::time::sleep(CROSS_CLUSTER_CONVERGENCE_POLL_INTERVAL).await;
+    };
     assert_eq!(
         status,
         200,
@@ -10261,12 +10311,27 @@ async fn live_xc_test_http(fixture: &LiveTwoClusterFixture) {
 
 #[cfg(target_os = "linux")]
 async fn live_xc_test_grpc(fixture: &LiveTwoClusterFixture) {
-    let response = fixture.grpc().await.unwrap_or_else(|error| {
-        panic!(
-            "Sidecar gRPC did not cross the live fixture: {error}\n{}",
-            fixture.diagnostics()
-        )
-    });
+    // Poll for the FIRST authoritative gRPC response past the source-slice
+    // convergence window, retrying only the NOT_FOUND route-miss / connection
+    // errors, then assert the routed result once.
+    let deadline = Instant::now() + CROSS_CLUSTER_CONVERGENCE_TIMEOUT;
+    let response = loop {
+        let transient = match fixture.grpc().await {
+            Ok(response) if cross_cluster_grpc_is_route_miss(&response) => {
+                format!("route not converged: {response:?}")
+            }
+            Ok(response) => break response,
+            Err(error) => format!("request error: {error}"),
+        };
+        if Instant::now() >= deadline {
+            panic!(
+                "Sidecar gRPC did not cross the live fixture within \
+                 {CROSS_CLUSTER_CONVERGENCE_TIMEOUT:?}; last transient error: {transient}\n{}",
+                fixture.diagnostics()
+            );
+        }
+        tokio::time::sleep(CROSS_CLUSTER_CONVERGENCE_POLL_INTERVAL).await;
+    };
     assert_eq!(
         response.status,
         200,
@@ -10303,33 +10368,57 @@ async fn live_xc_test_sidecar_websocket(fixture: &LiveTwoClusterFixture) {
     let destination = format!("{LIVE_XC_MULTI_VIP}:{LIVE_XC_SIDECAR_WS_PORT}")
         .parse()
         .expect("sidecar WebSocket VIP");
-    let reply = fixture
-        .websocket(
-            destination,
-            "live-matrix.ferrum.svc.cluster.local:18082",
-            "sidecar-live",
-        )
-        .await
-        .unwrap_or_else(|error| {
-            panic!(
-                "Sidecar WebSocket live cross-cluster row failed: {error}\n{}",
-                fixture.diagnostics()
+    // Poll past the source-slice convergence window: a completed upgrade is the
+    // authoritative result (asserted once); only transient upgrade / route-miss
+    // failures are retried.
+    let deadline = Instant::now() + CROSS_CLUSTER_CONVERGENCE_TIMEOUT;
+    let reply = loop {
+        let transient = match fixture
+            .websocket(
+                destination,
+                "live-matrix.ferrum.svc.cluster.local:18082",
+                "sidecar-live",
             )
-        });
+            .await
+        {
+            Ok(reply) => break reply,
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            panic!(
+                "Sidecar WebSocket live cross-cluster row failed within \
+                 {CROSS_CLUSTER_CONVERGENCE_TIMEOUT:?}; last transient error: {transient}\n{}",
+                fixture.diagnostics()
+            );
+        }
+        tokio::time::sleep(CROSS_CLUSTER_CONVERGENCE_POLL_INTERVAL).await;
+    };
     assert_eq!(reply, "backend-ws:sidecar-live");
 }
 
 #[cfg(target_os = "linux")]
 async fn live_xc_test_ambient_websocket(fixture: &LiveTwoClusterFixture) {
-    let reply = fixture
-        .ambient_websocket("live-matrix.ferrum.svc.cluster.local:18083", "ambient-live")
-        .await
-        .unwrap_or_else(|error| {
+    // Poll past the source-slice convergence window: a completed upgrade is the
+    // authoritative result (asserted once); only transient upgrade / route-miss
+    // failures are retried.
+    let deadline = Instant::now() + CROSS_CLUSTER_CONVERGENCE_TIMEOUT;
+    let reply = loop {
+        let transient = match fixture
+            .ambient_websocket("live-matrix.ferrum.svc.cluster.local:18083", "ambient-live")
+            .await
+        {
+            Ok(reply) => break reply,
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
             panic!(
-                "Ambient HBONE WebSocket live cross-cluster row failed: {error}\n{}",
+                "Ambient HBONE WebSocket live cross-cluster row failed within \
+                 {CROSS_CLUSTER_CONVERGENCE_TIMEOUT:?}; last transient error: {transient}\n{}",
                 fixture.diagnostics()
-            )
-        });
+            );
+        }
+        tokio::time::sleep(CROSS_CLUSTER_CONVERGENCE_POLL_INTERVAL).await;
+    };
     assert_eq!(reply, "backend-ws:ambient-live");
 }
 
@@ -10353,13 +10442,27 @@ fn live_xc_test_multi_port(fixture: &mut LiveTwoClusterFixture) {
         let destination = format!("{LIVE_XC_MULTI_VIP}:{port}")
             .parse()
             .expect("multi-port VIP");
-        let (status, body) = live_xc_http_get_from_vip(fixture.source.pod.pid(), destination, host)
-            .unwrap_or_else(|error| {
+        // Poll past the source-slice convergence window, retrying only transient
+        // route-miss / setup outcomes, then assert the alias route once.
+        let deadline = Instant::now() + CROSS_CLUSTER_CONVERGENCE_TIMEOUT;
+        let (status, body) = loop {
+            let transient = match classify_cross_cluster_http(live_xc_http_get_from_vip(
+                fixture.source.pod.pid(),
+                destination,
+                host,
+            )) {
+                Ok(response) => break response,
+                Err(transient) => transient,
+            };
+            if Instant::now() >= deadline {
                 panic!(
-                    "multi-port p{port} alias row failed: {error}\n{}",
+                    "multi-port p{port} alias row failed within \
+                     {CROSS_CLUSTER_CONVERGENCE_TIMEOUT:?}; last transient error: {transient}\n{}",
                     fixture.diagnostics()
-                )
-            });
+                );
+            }
+            std::thread::sleep(CROSS_CLUSTER_CONVERGENCE_POLL_INTERVAL);
+        };
         assert_eq!(status, 200, "p{port} alias response: {body:?}");
         assert_eq!(body, expected, "p{port} routed to the wrong backend");
     }
@@ -10373,17 +10476,28 @@ fn live_xc_test_raw_tcp(fixture: &mut LiveTwoClusterFixture) {
     let destination = format!("{LIVE_XC_TCP_VIP}:{LIVE_XC_TCP_PORT}")
         .parse()
         .expect("raw TCP VIP");
-    let (reply, peer) = tcp_round_trip_from_netns(
-        fixture.source.pod.pid(),
-        destination,
-        b"live-two-cluster-raw-tcp",
-    )
-    .unwrap_or_else(|error| {
-        panic!(
-            "raw TCP cross-cluster capture/tunnel failed: {error}\n{}",
-            fixture.diagnostics()
-        )
-    });
+    // Poll past the source-slice convergence window: a completed round trip is
+    // the authoritative result (asserted once); only transient connection /
+    // route-miss failures are retried.
+    let deadline = Instant::now() + CROSS_CLUSTER_CONVERGENCE_TIMEOUT;
+    let (reply, peer) = loop {
+        let transient = match tcp_round_trip_from_netns(
+            fixture.source.pod.pid(),
+            destination,
+            b"live-two-cluster-raw-tcp",
+        ) {
+            Ok(result) => break result,
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            panic!(
+                "raw TCP cross-cluster capture/tunnel failed within \
+                 {CROSS_CLUSTER_CONVERGENCE_TIMEOUT:?}; last transient error: {transient}\n{}",
+                fixture.diagnostics()
+            );
+        }
+        std::thread::sleep(CROSS_CLUSTER_CONVERGENCE_POLL_INTERVAL);
+    };
     assert_eq!(reply, b"live-two-cluster-raw-tcp");
     assert_eq!(peer, destination, "the captured TCP peer must stay the VIP");
 }
@@ -10393,18 +10507,29 @@ async fn live_xc_test_udp(fixture: &mut LiveTwoClusterFixture) {
     let destination = format!("{LIVE_XC_UDP_VIP}:{LIVE_XC_UDP_PORT}")
         .parse()
         .expect("UDP VIP");
-    let (reply, source) = live_xc_udp_round_trip(
-        fixture.source.pod.pid(),
-        fixture.source.pod_ip(),
-        destination,
-        b"live-two-cluster-udp-frame",
-    )
-    .unwrap_or_else(|error| {
-        panic!(
-            "UDP framed cross-cluster capture/tunnel failed: {error}\n{}",
-            fixture.diagnostics()
-        )
-    });
+    // Poll past the source-slice convergence window: a framed reply is the
+    // authoritative result (asserted once); only transient send / no-reply
+    // failures before the route materializes are retried.
+    let deadline = Instant::now() + CROSS_CLUSTER_CONVERGENCE_TIMEOUT;
+    let (reply, source) = loop {
+        let transient = match live_xc_udp_round_trip(
+            fixture.source.pod.pid(),
+            fixture.source.pod_ip(),
+            destination,
+            b"live-two-cluster-udp-frame",
+        ) {
+            Ok(result) => break result,
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            panic!(
+                "UDP framed cross-cluster capture/tunnel failed within \
+                 {CROSS_CLUSTER_CONVERGENCE_TIMEOUT:?}; last transient error: {transient}\n{}",
+                fixture.diagnostics()
+            );
+        }
+        tokio::time::sleep(CROSS_CLUSTER_CONVERGENCE_POLL_INTERVAL).await;
+    };
     assert_eq!(reply, b"live-two-cluster-udp-frame");
     assert_eq!(
         source, destination,
