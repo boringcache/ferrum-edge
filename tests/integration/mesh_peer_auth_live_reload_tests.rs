@@ -94,6 +94,12 @@ async fn start_live_reload_listener_with_retry(
                 listener_state,
                 shutdown_rx,
                 None,
+                // Match the production Sidecar non-production derivation
+                // (`mesh_inbound_listener_allows_plaintext`): the empty-slot
+                // phase of these tests serves plaintext HTTP, and the strict
+                // swap must reject plaintext via the policy slot even though
+                // the listener itself allows the plaintext peek path.
+                true,
                 Some(started_tx),
             )
             .await
