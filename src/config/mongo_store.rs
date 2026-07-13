@@ -49,6 +49,7 @@ mod inner {
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
         Upstream,
     };
+    use crate::config::validation_pipeline::collect_rejecting_runtime_config_errors;
     use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
     use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
     use arc_swap::ArcSwap;
@@ -2857,17 +2858,21 @@ mod inner {
                 error!("MongoDB config: {}", message);
             }
 
-            // Defense in depth — Mongo `load_full_config` does not run the
-            // SQL-side `ValidationPipeline`, so a row written directly into
-            // the proxy collection with an encoded-slash listen_path would
-            // otherwise reach `ProxyState::validate_full_config()` as the
-            // only guard. Reject here as well so a Mongo-backed CP broadcast
-            // can never carry the bypass shape downstream.
-            if let Err(errors) = config.validate_listen_path_encodings() {
-                for msg in &errors {
+            // Mongo does not run the SQL-side `ValidationPipeline`, but full
+            // runtime loads must still fail closed on the same rejecting
+            // validation contract used by SQL loads and CP updates. This
+            // catches malformed routes, stream proxy shapes, dangling upstream
+            // references, and invalid plugin associations before startup or
+            // broadcast can build runtime caches from invalid collection data.
+            let validation_errors = collect_rejecting_runtime_config_errors(&config);
+            if !validation_errors.is_empty() {
+                for msg in &validation_errors {
                     error!("MongoDB config rejected — {}", msg);
                 }
-                anyhow::bail!("MongoDB has listen_path(s) containing encoded slashes");
+                anyhow::bail!(
+                    "MongoDB configuration validation failed: {} rejecting error(s) found",
+                    validation_errors.len()
+                );
             }
 
             Ok(config)
@@ -10310,6 +10315,82 @@ mod inner {
                 target_lookup < proxy_refs && target_lookup < plugin_refs,
                 "standalone delete_upstream must establish target existence in the requested \
                  namespace before scanning references"
+            );
+        }
+
+        #[test]
+        fn load_full_config_rejects_after_normalization_and_identity_quarantine() {
+            let source = include_str!("mongo_store.rs");
+            let load_start = source
+                .find(
+                    "async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error>",
+                )
+                .expect("Mongo load_full_config function");
+            let load_path = &source[load_start..];
+            let snapshot_start = load_path
+                .find("async fn load_namespace_snapshot(")
+                .expect("load_namespace_snapshot following load_full_config");
+            let load_body = &load_path[..snapshot_start];
+
+            let normalize = load_body
+                .find("config.normalize_fields();")
+                .expect("load_full_config normalization");
+            let quarantine = load_body
+                .find("config.quarantine_colliding_consumer_identities()")
+                .expect("load_full_config identity quarantine");
+            let rejecting_validation = load_body
+                .find("collect_rejecting_runtime_config_errors(&config)")
+                .expect("load_full_config shared rejecting validation");
+            let non_empty_guard = load_body
+                .find("if !validation_errors.is_empty() {")
+                .expect("load_full_config non-empty validation guard");
+            let success = load_body
+                .find("Ok(config)")
+                .expect("load_full_config success return");
+
+            // Brace-match the guard's block so the bail assertion is scoped
+            // to it: a later unrelated bail must not satisfy this test if the
+            // guard itself regresses to log-only. Format-string braces ({})
+            // are balanced, so they do not skew the depth count.
+            let mut depth = 0usize;
+            let mut guard_end = None;
+            for (offset, ch) in load_body[non_empty_guard..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            guard_end = Some(non_empty_guard + offset + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let guard_block =
+                &load_body[non_empty_guard..guard_end.expect("validation guard block must close")];
+
+            assert!(
+                normalize < quarantine && quarantine < rejecting_validation,
+                "load_full_config must run shared rejecting validation after normalization and \
+                 consumer identity quarantine"
+            );
+            assert!(
+                rejecting_validation < non_empty_guard && non_empty_guard < success,
+                "the rejecting validation guard must sit between the shared validation call and \
+                 the Ok(config) success return"
+            );
+            let bail_start = guard_block.find("anyhow::bail!(").expect(
+                "the non-empty rejecting validation guard itself must bail, not merely log",
+            );
+            let bail_call = &guard_block[bail_start..];
+            let bail_end = bail_call
+                .find(");")
+                .expect("validation guard bail invocation must terminate");
+            assert!(
+                bail_call[..bail_end].contains("MongoDB configuration validation failed"),
+                "the guard's bail invocation itself must carry the MongoDB validation failure \
+                 message"
             );
         }
 

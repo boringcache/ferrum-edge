@@ -53,31 +53,6 @@ pub(super) fn translate(
         }
         "PeerAuthentication" => {
             let peer_auth = peer_authentication(&acc.options, object)?;
-            // Istio `spec.portLevelMtls` keys are workload APP/container ports
-            // (e.g. 8080, 8081). The inbound mesh listener terminates mTLS on a
-            // single TRANSPORT port (Sidecar 15006 / Ambient 15008 / Egress
-            // 15090), and one `rustls::ServerConfig` per listener cannot vary
-            // STRICT/PERMISSIVE per app port without pre-handshake
-            // SO_ORIGINAL_DST demux. The runtime therefore resolves one mode
-            // for the whole listener: normally the policy's top-level mode,
-            // but an app-port key that numerically equals the topology's
-            // transport port wins listener-wide. Surface that gap instead of
-            // silently discarding it (the status writer additionally records it in
-            // `status.ferrum.translation.deferred_fields`); full per-app-port
-            // enforcement is tracked as a separate architectural item.
-            if !peer_auth.port_overrides.is_empty() {
-                let mut ports: Vec<u16> = peer_auth.port_overrides.keys().copied().collect();
-                ports.sort_unstable();
-                let ports_list = ports
-                    .iter()
-                    .map(u16::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                acc.warnings.push(format!(
-                    "PeerAuthentication {}/{}: portLevelMtls entries (ports: {ports_list}) are parsed and validated but NOT enforced per app port; the inbound mesh listener resolves one mode for the whole transport listener. The top-level mtls.mode ({:?}) governs unless an override key equals that topology's transport port, in which case that override's mode governs the whole listener rather than only the app port. Per-app-port mTLS requires SO_ORIGINAL_DST demux and is tracked separately. Surfaced in status.ferrum.translation.deferred_fields.",
-                    peer_auth.namespace, peer_auth.name, peer_auth.mtls_mode
-                ));
-            }
             acc.mesh.peer_authentications.push(peer_auth);
             Ok(true)
         }
@@ -940,7 +915,10 @@ fn istio_policy_scope(
     selector: Option<&Value>,
 ) -> PolicyScope {
     let is_root_namespace = object.metadata.namespace == options.istio_root_namespace;
-    match selector {
+    // Kubernetes JSON can preserve an explicitly-null optional selector. Istio
+    // treats that the same as an omitted selector; only an actual selector
+    // object (including an explicit empty `{}` selector) creates workload scope.
+    match selector.filter(|selector| !selector.is_null()) {
         Some(selector) => PolicyScope::WorkloadSelector {
             selector: WorkloadSelector {
                 labels: selector_from_istio(Some(selector)),
@@ -5866,6 +5844,45 @@ mod tests {
             mesh.peer_authentications[0].scope,
             Some(PolicyScope::MeshWide)
         ));
+    }
+
+    #[test]
+    fn null_peer_authentication_selector_is_namespace_scoped() {
+        let result = translate_k8s_objects(
+            &[object(
+                "PeerAuthentication",
+                serde_json::json!({
+                    "selector": null,
+                    "mtls": {"mode": "STRICT"},
+                    "portLevelMtls": {
+                        "8080": {"mode": "DISABLE"}
+                    }
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let peer_auth = &mesh.peer_authentications[0];
+        assert!(matches!(
+            &peer_auth.scope,
+            Some(PolicyScope::Namespace { namespace }) if namespace == "default"
+        ));
+        assert!(
+            peer_auth.selector.is_none(),
+            "a null selector must not become an empty workload selector"
+        );
+        assert_eq!(
+            crate::modes::mesh::slice::resolve_effective_mtls_mode(
+                std::slice::from_ref(peer_auth),
+                "default",
+                &HashMap::<String, String>::new(),
+                8080,
+            ),
+            MtlsMode::Strict,
+            "portLevelMtls must remain ignored when selector is explicitly null"
+        );
     }
 
     #[test]

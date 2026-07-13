@@ -408,6 +408,8 @@ pub(super) async fn handle_hbone_request(
     proxy: &Arc<Proxy>,
     epoch: &RequestEpoch,
     ctx: &mut RequestContext,
+    is_tls: bool,
+    mesh_inbound_pre_handshake_app_port: Option<u16>,
     client_request_body: ClientRequestBody,
     plugins: &[Arc<dyn Plugin>],
     start_time: Instant,
@@ -481,6 +483,31 @@ pub(super) async fn handle_hbone_request(
     );
     let upstream_target = selection.target;
     let upstream_balancer = selection.balancer;
+
+    if let Some(mismatch) = super::mesh_inbound_peer_auth_transport_mismatch(
+        state,
+        ctx.mesh_direction,
+        mesh_inbound_pre_handshake_app_port,
+        proxy,
+        upstream_target.as_deref(),
+        is_tls,
+        ctx.tls_client_cert_der.is_some(),
+    ) {
+        return super::reject_mesh_inbound_peer_auth_transport_mismatch(
+            state,
+            plugins,
+            ctx,
+            proxy,
+            mismatch,
+            is_tls,
+            false,
+            start_time,
+            plugin_execution_ns,
+            "hbone_peer_auth_transport_mismatch",
+            None,
+        )
+        .await;
+    }
 
     if proxy.id == MESH_INBOUND_HBONE_RELAY_PROXY_ID
         && !inbound_hbone_relay_effective_destination_allowed(
@@ -846,6 +873,8 @@ pub(super) async fn handle_hbone_udp_request(
     proxy: &Arc<Proxy>,
     epoch: &RequestEpoch,
     ctx: &mut RequestContext,
+    is_tls: bool,
+    mesh_inbound_pre_handshake_app_port: Option<u16>,
     client_request_body: ClientRequestBody,
     plugins: &[Arc<dyn Plugin>],
     start_time: Instant,
@@ -909,6 +938,32 @@ pub(super) async fn handle_hbone_udp_request(
         .as_deref()
         .map(|t| (t.host.as_str(), t.port))
         .unwrap_or((proxy.backend_host.as_str(), proxy.backend_port));
+
+    if let Some(mismatch) = super::mesh_inbound_peer_auth_transport_mismatch(
+        state,
+        ctx.mesh_direction,
+        mesh_inbound_pre_handshake_app_port,
+        proxy,
+        upstream_target.as_deref(),
+        is_tls,
+        ctx.tls_client_cert_der.is_some(),
+    ) {
+        return super::reject_mesh_inbound_peer_auth_transport_mismatch(
+            state,
+            plugins,
+            ctx,
+            proxy,
+            mismatch,
+            is_tls,
+            false,
+            start_time,
+            plugin_execution_ns,
+            "hbone_udp_peer_auth_transport_mismatch",
+            None,
+        )
+        .await;
+    }
+
     if app_host.is_empty() || app_port == 0 {
         error!(proxy_id = %proxy.id, "HBONE UDP CONNECT has no resolvable local destination");
         let reject = finalize_reject_response_with_after_proxy_hooks(
