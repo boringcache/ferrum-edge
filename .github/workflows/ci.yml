@@ -1935,6 +1935,41 @@ jobs:
             exit 1
           fi
           grep -F 'hard-fails on a non-loopback plaintext admin bind' "$RUNNER_TEMP/ferrum-gateway-helm-results/unsafe-admin-bind.err"
+          # Liveness/startup must probe /live (--live) and readiness must probe
+          # /health (no --live) — the two probe commands must stay distinct so an
+          # alive-but-unready pod is not restart-looped.
+          liveness_block="$(awk '/^[[:space:]]+livenessProbe:/{f=1} f{print} f&&/periodSeconds:/{exit}' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml")"
+          startup_block="$(awk '/^[[:space:]]+startupProbe:/{f=1} f{print} f&&/periodSeconds:/{exit}' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml")"
+          readiness_block="$(awk '/^[[:space:]]+readinessProbe:/{f=1} f{print} f&&/periodSeconds:/{exit}' "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml")"
+          if ! grep -q -- '--live' <<<"$liveness_block"; then
+            echo "::error title=Liveness probe not distinguished::livenessProbe must run 'ferrum-edge health --live'"
+            exit 1
+          fi
+          if ! grep -q -- '--live' <<<"$startup_block"; then
+            echo "::error title=Startup probe not distinguished::startupProbe must run 'ferrum-edge health --live'"
+            exit 1
+          fi
+          if grep -q -- '--live' <<<"$readiness_block"; then
+            echo "::error title=Readiness probe coupled to liveness::readinessProbe must probe /health (no --live)"
+            exit 1
+          fi
+          # The old shared probes.override shape is removed: a top-level
+          # probes.override must be rejected by values.schema.json so liveness and
+          # readiness cannot be silently re-coupled. Use per-probe overrides.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set probes.override.httpGet.path=/health \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/coupled-override.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/coupled-override.err"; then
+            echo "::error title=Coupled probe override accepted::a shared probes.override must be rejected"
+            exit 1
+          fi
+          grep -F 'override' "$RUNNER_TEMP/ferrum-gateway-helm-results/coupled-override.err"
+          # A per-probe liveness override still renders (and reaches the startup probe).
+          helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set probes.liveness.override.httpGet.path=/live \
+            --set probes.liveness.override.httpGet.port=admin-http \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/liveness-override.yaml"
+          grep -Fq 'path: /live' "$RUNNER_TEMP/ferrum-gateway-helm-results/liveness-override.yaml"
 
       - name: Upload core gateway chart diagnostics
         if: always() && steps.helm_changes.outputs.changed == 'true'

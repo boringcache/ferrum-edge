@@ -1,14 +1,25 @@
 {{- include "ferrum-gateway.validate" . -}}
 {{- $adminHttp := include "ferrum-gateway.adminHttpPort" . -}}
 {{- $ports := .Values.ports | default dict -}}
-{{- $healthCmd := list "/app/ferrum-edge" "health" -}}
+{{/*
+  Liveness probes GET /live (200 whenever the process + admin listener are up),
+  readiness probes GET /health (503 until ready / while serving degraded). They
+  MUST stay distinct commands: coupling them makes an alive-but-unready pod fail
+  liveness and restart-loop instead of merely leaving Service endpoints.
+*/}}
+{{- $liveCmd := list "/app/ferrum-edge" "health" "--live" -}}
+{{- $readyCmd := list "/app/ferrum-edge" "health" -}}
 {{- if eq ($adminHttp | toString) "0" -}}
-{{- $healthCmd = list "/app/ferrum-edge" "health" "--tls" "--tls-no-verify" -}}
+{{- $liveCmd = list "/app/ferrum-edge" "health" "--live" "--tls" "--tls-no-verify" -}}
+{{- $readyCmd = list "/app/ferrum-edge" "health" "--tls" "--tls-no-verify" -}}
 {{- else -}}
-{{- $healthCmd = list "/app/ferrum-edge" "health" "-p" ($adminHttp | toString) "--host" "127.0.0.1" -}}
+{{- $liveCmd = list "/app/ferrum-edge" "health" "--live" "-p" ($adminHttp | toString) "--host" "127.0.0.1" -}}
+{{- $readyCmd = list "/app/ferrum-edge" "health" "-p" ($adminHttp | toString) "--host" "127.0.0.1" -}}
 {{- end -}}
-{{- $probeHandler := .Values.probes.override | default dict -}}
-{{- if not $probeHandler }}{{- $probeHandler = dict "exec" (dict "command" $healthCmd) -}}{{- end -}}
+{{- $liveHandler := .Values.probes.liveness.override | default dict -}}
+{{- if not $liveHandler }}{{- $liveHandler = dict "exec" (dict "command" $liveCmd) -}}{{- end -}}
+{{- $readyHandler := .Values.probes.readiness.override | default dict -}}
+{{- if not $readyHandler }}{{- $readyHandler = dict "exec" (dict "command" $readyCmd) -}}{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -120,19 +131,23 @@ spec:
             {{- end }}
           {{- if .Values.probes.startup.enabled }}
           startupProbe:
-            {{- toYaml $probeHandler | nindent 12 }}
+            {{- /* Startup gates liveness during slow boots, so it shares the
+                   liveness /live handler; using /health here would let a pod
+                   that boots but never becomes ready exhaust failureThreshold
+                   and get killed — the restart-loop we are avoiding. */}}
+            {{- toYaml $liveHandler | nindent 12 }}
             failureThreshold: {{ .Values.probes.startup.failureThreshold }}
             periodSeconds: {{ .Values.probes.startup.periodSeconds }}
           {{- end }}
           {{- if .Values.probes.liveness.enabled }}
           livenessProbe:
-            {{- toYaml $probeHandler | nindent 12 }}
+            {{- toYaml $liveHandler | nindent 12 }}
             initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
           {{- end }}
           {{- if .Values.probes.readiness.enabled }}
           readinessProbe:
-            {{- toYaml $probeHandler | nindent 12 }}
+            {{- toYaml $readyHandler | nindent 12 }}
             initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
           {{- end }}

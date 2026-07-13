@@ -268,11 +268,20 @@ extraVolumeMounts: []
 # -----------------------------------------------------------------------------
 # Health probes. Admin binds loopback by default, so the defaults use the in-pod
 # exec `ferrum-edge health` check (a kubelet httpGet targets the pod IP and would
-# miss a loopback listener). Liveness/startup verify the process + admin listener;
-# readiness verifies unauthenticated /health (status + ready), which is the tiered
-# detail exposed without auth. When ports.adminHttp=0 (TLS-only admin) the exec
-# health command auto-detects TLS + 9443. Set a probe block to `null`/custom to
-# override entirely.
+# miss a loopback listener).
+#
+# Liveness and startup run `ferrum-edge health --live` (GET /live): 200 whenever
+# the process + admin listener are up, even during startup or while serving
+# degraded. Readiness runs `ferrum-edge health` (GET /health): returns 503 until
+# the gateway is ready, so an alive-but-unready pod is dropped from Service
+# endpoints WITHOUT being restart-looped by liveness. Do NOT point liveness at
+# /health — that couples the two and restart-loops a healthy-but-unready pod
+# (e.g. a dp that has lost its cp).
+#
+# When ports.adminHttp=0 (TLS-only admin) both exec commands auto-detect TLS +
+# 9443. Liveness and readiness have SEPARATE override knobs so a custom handler
+# cannot silently re-couple them; set one to a custom exec/httpGet to replace
+# only that probe's computed default.
 # -----------------------------------------------------------------------------
 probes:
   startup:
@@ -283,16 +292,23 @@ probes:
     enabled: true
     initialDelaySeconds: 10
     periodSeconds: 15
+    # Replaces the computed liveness handler (also used by the startup probe).
+    # e.g.:
+    # override:
+    #   httpGet:
+    #     path: /live
+    #     port: admin-http
+    override: {}
   readiness:
     enabled: true
     initialDelaySeconds: 5
     periodSeconds: 10
-  # Provide a custom exec/httpGet handler to replace the computed default, e.g.:
-  # override:
-  #   httpGet:
-  #     path: /health
-  #     port: admin-http
-  override: {}
+    # Replaces the computed readiness handler, e.g.:
+    # override:
+    #   httpGet:
+    #     path: /health
+    #     port: admin-http
+    override: {}
 
 resources:
   requests:

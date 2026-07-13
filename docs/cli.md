@@ -165,7 +165,9 @@ When `--pid` is omitted, the CLI uses `pgrep -x ferrum-edge` to find the running
 
 ## health
 
-Check gateway health by connecting to the admin API `/health` endpoint. Designed for use as a Docker `HEALTHCHECK` or Kubernetes exec probe in distroless containers (no shell or curl needed).
+Check gateway health by connecting to the admin API. By default it probes readiness via `GET /health` (returns 503 until the gateway is ready). With `--live` it probes liveness via `GET /live`, which returns 200 whenever the process and admin listener are up — even during startup or while serving degraded. Designed for use as a Docker `HEALTHCHECK` or Kubernetes exec probe in distroless containers (no shell or curl needed).
+
+Point a Kubernetes **livenessProbe** at `ferrum-edge health --live` and the **readinessProbe** at `ferrum-edge health`. Using `/health` for liveness would restart-loop an alive-but-unready pod (e.g. a `dp` that has lost its `cp`), whereas readiness only drops it from Service endpoints.
 
 ```
 ferrum-edge health [OPTIONS]
@@ -179,6 +181,7 @@ ferrum-edge health [OPTIONS]
 | `--host <HOST>` | | Admin API host (default: `127.0.0.1`) |
 | `--tls` | | Connect via HTTPS instead of HTTP |
 | `--tls-no-verify` | | Skip TLS certificate verification (for self-signed certs / testing) |
+| `--live` | | Probe liveness (`GET /live`) instead of readiness (`GET /health`) |
 
 ### Auto-Detection
 
@@ -202,6 +205,9 @@ ferrum-edge health --tls --tls-no-verify
 # Auto-detected TLS when FERRUM_ADMIN_HTTP_PORT=0
 FERRUM_ADMIN_HTTP_PORT=0 ferrum-edge health
 # → connects to https://127.0.0.1:9443/health automatically
+
+# Liveness probe — GET /live (200 while up, even before ready)
+ferrum-edge health --live
 ```
 
 ### Docker HEALTHCHECK
@@ -220,7 +226,7 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
 
 | Code | Meaning |
 |------|---------|
-| `0` | Healthy (HTTP 200 from `/health`) |
+| `0` | Healthy (HTTP 200 from `/health`, or `/live` with `--live`) |
 | `1` | Unhealthy (non-200 response, connection refused, timeout) |
 
 ## version

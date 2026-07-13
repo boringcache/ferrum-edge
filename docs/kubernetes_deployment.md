@@ -224,12 +224,14 @@ At startup, the gateway runs DNS warmup followed by optional connection pool war
 
 ### Default Probe Strategy
 
-Use this when cached config is acceptable and you mainly want to know whether the process and admin listener are alive. The probes use the **exec** `ferrum-edge health` check, which connects to `127.0.0.1` inside the pod and therefore works with the safe loopback admin default (an `httpGet` probe targets the pod IP and would miss a loopback-bound listener — see "Admin bind address" above):
+Use this when cached config is acceptable and you mainly want to know whether the process and admin listener are alive. The probes use the **exec** `ferrum-edge health` check, which connects to `127.0.0.1` inside the pod and therefore works with the safe loopback admin default (an `httpGet` probe targets the pod IP and would miss a loopback-bound listener — see "Admin bind address" above).
+
+Liveness and startup add `--live` so they probe `GET /live` (200 whenever the process and admin listener are up); readiness omits it to probe `GET /health` (503 until the gateway is ready). Do **not** point liveness at `/health` — an alive-but-unready pod (e.g. a `dp` that has lost its `cp`) would fail liveness and restart-loop instead of merely being dropped from Service endpoints:
 
 ```yaml
 livenessProbe:
   exec:
-    command: ["/app/ferrum-edge", "health", "-p", "9000", "--host", "127.0.0.1"]
+    command: ["/app/ferrum-edge", "health", "--live", "-p", "9000", "--host", "127.0.0.1"]
   initialDelaySeconds: 10
   periodSeconds: 15
 
@@ -241,7 +243,7 @@ readinessProbe:
 
 startupProbe:
   exec:
-    command: ["/app/ferrum-edge", "health", "-p", "9000", "--host", "127.0.0.1"]
+    command: ["/app/ferrum-edge", "health", "--live", "-p", "9000", "--host", "127.0.0.1"]
   failureThreshold: 30
   periodSeconds: 5
 ```
@@ -373,15 +375,17 @@ spec:
           # Admin binds to loopback by default, so probes use the in-pod exec
           # health check (the kubelet's httpGet would target the pod IP and miss
           # a loopback listener). See "Admin bind address" above before switching
-          # to httpGet probes.
+          # to httpGet probes. Liveness/startup use --live (GET /live: up != ready)
+          # so an alive-but-unready pod is not restart-looped; readiness omits it
+          # (GET /health: 503 until ready).
           startupProbe:
             exec:
-              command: ["/app/ferrum-edge", "health", "-p", "9000", "--host", "127.0.0.1"]
+              command: ["/app/ferrum-edge", "health", "--live", "-p", "9000", "--host", "127.0.0.1"]
             failureThreshold: 30
             periodSeconds: 5
           livenessProbe:
             exec:
-              command: ["/app/ferrum-edge", "health", "-p", "9000", "--host", "127.0.0.1"]
+              command: ["/app/ferrum-edge", "health", "--live", "-p", "9000", "--host", "127.0.0.1"]
             initialDelaySeconds: 10
             periodSeconds: 15
           readinessProbe:

@@ -39,12 +39,20 @@ node_agent, migrate) fails at template time with a pointer to the right chart.
 
 ## Probes
 
-Liveness/startup verify the process and admin listener; readiness verifies the
-always-unauthenticated `/health` (which returns `status` + `ready` without
-auth — sufficient for a probe). Defaults use the exec `ferrum-edge health`
-command and auto-switch to the TLS variant when `ports.adminHttp=0`. Override a
-handler entirely with `probes.override` (e.g. an `httpGet` when admin is bound
-non-loopback).
+Liveness and startup run `ferrum-edge health --live` (GET `/live`), which
+returns 200 whenever the process and admin listener are up — even during
+startup or while serving degraded. Readiness runs `ferrum-edge health` (GET
+`/health`), which returns 503 until the gateway is ready. Keeping them distinct
+means an alive-but-unready pod (e.g. a `dp` that has lost its `cp`) is dropped
+from Service endpoints **without** being restart-looped by liveness — never
+point liveness at `/health`. The defaults use the exec `ferrum-edge health`
+command and auto-switch to the TLS variant when `ports.adminHttp=0`.
+
+Liveness and readiness have **separate** override knobs so a custom handler
+cannot silently re-couple them. Replace only one probe's computed handler with
+`probes.liveness.override` or `probes.readiness.override` (e.g. an `httpGet`
+when admin is bound non-loopback); the startup probe reuses the liveness
+handler.
 
 ## Quickstart per mode
 

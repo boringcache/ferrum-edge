@@ -2,8 +2,8 @@
 
 use clap::Parser;
 use ferrum_edge::cli::{
-    Cli, Command, ReloadArgs, RunArgs, ValidateArgs, VersionArgs, resolve_settings_path,
-    resolve_spec_path,
+    Cli, Command, HealthArgs, ReloadArgs, RunArgs, ValidateArgs, VersionArgs, execute_health,
+    resolve_settings_path, resolve_spec_path,
 };
 use std::path::Path;
 use std::sync::Mutex;
@@ -180,6 +180,52 @@ fn test_parse_reload_no_pid() {
 fn test_parse_unknown_subcommand_fails() {
     let result = Cli::try_parse_from(["ferrum-edge", "start"]);
     assert!(result.is_err());
+}
+
+// ── health --live parsing ───────────────────────────────────────────────────
+
+#[test]
+fn test_parse_health_defaults_to_readiness() {
+    let cli = Cli::try_parse_from(["ferrum-edge", "health"]).unwrap();
+    match cli.command {
+        Some(Command::Health(args)) => {
+            assert!(!args.live, "health without --live must probe readiness");
+            assert!(!args.tls);
+            assert!(args.port.is_none());
+        }
+        _ => panic!("Expected Health command"),
+    }
+}
+
+#[test]
+fn test_parse_health_live_flag() {
+    let cli = Cli::try_parse_from(["ferrum-edge", "health", "--live"]).unwrap();
+    match cli.command {
+        Some(Command::Health(args)) => assert!(args.live, "--live must select liveness probe"),
+        _ => panic!("Expected Health command"),
+    }
+}
+
+#[test]
+fn test_parse_health_live_with_port_and_host() {
+    let cli = Cli::try_parse_from([
+        "ferrum-edge",
+        "health",
+        "--live",
+        "-p",
+        "9001",
+        "--host",
+        "127.0.0.1",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Command::Health(args)) => {
+            assert!(args.live);
+            assert_eq!(args.port, Some(9001));
+            assert_eq!(args.host, "127.0.0.1");
+        }
+        _ => panic!("Expected Health command"),
+    }
 }
 
 // ── Smart path resolution tests ─────────────────────────────────────────────
@@ -454,4 +500,56 @@ fn test_execute_reload_no_pid_when_no_process_running() {
     // This may succeed if a ferrum-edge process happens to be running, but
     // in CI/test environments it should typically fail. Either way, no panic.
     let _ = result;
+}
+
+// ── execute_health path selection ───────────────────────────────────────────
+
+/// Spawn a one-shot HTTP server on loopback that captures the request line,
+/// run `execute_health`, and return the request line the CLI sent.
+fn capture_health_request_line(live: bool) -> String {
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .expect("loopback should be available for CLI health tests");
+    let port = listener.local_addr().unwrap().port();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf).unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .unwrap();
+        request.lines().next().unwrap_or("").to_string()
+    });
+
+    let args = HealthArgs {
+        port: Some(port),
+        host: "127.0.0.1".to_string(),
+        tls: false,
+        tls_no_verify: false,
+        live,
+    };
+    execute_health(&args).expect("health check against a 200 server should succeed");
+    server.join().unwrap()
+}
+
+#[test]
+fn test_execute_health_default_targets_health_endpoint() {
+    let request_line = capture_health_request_line(false);
+    assert!(
+        request_line.starts_with("GET /health "),
+        "default health check must probe readiness /health, got: {request_line}"
+    );
+}
+
+#[test]
+fn test_execute_health_live_targets_live_endpoint() {
+    let request_line = capture_health_request_line(true);
+    assert!(
+        request_line.starts_with("GET /live "),
+        "--live must probe liveness /live, got: {request_line}"
+    );
 }

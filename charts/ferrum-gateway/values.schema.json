@@ -56,6 +56,45 @@
       "properties": {
         "type": { "type": "string", "enum": ["", "sqlite", "postgres", "mysql", "mongodb"] }
       }
+    },
+    "probes": {
+      "type": "object",
+      "description": "Health probes. Liveness/startup use `ferrum-edge health --live` (GET /live); readiness uses `ferrum-edge health` (GET /health). Overrides are per-probe so liveness and readiness cannot be silently coupled.",
+      "additionalProperties": false,
+      "properties": {
+        "startup": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "failureThreshold": { "type": "integer", "minimum": 1 },
+            "periodSeconds": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "liveness": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+            "periodSeconds": { "type": "integer", "minimum": 1 },
+            "override": {
+              "type": "object",
+              "description": "Custom liveness handler (exec/httpGet/tcpSocket) replacing the computed /live check; also used by the startup probe."
+            }
+          }
+        },
+        "readiness": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+            "periodSeconds": { "type": "integer", "minimum": 1 },
+            "override": {
+              "type": "object",
+              "description": "Custom readiness handler (exec/httpGet/tcpSocket) replacing the computed /health check."
+            }
+          }
+        }
+      }
     }
   }
 }
