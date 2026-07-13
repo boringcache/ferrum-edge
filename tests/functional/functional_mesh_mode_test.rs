@@ -66,6 +66,11 @@ use crate::scaffolding::ports::reserve_port;
 const GRPC_SECRET: &str = "ferrum-edge-functional-mesh-grpc-secret00";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const RETRY_ATTEMPTS: u32 = 3;
+const CROSS_CLUSTER_NEGATIVE_TIMEOUT: Duration = Duration::from_secs(15);
+const CROSS_CLUSTER_NEGATIVE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const CROSS_CLUSTER_TLS_REJECTION_BODY: &str = "HBONE backend unavailable: TLS handshake failed";
+const CROSS_CLUSTER_WS_REJECTION_MARKER: &str =
+    "authoritative cross-cluster WebSocket mTLS rejection";
 
 fn binary_path() -> PathBuf {
     let debug = PathBuf::from("./target/debug/ferrum-edge");
@@ -3759,6 +3764,133 @@ async fn wait_for_cross_cluster_destination_ready(
     }
 }
 
+/// Poll an untrusted cross-cluster HTTP request until gateway A has installed
+/// the route and its secured-transport dial reaches the expected TLS rejection.
+/// Transient route misses / 503s do not prove fail-closed behavior and therefore
+/// cannot satisfy a negative assertion. A 200 is returned immediately so a real
+/// security regression is never hidden behind the bounded poll.
+async fn wait_for_authoritative_cross_cluster_http_rejection(
+    outbound_port: u16,
+    request_label: &str,
+) -> Result<(u16, String), String> {
+    let deadline = Instant::now() + CROSS_CLUSTER_NEGATIVE_TIMEOUT;
+
+    loop {
+        let last_observation =
+            match plaintext_http_get(outbound_port, "svc-c.ferrum.svc.cluster.local", "/").await {
+                Ok((status, body))
+                    if status == 502 && body.contains(CROSS_CLUSTER_TLS_REJECTION_BODY) =>
+                {
+                    return Ok((status, body));
+                }
+                Ok((status, body)) if status == 200 => return Ok((status, body)),
+                Ok((status, body)) => format!("HTTP {status}: {body:?}"),
+                Err(error) => format!("request error: {error}"),
+            };
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{request_label} route never reached the authoritative mTLS rejection within \
+                 {CROSS_CLUSTER_NEGATIVE_TIMEOUT:?}; last observation: {last_observation}"
+            ));
+        }
+        tokio::time::sleep(CROSS_CLUSTER_NEGATIVE_POLL_INTERVAL).await;
+    }
+}
+
+fn is_authoritative_cross_cluster_grpc_rejection(response: &GrpcEgressResponse) -> bool {
+    response.status == 200
+        && response.headers.get("grpc-status").map(String::as_str) == Some("14")
+        && response.headers.get("grpc-message").map(String::as_str)
+            == Some("sidecar mTLS backend unavailable")
+        && response.body.is_empty()
+}
+
+/// gRPC counterpart of the HTTP negative gate. A route miss does not carry the
+/// mesh transport's Trailers-Only UNAVAILABLE signature, while a live route
+/// whose untrusted mTLS dial is rejected does. Return a backend success
+/// immediately so the caller's security assertion fails without retry masking.
+async fn wait_for_authoritative_cross_cluster_grpc_rejection(
+    outbound_port: u16,
+    framed_body: &[u8],
+) -> Result<GrpcEgressResponse, String> {
+    let deadline = Instant::now() + CROSS_CLUSTER_NEGATIVE_TIMEOUT;
+
+    loop {
+        let last_observation = match grpc_egress_request(
+            outbound_port,
+            "svc-c.ferrum.svc.cluster.local",
+            "/echo.Mesh/Call",
+            framed_body,
+        )
+        .await
+        {
+            Ok(response) if is_authoritative_cross_cluster_grpc_rejection(&response) => {
+                return Ok(response);
+            }
+            Ok(response)
+                if response.status == 200
+                    && (response.trailers.get("grpc-status").map(String::as_str) == Some("0")
+                        || response
+                            .body
+                            .windows(framed_body.len())
+                            .any(|window| window == framed_body)) =>
+            {
+                return Ok(response);
+            }
+            Ok(response) => format!("{response:?}"),
+            Err(error) => format!("request error: {error}"),
+        };
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "cross-cluster gRPC route never reached the authoritative mTLS rejection within \
+                 {CROSS_CLUSTER_NEGATIVE_TIMEOUT:?}; last observation: {last_observation}"
+            ));
+        }
+        tokio::time::sleep(CROSS_CLUSTER_NEGATIVE_POLL_INTERVAL).await;
+    }
+}
+
+fn is_cross_cluster_websocket_bad_gateway(error: &str) -> bool {
+    error.contains("HTTP error: 502") || error.contains("HTTP status 502")
+}
+
+/// Poll an untrusted cross-cluster WebSocket upgrade past A's route-apply
+/// window. Once the route is live, the secured backend dial produces a 502;
+/// route misses / transient 503s are ignored. Any successful upgrade is
+/// returned immediately so the negative test fails instead of retrying it away.
+async fn wait_for_authoritative_cross_cluster_ws_rejection(
+    outbound_port: u16,
+    payload: &str,
+) -> Result<String, String> {
+    let deadline = Instant::now() + CROSS_CLUSTER_NEGATIVE_TIMEOUT;
+
+    loop {
+        let last_observation = match mesh_websocket_echo_roundtrip(
+            outbound_port,
+            "svc-c.ferrum.svc.cluster.local",
+            payload,
+        )
+        .await
+        {
+            Ok(reply) => return Ok(reply),
+            Err(error) if is_cross_cluster_websocket_bad_gateway(&error) => {
+                return Err(format!("{CROSS_CLUSTER_WS_REJECTION_MARKER}: {error}"));
+            }
+            Err(error) => error,
+        };
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "cross-cluster WebSocket route never reached the authoritative mTLS rejection \
+                 within {CROSS_CLUSTER_NEGATIVE_TIMEOUT:?}; last observation: {last_observation}"
+            ));
+        }
+        tokio::time::sleep(CROSS_CLUSTER_NEGATIVE_POLL_INTERVAL).await;
+    }
+}
+
 /// A config-layer `TrustBundle` (base64 DER) for `trust_domain` from a CA PEM.
 fn config_trust_bundle(trust_domain: &str, ca_pem: &str) -> TrustBundle {
     use base64::Engine;
@@ -4259,11 +4391,22 @@ async fn drive_cross_cluster_egress(client_trusted: bool) -> Result<(u16, String
             continue;
         }
 
-        // The B/C readiness gate has already absorbed setup races. Drive once
-        // so an HTTP status or body regression is never hidden by retries.
-        let last = plaintext_http_get(a_outbound_port, "svc-c.ferrum.svc.cluster.local", "/")
+        // Trusted requests stay one-shot after the B/C readiness gate so a
+        // positive-path regression cannot be hidden. The untrusted negative
+        // additionally waits for A's route to become live and requires the
+        // authoritative TLS-rejection response rather than accepting a
+        // transient route miss / 503 as proof of fail-closed behavior.
+        let last = if client_trusted {
+            plaintext_http_get(a_outbound_port, "svc-c.ferrum.svc.cluster.local", "/")
+                .await
+                .map_err(|error| format!("cross-cluster egress GET failed: {error}"))
+        } else {
+            wait_for_authoritative_cross_cluster_http_rejection(
+                a_outbound_port,
+                "cross-cluster egress",
+            )
             .await
-            .map_err(|error| format!("cross-cluster egress GET failed: {error}"));
+        };
 
         let output_a = captured_output(&temp_a);
         let output_b = captured_output(&temp_b);
@@ -4629,8 +4772,9 @@ async fn try_start_sidecar_cross_cluster_fixture(
 
 /// Drive one captured native-gRPC request from client gateway A across the
 /// east-west gateway B to the gRPC trailers-echo backend behind dest gateway C
-/// (two trust domains, federated bundle). The fixture's mTLS readiness gate
-/// absorbs startup races before this sends exactly one assertion-bearing call.
+/// (two trust domains, federated bundle). The trusted path sends exactly one
+/// assertion-bearing call after the fixture's mTLS readiness gate; the
+/// untrusted path additionally waits for A's live-route rejection signature.
 async fn drive_cross_cluster_grpc_egress(
     client_trusted: bool,
 ) -> Result<(GrpcEgressResponse, String), String> {
@@ -4648,14 +4792,19 @@ async fn drive_cross_cluster_grpc_egress(
             continue;
         };
 
-        let last = grpc_egress_request(
-            fixture.a_outbound_port,
-            "svc-c.ferrum.svc.cluster.local",
-            "/echo.Mesh/Call",
-            &framed,
-        )
-        .await
-        .map_err(|error| format!("cross-cluster gRPC egress request failed: {error}"));
+        let last = if client_trusted {
+            grpc_egress_request(
+                fixture.a_outbound_port,
+                "svc-c.ferrum.svc.cluster.local",
+                "/echo.Mesh/Call",
+                &framed,
+            )
+            .await
+            .map_err(|error| format!("cross-cluster gRPC egress request failed: {error}"))
+        } else {
+            wait_for_authoritative_cross_cluster_grpc_rejection(fixture.a_outbound_port, &framed)
+                .await
+        };
 
         let logs = fixture.logs();
         fixture.shutdown().await;
@@ -4729,9 +4878,9 @@ async fn functional_mesh_sidecar_cross_cluster_grpc_rejects_untrusted_client() {
         .await
         .expect("untrusted cross-cluster gRPC egress drive");
     assert!(
-        !(resp.status == 200 && resp.trailers.get("grpc-status").map(String::as_str) == Some("0")),
-        "an untrusted gateway's cross-cluster gRPC request must fail closed, not complete: \
-         {resp:?}\n{logs}"
+        is_authoritative_cross_cluster_grpc_rejection(&resp),
+        "an untrusted gateway's live cross-cluster gRPC route must return the mesh-mTLS \
+         Trailers-Only UNAVAILABLE rejection: {resp:?}\n{logs}"
     );
     assert!(
         !resp
@@ -4760,12 +4909,20 @@ async fn drive_cross_cluster_ws_egress(client_trusted: bool) -> Result<(String, 
             continue;
         };
 
-        let last = mesh_websocket_echo_roundtrip(
-            fixture.a_outbound_port,
-            "svc-c.ferrum.svc.cluster.local",
-            "mesh-xc-ws-hello",
-        )
-        .await;
+        let last = if client_trusted {
+            mesh_websocket_echo_roundtrip(
+                fixture.a_outbound_port,
+                "svc-c.ferrum.svc.cluster.local",
+                "mesh-xc-ws-hello",
+            )
+            .await
+        } else {
+            wait_for_authoritative_cross_cluster_ws_rejection(
+                fixture.a_outbound_port,
+                "mesh-xc-ws-hello",
+            )
+            .await
+        };
 
         let logs = fixture.logs();
         fixture.shutdown().await;
@@ -4810,15 +4967,16 @@ async fn functional_mesh_sidecar_cross_cluster_ws_routes_a_to_c_over_east_west()
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_sidecar_cross_cluster_ws_rejects_untrusted_client() {
-    // The driver returns `Err` when the upgrade never completes (the expected
-    // fail-closed outcome). It returns `Ok(reply)` only if a handshake somehow
-    // succeeded — in which case the reply must NOT carry a backend frame.
-    if let Ok((reply, logs)) = drive_cross_cluster_ws_egress(false).await {
-        assert!(
-            !reply.contains("backend-ws:"),
-            "an untrusted gateway's cross-cluster WebSocket egress must fail closed, not echo a \
-             backend frame: {reply:?}\n{logs}"
-        );
+    match drive_cross_cluster_ws_egress(false).await {
+        Ok((reply, logs)) => panic!(
+            "an untrusted gateway's cross-cluster WebSocket egress must reject the upgrade, not \
+             establish a backend session: {reply:?}\n{logs}"
+        ),
+        Err(error) => assert!(
+            error.contains(CROSS_CLUSTER_WS_REJECTION_MARKER),
+            "the negative must reach the live route's authoritative mTLS rejection, not pass on \
+             a transient route/setup failure: {error}"
+        ),
     }
 }
 
@@ -5306,11 +5464,20 @@ async fn drive_ambient_cross_cluster_egress(
             continue;
         }
 
-        // The B/C readiness gate has already absorbed setup races. Drive once
-        // so an HTTP status or body regression is never hidden by retries.
-        let last = plaintext_http_get(a_outbound_port, "svc-c.ferrum.svc.cluster.local", "/")
+        // Keep the trusted positive one-shot. The untrusted negative must first
+        // observe A's live route and its TLS-rejection body; a transient route
+        // miss / 503 is not an acceptable fail-closed result.
+        let last = if client_trusted {
+            plaintext_http_get(a_outbound_port, "svc-c.ferrum.svc.cluster.local", "/")
+                .await
+                .map_err(|error| format!("ambient cross-cluster egress GET failed: {error}"))
+        } else {
+            wait_for_authoritative_cross_cluster_http_rejection(
+                a_outbound_port,
+                "ambient cross-cluster egress",
+            )
             .await
-            .map_err(|error| format!("ambient cross-cluster egress GET failed: {error}"));
+        };
 
         let output_a = captured_output(&temp_a);
         let output_b = captured_output(&temp_b);
@@ -5686,12 +5853,20 @@ async fn drive_ambient_cross_cluster_ws_egress(
             continue;
         };
 
-        let last = mesh_websocket_echo_roundtrip(
-            fixture.a_outbound_port,
-            "svc-c.ferrum.svc.cluster.local",
-            "mesh-amb-xc-ws-hello",
-        )
-        .await;
+        let last = if client_trusted {
+            mesh_websocket_echo_roundtrip(
+                fixture.a_outbound_port,
+                "svc-c.ferrum.svc.cluster.local",
+                "mesh-amb-xc-ws-hello",
+            )
+            .await
+        } else {
+            wait_for_authoritative_cross_cluster_ws_rejection(
+                fixture.a_outbound_port,
+                "mesh-amb-xc-ws-hello",
+            )
+            .await
+        };
 
         let logs = fixture.logs();
         fixture.shutdown().await;
@@ -5737,12 +5912,16 @@ async fn functional_mesh_ambient_cross_cluster_ws_routes_a_to_c_over_east_west()
 #[ignore]
 #[tokio::test]
 async fn functional_mesh_ambient_cross_cluster_ws_rejects_untrusted_client() {
-    if let Ok((reply, logs)) = drive_ambient_cross_cluster_ws_egress(false).await {
-        assert!(
-            !reply.contains("backend-ws:"),
-            "an untrusted gateway's cross-cluster Ambient WebSocket egress must fail closed, not \
-             echo a backend frame: {reply:?}\n{logs}"
-        );
+    match drive_ambient_cross_cluster_ws_egress(false).await {
+        Ok((reply, logs)) => panic!(
+            "an untrusted gateway's cross-cluster Ambient WebSocket egress must reject the \
+             upgrade, not establish a backend session: {reply:?}\n{logs}"
+        ),
+        Err(error) => assert!(
+            error.contains(CROSS_CLUSTER_WS_REJECTION_MARKER),
+            "the negative must reach the live route's authoritative mTLS rejection, not pass on \
+             a transient route/setup failure: {error}"
+        ),
     }
 }
 
