@@ -495,6 +495,14 @@ pub struct RequestContext {
     /// markers (a hash over the raw request body including tool-call arguments),
     /// so they remain off `metadata` too.
     pub(crate) ai_tool_governor_request_hashes: HashMap<u64, String>,
+    /// Per-`ai_semantic_firewall`-instance hashes of request bodies already
+    /// inspected before request transforms. Kept outside serialized metadata so
+    /// prompt-derived digests never enter transaction logs.
+    pub(crate) ai_semantic_firewall_request_hashes: HashMap<u64, String>,
+    /// Per-instance response-body hashes used to skip unchanged final bodies and
+    /// re-evaluate transformed client-visible representations. Also private for
+    /// the same prompt/response confidentiality reason.
+    pub(crate) ai_semantic_firewall_response_hashes: HashMap<u64, String>,
     /// Process-unique id for an attached response-stream inspector chain.
     /// Assigned only after at least one configured plugin opts into streaming
     /// hooks for the response, and cleared again when every factory returns
@@ -765,6 +773,8 @@ impl RequestContext {
             ai_tool_governor_response_hashes: HashMap::new(),
             ai_tool_governor_call_hashes: HashMap::new(),
             ai_tool_governor_request_hashes: HashMap::new(),
+            ai_semantic_firewall_request_hashes: HashMap::new(),
+            ai_semantic_firewall_response_hashes: HashMap::new(),
             response_stream_id: None,
             response_stream_completion: None,
             a2a_gateway_detected: false,
@@ -857,6 +867,8 @@ impl RequestContext {
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
             ai_tool_governor_call_hashes: self.ai_tool_governor_call_hashes.clone(),
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
+            ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
+            ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,

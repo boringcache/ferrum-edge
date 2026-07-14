@@ -11,15 +11,16 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::OnceCell;
 use url::{Host, Url};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
+use super::utils::response_body::read_response_body_bounded;
 use super::utils::sse::{
-    SseReassembler, SseText, SseTextKind, encode_sse_error_event, floor_char_boundary,
-    last_paragraph_boundary, last_sentence_boundary, parse_sse_data_frames_checked,
+    SseReassembler, SseText, SseTextKind, encode_sse_error_event, last_paragraph_boundary,
+    last_sentence_boundary, parse_sse_data_frames_checked,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
@@ -30,6 +31,7 @@ const DEFAULT_REQUEST_JSON_PATHS: &[&str] = &[
     "$.messages[*].content",
     "$.messages[*].tool_calls[*].function.name",
     "$.messages[*].tool_calls[*].function.arguments",
+    "$.prompt",
     "$.input",
     "$.instructions",
     "$.tools[*].function.name",
@@ -42,6 +44,7 @@ const DEFAULT_REQUEST_JSON_PATHS: &[&str] = &[
 ];
 
 const DEFAULT_RESPONSE_JSON_PATHS: &[&str] = &[
+    "$.choices[*].text",
     "$.choices[*].message.content",
     "$.choices[*].message.tool_calls[*].function.name",
     "$.choices[*].message.tool_calls[*].function.arguments",
@@ -53,13 +56,32 @@ const DEFAULT_RESPONSE_JSON_PATHS: &[&str] = &[
     "$.output[*].arguments",
 ];
 
-/// Chat-completions streaming `delta.*` response paths. These are reassembled
+/// Embedding-provider responses are small JSON documents in normal operation.
+/// Bound the wire body before generic JSON deserialization so a compromised or
+/// faulty provider cannot force an unbounded allocation.
+const MAX_EMBEDDING_RESPONSE_BYTES: usize = 1024 * 1024;
+/// OpenAI-compatible embedding models are normally at most a few thousand
+/// dimensions. This deliberately generous ceiling bounds scalar allocation and
+/// normalization work while retaining compatibility with custom models.
+const MAX_EMBEDDING_DIMENSIONS: usize = 16_384;
+/// Final-body reinspection may need to decode a response compressed by Ferrum's
+/// own `compression` plugin. Match the gateway's default response-body ceiling
+/// and fail closed above it, even when the global body cap is configured as
+/// unlimited.
+const MAX_INSPECTION_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Process-unique scope for private per-request body-hash ledgers. A plugin
+/// cache rebuild creates fresh instances and multiple semantic-firewall
+/// instances on one proxy never consume one another's dedup state.
+static NEXT_FIREWALL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Incremental chat/completions streaming response paths. These are reassembled
 /// across frames by [`SseReassembler`]; per-frame extraction must skip them or
 /// it re-introduces the meaningless per-fragment segments reassembly exists to
-/// avoid. Non-delta paths (`message.*`, `output_text`, `output[*].*`) are not
-/// listed here because per-frame extraction handles them correctly — they never
-/// match a streaming `delta` frame, so there is no double counting.
+/// avoid. Non-incremental paths (`message.*`, `output_text`, `output[*].*`) are
+/// not listed here because per-frame extraction handles them correctly.
 const SSE_DELTA_RESPONSE_PATHS: &[&str] = &[
+    "$.choices[*].text",
     "$.choices[*].delta.content",
     "$.choices[*].delta.tool_calls[*].function.name",
     "$.choices[*].delta.tool_calls[*].function.arguments",
@@ -351,12 +373,18 @@ struct PrivacyConfig {
 struct ProviderConfig {
     endpoint: String,
     redacted_endpoint: String,
+    /// Normalized DNS hostname retained at validation time for startup warmup.
+    /// Literal IPs are intentionally omitted because they require no lookup.
+    warmup_hostname: Option<String>,
     model: Option<String>,
     /// Name of the env var holding the provider API key. Resolved lazily at the
     /// first embedding call rather than in `new()` so config validation (CP
     /// admin, `ferrum-edge validate`) does not require the live secret to be
     /// present in a process that never calls the provider.
     api_key_env: Option<String>,
+    /// Fully-rendered Authorization header, initialized on the first successful
+    /// environment lookup and reused for every later provider call.
+    authorization_header: OnceCell<String>,
     request_timeout: Duration,
 }
 
@@ -370,33 +398,71 @@ impl EmbeddingVector {
         if values.is_empty() {
             return Err("embedding vector must not be empty".to_string());
         }
-        let mut norm_squared = 0.0_f32;
+        // f32::MAX is finite but squaring it in f32 overflows to infinity. Use
+        // f64 for every reduction so a large finite vector is normalized
+        // mathematically instead of collapsing to an accepted all-zero vector.
+        let mut norm_squared = 0.0_f64;
         for value in &values {
             if !value.is_finite() {
                 return Err("embedding vector contains a non-finite value".to_string());
             }
+            let value = f64::from(*value);
             norm_squared += value * value;
+            if !norm_squared.is_finite() {
+                return Err("embedding vector norm is non-finite".to_string());
+            }
         }
-        if norm_squared <= f32::EPSILON {
+        if norm_squared == 0.0 {
             return Err("embedding vector must not have zero length".to_string());
         }
         let norm = norm_squared.sqrt();
-        Ok(Self {
-            values: values.into_iter().map(|value| value / norm).collect(),
-        })
+        if !norm.is_finite() || norm == 0.0 {
+            return Err("embedding vector norm is invalid".to_string());
+        }
+
+        let mut normalized = Vec::with_capacity(values.len());
+        for value in values {
+            let component = f64::from(value) / norm;
+            if !component.is_finite() {
+                return Err("normalized embedding contains a non-finite value".to_string());
+            }
+            let component = component as f32;
+            if !component.is_finite() {
+                return Err("normalized embedding is outside f32 range".to_string());
+            }
+            normalized.push(component);
+        }
+
+        let unit_norm_squared = normalized.iter().fold(0.0_f64, |acc, value| {
+            let value = f64::from(*value);
+            acc + value * value
+        });
+        if !unit_norm_squared.is_finite() || (unit_norm_squared.sqrt() - 1.0).abs() > 1.0e-4 {
+            return Err("normalized embedding does not have unit length".to_string());
+        }
+
+        Ok(Self { values: normalized })
     }
 
-    fn cosine(&self, other: &Self) -> Option<f32> {
+    fn cosine(&self, other: &Self) -> Result<f32, String> {
         if self.values.len() != other.values.len() {
-            return None;
+            return Err(format!(
+                "embedding dimension mismatch: request vector has {} dimensions, rule vector has {} dimensions",
+                self.dimension(),
+                other.dimension()
+            ));
         }
-        Some(
-            self.values
-                .iter()
-                .zip(&other.values)
-                .fold(0.0_f32, |acc, (left, right)| acc + left * right)
-                .clamp(-1.0, 1.0),
-        )
+        let score = self
+            .values
+            .iter()
+            .zip(&other.values)
+            .fold(0.0_f64, |acc, (left, right)| {
+                acc + f64::from(*left) * f64::from(*right)
+            });
+        if !score.is_finite() {
+            return Err("embedding cosine result is non-finite".to_string());
+        }
+        Ok((score as f32).clamp(-1.0, 1.0))
     }
 
     fn dimension(&self) -> usize {
@@ -434,6 +500,7 @@ struct FirewallEngine {
     extraction: ExtractionConfig,
     privacy: PrivacyConfig,
     expose_rule_id_to_client: bool,
+    fail_on_uninspectable_body: bool,
     /// True when both directions can produce decision metadata in the same
     /// transaction (request + response inspection both active with applicable
     /// rules). In that case decision metadata keys are scoped by direction
@@ -441,9 +508,13 @@ struct FirewallEngine {
     /// so the response pass does not overwrite the request-side audit record.
     metadata_direction_scoped: bool,
     rule_embeddings: OnceCell<Arc<RuleEmbeddingIndex>>,
+    /// Dimension learned from the first valid provider response. Later calls
+    /// must match it before their vectors enter policy evaluation.
+    embedding_dimension: OnceCell<usize>,
 }
 
 pub struct AiSemanticFirewall {
+    instance_id: u64,
     enabled: bool,
     inspect_request: bool,
     inspect_response: bool,
@@ -459,9 +530,12 @@ pub struct AiSemanticFirewall {
 
 impl AiSemanticFirewall {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        if !config.is_object() {
+        let Some(config_object) = config.as_object() else {
             return Err("ai_semantic_firewall: config must be an object".to_string());
-        }
+        };
+        validate_config_keys(config_object)?;
+
+        let instance_id = NEXT_FIREWALL_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
 
         let enabled = optional_bool(config, "enabled")?.unwrap_or(true);
         let inspect = optional_object(config, "inspect")?;
@@ -552,6 +626,8 @@ impl AiSemanticFirewall {
 
         let expose_rule_id_to_client =
             optional_bool(config, "expose_rule_id_to_client")?.unwrap_or(false);
+        let fail_on_uninspectable_body =
+            optional_bool(config, "fail_on_uninspectable_body")?.unwrap_or(true);
 
         let extraction_object = optional_object(config, "extraction")?;
         let extraction = ExtractionConfig {
@@ -578,6 +654,7 @@ impl AiSemanticFirewall {
         };
         if !enabled {
             return Ok(Self {
+                instance_id,
                 enabled,
                 inspect_request,
                 inspect_response,
@@ -599,8 +676,10 @@ impl AiSemanticFirewall {
                     extraction,
                     privacy,
                     expose_rule_id_to_client,
+                    fail_on_uninspectable_body,
                     metadata_direction_scoped: false,
                     rule_embeddings: OnceCell::new(),
+                    embedding_dimension: OnceCell::new(),
                 }),
             });
         }
@@ -662,6 +741,19 @@ impl AiSemanticFirewall {
             );
         }
 
+        if has_request_rules && extraction.request_json_paths.is_empty() {
+            return Err(
+                "ai_semantic_firewall: extraction.request_json_paths must not be empty when request rules are active"
+                    .to_string(),
+            );
+        }
+        if has_response_rules && extraction.response_json_paths.is_empty() {
+            return Err(
+                "ai_semantic_firewall: extraction.response_json_paths must not be empty when response rules are active"
+                    .to_string(),
+            );
+        }
+
         let streaming_response = configured_streaming_response.unwrap_or_else(|| {
             if mode == EnforcementMode::Enforce && has_response_rules {
                 StreamingResponsePolicy::Reject
@@ -671,6 +763,7 @@ impl AiSemanticFirewall {
         });
 
         Ok(Self {
+            instance_id,
             enabled,
             inspect_request,
             inspect_response,
@@ -691,10 +784,263 @@ impl AiSemanticFirewall {
                 extraction,
                 privacy,
                 expose_rule_id_to_client,
+                fail_on_uninspectable_body,
                 metadata_direction_scoped: has_request_rules && has_response_rules,
                 rule_embeddings: OnceCell::new(),
+                embedding_dimension: OnceCell::new(),
             }),
         })
+    }
+
+    fn request_hash<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
+        ctx.ai_semantic_firewall_request_hashes
+            .get(&self.instance_id)
+            .map(String::as_str)
+    }
+
+    fn set_request_hash(&self, ctx: &mut RequestContext, hash: String) {
+        ctx.ai_semantic_firewall_request_hashes
+            .insert(self.instance_id, hash);
+    }
+
+    fn response_hash<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
+        ctx.ai_semantic_firewall_response_hashes
+            .get(&self.instance_id)
+            .map(String::as_str)
+    }
+
+    fn set_response_hash(&self, ctx: &mut RequestContext, hash: String) {
+        ctx.ai_semantic_firewall_response_hashes
+            .insert(self.instance_id, hash);
+    }
+
+    fn needs_governed_request_body(&self) -> bool {
+        self.enabled
+            && ((self.inspect_request && self.has_request_rules)
+                || ((self.streaming_response != StreamingResponsePolicy::Skip
+                    || self.audit_streaming_skip)
+                    && self.inspect_response
+                    && self.has_response_rules))
+    }
+
+    fn apply_streaming_request_policy(
+        &self,
+        ctx: &mut RequestContext,
+        json: &Value,
+    ) -> PluginResult {
+        if json.get("stream").and_then(Value::as_bool) != Some(true) {
+            return PluginResult::Continue;
+        }
+
+        let response_inspectable = self.inspect_response && self.has_response_rules;
+        match self.streaming_response {
+            StreamingResponsePolicy::Buffer if response_inspectable => {
+                ctx.metadata
+                    .insert(STREAM_BUFFER_REQUESTED_KEY.to_string(), "true".to_string());
+                ctx.metadata.insert(
+                    RESPONSE_INSPECTION_KEY.to_string(),
+                    STREAMING_BUFFERED_MARKER.to_string(),
+                );
+            }
+            StreamingResponsePolicy::Inspect if response_inspectable => {
+                ctx.metadata
+                    .insert("ai_request_streaming".to_string(), "true".to_string());
+                ctx.metadata
+                    .insert(STREAM_INSPECT_REQUESTED_KEY.to_string(), "true".to_string());
+                ctx.metadata.insert(
+                    RESPONSE_INSPECTION_KEY.to_string(),
+                    STREAMING_WINDOWED_MARKER.to_string(),
+                );
+            }
+            StreamingResponsePolicy::Reject
+                if response_inspectable && self.engine.mode == EnforcementMode::Enforce =>
+            {
+                ctx.metadata
+                    .insert("ai_request_streaming".to_string(), "true".to_string());
+                ctx.metadata.insert(
+                    "ai_semantic_firewall.response_inspection_skipped".to_string(),
+                    "streaming_rejected".to_string(),
+                );
+                return PluginResult::Reject {
+                    status_code: 400,
+                    body: rejection_body(
+                        "ai_semantic_firewall_streaming_rejected",
+                        "Streaming responses are not permitted while AI semantic firewall response inspection is enabled; retry with \"stream\": false.",
+                        None,
+                    ),
+                    headers: json_headers(),
+                };
+            }
+            StreamingResponsePolicy::Skip if response_inspectable && self.audit_streaming_skip => {
+                ctx.metadata
+                    .insert("ai_request_streaming".to_string(), "true".to_string());
+                ctx.metadata
+                    .insert(STREAM_SKIP_REQUESTED_KEY.to_string(), "true".to_string());
+                ctx.metadata.insert(
+                    "ai_semantic_firewall.response_inspection_skipped".to_string(),
+                    "streaming".to_string(),
+                );
+            }
+            _ => {
+                ctx.metadata
+                    .insert("ai_request_streaming".to_string(), "true".to_string());
+                if response_inspectable {
+                    ctx.metadata.insert(
+                        "ai_semantic_firewall.response_inspection_skipped".to_string(),
+                        "streaming".to_string(),
+                    );
+                }
+            }
+        }
+        PluginResult::Continue
+    }
+
+    async fn inspect_request_json(
+        &self,
+        ctx: &mut RequestContext,
+        json: &Value,
+        body: &[u8],
+    ) -> PluginResult {
+        let streaming_result = self.apply_streaming_request_policy(ctx, json);
+        if !matches!(streaming_result, PluginResult::Continue) {
+            return streaming_result;
+        }
+
+        if !self.inspect_request || !self.has_request_rules {
+            return PluginResult::Continue;
+        }
+
+        let segments = extract_request_segments(json, &self.engine.extraction);
+        if segments.is_empty() {
+            return if !self.engine.allow_topics.is_empty() || looks_like_governed_request_json(json)
+            {
+                self.set_request_hash(ctx, sha256_hex_bytes(body));
+                self.engine.handle_uninspectable_body(
+                    ctx,
+                    Direction::Request,
+                    "no_extractable_content",
+                )
+            } else {
+                PluginResult::Continue
+            };
+        }
+
+        self.set_request_hash(ctx, sha256_hex_bytes(body));
+
+        let outcome = self
+            .engine
+            .evaluate(Direction::Request, &segments, &ctx.plugin_http_call_ns)
+            .await;
+        if self
+            .engine
+            .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref())
+        {
+            return self.engine.handle_provider_error(
+                ctx,
+                Direction::Request,
+                outcome
+                    .provider_error
+                    .as_deref()
+                    .unwrap_or("provider error"),
+            );
+        }
+
+        self.engine.handle_decision(
+            ctx,
+            outcome.decision,
+            Direction::Request,
+            outcome.provider_error.as_deref(),
+        )
+    }
+
+    async fn inspect_response_bytes(
+        &self,
+        ctx: &mut RequestContext,
+        content_type: &str,
+        body: &[u8],
+    ) -> PluginResult {
+        let event_stream = is_event_stream_content_type(content_type);
+        let json_body = is_json_content_type(content_type) || looks_like_json(body);
+        if !event_stream && !json_body {
+            return PluginResult::Continue;
+        }
+        if body.len() > MAX_INSPECTION_BODY_BYTES {
+            return self.engine.handle_uninspectable_body(
+                ctx,
+                Direction::Response,
+                "body_too_large",
+            );
+        }
+        let segments = if event_stream {
+            let (segments, fully_parsed) =
+                reassemble_sse_response_segments(body, &self.engine.extraction);
+            if (buffer_streaming_marker_set(ctx) || windowed_streaming_marker_set(ctx))
+                && (!fully_parsed || segments.is_empty())
+            {
+                self.set_response_hash(ctx, sha256_hex_bytes(body));
+                return self.engine.handle_uninspectable_buffered_stream(ctx);
+            }
+            segments
+        } else {
+            let json: Value = match serde_json::from_slice(strip_json_bom(body)) {
+                Ok(json) => json,
+                Err(_) => {
+                    self.set_response_hash(ctx, sha256_hex_bytes(body));
+                    return self.engine.handle_uninspectable_body(
+                        ctx,
+                        Direction::Response,
+                        "malformed_json",
+                    );
+                }
+            };
+            let mut segments = Vec::new();
+            extract_response_segments_from_json(
+                &json,
+                &self.engine.extraction,
+                None,
+                &mut segments,
+            );
+            if segments.is_empty() && looks_like_governed_response_json(&json) {
+                self.set_response_hash(ctx, sha256_hex_bytes(body));
+                return self.engine.handle_uninspectable_body(
+                    ctx,
+                    Direction::Response,
+                    "no_extractable_content",
+                );
+            }
+            segments
+        };
+
+        if segments.is_empty() {
+            return PluginResult::Continue;
+        }
+
+        self.set_response_hash(ctx, sha256_hex_bytes(body));
+
+        let outcome = self
+            .engine
+            .evaluate(Direction::Response, &segments, &ctx.plugin_http_call_ns)
+            .await;
+        if self
+            .engine
+            .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref())
+        {
+            return self.engine.handle_provider_error(
+                ctx,
+                Direction::Response,
+                outcome
+                    .provider_error
+                    .as_deref()
+                    .unwrap_or("provider error"),
+            );
+        }
+
+        self.engine.handle_decision(
+            ctx,
+            outcome.decision,
+            Direction::Response,
+            outcome.provider_error.as_deref(),
+        )
     }
 }
 
@@ -966,12 +1312,18 @@ impl FirewallEngine {
             // Resolved lazily here (not in `new()`) so config validation does not
             // require the secret. A configured-but-missing key is a clear error
             // rather than a silently unauthenticated request that 401s opaquely.
-            let api_key = std::env::var(env_name).map_err(|_| {
-                format!(
-                    "ai_semantic_firewall: provider.api_key_env {env_name:?} is set but not present in this process"
-                )
-            })?;
-            request = request.header("Authorization", format!("Bearer {api_key}"));
+            let authorization = provider
+                .authorization_header
+                .get_or_try_init(|| async {
+                    let api_key = std::env::var(env_name).map_err(|_| {
+                        format!(
+                            "ai_semantic_firewall: provider.api_key_env {env_name:?} is set but not present in this process"
+                        )
+                    })?;
+                    Ok::<String, String>(format!("Bearer {api_key}"))
+                })
+                .await?;
+            request = request.header("Authorization", authorization.as_str());
         }
 
         let response = self
@@ -992,13 +1344,36 @@ impl FirewallEngine {
             ));
         }
 
-        let body: Value = response
-            .json()
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_EMBEDDING_RESPONSE_BYTES as u64)
+        {
+            return Err(format!(
+                "embedding response invalid: declared body exceeds {MAX_EMBEDDING_RESPONSE_BYTES} bytes"
+            ));
+        }
+        let body = read_response_body_bounded(response, MAX_EMBEDDING_RESPONSE_BYTES)
             .await
+            .map_err(|err| format!("embedding response invalid: bounded read failed: {err}"))?;
+        let body: Value = serde_json::from_slice(&body)
             .map_err(|err| format!("embedding response parse failed: {err}"))?;
 
-        parse_openai_embedding_response(&body, texts.len())
-            .map_err(|err| format!("embedding response invalid: {err}"))
+        let embeddings = parse_openai_embedding_response(&body, texts.len())
+            .map_err(|err| format!("embedding response invalid: {err}"))?;
+        let Some(dimension) = embeddings.first().map(EmbeddingVector::dimension) else {
+            return Err("embedding response invalid: no embedding vectors returned".to_string());
+        };
+        let expected_dimension = self
+            .embedding_dimension
+            .get_or_init(|| async move { dimension })
+            .await;
+        if *expected_dimension != dimension {
+            return Err(format!(
+                "embedding response invalid: dimension changed from {} to {dimension}",
+                *expected_dimension
+            ));
+        }
+        Ok(embeddings)
     }
 
     fn segment_has_semantic_rule(&self, direction: Direction, kind: SegmentKind) -> bool {
@@ -1190,6 +1565,23 @@ impl FirewallEngine {
                 "streaming detect: response window would be blocked by semantic firewall policy"
             );
         }
+    }
+
+    /// Detect-mode evaluations are detached, so a sanitized structured warning
+    /// is their only durable provider-failure signal. The per-response atomic is
+    /// shared by every detached window and bounds an outage to one event.
+    fn log_stream_provider_error_once(&self, error: &str, emitted: &AtomicBool) {
+        if emitted.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let provider_error = sanitize_provider_error(error);
+        tracing::warn!(
+            target: "ai_semantic_firewall",
+            direction = "response",
+            enforcement = "detect",
+            provider_error,
+            "streaming detect: embedding provider evaluation failed"
+        );
     }
 
     fn write_decision_metadata(
@@ -1430,12 +1822,29 @@ impl FirewallEngine {
         }
     }
 
-    /// Disposition for a `buffer`-mode streamed response that yielded no
-    /// inspectable content (uninspectable `data:` events, or no extractable
-    /// content). Buffer mode exists to inspect the stream, so an uninspectable
-    /// body is treated as an inspection failure governed by `on_error`: `reject`
-    /// fails closed (502), `warn`/`allow` (and dry-run) record and deliver.
-    fn handle_uninspectable_buffered_stream(&self, ctx: &mut RequestContext) -> PluginResult {
+    fn handle_uninspectable_body(
+        &self,
+        ctx: &mut RequestContext,
+        direction: Direction,
+        reason: &'static str,
+    ) -> PluginResult {
+        let key = if self.metadata_direction_scoped {
+            format!(
+                "ai_semantic_firewall.{}.uninspectable_body",
+                direction.as_str()
+            )
+        } else {
+            "ai_semantic_firewall.uninspectable_body".to_string()
+        };
+        ctx.metadata.insert(key, reason.to_string());
+
+        // This compatibility opt-out passes the body through without inspecting
+        // any content. Keep the diagnostic above, but do not make that path look
+        // like an evaluated allow decision in transaction metadata.
+        if !self.fail_on_uninspectable_body {
+            return PluginResult::Continue;
+        }
+
         let action = match self.on_error {
             OnErrorAction::Allow => Action::Allow,
             OnErrorAction::Warn => Action::Warn,
@@ -1446,25 +1855,45 @@ impl FirewallEngine {
             dry_run: self.mode == EnforcementMode::DryRun,
             matches: Vec::new(),
         };
-        self.write_decision_metadata(ctx, &decision, Direction::Response, None);
-        ctx.metadata.insert(
-            RESPONSE_INSPECTION_KEY.to_string(),
-            "streaming_uninspectable".to_string(),
-        );
+        self.write_decision_metadata(ctx, &decision, direction, None);
 
         if decision.dry_run || action != Action::Reject {
             return PluginResult::Continue;
         }
 
-        PluginResult::Reject {
-            status_code: 502,
-            body: rejection_body(
-                "ai_semantic_firewall_response_uninspectable",
-                "AI semantic firewall could not inspect the buffered streaming response.",
-                None,
-            ),
-            headers: json_headers(),
+        match direction {
+            Direction::Request => PluginResult::Reject {
+                status_code: 400,
+                body: rejection_body(
+                    "ai_semantic_firewall_request_uninspectable",
+                    "AI semantic firewall could not inspect the governed request body.",
+                    None,
+                ),
+                headers: json_headers(),
+            },
+            Direction::Response => PluginResult::Reject {
+                status_code: 502,
+                body: rejection_body(
+                    "ai_semantic_firewall_response_uninspectable",
+                    "AI semantic firewall could not inspect the governed response body.",
+                    None,
+                ),
+                headers: json_headers(),
+            },
         }
+    }
+
+    /// Disposition for a `buffer`-mode streamed response that yielded no
+    /// inspectable content (uninspectable `data:` events, or no extractable
+    /// content). Buffer mode exists to inspect the stream, so an uninspectable
+    /// body is treated as an inspection failure governed by `on_error`: `reject`
+    /// fails closed (502), `warn`/`allow` (and dry-run) record and deliver.
+    fn handle_uninspectable_buffered_stream(&self, ctx: &mut RequestContext) -> PluginResult {
+        ctx.metadata.insert(
+            RESPONSE_INSPECTION_KEY.to_string(),
+            "streaming_uninspectable".to_string(),
+        );
+        self.handle_uninspectable_body(ctx, Direction::Response, "streaming_body")
     }
 }
 
@@ -1482,16 +1911,17 @@ impl Plugin for AiSemanticFirewall {
         HTTP_ONLY_PROTOCOLS
     }
 
+    fn warmup_hostnames(&self) -> Vec<String> {
+        self.engine
+            .provider
+            .as_ref()
+            .and_then(|provider| provider.warmup_hostname.clone())
+            .into_iter()
+            .collect()
+    }
+
     fn requires_request_body_before_before_proxy(&self) -> bool {
-        self.enabled
-            && ((self.inspect_request && self.has_request_rules)
-                // Response-side stream policies must read the request body to
-                // detect `stream: true`: non-skip policies act on it, while an
-                // explicit skip is audited as a production opt-out.
-                || ((self.streaming_response != StreamingResponsePolicy::Skip
-                    || self.audit_streaming_skip)
-                    && self.inspect_response
-                    && self.has_response_rules))
+        self.needs_governed_request_body()
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
@@ -1520,155 +1950,104 @@ impl Plugin for AiSemanticFirewall {
         {
             return PluginResult::Continue;
         }
+        // Request decompression runs later in `transform_request_body`. Defer
+        // encoded JSON to the final backend-visible hook, where it is either
+        // plaintext and inspectable or still encoded and failed closed.
+        if has_non_identity_content_encoding(headers) {
+            return PluginResult::Continue;
+        }
 
         let Some(body) = ctx.metadata.get("request_body").cloned() else {
-            return PluginResult::Continue;
+            if !self.needs_governed_request_body() {
+                return PluginResult::Continue;
+            }
+            return self.engine.handle_uninspectable_body(
+                ctx,
+                Direction::Request,
+                if ctx.metadata.contains_key("request_body_size_bytes") {
+                    "non_utf8_body"
+                } else {
+                    "missing_buffered_body"
+                },
+            );
         };
         if body.trim().is_empty() {
-            return PluginResult::Continue;
+            return self
+                .engine
+                .handle_uninspectable_body(ctx, Direction::Request, "empty_body");
         }
 
         let json: Value = match serde_json::from_str(&body) {
             Ok(json) => json,
-            Err(_) => return PluginResult::Continue,
-        };
-
-        if json.get("stream").and_then(Value::as_bool) == Some(true) {
-            let response_inspectable = self.inspect_response && self.has_response_rules;
-            match self.streaming_response {
-                // `buffer`: force the streamed response onto the buffered path so
-                // its deltas can be reassembled. Do NOT set `ai_request_streaming`
-                // — that shared flag suppresses response buffering, which buffer
-                // mode needs enabled.
-                StreamingResponsePolicy::Buffer if response_inspectable => {
-                    // Additive boolean marker (survives a second firewall instance)
-                    // plus the single-valued audit marker.
-                    ctx.metadata
-                        .insert(STREAM_BUFFER_REQUESTED_KEY.to_string(), "true".to_string());
-                    ctx.metadata.insert(
-                        RESPONSE_INSPECTION_KEY.to_string(),
-                        STREAMING_BUFFERED_MARKER.to_string(),
-                    );
-                }
-                // `inspect`: keep streaming (set `ai_request_streaming` so the
-                // response is NOT buffered) and let the per-chunk windowed
-                // inspector run on the response path.
-                StreamingResponsePolicy::Inspect if response_inspectable => {
-                    ctx.metadata
-                        .insert("ai_request_streaming".to_string(), "true".to_string());
-                    ctx.metadata
-                        .insert(STREAM_INSPECT_REQUESTED_KEY.to_string(), "true".to_string());
-                    ctx.metadata.insert(
-                        RESPONSE_INSPECTION_KEY.to_string(),
-                        STREAMING_WINDOWED_MARKER.to_string(),
-                    );
-                }
-                // `reject` (enforce): fail closed so a client cannot disable response
-                // inspection by requesting a stream; require a non-streaming retry.
-                StreamingResponsePolicy::Reject
-                    if response_inspectable && self.engine.mode == EnforcementMode::Enforce =>
-                {
-                    ctx.metadata
-                        .insert("ai_request_streaming".to_string(), "true".to_string());
-                    ctx.metadata.insert(
-                        "ai_semantic_firewall.response_inspection_skipped".to_string(),
-                        "streaming_rejected".to_string(),
-                    );
-                    return PluginResult::Reject {
-                        status_code: 400,
-                        body: rejection_body(
-                            "ai_semantic_firewall_streaming_rejected",
-                            "Streaming responses are not permitted while AI semantic firewall response inspection is enabled; retry with \"stream\": false.",
-                            None,
-                        ),
-                        headers: json_headers(),
-                    };
-                }
-                // EXPLICIT `skip` with response rules active: fail-open opt-out for
-                // the genuinely STREAMED (SSE) response only. Set the SHARED
-                // `ai_request_streaming` marker — its contract is "the REQUEST asked
-                // for a streamed response", which is true here — so downstream
-                // response plugins (`ai_response_guard`, `ai_token_metrics`) keep
-                // their existing streaming behavior and do NOT buffer an SSE body to
-                // EOF. THIS plugin overrides that shared flag for its own
-                // JSON-vs-SSE decision via the dedicated, per-instance skip marker:
-                // a backend that ignores `stream: true` and returns a normal JSON
-                // response must still be inspected, so the skip marker keeps the
-                // pre-header buffering decision buffering by default; content-type
-                // refinement then downgrades ONLY a `text/event-stream` body back to
-                // the uninspected streaming path (see
-                // `should_buffer_response_body_for_content_type`). The audit marker
-                // records the intended skip for an SSE response.
-                //
-                // Gated on `audit_streaming_skip` (the operator explicitly chose
-                // `skip`) so the implicit `Skip` default — only reached in dry-run
-                // or request-only configs, where the request body is not buffered
-                // and `requires_request_body_before_before_proxy()` is false — keeps
-                // its existing `_`-arm behavior below. The skip marker is also read
-                // back per-instance (gated on `self.audit_streaming_skip`) so a
-                // coexisting implicit-`Skip` instance never buffers a JSON fallback
-                // solely because this instance set the marker.
-                StreamingResponsePolicy::Skip
-                    if response_inspectable && self.audit_streaming_skip =>
-                {
-                    ctx.metadata
-                        .insert("ai_request_streaming".to_string(), "true".to_string());
-                    ctx.metadata
-                        .insert(STREAM_SKIP_REQUESTED_KEY.to_string(), "true".to_string());
-                    ctx.metadata.insert(
-                        "ai_semantic_firewall.response_inspection_skipped".to_string(),
-                        "streaming".to_string(),
-                    );
-                }
-                // Implicit `skip` default, `reject` in dry-run, or no response
-                // rules: the streamed response is not inspected. Record the skip
-                // for audit.
-                _ => {
-                    ctx.metadata
-                        .insert("ai_request_streaming".to_string(), "true".to_string());
-                    if response_inspectable {
-                        ctx.metadata.insert(
-                            "ai_semantic_firewall.response_inspection_skipped".to_string(),
-                            "streaming".to_string(),
-                        );
-                    }
-                }
+            Err(_) => {
+                return self.engine.handle_uninspectable_body(
+                    ctx,
+                    Direction::Request,
+                    "malformed_json",
+                );
             }
-        }
+        };
+        self.inspect_request_json(ctx, &json, body.as_bytes()).await
+    }
 
-        if !self.inspect_request || !self.has_request_rules {
+    fn needs_final_request_body_context(&self) -> bool {
+        self.needs_governed_request_body()
+    }
+
+    /// Reinspect the final backend-visible request after decompression and
+    /// request transforms. An instance-scoped hash skips unchanged plaintext
+    /// bodies, while an encoded/malformed/rewritten governed body cannot bypass
+    /// policy after the initial pass.
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        if !self.needs_governed_request_body() || !ctx.method.eq_ignore_ascii_case("POST") {
             return PluginResult::Continue;
         }
 
-        let segments = extract_request_segments(&json, &self.engine.extraction);
-        if segments.is_empty() && self.engine.allow_topics.is_empty() {
+        let was_governed = self.request_hash(ctx).is_some();
+        let json_content_type =
+            header_value(headers, "content-type").is_some_and(is_json_content_type);
+        if !json_content_type && !looks_like_json(body) && !was_governed {
             return PluginResult::Continue;
         }
 
-        let outcome = self
-            .engine
-            .evaluate(Direction::Request, &segments, &ctx.plugin_http_call_ns)
-            .await;
-        if self
-            .engine
-            .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref())
-        {
-            return self.engine.handle_provider_error(
+        let final_hash = sha256_hex_bytes(body);
+        if self.request_hash(ctx) == Some(final_hash.as_str()) {
+            return PluginResult::Continue;
+        }
+        if body.is_empty() {
+            return self
+                .engine
+                .handle_uninspectable_body(ctx, Direction::Request, "empty_body");
+        }
+        if body.len() > MAX_INSPECTION_BODY_BYTES {
+            return self.engine.handle_uninspectable_body(
                 ctx,
                 Direction::Request,
-                outcome
-                    .provider_error
-                    .as_deref()
-                    .unwrap_or("provider error"),
+                "body_too_large",
             );
         }
+        if has_non_identity_content_encoding(headers) {
+            return self
+                .engine
+                .handle_uninspectable_body(ctx, Direction::Request, "encoded_body");
+        }
 
-        self.engine.handle_decision(
-            ctx,
-            outcome.decision,
-            Direction::Request,
-            outcome.provider_error.as_deref(),
-        )
+        let json: Value = match serde_json::from_slice(strip_json_bom(body)) {
+            Ok(json) => json,
+            Err(_) => {
+                return self.engine.handle_uninspectable_body(
+                    ctx,
+                    Direction::Request,
+                    "malformed_json",
+                );
+            }
+        };
+        self.inspect_request_json(ctx, &json, body).await
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -1676,7 +2055,10 @@ impl Plugin for AiSemanticFirewall {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        if !self.requires_response_body_buffering() || is_native_grpc_request(ctx) {
+        if !self.requires_response_body_buffering()
+            || ctx.method.eq_ignore_ascii_case("HEAD")
+            || is_native_grpc_request(ctx)
+        {
             return false;
         }
         // `buffer` mode pins this response onto the buffered path even when an
@@ -1720,7 +2102,10 @@ impl Plugin for AiSemanticFirewall {
         response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
-        if !self.requires_response_body_buffering() || is_native_grpc_request(ctx) {
+        if !self.requires_response_body_buffering()
+            || ctx.method.eq_ignore_ascii_case("HEAD")
+            || is_native_grpc_request(ctx)
+        {
             return false;
         }
 
@@ -1840,85 +2225,119 @@ impl Plugin for AiSemanticFirewall {
         if !self.enabled || !self.inspect_response || !self.has_response_rules {
             return PluginResult::Continue;
         }
-        if !(200..300).contains(&response_status) || body.is_empty() {
+        if ctx.method.eq_ignore_ascii_case("HEAD") {
+            return PluginResult::Continue;
+        }
+        if !(200..300).contains(&response_status) || matches!(response_status, 204 | 205) {
             return PluginResult::Continue;
         }
 
-        let content_type = response_headers
-            .get("content-type")
-            .map(String::as_str)
-            .unwrap_or("");
-        let segments = if is_event_stream_content_type(content_type) {
-            // Reached when the response was buffered for inspection — either
-            // `streaming_response: buffer`, or another response-body plugin/mode
-            // pinned the stream. SSE deltas arrive as many tiny fragments, so they
-            // are reassembled into coherent per-choice / per-tool-call text before
-            // inspection rather than scored fragment-by-fragment.
-            let (segments, fully_parsed) =
-                reassemble_sse_response_segments(body, &self.engine.extraction);
-            // `buffer` mode forced this stream onto the buffered path specifically
-            // to inspect it. If nothing inspectable was recovered — the body had
-            // non-UTF-8 / non-JSON `data:` events, or no extractable content — then
-            // delivering it would be fail-open for an explicit inspection mode, so
-            // treat it as an inspection failure governed by `on_error`. (Other
-            // buffered SSE, e.g. pinned by a different plugin, keeps the lenient
-            // path: no marker means this branch is skipped.)
-            // Fail closed for either marker: `buffer` mode pinned this stream, OR
-            // `inspect` mode marked it but the response was buffered anyway (e.g.
-            // another response-body plugin pinned it, so the windowed inspector
-            // never ran) — both promised inspection, so uninspectable SSE must
-            // honor on_error rather than be delivered.
-            if (buffer_streaming_marker_set(ctx) || windowed_streaming_marker_set(ctx))
-                && (!fully_parsed || segments.is_empty())
-            {
-                return self.engine.handle_uninspectable_buffered_stream(ctx);
-            }
-            segments
-        } else if is_json_content_type(content_type) {
-            let json: Value = match serde_json::from_slice(body) {
-                Ok(json) => json,
-                Err(_) => return PluginResult::Continue,
-            };
-            let mut segments = Vec::new();
-            extract_response_segments_from_json(
-                &json,
-                &self.engine.extraction,
-                None,
-                &mut segments,
-            );
-            segments
-        } else {
-            return PluginResult::Continue;
-        };
-
-        if segments.is_empty() {
-            return PluginResult::Continue;
-        }
-
-        let outcome = self
-            .engine
-            .evaluate(Direction::Response, &segments, &ctx.plugin_http_call_ns)
-            .await;
-        if self
-            .engine
-            .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref())
+        let content_type = header_value(response_headers, "content-type").unwrap_or("");
+        let encoded_body = has_non_identity_content_encoding(response_headers)
+            && !gateway_response_compression_planned(ctx, response_headers);
+        if !response_content_type_is_inspection_candidate(content_type)
+            && (encoded_body || !looks_like_json(body))
         {
-            return self.engine.handle_provider_error(
-                ctx,
-                Direction::Response,
-                outcome
-                    .provider_error
-                    .as_deref()
-                    .unwrap_or("provider error"),
-            );
+            return PluginResult::Continue;
+        }
+        if body.is_empty() {
+            return self
+                .engine
+                .handle_uninspectable_body(ctx, Direction::Response, "empty_body");
+        }
+        if encoded_body {
+            self.set_response_hash(ctx, sha256_hex_bytes(body));
+            return self
+                .engine
+                .handle_uninspectable_body(ctx, Direction::Response, "encoded_body");
         }
 
-        self.engine.handle_decision(
-            ctx,
-            outcome.decision,
-            Direction::Response,
-            outcome.provider_error.as_deref(),
-        )
+        self.inspect_response_bytes(ctx, content_type, body).await
+    }
+
+    /// Reinspect the final client-visible response after response transforms.
+    /// Gateway-added gzip/Brotli is decoded within a hard cap; a compression-only
+    /// rewrite hash-skips, while transformed decoded content is evaluated again.
+    async fn on_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        if !self.enabled || !self.inspect_response || !self.has_response_rules {
+            return PluginResult::Continue;
+        }
+        if ctx.method.eq_ignore_ascii_case("HEAD") {
+            return PluginResult::Continue;
+        }
+        if !(200..300).contains(&response_status) || matches!(response_status, 204 | 205) {
+            return PluginResult::Continue;
+        }
+
+        let content_type = header_value(response_headers, "content-type").unwrap_or("");
+        let was_governed = self.response_hash(ctx).is_some();
+        let type_candidate = response_content_type_is_inspection_candidate(content_type);
+        if let Some(encoding) = content_encoding_value(response_headers) {
+            if !was_governed && !type_candidate {
+                return PluginResult::Continue;
+            }
+            if body.is_empty() {
+                return self.engine.handle_uninspectable_body(
+                    ctx,
+                    Direction::Response,
+                    "empty_body",
+                );
+            }
+            let Some(decoded) = decompress_within_limit(encoding, body) else {
+                return self.engine.handle_uninspectable_body(
+                    ctx,
+                    Direction::Response,
+                    "encoded_body",
+                );
+            };
+            if !type_candidate && !looks_like_json(&decoded) {
+                return if was_governed {
+                    self.engine.handle_uninspectable_body(
+                        ctx,
+                        Direction::Response,
+                        "transformed_body_not_inspectable",
+                    )
+                } else {
+                    PluginResult::Continue
+                };
+            }
+            let decoded_hash = sha256_hex_bytes(&decoded);
+            if self.response_hash(ctx) == Some(decoded_hash.as_str()) {
+                return PluginResult::Continue;
+            }
+            return self
+                .inspect_response_bytes(ctx, content_type, &decoded)
+                .await;
+        }
+
+        if !type_candidate && !looks_like_json(body) {
+            return if was_governed {
+                self.engine.handle_uninspectable_body(
+                    ctx,
+                    Direction::Response,
+                    "transformed_body_not_inspectable",
+                )
+            } else {
+                PluginResult::Continue
+            };
+        }
+        let raw_hash = sha256_hex_bytes(body);
+        if self.response_hash(ctx) == Some(raw_hash.as_str()) {
+            return PluginResult::Continue;
+        }
+        if body.is_empty() {
+            return self
+                .engine
+                .handle_uninspectable_body(ctx, Direction::Response, "empty_body");
+        }
+
+        self.inspect_response_bytes(ctx, content_type, body).await
     }
 }
 
@@ -2413,7 +2832,7 @@ fn parse_provider_config(
     }
 
     let endpoint = required_non_empty_string(provider.get("endpoint"), "provider.endpoint")?;
-    let redacted_endpoint = validate_provider_endpoint(&endpoint, backend_allow_ips)?;
+    let validated_endpoint = validate_provider_endpoint(&endpoint, backend_allow_ips)?;
 
     let model = optional_string_from_object(provider, "model")?
         .map(str::trim)
@@ -2433,17 +2852,24 @@ fn parse_provider_config(
 
     Ok(Some(ProviderConfig {
         endpoint,
-        redacted_endpoint,
+        redacted_endpoint: validated_endpoint.redacted,
+        warmup_hostname: validated_endpoint.warmup_hostname,
         model,
         api_key_env,
+        authorization_header: OnceCell::new(),
         request_timeout: Duration::from_millis(request_timeout_ms),
     }))
+}
+
+struct ValidatedProviderEndpoint {
+    redacted: String,
+    warmup_hostname: Option<String>,
 }
 
 fn validate_provider_endpoint(
     endpoint: &str,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
-) -> Result<String, String> {
+) -> Result<ValidatedProviderEndpoint, String> {
     let parsed = Url::parse(endpoint)
         .map_err(|_| "ai_semantic_firewall: provider.endpoint must be a valid URL".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -2459,10 +2885,10 @@ fn validate_provider_endpoint(
     let host = parsed
         .host()
         .ok_or_else(|| "ai_semantic_firewall: provider.endpoint must include a host".to_string())?;
-    let literal_ip = match host {
-        Host::Ipv4(ip) => Some(std::net::IpAddr::V4(ip)),
-        Host::Ipv6(ip) => Some(std::net::IpAddr::V6(ip)),
-        Host::Domain(_) => None,
+    let (literal_ip, warmup_hostname) = match host {
+        Host::Ipv4(ip) => (Some(std::net::IpAddr::V4(ip)), None),
+        Host::Ipv6(ip) => (Some(std::net::IpAddr::V6(ip)), None),
+        Host::Domain(hostname) => (None, Some(hostname.to_ascii_lowercase())),
     };
     if let Some(ip) = literal_ip
         && !backend_allow_ips.is_allowed(&ip)
@@ -2472,7 +2898,10 @@ fn validate_provider_endpoint(
         ));
     }
 
-    Ok(redacted_provider_endpoint(&parsed))
+    Ok(ValidatedProviderEndpoint {
+        redacted: redacted_provider_endpoint(&parsed),
+        warmup_hostname,
+    })
 }
 
 fn redacted_provider_endpoint(parsed: &Url) -> String {
@@ -2515,17 +2944,18 @@ fn extract_response_segments_from_json(
 /// Two passes, merged and deduped, so the buffered path inspects everything in
 /// the body:
 ///
-/// 1. **Delta reassembly.** Streaming bodies arrive as many tiny delta frames
-///    (`data: {"choices":[{"delta":{"content":"Hel"}}]}`); inspecting each frame
-///    in isolation is meaningless, so the deltas are concatenated per choice /
-///    tool call into coherent text first (see [`SseReassembler`]).
+/// 1. **Incremental reassembly.** Streaming bodies arrive as many tiny fragments
+///    (`data: {"choices":[{"delta":{"content":"Hel"}}]}` or legacy
+///    `choices[].text`); inspecting each frame in isolation is meaningless, so
+///    the fragments are concatenated per choice / tool call into coherent text
+///    first (see [`SseReassembler`]).
 /// 2. **Per-frame non-delta extraction.** A buffered stream can also carry
 ///    non-delta JSON events — a final `choices[].message.content` / `output_text`
 ///    summary, or a side-channel event — which could smuggle a violation past a
-///    clean delta stream. These are extracted per frame using only the non-delta
-///    paths; the chat-completions `delta.*` paths are excluded here because pass
-///    (1) already covers them and per-frame extraction would re-introduce the
-///    per-fragment segments reassembly exists to avoid.
+///    clean delta stream. These are extracted per frame using only the
+///    non-incremental paths; streamed `choices[].text` and `delta.*` paths are
+///    excluded here because pass (1) already covers them and per-frame extraction
+///    would re-introduce the per-fragment segments reassembly exists to avoid.
 ///
 /// Only fragments whose canonical JSON path is enabled in `response_json_paths`
 /// are kept, preserving operator extraction overrides.
@@ -2575,9 +3005,9 @@ fn reassemble_sse_response_segments(
     (dedupe_segments(segments), parsed.fully_parsed)
 }
 
-/// Whether a response JSON path is a chat-completions streaming `delta.*` path
-/// handled by [`SseReassembler`] (and therefore excluded from per-frame
-/// extraction in [`reassemble_sse_response_segments`]).
+/// Whether a response JSON path is an incremental streaming path handled by
+/// [`SseReassembler`] (and therefore excluded from per-frame extraction in
+/// [`reassemble_sse_response_segments`]).
 fn is_sse_delta_response_path(path: &str) -> bool {
     SSE_DELTA_RESPONSE_PATHS.contains(&path)
 }
@@ -2643,6 +3073,17 @@ struct HeldEvent {
     /// `output_text`) before this event is released — matching the buffered
     /// path. Dropped when the event is released. Bounded by `held`.
     frames: Vec<Value>,
+    /// Logical serialized size budget charged for retained parsed frames. The
+    /// generic `Value` tree has allocator overhead, so charging the full raw
+    /// event length is deliberately conservative.
+    frame_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IngestStep {
+    consumed: usize,
+    progressed: bool,
+    window_ready: bool,
 }
 
 /// Pure state machine for windowed streamed inspection.
@@ -2703,26 +3144,69 @@ impl StreamWindowEngine {
     /// force-flush boundary and otherwise release bytes the client reassembles
     /// into valid, uninspected SSE data.
     fn absorb_event(&mut self, raw: Vec<u8>, force_uninspectable: bool) {
-        let mut parsed = parse_sse_data_frames_checked(&raw);
-        if force_uninspectable {
-            parsed.fully_parsed = false;
-        }
-        for frame in &parsed.frames {
-            self.reassembler.push_frame(frame);
-        }
-        let content_len_after = self.reassembler.assistant_content_len();
         let raw_len = raw.len();
+        let raw_retained = if self.hold_raw { raw_len } else { 0 };
+        let frame_budget = if self.store_frames { raw_len } else { 0 };
+        // Reassembled strings cannot contain more payload bytes than the raw
+        // event. Reserve that upper bound before parsing; if the aggregate
+        // retained-state budget would be crossed, keep only the raw block-mode
+        // bytes and mark the event uninspectable instead of duplicating it.
+        let projected = self
+            .retained_bytes()
+            .saturating_add(raw_retained)
+            .saturating_add(frame_budget)
+            .saturating_add(raw_len);
+        let within_budget = !force_uninspectable && projected <= self.config.max_window_bytes;
+
+        let (inspectable, frames, actual_frame_bytes) = if within_budget {
+            let parsed = parse_sse_data_frames_checked(&raw);
+            for frame in &parsed.frames {
+                self.reassembler.push_frame(frame);
+            }
+            let actual_frame_bytes = if self.store_frames && !parsed.frames.is_empty() {
+                raw_len
+            } else {
+                0
+            };
+            (
+                parsed.fully_parsed,
+                if self.store_frames {
+                    parsed.frames
+                } else {
+                    Vec::new()
+                },
+                actual_frame_bytes,
+            )
+        } else {
+            (false, Vec::new(), 0)
+        };
+        let content_len_after = self.reassembler.assistant_content_len();
         self.held.push(HeldEvent {
             raw: if self.hold_raw { raw } else { Vec::new() },
             raw_len,
             content_len_after,
-            inspectable: parsed.fully_parsed,
-            frames: if self.store_frames {
-                parsed.frames
-            } else {
-                Vec::new()
-            },
+            inspectable,
+            frames,
+            frame_bytes: actual_frame_bytes,
         });
+    }
+
+    fn input_window_bytes(&self) -> usize {
+        self.carry
+            .len()
+            .saturating_add(self.held.iter().map(|event| event.raw_len).sum::<usize>())
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.carry
+            .len()
+            .saturating_add(
+                self.held
+                    .iter()
+                    .map(|event| event.raw.len().saturating_add(event.frame_bytes))
+                    .sum::<usize>(),
+            )
+            .saturating_add(self.reassembler.retained_text_len())
     }
 
     /// The parsed JSON frames of all currently-held (un-released) events, for
@@ -2731,42 +3215,118 @@ impl StreamWindowEngine {
         self.held.iter().flat_map(|e| e.frames.iter())
     }
 
-    /// Append a raw chunk, reassembling any complete SSE events. Returns `true`
-    /// when a window is ready to inspect (boundary, byte cap, or carry overflow),
-    /// setting the pending release point; `false` means hold.
-    fn ingest(&mut self, chunk: &[u8]) -> bool {
-        self.carry.extend_from_slice(chunk);
-        while let Some(end) = next_event_end(&self.carry) {
+    /// Consume only as much of `chunk` as fits the aggregate input/retained-state
+    /// budget, and absorb at most one complete event. The caller inspects/releases
+    /// a ready window before invoking another step, so one coalesced transport
+    /// chunk can never be expanded into an unbounded `held`/frame/reassembly set.
+    fn ingest_step(&mut self, chunk: &[u8]) -> IngestStep {
+        if self.pending_clears_to.is_some() {
+            return IngestStep {
+                consumed: 0,
+                progressed: false,
+                window_ready: true,
+            };
+        }
+
+        if let Some(end) = next_event_end(&self.carry) {
             let raw: Vec<u8> = self.carry.drain(..end).collect();
             self.absorb_event(raw, false);
+            let force = self.input_window_bytes() >= self.config.max_window_bytes
+                || self.retained_bytes() >= self.config.max_window_bytes;
+            return IngestStep {
+                consumed: 0,
+                progressed: true,
+                window_ready: self.window_ready(false, force),
+            };
         }
-        // Bound carry: an event that never sends a blank-line terminator must not
-        // grow without limit. Once it passes the window cap, force it through as a
-        // (degenerate, almost certainly un-parseable) event so it is inspected or
-        // fails closed instead of buffering unbounded memory.
-        if self.carry.len() > self.config.max_window_bytes {
+
+        let input_capacity = self
+            .config
+            .max_window_bytes
+            .saturating_sub(self.input_window_bytes());
+        let retained_capacity = self
+            .config
+            .max_window_bytes
+            .saturating_sub(self.retained_bytes());
+        let capacity = input_capacity.min(retained_capacity);
+        if capacity == 0 {
+            if !self.carry.is_empty() {
+                let raw = std::mem::take(&mut self.carry);
+                self.absorb_event(raw, true);
+            }
+            return IngestStep {
+                consumed: 0,
+                progressed: !self.held.is_empty(),
+                window_ready: self.window_ready(false, true),
+            };
+        }
+        if chunk.is_empty() {
+            return IngestStep {
+                consumed: 0,
+                progressed: false,
+                window_ready: false,
+            };
+        }
+
+        let consumed = capacity.min(chunk.len());
+        self.carry.extend_from_slice(&chunk[..consumed]);
+        if let Some(end) = next_event_end(&self.carry) {
+            let raw: Vec<u8> = self.carry.drain(..end).collect();
+            self.absorb_event(raw, false);
+        } else if self.input_window_bytes() >= self.config.max_window_bytes
+            || self.retained_bytes() >= self.config.max_window_bytes
+        {
             let raw = std::mem::take(&mut self.carry);
             self.absorb_event(raw, true);
         }
-        self.window_ready(false)
+
+        let force = self.input_window_bytes() >= self.config.max_window_bytes
+            || self.retained_bytes() >= self.config.max_window_bytes;
+        IngestStep {
+            consumed,
+            progressed: true,
+            window_ready: self.window_ready(false, force),
+        }
     }
 
-    /// Flush at end of stream: parse any trailing partial event and signal a final
-    /// window covering all remaining content (boundary or not).
-    fn finish(&mut self) -> bool {
-        if !self.carry.is_empty() {
+    /// Process one retained event at end-of-stream. The caller repeats until no
+    /// progress remains, inspecting each bounded window before advancing.
+    fn finish_step(&mut self) -> IngestStep {
+        if self.pending_clears_to.is_some() {
+            return IngestStep {
+                consumed: 0,
+                progressed: false,
+                window_ready: true,
+            };
+        }
+
+        let progressed = if let Some(end) = next_event_end(&self.carry) {
+            let raw: Vec<u8> = self.carry.drain(..end).collect();
+            self.absorb_event(raw, false);
+            true
+        } else if !self.carry.is_empty() {
             let raw = std::mem::take(&mut self.carry);
             self.absorb_event(raw, false);
+            true
+        } else {
+            false
+        };
+        let at_end = self.carry.is_empty();
+        let force = self.input_window_bytes() >= self.config.max_window_bytes
+            || self.retained_bytes() >= self.config.max_window_bytes;
+        IngestStep {
+            consumed: 0,
+            progressed,
+            window_ready: self.window_ready(at_end, force),
         }
-        self.window_ready(true)
     }
 
-    fn window_ready(&mut self, at_end: bool) -> bool {
+    fn window_ready(&mut self, at_end: bool, force: bool) -> bool {
         let content_len = self.reassembler.assistant_content_len();
         let held_bytes: usize = self.held.iter().map(|e| e.raw_len).sum();
         let new_content = content_len > self.cleared_len;
 
-        let clears_to = if at_end {
+        let clears_to = if at_end || force {
             if !new_content && self.held.is_empty() {
                 return false;
             }
@@ -2841,26 +3401,57 @@ impl StreamWindowEngine {
             }
         }
 
-        // Bound retained prose: drop everything before the re-inspection overlap,
+        // Split the aggregate overlap budget when tool state is present so prose
+        // cannot consume every retained byte and erase a tool argument/name tail.
+        // The shared cap remains fixed (parallel attacker-selected tool indexes
+        // cannot multiply it), while each content class keeps cross-window context.
+        let has_tool_state =
+            self.reassembler.retained_text_len() > self.reassembler.assistant_content_len();
+        let tool_overlap_reserve = if has_tool_state {
+            self.config.overlap_bytes.div_ceil(2)
+        } else {
+            0
+        };
+        let prose_overlap = self
+            .config
+            .overlap_bytes
+            .saturating_sub(tool_overlap_reserve);
+
+        // Bound retained prose: drop everything before its allocated overlap,
         // rebasing the offsets that count from the front of the reassembly.
-        let keep_from = self.cleared_len.saturating_sub(self.config.overlap_bytes);
+        let keep_from = self.cleared_len.saturating_sub(prose_overlap);
         if keep_from > 0 {
             let content = self.reassembler.assistant_content();
-            let drop = floor_char_boundary(&content, keep_from);
+            // This prefix was inspected clean. Snap the drop UP to a UTF-8
+            // boundary so retained prose cannot exceed its allocation and starve
+            // the reserved tool tail by a partial multibyte character.
+            let max_drop = self.cleared_len.min(content.len());
+            let mut drop = keep_from.min(max_drop);
+            while drop < max_drop && !content.is_char_boundary(drop) {
+                drop += 1;
+            }
+            while drop > 0 && !content.is_char_boundary(drop) {
+                drop -= 1;
+            }
             if drop > 0 {
                 self.reassembler.drain_assistant_prefix(drop);
-                self.cleared_len -= drop;
+                self.cleared_len = self.cleared_len.saturating_sub(drop);
                 for e in &mut self.held {
                     e.content_len_after = e.content_len_after.saturating_sub(drop);
                 }
             }
         }
-        // Bound retained tool-call arguments the same way: the window just
-        // inspected them clean, so drop all but the overlap tail. (These have no
-        // linear prose offset, so they are trimmed independently of `cleared_len`
-        // — the prose-based raw-frame release above is unaffected.)
-        self.reassembler
-            .truncate_streamed_tool_args(self.config.overlap_bytes);
+        // Bound retained tool-call names/arguments the same way: the window just
+        // inspected them clean, so prose and every attacker-selected tool index
+        // share one aggregate overlap budget. These fields have no linear prose
+        // offset, so give them the budget not already occupied by prose. The
+        // split above guarantees a non-zero reservation when overlap and tool
+        // state are both present.
+        let tool_overlap = self
+            .config
+            .overlap_bytes
+            .saturating_sub(self.reassembler.assistant_content_len());
+        self.reassembler.truncate_streamed_tool_state(tool_overlap);
         out
     }
 
@@ -2975,6 +3566,12 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
         );
     }
     let overlap_bytes = streaming_u64(streaming, "overlap_bytes")?.unwrap_or(256);
+    if overlap_bytes >= max_window_bytes {
+        return Err(
+            "ai_semantic_firewall: streaming.overlap_bytes must be less than streaming.max_window_bytes"
+                .to_string(),
+        );
+    }
     let max_inspections = streaming_u64(streaming, "max_inspections")?.unwrap_or(64);
     if max_inspections == 0 {
         return Err(
@@ -3023,6 +3620,9 @@ struct StreamInspector {
     /// Bounds concurrent `detect`-mode spawned inspections. `Some` only in detect
     /// mode (block mode serializes via `await`, so it needs no limiter).
     detect_concurrency: Option<Arc<tokio::sync::Semaphore>>,
+    /// Shared by every detached detect evaluation for this response so provider
+    /// outages emit one sanitized warning rather than one per window.
+    detect_provider_error_logged: Arc<AtomicBool>,
 }
 
 impl StreamInspector {
@@ -3063,6 +3663,7 @@ impl StreamInspector {
                     DETECT_MAX_CONCURRENT_INSPECTIONS,
                 ))
             }),
+            detect_provider_error_logged: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3199,6 +3800,11 @@ impl StreamInspector {
         let engine = Arc::clone(&self.engine);
         let plugin_http_call_ns = Arc::clone(&self.plugin_http_call_ns);
         let concurrency = self.detect_concurrency.clone();
+        let provider_error_logged = Arc::clone(&self.detect_provider_error_logged);
+        // Capture the current dispatcher so detached tasks preserve the
+        // request's structured-log destination (and tests can observe them
+        // deterministically even if Tokio schedules the task on another thread).
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         tokio::spawn(async move {
             // Cap concurrent provider round-trips per response: the permit is held
             // until the evaluation finishes, so excess windows queue rather than
@@ -3213,14 +3819,23 @@ impl StreamInspector {
                 .await;
             let provider_error = engine
                 .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref());
+            if provider_error {
+                if let Some(error) = outcome.provider_error.as_deref() {
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        engine.log_stream_provider_error_once(error, &provider_error_logged);
+                    });
+                }
+                return;
+            }
             // Log both `reject` and `warn` hits — same action gate as block mode.
             // Detached detect results can complete after transaction metadata is
             // finalized, so their structured log remains the audit record.
-            if !provider_error
-                && matches!(outcome.decision.action, Action::Reject | Action::Warn)
+            if matches!(outcome.decision.action, Action::Reject | Action::Warn)
                 && !outcome.decision.matches.is_empty()
             {
-                engine.log_stream_detection(&outcome.decision, false);
+                tracing::dispatcher::with_default(&dispatch, || {
+                    engine.log_stream_detection(&outcome.decision, false);
+                });
             }
         });
     }
@@ -3245,20 +3860,48 @@ impl ResponseStreamInspector for StreamInspector {
             return ResponseStreamAction::Forward(Bytes::new());
         }
         match self.config.enforcement {
-            // Hold: emit only what the window engine clears (or cut).
+            // Hold: process a coalesced transport chunk incrementally, inspect
+            // each bounded ready window, and aggregate only clean releases.
             StreamEnforcement::Block => {
-                if self.window.ingest(chunk) {
-                    self.act_on_window().await
-                } else {
-                    ResponseStreamAction::Forward(Bytes::new())
+                let mut consumed = 0usize;
+                let mut released = Vec::new();
+                loop {
+                    let step = self.window.ingest_step(&chunk[consumed..]);
+                    consumed = consumed.saturating_add(step.consumed);
+                    if step.window_ready {
+                        match self.act_on_window().await {
+                            ResponseStreamAction::Forward(bytes) => {
+                                released.extend_from_slice(&bytes);
+                            }
+                            terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                        }
+                    }
+                    if consumed >= chunk.len() && !step.progressed {
+                        break;
+                    }
+                    if step.consumed == 0 && !step.progressed && !step.window_ready {
+                        break;
+                    }
                 }
+                ResponseStreamAction::Forward(Bytes::from(released))
             }
-            // Release immediately; inspect ready windows only to detect/log (the
-            // evaluation is spawned, so the forward is never stalled).
+            // Release immediately; incrementally drain every ready internal
+            // window so detect-mode structured state stays bounded too.
             StreamEnforcement::Detect => {
                 let out = Bytes::copy_from_slice(chunk);
-                if self.window.ingest(chunk) {
-                    self.detect_window();
+                let mut consumed = 0usize;
+                loop {
+                    let step = self.window.ingest_step(&chunk[consumed..]);
+                    consumed = consumed.saturating_add(step.consumed);
+                    if step.window_ready {
+                        self.detect_window();
+                    }
+                    if consumed >= chunk.len() && !step.progressed {
+                        break;
+                    }
+                    if step.consumed == 0 && !step.progressed && !step.window_ready {
+                        break;
+                    }
                 }
                 ResponseStreamAction::Forward(out)
             }
@@ -3271,15 +3914,32 @@ impl ResponseStreamInspector for StreamInspector {
         }
         match self.config.enforcement {
             StreamEnforcement::Block => {
-                if self.window.finish() {
-                    self.act_on_window().await
-                } else {
-                    ResponseStreamAction::Forward(Bytes::new())
+                let mut released = Vec::new();
+                loop {
+                    let step = self.window.finish_step();
+                    if step.window_ready {
+                        match self.act_on_window().await {
+                            ResponseStreamAction::Forward(bytes) => {
+                                released.extend_from_slice(&bytes);
+                            }
+                            terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                        }
+                    }
+                    if !step.progressed && !step.window_ready {
+                        break;
+                    }
                 }
+                ResponseStreamAction::Forward(Bytes::from(released))
             }
             StreamEnforcement::Detect => {
-                if self.window.finish() {
-                    self.detect_window();
+                loop {
+                    let step = self.window.finish_step();
+                    if step.window_ready {
+                        self.detect_window();
+                    }
+                    if !step.progressed && !step.window_ready {
+                        break;
+                    }
                 }
                 ResponseStreamAction::Forward(Bytes::new())
             }
@@ -3298,6 +3958,7 @@ impl ResponseStreamInspector for StreamInspector {
 /// streamed equivalent instead of silently dropping it.
 fn sse_text_to_segment(text: SseText, extraction: &ExtractionConfig) -> Option<TextSegment> {
     let (path_patterns, kind): (&[&str], SegmentKind) = match text.kind {
+        SseTextKind::CompletionText => (&["$.choices[*].text"], SegmentKind::AssistantMessage),
         SseTextKind::ChatContent => (
             &["$.choices[*].delta.content", "$.choices[*].message.content"],
             SegmentKind::AssistantMessage,
@@ -3397,6 +4058,14 @@ fn extract_known_path(
             prefix,
             segments,
         ),
+        "$.prompt" => extract_text_value(
+            json.get("prompt"),
+            direction,
+            SegmentKind::UserPrompt,
+            None,
+            Some(prefixed_json_path(prefix, "$.prompt".to_string())),
+            segments,
+        ),
         "$.input" => extract_text_value(
             json.get("input"),
             direction,
@@ -3485,6 +4154,23 @@ fn extract_known_path(
                         Some(prefixed_json_path(
                             prefix,
                             format!("$.choices[{index}].message.content"),
+                        )),
+                        segments,
+                    );
+                }
+            }
+        }
+        "$.choices[*].text" => {
+            if let Some(choices) = json.get("choices").and_then(Value::as_array) {
+                for (index, choice) in choices.iter().enumerate() {
+                    extract_text_value(
+                        choice.get("text"),
+                        direction,
+                        SegmentKind::AssistantMessage,
+                        Some("assistant".to_string()),
+                        Some(prefixed_json_path(
+                            prefix,
+                            format!("$.choices[{index}].text"),
                         )),
                         segments,
                     );
@@ -4152,13 +4838,10 @@ fn max_cosine(
 ) -> Result<f32, String> {
     let mut best = 0.0_f32;
     for rule_embedding in rule_embeddings {
-        let Some(score) = segment_embedding.cosine(rule_embedding) else {
-            return Err(format!(
-                "embedding dimension mismatch: request vector has {} dimensions, rule vector has {} dimensions",
-                segment_embedding.dimension(),
-                rule_embedding.dimension()
-            ));
-        };
+        let score = segment_embedding.cosine(rule_embedding)?;
+        if !score.is_finite() {
+            return Err("embedding cosine result is non-finite".to_string());
+        }
         best = best.max(score);
     }
     Ok(best)
@@ -4196,6 +4879,104 @@ fn skip_streaming_marker_set(ctx: &RequestContext) -> bool {
         == Some("true")
 }
 
+fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    headers.get(name).map(String::as_str).or_else(|| {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    })
+}
+
+fn content_encoding_value(headers: &HashMap<String, String>) -> Option<&str> {
+    header_value(headers, "content-encoding")
+        .map(str::trim)
+        .filter(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
+}
+
+fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool {
+    content_encoding_value(headers).is_some()
+}
+
+fn response_content_type_is_inspection_candidate(content_type: &str) -> bool {
+    is_json_content_type(content_type) || is_event_stream_content_type(content_type)
+}
+
+/// The compression plugin advertises its selected encoding in headers during
+/// `after_proxy`, before it transforms a buffered plaintext body. Its private
+/// algorithm marker distinguishes that planned gateway representation from an
+/// already-encoded origin body at the initial inspection hook.
+fn gateway_response_compression_planned(
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+) -> bool {
+    let Some(encoding) = content_encoding_value(headers) else {
+        return false;
+    };
+    ctx.metadata
+        .get("compression:algorithm")
+        .is_some_and(|algorithm| algorithm.eq_ignore_ascii_case(encoding))
+}
+
+fn strip_json_bom(body: &[u8]) -> &[u8] {
+    body.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(body)
+}
+
+fn looks_like_json(body: &[u8]) -> bool {
+    let body = strip_json_bom(body);
+    let Some(first) = body
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+    else {
+        return false;
+    };
+    matches!(first, b'{' | b'[')
+}
+
+fn looks_like_governed_request_json(json: &Value) -> bool {
+    const MARKERS: &[&str] = &[
+        "messages",
+        "prompt",
+        "input",
+        "instructions",
+        "tools",
+        "context",
+        "documents",
+        "retrieved_context",
+        "tool_results",
+    ];
+    json.as_object()
+        .is_some_and(|object| MARKERS.iter().any(|key| object.contains_key(*key)))
+}
+
+fn looks_like_governed_response_json(json: &Value) -> bool {
+    json.as_object().is_some_and(|object| {
+        ["choices", "output_text", "output"]
+            .iter()
+            .any(|key| object.contains_key(*key))
+    })
+}
+
+fn decompress_within_limit(encoding: &str, data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let mut output = Vec::new();
+    let limit = MAX_INSPECTION_BODY_BYTES as u64;
+    match encoding.trim().to_ascii_lowercase().as_str() {
+        "gzip" | "x-gzip" => {
+            let mut reader = flate2::read::MultiGzDecoder::new(data).take(limit + 1);
+            reader.read_to_end(&mut output).ok()?;
+        }
+        "br" => {
+            let mut reader = brotli::Decompressor::new(data, 4096).take(limit + 1);
+            reader.read_to_end(&mut output).ok()?;
+        }
+        _ => return None,
+    }
+    (output.len() <= MAX_INSPECTION_BODY_BYTES).then_some(output)
+}
+
 fn is_native_grpc_request(ctx: &RequestContext) -> bool {
     ctx.headers
         .get("content-type")
@@ -4224,6 +5005,7 @@ fn parse_openai_embedding_response(
 
     let mut rows: Vec<(usize, EmbeddingVector)> = Vec::with_capacity(data.len());
     let mut seen_indices = vec![false; expected_count];
+    let mut response_dimension = None;
     for (fallback_index, item) in data.iter().enumerate() {
         let index = item
             .get("index")
@@ -4238,10 +5020,26 @@ fn parse_openai_embedding_response(
         if std::mem::replace(&mut seen_indices[index], true) {
             return Err(format!("duplicate embedding index {index}"));
         }
-        let values = item
+        let embedding = item
             .get("embedding")
             .and_then(Value::as_array)
-            .ok_or_else(|| format!("data[{fallback_index}].embedding must be an array"))?
+            .ok_or_else(|| format!("data[{fallback_index}].embedding must be an array"))?;
+        if embedding.len() > MAX_EMBEDDING_DIMENSIONS {
+            return Err(format!(
+                "data[{fallback_index}].embedding exceeds the maximum dimension {MAX_EMBEDDING_DIMENSIONS}"
+            ));
+        }
+        if let Some(expected_dimension) = response_dimension {
+            if embedding.len() != expected_dimension {
+                return Err(format!(
+                    "data[{fallback_index}].embedding dimension {} does not match earlier dimension {expected_dimension}",
+                    embedding.len()
+                ));
+            }
+        } else {
+            response_dimension = Some(embedding.len());
+        }
+        let values = embedding
             .iter()
             .map(|value| {
                 value
@@ -4312,6 +5110,10 @@ fn sanitize_provider_error(error: &str) -> String {
     }
 }
 
+fn sha256_hex_bytes(input: &[u8]) -> String {
+    hex::encode(Sha256::digest(input))
+}
+
 fn request_text_kinds() -> Vec<SegmentKind> {
     vec![
         SegmentKind::UserPrompt,
@@ -4350,6 +5152,153 @@ fn ensure_unique_id(ids: &mut HashSet<String>, id: &str) -> Result<(), String> {
     if !ids.insert(id.to_string()) {
         return Err(format!("ai_semantic_firewall: duplicate rule ID {id:?}"));
     }
+    Ok(())
+}
+
+fn reject_unknown_keys(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!(
+            "ai_semantic_firewall: unknown property {path}.{key}; allowed properties: {}",
+            allowed.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Keep runtime admission as strict as the OpenAPI schema. This runs before
+/// ordinary type/value parsing so a valid sibling field or default built-in
+/// pack can never mask a misspelled security policy.
+fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), String> {
+    const ROOT: &[&str] = &[
+        "enabled",
+        "inspect",
+        "mode",
+        "on_error",
+        "default_action",
+        "streaming_response",
+        "streaming",
+        "provider",
+        "builtins",
+        "extraction",
+        "allow_topics",
+        "deny_topics",
+        "custom_rules",
+        "privacy",
+        "expose_rule_id_to_client",
+        "fail_on_uninspectable_body",
+    ];
+    const BUILTIN_NAMES: &[&str] = &[
+        "prompt_injection",
+        "jailbreak",
+        "system_prompt_exfiltration",
+        "data_exfiltration",
+        "indirect_prompt_injection",
+        "tool_abuse",
+        "response_leakage",
+    ];
+
+    reject_unknown_keys(config, "config", ROOT)?;
+    if let Some(object) = config.get("inspect").and_then(Value::as_object) {
+        reject_unknown_keys(object, "config.inspect", &["request", "response"])?;
+    }
+    if let Some(object) = config.get("streaming").and_then(Value::as_object) {
+        // `max_hold_ms` remains recognized solely to return its existing,
+        // explicit not-yet-supported validation error.
+        reject_unknown_keys(
+            object,
+            "config.streaming",
+            &[
+                "window",
+                "enforcement",
+                "max_window_bytes",
+                "overlap_bytes",
+                "max_inspections",
+                "on_violation",
+                "max_hold_ms",
+            ],
+        )?;
+    }
+    if let Some(object) = config.get("provider").and_then(Value::as_object) {
+        reject_unknown_keys(
+            object,
+            "config.provider",
+            &[
+                "type",
+                "endpoint",
+                "model",
+                "api_key_env",
+                "request_timeout_ms",
+            ],
+        )?;
+    }
+    if let Some(object) = config.get("builtins").and_then(Value::as_object) {
+        reject_unknown_keys(object, "config.builtins", BUILTIN_NAMES)?;
+        for builtin in BUILTIN_NAMES {
+            if let Some(pack) = object.get(*builtin).and_then(Value::as_object) {
+                reject_unknown_keys(
+                    pack,
+                    &format!("config.builtins.{builtin}"),
+                    &["enabled", "examples_mode", "examples"],
+                )?;
+            }
+        }
+    }
+    if let Some(object) = config.get("extraction").and_then(Value::as_object) {
+        reject_unknown_keys(
+            object,
+            "config.extraction",
+            &["request_json_paths", "response_json_paths"],
+        )?;
+    }
+    if let Some(object) = config.get("privacy").and_then(Value::as_object) {
+        reject_unknown_keys(
+            object,
+            "config.privacy",
+            &["log_raw_text", "include_snippet_hash", "snippet_hash_salt"],
+        )?;
+    }
+
+    for (field, allowed) in [
+        (
+            "allow_topics",
+            &[
+                "id",
+                "description",
+                "examples",
+                "threshold",
+                "action_on_no_match",
+            ][..],
+        ),
+        (
+            "deny_topics",
+            &["id", "description", "examples", "threshold", "action"][..],
+        ),
+        (
+            "custom_rules",
+            &[
+                "id",
+                "description",
+                "direction",
+                "severity",
+                "action",
+                "examples",
+                "threshold",
+            ][..],
+        ),
+    ] {
+        if let Some(items) = config.get(field).and_then(Value::as_array) {
+            for (index, item) in items.iter().enumerate() {
+                if let Some(object) = item.as_object() {
+                    reject_unknown_keys(object, &format!("config.{field}[{index}]"), allowed)?;
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -4613,11 +5562,39 @@ mod stream_window_tests {
             .filter(|t| {
                 matches!(
                     t.kind,
-                    SseTextKind::ChatContent | SseTextKind::ResponsesText
+                    SseTextKind::CompletionText
+                        | SseTextKind::ChatContent
+                        | SseTextKind::ResponsesText
                 )
             })
             .map(|t| t.text)
             .collect()
+    }
+
+    fn ingest(eng: &mut StreamWindowEngine, chunk: &[u8]) -> bool {
+        let mut consumed = 0usize;
+        loop {
+            let step = eng.ingest_step(&chunk[consumed..]);
+            consumed = consumed.saturating_add(step.consumed);
+            if step.window_ready {
+                return true;
+            }
+            if consumed >= chunk.len() && !step.progressed {
+                return false;
+            }
+        }
+    }
+
+    fn finish(eng: &mut StreamWindowEngine) -> bool {
+        loop {
+            let step = eng.finish_step();
+            if step.window_ready {
+                return true;
+            }
+            if !step.progressed {
+                return false;
+            }
+        }
     }
 
     #[test]
@@ -4625,9 +5602,9 @@ mod stream_window_tests {
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
         let f1 = content_event("Hello ");
         // No terminator/boundary yet → hold (not ready).
-        assert!(!eng.ingest(&f1));
+        assert!(!ingest(&mut eng, &f1));
         let f2 = content_event("world.");
-        assert!(eng.ingest(&f2), "window ready at sentence boundary");
+        assert!(ingest(&mut eng, &f2), "window ready at sentence boundary");
         assert_eq!(window_prose(&eng), "Hello world.");
         // A clean verdict releases the raw bytes of both held events.
         assert_eq!(eng.release(), [f1, f2].concat());
@@ -4637,7 +5614,10 @@ mod stream_window_tests {
     fn partial_event_without_blank_line_is_held() {
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
         // No "\n\n" terminator and under the cap → nothing reassembled, hold.
-        assert!(!eng.ingest(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi.\"}}]}"));
+        assert!(!ingest(
+            &mut eng,
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi.\"}}]}"
+        ));
         assert!(eng.release().is_empty());
     }
 
@@ -4645,20 +5625,20 @@ mod stream_window_tests {
     fn byte_cap_forces_window_without_boundary() {
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Bytes, 8, 0));
         let f = content_event("abcdefghij");
-        assert!(eng.ingest(&f), "forced window at byte cap");
-        assert_eq!(window_prose(&eng), "abcdefghij");
-        assert_eq!(eng.release(), f);
+        assert!(ingest(&mut eng, &f), "forced window at byte cap");
+        assert!(eng.pending_uninspectable());
+        assert_eq!(eng.release().len(), 8);
     }
 
     #[test]
     fn overlap_reinspects_prior_cleared_text() {
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 5));
         let f1 = content_event("First one. ");
-        assert!(eng.ingest(&f1));
+        assert!(ingest(&mut eng, &f1));
         assert!(window_prose(&eng).starts_with("First one."));
         eng.release();
         let f2 = content_event("Second.");
-        assert!(eng.ingest(&f2), "second window");
+        assert!(ingest(&mut eng, &f2), "second window");
         let prose = window_prose(&eng);
         assert!(prose.ends_with("Second."));
         // Overlap re-introduced cleared text, so the window exceeds just the new text.
@@ -4666,10 +5646,23 @@ mod stream_window_tests {
     }
 
     #[test]
+    fn legacy_completion_chunks_are_windowed_as_reassembled_prose() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 8));
+        let first = b"data: {\"choices\":[{\"index\":0,\"text\":\"My system \"}]}\n\n";
+        let second = b"data: {\"choices\":[{\"index\":0,\"text\":\"prompt is secret.\"}]}\n\n";
+        assert!(!ingest(&mut eng, first));
+        assert!(ingest(&mut eng, second));
+        assert_eq!(window_prose(&eng), "My system prompt is secret.");
+        assert!(eng.snapshot_texts().iter().any(|text| {
+            text.kind == SseTextKind::CompletionText && text.text == "My system prompt is secret."
+        }));
+    }
+
+    #[test]
     fn clean_release_drains_retained_prose() {
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 4));
         let f1 = content_event("Aaaaa bbbbb. ");
-        assert!(eng.ingest(&f1));
+        assert!(ingest(&mut eng, &f1));
         eng.release();
         // After a clean release the inspected prose is drained down to ~overlap, so
         // memory does not grow with the whole completion (Codex P2).
@@ -4685,8 +5678,8 @@ mod stream_window_tests {
     fn finish_flushes_trailing_partial_window() {
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
         let f = content_event("no terminator");
-        assert!(!eng.ingest(&f)); // no sentence boundary yet → hold
-        assert!(eng.finish(), "end-of-stream flushes the held window");
+        assert!(!ingest(&mut eng, &f)); // no sentence boundary yet → hold
+        assert!(finish(&mut eng), "end-of-stream flushes the held window");
         assert_eq!(window_prose(&eng), "no terminator");
         assert_eq!(eng.release(), f);
     }
@@ -4696,9 +5689,9 @@ mod stream_window_tests {
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
         let role =
             b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n".to_vec();
-        assert!(!eng.ingest(&role)); // no content yet
+        assert!(!ingest(&mut eng, &role)); // no content yet
         let f = content_event("Done.");
-        assert!(eng.ingest(&f));
+        assert!(ingest(&mut eng, &f));
         assert_eq!(window_prose(&eng), "Done.");
         // The role-only event is released alongside the content event it preceded.
         assert_eq!(eng.release(), [role, f].concat());
@@ -4711,8 +5704,8 @@ mod stream_window_tests {
         // bypassed (Codex P2).
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
         let tool = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"cmd\\\":\\\"rm -rf /\\\"}\"}}]}}]}\n\n".to_vec();
-        assert!(!eng.ingest(&tool)); // no prose boundary, under cap → hold
-        assert!(eng.finish(), "end-of-stream flushes tool-only events");
+        assert!(!ingest(&mut eng, &tool)); // no prose boundary, under cap → hold
+        assert!(finish(&mut eng), "end-of-stream flushes tool-only events");
         let texts = eng.snapshot_texts();
         assert!(
             texts
@@ -4729,11 +5722,60 @@ mod stream_window_tests {
     }
 
     #[test]
+    fn released_long_tool_name_keeps_capacity_for_later_events() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Bytes, 4096, 64));
+        let long_name = "N".repeat(800);
+        let tool = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"name\":\"{long_name}\",\"arguments\":\"\"}}}}]}}}}]}}\n\n"
+        )
+        .into_bytes();
+        assert!(!ingest(&mut eng, &tool));
+        assert!(finish(&mut eng));
+        let _ = eng.release();
+        assert!(
+            eng.retained_bytes() <= 64,
+            "released tool state exceeded overlap: {}",
+            eng.retained_bytes()
+        );
+
+        let next = content_event("later");
+        let step = eng.ingest_step(&next);
+        assert!(step.consumed > 0, "retained tool state stalled the stream");
+        assert!(eng.retained_bytes() <= 4096);
+    }
+
+    #[test]
+    fn mixed_window_reserves_overlap_for_tool_argument_tail() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 16));
+        let first = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"This prose is longer than overlap.\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"prefix-one\"}}]}}]}\n\n";
+        assert!(ingest(&mut eng, first));
+        let _ = eng.release();
+        assert!(
+            eng.retained_bytes() <= 16,
+            "mixed overlap exceeded aggregate budget: {}",
+            eng.retained_bytes()
+        );
+        assert!(
+            eng.snapshot_texts().iter().any(|text| {
+                text.kind == SseTextKind::ChatToolArguments && text.text.ends_with("-one")
+            }),
+            "prose must not starve the retained tool tail"
+        );
+
+        let second = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"-two\"}}]}}]}\n\n";
+        assert!(!ingest(&mut eng, second));
+        assert!(finish(&mut eng));
+        assert!(eng.snapshot_texts().iter().any(|text| {
+            text.kind == SseTextKind::ChatToolArguments && text.text.ends_with("-one-two")
+        }));
+    }
+
+    #[test]
     fn unterminated_nonjson_event_is_flagged_uninspectable() {
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 0));
         // A complete but non-JSON `data:` payload: parsed-but-uninspectable.
-        assert!(!eng.ingest(b"data: not-json\n\n"));
-        assert!(eng.finish());
+        assert!(!ingest(&mut eng, b"data: not-json\n\n"));
+        assert!(finish(&mut eng));
         assert!(
             eng.pending_uninspectable(),
             "a non-JSON data: event must fail closed in block mode"
@@ -4746,8 +5788,11 @@ mod stream_window_tests {
         // unbounded memory: once `carry` passes the cap it is force-flushed as a
         // degenerate (un-parseable) event (Codex P2).
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Bytes, 16, 0));
-        assert!(!eng.ingest(b"data: ")); // small, under cap
-        assert!(eng.ingest(&[b'a'; 32]), "carry overflow forces a window");
+        assert!(!ingest(&mut eng, b"data: ")); // small, under cap
+        assert!(
+            ingest(&mut eng, &[b'a'; 32]),
+            "carry overflow forces a window"
+        );
         assert!(
             eng.pending_uninspectable(),
             "the oversized un-terminated event is uninspectable"
@@ -4764,14 +5809,67 @@ mod stream_window_tests {
         // fails closed rather than releasing an uninspected SSE payload.
         let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Bytes, 16, 0));
         assert!(
-            eng.ingest(b"event: message\nda"),
+            ingest(&mut eng, b"event: message\nda"),
             "carry overflow forces a window"
         );
         assert!(
             eng.pending_uninspectable(),
             "a split data: field prefix must fail closed"
         );
-        assert_eq!(eng.release(), b"event: message\nda");
+        assert_eq!(eng.release(), b"event: message\nd");
+    }
+
+    #[test]
+    fn coalesced_events_are_expanded_incrementally_within_the_aggregate_cap() {
+        const CAP: usize = 256;
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Bytes, CAP, 0));
+        eng.store_frames = true;
+        let chunk = (0..64)
+            .flat_map(|index| content_event(&format!("fragment-{index}")))
+            .collect::<Vec<_>>();
+        assert!(
+            chunk.len() > CAP * 8,
+            "hostile chunk must greatly exceed cap"
+        );
+
+        let mut consumed = 0usize;
+        let mut windows = 0usize;
+        let mut steps = 0usize;
+        while consumed < chunk.len() {
+            let step = eng.ingest_step(&chunk[consumed..]);
+            consumed = consumed.saturating_add(step.consumed);
+            steps += 1;
+            assert!(
+                eng.input_window_bytes() <= CAP,
+                "raw input window exceeded cap: {}",
+                eng.input_window_bytes()
+            );
+            assert!(
+                eng.retained_bytes() <= CAP,
+                "aggregate retained state exceeded cap: {}",
+                eng.retained_bytes()
+            );
+            if step.window_ready {
+                windows += 1;
+                let _ = eng.release();
+            }
+            assert!(
+                step.progressed || step.window_ready,
+                "engine stalled with {} input bytes remaining",
+                chunk.len() - consumed
+            );
+            assert!(steps < chunk.len() * 2, "incremental processing stalled");
+        }
+
+        while finish(&mut eng) {
+            windows += 1;
+            assert!(eng.retained_bytes() <= CAP);
+            let _ = eng.release();
+        }
+        assert!(
+            windows > 1,
+            "coalesced chunk must be split into bounded windows"
+        );
     }
 
     #[test]
@@ -4785,7 +5883,7 @@ mod stream_window_tests {
             StreamEnforcement::Detect,
         ));
         let f = content_event("Hi there.");
-        assert!(eng.ingest(&f));
+        assert!(ingest(&mut eng, &f));
         assert!(
             eng.release().is_empty(),
             "detect mode holds no raw bytes for release"
