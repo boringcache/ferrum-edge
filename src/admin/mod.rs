@@ -3347,11 +3347,7 @@ async fn handle_update_credentials(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
-    let _mtls_admission_guard = if cred_type == "mtls_auth" {
-        Some(crud::lock_mtls_admission(namespace).await)
-    } else {
-        None
-    };
+    let _mtls_admission_guard = crud::lock_mtls_admission(namespace).await;
 
     let mut cred_value = match parse_json_value(body) {
         Ok(value) => value,
@@ -3438,11 +3434,7 @@ async fn handle_delete_credentials(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
-    let _mtls_admission_guard = if cred_type == "mtls_auth" {
-        Some(crud::lock_mtls_admission(namespace).await)
-    } else {
-        None
-    };
+    let _mtls_admission_guard = crud::lock_mtls_admission(namespace).await;
 
     let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
         Ok(consumer) => consumer,
@@ -3496,11 +3488,7 @@ async fn handle_append_credential(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
-    let _mtls_admission_guard = if cred_type == "mtls_auth" {
-        Some(crud::lock_mtls_admission(namespace).await)
-    } else {
-        None
-    };
+    let _mtls_admission_guard = crud::lock_mtls_admission(namespace).await;
 
     let mut new_cred = match parse_json_value(body) {
         Ok(value) => value,
@@ -3623,11 +3611,7 @@ async fn handle_delete_credential_by_index(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
-    let _mtls_admission_guard = if cred_type == "mtls_auth" {
-        Some(crud::lock_mtls_admission(namespace).await)
-    } else {
-        None
-    };
+    let _mtls_admission_guard = crud::lock_mtls_admission(namespace).await;
 
     let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
         Ok(consumer) => consumer,

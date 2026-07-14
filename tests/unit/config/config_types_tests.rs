@@ -1603,6 +1603,34 @@ fn test_unique_consumer_credentials_scopes_case_folding_to_san_dns() {
 }
 
 #[test]
+fn test_unique_mtls_dns_identities_include_global_fallback_without_proxies() {
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "API.Example.COM"}]),
+    );
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "api.example.com"}]),
+    );
+    let config = GatewayConfig {
+        consumers: vec![c1, c2],
+        plugin_configs: vec![mtls_plugin(
+            "global-dns-mtls",
+            PluginScope::Global,
+            None,
+            serde_json::json!({"cert_field": "san_dns"}),
+        )],
+        ..empty_config()
+    };
+
+    let errors = config.validate_unique_mtls_credentials().unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("ASCII case-insensitive"));
+}
+
+#[test]
 fn test_unique_mtls_dns_identities_ignore_unattached_plugin() {
     let mut c1 = make_consumer("c1", "alice");
     c1.credentials.insert(

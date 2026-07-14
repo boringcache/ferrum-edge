@@ -77,6 +77,9 @@ static MTLS_ADMISSION_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
 /// case variants used by exact-match policies. Fully serializing that dynamic
 /// check across SQL and MongoDB writers requires backend-specific transactions;
 /// this lock deliberately does not claim to coordinate separate admin processes.
+/// Every credential mutation takes this lock, even for non-mTLS types, because
+/// those endpoints persist the complete `Consumer` and could otherwise replay
+/// stale `mtls_auth` entries loaded before a concurrent mTLS mutation.
 pub(crate) async fn lock_mtls_admission(namespace: &str) -> MutexGuard<'static, ()> {
     let locks = MTLS_ADMISSION_LOCKS.get_or_init(|| {
         (0..MTLS_ADMISSION_LOCK_SHARDS)

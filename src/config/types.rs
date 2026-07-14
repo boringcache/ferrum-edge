@@ -3571,17 +3571,28 @@ impl GatewayConfig {
     /// Reject case-variant identities before publishing the lower-cased DNS
     /// lookup index. Exact-match mTLS policies remain case-sensitive.
     pub fn validate_unique_mtls_dns_identities(&self) -> Result<(), Vec<String>> {
-        let dns_identity_matching_enabled = self
-            .effective_mtls_auth_plugins_by_proxy()
-            .into_iter()
-            .flat_map(|(_, plugins)| plugins)
-            .any(|plugin| {
-                plugin
+        let is_dns_identity_plugin = |plugin: &PluginConfig| {
+            plugin.enabled
+                && plugin.plugin_name == "mtls_auth"
+                && plugin
                     .config
                     .get("cert_field")
                     .and_then(|value| value.as_str())
                     == Some("san_dns")
-            });
+        };
+        let dns_identity_matching_enabled = self
+            .effective_mtls_auth_plugins_by_proxy()
+            .into_iter()
+            .flat_map(|(_, plugins)| plugins)
+            .any(&is_dns_identity_plugin)
+            // The plugin cache keeps global plugins as the fallback for proxy
+            // IDs absent from the config (including synthesized mesh relays).
+            // With no registered proxy there is no local association that can
+            // shadow this fallback, so it remains an effective DNS consumer.
+            || (self.proxies.is_empty()
+                && self.plugin_configs.iter().any(|plugin| {
+                    plugin.scope == PluginScope::Global && is_dns_identity_plugin(plugin)
+                }));
         if !dns_identity_matching_enabled {
             return Ok(());
         }
