@@ -3579,10 +3579,9 @@ pub trait Plugin: Send + Sync {
 
     /// Returns the JWKS URIs this plugin is actively using.
     ///
-    /// Only meaningful for `jwks_auth` — returns the JWKS endpoint URIs from
-    /// its configured providers. Used by the plugin cache to clean up stale
-    /// JWKS cache entries (and their background refresh tasks) when plugins
-    /// are removed from config.
+    /// Implemented by plugins such as `jwks_auth` and `oidc_relying_party` that
+    /// retain shared JWKS stores. Used by the plugin cache to clean up stale
+    /// entries (and their background refresh tasks) when plugins are removed.
     fn active_jwks_uris(&self) -> Vec<String> {
         Vec::new()
     }
@@ -3899,8 +3898,9 @@ pub fn create_plugin_with_http_client(
 /// Validate a plugin configuration by attempting to instantiate the plugin,
 /// with a default-open egress policy.
 ///
-/// The plugin instance is created and immediately dropped — only the config
-/// validation side effects of the plugin's `new()` constructor matter.
+/// Most plugin instances are created and immediately dropped. Plugins with
+/// persistent constructor side effects use a dedicated shape-only validation
+/// path instead.
 ///
 /// Production config-load paths (file/db/admin/spec) use
 /// [`validate_plugin_config_with_policy`] so a plugin's literal-IP endpoints
@@ -3913,7 +3913,23 @@ pub fn create_plugin_with_http_client(
 /// Returns `Ok(())` if the config is valid, `Err(msg)` if validation fails.
 #[allow(dead_code)]
 pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> {
-    match create_plugin(name, config)? {
+    validate_plugin_config_with_http_client(name, config, PluginHttpClient::default())
+}
+
+/// Validate a plugin configuration with a caller-supplied HTTP policy without
+/// retaining runtime workers. OIDC discovery/JWKS construction is explicitly
+/// shape-only here so admin validation and config admission cannot leak retry
+/// tasks that outlive the temporary instance.
+pub(crate) fn validate_plugin_config_with_http_client(
+    name: &str,
+    config: &Value,
+    http_client: PluginHttpClient,
+) -> Result<(), String> {
+    if name == "oidc_relying_party" {
+        screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
+        return oidc_relying_party::OidcRelyingParty::validate_config(config, http_client);
+    }
+    match create_plugin_with_http_client(name, config, http_client)? {
         Some(_) => Ok(()),
         None => Err(format!("Unknown plugin name '{}'", name)),
     }
@@ -3931,30 +3947,26 @@ pub fn validate_plugin_config_with_policy(
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
     let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone());
-    match create_plugin_with_http_client(name, config, http_client)? {
-        Some(_) => {
-            // The HTTP-endpoint screen above does not cover a plugin's own
-            // literal-IP backend fields that aren't dialed through the shared
-            // client (mesh_route_dispatch route destinations).
-            if name == "mesh_route_dispatch"
-                && let Err(errs) = screen_mesh_route_dispatch_egress(config, backend_allow_ips)
-            {
-                return Err(errs.join("; "));
-            }
-            // Redis-backed plugins (rate_limit / request_deduplication /
-            // ai_semantic_cache with sync_mode=redis) build their client from
-            // `redis_url` WITHOUT the egress policy, and the client skips literals
-            // / falls back to the hostname on a DNS denial — so a denied literal
-            // endpoint must be rejected here at config-load.
-            screen_redis_endpoint_egress(config, backend_allow_ips)?;
-            // NOTE: ldap_auth / kafka_logging / ws_logging literal endpoints are
-            // screened *inside* `create_plugin_with_http_client` above (before the
-            // dial task spawns), so no explicit `screen_direct_client_endpoint_egress`
-            // call is needed here — that path already failed closed on a denial.
-            Ok(())
-        }
-        None => Err(format!("Unknown plugin name '{}'", name)),
+    validate_plugin_config_with_http_client(name, config, http_client)?;
+    // The HTTP-endpoint screen above does not cover a plugin's own
+    // literal-IP backend fields that aren't dialed through the shared
+    // client (mesh_route_dispatch route destinations).
+    if name == "mesh_route_dispatch"
+        && let Err(errs) = screen_mesh_route_dispatch_egress(config, backend_allow_ips)
+    {
+        return Err(errs.join("; "));
     }
+    // Redis-backed plugins (rate_limit / request_deduplication /
+    // ai_semantic_cache with sync_mode=redis) build their client from
+    // `redis_url` WITHOUT the egress policy, and the client skips literals
+    // / falls back to the hostname on a DNS denial — so a denied literal
+    // endpoint must be rejected here at config-load.
+    screen_redis_endpoint_egress(config, backend_allow_ips)?;
+    // NOTE: ldap_auth / kafka_logging / ws_logging literal endpoints are
+    // screened *inside* `create_plugin_with_http_client` above (before the
+    // dial task spawns), so no explicit `screen_direct_client_endpoint_egress`
+    // call is needed here — that path already failed closed on a denial.
+    Ok(())
 }
 
 /// Screen a `mesh_route_dispatch` plugin's per-rule `destination.backend_host`

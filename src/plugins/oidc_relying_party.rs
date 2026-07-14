@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -28,11 +29,88 @@ use super::utils::claim_resolver::extract_claim_string;
 use super::utils::jwks_cache::get_or_create_jwks_store;
 use super::utils::jwks_store::JwksKeyStore;
 use super::utils::jwt_verifier::{JwtVerifyParams, verify_jwt_with_jwks};
+use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::{PluginResult, RequestContext};
 
 const CLAIM_HEADER_METADATA_PREFIX: &str = "oidc_rp.claim_header.";
 const DEFAULT_JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(900);
+const DEFAULT_ID_TOKEN_CLOCK_SKEW_SECS: u64 = 60;
+const DEFAULT_SESSION_TTL_SECS: u64 = 3600;
+const DEFAULT_SESSION_IDLE_TTL_SECS: u64 = 1800;
+const DEFAULT_SESSION_MAX_COOKIE_BYTES: u64 = 8000;
+const DEFAULT_STATE_TTL_SECS: u64 = 600;
+const DEFAULT_STATE_CACHE_MAX_ENTRIES: usize = 10_000;
+const DEFAULT_STATE_CACHE_MAX_ENTRIES_PER_SOURCE: usize = 32;
+const DEFAULT_REFRESH_SKEW_SECS: u64 = 30;
+const DEFAULT_CHALLENGE_HTML_STATUS: u64 = 302;
+const DEFAULT_CHALLENGE_API_STATUS: u64 = 401;
+const MAX_STATE_TTL_SECS: u64 = 3600;
+const STATE_EXPIRY_BUCKET_SECS: u64 = 1;
+const SESSION_PAYLOAD_VERSION: u8 = 2;
+const MAX_TOKEN_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_USERINFO_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_DISCOVERY_RESPONSE_BYTES: usize = 256 * 1024;
+const CONFIG_FIELDS: &[&str] = &["providers", "session", "behavior"];
+const PROVIDER_FIELDS: &[&str] = &[
+    "issuer",
+    "discovery_url",
+    "authorization_endpoint",
+    "token_endpoint",
+    "userinfo_endpoint",
+    "jwks_uri",
+    "end_session_endpoint",
+    "client_id",
+    "client_auth",
+    "redirect_uri",
+    "callback_path",
+    "logout_path",
+    "post_logout_redirect_uri",
+    "scopes",
+    "audiences",
+    "required_scopes",
+    "required_roles",
+    "scope_claim",
+    "role_claim",
+    "consumer_identity_claim",
+    "consumer_header_claim",
+    "claim_headers",
+    "id_token_clock_skew_secs",
+];
+const CLIENT_AUTH_FIELDS: &[&str] = &[
+    "method",
+    "client_secret",
+    "private_key_pem",
+    "private_key_jwt_alg",
+    "private_key_jwt_kid",
+];
+const SESSION_FIELDS: &[&str] = &[
+    "encryption_secret",
+    "encryption_secret_previous",
+    "cookie_name",
+    "store",
+    "ttl_secs",
+    "idle_ttl_secs",
+    "max_cookie_bytes",
+    "secure",
+    "http_only",
+    "same_site",
+    "domain",
+    "path",
+];
+const BEHAVIOR_FIELDS: &[&str] = &[
+    "state_ttl_secs",
+    "state_cache_max_entries",
+    "state_cache_max_entries_per_source",
+    "post_login_redirect_param",
+    "trusted_redirect_hosts",
+    "refresh_skew_secs",
+    "challenge_html_status",
+    "challenge_api_status",
+    "html_accept_substrings",
+    "rp_initiated_logout",
+    "post_login_default_path",
+];
 /// Carries a re-sealed rolling-session cookie from `authenticate` to
 /// `after_proxy`, which appends it as `Set-Cookie` on the proxied response. The
 /// key contains "cookie" so transaction-log metadata redaction masks its value.
@@ -46,6 +124,7 @@ pub struct OidcRelyingParty {
     provider: Arc<ProviderRuntime>,
     session: Arc<SessionRuntime>,
     behavior: Arc<BehaviorConfig>,
+    discovery_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 struct ProviderRuntime {
@@ -85,6 +164,9 @@ struct SessionRuntime {
     codec: super::utils::session_cookie::SessionCookieCodec,
     cookie_name: String,
     cookie_attrs: String,
+    context_id: String,
+    correlation_cookie_name_prefix: String,
+    correlation_cookie_attrs: String,
     max_cookie_bytes: usize,
     ttl: Duration,
     idle_ttl: Duration,
@@ -144,18 +226,29 @@ struct FlowState {
     code_verifier: String,
     nonce: String,
     original_url: String,
+    browser_binding_hash: [u8; 32],
+    source_ip: String,
     expires_at: Instant,
 }
 
 struct StateCache {
     entries: DashMap<String, FlowState>,
+    expiry_buckets: DashMap<u64, Arc<DashMap<String, ()>>>,
+    per_source_entries: DashMap<String, usize>,
+    active_entries: AtomicUsize,
+    last_evicted_bucket: AtomicU64,
+    origin: Instant,
     max_entries: usize,
+    max_entries_per_source: usize,
+    shard_amount: usize,
     ttl: Duration,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct SessionPayload {
     version: u8,
+    #[serde(default)]
+    context_id: String,
     sub: String,
     id_token_b64: String,
     access_token_b64: String,
@@ -168,6 +261,82 @@ struct SessionPayload {
     last_touch_unix: i64,
     nonce: String,
     claims: Value,
+}
+
+#[derive(Serialize)]
+struct NormalizedSessionContextSeed {
+    version: u8,
+    provider: NormalizedProviderContext,
+    session: NormalizedSessionContext,
+    behavior: NormalizedBehaviorContext,
+}
+
+#[derive(Serialize)]
+struct NormalizedProviderContext {
+    issuer: String,
+    discovery_url: Option<String>,
+    authorization_endpoint: Option<String>,
+    token_endpoint: Option<String>,
+    userinfo_endpoint: Option<String>,
+    jwks_uri: Option<String>,
+    end_session_endpoint: Option<String>,
+    client_id: String,
+    client_auth: NormalizedClientAuthContext,
+    redirect_uri: String,
+    callback_path: String,
+    logout_path: String,
+    post_logout_redirect_uri: Option<String>,
+    scopes: Vec<String>,
+    audiences: Vec<String>,
+    required_scopes: Vec<String>,
+    required_roles: Vec<String>,
+    scope_claim: String,
+    role_claim: String,
+    consumer_identity_claim: String,
+    consumer_header_claim: String,
+    claim_headers: Vec<NormalizedClaimHeaderContext>,
+    id_token_clock_skew_secs: u64,
+}
+
+#[derive(Serialize)]
+struct NormalizedClientAuthContext {
+    method: String,
+    private_key_jwt_alg: Option<String>,
+    private_key_jwt_kid: Option<String>,
+}
+
+#[derive(Serialize)]
+struct NormalizedClaimHeaderContext {
+    claim_path: String,
+    metadata_key: String,
+}
+
+#[derive(Serialize)]
+struct NormalizedSessionContext {
+    store: String,
+    ttl_secs: u64,
+    idle_ttl_secs: u64,
+    max_cookie_bytes: u64,
+    secure: bool,
+    http_only: bool,
+    same_site: String,
+    domain: Option<String>,
+    path: String,
+}
+
+#[derive(Serialize)]
+struct NormalizedBehaviorContext {
+    state_ttl_secs: u64,
+    state_cache_max_entries: u64,
+    state_cache_max_entries_per_source: u64,
+    post_login_redirect_param: Option<String>,
+    trusted_redirect_hosts: Vec<String>,
+    refresh_skew_secs: u64,
+    challenge_html_status: u64,
+    challenge_api_status: u64,
+    html_accept_substrings: Vec<String>,
+    rp_initiated_logout: bool,
+    post_login_default_path: String,
 }
 
 #[derive(Deserialize)]
@@ -216,9 +385,25 @@ impl RefreshOutcome {
 
 impl OidcRelyingParty {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_internal(config, http_client, true)
+    }
+
+    pub(crate) fn validate_config(
+        config: &Value,
+        http_client: PluginHttpClient,
+    ) -> Result<(), String> {
+        Self::new_internal(config, http_client, false).map(drop)
+    }
+
+    fn new_internal(
+        config: &Value,
+        http_client: PluginHttpClient,
+        start_background_tasks: bool,
+    ) -> Result<Self, String> {
         let config_obj = config.as_object().ok_or_else(|| {
             format!("oidc_relying_party: config must be an object, got: {config}")
         })?;
+        reject_unknown_fields(config_obj, CONFIG_FIELDS, "config")?;
         let providers = config_obj
             .get("providers")
             .and_then(Value::as_array)
@@ -234,13 +419,34 @@ impl OidcRelyingParty {
         let provider_obj = providers[0]
             .as_object()
             .ok_or_else(|| "oidc_relying_party: provider[0] must be an object".to_string())?;
+        reject_unknown_fields(provider_obj, PROVIDER_FIELDS, "provider[0]")?;
         let session_obj = config_obj
             .get("session")
             .and_then(Value::as_object)
             .ok_or_else(|| "oidc_relying_party: 'session' object is required".to_string())?;
-        let behavior_obj = config_obj.get("behavior").and_then(Value::as_object);
+        reject_unknown_fields(session_obj, SESSION_FIELDS, "session")?;
+        let behavior_obj = match config_obj.get("behavior") {
+            Some(Value::Null) | None => None,
+            Some(value) => Some(
+                value
+                    .as_object()
+                    .ok_or_else(|| "oidc_relying_party: behavior must be an object".to_string())?,
+            ),
+        };
+        if let Some(behavior_obj) = behavior_obj {
+            reject_unknown_fields(behavior_obj, BEHAVIOR_FIELDS, "behavior")?;
+        }
+        if let Some(client_auth) = provider_obj.get("client_auth") {
+            let client_auth = client_auth.as_object().ok_or_else(|| {
+                "oidc_relying_party: provider[0].client_auth must be an object".to_string()
+            })?;
+            reject_unknown_fields(client_auth, CLIENT_AUTH_FIELDS, "provider[0].client_auth")?;
+        }
 
-        let issuer = required_string(provider_obj, "issuer", "provider[0]")?;
+        let issuer = validate_url_string(
+            &required_string(provider_obj, "issuer", "provider[0]")?,
+            "provider[0].issuer",
+        )?;
         let discovery_url = optional_string(provider_obj, "discovery_url", "provider[0]")?;
         let authorization_endpoint =
             optional_string(provider_obj, "authorization_endpoint", "provider[0]")?;
@@ -324,8 +530,16 @@ impl OidcRelyingParty {
         };
         let discovery = Arc::new(ArcSwap::from_pointee(discovery_doc.clone()));
 
+        let context_seed = session_context_seed(provider_obj, session_obj, behavior_obj)?;
         let cookie_name = optional_string(session_obj, "cookie_name", "session")?
-            .unwrap_or_else(|| "ferrum_session".to_string());
+            .unwrap_or_else(|| derived_cookie_name("ferrum_session", &context_seed));
+        let session_context = session_context_id(&context_seed, &cookie_name);
+        let session_context_id =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(session_context);
+        let mut session_aad = b"ferrum-edge/oidc-session/v2\0".to_vec();
+        session_aad.extend_from_slice(&session_context);
+        let correlation_cookie_name_prefix =
+            derived_cookie_name("ferrum_oidc_state", &session_context);
         let store = optional_string(session_obj, "store", "session")?
             .unwrap_or_else(|| "cookie".to_string());
         if store != "cookie" {
@@ -334,10 +548,15 @@ impl OidcRelyingParty {
         let encryption_secret = required_string(session_obj, "encryption_secret", "session")?;
         let previous_secret =
             optional_string(session_obj, "encryption_secret_previous", "session")?;
-        let ttl_secs = optional_u64(session_obj, "ttl_secs", 3600)?;
-        let idle_ttl_secs = optional_u64(session_obj, "idle_ttl_secs", 1800)?;
-        let max_cookie_bytes = optional_u64(session_obj, "max_cookie_bytes", 8000)?;
-        if max_cookie_bytes > 8000 {
+        let ttl_secs = optional_u64(session_obj, "ttl_secs", DEFAULT_SESSION_TTL_SECS)?;
+        let idle_ttl_secs =
+            optional_u64(session_obj, "idle_ttl_secs", DEFAULT_SESSION_IDLE_TTL_SECS)?;
+        let max_cookie_bytes = optional_u64(
+            session_obj,
+            "max_cookie_bytes",
+            DEFAULT_SESSION_MAX_COOKIE_BYTES,
+        )?;
+        if max_cookie_bytes > DEFAULT_SESSION_MAX_COOKIE_BYTES {
             return Err("oidc_relying_party: session.max_cookie_bytes must be <= 8000".to_string());
         }
         let secure = optional_bool(session_obj, "secure")?.unwrap_or(true);
@@ -358,20 +577,62 @@ impl OidcRelyingParty {
             optional_string(session_obj, "path", "session")?.unwrap_or_else(|| "/".to_string());
         let cookie_attrs =
             build_cookie_attrs(secure, http_only, &same_site, domain.as_deref(), &path);
+        let state_ttl = Duration::from_secs(optional_behavior_u64(
+            behavior_obj,
+            "state_ttl_secs",
+            DEFAULT_STATE_TTL_SECS,
+        )?);
+        if state_ttl.is_zero() {
+            return Err(
+                "oidc_relying_party: behavior.state_ttl_secs must be greater than zero".to_string(),
+            );
+        }
+        if state_ttl.as_secs() > MAX_STATE_TTL_SECS {
+            return Err(format!(
+                "oidc_relying_party: behavior.state_ttl_secs must be <= {MAX_STATE_TTL_SECS}"
+            ));
+        }
+        let state_cache_max_entries = behavior_usize(
+            behavior_obj,
+            "state_cache_max_entries",
+            DEFAULT_STATE_CACHE_MAX_ENTRIES,
+        )?;
+        let state_cache_max_entries_per_source = behavior_usize(
+            behavior_obj,
+            "state_cache_max_entries_per_source",
+            DEFAULT_STATE_CACHE_MAX_ENTRIES_PER_SOURCE,
+        )?;
+        if state_cache_max_entries_per_source > state_cache_max_entries {
+            return Err(
+                "oidc_relying_party: behavior.state_cache_max_entries_per_source must not exceed state_cache_max_entries"
+                    .to_string(),
+            );
+        }
         let session = Arc::new(SessionRuntime {
-            codec: super::utils::session_cookie::SessionCookieCodec::new(
+            codec: super::utils::session_cookie::SessionCookieCodec::new_with_aad(
                 &encryption_secret,
                 previous_secret.as_deref(),
                 max_cookie_bytes as usize,
+                &session_aad,
             )?,
             cookie_name,
             cookie_attrs,
+            context_id: session_context_id,
+            correlation_cookie_name_prefix,
+            correlation_cookie_attrs: build_cookie_attrs(
+                secure,
+                true,
+                "Lax",
+                domain.as_deref(),
+                &callback_path,
+            ),
             max_cookie_bytes: max_cookie_bytes as usize,
             ttl: Duration::from_secs(ttl_secs),
             idle_ttl: Duration::from_secs(idle_ttl_secs),
             state_cache: Arc::new(StateCache::new(
-                50_000,
-                Duration::from_secs(optional_behavior_u64(behavior_obj, "state_ttl_secs", 600)?),
+                state_cache_max_entries,
+                state_cache_max_entries_per_source,
+                state_ttl,
                 http_client.pool_shard_amount(),
             )),
         });
@@ -383,7 +644,8 @@ impl OidcRelyingParty {
         if post_login_redirect_param.is_some() && trusted_redirect_hosts.is_empty() {
             return Err("oidc_relying_party: behavior.trusted_redirect_hosts is required when post_login_redirect_param is set".to_string());
         }
-        let refresh_skew_secs = optional_behavior_u64(behavior_obj, "refresh_skew_secs", 30)?;
+        let refresh_skew_secs =
+            optional_behavior_u64(behavior_obj, "refresh_skew_secs", DEFAULT_REFRESH_SKEW_SECS)?;
         if refresh_skew_secs > ttl_secs / 2 {
             return Err(
                 "oidc_relying_party: behavior.refresh_skew_secs must be <= session.ttl_secs / 2"
@@ -393,12 +655,20 @@ impl OidcRelyingParty {
 
         let behavior = Arc::new(BehaviorConfig {
             challenge_html_status: parse_status(
-                optional_behavior_u64(behavior_obj, "challenge_html_status", 302)?,
+                optional_behavior_u64(
+                    behavior_obj,
+                    "challenge_html_status",
+                    DEFAULT_CHALLENGE_HTML_STATUS,
+                )?,
                 &[302, 303, 307],
                 "challenge_html_status",
             )?,
             challenge_api_status: parse_status(
-                optional_behavior_u64(behavior_obj, "challenge_api_status", 401)?,
+                optional_behavior_u64(
+                    behavior_obj,
+                    "challenge_api_status",
+                    DEFAULT_CHALLENGE_API_STATUS,
+                )?,
                 &[401, 403],
                 "challenge_api_status",
             )?,
@@ -426,27 +696,34 @@ impl OidcRelyingParty {
             provider_obj,
             token_endpoint.as_deref().or(discovery_url.as_deref()),
         )?;
-        // Validate like the other endpoint fields (a parseable http(s) URL with
-        // a host) so a malformed or non-http(s) value is rejected at config load
-        // instead of being forwarded to the IdP and browser at logout. Uses the
-        // lenient validate_url_string (not validate_redirect_uri) so localhost/dev
-        // setups are not over-constrained. Do this before spawning discovery so
+        // Validate like the other endpoint fields so a malformed or insecure
+        // value is rejected at config load instead of being forwarded to the
+        // IdP and browser at logout. Do this before starting runtime workers so
         // rejected plugin configs have no background side effects.
         let post_logout_redirect_uri =
             optional_string(provider_obj, "post_logout_redirect_uri", "provider[0]")?
                 .map(|url| validate_url_string(&url, "provider[0].post_logout_redirect_uri"))
                 .transpose()?;
-        let jwks_store = Arc::new(ArcSwap::from_pointee(jwks_uri.as_ref().map(|uri| {
-            get_or_create_jwks_store(uri, &http_client, DEFAULT_JWKS_REFRESH_INTERVAL)
-        })));
-        if let Some(url) = discovery_url.clone() {
-            spawn_oidc_discovery(
-                discovery.clone(),
-                jwks_store.clone(),
-                http_client.clone(),
-                url,
-            );
-        }
+        let initial_jwks_store = if start_background_tasks {
+            jwks_uri.as_ref().map(|uri| {
+                get_or_create_jwks_store(uri, &http_client, DEFAULT_JWKS_REFRESH_INTERVAL)
+            })
+        } else {
+            None
+        };
+        let jwks_store = Arc::new(ArcSwap::from_pointee(initial_jwks_store));
+        let discovery_task = if start_background_tasks {
+            discovery_url.clone().map(|url| {
+                spawn_oidc_discovery(
+                    discovery.clone(),
+                    jwks_store.clone(),
+                    http_client.clone(),
+                    url,
+                )
+            })
+        } else {
+            None
+        };
 
         let provider = Arc::new(ProviderRuntime {
             issuer,
@@ -487,7 +764,7 @@ impl OidcRelyingParty {
             id_token_clock_skew: Duration::from_secs(optional_u64(
                 provider_obj,
                 "id_token_clock_skew_secs",
-                60,
+                DEFAULT_ID_TOKEN_CLOCK_SKEW_SECS,
             )?),
             http_client,
             warmup_hostnames: discovery_url
@@ -500,35 +777,61 @@ impl OidcRelyingParty {
             provider,
             session,
             behavior,
+            discovery_task,
         })
     }
 
     async fn handle_callback(&self, ctx: &mut RequestContext) -> PluginResult {
-        if let Some(error) = ctx.query_params.get("error") {
-            return reject(400, format!(r#"{{"error":"{}"}}"#, escape_json(error)));
-        }
         let Some(state) = ctx.query_params.get("state").cloned() else {
-            return reject(400, r#"{"error":"Missing state"}"#.to_string());
+            return self.callback_reject(400, r#"{"error":"Missing state"}"#.to_string(), None);
         };
-        let Some(flow) = self.session.state_cache.take(&state) else {
-            return reject(400, r#"{"error":"Invalid state"}"#.to_string());
+        let correlation_cookie_name = self.correlation_cookie_name(&state);
+        let Some(browser_binding) = cookie_value(ctx, &correlation_cookie_name) else {
+            return self.callback_reject(
+                400,
+                r#"{"error":"Invalid state"}"#.to_string(),
+                Some(&state),
+            );
+        };
+        let browser_binding_hash: [u8; 32] = Sha256::digest(browser_binding.as_bytes()).into();
+        let Some(flow) = self
+            .session
+            .state_cache
+            .take_bound(&state, &browser_binding_hash)
+        else {
+            return self.callback_reject(
+                400,
+                r#"{"error":"Invalid state"}"#.to_string(),
+                Some(&state),
+            );
+        };
+        if let Some(error) = ctx.query_params.get("error") {
+            return self.callback_reject(400, json!({"error": error}).to_string(), Some(&state));
         };
         let Some(code) = ctx.query_params.get("code").cloned() else {
-            return reject(400, r#"{"error":"Missing code"}"#.to_string());
+            return self.callback_reject(
+                400,
+                r#"{"error":"Missing code"}"#.to_string(),
+                Some(&state),
+            );
         };
         let Some(discovery) = self.provider.discovery.load().as_ref().as_ref().cloned() else {
-            return reject(400, r#"{"error":"OIDC discovery unavailable"}"#.to_string());
+            return self.callback_reject(
+                400,
+                r#"{"error":"OIDC discovery unavailable"}"#.to_string(),
+                Some(&state),
+            );
         };
         let token = match self
             .exchange_code(&discovery, &code, &flow.code_verifier)
             .await
         {
             Ok(token) => token,
-            Err(body) => return reject(400, body),
+            Err(body) => return self.callback_reject(400, body, Some(&state)),
         };
         let claims = match self.verify_id_token(&token.id_token, &flow.nonce).await {
             Ok(claims) => claims,
-            Err(body) => return reject(400, body),
+            Err(body) => return self.callback_reject(400, body, Some(&state)),
         };
         let merged_claims = if let Some(userinfo_endpoint) = &discovery.userinfo_endpoint {
             match self
@@ -538,7 +841,7 @@ impl OidcRelyingParty {
                 Ok(Some(userinfo)) => {
                     match merge_claims(claims.clone(), userinfo, &self.provider) {
                         Ok(claims) => claims,
-                        Err(body) => return reject(400, body),
+                        Err(body) => return self.callback_reject(400, body, Some(&state)),
                     }
                 }
                 Ok(None) => claims,
@@ -560,9 +863,17 @@ impl OidcRelyingParty {
                 .expires_in
                 .unwrap_or(self.session.ttl.as_secs() as i64);
         let claims_expires_at = claim_expiry(&merged_claims).unwrap_or(expires_at);
+        let Ok(sub) = required_subject(&merged_claims, "ID token") else {
+            return self.callback_reject(
+                400,
+                r#"{"error":"Invalid ID token"}"#.to_string(),
+                Some(&state),
+            );
+        };
         let payload = SessionPayload {
-            version: 1,
-            sub: extract_claim_string(&merged_claims, "sub").unwrap_or_default(),
+            version: SESSION_PAYLOAD_VERSION,
+            context_id: self.session.context_id.clone(),
+            sub: sub.to_string(),
             id_token_b64: token.id_token,
             access_token_b64: token.access_token,
             refresh_token_b64: token.refresh_token,
@@ -580,12 +891,15 @@ impl OidcRelyingParty {
         };
         let cookie = match self.seal_session_cookie(&payload) {
             Ok(cookie) => cookie,
-            Err(body) => return reject(400, body),
+            Err(body) => return self.callback_reject(400, body, Some(&state)),
         };
         redirect(
             302,
             &self.sanitize_redirect(&flow.original_url),
-            Some(cookie),
+            Some(join_set_cookies(
+                cookie,
+                self.clear_correlation_cookie(&state),
+            )),
         )
     }
 
@@ -612,8 +926,7 @@ impl OidcRelyingParty {
         if !response.status().is_success() {
             return Err(r#"{"error":"Token exchange failed"}"#.to_string());
         }
-        let token: TokenResponse = response
-            .json()
+        let token: TokenResponse = read_bounded_json(response, MAX_TOKEN_RESPONSE_BYTES)
             .await
             .map_err(|_| r#"{"error":"Token response parse failed"}"#.to_string())?;
         if !token.token_type.eq_ignore_ascii_case("bearer") {
@@ -688,12 +1001,14 @@ impl OidcRelyingParty {
                 .await
                 .map_err(|_| r#"{"error":"JWKS unavailable"}"#.to_string())?;
         }
-        let audiences = if self.provider.audiences.is_empty() {
-            vec![self.provider.client_id.clone()]
-        } else {
-            self.provider.audiences.clone()
-        };
-        verify_jwt_with_jwks(
+        let mut audiences = self.provider.audiences.clone();
+        if !audiences
+            .iter()
+            .any(|audience| audience == &self.provider.client_id)
+        {
+            audiences.push(self.provider.client_id.clone());
+        }
+        let claims = verify_jwt_with_jwks(
             id_token,
             &store,
             &JwtVerifyParams {
@@ -701,15 +1016,22 @@ impl OidcRelyingParty {
                 audiences: &audiences,
                 require_exp: true,
                 leeway_secs: self.provider.id_token_clock_skew.as_secs(),
-                validate_nbf: false,
+                validate_nbf: true,
             },
         )
         .await
-        .ok_or_else(|| r#"{"error":"Invalid ID token"}"#.to_string())
+        .ok_or_else(|| r#"{"error":"Invalid ID token"}"#.to_string())?;
+        validate_oidc_audience_and_azp(
+            &claims,
+            &self.provider.client_id,
+            &self.provider.audiences,
+        )?;
+        Ok(claims)
     }
 
     async fn verify_id_token(&self, id_token: &str, nonce: &str) -> Result<Value, String> {
         let claims = self.verify_id_token_jwks(id_token).await?;
+        required_subject(&claims, "ID token")?;
         let token_nonce = claims
             .get("nonce")
             .and_then(Value::as_str)
@@ -731,17 +1053,17 @@ impl OidcRelyingParty {
         expected_nonce: &str,
     ) -> Result<Value, String> {
         let claims = self.verify_id_token_jwks(id_token).await?;
-        let sub = claims
-            .get("sub")
-            .and_then(Value::as_str)
-            .ok_or_else(|| r#"{"error":"Refreshed ID token missing subject"}"#.to_string())?;
+        let sub = required_subject(&claims, "Refreshed ID token")?;
         if !constant_time_eq(sub.as_bytes(), expected_sub.as_bytes()) {
             return Err(r#"{"error":"Refreshed ID token subject mismatch"}"#.to_string());
         }
-        if let Some(token_nonce) = claims.get("nonce").and_then(Value::as_str)
-            && !constant_time_eq(token_nonce.as_bytes(), expected_nonce.as_bytes())
-        {
-            return Err(r#"{"error":"Refreshed ID token nonce mismatch"}"#.to_string());
+        if let Some(nonce_claim) = claims.get("nonce") {
+            let Some(token_nonce) = nonce_claim.as_str() else {
+                return Err(r#"{"error":"Refreshed ID token nonce mismatch"}"#.to_string());
+            };
+            if !constant_time_eq(token_nonce.as_bytes(), expected_nonce.as_bytes()) {
+                return Err(r#"{"error":"Refreshed ID token nonce mismatch"}"#.to_string());
+            }
         }
         Ok(claims)
     }
@@ -767,8 +1089,7 @@ impl OidcRelyingParty {
         if !response.status().is_success() {
             return Err(format!("userinfo returned HTTP {}", response.status()));
         }
-        response
-            .json()
+        read_bounded_json(response, MAX_USERINFO_RESPONSE_BYTES)
             .await
             .map(Some)
             .map_err(|error| format!("userinfo parse failed: {error}"))
@@ -938,8 +1259,7 @@ impl OidcRelyingParty {
         if !response.status().is_success() {
             return Err(r#"{"error":"Token refresh failed"}"#.to_string());
         }
-        let token: RefreshTokenResponse = response
-            .json()
+        let token: RefreshTokenResponse = read_bounded_json(response, MAX_TOKEN_RESPONSE_BYTES)
             .await
             .map_err(|_| r#"{"error":"Token refresh response parse failed"}"#.to_string())?;
         if !token.token_type.eq_ignore_ascii_case("bearer") {
@@ -977,8 +1297,7 @@ impl OidcRelyingParty {
             } else {
                 id_claims
             };
-            payload.sub =
-                extract_claim_string(&merged, "sub").unwrap_or_else(|| payload.sub.clone());
+            payload.sub = required_subject(&merged, "Refreshed ID token")?.to_string();
             payload.id_token_b64 = id_token.to_string();
             payload.claims_expires_at_unix = claim_expiry(&merged).unwrap_or(expires_at);
             payload.claims = merged;
@@ -1018,7 +1337,7 @@ impl OidcRelyingParty {
 
     fn challenge(&self, ctx: &mut RequestContext, clear: bool) -> PluginResult {
         if is_browser_request(ctx, &self.behavior) {
-            let (state, flow) = match self.create_flow(ctx) {
+            let (state, flow, browser_binding) = match self.create_flow(ctx) {
                 Ok(flow) => flow,
                 Err(body) => return reject(503, body),
             };
@@ -1031,8 +1350,13 @@ impl OidcRelyingParty {
                 self.session.state_cache.take(&state);
                 return reject(503, r#"{"error":"OIDC discovery unavailable"}"#.to_string());
             };
-            let cookie = clear.then(|| self.clear_cookie());
-            redirect(self.behavior.challenge_html_status, &location, cookie)
+            let correlation_cookie = self.correlation_cookie(&state, &browser_binding);
+            let cookie = if clear {
+                join_set_cookies(correlation_cookie, self.clear_cookie())
+            } else {
+                correlation_cookie
+            };
+            redirect(self.behavior.challenge_html_status, &location, Some(cookie))
         } else {
             let mut headers = HashMap::new();
             headers.insert(
@@ -1050,21 +1374,25 @@ impl OidcRelyingParty {
         }
     }
 
-    fn create_flow(&self, ctx: &RequestContext) -> Result<(String, FlowState), String> {
+    fn create_flow(&self, ctx: &RequestContext) -> Result<(String, FlowState, String), String> {
         let state = random_b64(32)?;
         let code_verifier = random_b64(64)?;
         let nonce = random_b64(32)?;
+        let browser_binding = random_b64(32)?;
+        let browser_binding_hash: [u8; 32] = Sha256::digest(browser_binding.as_bytes()).into();
         let original_url = original_url(ctx, &self.behavior);
         let flow = FlowState {
             code_verifier,
             nonce,
             original_url,
+            browser_binding_hash,
+            source_ip: ctx.client_ip.clone(),
             expires_at: Instant::now() + self.behavior.state_ttl,
         };
         self.session
             .state_cache
             .insert(state.clone(), flow.clone())?;
-        Ok((state, flow))
+        Ok((state, flow, browser_binding))
     }
 
     /// Build the absolute IdP authorization URL for a browser challenge. Returns
@@ -1116,7 +1444,16 @@ impl OidcRelyingParty {
 
     fn open_session(&self, value: &str) -> Option<SessionPayload> {
         let bytes = self.session.codec.open(value)?;
-        serde_json::from_slice(&bytes).ok()
+        let payload: SessionPayload = serde_json::from_slice(&bytes).ok()?;
+        if payload.version != SESSION_PAYLOAD_VERSION
+            || !constant_time_eq(
+                payload.context_id.as_bytes(),
+                self.session.context_id.as_bytes(),
+            )
+        {
+            return None;
+        }
+        Some(payload)
     }
 
     fn clear_cookie(&self) -> String {
@@ -1124,6 +1461,48 @@ impl OidcRelyingParty {
             "{}=; Max-Age=0; {}",
             self.session.cookie_name, self.session.cookie_attrs
         )
+    }
+
+    fn correlation_cookie_name(&self, state: &str) -> String {
+        let state_hash: [u8; 32] = Sha256::digest(state.as_bytes()).into();
+        derived_cookie_name(&self.session.correlation_cookie_name_prefix, &state_hash)
+    }
+
+    fn correlation_cookie(&self, state: &str, value: &str) -> String {
+        format!(
+            "{}={value}; Max-Age={}; {}",
+            self.correlation_cookie_name(state),
+            self.behavior.state_ttl.as_secs(),
+            self.session.correlation_cookie_attrs
+        )
+    }
+
+    fn clear_correlation_cookie(&self, state: &str) -> String {
+        format!(
+            "{}=; Max-Age=0; {}",
+            self.correlation_cookie_name(state),
+            self.session.correlation_cookie_attrs
+        )
+    }
+
+    fn callback_reject(
+        &self,
+        status_code: u16,
+        body: String,
+        correlation_state: Option<&str>,
+    ) -> PluginResult {
+        let mut headers = HashMap::new();
+        if let Some(state) = correlation_state {
+            headers.insert(
+                "set-cookie".to_string(),
+                self.clear_correlation_cookie(state),
+            );
+        }
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        }
     }
 
     fn sanitize_redirect(&self, original: &str) -> String {
@@ -1146,6 +1525,14 @@ impl OidcRelyingParty {
     }
 }
 
+impl Drop for OidcRelyingParty {
+    fn drop(&mut self) {
+        if let Some(task) = self.discovery_task.take() {
+            task.abort();
+        }
+    }
+}
+
 #[async_trait]
 impl super::Plugin for OidcRelyingParty {
     fn name(&self) -> &str {
@@ -1162,6 +1549,11 @@ impl super::Plugin for OidcRelyingParty {
     }
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         if ctx.path == self.provider.callback_path {
+            // The shared proxy deliberately defers query materialization until
+            // after this phase. The callback is the one request-received hook
+            // that needs decoded parameters, so materialize here once; the
+            // later shared call is idempotent and the raw query remains intact.
+            ctx.materialize_query_params();
             self.handle_callback(ctx).await
         } else if ctx.path == self.provider.logout_path {
             let mut headers = HashMap::new();
@@ -1259,32 +1651,183 @@ impl super::Plugin for OidcRelyingParty {
     fn requires_decoded_query_params(&self) -> bool {
         true
     }
+    fn active_jwks_uris(&self) -> Vec<String> {
+        self.provider
+            .jwks_store
+            .load()
+            .as_ref()
+            .as_ref()
+            .filter(|store| store.is_refreshable())
+            .map(|store| vec![store.jwks_uri().to_string()])
+            .unwrap_or_default()
+    }
 }
 
 impl StateCache {
-    fn new(max_entries: usize, ttl: Duration, shard_amount: usize) -> Self {
+    fn new(
+        max_entries: usize,
+        max_entries_per_source: usize,
+        ttl: Duration,
+        shard_amount: usize,
+    ) -> Self {
         Self {
             entries: DashMap::with_shard_amount(shard_amount),
+            expiry_buckets: DashMap::with_shard_amount(shard_amount),
+            per_source_entries: DashMap::with_shard_amount(shard_amount),
+            active_entries: AtomicUsize::new(0),
+            last_evicted_bucket: AtomicU64::new(0),
+            origin: Instant::now(),
             max_entries,
+            max_entries_per_source,
+            shard_amount,
             ttl,
         }
     }
     fn insert(&self, state: String, flow: FlowState) -> Result<(), String> {
         self.evict_expired();
-        if self.entries.len() >= self.max_entries {
+        if self
+            .active_entries
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.max_entries).then_some(active + 1)
+            })
+            .is_err()
+        {
             return Err(r#"{"error":"OIDC state cache full"}"#.to_string());
         }
-        self.entries.insert(state, flow);
+        if !self.reserve_source(&flow.source_ip) {
+            decrement_atomic(&self.active_entries);
+            return Err(r#"{"error":"Too many pending OIDC logins"}"#.to_string());
+        }
+        let expiry_bucket = self.bucket_for(flow.expires_at);
+        if let Some(replaced) = self.entries.insert(state.clone(), flow) {
+            decrement_atomic(&self.active_entries);
+            self.release_source(&replaced.source_ip);
+            self.remove_expiry_record(&state, replaced.expires_at);
+        }
+        self.expiry_buckets
+            .entry(expiry_bucket)
+            .or_insert_with(|| Arc::new(DashMap::with_shard_amount(self.shard_amount)))
+            .insert(state, ());
         Ok(())
     }
     fn take(&self, state: &str) -> Option<FlowState> {
         let (_, flow) = self.entries.remove(state)?;
+        self.remove_expiry_record(state, flow.expires_at);
+        decrement_atomic(&self.active_entries);
+        self.release_source(&flow.source_ip);
         (flow.expires_at > Instant::now()).then_some(flow)
     }
+
+    fn take_bound(&self, state: &str, browser_binding_hash: &[u8]) -> Option<FlowState> {
+        let now = Instant::now();
+        let (_, flow) = self.entries.remove_if(state, |_, flow| {
+            flow.expires_at <= now
+                || constant_time_eq(&flow.browser_binding_hash, browser_binding_hash)
+        })?;
+        self.remove_expiry_record(state, flow.expires_at);
+        decrement_atomic(&self.active_entries);
+        self.release_source(&flow.source_ip);
+        (flow.expires_at > now
+            && constant_time_eq(&flow.browser_binding_hash, browser_binding_hash))
+        .then_some(flow)
+    }
+
     fn evict_expired(&self) {
         let now = Instant::now();
-        self.entries.retain(|_, flow| flow.expires_at > now);
+        let current_bucket = self.bucket_for(now);
+        let previous = self
+            .last_evicted_bucket
+            .swap(current_bucket, Ordering::AcqRel);
+        if current_bucket <= previous {
+            return;
+        }
+
+        // Normal traffic advances zero or one bucket and performs O(1)
+        // cleanup. After a long idle period, scan only the bounded bucket
+        // index instead of looping through every empty wall-clock bucket.
+        if current_bucket - previous > 1024 {
+            let expired: Vec<u64> = self
+                .expiry_buckets
+                .iter()
+                .filter_map(|entry| (*entry.key() < current_bucket).then_some(*entry.key()))
+                .collect();
+            for bucket in expired {
+                self.evict_bucket(bucket, now);
+            }
+        } else {
+            for bucket in previous..current_bucket {
+                self.evict_bucket(bucket, now);
+            }
+        }
     }
+
+    fn evict_bucket(&self, bucket: u64, now: Instant) {
+        let Some((_, states)) = self.expiry_buckets.remove(&bucket) else {
+            return;
+        };
+        for state in states.iter() {
+            if let Some((_, flow)) = self
+                .entries
+                .remove_if(state.key(), |_, flow| flow.expires_at <= now)
+            {
+                decrement_atomic(&self.active_entries);
+                self.release_source(&flow.source_ip);
+            }
+        }
+    }
+
+    fn remove_expiry_record(&self, state: &str, expires_at: Instant) {
+        if let Some(states) = self.expiry_buckets.get(&self.bucket_for(expires_at)) {
+            states.remove(state);
+        }
+    }
+
+    fn bucket_for(&self, instant: Instant) -> u64 {
+        instant
+            .checked_duration_since(self.origin)
+            .unwrap_or_default()
+            .as_secs()
+            / STATE_EXPIRY_BUCKET_SECS
+    }
+
+    fn reserve_source(&self, source_ip: &str) -> bool {
+        use dashmap::mapref::entry::Entry;
+
+        match self.per_source_entries.entry(source_ip.to_string()) {
+            Entry::Occupied(mut entry) => {
+                if *entry.get() >= self.max_entries_per_source {
+                    false
+                } else {
+                    *entry.get_mut() += 1;
+                    true
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(1);
+                true
+            }
+        }
+    }
+
+    fn release_source(&self, source_ip: &str) {
+        let remove = if let Some(mut entry) = self.per_source_entries.get_mut(source_ip) {
+            let count = entry.value_mut();
+            *count = count.saturating_sub(1);
+            *count == 0
+        } else {
+            false
+        };
+        if remove {
+            self.per_source_entries
+                .remove_if(source_ip, |_, count| *count == 0);
+        }
+    }
+}
+
+fn decrement_atomic(value: &AtomicUsize) {
+    let _ = value.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        (current > 0).then_some(current - 1)
+    });
 }
 
 trait PipeDefault {
@@ -1408,6 +1951,16 @@ fn with_form_body(
         .body(serializer.finish())
 }
 
+async fn read_bounded_json<T>(response: reqwest::Response, max_bytes: usize) -> Result<T, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let body = read_response_body_bounded(response, max_bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::from_slice(&body).map_err(|error| error.to_string())
+}
+
 fn apply_verify_outcome(ctx: &mut RequestContext, outcome: VerifyOutcome) -> PluginResult {
     match outcome {
         VerifyOutcome::Success {
@@ -1441,6 +1994,230 @@ fn apply_verify_outcome(ctx: &mut RequestContext, outcome: VerifyOutcome) -> Plu
         VerifyOutcome::Internal(body) => reject(500, body),
         VerifyOutcome::NotApplicable => PluginResult::Continue,
     }
+}
+
+fn reject_unknown_fields(
+    config: &Map<String, Value>,
+    allowed: &[&str],
+    scope: &str,
+) -> Result<(), String> {
+    if let Some(field) = config
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(format!(
+            "oidc_relying_party: unknown field '{scope}.{field}'"
+        ));
+    }
+    Ok(())
+}
+
+fn session_context_seed(
+    provider: &Map<String, Value>,
+    session: &Map<String, Value>,
+    behavior: Option<&Map<String, Value>>,
+) -> Result<[u8; 32], String> {
+    let mut claim_headers = parse_claim_headers(
+        provider,
+        "claim_headers",
+        "oidc_relying_party",
+        CLAIM_HEADER_METADATA_PREFIX,
+    )?
+    .into_iter()
+    .map(|mapping| NormalizedClaimHeaderContext {
+        claim_path: mapping.claim_path,
+        metadata_key: mapping.metadata_key,
+    })
+    .collect::<Vec<_>>();
+    claim_headers.sort_unstable_by(|left, right| {
+        left.claim_path
+            .cmp(&right.claim_path)
+            .then_with(|| left.metadata_key.cmp(&right.metadata_key))
+    });
+
+    let html_accept_substrings = parse_behavior_string_array(behavior, "html_accept_substrings")?
+        .pipe_default(vec!["text/html".to_string()]);
+    let normalized = NormalizedSessionContextSeed {
+        version: SESSION_PAYLOAD_VERSION,
+        provider: NormalizedProviderContext {
+            issuer: required_string(provider, "issuer", "provider[0]")?,
+            discovery_url: optional_string(provider, "discovery_url", "provider[0]")?,
+            authorization_endpoint: optional_string(
+                provider,
+                "authorization_endpoint",
+                "provider[0]",
+            )?,
+            token_endpoint: optional_string(provider, "token_endpoint", "provider[0]")?,
+            userinfo_endpoint: optional_string(provider, "userinfo_endpoint", "provider[0]")?,
+            jwks_uri: optional_string(provider, "jwks_uri", "provider[0]")?,
+            end_session_endpoint: optional_string(provider, "end_session_endpoint", "provider[0]")?,
+            client_id: required_string(provider, "client_id", "provider[0]")?,
+            client_auth: normalized_client_auth_context(provider),
+            redirect_uri: required_string(provider, "redirect_uri", "provider[0]")?,
+            callback_path: optional_string(provider, "callback_path", "provider[0]")?
+                .unwrap_or_else(|| "/oauth/callback".to_string()),
+            logout_path: optional_string(provider, "logout_path", "provider[0]")?
+                .unwrap_or_else(|| "/oauth/logout".to_string()),
+            post_logout_redirect_uri: optional_string(
+                provider,
+                "post_logout_redirect_uri",
+                "provider[0]",
+            )?,
+            scopes: parse_string_array(provider, "scopes", "provider[0]")?,
+            audiences: parse_string_array(provider, "audiences", "provider[0]")?,
+            required_scopes: parse_string_array(provider, "required_scopes", "provider[0]")?,
+            required_roles: parse_string_array(provider, "required_roles", "provider[0]")?,
+            scope_claim: optional_string(provider, "scope_claim", "provider[0]")?
+                .unwrap_or_else(|| "scope".to_string()),
+            role_claim: optional_string(provider, "role_claim", "provider[0]")?
+                .unwrap_or_else(|| "roles".to_string()),
+            consumer_identity_claim: optional_string(
+                provider,
+                "consumer_identity_claim",
+                "provider[0]",
+            )?
+            .unwrap_or_else(|| "sub".to_string()),
+            consumer_header_claim: optional_string(
+                provider,
+                "consumer_header_claim",
+                "provider[0]",
+            )?
+            .unwrap_or_else(|| "sub".to_string()),
+            claim_headers,
+            id_token_clock_skew_secs: optional_u64(
+                provider,
+                "id_token_clock_skew_secs",
+                DEFAULT_ID_TOKEN_CLOCK_SKEW_SECS,
+            )?,
+        },
+        session: NormalizedSessionContext {
+            store: optional_string(session, "store", "session")?
+                .unwrap_or_else(|| "cookie".to_string()),
+            ttl_secs: optional_u64(session, "ttl_secs", DEFAULT_SESSION_TTL_SECS)?,
+            idle_ttl_secs: optional_u64(session, "idle_ttl_secs", DEFAULT_SESSION_IDLE_TTL_SECS)?,
+            max_cookie_bytes: optional_u64(
+                session,
+                "max_cookie_bytes",
+                DEFAULT_SESSION_MAX_COOKIE_BYTES,
+            )?,
+            secure: optional_bool(session, "secure")?.unwrap_or(true),
+            http_only: optional_bool(session, "http_only")?.unwrap_or(true),
+            same_site: optional_string(session, "same_site", "session")?
+                .unwrap_or_else(|| "lax".to_string())
+                .to_ascii_lowercase(),
+            domain: optional_string(session, "domain", "session")?,
+            path: optional_string(session, "path", "session")?.unwrap_or_else(|| "/".to_string()),
+        },
+        behavior: NormalizedBehaviorContext {
+            state_ttl_secs: optional_behavior_u64(
+                behavior,
+                "state_ttl_secs",
+                DEFAULT_STATE_TTL_SECS,
+            )?,
+            state_cache_max_entries: optional_behavior_u64(
+                behavior,
+                "state_cache_max_entries",
+                DEFAULT_STATE_CACHE_MAX_ENTRIES as u64,
+            )?,
+            state_cache_max_entries_per_source: optional_behavior_u64(
+                behavior,
+                "state_cache_max_entries_per_source",
+                DEFAULT_STATE_CACHE_MAX_ENTRIES_PER_SOURCE as u64,
+            )?,
+            post_login_redirect_param: optional_behavior_string(
+                behavior,
+                "post_login_redirect_param",
+            )?,
+            trusted_redirect_hosts: parse_behavior_string_array(
+                behavior,
+                "trusted_redirect_hosts",
+            )?,
+            refresh_skew_secs: optional_behavior_u64(
+                behavior,
+                "refresh_skew_secs",
+                DEFAULT_REFRESH_SKEW_SECS,
+            )?,
+            challenge_html_status: optional_behavior_u64(
+                behavior,
+                "challenge_html_status",
+                DEFAULT_CHALLENGE_HTML_STATUS,
+            )?,
+            challenge_api_status: optional_behavior_u64(
+                behavior,
+                "challenge_api_status",
+                DEFAULT_CHALLENGE_API_STATUS,
+            )?,
+            html_accept_substrings,
+            rp_initiated_logout: optional_behavior_bool(behavior, "rp_initiated_logout")?
+                .unwrap_or(true),
+            post_login_default_path: optional_behavior_string(behavior, "post_login_default_path")?
+                .unwrap_or_else(|| "/".to_string()),
+        },
+    };
+    // Struct field order plus the sorted claim-header list make the byte
+    // representation deterministic, independent of input object key order.
+    let serialized = serde_json::to_vec(&normalized)
+        .map_err(|_| "oidc_relying_party: failed to derive session context".to_string())?;
+    Ok(Sha256::digest(serialized).into())
+}
+
+fn normalized_client_auth_context(provider: &Map<String, Value>) -> NormalizedClientAuthContext {
+    let client_auth = provider.get("client_auth").and_then(Value::as_object);
+    let method = client_auth
+        .and_then(|auth| auth.get("method"))
+        .and_then(Value::as_str)
+        .unwrap_or("client_secret_basic")
+        .to_string();
+    let is_private_key_jwt = method == "private_key_jwt";
+    NormalizedClientAuthContext {
+        method,
+        private_key_jwt_alg: is_private_key_jwt.then(|| {
+            client_auth
+                .and_then(|auth| auth.get("private_key_jwt_alg"))
+                .and_then(Value::as_str)
+                .unwrap_or("RS256")
+                .to_string()
+        }),
+        private_key_jwt_kid: if is_private_key_jwt {
+            client_auth
+                .and_then(|auth| auth.get("private_key_jwt_kid"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        } else {
+            None
+        },
+    }
+}
+
+fn session_context_id(seed: &[u8; 32], cookie_name: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ferrum-edge/oidc-session-context/v2\0");
+    hasher.update(seed);
+    hasher.update((cookie_name.len() as u64).to_be_bytes());
+    hasher.update(cookie_name.as_bytes());
+    hasher.finalize().into()
+}
+
+fn derived_cookie_name(prefix: &str, context_seed: &[u8; 32]) -> String {
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(context_seed);
+    let suffix: String = encoded.chars().take(12).collect();
+    format!("{prefix}_{suffix}")
+}
+
+fn behavior_usize(
+    config: Option<&Map<String, Value>>,
+    field: &str,
+    default: usize,
+) -> Result<usize, String> {
+    let raw = optional_behavior_u64(config, field, default as u64)?;
+    if raw == 0 {
+        return Err(format!(
+            "oidc_relying_party: behavior.{field} must be greater than zero"
+        ));
+    }
+    usize::try_from(raw).map_err(|_| format!("oidc_relying_party: behavior.{field} is too large"))
 }
 
 fn required_string(
@@ -1614,9 +2391,23 @@ fn parse_status(value: u64, allowed: &[u16], field: &str) -> Result<u16, String>
 fn validate_redirect_uri(uri: &str) -> Result<(), String> {
     let parsed =
         Url::parse(uri).map_err(|e| format!("oidc_relying_party: redirect_uri invalid: {e}"))?;
-    let host = parsed.host_str().unwrap_or_default();
-    if parsed.scheme() != "https" && !matches!(host, "localhost" | "127.0.0.1" | "::1") {
-        return Err("oidc_relying_party: redirect_uri must be https except localhost".to_string());
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "oidc_relying_party: redirect_uri must include a hostname".to_string())?;
+    match parsed.scheme() {
+        "https" => {}
+        "http" if is_local_auth_host(host) => {}
+        "http" => {
+            return Err(
+                "oidc_relying_party: redirect_uri must use https except for literal loopback or localhost"
+                    .to_string(),
+            );
+        }
+        scheme => {
+            return Err(format!(
+                "oidc_relying_party: redirect_uri must use http or https, got {scheme}"
+            ));
+        }
     }
     Ok(())
 }
@@ -1624,18 +2415,22 @@ fn validate_redirect_uri(uri: &str) -> Result<(), String> {
 fn validate_url_string(raw: &str, field: &str) -> Result<String, String> {
     let parsed =
         Url::parse(raw).map_err(|e| format!("oidc_relying_party: {field} invalid: {e}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("oidc_relying_party: {field} must include a hostname"))?;
     match parsed.scheme() {
-        "http" | "https" => {}
+        "https" => {}
+        "http" if is_local_auth_host(host) => {}
+        "http" => {
+            return Err(format!(
+                "oidc_relying_party: {field} must use https except for literal loopback or localhost"
+            ));
+        }
         scheme => {
             return Err(format!(
                 "oidc_relying_party: {field} must use http or https, got {scheme}"
             ));
         }
-    }
-    if parsed.host_str().is_none() {
-        return Err(format!(
-            "oidc_relying_party: {field} must include a hostname"
-        ));
     }
     Ok(raw.trim().to_string())
 }
@@ -1645,8 +2440,17 @@ fn validate_discovered_url(discovery_url: &str, raw: &str, field: &str) -> Resul
         .map_err(|e| format!("oidc_relying_party: discovery_url invalid: {e}"))?;
     let parsed = Url::parse(raw)
         .map_err(|e| format!("oidc_relying_party: discovery {field} invalid: {e}"))?;
+    let endpoint_host = parsed
+        .host_str()
+        .ok_or_else(|| format!("oidc_relying_party: discovery {field} must include a hostname"))?;
     match parsed.scheme() {
-        "http" | "https" => {}
+        "https" => {}
+        "http" if is_local_auth_host(endpoint_host) => {}
+        "http" => {
+            return Err(format!(
+                "oidc_relying_party: discovery {field} must use https except for literal loopback or localhost"
+            ));
+        }
         scheme => {
             return Err(format!(
                 "oidc_relying_party: discovery {field} must use http or https, got {scheme}"
@@ -1656,20 +2460,28 @@ fn validate_discovered_url(discovery_url: &str, raw: &str, field: &str) -> Resul
     let discovery_host = discovery
         .host_str()
         .ok_or_else(|| "oidc_relying_party: discovery_url must include a hostname".to_string())?;
-    let endpoint_host = parsed
-        .host_str()
-        .ok_or_else(|| format!("oidc_relying_party: discovery {field} must include a hostname"))?;
     if !endpoint_host.eq_ignore_ascii_case(discovery_host) {
         return Err(format!(
             "oidc_relying_party: discovery {field} host must match discovery_url host"
+        ));
+    }
+    if parsed.scheme() != discovery.scheme()
+        || parsed.port_or_known_default() != discovery.port_or_known_default()
+    {
+        return Err(format!(
+            "oidc_relying_party: discovery {field} scheme and port must match discovery_url"
         ));
     }
     Ok(raw.trim().to_string())
 }
 
 fn is_local_auth_host(hostname: &str) -> bool {
-    hostname.eq_ignore_ascii_case("localhost")
-        || hostname
+    let literal = hostname
+        .strip_prefix('[')
+        .and_then(|hostname| hostname.strip_suffix(']'))
+        .unwrap_or(hostname);
+    literal.eq_ignore_ascii_case("localhost")
+        || literal
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
 }
@@ -1726,6 +2538,55 @@ fn claim_expiry(claims: &Value) -> Option<i64> {
     claims.get("exp").and_then(Value::as_i64)
 }
 
+fn required_subject<'a>(claims: &'a Value, token_kind: &str) -> Result<&'a str, String> {
+    claims
+        .get("sub")
+        .and_then(Value::as_str)
+        .filter(|subject| !subject.trim().is_empty())
+        .ok_or_else(|| format!(r#"{{"error":"{token_kind} missing subject"}}"#))
+}
+
+fn validate_oidc_audience_and_azp(
+    claims: &Value,
+    client_id: &str,
+    configured_audiences: &[String],
+) -> Result<(), String> {
+    let mut audiences = Vec::new();
+    match claims.get("aud") {
+        Some(Value::String(audience)) if !audience.is_empty() => audiences.push(audience.as_str()),
+        Some(Value::Array(values)) => {
+            for value in values {
+                let Some(audience) = value.as_str().filter(|audience| !audience.is_empty()) else {
+                    return Err(r#"{"error":"Invalid ID token audience"}"#.to_string());
+                };
+                audiences.push(audience);
+            }
+        }
+        _ => return Err(r#"{"error":"Invalid ID token audience"}"#.to_string()),
+    }
+    if audiences.is_empty() || !audiences.contains(&client_id) {
+        return Err(r#"{"error":"Invalid ID token audience"}"#.to_string());
+    }
+    if !configured_audiences.is_empty()
+        && !configured_audiences
+            .iter()
+            .any(|expected| audiences.contains(&expected.as_str()))
+    {
+        return Err(r#"{"error":"Invalid ID token audience"}"#.to_string());
+    }
+
+    let azp = claims.get("azp");
+    if audiences.len() > 1 || azp.is_some() {
+        let Some(authorized_party) = azp.and_then(Value::as_str) else {
+            return Err(r#"{"error":"Invalid ID token authorized party"}"#.to_string());
+        };
+        if !constant_time_eq(authorized_party.as_bytes(), client_id.as_bytes()) {
+            return Err(r#"{"error":"Invalid ID token authorized party"}"#.to_string());
+        }
+    }
+    Ok(())
+}
+
 fn effective_claims_expires_at(payload: &SessionPayload) -> i64 {
     stored_claims_expires_at(payload).min(payload.expires_at_unix)
 }
@@ -1777,7 +2638,12 @@ fn original_url(ctx: &RequestContext, behavior: &BehaviorConfig) -> String {
     }
     let scheme = frontend_scheme(ctx);
     let host = request_host(ctx);
-    format!("{scheme}://{host}{}", ctx.path)
+    let mut original = format!("{scheme}://{host}{}", ctx.path);
+    if let Some(raw_query) = ctx.raw_query_string() {
+        original.push('?');
+        original.push_str(raw_query);
+    }
+    original
 }
 
 fn frontend_scheme(ctx: &RequestContext) -> &str {
@@ -1822,16 +2688,28 @@ fn merge_claims_with_protected_keys(
     userinfo: Value,
     protected: &HashSet<&str>,
 ) -> Result<Value, String> {
-    if let Some(userinfo_sub) = userinfo.get("sub").and_then(Value::as_str) {
-        let Some(id_sub) = id_claims.get("sub").and_then(Value::as_str) else {
-            return Err(r#"{"error":"Userinfo subject mismatch"}"#.to_string());
-        };
-        if !constant_time_eq(id_sub.as_bytes(), userinfo_sub.as_bytes()) {
-            return Err(r#"{"error":"Userinfo subject mismatch"}"#.to_string());
-        }
+    let Some(userinfo_obj) = userinfo.as_object() else {
+        return Err(r#"{"error":"Userinfo subject mismatch"}"#.to_string());
+    };
+    let Some(userinfo_sub) = userinfo_obj
+        .get("sub")
+        .and_then(Value::as_str)
+        .filter(|subject| !subject.trim().is_empty())
+    else {
+        return Err(r#"{"error":"Userinfo subject mismatch"}"#.to_string());
+    };
+    let Some(id_sub) = id_claims
+        .get("sub")
+        .and_then(Value::as_str)
+        .filter(|subject| !subject.trim().is_empty())
+    else {
+        return Err(r#"{"error":"Userinfo subject mismatch"}"#.to_string());
+    };
+    if !constant_time_eq(id_sub.as_bytes(), userinfo_sub.as_bytes()) {
+        return Err(r#"{"error":"Userinfo subject mismatch"}"#.to_string());
     }
-    if let (Some(id), Some(userinfo)) = (id_claims.as_object_mut(), userinfo.as_object()) {
-        for (key, value) in userinfo {
+    if let Some(id) = id_claims.as_object_mut() {
+        for (key, value) in userinfo_obj {
             if protected.contains(key.as_str()) {
                 continue;
             }
@@ -1881,6 +2759,12 @@ fn redirect(status_code: u16, location: &str, set_cookie: Option<String>) -> Plu
     }
 }
 
+fn join_set_cookies(mut first: String, second: String) -> String {
+    first.push('\n');
+    first.push_str(&second);
+    first
+}
+
 fn reject(status_code: u16, body: String) -> PluginResult {
     PluginResult::Reject {
         status_code,
@@ -1898,16 +2782,12 @@ fn hostname_from_url(url: &str) -> Option<String> {
     })
 }
 
-fn escape_json(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 fn spawn_oidc_discovery(
     discovery_slot: Arc<ArcSwap<Option<DiscoveryDoc>>>,
     jwks_slot: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
     http_client: PluginHttpClient,
     discovery_url: String,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         const INITIAL_BACKOFF_SECS: u64 = 2;
         const MAX_BACKOFF_SECS: u64 = 300;
@@ -1942,7 +2822,7 @@ fn spawn_oidc_discovery(
                 }
             }
         }
-    });
+    })
 }
 
 async fn fetch_discovery(
@@ -1956,8 +2836,7 @@ async fn fetch_discovery(
     if !response.status().is_success() {
         return Err(format!("discovery returned HTTP {}", response.status()));
     }
-    let body: Value = response
-        .json()
+    let body: Value = read_bounded_json(response, MAX_DISCOVERY_RESPONSE_BYTES)
         .await
         .map_err(|e| format!("discovery parse failed: {e}"))?;
     let authorization_endpoint = body
@@ -2047,6 +2926,23 @@ mod tests {
     }
 
     #[test]
+    fn userinfo_requires_a_non_empty_string_subject() {
+        let protected = HashSet::from(["sub"]);
+        for userinfo in [
+            json!({"email": "unbound@example.com"}),
+            json!({"sub": null, "email": "unbound@example.com"}),
+            json!({"sub": [], "email": "unbound@example.com"}),
+            json!({"sub": "", "email": "unbound@example.com"}),
+            json!([{"sub": "user-1"}]),
+        ] {
+            assert!(
+                merge_claims_with_protected_keys(json!({"sub": "user-1"}), userinfo, &protected,)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn discovered_urls_must_stay_on_discovery_host() {
         assert!(
             validate_discovered_url(
@@ -2064,6 +2960,45 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn discovered_urls_cannot_change_scheme_or_effective_port() {
+        let discovery = "https://issuer.example.com/.well-known/openid-configuration";
+        for endpoint in [
+            "http://issuer.example.com/token",
+            "https://issuer.example.com:8443/token",
+        ] {
+            assert!(validate_discovered_url(discovery, endpoint, "token_endpoint").is_err());
+        }
+        assert_eq!(
+            validate_discovered_url(
+                discovery,
+                "https://issuer.example.com/token",
+                "token_endpoint",
+            )
+            .expect("same-origin HTTPS endpoint"),
+            "https://issuer.example.com/token"
+        );
+    }
+
+    #[test]
+    fn direct_provider_urls_allow_http_only_for_literal_loopback_or_localhost() {
+        for allowed in [
+            "http://localhost:8080/token",
+            "http://127.0.0.1:8080/token",
+            "http://[::1]:8080/token",
+            "https://idp.example.com/token",
+        ] {
+            assert!(validate_url_string(allowed, "token_endpoint").is_ok());
+        }
+        for denied in [
+            "http://idp.example.com/token",
+            "http://127.0.0.1.example.com/token",
+            "ftp://localhost/token",
+        ] {
+            assert!(validate_url_string(denied, "token_endpoint").is_err());
+        }
     }
 
     #[test]
@@ -2092,6 +3027,52 @@ mod tests {
         );
     }
 
+    fn default_redirect_behavior() -> BehaviorConfig {
+        BehaviorConfig {
+            challenge_html_status: 302,
+            challenge_api_status: 401,
+            html_accept_substrings: vec!["text/html".to_string()],
+            state_ttl: Duration::from_secs(600),
+            refresh_skew: Duration::from_secs(30),
+            rp_initiated_logout: true,
+            post_login_redirect_param: None,
+            post_login_default_path: "/".to_string(),
+            trusted_redirect_hosts: vec!["app.example.com".to_string()],
+        }
+    }
+
+    #[test]
+    fn default_original_url_preserves_raw_query_exactly() {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/orders".into());
+        ctx.headers
+            .insert("host".to_string(), "app.example.com".to_string());
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+        ctx.set_raw_query_string(
+            "filter=open&page=2&tag=a&tag=b&encoded=%2Fkeep%20raw".to_string(),
+        );
+        ctx.materialize_query_params();
+
+        assert_eq!(
+            original_url(&ctx, &default_redirect_behavior()),
+            "https://app.example.com/orders?filter=open&page=2&tag=a&tag=b&encoded=%2Fkeep%20raw"
+        );
+    }
+
+    #[test]
+    fn default_original_url_without_query_has_no_question_mark() {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/orders".into());
+        ctx.headers
+            .insert("host".to_string(), "app.example.com".to_string());
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
+
+        assert_eq!(
+            original_url(&ctx, &default_redirect_behavior()),
+            "https://app.example.com/orders"
+        );
+    }
+
     #[test]
     fn cookie_value_skips_segments_without_equals() {
         let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
@@ -2112,6 +3093,201 @@ mod tests {
         assert_eq!(cookie_value(&ctx, "ferrum_session"), None);
     }
 
+    fn plugin_config_without_optional_defaults(redirect_uri: &str) -> Value {
+        json!({
+            "providers": [{
+                "issuer": "https://idp.example.com",
+                "client_id": "client-1",
+                "authorization_endpoint": "https://idp.example.com/authorize",
+                "token_endpoint": "https://idp.example.com/token",
+                "jwks_uri": "https://idp.example.com/jwks",
+                "scopes": ["openid"],
+                "redirect_uri": redirect_uri,
+                "client_auth": {"client_secret": "shhh"}
+            }],
+            "session": {
+                "encryption_secret": "0123456789012345678901234567890123"
+            }
+        })
+    }
+
+    fn build_plugin_without_workers(config: &Value) -> OidcRelyingParty {
+        OidcRelyingParty::new_internal(config, PluginHttpClient::default(), false)
+            .expect("OIDC test config is valid")
+    }
+
+    #[test]
+    fn concurrent_browser_challenges_keep_distinct_state_bindings() {
+        let config =
+            plugin_config_without_optional_defaults("https://app.example.com/oauth/callback");
+        let plugin = build_plugin_without_workers(&config);
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+        ctx.headers
+            .insert("accept".to_string(), "text/html".to_string());
+
+        let mut issue_challenge = || {
+            let PluginResult::Reject {
+                status_code,
+                headers,
+                ..
+            } = plugin.challenge(&mut ctx, false)
+            else {
+                panic!("browser challenge must redirect");
+            };
+            assert_eq!(status_code, 302);
+            let location = headers.get("location").expect("challenge location");
+            let state = Url::parse(location)
+                .expect("absolute authorization URL")
+                .query_pairs()
+                .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+                .expect("state query parameter");
+            let cookie_pair = headers
+                .get("set-cookie")
+                .expect("correlation cookie")
+                .split(';')
+                .next()
+                .expect("cookie pair");
+            let (name, value) = cookie_pair.split_once('=').expect("named cookie");
+            (state, name.to_string(), value.to_string())
+        };
+
+        let first = issue_challenge();
+        let second = issue_challenge();
+        assert_ne!(first.0, second.0);
+        assert_ne!(first.1, second.1, "each state needs its own cookie name");
+        assert_eq!(first.1, plugin.correlation_cookie_name(&first.0));
+        assert_eq!(second.1, plugin.correlation_cookie_name(&second.0));
+
+        let mut callback =
+            RequestContext::new("127.0.0.1".into(), "GET".into(), "/oauth/callback".into());
+        callback.headers.insert(
+            "cookie".to_string(),
+            format!("{}={}; {}={}", first.1, first.2, second.1, second.2),
+        );
+        assert_eq!(cookie_value(&callback, &first.1), Some(first.2.as_str()));
+        assert_eq!(cookie_value(&callback, &second.1), Some(second.2.as_str()));
+
+        let first_hash: [u8; 32] = Sha256::digest(first.2.as_bytes()).into();
+        let second_hash: [u8; 32] = Sha256::digest(second.2.as_bytes()).into();
+        assert!(
+            plugin
+                .session
+                .state_cache
+                .take_bound(&first.0, &first_hash)
+                .is_some()
+        );
+        assert!(
+            plugin
+                .session
+                .state_cache
+                .take_bound(&second.0, &second_hash)
+                .is_some(),
+            "consuming one browser-bound flow must not evict its sibling"
+        );
+    }
+
+    #[test]
+    fn session_context_is_stable_across_omitted_and_explicit_defaults() {
+        let omitted_config =
+            plugin_config_without_optional_defaults("https://app.example.com/oauth/callback");
+        let explicit_config = json!({
+            "providers": [{
+                "issuer": "https://idp.example.com",
+                "discovery_url": null,
+                "authorization_endpoint": "https://idp.example.com/authorize",
+                "token_endpoint": "https://idp.example.com/token",
+                "userinfo_endpoint": null,
+                "jwks_uri": "https://idp.example.com/jwks",
+                "end_session_endpoint": null,
+                "client_id": "client-1",
+                "client_auth": {
+                    "method": "client_secret_basic",
+                    "client_secret": "shhh"
+                },
+                "redirect_uri": "https://app.example.com/oauth/callback",
+                "callback_path": "/oauth/callback",
+                "logout_path": "/oauth/logout",
+                "post_logout_redirect_uri": null,
+                "scopes": ["openid"],
+                "audiences": [],
+                "required_scopes": [],
+                "required_roles": [],
+                "scope_claim": "scope",
+                "role_claim": "roles",
+                "consumer_identity_claim": "sub",
+                "consumer_header_claim": "sub",
+                "claim_headers": {},
+                "id_token_clock_skew_secs": 60
+            }],
+            "session": {
+                "encryption_secret": "0123456789012345678901234567890123",
+                "encryption_secret_previous": null,
+                "store": "cookie",
+                "ttl_secs": 3600,
+                "idle_ttl_secs": 1800,
+                "max_cookie_bytes": 8000,
+                "secure": true,
+                "http_only": true,
+                "same_site": "lax",
+                "domain": null,
+                "path": "/"
+            },
+            "behavior": {
+                "state_ttl_secs": 600,
+                "state_cache_max_entries": 10000,
+                "state_cache_max_entries_per_source": 32,
+                "post_login_redirect_param": null,
+                "trusted_redirect_hosts": [],
+                "refresh_skew_secs": 30,
+                "challenge_html_status": 302,
+                "challenge_api_status": 401,
+                "html_accept_substrings": [],
+                "rp_initiated_logout": true,
+                "post_login_default_path": "/"
+            }
+        });
+        let omitted = build_plugin_without_workers(&omitted_config);
+        let explicit = build_plugin_without_workers(&explicit_config);
+
+        assert_eq!(omitted.session.cookie_name, explicit.session.cookie_name);
+        assert_eq!(omitted.session.context_id, explicit.session.context_id);
+
+        let now = chrono::Utc::now().timestamp();
+        let mut payload = session_payload(now - 10, now - 10, None, now + 1000);
+        payload.context_id = omitted.session.context_id.clone();
+        let cookie = omitted
+            .seal_session_cookie(&payload)
+            .expect("omitted-default context seals");
+        assert!(
+            explicit
+                .open_session(sealed_cookie_value(&cookie))
+                .is_some(),
+            "an explicitly defaulted reload must retain the same session AAD"
+        );
+    }
+
+    #[test]
+    fn localhost_http_callback_honors_insecure_correlation_cookie_setting() {
+        for redirect_uri in [
+            "http://localhost/oauth/callback",
+            "http://127.0.0.1/oauth/callback",
+            "http://[::1]/oauth/callback",
+        ] {
+            let mut config = plugin_config_without_optional_defaults(redirect_uri);
+            config["session"]["secure"] = Value::Bool(false);
+            let plugin = build_plugin_without_workers(&config);
+            let correlation_cookie = plugin.correlation_cookie("state", "browser-binding");
+
+            assert!(!plugin.session.cookie_attrs.contains("; Secure"));
+            assert!(
+                !correlation_cookie.contains("; Secure"),
+                "local HTTP callback cookie must match session.secure=false for {redirect_uri}"
+            );
+            assert!(correlation_cookie.contains("; HttpOnly"));
+            assert!(correlation_cookie.contains("SameSite=Lax"));
+        }
+    }
+
     #[test]
     fn next_refresh_after_floors_at_backoff() {
         // Normal: refresh `refresh_skew` before expiry.
@@ -2123,12 +3299,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn oidc_audience_and_authorized_party_rules_fail_closed() {
+        let configured = vec!["api://orders".to_string()];
+        assert!(
+            validate_oidc_audience_and_azp(
+                &json!({"aud": ["client-1", "api://orders"], "azp": "client-1"}),
+                "client-1",
+                &configured,
+            )
+            .is_ok()
+        );
+        for claims in [
+            json!({"aud": "other-client"}),
+            json!({"aud": ["client-1", "api://orders"]}),
+            json!({"aud": ["client-1", "api://orders"], "azp": "other-client"}),
+            json!({"aud": ["client-1"], "azp": 7}),
+            json!({"aud": ["client-1"]}),
+        ] {
+            let result = validate_oidc_audience_and_azp(&claims, "client-1", &configured);
+            if claims == json!({"aud": ["client-1"]}) {
+                assert!(
+                    result.is_err(),
+                    "configured resource audience is also required"
+                );
+            } else {
+                assert!(result.is_err(), "claims should be rejected: {claims}");
+            }
+        }
+    }
+
+    #[test]
+    fn id_token_subject_must_be_a_non_empty_string() {
+        assert_eq!(
+            required_subject(&json!({"sub": "user-1"}), "ID token").ok(),
+            Some("user-1")
+        );
+        for claims in [
+            json!({}),
+            json!({"sub": null}),
+            json!({"sub": 7}),
+            json!({"sub": ""}),
+            json!({"sub": "   "}),
+        ] {
+            assert!(required_subject(&claims, "ID token").is_err());
+        }
+    }
+
     fn build_plugin(token_endpoint: &str) -> OidcRelyingParty {
+        build_plugin_with_client(token_endpoint, "client-1")
+    }
+
+    fn build_plugin_with_client(token_endpoint: &str, client_id: &str) -> OidcRelyingParty {
         OidcRelyingParty::new(
             &json!({
                 "providers": [{
                     "issuer": "https://idp.example.com",
-                    "client_id": "client-1",
+                    "client_id": client_id,
                     "authorization_endpoint": "https://idp.example.com/authorize",
                     "token_endpoint": token_endpoint,
                     "jwks_uri": "https://idp.example.com/jwks",
@@ -2155,7 +3382,8 @@ mod tests {
         refresh_after: i64,
     ) -> SessionPayload {
         SessionPayload {
-            version: 1,
+            version: SESSION_PAYLOAD_VERSION,
+            context_id: String::new(),
             sub: "user-1".to_string(),
             id_token_b64: "old-id".to_string(),
             access_token_b64: "old-at".to_string(),
@@ -2171,7 +3399,10 @@ mod tests {
     }
 
     fn ctx_with_session(plugin: &OidcRelyingParty, payload: &SessionPayload) -> RequestContext {
-        let set_cookie = plugin.seal_session_cookie(payload).expect("seal session");
+        let mut payload = payload.clone();
+        payload.version = SESSION_PAYLOAD_VERSION;
+        payload.context_id = plugin.session.context_id.clone();
+        let set_cookie = plugin.seal_session_cookie(&payload).expect("seal session");
         // "name=value; attrs..." -> request "Cookie: name=value".
         let cookie_pair = set_cookie.split(';').next().unwrap().to_string();
         let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
@@ -2184,11 +3415,172 @@ mod tests {
         response_headers: &HashMap<String, String>,
     ) -> Option<SessionPayload> {
         let set_cookie = response_headers.get("set-cookie")?;
+        let prefix = format!("{}=", plugin.session.cookie_name);
         let cookie = set_cookie
             .split('\n')
-            .find(|c| c.trim_start().starts_with("ferrum_session="))?;
+            .find(|c| c.trim_start().starts_with(&prefix))?;
         let value = cookie.split(';').next()?.split_once('=')?.1;
         plugin.open_session(value)
+    }
+
+    fn sealed_cookie_value(set_cookie: &str) -> &str {
+        set_cookie
+            .split(';')
+            .next()
+            .and_then(|pair| pair.split_once('='))
+            .map(|(_, value)| value)
+            .expect("sealed cookie value")
+    }
+
+    #[tokio::test]
+    async fn session_cookie_is_bound_to_provider_context_and_version() {
+        let first = build_plugin_with_client("https://idp.example.com/token", "client-1");
+        let second = build_plugin_with_client("https://idp.example.com/token", "client-2");
+        assert_ne!(first.session.cookie_name, second.session.cookie_name);
+        assert_ne!(first.session.context_id, second.session.context_id);
+
+        let now = chrono::Utc::now().timestamp();
+        let mut payload = session_payload(now - 10, now - 10, None, now + 1000);
+        payload.context_id = first.session.context_id.clone();
+        let first_cookie = first
+            .seal_session_cookie(&payload)
+            .expect("first context seals");
+        assert!(
+            second
+                .open_session(sealed_cookie_value(&first_cookie))
+                .is_none(),
+            "a shared secret must not make cookies portable across client contexts"
+        );
+
+        payload.version = SESSION_PAYLOAD_VERSION.saturating_add(1);
+        let wrong_version = first
+            .seal_session_cookie(&payload)
+            .expect("test payload seals");
+        assert!(
+            first
+                .open_session(sealed_cookie_value(&wrong_version))
+                .is_none(),
+            "unknown payload versions must fail closed"
+        );
+    }
+
+    fn flow_for(source_ip: &str, expires_at: Instant) -> FlowState {
+        FlowState {
+            code_verifier: "verifier".to_string(),
+            nonce: "nonce".to_string(),
+            original_url: "https://app.example.com/".to_string(),
+            browser_binding_hash: [7; 32],
+            source_ip: source_ip.to_string(),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn state_cache_capacity_reservation_is_atomic_under_concurrency() {
+        let cache = Arc::new(StateCache::new(10, 10, Duration::from_secs(600), 16));
+        let mut workers = Vec::new();
+        for idx in 0..40 {
+            let cache = Arc::clone(&cache);
+            workers.push(std::thread::spawn(move || {
+                cache
+                    .insert(
+                        format!("state-{idx}"),
+                        flow_for(
+                            &format!("192.0.2.{idx}"),
+                            Instant::now() + Duration::from_secs(60),
+                        ),
+                    )
+                    .is_ok()
+            }));
+        }
+        let admitted = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker completes"))
+            .filter(|admitted| *admitted)
+            .count();
+
+        assert_eq!(admitted, 10);
+        assert_eq!(cache.active_entries.load(Ordering::Acquire), 10);
+        assert_eq!(cache.entries.len(), 10);
+    }
+
+    #[test]
+    fn state_cache_releases_global_and_source_capacity_on_take() {
+        let cache = StateCache::new(1, 1, Duration::from_secs(600), 16);
+        cache
+            .insert(
+                "first".to_string(),
+                flow_for("192.0.2.1", Instant::now() + Duration::from_secs(60)),
+            )
+            .expect("first flow admitted");
+        assert!(
+            cache
+                .insert(
+                    "blocked".to_string(),
+                    flow_for("192.0.2.2", Instant::now() + Duration::from_secs(60)),
+                )
+                .is_err()
+        );
+        assert!(cache.take("first").is_some());
+        cache
+            .insert(
+                "replacement".to_string(),
+                flow_for("192.0.2.1", Instant::now() + Duration::from_secs(60)),
+            )
+            .expect("released capacity is reusable");
+    }
+
+    fn discovery_config(discovery_url: &str) -> Value {
+        json!({
+            "providers": [{
+                "issuer": "http://127.0.0.1:9",
+                "discovery_url": discovery_url,
+                "client_id": "client-1",
+                "scopes": ["openid"],
+                "redirect_uri": "http://localhost/oauth/callback",
+                "callback_path": "/oauth/callback",
+                "client_auth": {"method": "client_secret_basic", "client_secret": "secret"}
+            }],
+            "session": {
+                "encryption_secret": "0123456789012345678901234567890123"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn validation_skips_workers_and_runtime_drop_aborts_discovery() {
+        let config = discovery_config("http://127.0.0.1:9/.well-known/openid-configuration");
+        let validated = OidcRelyingParty::new_internal(&config, PluginHttpClient::default(), false)
+            .expect("shape-only validation succeeds");
+        assert!(validated.discovery_task.is_none());
+        assert!(validated.provider.jwks_store.load().is_none());
+        validated
+            .provider
+            .jwks_store
+            .store(Arc::new(Some(Arc::new(JwksKeyStore::new(
+                "http://127.0.0.1:9/jwks".to_string(),
+                PluginHttpClient::default(),
+            )))));
+        assert_eq!(
+            validated.active_jwks_uris(),
+            vec!["http://127.0.0.1:9/jwks".to_string()]
+        );
+
+        let runtime = OidcRelyingParty::new_internal(&config, PluginHttpClient::default(), true)
+            .expect("runtime construction succeeds");
+        let abort_handle = runtime
+            .discovery_task
+            .as_ref()
+            .expect("runtime discovery task")
+            .abort_handle();
+        drop(runtime);
+        for _ in 0..10 {
+            if abort_handle.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(abort_handle.is_finished());
     }
 
     // tokio runtime required: building the plugin spawns the background JWKS
@@ -2298,6 +3690,68 @@ mod tests {
         assert_eq!(refreshed.access_token_b64, "new-at");
         assert_eq!(refreshed.refresh_token_b64.as_deref(), Some("rt-2"));
         assert!(refreshed.refresh_after_unix > now);
+    }
+
+    #[tokio::test]
+    async fn oversized_provider_json_responses_are_rejected_before_deserialization() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
+                b' ';
+                MAX_TOKEN_RESPONSE_BYTES
+                    + 1
+            ]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/userinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
+                b' ';
+                MAX_USERINFO_RESPONSE_BYTES
+                    + 1
+            ]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
+                b' ';
+                MAX_DISCOVERY_RESPONSE_BYTES
+                    + 1
+            ]))
+            .mount(&server)
+            .await;
+
+        let plugin = build_plugin(&format!("{}/token", server.uri()));
+        let discovery = plugin
+            .provider
+            .discovery
+            .load()
+            .as_ref()
+            .as_ref()
+            .cloned()
+            .expect("explicit discovery document");
+        assert!(
+            plugin
+                .exchange_code(&discovery, "code", "verifier")
+                .await
+                .is_err()
+        );
+        assert!(
+            plugin
+                .fetch_userinfo(&format!("{}/userinfo", server.uri()), "access-token")
+                .await
+                .is_err()
+        );
+        assert!(
+            fetch_discovery(
+                &PluginHttpClient::default(),
+                &format!("{}/.well-known/openid-configuration", server.uri()),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2466,6 +3920,77 @@ mod tests {
         p += c;
         let e = der[p..p + e_len].to_vec();
         (n, e)
+    }
+
+    #[tokio::test]
+    async fn id_token_validation_rejects_future_nbf_missing_sub_and_bad_azp() {
+        let server = MockServer::start().await;
+        let jwks =
+            rsa_jwks_from_public_pem(include_bytes!("../../tests/fixtures/test_rsa_public.pem"));
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks))
+            .mount(&server)
+            .await;
+        let plugin = OidcRelyingParty::new(
+            &json!({
+                "providers": [{
+                    "issuer": "https://idp.example.com",
+                    "client_id": "client-1",
+                    "authorization_endpoint": "https://idp.example.com/authorize",
+                    "token_endpoint": "https://idp.example.com/token",
+                    "jwks_uri": format!("{}/jwks", server.uri()),
+                    "scopes": ["openid"],
+                    "redirect_uri": "https://app.example.com/oauth/callback",
+                    "callback_path": "/oauth/callback",
+                    "client_auth": {"method": "client_secret_basic", "client_secret": "shhh"}
+                }],
+                "session": {
+                    "encryption_secret": "0123456789012345678901234567890123"
+                }
+            }),
+            PluginHttpClient::default(),
+        )
+        .expect("OIDC config");
+        let now = chrono::Utc::now().timestamp();
+
+        let future_nbf = sign_rs256(&json!({
+            "iss": "https://idp.example.com",
+            "aud": "client-1",
+            "sub": "user-1",
+            "nonce": "nonce-1",
+            "exp": now + 3600,
+            "nbf": now + 600,
+        }));
+        assert!(
+            plugin
+                .verify_id_token(&future_nbf, "nonce-1")
+                .await
+                .is_err()
+        );
+
+        let missing_sub = sign_rs256(&json!({
+            "iss": "https://idp.example.com",
+            "aud": "client-1",
+            "nonce": "nonce-1",
+            "exp": now + 3600,
+        }));
+        assert!(
+            plugin
+                .verify_id_token(&missing_sub, "nonce-1")
+                .await
+                .is_err()
+        );
+
+        let wrong_azp = sign_rs256(&json!({
+            "iss": "https://idp.example.com",
+            "aud": ["client-1", "api://orders"],
+            "azp": "other-client",
+            "sub": "user-1",
+            "nonce": "nonce-1",
+            "exp": now + 3600,
+        }));
+        assert!(plugin.verify_id_token(&wrong_azp, "nonce-1").await.is_err());
     }
 
     #[tokio::test]

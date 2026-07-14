@@ -20,19 +20,39 @@ pub struct SessionCookieCodec {
     previous: Option<LessSafeKey>,
     max_cookie_bytes: usize,
     rng: SystemRandom,
+    aad: Vec<u8>,
 }
 
 impl SessionCookieCodec {
+    /// Convenience constructor with no additional AAD, used only by tests;
+    /// production paths use `new_with_aad` for context binding.
+    #[cfg(test)]
     pub fn new(
         current_secret: &str,
         previous_secret: Option<&str>,
         max_cookie_bytes: usize,
+    ) -> Result<Self, String> {
+        Self::new_with_aad(current_secret, previous_secret, max_cookie_bytes, &[])
+    }
+
+    /// Build a codec that cryptographically binds every sealed value to
+    /// `associated_data`.
+    ///
+    /// The associated data is authenticated but not encrypted or serialized
+    /// into the cookie. Callers should pass a stable, versioned context that
+    /// identifies the trust boundary in which the cookie is valid.
+    pub fn new_with_aad(
+        current_secret: &str,
+        previous_secret: Option<&str>,
+        max_cookie_bytes: usize,
+        associated_data: &[u8],
     ) -> Result<Self, String> {
         Ok(Self {
             current: derive_key(current_secret)?,
             previous: previous_secret.map(derive_key).transpose()?,
             max_cookie_bytes,
             rng: SystemRandom::new(),
+            aad: associated_data.to_vec(),
         })
     }
 
@@ -44,7 +64,7 @@ impl SessionCookieCodec {
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
         let mut in_out = plaintext.to_vec();
         self.current
-            .seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+            .seal_in_place_append_tag(nonce, Aad::from(self.aad.as_slice()), &mut in_out)
             .map_err(|_| "session_cookie: seal failed".to_string())?;
         let mut encoded = Vec::with_capacity(NONCE_LEN + in_out.len());
         encoded.extend_from_slice(&nonce_bytes);
@@ -81,7 +101,7 @@ impl SessionCookieCodec {
     ) -> Option<Vec<u8>> {
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
         let mut in_out = ciphertext.to_vec();
-        key.open_in_place(nonce, Aad::empty(), &mut in_out)
+        key.open_in_place(nonce, Aad::from(self.aad.as_slice()), &mut in_out)
             .ok()
             .map(|plaintext| plaintext.to_vec())
     }
@@ -145,5 +165,17 @@ mod tests {
     fn large_payload_above_cap_seal_fails() {
         let codec = SessionCookieCodec::new(SECRET, None, 10).expect("codec");
         assert!(codec.seal(b"payload").is_err());
+    }
+
+    #[test]
+    fn associated_data_prevents_cross_context_reuse() {
+        let first =
+            SessionCookieCodec::new_with_aad(SECRET, None, 4000, b"issuer-a").expect("first codec");
+        let second = SessionCookieCodec::new_with_aad(SECRET, None, 4000, b"issuer-b")
+            .expect("second codec");
+        let sealed = first.seal(b"payload").expect("seal");
+
+        assert_eq!(first.open(&sealed).as_deref(), Some(&b"payload"[..]));
+        assert!(second.open(&sealed).is_none());
     }
 }

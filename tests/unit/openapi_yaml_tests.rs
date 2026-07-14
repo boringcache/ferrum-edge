@@ -494,6 +494,126 @@ fn waf_scoring_weights_reject_unknown_severities() {
 }
 
 #[test]
+fn oidc_relying_party_schema_matches_strict_runtime_surface() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/OidcRelyingPartyConfig")
+        .expect("missing OidcRelyingPartyConfig schema");
+    assert_eq!(schema["additionalProperties"], false);
+
+    let provider = &schema["properties"]["providers"]["items"];
+    assert_eq!(provider["additionalProperties"], false);
+    let provider_fields: BTreeSet<_> = provider["properties"]
+        .as_object()
+        .expect("provider properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        provider_fields,
+        BTreeSet::from([
+            "audiences",
+            "authorization_endpoint",
+            "callback_path",
+            "claim_headers",
+            "client_auth",
+            "client_id",
+            "consumer_header_claim",
+            "consumer_identity_claim",
+            "discovery_url",
+            "end_session_endpoint",
+            "id_token_clock_skew_secs",
+            "issuer",
+            "jwks_uri",
+            "logout_path",
+            "post_logout_redirect_uri",
+            "redirect_uri",
+            "required_roles",
+            "required_scopes",
+            "role_claim",
+            "scope_claim",
+            "scopes",
+            "token_endpoint",
+            "userinfo_endpoint",
+        ])
+    );
+    assert!(
+        provider["properties"]
+            .get("post_logout_redirect_uri")
+            .is_some()
+    );
+    assert_eq!(
+        provider["properties"]["id_token_clock_skew_secs"]["default"],
+        60
+    );
+    assert_eq!(
+        provider["properties"]["client_auth"]["additionalProperties"],
+        false
+    );
+
+    let session = &schema["properties"]["session"];
+    assert_eq!(session["additionalProperties"], false);
+    assert!(session["properties"].get("redis_url").is_none());
+    let session_fields: BTreeSet<_> = session["properties"]
+        .as_object()
+        .expect("session properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        session_fields,
+        BTreeSet::from([
+            "cookie_name",
+            "domain",
+            "encryption_secret",
+            "encryption_secret_previous",
+            "http_only",
+            "idle_ttl_secs",
+            "max_cookie_bytes",
+            "path",
+            "same_site",
+            "secure",
+            "store",
+            "ttl_secs",
+        ])
+    );
+
+    let behavior = &schema["properties"]["behavior"];
+    assert_eq!(behavior["additionalProperties"], false);
+    let behavior_fields: BTreeSet<_> = behavior["properties"]
+        .as_object()
+        .expect("behavior properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        behavior_fields,
+        BTreeSet::from([
+            "challenge_api_status",
+            "challenge_html_status",
+            "html_accept_substrings",
+            "post_login_default_path",
+            "post_login_redirect_param",
+            "refresh_skew_secs",
+            "rp_initiated_logout",
+            "state_cache_max_entries",
+            "state_cache_max_entries_per_source",
+            "state_ttl_secs",
+            "trusted_redirect_hosts",
+        ])
+    );
+    assert_eq!(
+        behavior["properties"]["state_cache_max_entries"]["default"],
+        10_000
+    );
+    assert_eq!(
+        behavior["properties"]["state_cache_max_entries_per_source"]["default"],
+        32
+    );
+}
+
+#[test]
 fn access_control_schema_matches_runtime_validation() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

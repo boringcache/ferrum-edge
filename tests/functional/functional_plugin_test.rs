@@ -1573,6 +1573,96 @@ async fn test_plugin_request_transformer_body_rules_bypass_direct_h2_pool() {
     );
 }
 
+#[tokio::test]
+#[ignore]
+async fn test_oidc_callback_materializes_query_in_production_pipeline() {
+    let harness = PluginTestHarness::new()
+        .await
+        .expect("Failed to create harness");
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend port");
+    let backend_port = backend_listener
+        .local_addr()
+        .expect("backend address")
+        .port();
+    drop(backend_listener);
+    let _backend = start_header_echo_backend(backend_port)
+        .await
+        .expect("start backend");
+    let admin_client = reqwest::Client::new();
+    let redirect_uri = format!("{}/oauth/callback", harness.proxy_base_url);
+
+    setup_proxy_with_plugins(
+        &harness,
+        &admin_client,
+        "proxy-oidc-callback-query",
+        "/",
+        backend_port,
+        vec![json!({
+            "id": "plugin-oidc-callback-query",
+            "plugin_name": "oidc_relying_party",
+            "scope": "proxy",
+            "proxy_id": "proxy-oidc-callback-query",
+            "enabled": true,
+            "config": {
+                "providers": [{
+                    "issuer": "http://127.0.0.1:9",
+                    "authorization_endpoint": "http://127.0.0.1:9/authorize",
+                    "token_endpoint": "http://127.0.0.1:9/token",
+                    "jwks_uri": "http://127.0.0.1:9/jwks",
+                    "client_id": "ferrum-gateway",
+                    "client_auth": {
+                        "method": "client_secret_basic",
+                        "client_secret": "secret"
+                    },
+                    "scopes": ["openid"],
+                    "redirect_uri": redirect_uri,
+                    "callback_path": "/oauth/callback"
+                }],
+                "session": {
+                    "encryption_secret": "01234567890123456789012345678901"
+                }
+            }
+        })],
+    )
+    .await
+    .expect("configure OIDC proxy");
+    harness.wait_for_poll().await;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("callback client");
+    let response = client
+        .get(format!(
+            "{}/oauth/callback?code=example&state=encoded%2Bstate",
+            harness.proxy_base_url
+        ))
+        .send()
+        .await
+        .expect("callback response");
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.text().await.expect("callback body"),
+        r#"{"error":"Invalid state"}"#
+    );
+
+    let missing = client
+        .get(format!(
+            "{}/oauth/callback?code=example",
+            harness.proxy_base_url
+        ))
+        .send()
+        .await
+        .expect("missing-state response");
+    assert_eq!(missing.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        missing.text().await.expect("missing-state body"),
+        r#"{"error":"Missing state"}"#
+    );
+}
+
 // ============================================================================
 // Response Transformer Plugin Test
 // ============================================================================
