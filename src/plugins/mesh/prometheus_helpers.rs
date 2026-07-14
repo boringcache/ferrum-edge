@@ -1074,7 +1074,30 @@ pub(crate) fn mesh_request_key_for_family(
     };
     let mut key = base.clone();
     apply_metric_override_plan(&mut key, plan);
+    normalize_removed_labels(&mut key);
     key
+}
+
+/// Collapse every removed label onto one shared sentinel value so the derived
+/// `Hash`/`Eq` no longer distinguishes keys by values that rendering omits.
+/// Without this, traffic differing only on a removed label registers multiple
+/// entries that render with an identical Prometheus label set, splitting one
+/// logical series into duplicates. Runs after the full ordered plan so rename
+/// operations can still copy a value before its source label is cleared.
+fn normalize_removed_labels(key: &mut MeshRequestKey) {
+    if key.removed_labels == 0 {
+        return;
+    }
+    static REMOVED_LABEL_SENTINEL: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from(""));
+    for index in 0u8..=12 {
+        if key.removed_labels & (1u16 << index) == 0 {
+            continue;
+        }
+        let Some(label) = MeshMetricLabel::from_index(index) else {
+            continue;
+        };
+        set_metric_label_value(key, label, Arc::clone(&REMOVED_LABEL_SENTINEL));
+    }
 }
 
 fn apply_metric_override_plan(key: &mut MeshRequestKey, mut plan: &str) {
@@ -1477,6 +1500,48 @@ mod tests {
             labels.contains("destination_workload=\"frontend\""),
             "{labels}"
         );
+    }
+
+    #[test]
+    fn removed_and_renamed_labels_do_not_split_series_identity() {
+        let summary = TransactionSummary {
+            metadata: HashMap::from([(
+                MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
+                // Remove source_principal, rename source_workload into
+                // source_app (removing source_workload).
+                "r2;n0,3;".to_string(),
+            )]),
+            ..TransactionSummary::default()
+        };
+
+        let base_a = mesh_key();
+        let mut base_b = mesh_key();
+        base_b.source_principal = Arc::from("other-principal");
+        base_b.source_workload = Arc::from("frontend"); // same rename source value
+
+        let key_a = mesh_request_key_for_family(&summary, &base_a, MeshMetricFamily::RequestCount);
+        let key_b = mesh_request_key_for_family(&summary, &base_b, MeshMetricFamily::RequestCount);
+
+        // Rendering omits removed labels, so keys differing only on removed
+        // label values must compare and hash equal or one scrape emits
+        // duplicate series with identical label sets.
+        assert_eq!(key_a, key_b);
+        assert_eq!(
+            mesh_label_fragment(&key_a, None),
+            mesh_label_fragment(&key_b, None)
+        );
+        // The rename still carried the original value before clearing it.
+        assert!(
+            mesh_label_fragment(&key_a, None).contains("source_app=\"frontend\""),
+            "{}",
+            mesh_label_fragment(&key_a, None)
+        );
+
+        // A base whose renamed *source value* differs must stay distinct.
+        let mut base_c = mesh_key();
+        base_c.source_workload = Arc::from("checkout");
+        let key_c = mesh_request_key_for_family(&summary, &base_c, MeshMetricFamily::RequestCount);
+        assert_ne!(key_a, key_c);
     }
 
     #[test]

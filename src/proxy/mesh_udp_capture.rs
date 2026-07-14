@@ -1098,6 +1098,7 @@ async fn run_udp_egress_session(
         key.client.ip(),
         &entry.service_fqdn,
         key.orig_dst.port(),
+        source_identity.map(|identity| &identity.principal),
     )
     .await;
 

@@ -78,6 +78,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
         remote_addr.ip(),
         &entry.service_fqdn,
         orig_dst.port(),
+        asserted_source_identity,
     )
     .await;
     // Scope passive health to the stream-family dispatch port whenever an

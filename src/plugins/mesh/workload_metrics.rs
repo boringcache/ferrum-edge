@@ -733,6 +733,26 @@ impl Plugin for WorkloadMetrics {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // `on_request_received` stamps source labels before `mesh_authz`
+        // evaluates Ambient UDP pod-UID/source-scope evidence. When authz
+        // discards that evidence (`mesh_authz.ignored_udp_source_scope`) and
+        // rejects, `before_proxy` never runs, so restamp here — this hook runs
+        // on the reject path before the rejected transaction summary is built.
+        // The stale baggage-derived source keys are cleared first because the
+        // attesting-peer fallback identity may not carry every SPIFFE path
+        // segment the discarded baggage principal did.
+        if ctx.metadata.contains_key(IGNORED_UDP_SOURCE_SCOPE_METADATA)
+            && ctx.metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str)
+                != ctx.peer_spiffe_id.as_ref().map(SpiffeId::as_str)
+        {
+            ctx.metadata.remove(MESH_SOURCE_PRINCIPAL);
+            ctx.metadata.remove(MESH_SOURCE_TRUST_DOMAIN);
+            ctx.metadata.remove(MESH_SOURCE_NAMESPACE);
+            ctx.metadata.remove(MESH_SOURCE_SERVICE_ACCOUNT);
+            let headers = std::mem::take(&mut ctx.headers);
+            self.annotate_http_context(ctx, &headers);
+            ctx.headers = headers;
+        }
         if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
             response_headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
         }
@@ -740,7 +760,10 @@ impl Plugin for WorkloadMetrics {
     }
 
     fn applies_after_proxy_on_reject(&self) -> bool {
-        self.trace_context_enabled()
+        // Always participate in reject-path `after_proxy`: even with tracing
+        // disabled, a mesh_authz UDP source-scope reject needs its RED /
+        // service-graph source labels restamped (see `after_proxy`).
+        true
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
@@ -803,10 +826,20 @@ impl Plugin for WorkloadMetrics {
                 self.insert_local_destination_workload_labels(metadata);
             }
             Some(MeshTrafficDirection::Outbound) => {
-                if let Some(identity) = self.workload_spiffe_id.as_ref() {
+                // Captured L4 egress (NodeWaypoint TCP, Ambient UDP) runs on
+                // the node data plane but carries the originating pod's
+                // verified identity as the authenticated peer. Honor it as
+                // the source so CLIENT spans/labels attribute the traffic to
+                // the captured workload instead of the waypoint/ztunnel.
+                if let Some(identity) = peer_identity.as_ref() {
                     insert_source_spiffe_labels(metadata, identity);
+                    self.insert_remote_source_workload_labels(metadata, Some(identity));
+                } else {
+                    if let Some(identity) = self.workload_spiffe_id.as_ref() {
+                        insert_source_spiffe_labels(metadata, identity);
+                    }
+                    self.insert_local_source_workload_labels(metadata);
                 }
-                self.insert_local_source_workload_labels(metadata);
                 self.insert_proxy_destination_labels(metadata, &proxy_namespace, &proxy_name);
             }
             None => {
@@ -1773,6 +1806,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn udp_source_scope_reject_restamps_source_to_attesting_peer() {
+        let metrics = WorkloadMetrics::new(&json!({
+            "namespace": "payments",
+            "workload_spiffe_id": "spiffe://cluster.local/ns/payments/sa/checkout",
+            "labels": {"app": "checkout"},
+            "trusted_hbone_assertors": [
+                "spiffe://cluster.local/ns/istio-system/sa/ztunnel"
+            ]
+        }))
+        .expect("metrics config");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api".to_string(),
+        );
+        ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+        ctx.peer_spiffe_id = Some(
+            SpiffeId::new("spiffe://cluster.local/ns/istio-system/sa/ztunnel")
+                .expect("assertor SPIFFE ID"),
+        );
+        ctx.metadata
+            .insert("request_protocol".to_string(), "hbone".to_string());
+        ctx.headers.insert(
+            BAGGAGE_HEADER.to_string(),
+            "source.principal=spiffe%3A%2F%2Fcluster.local%2Fns%2Fstorefront%2Fsa%2Ffrontend"
+                .to_string(),
+        );
+
+        // Request-received attribution runs before authorization and honors
+        // the trusted-assertor baggage.
+        metrics.on_request_received(&mut ctx).await;
+        assert_eq!(
+            ctx.metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str),
+            Some("spiffe://cluster.local/ns/storefront/sa/frontend")
+        );
+
+        // mesh_authz then discards the UDP pod-UID/source-scope evidence
+        // bundle, falls back to the attesting peer, and rejects before
+        // before_proxy can refresh the labels.
+        ctx.metadata.insert(
+            IGNORED_UDP_SOURCE_SCOPE_METADATA.to_string(),
+            "pod_uid_not_bound".to_string(),
+        );
+
+        let mut response_headers = HashMap::new();
+        metrics
+            .after_proxy(&mut ctx, 403, &mut response_headers)
+            .await;
+
+        assert_eq!(
+            ctx.metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str),
+            Some("spiffe://cluster.local/ns/istio-system/sa/ztunnel")
+        );
+        assert_eq!(
+            ctx.metadata.get("mesh.source.workload").map(String::as_str),
+            Some("ztunnel")
+        );
+        assert_eq!(
+            ctx.metadata.get(MESH_SOURCE_NAMESPACE).map(String::as_str),
+            Some("istio-system")
+        );
+    }
+
     #[test]
     fn outbound_local_workload_remains_the_source() {
         let metrics = WorkloadMetrics::new(&json!({
@@ -1845,6 +1942,46 @@ mod tests {
             "reviews.catalog.svc.cluster.local"
         );
         assert_eq!(outbound_key.destination_namespace.as_ref(), "catalog");
+    }
+
+    #[tokio::test]
+    async fn captured_outbound_stream_attributes_asserted_source_workload() {
+        // NodeWaypoint TCP / Ambient UDP capture runs on the node data plane
+        // (ztunnel/waypoint identity) but asserts the originating pod as the
+        // authenticated peer; the CLIENT-side labels must name that pod, not
+        // the capturing data plane.
+        let metrics = WorkloadMetrics::new(&json!({
+            "namespace": "istio-system",
+            "workload_spiffe_id": "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
+            "labels": {"app": "ztunnel"}
+        }))
+        .expect("metrics config");
+        let mut outbound = stream_context(
+            MeshTrafficDirection::Outbound,
+            Some("spiffe://cluster.local/ns/storefront/sa/frontend"),
+            "reviews.catalog.svc.cluster.local",
+        );
+        metrics.on_stream_connect(&mut outbound).await;
+        let metadata = outbound.take_metadata();
+
+        assert_eq!(
+            metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str),
+            Some("spiffe://cluster.local/ns/storefront/sa/frontend")
+        );
+        assert_eq!(
+            metadata.get("mesh.source.workload").map(String::as_str),
+            Some("frontend")
+        );
+        assert_eq!(
+            metadata.get(MESH_SOURCE_NAMESPACE).map(String::as_str),
+            Some("storefront")
+        );
+        assert_eq!(
+            metadata
+                .get("mesh.destination.workload")
+                .map(String::as_str),
+            Some("reviews.catalog.svc.cluster.local")
+        );
     }
 
     #[test]

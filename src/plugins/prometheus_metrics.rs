@@ -2296,6 +2296,7 @@ mod tests {
     use crate::tls::inventory::{
         TlsInventory, TlsInventoryEntry, TlsInventorySource, TlsInventoryState, TlsInventoryUsage,
     };
+    use std::collections::HashMap;
 
     fn mesh_summary() -> TransactionSummary {
         TransactionSummary {

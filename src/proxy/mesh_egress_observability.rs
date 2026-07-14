@@ -44,6 +44,7 @@ impl CapturedMeshEgressLifecycle {
         client_ip: std::net::IpAddr,
         destination_service: &str,
         destination_port: u16,
+        asserted_source_identity: Option<&crate::identity::SpiffeId>,
     ) -> Option<Self> {
         let plugins: Vec<_> = epoch
             .plugin_cache
@@ -66,7 +67,11 @@ impl CapturedMeshEgressLifecycle {
             backend_scheme: proxy.effective_scheme(),
             consumer_index: Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index))),
             identified_consumer: None,
-            authenticated_identity: None,
+            // NodeWaypoint TCP and Ambient UDP capture already verified the
+            // originating pod's identity before handing the flow here; carry
+            // it so workload_metrics attributes CLIENT spans/labels to the
+            // captured source workload rather than the waypoint/ztunnel.
+            authenticated_identity: asserted_source_identity.map(|identity| identity.to_string()),
             auth_method: None,
             metadata: None,
             tls_client_cert_der: None,
@@ -179,8 +184,12 @@ impl CapturedMeshEgressLifecycle {
         self.bytes_received = bytes_received;
         match outcome {
             CapturedUdpOutcome::IdleTimeout => {
-                self.connection_error = Some("captured mesh UDP session idle timeout".to_string());
-                self.error_class = Some(ErrorClass::ReadWriteTimeout);
+                // Idle expiry is how a healthy quiet UDP session normally
+                // ends; the generic UDP lifecycle records it with no
+                // connection error, and captured sessions must match so
+                // DNS-style flows don't inflate error-rate dashboards.
+                self.connection_error = None;
+                self.error_class = None;
                 self.disconnect_direction = None;
                 self.disconnect_cause = Some(DisconnectCause::IdleTimeout);
             }
@@ -358,5 +367,48 @@ mod tests {
             Some(DisconnectCause::GracefulShutdown)
         );
         assert!(summary.connection_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn udp_idle_expiry_finalizes_without_connection_error() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let plugin: Arc<dyn Plugin> = Arc::new(SummaryCapture {
+            tx: Mutex::new(Some(tx)),
+        });
+        let mut lifecycle = CapturedMeshEgressLifecycle {
+            plugins: vec![plugin],
+            stream_ctx: Some(stream_context()),
+            namespace: "default".to_string(),
+            proxy_id: "mesh-egress".to_string(),
+            proxy_name: Some("dns.kube-system.svc.cluster.local".to_string()),
+            client_ip: "10.0.0.2".to_string(),
+            backend_target: "10.0.0.8:53".to_string(),
+            protocol: "udp".to_string(),
+            connected_wall_at: chrono::Utc::now(),
+            connected_at: std::time::Instant::now(),
+            bytes_sent: 0,
+            bytes_received: 0,
+            connection_error: Some("setup failed".to_string()),
+            error_class: Some(ErrorClass::ConnectionPoolError),
+            disconnect_direction: Some(Direction::ClientToBackend),
+            disconnect_cause: Some(DisconnectCause::BackendError),
+        };
+        lifecycle.complete_udp(7, 9, CapturedUdpOutcome::IdleTimeout);
+
+        drop(lifecycle);
+        let summary = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("disconnect callback timeout")
+            .expect("disconnect summary");
+
+        // Idle expiry is the normal end of a quiet UDP flow: it must match
+        // the generic UDP lifecycle (IdleTimeout cause, no error) so healthy
+        // DNS-style sessions don't register as errored spans.
+        assert_eq!(summary.disconnect_cause, Some(DisconnectCause::IdleTimeout));
+        assert!(summary.connection_error.is_none());
+        assert!(summary.error_class.is_none());
+        assert!(summary.disconnect_direction.is_none());
+        assert_eq!(summary.bytes_sent, 7);
+        assert_eq!(summary.bytes_received, 9);
     }
 }
