@@ -4,7 +4,10 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
+use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 use crate::admin::AdminState;
@@ -59,6 +62,25 @@ pub(crate) enum ValidationError {
     Message(String),
 }
 
+const MTLS_ADMISSION_LOCK_SHARDS: usize = 64;
+static MTLS_ADMISSION_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+
+/// Serialize mTLS-sensitive admin mutations for a namespace from candidate
+/// validation through persistence. A bounded process-global lock set covers
+/// every `AdminState` served by this process without retaining attacker-chosen
+/// namespace strings indefinitely.
+pub(crate) async fn lock_mtls_admission(namespace: &str) -> MutexGuard<'static, ()> {
+    let locks = MTLS_ADMISSION_LOCKS.get_or_init(|| {
+        (0..MTLS_ADMISSION_LOCK_SHARDS)
+            .map(|_| Mutex::new(()))
+            .collect()
+    });
+    let mut hasher = DefaultHasher::new();
+    namespace.hash(&mut hasher);
+    let shard = hasher.finish() as usize % MTLS_ADMISSION_LOCK_SHARDS;
+    locks[shard].lock().await
+}
+
 async fn validate_mtls_auth_candidate(
     db: &dyn DatabaseBackend,
     namespace: &str,
@@ -97,7 +119,7 @@ async fn validate_mtls_auth_candidate(
         .validate_mtls_auth_compatibility()
         .err()
         .unwrap_or_default();
-    if let Err(credential_errors) = config.validate_unique_consumer_credentials() {
+    if let Err(credential_errors) = config.validate_unique_mtls_credentials() {
         errors.extend(credential_errors);
     }
     if errors.is_empty() {
@@ -123,7 +145,7 @@ pub(crate) async fn mtls_consumer_candidate_errors(
         config.consumers.push(consumer.clone());
     }
     Ok(config
-        .validate_unique_consumer_credentials()
+        .validate_unique_mtls_credentials()
         .err()
         .unwrap_or_default())
 }
@@ -146,6 +168,7 @@ pub(crate) trait AdminResource:
     const VALIDATION_ERROR_LABEL: &'static str;
     const NOT_FOUND_MESSAGE: &'static str;
     const ID_CONFLICT_LABEL: &'static str = Self::RESOURCE_LABEL;
+    const SERIALIZE_MTLS_ADMISSION: bool = false;
 
     fn id(&self) -> &str;
     fn set_id(&mut self, id: String);
@@ -444,6 +467,11 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         }
     };
     let db = db_arc.as_ref();
+    let _mtls_admission_guard = if R::SERIALIZE_MTLS_ADMISSION {
+        Some(lock_mtls_admission(namespace).await)
+    } else {
+        None
+    };
 
     let existing = match R::db_get_for_write(db, namespace, id).await {
         Ok(None) => {
@@ -1537,6 +1565,7 @@ impl AdminResource for PluginConfig {
     const RESOURCE_LABEL: &'static str = "Plugin config";
     const VALIDATION_ERROR_LABEL: &'static str = "plugin config fields";
     const NOT_FOUND_MESSAGE: &'static str = "Plugin config not found";
+    const SERIALIZE_MTLS_ADMISSION: bool = true;
     const ID_CONFLICT_LABEL: &'static str = "PluginConfig";
 
     fn id(&self) -> &str {
@@ -1826,6 +1855,7 @@ impl AdminResource for Proxy {
     const RESOURCE_LABEL: &'static str = "Proxy";
     const VALIDATION_ERROR_LABEL: &'static str = "proxy fields";
     const NOT_FOUND_MESSAGE: &'static str = "Proxy not found";
+    const SERIALIZE_MTLS_ADMISSION: bool = true;
 
     fn id(&self) -> &str {
         &self.id
@@ -2175,9 +2205,11 @@ impl AdminResource for Proxy {
             Err(error) => return Err(AfterValidateError::Db(error)),
         }
 
-        if resource.effective_scheme().is_stream() {
-            validate_mtls_auth_candidate(db, namespace, Some(resource), None, None).await?;
-        }
+        // HTTP proxy associations can make a dormant/global `san_dns` policy
+        // effective just as stream proxies can, so candidate DNS identity
+        // validation is required for every transport. The compatibility
+        // validator itself remains stream-specific.
+        validate_mtls_auth_candidate(db, namespace, Some(resource), None, None).await?;
 
         if resource.dispatch_kind.is_stream()
             && let Some(port) = resource.listen_port
@@ -2248,6 +2280,7 @@ impl AdminResource for Consumer {
     const RESOURCE_LABEL: &'static str = "Consumer";
     const VALIDATION_ERROR_LABEL: &'static str = "consumer fields";
     const NOT_FOUND_MESSAGE: &'static str = "Consumer not found";
+    const SERIALIZE_MTLS_ADMISSION: bool = true;
 
     fn id(&self) -> &str {
         &self.id
@@ -2435,6 +2468,11 @@ async fn handle_write<R: AdminResource>(
         }
     };
     let db = db_arc.as_ref();
+    let _mtls_admission_guard = if R::SERIALIZE_MTLS_ADMISSION {
+        Some(lock_mtls_admission(namespace).await)
+    } else {
+        None
+    };
 
     if let Err(message) = R::validate_raw_body(body) {
         return Ok(super::json_response(

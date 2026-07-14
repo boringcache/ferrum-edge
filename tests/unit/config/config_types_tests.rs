@@ -1528,6 +1528,41 @@ fn test_unique_consumer_credentials_mtls_different_identities_ok() {
 }
 
 #[test]
+fn test_unique_mtls_credentials_ignore_unrelated_credential_collisions() {
+    let mut c1 = make_consumer("c1", "shared-user");
+    c1.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "legacy-duplicate"}]),
+    );
+    c1.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!([{"password_hash": "hmac_sha256:first"}]),
+    );
+    c1.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "client-a.example.com"}]),
+    );
+    let mut c2 = make_consumer("c2", "shared-user");
+    c2.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "legacy-duplicate"}]),
+    );
+    c2.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!([{"password_hash": "hmac_sha256:second"}]),
+    );
+    c2.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "client-b.example.com"}]),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+
+    assert!(config.validate_unique_consumer_credentials().is_err());
+    assert!(config.validate_unique_mtls_credentials().is_ok());
+}
+
+#[test]
 fn test_unique_consumer_credentials_scopes_case_folding_to_san_dns() {
     let mut c1 = make_consumer("c1", "alice");
     c1.credentials.insert(
@@ -1541,6 +1576,7 @@ fn test_unique_consumer_credentials_scopes_case_folding_to_san_dns() {
     );
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
+    config.proxies.push(make_proxy("p1", "/"));
 
     assert!(
         config.validate_unique_consumer_credentials().is_ok(),
@@ -1564,6 +1600,83 @@ fn test_unique_consumer_credentials_scopes_case_folding_to_san_dns() {
     let errors = config.validate_unique_consumer_credentials().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(errors[0].contains("ASCII case-insensitive"));
+}
+
+#[test]
+fn test_unique_mtls_dns_identities_ignore_unattached_plugin() {
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "API.Example.COM"}]),
+    );
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "api.example.com"}]),
+    );
+    let mut proxy = make_proxy("p1", "/");
+    let dns_plugin = mtls_plugin(
+        "dns-mtls",
+        PluginScope::Proxy,
+        Some("p1"),
+        serde_json::json!({"cert_field": "san_dns"}),
+    );
+    let mut config = GatewayConfig {
+        proxies: vec![proxy.clone()],
+        consumers: vec![c1, c2],
+        plugin_configs: vec![dns_plugin],
+        ..empty_config()
+    };
+
+    assert!(config.validate_unique_mtls_credentials().is_ok());
+
+    proxy.plugins.push(PluginAssociation {
+        plugin_config_id: "dns-mtls".to_string(),
+    });
+    config.proxies[0] = proxy;
+    assert!(config.validate_unique_mtls_credentials().is_err());
+}
+
+#[test]
+fn test_unique_mtls_dns_identities_ignore_globally_shadowed_plugin() {
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "API.Example.COM"}]),
+    );
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "api.example.com"}]),
+    );
+    let mut proxy = make_proxy("p1", "/");
+    proxy.plugins.push(PluginAssociation {
+        plugin_config_id: "local-exact-mtls".to_string(),
+    });
+    let mut config = GatewayConfig {
+        proxies: vec![proxy],
+        consumers: vec![c1, c2],
+        plugin_configs: vec![
+            mtls_plugin(
+                "global-dns-mtls",
+                PluginScope::Global,
+                None,
+                serde_json::json!({"cert_field": "san_dns"}),
+            ),
+            mtls_plugin(
+                "local-exact-mtls",
+                PluginScope::Proxy,
+                Some("p1"),
+                serde_json::json!({"cert_field": "subject_cn"}),
+            ),
+        ],
+        ..empty_config()
+    };
+
+    assert!(config.validate_unique_mtls_credentials().is_ok());
+
+    config.proxies[0].plugins.clear();
+    assert!(config.validate_unique_mtls_credentials().is_err());
 }
 
 // ---- Multi-credential (array format) tests ----

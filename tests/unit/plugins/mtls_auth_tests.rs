@@ -70,6 +70,7 @@ fn create_ca_signed_cert(
     }
     ca_params.distinguished_name = ca_dn;
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
 
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
@@ -102,6 +103,7 @@ fn create_intermediate_signed_cert(
     root_dn.push(rcgen::DnType::CommonName, root_cn);
     root_params.distinguished_name = root_dn;
     root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    root_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
     let root_key = rcgen::KeyPair::generate().unwrap();
     let root_cert = root_params.self_signed(&root_key).unwrap();
     let root_der = root_cert.der().to_vec();
@@ -112,6 +114,7 @@ fn create_intermediate_signed_cert(
     intermediate_dn.push(rcgen::DnType::CommonName, intermediate_cn);
     intermediate_params.distinguished_name = intermediate_dn;
     intermediate_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    intermediate_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
     let intermediate_key = rcgen::KeyPair::generate().unwrap();
     let intermediate_cert = intermediate_params
         .signed_by(&intermediate_key, &root_issuer)
@@ -141,6 +144,7 @@ fn create_cross_signed_intermediate_chain() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u
     unpinned_root_dn.push(rcgen::DnType::CommonName, "Unpinned Root CA");
     unpinned_root_params.distinguished_name = unpinned_root_dn;
     unpinned_root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    unpinned_root_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
     let unpinned_root_key = rcgen::KeyPair::generate().unwrap();
     let unpinned_root_issuer = rcgen::Issuer::new(unpinned_root_params, unpinned_root_key);
 
@@ -149,6 +153,7 @@ fn create_cross_signed_intermediate_chain() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u
     pinned_root_dn.push(rcgen::DnType::CommonName, "Pinned Root CA");
     pinned_root_params.distinguished_name = pinned_root_dn;
     pinned_root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    pinned_root_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
     let pinned_root_key = rcgen::KeyPair::generate().unwrap();
     let pinned_root_cert = pinned_root_params.self_signed(&pinned_root_key).unwrap();
     let pinned_root_der = pinned_root_cert.der().to_vec();
@@ -159,6 +164,7 @@ fn create_cross_signed_intermediate_chain() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u
     intermediate_dn.push(rcgen::DnType::CommonName, "Cross-Signed Intermediate CA");
     intermediate_params.distinguished_name = intermediate_dn;
     intermediate_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    intermediate_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
     let intermediate_key = rcgen::KeyPair::generate().unwrap();
     let unpinned_intermediate = intermediate_params
         .signed_by(&intermediate_key, &unpinned_root_issuer)
@@ -187,6 +193,90 @@ fn create_cross_signed_intermediate_chain() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u
         pinned_root_der,
         unpinned_intermediate,
         pinned_intermediate,
+        client_der,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum InvalidPinnedIntermediate {
+    Expired,
+    NotCa,
+}
+
+/// Create a leaf with two certificates for the same intermediate key/subject.
+/// The valid certificate reaches an unpinned root while the alternate reaches
+/// the pinned root but is deliberately not a valid issuer.
+fn create_invalid_pinned_intermediate_chain(
+    invalid: InvalidPinnedIntermediate,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut unpinned_root_params = rcgen::CertificateParams::default();
+    let mut unpinned_root_dn = rcgen::DistinguishedName::new();
+    unpinned_root_dn.push(rcgen::DnType::CommonName, "Unpinned Valid Root CA");
+    unpinned_root_params.distinguished_name = unpinned_root_dn;
+    unpinned_root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    unpinned_root_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    let unpinned_root_key = rcgen::KeyPair::generate().unwrap();
+    let unpinned_root_issuer = rcgen::Issuer::new(unpinned_root_params, unpinned_root_key);
+
+    let mut pinned_root_params = rcgen::CertificateParams::default();
+    let mut pinned_root_dn = rcgen::DistinguishedName::new();
+    pinned_root_dn.push(rcgen::DnType::CommonName, "Pinned Policy Root CA");
+    pinned_root_params.distinguished_name = pinned_root_dn;
+    pinned_root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    pinned_root_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    let pinned_root_key = rcgen::KeyPair::generate().unwrap();
+    let pinned_root_cert = pinned_root_params.self_signed(&pinned_root_key).unwrap();
+    let pinned_root_der = pinned_root_cert.der().to_vec();
+    let pinned_root_issuer = rcgen::Issuer::new(pinned_root_params, pinned_root_key);
+
+    let mut valid_intermediate_params = rcgen::CertificateParams::default();
+    let mut intermediate_dn = rcgen::DistinguishedName::new();
+    intermediate_dn.push(
+        rcgen::DnType::CommonName,
+        "Shared Alternate Intermediate CA",
+    );
+    valid_intermediate_params.distinguished_name = intermediate_dn;
+    valid_intermediate_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    valid_intermediate_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    let intermediate_key = rcgen::KeyPair::generate().unwrap();
+    let valid_intermediate_der = valid_intermediate_params
+        .signed_by(&intermediate_key, &unpinned_root_issuer)
+        .unwrap()
+        .der()
+        .to_vec();
+
+    let mut invalid_intermediate_params = valid_intermediate_params.clone();
+    match invalid {
+        InvalidPinnedIntermediate::Expired => {
+            invalid_intermediate_params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            invalid_intermediate_params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        }
+        InvalidPinnedIntermediate::NotCa => {
+            invalid_intermediate_params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        }
+    }
+    let invalid_intermediate_der = invalid_intermediate_params
+        .signed_by(&intermediate_key, &pinned_root_issuer)
+        .unwrap()
+        .der()
+        .to_vec();
+    let valid_intermediate_issuer = rcgen::Issuer::new(valid_intermediate_params, intermediate_key);
+
+    let mut client_params = rcgen::CertificateParams::default();
+    let mut client_dn = rcgen::DistinguishedName::new();
+    client_dn.push(rcgen::DnType::CommonName, "client.example.com");
+    client_params.distinguished_name = client_dn;
+    let client_key = rcgen::KeyPair::generate().unwrap();
+    let client_der = client_params
+        .signed_by(&client_key, &valid_intermediate_issuer)
+        .unwrap()
+        .der()
+        .to_vec();
+
+    (
+        pinned_root_der,
+        valid_intermediate_der,
+        invalid_intermediate_der,
         client_der,
     )
 }
@@ -647,6 +737,36 @@ async fn test_mtls_auth_backtracks_across_cross_signed_intermediates() {
         plugin.authenticate(&mut unpinned_only_ctx, &index).await,
         Some(403),
     );
+}
+
+#[tokio::test]
+async fn test_mtls_auth_rejects_expired_alternate_intermediate_to_pinned_root() {
+    let (pinned_root, valid_intermediate, expired_intermediate, client_der) =
+        create_invalid_pinned_intermediate_chain(InvalidPinnedIntermediate::Expired);
+    let plugin = MtlsAuth::new(&json!({
+        "allowed_issuers": [issuer_filter(&pinned_root, Some("Pinned Policy Root CA"), None, None)]
+    }))
+    .unwrap();
+    let index = ConsumerIndex::new(&[create_mtls_consumer("c1", "alice", "client.example.com")]);
+    let mut ctx =
+        create_ctx_with_cert_and_chain(client_der, vec![valid_intermediate, expired_intermediate]);
+
+    assert_reject(plugin.authenticate(&mut ctx, &index).await, Some(403));
+}
+
+#[tokio::test]
+async fn test_mtls_auth_rejects_non_ca_alternate_intermediate_to_pinned_root() {
+    let (pinned_root, valid_intermediate, non_ca_intermediate, client_der) =
+        create_invalid_pinned_intermediate_chain(InvalidPinnedIntermediate::NotCa);
+    let plugin = MtlsAuth::new(&json!({
+        "allowed_issuers": [issuer_filter(&pinned_root, Some("Pinned Policy Root CA"), None, None)]
+    }))
+    .unwrap();
+    let index = ConsumerIndex::new(&[create_mtls_consumer("c1", "alice", "client.example.com")]);
+    let mut ctx =
+        create_ctx_with_cert_and_chain(client_der, vec![valid_intermediate, non_ca_intermediate]);
+
+    assert_reject(plugin.authenticate(&mut ctx, &index).await, Some(403));
 }
 
 #[tokio::test]
@@ -1208,6 +1328,28 @@ fn test_mtls_auth_rejects_non_ca_issuer_pin() {
         error.contains("must contain a CA certificate"),
         "got: {error}"
     );
+}
+
+#[test]
+fn test_mtls_auth_rejects_issuer_pin_without_key_cert_sign() {
+    let mut params = rcgen::CertificateParams::default();
+    let mut dn = rcgen::DistinguishedName::new();
+    dn.push(rcgen::DnType::CommonName, "CA Without Key Usage");
+    params.distinguished_name = dn;
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let cert = params
+        .self_signed(&rcgen::KeyPair::generate().unwrap())
+        .unwrap();
+    let error = MtlsAuth::new(&json!({
+        "allowed_issuers": [{
+            "cn": "CA Without Key Usage",
+            "ca_certificate_pem": cert_der_to_pem(cert.der().as_ref())
+        }]
+    }))
+    .err()
+    .expect("issuer pins must assert keyCertSign");
+
+    assert!(error.contains("keyCertSign"), "got: {error}");
 }
 
 #[tokio::test]

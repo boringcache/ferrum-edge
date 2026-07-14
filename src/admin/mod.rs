@@ -3347,6 +3347,11 @@ async fn handle_update_credentials(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
+    let _mtls_admission_guard = if cred_type == "mtls_auth" {
+        Some(crud::lock_mtls_admission(namespace).await)
+    } else {
+        None
+    };
 
     let mut cred_value = match parse_json_value(body) {
         Ok(value) => value,
@@ -3433,6 +3438,11 @@ async fn handle_delete_credentials(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
+    let _mtls_admission_guard = if cred_type == "mtls_auth" {
+        Some(crud::lock_mtls_admission(namespace).await)
+    } else {
+        None
+    };
 
     let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
         Ok(consumer) => consumer,
@@ -3485,6 +3495,11 @@ async fn handle_append_credential(
     let db = match require_db(state) {
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
+    };
+    let _mtls_admission_guard = if cred_type == "mtls_auth" {
+        Some(crud::lock_mtls_admission(namespace).await)
+    } else {
+        None
     };
 
     let mut new_cred = match parse_json_value(body) {
@@ -3607,6 +3622,11 @@ async fn handle_delete_credential_by_index(
     let db = match require_db(state) {
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
+    };
+    let _mtls_admission_guard = if cred_type == "mtls_auth" {
+        Some(crud::lock_mtls_admission(namespace).await)
+    } else {
+        None
     };
 
     let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
@@ -4033,6 +4053,7 @@ async fn handle_batch_create(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
+    let _mtls_admission_guard = crud::lock_mtls_admission(namespace).await;
 
     let mut batch: RestorePayload = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -4179,7 +4200,7 @@ async fn handle_batch_create(
             if let Err(errors) = candidate_config.validate_mtls_auth_compatibility() {
                 validation_errors.extend(errors);
             }
-            if let Err(errors) = candidate_config.validate_unique_consumer_credentials() {
+            if let Err(errors) = candidate_config.validate_unique_mtls_credentials() {
                 validation_errors.extend(errors);
             }
         }
@@ -4652,6 +4673,7 @@ async fn handle_restore(
             }),
         ));
     }
+    let _mtls_admission_guard = crud::lock_mtls_admission(namespace).await;
 
     // Phase 1: Parse all resources directly into typed structs before deleting
     // anything. This avoids an intermediate serde_json::Value copy (~50% less
