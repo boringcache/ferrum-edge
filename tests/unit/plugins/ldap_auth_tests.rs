@@ -217,6 +217,7 @@ fn test_search_filter_missing_placeholder_rejected() {
             "ldap_url": "ldaps://ldap.example.com:636",
             "search_base_dn": "ou=users,dc=example,dc=com",
             "search_filter": "(&(objectClass=person)(uid=admin))",
+            "canonical_identity_attribute": "uid",
             "service_account_dn": "cn=admin,dc=example,dc=com",
             "service_account_password": "admin_password"
         }),
