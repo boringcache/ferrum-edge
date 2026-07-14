@@ -980,7 +980,10 @@ fn is_loopback_ldap_endpoint(parsed: &Url) -> bool {
         Some(Host::Ipv6(address)) => address.is_loopback(),
         Some(Host::Domain(hostname)) => {
             let hostname = hostname.trim_end_matches('.');
-            hostname.eq_ignore_ascii_case("localhost")
+            hostname
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+                || hostname.eq_ignore_ascii_case("localhost")
                 || hostname.to_ascii_lowercase().ends_with(".localhost")
         }
         None => false,
