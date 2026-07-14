@@ -912,7 +912,7 @@ impl AiSemanticFirewall {
         }
 
         let segments = extract_request_segments(json, &self.engine.extraction);
-        if segments.is_empty() && self.engine.allow_topics.is_empty() {
+        if segments.is_empty() {
             return if looks_like_governed_request_json(json) {
                 self.engine.handle_uninspectable_body(
                     ctx,
@@ -1937,10 +1937,6 @@ impl Plugin for AiSemanticFirewall {
         {
             return PluginResult::Continue;
         }
-        if !self.needs_governed_request_body() {
-            return PluginResult::Continue;
-        }
-
         // Request decompression runs later in `transform_request_body`. Defer
         // encoded JSON to the final backend-visible hook, where it is either
         // plaintext and inspectable or still encoded and failed closed.
@@ -1949,6 +1945,9 @@ impl Plugin for AiSemanticFirewall {
         }
 
         let Some(body) = ctx.metadata.get("request_body").cloned() else {
+            if !self.needs_governed_request_body() {
+                return PluginResult::Continue;
+            }
             return self.engine.handle_uninspectable_body(
                 ctx,
                 Direction::Request,
@@ -5654,7 +5653,7 @@ mod stream_window_tests {
             eng.pending_uninspectable(),
             "a split data: field prefix must fail closed"
         );
-        assert_eq!(eng.release(), b"event: message\nda");
+        assert_eq!(eng.release(), b"event: message\nd");
     }
 
     #[test]

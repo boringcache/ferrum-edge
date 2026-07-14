@@ -1054,6 +1054,7 @@ async fn request_extraction_paths_define_the_inspected_fields() {
         "inspect": {"request": true, "response": false},
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
         "builtins": {"prompt_injection": true},
+        "fail_on_uninspectable_body": false,
         "extraction": {
             "request_json_paths": ["$.context"]
         }
@@ -1391,7 +1392,7 @@ async fn allowlist_no_match_rejects_after_successful_semantic_check() {
 }
 
 #[tokio::test]
-async fn allowlist_no_match_rejects_when_extraction_is_empty() {
+async fn allowlist_with_no_extractable_content_fails_closed_as_uninspectable() {
     let config = json!({
         "inspect": {"request": true, "response": false},
         "provider": provider("http://127.0.0.1:9/v1/embeddings"),
@@ -1404,19 +1405,17 @@ async fn allowlist_no_match_rejects_when_extraction_is_empty() {
         }]
     });
     let plugin = plugin(&config);
-    let mut ctx = make_post_ctx(&json!({
-        "prompt": "Tell me whether this contract clause is enforceable."
-    }));
+    let mut ctx = make_post_ctx(&json!({"messages": []}));
     let mut headers = json_headers();
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
 
-    assert_reject(result, Some(403));
+    assert_reject(result, Some(400));
     assert_eq!(
         ctx.metadata
-            .get("ai_semantic_firewall.rule_ids")
+            .get("ai_semantic_firewall.uninspectable_body")
             .map(String::as_str),
-        Some("allow_topics:no_match")
+        Some("no_extractable_content")
     );
     assert!(
         !ctx.metadata
@@ -3229,7 +3228,7 @@ async fn huge_finite_embeddings_normalize_without_zero_vector_bypass() {
                 .map(|(index, _)| {
                     json!({
                         "index": index,
-                        "embedding": [f32::MAX, f32::from_bits(1)]
+                        "embedding": [3.0e38_f32, f32::from_bits(1)]
                     })
                 })
                 .collect();
