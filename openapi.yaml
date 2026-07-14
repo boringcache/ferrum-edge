@@ -11125,10 +11125,12 @@ components:
                 type: string
                 minLength: 1
                 description: >-
-                  Exactly one PEM-encoded CA certificate. Ferrum verifies the
-                  leaf signature path to this pinned key; DN labels alone never
-                  authorize an issuer. UDP+DTLS exposes no intermediate chain,
-                  so its pin must be the immediate issuing CA.
+                  Required for every allowed_issuers entry. Must contain exactly
+                  one currently valid PEM-encoded CA certificate with
+                  basicConstraints CA:TRUE and keyUsage keyCertSign. Ferrum
+                  verifies the leaf signature path to this pinned key; DN labels
+                  alone never authorize an issuer. UDP+DTLS exposes no
+                  intermediate chain, so its pin must be the immediate issuing CA.
           description: >-
             Per-proxy issuer pins. DN fields are descriptive filters (AND within
             an entry, OR across entries) and must match the pinned CA subject;
