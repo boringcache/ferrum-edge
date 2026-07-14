@@ -3035,7 +3035,10 @@ impl GatewayConfig {
         }
     }
 
-    fn mtls_auth_compatibility_errors(&self) -> Vec<String> {
+    /// Resolve the enabled `mtls_auth` configurations that the plugin cache
+    /// would install for each proxy. Any local proxy/proxy-group instance
+    /// shadows all global instances of the same plugin type on that proxy.
+    fn effective_mtls_auth_plugins_by_proxy(&self) -> Vec<(&Proxy, Vec<&PluginConfig>)> {
         let plugin_by_id: HashMap<&str, &PluginConfig> = self
             .plugin_configs
             .iter()
@@ -3050,30 +3053,52 @@ impl GatewayConfig {
                     && plugin.plugin_name == "mtls_auth"
             })
             .collect();
+
+        self.proxies
+            .iter()
+            .map(|proxy| {
+                let local_mtls: Vec<&PluginConfig> = proxy
+                    .plugins
+                    .iter()
+                    .filter_map(|association| {
+                        let plugin = *plugin_by_id.get(association.plugin_config_id.as_str())?;
+                        let scope_applies = match plugin.scope {
+                            PluginScope::Proxy => {
+                                plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+                            }
+                            PluginScope::ProxyGroup => plugin.proxy_id.is_none(),
+                            PluginScope::Global => false,
+                        };
+                        (plugin.enabled && plugin.plugin_name == "mtls_auth" && scope_applies)
+                            .then_some(plugin)
+                    })
+                    .collect();
+                let effective = if local_mtls.is_empty() {
+                    global_mtls.clone()
+                } else {
+                    local_mtls
+                };
+                (proxy, effective)
+            })
+            .collect()
+    }
+
+    /// Whether the named proxy has at least one enabled `mtls_auth` instance
+    /// after resolving local association shadowing against global instances.
+    pub(crate) fn has_effective_mtls_auth_for_proxy(&self, proxy_id: &str) -> bool {
+        self.effective_mtls_auth_plugins_by_proxy()
+            .into_iter()
+            .any(|(proxy, plugins)| proxy.id == proxy_id && !plugins.is_empty())
+    }
+
+    fn mtls_auth_compatibility_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
 
-        for proxy in &self.proxies {
+        for (proxy, effective_plugins) in self.effective_mtls_auth_plugins_by_proxy() {
             let scheme = proxy.effective_scheme();
             if !scheme.is_stream() {
                 continue;
             }
-
-            let local_mtls: Vec<&PluginConfig> = proxy
-                .plugins
-                .iter()
-                .filter_map(|association| {
-                    let plugin = plugin_by_id.get(association.plugin_config_id.as_str())?;
-                    (plugin.enabled
-                        && plugin.plugin_name == "mtls_auth"
-                        && matches!(plugin.scope, PluginScope::Proxy | PluginScope::ProxyGroup))
-                    .then_some(*plugin)
-                })
-                .collect();
-            let effective_plugins = if local_mtls.is_empty() {
-                global_mtls.as_slice()
-            } else {
-                local_mtls.as_slice()
-            };
 
             for plugin in effective_plugins {
                 if !proxy.frontend_tls || proxy.passthrough {
@@ -3459,17 +3484,54 @@ impl GatewayConfig {
         messages
     }
 
+    fn mtls_credential_uniqueness_errors(&self) -> Vec<String> {
+        let mut seen_mtls: HashMap<&str, &str> = HashMap::new();
+        let mut duplicates = Vec::new();
+
+        for consumer in &self.consumers {
+            // Check all mTLS entries.
+            for entry in consumer.credential_entries("mtls_auth") {
+                if let Some(identity) = entry.get("identity").and_then(|s| s.as_str())
+                    && let Some(existing_id) = seen_mtls.insert(identity, &consumer.id)
+                {
+                    duplicates.push(format!(
+                        "Duplicate mtls_auth identity '{}' in consumer '{}' (conflicts with consumer '{}')",
+                        identity, consumer.id, existing_id
+                    ));
+                }
+            }
+        }
+
+        if let Err(dns_duplicates) = self.validate_unique_mtls_dns_identities() {
+            duplicates.extend(dns_duplicates);
+        }
+
+        duplicates
+    }
+
+    /// Validate only the exact and effective-DNS mTLS identity constraints.
+    /// Admin candidate checks use this narrower surface so unrelated legacy
+    /// keyauth/basicauth collisions do not block mTLS configuration repairs.
+    pub fn validate_unique_mtls_credentials(&self) -> Result<(), Vec<String>> {
+        let duplicates = self.mtls_credential_uniqueness_errors();
+
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            Err(duplicates)
+        }
+    }
+
     /// Validate that consumer credentials are unique across all consumers.
     ///
     /// Checks keyauth API keys, basicauth usernames, and mTLS identities.
     /// mTLS identities are exact by default and additionally ASCII-case-folded
-    /// when an enabled `san_dns` mTLS policy can consume the DNS lookup index.
+    /// when an effective `san_dns` mTLS policy can consume the DNS lookup index.
     /// If two consumers share the same credential, the ConsumerIndex silently
     /// overwrites one, causing the wrong consumer to be authenticated.
     pub fn validate_unique_consumer_credentials(&self) -> Result<(), Vec<String>> {
         let mut seen_keyauth: HashMap<&str, &str> = HashMap::new();
         let mut seen_basicauth: HashMap<&str, &str> = HashMap::new();
-        let mut seen_mtls: HashMap<&str, &str> = HashMap::new();
         let mut duplicates = Vec::new();
 
         for consumer in &self.consumers {
@@ -3495,23 +3557,9 @@ impl GatewayConfig {
                     consumer.username, consumer.id, existing_id
                 ));
             }
-
-            // Check all mTLS entries.
-            for entry in consumer.credential_entries("mtls_auth") {
-                if let Some(identity) = entry.get("identity").and_then(|s| s.as_str())
-                    && let Some(existing_id) = seen_mtls.insert(identity, &consumer.id)
-                {
-                    duplicates.push(format!(
-                        "Duplicate mtls_auth identity '{}' in consumer '{}' (conflicts with consumer '{}')",
-                        identity, consumer.id, existing_id
-                    ));
-                }
-            }
         }
 
-        if let Err(dns_duplicates) = self.validate_unique_mtls_dns_identities() {
-            duplicates.extend(dns_duplicates);
-        }
+        duplicates.extend(self.mtls_credential_uniqueness_errors());
 
         if duplicates.is_empty() {
             Ok(())
@@ -3523,7 +3571,7 @@ impl GatewayConfig {
     /// Reject case-variant identities before publishing the lower-cased DNS
     /// lookup index. Exact-match mTLS policies remain case-sensitive.
     pub fn validate_unique_mtls_dns_identities(&self) -> Result<(), Vec<String>> {
-        let dns_identity_matching_enabled = self.plugin_configs.iter().any(|plugin| {
+        let is_dns_identity_plugin = |plugin: &PluginConfig| {
             plugin.enabled
                 && plugin.plugin_name == "mtls_auth"
                 && plugin
@@ -3531,7 +3579,19 @@ impl GatewayConfig {
                     .get("cert_field")
                     .and_then(|value| value.as_str())
                     == Some("san_dns")
-        });
+        };
+        // The plugin cache keeps globals as the fallback for every proxy ID
+        // absent from its association map, including synthesized mesh relays.
+        // Local associations can shadow a global on registered proxies, but
+        // cannot make that global dormant for unknown proxy IDs.
+        let dns_identity_matching_enabled =
+            self.plugin_configs.iter().any(|plugin| {
+                plugin.scope == PluginScope::Global && is_dns_identity_plugin(plugin)
+            }) || self
+                .effective_mtls_auth_plugins_by_proxy()
+                .into_iter()
+                .flat_map(|(_, plugins)| plugins)
+                .any(&is_dns_identity_plugin);
         if !dns_identity_matching_enabled {
             return Ok(());
         }
