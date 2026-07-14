@@ -83,6 +83,13 @@ pub const MAX_CREDENTIAL_VALUE_LENGTH: usize = 4096;
 pub const MIN_JWT_SECRET_LENGTH: usize = 32;
 /// Minimum length for hmac_auth shared secrets.
 pub const MIN_HMAC_SECRET_LENGTH: usize = 32;
+
+/// Effective strength of an hmac_auth secret: whitespace does not count
+/// toward [`MIN_HMAC_SECRET_LENGTH`]. Shared by admission-time field
+/// validation and the full-load quarantine so the two policies cannot drift.
+pub(crate) fn hmac_secret_strength(secret: &str) -> usize {
+    secret.chars().filter(|ch| !ch.is_whitespace()).count()
+}
 /// Default maximum number of credential entries per type (for zero-downtime rotation).
 /// Overridable at runtime via `FERRUM_MAX_CREDENTIALS_PER_TYPE` env var / conf file.
 pub const DEFAULT_MAX_CREDENTIALS_PER_TYPE: usize = 2;
@@ -3511,6 +3518,117 @@ impl GatewayConfig {
         duplicates
     }
 
+    /// Cross-Consumer hmac_auth shared-secret collisions. HMAC signs the
+    /// credential identity, but a secret reused by two Consumers would still
+    /// collapse their trust boundary. Intra-consumer reuse (rotation entries
+    /// sharing one secret) is allowed; the secret value itself is never
+    /// included in the error message.
+    fn hmac_credential_uniqueness_errors(&self) -> Vec<String> {
+        let mut seen_hmac: HashMap<&str, &str> = HashMap::new();
+        let mut duplicates = Vec::new();
+
+        for consumer in &self.consumers {
+            for entry in consumer.credential_entries("hmac_auth") {
+                if let Some(secret) = entry.get("secret").and_then(|s| s.as_str())
+                    && let Some(existing_id) = seen_hmac.insert(secret, &consumer.id)
+                    && existing_id != consumer.id
+                {
+                    duplicates.push(format!(
+                        "Duplicate hmac_auth shared secret in consumer '{}' (conflicts with consumer '{}')",
+                        consumer.id, existing_id
+                    ));
+                }
+            }
+        }
+
+        duplicates
+    }
+
+    /// Validate only the cross-Consumer hmac_auth shared-secret constraint.
+    /// Admin candidate checks use this narrower surface so unrelated legacy
+    /// keyauth/basicauth collisions do not block HMAC configuration repairs.
+    pub fn validate_unique_hmac_credentials(&self) -> Result<(), Vec<String>> {
+        let duplicates = self.hmac_credential_uniqueness_errors();
+
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            Err(duplicates)
+        }
+    }
+
+    /// Fail-closed handling of hmac_auth credential policy at full-load time:
+    /// strip the `hmac_auth` credential from every consumer whose stored
+    /// entries violate the secret policy (non-array credential, empty array,
+    /// malformed entry, missing/non-string secret, or fewer than
+    /// [`MIN_HMAC_SECRET_LENGTH`] non-whitespace characters) or whose secret
+    /// is already claimed by an earlier-loaded consumer (first-loaded
+    /// consumer wins; the SQL and Mongo full loaders sort by id).
+    ///
+    /// Admin write-time validation rejects NEW violations; this guard covers
+    /// pre-existing and out-of-band rows, mirroring
+    /// [`Self::quarantine_colliding_consumer_identities`]. A stripped
+    /// credential fails closed: the hmac_auth plugin returns 401 for a
+    /// consumer with no hmac_auth entries. Returns one human-readable message
+    /// per quarantined credential (never containing the secret); callers log
+    /// these at `error!` severity.
+    pub fn quarantine_invalid_hmac_credentials(&mut self) -> Vec<String> {
+        let mut claimed: HashMap<String, String> = HashMap::new();
+        let mut messages = Vec::new();
+
+        for consumer in &mut self.consumers {
+            let Some(value) = consumer.credentials.get("hmac_auth") else {
+                continue;
+            };
+            let secrets: Option<Vec<String>> = match value.as_array() {
+                Some(entries) if !entries.is_empty() => entries
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .as_object()
+                            .and_then(|obj| obj.get("secret"))
+                            .and_then(|secret| secret.as_str())
+                            .filter(|secret| hmac_secret_strength(secret) >= MIN_HMAC_SECRET_LENGTH)
+                            .map(str::to_owned)
+                    })
+                    .collect(),
+                _ => None,
+            };
+            let Some(secrets) = secrets else {
+                consumer.credentials.remove("hmac_auth");
+                messages.push(format!(
+                    "Quarantined hmac_auth credential of consumer '{}': a stored entry \
+                     is malformed or its secret has fewer than {} non-whitespace \
+                     characters — the credential is excluded from this config load so \
+                     the weak secret cannot authenticate. Repair the stored credential \
+                     to restore it.",
+                    consumer.id, MIN_HMAC_SECRET_LENGTH
+                ));
+                continue;
+            };
+            match secrets.iter().find_map(|secret| claimed.get(secret)) {
+                Some(other_id) => {
+                    let other_id = other_id.clone();
+                    consumer.credentials.remove("hmac_auth");
+                    messages.push(format!(
+                        "Quarantined hmac_auth credential of consumer '{}': its shared \
+                         secret is also claimed by consumer '{}' — the credential is \
+                         excluded from this config load to prevent cross-Consumer \
+                         signature forgery. Rotate one of the secrets to restore it.",
+                        consumer.id, other_id
+                    ));
+                }
+                None => {
+                    for secret in secrets {
+                        claimed.entry(secret).or_insert_with(|| consumer.id.clone());
+                    }
+                }
+            }
+        }
+
+        messages
+    }
+
     /// Validate only the exact and effective-DNS mTLS identity constraints.
     /// Admin candidate checks use this narrower surface so unrelated legacy
     /// keyauth/basicauth collisions do not block mTLS configuration repairs.
@@ -3535,7 +3653,6 @@ impl GatewayConfig {
     pub fn validate_unique_consumer_credentials(&self) -> Result<(), Vec<String>> {
         let mut seen_keyauth: HashMap<&str, &str> = HashMap::new();
         let mut seen_basicauth: HashMap<&str, &str> = HashMap::new();
-        let mut seen_hmac: HashMap<&str, &str> = HashMap::new();
         let mut duplicates = Vec::new();
 
         for consumer in &self.consumers {
@@ -3561,24 +3678,9 @@ impl GatewayConfig {
                     consumer.username, consumer.id, existing_id
                 ));
             }
-
-            // HMAC signs the credential identity, but a shared secret reused by
-            // two Consumers would still collapse their trust boundary. Reject
-            // cross-Consumer reuse without ever including the secret in the
-            // validation error.
-            for entry in consumer.credential_entries("hmac_auth") {
-                if let Some(secret) = entry.get("secret").and_then(|s| s.as_str())
-                    && let Some(existing_id) = seen_hmac.insert(secret, &consumer.id)
-                    && existing_id != consumer.id
-                {
-                    duplicates.push(format!(
-                        "Duplicate hmac_auth shared secret in consumer '{}' (conflicts with consumer '{}')",
-                        consumer.id, existing_id
-                    ));
-                }
-            }
         }
 
+        duplicates.extend(self.hmac_credential_uniqueness_errors());
         duplicates.extend(self.mtls_credential_uniqueness_errors());
 
         if duplicates.is_empty() {
@@ -5603,7 +5705,7 @@ impl Consumer {
                     }
                     match obj.get("secret") {
                         Some(serde_json::Value::String(secret)) => {
-                            let strength = secret.chars().filter(|ch| !ch.is_whitespace()).count();
+                            let strength = hmac_secret_strength(secret);
                             if strength < MIN_HMAC_SECRET_LENGTH {
                                 errors.push(format!(
                                     "{}.secret must be at least {} non-whitespace characters (got {})",

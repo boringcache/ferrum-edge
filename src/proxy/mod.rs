@@ -7671,6 +7671,15 @@ impl ProxyState {
         // canonicalized fields.
         new_config.normalize_fields();
         new_config.resolve_upstream_tls();
+        // Fail-closed hmac_auth secret policy for point-loaded consumer rows:
+        // full loads quarantine weak/duplicate hmac secrets in the loaders,
+        // but incremental polls merge raw changed rows here. Unlike consumer
+        // identities (whose persistence-level index blocks out-of-band
+        // collisions), hmac secrets have no storage constraint, so strip
+        // violations before the merged snapshot publishes.
+        for message in new_config.quarantine_invalid_hmac_credentials() {
+            error!("Incremental config: {}", message);
+        }
         inject_gateway_workload_metrics_if_svid(
             &mut new_config,
             &self.gateway_svid_bundle,

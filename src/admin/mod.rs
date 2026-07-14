@@ -2796,6 +2796,24 @@ async fn ensure_mtls_consumer_candidate(
     }
 }
 
+async fn ensure_hmac_consumer_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> Result<(), Box<Response<Full<Bytes>>>> {
+    match crud::hmac_consumer_candidate_errors(db, namespace, consumer).await {
+        Ok(errors) if errors.is_empty() => Ok(()),
+        Ok(errors) => Err(Box::new(json_response(
+            StatusCode::CONFLICT,
+            &json!({"error": errors.join("; ")}),
+        ))),
+        Err(error) => Err(Box::new(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &db_error_response(&error),
+        ))),
+    }
+}
+
 async fn persist_consumer_update(
     db: &dyn DatabaseBackend,
     mut consumer: Consumer,
@@ -3390,6 +3408,11 @@ async fn handle_update_credentials(
     {
         return Ok(*resp);
     }
+    if cred_type == "hmac_auth"
+        && let Err(resp) = ensure_hmac_consumer_candidate(db.as_ref(), namespace, &consumer).await
+    {
+        return Ok(*resp);
+    }
 
     let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
     if response.status().is_success() {
@@ -3551,6 +3574,11 @@ async fn handle_append_credential(
     }
     if cred_type == "mtls_auth"
         && let Err(resp) = ensure_mtls_consumer_candidate(db.as_ref(), namespace, &consumer).await
+    {
+        return Ok(*resp);
+    }
+    if cred_type == "hmac_auth"
+        && let Err(resp) = ensure_hmac_consumer_candidate(db.as_ref(), namespace, &consumer).await
     {
         return Ok(*resp);
     }

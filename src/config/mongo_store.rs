@@ -3375,6 +3375,15 @@ mod inner {
                 error!("MongoDB config: {}", message);
             }
 
+            // Fail-closed hmac_auth secret policy: strip pre-existing or
+            // out-of-band credentials with weak or cross-consumer duplicate
+            // secrets before this snapshot can publish or broadcast. Admin
+            // write-time validation rejects new violations; this guard covers
+            // stored rows.
+            for message in config.quarantine_invalid_hmac_credentials() {
+                error!("MongoDB config: {}", message);
+            }
+
             // Mongo does not run the SQL-side `ValidationPipeline`, but full
             // runtime loads must still fail closed on the same rejecting
             // validation contract used by SQL loads and CP updates. This

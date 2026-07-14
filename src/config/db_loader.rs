@@ -1608,6 +1608,22 @@ impl DatabaseStore {
             );
         }
 
+        // Fail-closed hmac_auth secret policy: strip pre-existing or
+        // out-of-band credentials with weak or cross-consumer duplicate
+        // secrets instead of publishing them behind a warning-only
+        // validation run. Admin write-time validation rejects new
+        // violations; this guard covers stored rows.
+        let hmac_quarantined = config.quarantine_invalid_hmac_credentials();
+        if !hmac_quarantined.is_empty() {
+            for message in &hmac_quarantined {
+                error!("{}", message);
+            }
+            error!(
+                "Quarantined {} hmac_auth credential(s) during full config load",
+                hmac_quarantined.len()
+            );
+        }
+
         ValidationPipeline::new(&mut config)
             .resolve_upstream_tls()
             .validate_all_fields_with_ip_policy(

@@ -145,11 +145,11 @@ async fn validate_mtls_auth_candidate(
     }
 }
 
-pub(crate) async fn mtls_consumer_candidate_errors(
+async fn consumer_candidate_config(
     db: &dyn DatabaseBackend,
     namespace: &str,
     consumer: &Consumer,
-) -> DbResult<Vec<String>> {
+) -> DbResult<GatewayConfig> {
     let mut config = db.load_namespace_snapshot(namespace).await?;
     if let Some(existing) = config
         .consumers
@@ -160,8 +160,35 @@ pub(crate) async fn mtls_consumer_candidate_errors(
     } else {
         config.consumers.push(consumer.clone());
     }
-    Ok(config
+    Ok(config)
+}
+
+pub(crate) async fn mtls_consumer_candidate_errors(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> DbResult<Vec<String>> {
+    Ok(consumer_candidate_config(db, namespace, consumer)
+        .await?
         .validate_unique_mtls_credentials()
+        .err()
+        .unwrap_or_default())
+}
+
+/// Reject an admin Consumer/credential write whose hmac_auth secret is
+/// already claimed by another consumer in the namespace. Snapshot-based like
+/// the mTLS candidate check (rather than a credential-index probe) so
+/// pre-existing rows written before hmac secrets were policed are still
+/// authoritative; races are serialized by `lock_mtls_admission`, which every
+/// credential mutation takes.
+pub(crate) async fn hmac_consumer_candidate_errors(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> DbResult<Vec<String>> {
+    Ok(consumer_candidate_config(db, namespace, consumer)
+        .await?
+        .validate_unique_hmac_credentials()
         .err()
         .unwrap_or_default())
 }
@@ -2415,12 +2442,21 @@ impl AdminResource for Consumer {
         _existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
-        if !resource.has_credential("mtls_auth") {
-            return Ok(());
+        let mut errors = Vec::new();
+        if resource.has_credential("mtls_auth") {
+            errors.extend(
+                mtls_consumer_candidate_errors(db, namespace, resource)
+                    .await
+                    .map_err(AfterValidateError::Db)?,
+            );
         }
-        let errors = mtls_consumer_candidate_errors(db, namespace, resource)
-            .await
-            .map_err(AfterValidateError::Db)?;
+        if resource.has_credential("hmac_auth") {
+            errors.extend(
+                hmac_consumer_candidate_errors(db, namespace, resource)
+                    .await
+                    .map_err(AfterValidateError::Db)?,
+            );
+        }
         if errors.is_empty() {
             Ok(())
         } else {

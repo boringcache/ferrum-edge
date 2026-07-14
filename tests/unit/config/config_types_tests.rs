@@ -1478,6 +1478,126 @@ fn test_unique_consumer_credentials_allows_hmac_rotation_within_one_consumer() {
 }
 
 #[test]
+fn test_validate_unique_hmac_credentials_narrow_surface() {
+    let secret = "same-hmac-secret-at-least-32-characters";
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials
+        .insert("hmac_auth".into(), serde_json::json!([{"secret": secret}]));
+    // Unrelated keyauth collision must NOT surface through the narrow check.
+    c1.credentials
+        .insert("keyauth".into(), serde_json::json!([{"key": "same-key"}]));
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials
+        .insert("hmac_auth".into(), serde_json::json!([{"secret": secret}]));
+    c2.credentials
+        .insert("keyauth".into(), serde_json::json!([{"key": "same-key"}]));
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+
+    let errors = config.validate_unique_hmac_credentials().unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("Duplicate hmac_auth shared secret"));
+    assert!(!errors[0].contains(secret));
+
+    config.consumers[1].credentials.insert(
+        "hmac_auth".into(),
+        serde_json::json!([{"secret": "distinct-hmac-secret-at-least-32-chars!"}]),
+    );
+    assert!(config.validate_unique_hmac_credentials().is_ok());
+}
+
+#[test]
+fn test_quarantine_hmac_strips_weak_secret_and_keeps_strong() {
+    let weak = "short-secret";
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials
+        .insert("hmac_auth".into(), serde_json::json!([{"secret": weak}]));
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials.insert(
+        "hmac_auth".into(),
+        serde_json::json!([{"secret": "strong-hmac-secret-at-least-32-characters"}]),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+
+    let messages = config.quarantine_invalid_hmac_credentials();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].contains("consumer 'c1'"));
+    assert!(!messages[0].contains(weak));
+    assert!(!config.consumers[0].has_credential("hmac_auth"));
+    assert!(config.consumers[1].has_credential("hmac_auth"));
+}
+
+#[test]
+fn test_quarantine_hmac_strips_credential_when_any_rotation_entry_is_weak() {
+    // A single weak rotation entry disables the whole credential — fail
+    // closed rather than letting the weak entry authenticate.
+    let mut consumer = make_consumer("c1", "alice");
+    consumer.credentials.insert(
+        "hmac_auth".into(),
+        serde_json::json!([
+            {"secret": "strong-hmac-secret-at-least-32-characters"},
+            {"secret": "weak"}
+        ]),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![consumer];
+
+    let messages = config.quarantine_invalid_hmac_credentials();
+    assert_eq!(messages.len(), 1);
+    assert!(!config.consumers[0].has_credential("hmac_auth"));
+}
+
+#[test]
+fn test_quarantine_hmac_strips_malformed_credentials() {
+    // Whitespace padding must not count toward the strength minimum.
+    let padded = format!("{}short{}", " ".repeat(20), " ".repeat(20));
+    let shapes = [
+        serde_json::json!([{"secret": 12345}]),
+        serde_json::json!([]),
+        serde_json::json!({"secret": "not-an-array-secret-at-least-32-chars!"}),
+        serde_json::json!([{"no_secret": true}]),
+        serde_json::json!([{"secret": padded}]),
+    ];
+    for shape in shapes {
+        let mut consumer = make_consumer("c1", "alice");
+        consumer
+            .credentials
+            .insert("hmac_auth".into(), shape.clone());
+        let mut config = empty_config();
+        config.consumers = vec![consumer];
+
+        let messages = config.quarantine_invalid_hmac_credentials();
+        assert_eq!(messages.len(), 1, "shape not quarantined: {shape}");
+        assert!(!config.consumers[0].credentials.contains_key("hmac_auth"));
+    }
+}
+
+#[test]
+fn test_quarantine_hmac_duplicate_secret_first_loaded_consumer_wins() {
+    let secret = "same-hmac-secret-at-least-32-characters";
+    let mut c1 = make_consumer("c1", "alice");
+    // Intra-consumer rotation reuse of one secret is allowed.
+    c1.credentials.insert(
+        "hmac_auth".into(),
+        serde_json::json!([{"secret": secret}, {"secret": secret}]),
+    );
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials
+        .insert("hmac_auth".into(), serde_json::json!([{"secret": secret}]));
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+
+    let messages = config.quarantine_invalid_hmac_credentials();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].contains("consumer 'c2'"));
+    assert!(messages[0].contains("consumer 'c1'"));
+    assert!(!messages[0].contains(secret));
+    assert!(config.consumers[0].has_credential("hmac_auth"));
+    assert!(!config.consumers[1].has_credential("hmac_auth"));
+}
+
+#[test]
 fn test_unique_consumer_credentials_no_keyauth_ok() {
     // Consumers without keyauth credentials should not conflict
     let c1 = make_consumer("c1", "alice");
