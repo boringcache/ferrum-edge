@@ -289,6 +289,8 @@ When the kernel-side program is not pinned (no node-agent on the host, kernel < 
 
 Service-scoped Ambient waypoint for Istio GAMMA traffic. Set `FERRUM_MESH_TOPOLOGY=service_waypoint` and `FERRUM_MESH_WAYPOINT_NAME=<gateway-name>`; the waypoint name is required so the control plane can project only the services bound to this waypoint.
 
+Inbound byte-stream and datagram HBONE relays resolve authorization policy scope from the exact CONNECT destination's bound workload rather than from the waypoint pod's namespace and labels. A relay whose destination scope cannot be resolved is rejected, and an allowed decision is bound to that destination so a later route override cannot substitute an unchecked backend.
+
 | Listener | Address | Direction | Kind |
 |---|---|---|---|
 | HBONE | `0.0.0.0:15008` | Inbound | HBONE termination |
