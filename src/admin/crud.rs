@@ -59,6 +59,39 @@ pub(crate) enum ValidationError {
     Message(String),
 }
 
+async fn validate_mtls_auth_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxy: Option<&Proxy>,
+    plugin: Option<&PluginConfig>,
+) -> Result<(), AfterValidateError> {
+    let mut config = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    if let Some(proxy) = proxy {
+        if let Some(existing) = config.proxies.iter_mut().find(|item| item.id == proxy.id) {
+            *existing = proxy.clone();
+        } else {
+            config.proxies.push(proxy.clone());
+        }
+    }
+    if let Some(plugin) = plugin {
+        if let Some(existing) = config
+            .plugin_configs
+            .iter_mut()
+            .find(|item| item.id == plugin.id)
+        {
+            *existing = plugin.clone();
+        } else {
+            config.plugin_configs.push(plugin.clone());
+        }
+    }
+    config
+        .validate_mtls_auth_compatibility()
+        .map_err(AfterValidateError::BadRequest)
+}
+
 impl ValidationError {
     fn into_messages(self) -> Vec<String> {
         match self {
@@ -1640,6 +1673,10 @@ impl AdminResource for PluginConfig {
             return Err(AfterValidateError::BadRequest(retry_errors));
         }
 
+        if resource.plugin_name == "mtls_auth" {
+            validate_mtls_auth_candidate(db, namespace, None, Some(resource)).await?;
+        }
+
         Ok(())
     }
 }
@@ -1996,6 +2033,10 @@ impl AdminResource for Proxy {
             }
             Ok(_) => {}
             Err(error) => return Err(AfterValidateError::Db(error)),
+        }
+
+        if resource.effective_scheme().is_stream() {
+            validate_mtls_auth_candidate(db, namespace, Some(resource), None).await?;
         }
 
         if resource.dispatch_kind.is_stream()

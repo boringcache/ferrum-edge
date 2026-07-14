@@ -1272,7 +1272,7 @@ Exported spans include OTel semantic convention attributes, gateway-specific att
 
 ### `mtls_auth`
 
-Authenticates requests using the client's TLS/DTLS certificate, matching a configurable certificate field against consumer credentials. On TCP stream proxies, it runs in `on_stream_connect` after the frontend TLS handshake. On UDP stream proxies, it runs after the frontend DTLS handshake completes. In both cases, the client certificate is mapped to a Consumer before later stream plugins run.
+Authenticates requests using the client's TLS/DTLS certificate, matching a configurable certificate field against consumer credentials. It supports HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, terminated TCP+TLS, and UDP+DTLS. Stream proxies must set `frontend_tls: true` and `passthrough: false`; invalid combinations are rejected at configuration admission. On TCP stream proxies, it runs in `on_stream_connect` after the frontend TLS handshake. On UDP stream proxies, it runs after the frontend DTLS handshake completes. In both cases, the client certificate is mapped to a Consumer before later stream plugins run.
 
 For UDP+DTLS frontends, the underlying DTLS library exposes only the client leaf certificate to Ferrum. Chain-based plugin inputs such as `tls_client_cert_chain_der` are therefore unavailable on DTLS streams; configure the DTLS client CA bundle with any intermediate certificates needed for handshake validation.
 
@@ -1281,10 +1281,12 @@ For UDP+DTLS frontends, the underlying DTLS library exposes only the client leaf
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `cert_field` | String | `subject_cn` | Certificate field to use as identity |
-| `allowed_issuers` | Object[] | *(none)* | Per-proxy issuer DN filters |
+| `allowed_issuers` | Object[] | *(none)* | Per-proxy issuer filters cryptographically bound to pinned CA certificates |
 | `allowed_ca_fingerprints_sha256` | String[] | *(none)* | SHA-256 fingerprints of allowed CA/intermediate certs |
 
 **Supported `cert_field` values:** `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, `san_email`, `fingerprint_sha256`, `serial`
+
+For `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, and `san_email`, Ferrum selects only the **first matching value in certificate order**. Later subject attributes or SAN entries are not fallback identities. DNS SAN identities are normalized with ASCII lowercase and compared case-insensitively; every other identity field is compared exactly. Consumer mTLS identities must be unique under ASCII case folding so a certificate cannot resolve ambiguously when a proxy uses `san_dns`.
 
 > **`serial` format.** The serial identity is the lowercase hex serial number value — no separators, matching the lowercase of `openssl x509 -serial -noout -in cert.pem` output. DER may include a leading `00` sign-padding byte for positive serials whose high bit is set, but OpenSSL's serial value omits that DER-only pad and Ferrum strips it before lookup (for example, DER bytes `00 C0 01` match stored identity `c001`). Preserve real serial value zeros, but do not add DER sign padding and do not use the colon-separated form from `openssl x509 -text`.
 
@@ -1297,7 +1299,7 @@ credentials:
 ```
 
 **Issuer Filtering:**
-When `allowed_issuers` is configured, each filter object can specify `cn`, `o`, and/or `ou` fields. Within a single filter, all specified fields must match (AND logic). Across filter entries, any match is sufficient (OR logic).
+When `allowed_issuers` is configured, every filter requires `ca_certificate_pem` containing exactly one CA certificate plus at least one of `cn`, `o`, or `ou`. The DN fields must match both the leaf issuer and the pinned CA subject (AND logic within one filter; OR across filters), and Ferrum cryptographically verifies a signature path from the leaf to that pinned CA key. Matching issuer text alone never authorizes a certificate, so two CAs with the same DN cannot impersonate each other.
 
 ```yaml
 plugin_name: mtls_auth
@@ -1305,18 +1307,26 @@ config:
   cert_field: subject_cn
   allowed_issuers:
     - cn: "Internal Services CA"
+      ca_certificate_pem: |
+        -----BEGIN CERTIFICATE-----
+        ...Internal Services CA certificate...
+        -----END CERTIFICATE-----
     - cn: "Partner Portal CA"
       o: "Partner Corp"
+      ca_certificate_pem: |
+        -----BEGIN CERTIFICATE-----
+        ...Partner Portal CA certificate...
+        -----END CERTIFICATE-----
 ```
 
 **CA Fingerprint Filtering:**
 When `allowed_ca_fingerprints_sha256` is configured, at least one certificate in the client's TLS chain must match a configured SHA-256 fingerprint. When both `allowed_issuers` and `allowed_ca_fingerprints_sha256` are configured, both constraints must pass (AND logic).
 
-On UDP+DTLS streams, `allowed_ca_fingerprints_sha256` is not usable. The filter only ever hashes the client's intermediate/CA chain certificates (the leaf is never matched against it), and the dimpl-backed DTLS path exposes only the client leaf — `tls_client_cert_chain_der` is always `None`. Configuring `allowed_ca_fingerprints_sha256` on a DTLS-fronted proxy therefore rejects **every** connection, because there are no chain certificates to match. For DTLS, restrict the issuing CA with `allowed_issuers` (which matches the leaf's issuer DN and works on the exposed leaf), and/or pin a specific client certificate with `cert_field: fingerprint_sha256` mapped to a consumer identity.
+On UDP+DTLS streams, `allowed_ca_fingerprints_sha256` is not usable and is rejected during configuration admission. The filter hashes only verified intermediate/CA chain certificates (never the leaf), while the dimpl-backed DTLS path exposes only the client leaf. For DTLS, use `allowed_issuers` with `ca_certificate_pem`; the configured pin can verify the leaf signature even though the root is absent from the presented chain. To pin one client certificate instead, use `cert_field: fingerprint_sha256` mapped to a consumer identity.
 
 Issuer-constraint rejection bodies are always emitted as valid JSON even when certificate subject fields contain quotes, newlines, or other control characters.
 
-Works with `auth_mode: multi` — if the mTLS check fails, the gateway continues to the next auth plugin.
+`auth_mode: multi` applies only after a TLS/DTLS handshake succeeds. HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC, and TCP+TLS use `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` (or its `_SOURCE` equivalent); UDP+DTLS uses `FERRUM_DTLS_CLIENT_CA_CERT_PATH` (or its `_SOURCE` equivalent). When the corresponding client-CA source is configured, the handshake requires a certificate that validates to it, so a missing or untrusted certificate fails before JWT or API-key plugins can run. When it is absent, that frontend does not request a client certificate and `mtls_auth` has no certificate to authenticate. Multi-auth fallback is reachable only after a verified certificate reaches the plugin and then fails consumer mapping, identity extraction, or an issuer/fingerprint constraint.
 
 ### `jwks_auth`
 

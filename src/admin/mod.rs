@@ -3341,12 +3341,6 @@ async fn handle_update_credentials(
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut cred_value) {
         return Ok(*resp);
     }
-    if let Err(resp) =
-        ensure_credential_unique(db.as_ref(), namespace, consumer_id, cred_type, &cred_value).await
-    {
-        return Ok(*resp);
-    }
-
     let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
         Ok(consumer) => consumer,
         Err(resp) => return Ok(*resp),
@@ -3355,9 +3349,22 @@ async fn handle_update_credentials(
     consumer
         .credentials
         .insert(cred_type.to_string(), cred_value);
+    consumer.normalize_fields();
 
     if let Err(field_errors) = consumer.validate_fields() {
         return Ok(invalid_credential_fields_response(&field_errors));
+    }
+    if let Some(normalized_credential) = consumer.credentials.get(cred_type)
+        && let Err(resp) = ensure_credential_unique(
+            db.as_ref(),
+            namespace,
+            consumer_id,
+            cred_type,
+            normalized_credential,
+        )
+        .await
+    {
+        return Ok(*resp);
     }
 
     let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
@@ -4084,6 +4091,40 @@ async fn handle_batch_create(
             .and_then(|config| config.mesh.clone()),
         ..Default::default()
     };
+
+    match db.load_namespace_snapshot(namespace).await {
+        Ok(mut candidate_config) => {
+            for proxy in &batch.proxies {
+                if let Some(existing) = candidate_config
+                    .proxies
+                    .iter_mut()
+                    .find(|item| item.id == proxy.id)
+                {
+                    *existing = proxy.clone();
+                } else {
+                    candidate_config.proxies.push(proxy.clone());
+                }
+            }
+            for plugin in &batch.plugin_configs {
+                if let Some(existing) = candidate_config
+                    .plugin_configs
+                    .iter_mut()
+                    .find(|item| item.id == plugin.id)
+                {
+                    *existing = plugin.clone();
+                } else {
+                    candidate_config.plugin_configs.push(plugin.clone());
+                }
+            }
+            if let Err(errors) = candidate_config.validate_mtls_auth_compatibility() {
+                validation_errors.extend(errors);
+            }
+        }
+        Err(error) => validation_errors.push(format!(
+            "Failed to load namespace config for mTLS compatibility validation: {}",
+            error
+        )),
+    }
 
     match ValidationPipeline::new(&mut batch_config)
         .validate_unique_resource_ids(ValidationAction::Collect)

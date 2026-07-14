@@ -913,6 +913,200 @@ fn empty_config() -> GatewayConfig {
     }
 }
 
+fn mtls_plugin(
+    id: &str,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+    config: serde_json::Value,
+) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        plugin_name: "mtls_auth".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        config,
+        scope,
+        proxy_id: proxy_id.map(str::to_string),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn stream_proxy(id: &str, scheme: BackendScheme, frontend_tls: bool) -> Proxy {
+    let mut proxy = make_proxy(id, "/unused");
+    proxy.listen_path = None;
+    proxy.backend_scheme = Some(scheme);
+    proxy.dispatch_kind = DispatchKind::from(scheme);
+    proxy.listen_port = Some(if scheme.is_udp() { 5353 } else { 5432 });
+    proxy.frontend_tls = frontend_tls;
+    proxy
+}
+
+#[test]
+fn mtls_auth_compatibility_rejects_plaintext_and_passthrough_streams() {
+    let plaintext = stream_proxy("plain", BackendScheme::Tcp, false);
+    let mut passthrough = stream_proxy("passthrough", BackendScheme::Tcp, false);
+    passthrough.passthrough = true;
+    let config = GatewayConfig {
+        proxies: vec![plaintext, passthrough],
+        plugin_configs: vec![mtls_plugin(
+            "mtls-global",
+            PluginScope::Global,
+            None,
+            serde_json::json!({}),
+        )],
+        ..empty_config()
+    };
+
+    let errors = config.validate_mtls_auth_compatibility().unwrap_err();
+    assert_eq!(errors.len(), 2);
+    assert!(errors.iter().any(|error| error.contains("Proxy 'plain'")));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("passthrough=false"))
+    );
+}
+
+#[test]
+fn mtls_auth_compatibility_checks_proxy_and_proxy_group_scopes() {
+    let mut proxy = stream_proxy("tcp", BackendScheme::Tcp, false);
+    proxy.plugins = vec![
+        PluginAssociation {
+            plugin_config_id: "mtls-proxy".to_string(),
+        },
+        PluginAssociation {
+            plugin_config_id: "mtls-group".to_string(),
+        },
+    ];
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        plugin_configs: vec![
+            mtls_plugin(
+                "mtls-proxy",
+                PluginScope::Proxy,
+                Some("tcp"),
+                serde_json::json!({}),
+            ),
+            mtls_plugin(
+                "mtls-group",
+                PluginScope::ProxyGroup,
+                None,
+                serde_json::json!({}),
+            ),
+        ],
+        ..empty_config()
+    };
+
+    let errors = config.validate_mtls_auth_compatibility().unwrap_err();
+    assert_eq!(errors.len(), 2);
+    assert!(errors.iter().any(|error| error.contains("mtls-proxy")));
+    assert!(errors.iter().any(|error| error.contains("mtls-group")));
+}
+
+#[test]
+fn mtls_auth_compatibility_rejects_chain_fingerprints_on_dtls() {
+    let config = GatewayConfig {
+        proxies: vec![stream_proxy("dtls", BackendScheme::Dtls, true)],
+        plugin_configs: vec![mtls_plugin(
+            "mtls-global",
+            PluginScope::Global,
+            None,
+            serde_json::json!({
+                "allowed_ca_fingerprints_sha256": ["00".repeat(32)]
+            }),
+        )],
+        ..empty_config()
+    };
+
+    let errors = config.validate_mtls_auth_compatibility().unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("UDP/DTLS does not expose"));
+}
+
+#[test]
+fn mtls_auth_compatibility_allows_terminated_tcp_and_dtls_issuer_pins() {
+    let config = GatewayConfig {
+        proxies: vec![
+            stream_proxy("tcp", BackendScheme::Tcp, true),
+            stream_proxy("dtls", BackendScheme::Dtls, true),
+        ],
+        plugin_configs: vec![mtls_plugin(
+            "mtls-global",
+            PluginScope::Global,
+            None,
+            serde_json::json!({
+                "allowed_issuers": [{
+                    "cn": "Internal CA",
+                    "ca_certificate_pem": "configured CA PEM"
+                }]
+            }),
+        )],
+        ..empty_config()
+    };
+
+    assert!(config.validate_mtls_auth_compatibility().is_ok());
+}
+
+#[test]
+fn local_mtls_auth_shadows_incompatible_global_fingerprint_policy() {
+    let mut proxy = stream_proxy("dtls", BackendScheme::Dtls, true);
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "mtls-local".to_string(),
+    }];
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        plugin_configs: vec![
+            mtls_plugin(
+                "mtls-global",
+                PluginScope::Global,
+                None,
+                serde_json::json!({
+                    "allowed_ca_fingerprints_sha256": ["00".repeat(32)]
+                }),
+            ),
+            mtls_plugin(
+                "mtls-local",
+                PluginScope::Proxy,
+                Some("dtls"),
+                serde_json::json!({}),
+            ),
+        ],
+        ..empty_config()
+    };
+
+    assert!(config.validate_mtls_auth_compatibility().is_ok());
+}
+
+#[test]
+fn frontend_tls_mtls_example_is_a_valid_gateway_config() {
+    let docs = include_str!("../../../docs/frontend_tls.md");
+    let section = docs
+        .split("### Per-Proxy CA Filtering with `mtls_auth`")
+        .nth(1)
+        .expect("mTLS filtering section exists");
+    let yaml = section
+        .split("```yaml")
+        .nth(1)
+        .and_then(|tail| tail.split("```").next())
+        .expect("mTLS filtering section contains a YAML example");
+    let mut config: GatewayConfig = serde_yaml::from_str(yaml).expect("example YAML parses");
+
+    assert!(config.validate_all_fields(30).is_ok());
+    config.normalize_fields();
+    assert!(config.validate_plugin_references().is_ok());
+    for plugin_config in &config.plugin_configs {
+        assert!(
+            ferrum_edge::plugins::create_plugin(&plugin_config.plugin_name, &plugin_config.config,)
+                .is_ok(),
+            "documented PluginConfig '{}' must construct",
+            plugin_config.id
+        );
+    }
+}
+
 #[test]
 fn test_unique_listen_paths_valid() {
     let config = GatewayConfig {
@@ -1308,6 +1502,26 @@ fn test_unique_consumer_credentials_mtls_different_identities_ok() {
     assert!(config.validate_unique_consumer_credentials().is_ok());
 }
 
+#[test]
+fn test_unique_consumer_credentials_rejects_case_variant_mtls_identities() {
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "API.Example.COM"}]),
+    );
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "api.example.com"}]),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+
+    let errors = config.validate_unique_consumer_credentials().unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("case-insensitive"));
+}
+
 // ---- Multi-credential (array format) tests ----
 
 #[test]
@@ -1428,6 +1642,57 @@ fn test_validate_fields_array_credentials_within_limit() {
         serde_json::json!([{"key": "k1"}, {"key": "k2"}]),
     );
     assert!(c.validate_fields().is_ok());
+}
+
+#[test]
+fn test_validate_fields_accepts_well_formed_mtls_credentials() {
+    let mut consumer = make_consumer("c1", "alice");
+    consumer.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([
+            {"identity": "client.example.com"},
+            {"identity": "spiffe://example.test/ns/default/sa/alice"}
+        ]),
+    );
+    assert!(consumer.validate_fields().is_ok());
+}
+
+#[test]
+fn test_validate_fields_rejects_malformed_mtls_credentials() {
+    for credential in [
+        serde_json::json!({}),
+        serde_json::json!({"identity": ""}),
+        serde_json::json!({"identity": " \t "}),
+        serde_json::json!({"identity": 42}),
+        serde_json::json!({"identity": "client.example.com", "unexpected": true}),
+        serde_json::json!({"subject": "client.example.com"}),
+    ] {
+        let mut consumer = make_consumer("c1", "alice");
+        consumer
+            .credentials
+            .insert("mtls_auth".into(), serde_json::json!([credential]));
+        assert!(
+            consumer.validate_fields().is_err(),
+            "malformed credential must fail closed: {:?}",
+            consumer.credentials["mtls_auth"]
+        );
+    }
+}
+
+#[test]
+fn test_normalize_fields_trims_mtls_identity_without_case_folding() {
+    let mut consumer = make_consumer("c1", "alice");
+    consumer.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "  Client.Example.COM  "}]),
+    );
+
+    consumer.normalize_fields();
+
+    assert_eq!(
+        consumer.credentials["mtls_auth"][0]["identity"],
+        "Client.Example.COM"
+    );
 }
 
 #[test]

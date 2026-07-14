@@ -167,7 +167,7 @@ fn consumer_credential_index_entries(consumer: &Consumer) -> Vec<ConsumerCredent
         if let Some(identity) = entry.get("identity").and_then(|value| value.as_str()) {
             let indexed = ConsumerCredentialIndexEntry {
                 credential_type: "mtls_auth",
-                credential_hash: credential_value_hash(identity),
+                credential_hash: credential_value_hash(&identity.to_ascii_lowercase()),
             };
             if seen.insert(indexed.clone()) {
                 entries.push(indexed);
@@ -3874,7 +3874,7 @@ impl DatabaseStore {
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let credential_hash = credential_value_hash(mtls_identity);
+        let credential_hash = credential_value_hash(&mtls_identity.to_ascii_lowercase());
         let row: Option<AnyRow> =
             sqlx::query(&self.q("SELECT consumer_id FROM consumer_credential_index \
                  WHERE namespace = ? AND credential_type = ? AND credential_hash = ?"))

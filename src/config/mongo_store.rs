@@ -59,8 +59,8 @@ mod inner {
         Binary, Bson, DateTime as BsonDateTime, Document, doc, spec::BinarySubtype,
     };
     use mongodb::options::{
-        ClientOptions, FindOptions, IndexOptions, ReadConcern, ReadPreference, ReturnDocument,
-        SelectionCriteria, Tls, TlsOptions, WriteConcern,
+        ClientOptions, Collation, CollationStrength, FindOptions, IndexOptions, ReadConcern,
+        ReadPreference, ReturnDocument, SelectionCriteria, Tls, TlsOptions, WriteConcern,
     };
     use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
     use std::collections::HashSet;
@@ -189,6 +189,13 @@ mod inner {
 
     fn is_index_already_exists(err: &mongodb::error::Error) -> bool {
         is_mongo_command_error_with_code(err, MONGO_ERR_INDEX_ALREADY_EXISTS)
+    }
+
+    fn mtls_identity_collation() -> Collation {
+        Collation::builder()
+            .locale("en")
+            .strength(CollationStrength::Secondary)
+            .build()
     }
 
     fn is_duplicate_key(err: &mongodb::error::Error) -> bool {
@@ -6123,7 +6130,11 @@ mod inner {
                 // by the plain `id` field.
                 filter.insert("id", doc! { "$ne": id });
             }
-            let count = self.consumers().count_documents(filter).await?;
+            let count = self
+                .consumers()
+                .count_documents(filter)
+                .collation(mtls_identity_collation())
+                .await?;
             Ok(count == 0)
         }
 
@@ -7059,21 +7070,46 @@ mod inner {
                             .build(),
                     )
                     .await?;
-                self.consumers()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "credentials.mtls_auth.identity": 1 })
-                            .options(
-                                IndexOptions::builder()
-                                    .unique(true)
-                                    .partial_filter_expression(doc! {
-                                        "credentials.mtls_auth.identity": { "$type": "string" }
-                                    })
-                                    .build(),
-                            )
+                let mtls_identity_unique = IndexModel::builder()
+                    .keys(doc! { "namespace": 1, "credentials.mtls_auth.identity": 1 })
+                    .options(
+                        IndexOptions::builder()
+                            .unique(true)
+                            .partial_filter_expression(doc! {
+                                "credentials.mtls_auth.identity": { "$type": "string" }
+                            })
+                            .collation(mtls_identity_collation())
                             .build(),
                     )
-                    .await?;
+                    .build();
+                match self
+                    .consumers()
+                    .create_index(mtls_identity_unique.clone())
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) if is_index_options_conflict(&e) => {
+                        warn!(
+                            "MongoDB mTLS consumer identity index is case-sensitive. Dropping it \
+                             and recreating with case-insensitive collation."
+                        );
+                        match self
+                            .consumers()
+                            .drop_index("namespace_1_credentials.mtls_auth.identity_1")
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(drop_err) if is_index_not_found(&drop_err) => {}
+                            Err(drop_err) => return Err(drop_err.into()),
+                        }
+                        match self.consumers().create_index(mtls_identity_unique).await {
+                            Ok(_) => {}
+                            Err(create_err) if is_index_already_exists(&create_err) => {}
+                            Err(create_err) => return Err(create_err.into()),
+                        }
+                    }
+                    Err(e) => return Err(e.into()),
+                }
                 self.consumers()
                     .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
                     .await?;
@@ -9894,6 +9930,11 @@ mod inner {
                     && source.contains(r#""credentials.mtls_auth.identity": 1"#)
                     && source.contains(".unique(true)"),
                 "MongoDB must enforce keyauth and mTLS credential uniqueness with indexes"
+            );
+            assert!(
+                source.contains(".collation(mtls_identity_collation())")
+                    && source.contains("CollationStrength::Secondary"),
+                "mTLS identity uniqueness must be case-insensitive in MongoDB"
             );
         }
 

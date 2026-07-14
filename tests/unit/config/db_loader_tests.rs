@@ -403,6 +403,47 @@ async fn consumer_credential_index_enforces_keyauth_uniqueness() {
 }
 
 #[tokio::test]
+async fn consumer_credential_index_enforces_case_insensitive_mtls_uniqueness() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("consumer_mtls_identity_index.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{ "identity": "API.Example.COM" }]),
+    );
+    store.create_consumer(&c1).await.unwrap();
+
+    assert!(
+        !store
+            .check_mtls_identity_unique("ferrum", "api.example.com", None)
+            .await
+            .unwrap()
+    );
+
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{ "identity": "api.example.com" }]),
+    );
+    let error = store
+        .create_consumer(&c2)
+        .await
+        .expect_err("case-variant mTLS identity must violate credential index");
+    let message = error.to_string();
+    assert!(
+        message.contains("consumer_credential_index")
+            || message.contains("UNIQUE")
+            || message.contains("constraint"),
+        "unexpected duplicate-identity error: {message}"
+    );
+}
+
+#[tokio::test]
 async fn consumer_credential_index_updates_on_consumer_update() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("consumer_credential_index_update.db");

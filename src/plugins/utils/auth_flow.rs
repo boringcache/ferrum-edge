@@ -23,6 +23,7 @@ pub enum ExtractedCredential {
     MtlsCert {
         der_bytes: Arc<Vec<u8>>,
         chain_der: Option<Arc<Vec<Vec<u8>>>>,
+        connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     },
     /// Extract failed before verification could run (bad header scheme,
     /// malformed base64, missing required companion header, etc.).

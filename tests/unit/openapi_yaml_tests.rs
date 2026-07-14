@@ -223,6 +223,56 @@ fn typed_component_properties_match_serde_field_inventories() {
     check!(MeshEgressScopeResource, "MeshEgressScopeResource");
 }
 
+#[test]
+fn mtls_auth_schemas_match_runtime_contract() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let credential = &spec["components"]["schemas"]["MtlsAuthCredential"];
+    assert_eq!(credential["additionalProperties"], false);
+    assert_eq!(credential["required"], json!(["identity"]));
+    assert_eq!(credential["properties"]["identity"]["minLength"], 1);
+    let credential_description = credential["properties"]["identity"]["description"]
+        .as_str()
+        .expect("identity description");
+    assert!(credential_description.contains("`cert_field`"));
+    assert!(!credential_description.contains("identity_source"));
+    assert!(credential_description.contains("first matching value"));
+    assert!(credential_description.contains("ASCII case-insensitive"));
+
+    let config = &spec["components"]["schemas"]["MtlsAuthConfig"];
+    assert_eq!(config["additionalProperties"], false);
+    assert_eq!(config["properties"]["allowed_issuers"]["minItems"], 1);
+    assert_eq!(
+        config["properties"]["allowed_issuers"]["items"]["required"],
+        json!(["ca_certificate_pem"])
+    );
+    assert_eq!(
+        config["properties"]["allowed_issuers"]["items"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        config["properties"]["allowed_ca_fingerprints_sha256"]["minItems"],
+        1
+    );
+    let description = config["description"]
+        .as_str()
+        .expect("mtls config description");
+    for protocol in [
+        "HTTP/1.1",
+        "HTTP/2",
+        "HTTP/3",
+        "gRPC",
+        "WebSocket",
+        "TCP+TLS",
+        "UDP+DTLS",
+    ] {
+        assert!(
+            description.contains(protocol),
+            "missing protocol {protocol}"
+        );
+    }
+}
+
 fn normalized_path_template(path: &str) -> String {
     static PATH_PARAMETER: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\{[^}]+\}").expect("path-template regex compiles"));
