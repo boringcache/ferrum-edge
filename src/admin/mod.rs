@@ -205,15 +205,20 @@ pub struct AdminState {
     /// serve traffic (`startup_ready=true`) while admin writes are blocked
     /// (`db_available=false`) during a transient DB outage.
     pub db_available: Option<Arc<AtomicBool>>,
-    /// Set by the database-mode poll loop when the latest full config load was
-    /// rejected by the shared runtime-config *validation* contract (a reachable
-    /// backend served a semantically-invalid snapshot) rather than failing on
-    /// connectivity. Orthogonal to `db_available`: on a validation rejection the
-    /// backend is reachable and admin writes are the in-band repair tool, so
-    /// `db_available` stays `true` while this flag rises. Cleared only by the
-    /// next accepted authoritative full reload. Surfaced only in the authenticated `/health` detail
-    /// (`config_rejected`) and coarsely as a `"degraded"` status; `None` in
-    /// modes without a database poll loop. See issue #2158.
+    /// Set by the database- or CP-mode poll loop when the latest full config
+    /// load was rejected by the shared runtime-config *validation* contract (a
+    /// reachable backend served a semantically-invalid snapshot) rather than
+    /// failing on connectivity. Orthogonal to `db_available`: on a validation
+    /// rejection the backend is reachable and admin writes are the in-band repair
+    /// tool, so `db_available` stays `true` while this flag rises. Cleared only by
+    /// the next accepted authoritative full reload. Surfaced only in the
+    /// authenticated `/health` detail (`config_rejected`) and coarsely as a
+    /// `"degraded"` status; `None` in modes without a writable poll loop.
+    ///
+    /// The stored flag is deliberately sticky across a later connectivity outage;
+    /// the `/health` handler suppresses the detailed `config_rejected` field while
+    /// `db_available=false` so it never advertises the writable repair path when
+    /// admin writes are actually blocked. See issue #2158.
     pub config_rejected: Option<Arc<AtomicBool>>,
     /// Max request body size in MiB for POST /restore.
     pub admin_restore_max_body_size_mib: usize,
@@ -1135,12 +1140,24 @@ pub async fn handle_admin_request(
         // The boolean detail is authenticated-only: it is added to
         // `health_status`, which the minimal unauthenticated body below does not
         // echo. The coarse status is consistent with the other DB-driven
-        // degradations above. Cleared by the next accepted load.
+        // degradations above. Cleared by the next accepted full reload.
+        //
+        // The stored flag is intentionally STICKY across a later connectivity
+        // outage (it clears only on an accepted authoritative full reload). But
+        // while `db_available=false` the writable in-band repair path is gone
+        // (`admin_writes_enabled=false`), so surfacing `config_rejected=true`
+        // would falsely advertise that path. Suppress the detailed field during
+        // an outage — without touching the sticky stored flag — so the two
+        // authenticated details stay mutually honest (issue #2158).
         let config_rejected = state
             .config_rejected
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Relaxed));
-        if config_rejected {
+        let db_reachable = state
+            .db_available
+            .as_ref()
+            .is_none_or(|flag| flag.load(Ordering::Relaxed));
+        if config_rejected && db_reachable {
             health_status["status"] = json!("degraded");
             health_status["config_rejected"] = json!(true);
         }

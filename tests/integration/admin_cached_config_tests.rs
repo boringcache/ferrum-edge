@@ -3586,6 +3586,47 @@ async fn test_connectivity_failure_still_blocks_admin_writes_2158() {
     );
 }
 
+#[tokio::test]
+async fn test_config_rejected_detail_suppressed_during_connectivity_outage_2158() {
+    // Finding 3 (issue #2158): the stored config_rejected flag is deliberately
+    // sticky and clears only on an accepted authoritative full reload. But once a
+    // later connectivity outage sets db_available=false, admin writes are blocked
+    // (admin_writes_enabled=false), so the writable in-band repair path that
+    // config_rejected advertises no longer exists. The authenticated /health
+    // detail must therefore SUPPRESS config_rejected while db_available=false —
+    // keeping the two authenticated details mutually honest — without clearing
+    // the sticky stored flag.
+    let tc = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(false)); // connectivity outage
+    let cfg_rejected = Arc::new(AtomicBool::new(true)); // sticky prior rejection
+    let (mut state, _dir) =
+        create_db_admin_state_with_availability(&tc, Some(db_flag.clone())).await;
+    state.config_rejected = Some(cfg_rejected.clone());
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (health_status, health, _) = admin_get(&base_url, "/health", &token).await;
+    assert_eq!(health_status, reqwest::StatusCode::OK);
+    assert_eq!(
+        health["admin_writes_enabled"], false,
+        "a connectivity outage must block admin writes: {health:?}"
+    );
+    assert!(
+        health.get("config_rejected").is_none(),
+        "config_rejected detail must be suppressed while db_available=false: {health:?}"
+    );
+
+    // The stored flag is only suppressed, not cleared: once the backend is
+    // reachable again the detail re-appears (writes are back, repair path valid).
+    db_flag.store(true, Ordering::Relaxed);
+    let (_, health2, _) = admin_get(&base_url, "/health", &token).await;
+    assert_eq!(health2["admin_writes_enabled"], true);
+    assert_eq!(
+        health2["config_rejected"], true,
+        "the sticky rejection detail must re-surface once the backend is reachable: {health2:?}"
+    );
+}
+
 // ============================================================================
 // Backup Cached Config Fallback Tests
 // ============================================================================

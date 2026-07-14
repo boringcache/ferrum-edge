@@ -1057,7 +1057,7 @@ pub async fn run(
                 );
                 match load_config_backup(path) {
                     Some(cfg) => {
-                        startup_config_rejected = is_poll_validation_rejection(&e);
+                        startup_config_rejected = crate::modes::is_poll_validation_rejection(&e);
                         if startup_config_rejected {
                             error!(
                                 "Initial database snapshot was rejected by runtime validation; \
@@ -1941,13 +1941,15 @@ pub async fn run(
                                 }
                             }
                             Err(e) => {
-                                if is_poll_validation_rejection(&e) {
-                                    record_config_validation_rejection(
+                                if crate::modes::is_poll_validation_rejection(&e) {
+                                    crate::modes::record_config_validation_rejection(
+                                        &db_poll,
                                         &db_available_poll,
                                         &config_rejected_poll,
                                         &e,
                                         "full reload after DB DNS reconnect",
-                                    );
+                                    )
+                                    .await;
                                 } else {
                                     error!(
                                         "Authoritative primary full config reload failed after DB DNS reconnect; keeping existing config and retrying: {}",
@@ -2033,13 +2035,15 @@ pub async fn run(
                                                     // allowed to flip db_available on a
                                                     // reconnect error (issue #2158). Keep
                                                     // last known-good config + admin writable.
-                                                    if is_poll_validation_rejection(&e) {
-                                                        record_config_validation_rejection(
+                                                    if crate::modes::is_poll_validation_rejection(&e) {
+                                                        crate::modes::record_config_validation_rejection(
+                                                            &db_poll,
                                                             &db_available_poll,
                                                             &config_rejected_poll,
                                                             &e,
                                                             "rejected-delta escalation full reload",
-                                                        );
+                                                        )
+                                                        .await;
                                                     } else {
                                                         warn!(
                                                             "Authoritative primary full reload failed after repeated rejected delta; keeping last known-good runtime config: {}",
@@ -2084,13 +2088,15 @@ pub async fn run(
                                                                         }
                                                                     }
                                                                     Err(e2) => {
-                                                                        if is_poll_validation_rejection(&e2) {
-                                                                            record_config_validation_rejection(
+                                                                        if crate::modes::is_poll_validation_rejection(&e2) {
+                                                                            crate::modes::record_config_validation_rejection(
+                                                                                &db_poll,
                                                                                 &db_available_poll,
                                                                                 &config_rejected_poll,
                                                                                 &e2,
                                                                                 "rejected-delta escalation failover reload",
-                                                                            );
+                                                                            )
+                                                                            .await;
                                                                         } else {
                                                                             db_available_poll.store(
                                                                                 false,
@@ -2155,13 +2161,15 @@ pub async fn run(
                                         // identical on every replica, so keep the last
                                         // known-good config + admin writable and skip
                                         // failover (issue #2158).
-                                        if is_poll_validation_rejection(&e2) {
-                                            record_config_validation_rejection(
+                                        if crate::modes::is_poll_validation_rejection(&e2) {
+                                            crate::modes::record_config_validation_rejection(
+                                                &db_poll,
                                                 &db_available_poll,
                                                 &config_rejected_poll,
                                                 &e2,
                                                 "full fallback reload",
-                                            );
+                                            )
+                                            .await;
                                         } else {
                                             match db_poll
                                                 .try_failover_reconnect(&db_url_for_reconnect)
@@ -2194,13 +2202,15 @@ pub async fn run(
                                                             }
                                                         }
                                                         Err(e3) => {
-                                                            if is_poll_validation_rejection(&e3) {
-                                                                record_config_validation_rejection(
+                                                            if crate::modes::is_poll_validation_rejection(&e3) {
+                                                                crate::modes::record_config_validation_rejection(
+                                                                    &db_poll,
                                                                     &db_available_poll,
                                                                     &config_rejected_poll,
                                                                     &e3,
                                                                     "failover full reload",
-                                                                );
+                                                                )
+                                                                .await;
                                                             } else {
                                                                 db_available_poll
                                                                     .store(false, Ordering::Relaxed);
@@ -2246,13 +2256,15 @@ pub async fn run(
                                 }
                             }
                             Err(e) => {
-                                if is_poll_validation_rejection(&e) {
-                                    record_config_validation_rejection(
+                                if crate::modes::is_poll_validation_rejection(&e) {
+                                    crate::modes::record_config_validation_rejection(
+                                        &db_poll,
                                         &db_available_poll,
                                         &config_rejected_poll,
                                         &e,
                                         "initial full poll",
-                                    );
+                                    )
+                                    .await;
                                 } else {
                                     db_available_poll.store(false, Ordering::Relaxed);
                                     warn!(
@@ -2356,7 +2368,10 @@ fn commit_full_reload_poll_state(
         proxy::ConfigApplyOutcome::Applied => {
             *last_change_sequence = Some(sequence);
             info!("Configuration applied from database ({})", context);
-            clear_config_rejected_after_accepted_full_reload(config_rejected, context);
+            crate::modes::clear_config_rejected_after_accepted_full_reload(
+                config_rejected,
+                context,
+            );
             true
         }
         proxy::ConfigApplyOutcome::Unchanged => {
@@ -2365,7 +2380,10 @@ fn commit_full_reload_poll_state(
             // An Unchanged outcome still means the freshly-loaded FULL snapshot
             // passed loader validation and matches the running config, so the
             // full snapshot is proven valid again.
-            clear_config_rejected_after_accepted_full_reload(config_rejected, context);
+            crate::modes::clear_config_rejected_after_accepted_full_reload(
+                config_rejected,
+                context,
+            );
             true
         }
         proxy::ConfigApplyOutcome::Rejected { errors } => {
@@ -2393,22 +2411,6 @@ fn initial_db_available(bootstrap_from_backup: bool, config_rejected: bool) -> b
     !bootstrap_from_backup || config_rejected
 }
 
-/// Clear the standing config-rejection signal once a FULL config reload is
-/// accepted (issue #2158). This is the ONLY site that clears `config_rejected`:
-/// an accepted incremental/delta poll does not re-validate the whole snapshot,
-/// so it must leave the flag set until a full reload proves the offending row is
-/// gone. Logs the recovery only on the transition out of the rejected state to
-/// avoid per-poll spam.
-fn clear_config_rejected_after_accepted_full_reload(config_rejected: &AtomicBool, context: &str) {
-    if config_rejected.swap(false, Ordering::Relaxed) {
-        info!(
-            "Full database config snapshot accepted after a prior validation rejection ({}); \
-             config_rejected cleared",
-            context
-        );
-    }
-}
-
 async fn mark_db_available_after_successful_poll_load(
     db: &Arc<dyn DatabaseBackend>,
     db_available: &AtomicBool,
@@ -2418,7 +2420,8 @@ async fn mark_db_available_after_successful_poll_load(
     // re-enable admin writes. Note this does NOT clear `config_rejected`: an
     // accepted incremental poll on top of a validation-rejected full snapshot
     // does not prove the full snapshot is valid again. `config_rejected` is
-    // cleared only by [`clear_config_rejected_after_accepted_full_reload`], which
+    // cleared only by
+    // [`crate::modes::clear_config_rejected_after_accepted_full_reload`], which
     // fires exclusively from an accepted FULL reload (issue #2158).
     match db.maybe_apply_deferred_migrations().await {
         Ok(_) => db_available.store(true, Ordering::Relaxed),
@@ -2430,63 +2433,6 @@ async fn mark_db_available_after_successful_poll_load(
             );
             db_available.store(false, Ordering::Relaxed);
         }
-    }
-}
-
-/// Classifies a poll-loop full-load failure, distinguishing a config-VALIDATION
-/// rejection (reachable backend, semantically-invalid snapshot) from a
-/// connectivity failure (issue #2158). Returns `true` for a validation
-/// rejection.
-///
-/// When it returns `true` the caller must:
-///   - call [`record_config_validation_rejection`] instead of flipping
-///     `db_available` to `false` — the backend is reachable and admin writes are
-///     the in-band repair tool, so admin must stay writable (the helper forces
-///     `db_available = true`, re-enabling writes even after a prior outage); and
-///   - SKIP any failover reconnect — the same invalid snapshot lives on every
-///     replica, so failover cannot help and must not be allowed to flip
-///     `db_available` to `false` on a subsequent reconnect error.
-///
-/// When it returns `false` the caller keeps the existing fail-closed
-/// connectivity handling (failover attempt, then `db_available = false`).
-fn is_poll_validation_rejection(err: &anyhow::Error) -> bool {
-    crate::config::validation_pipeline::is_config_validation_rejection(err)
-}
-
-/// Raise the config-rejection signal for a full load rejected by the
-/// runtime-config VALIDATION contract (issue #2158). A validation rejection is
-/// positive proof the backend is REACHABLE — the loader read the snapshot and
-/// only the runtime-config contract rejected it — so this forces
-/// `db_available = true` regardless of its prior value. That matters when a
-/// preceding connectivity failure (or backup bootstrap) had already set
-/// `db_available = false`: without re-enabling writes the admin API would stay
-/// read-only and the operator could never repair the offending resource
-/// in-band, recreating the exact read-only wedge this change exists to prevent.
-/// The last known-good runtime config keeps serving (the caches were never
-/// rebuilt — the load returned `Err`). Logs loudly only on the transition INTO
-/// the rejected state; repeats log at debug to avoid per-poll spam.
-fn record_config_validation_rejection(
-    db_available: &AtomicBool,
-    config_rejected: &AtomicBool,
-    err: &anyhow::Error,
-    context: &str,
-) {
-    // Reachability is proven: re-enable admin writes so the invalid resource can
-    // be repaired in-band, even if a prior outage had blocked writes.
-    db_available.store(true, Ordering::Relaxed);
-    if !config_rejected.swap(true, Ordering::Relaxed) {
-        error!(
-            "Full config load rejected by validation ({}); backend is reachable so KEEPING \
-             admin API writable to repair the offending resource in-band, serving last \
-             known-good runtime config: {}",
-            context, err
-        );
-    } else {
-        debug!(
-            "Full config load still rejected by validation ({}); serving last known-good \
-             runtime config: {}",
-            context, err
-        );
     }
 }
 
@@ -2627,7 +2573,9 @@ mod tests {
     fn startup_backup_seeds_config_rejection_before_first_poll() {
         let source = include_str!("database.rs");
         assert!(
-            source.contains("startup_config_rejected = is_poll_validation_rejection(&e);"),
+            source.contains(
+                "startup_config_rejected = crate::modes::is_poll_validation_rejection(&e);"
+            ),
             "backup startup must classify the initial full-load failure"
         );
         assert!(
@@ -2644,58 +2592,10 @@ mod tests {
         .into_anyhow()
     }
 
-    #[test]
-    fn validation_rejection_keeps_writes_enabled_and_raises_config_rejected() {
-        // Issue #2158: a reachable-backend validation rejection keeps db_available
-        // true (admin stays writable to repair the config in-band) and raises
-        // config_rejected for the authenticated /health detail.
-        let db_available = AtomicBool::new(true);
-        let config_rejected = AtomicBool::new(false);
-        let err = validation_rejection_error();
-
-        assert!(is_poll_validation_rejection(&err));
-        record_config_validation_rejection(&db_available, &config_rejected, &err, "unit test");
-
-        assert!(
-            config_rejected.load(Ordering::Relaxed),
-            "validation rejection must raise config_rejected"
-        );
-        assert!(
-            db_available.load(Ordering::Relaxed),
-            "validation rejection must keep admin writable"
-        );
-    }
-
-    #[test]
-    fn validation_rejection_reenables_writes_after_prior_outage() {
-        // Issue #2158, P1: db_available was already false from a connectivity
-        // failure. A later load that reaches the backend but fails only
-        // validation PROVES the backend is reachable again, so writes must be
-        // re-enabled — otherwise admin could never repair the invalid config, the
-        // exact read-only wedge this change exists to prevent.
-        let db_available = AtomicBool::new(false);
-        let config_rejected = AtomicBool::new(false);
-        let err = validation_rejection_error();
-
-        record_config_validation_rejection(&db_available, &config_rejected, &err, "post-outage");
-
-        assert!(
-            db_available.load(Ordering::Relaxed),
-            "a validation rejection must re-enable writes even after a prior outage"
-        );
-        assert!(
-            config_rejected.load(Ordering::Relaxed),
-            "validation rejection must raise config_rejected"
-        );
-    }
-
-    #[test]
-    fn connectivity_failure_is_not_a_validation_rejection() {
-        // The connectivity classification is what preserves the fail-closed
-        // db_available=false behavior for genuine outages.
-        let err = anyhow::anyhow!("pool timed out while connecting");
-        assert!(!is_poll_validation_rejection(&err));
-    }
+    // The classification/state-machine semantics (writes stay enabled subject to
+    // the migration gate, config_rejected raised, connectivity ≠ rejection) are
+    // tested directly against the shared helpers in `crate::modes` tests. Here we
+    // only pin the DB-mode LIFECYCLE wiring that composes those helpers.
 
     #[test]
     fn rejected_full_then_incremental_keeps_flag_until_next_full_reload() {
@@ -2705,10 +2605,12 @@ mod tests {
         let db_available = AtomicBool::new(true);
         let config_rejected = AtomicBool::new(false);
 
-        // 1) Rejected full snapshot raises the flag.
-        record_config_validation_rejection(
+        // 1) Rejected full snapshot raises the flag (migration gate satisfied so
+        //    writes stay enabled).
+        crate::modes::apply_config_validation_rejection(
             &db_available,
             &config_rejected,
+            true,
             &validation_rejection_error(),
             "full poll",
         );
