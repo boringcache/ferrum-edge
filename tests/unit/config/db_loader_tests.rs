@@ -1,6 +1,6 @@
 use ferrum_edge::_test_support::{
     DbPoolConfig, db_append_connect_timeout, db_code_is_transient, db_diff_removed,
-    parse_auth_mode, parse_scheme, statement_timeout_sql,
+    db_wrap_mysql_isolation_read_error, parse_auth_mode, parse_scheme, statement_timeout_sql,
 };
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::DatabaseStore;
@@ -576,6 +576,39 @@ fn initial_config_load_transient_sqlx_error_stays_backup_eligible() {
     assert!(
         !DatabaseStore::is_non_transient_init_error(&classified),
         "a transient connectivity load failure must remain backup-eligible: {classified}"
+    );
+}
+
+#[test]
+fn mysql_transaction_isolation_read_disconnect_stays_backup_eligible() {
+    // A MySQL primary can drop mid-`configure_full_load_snapshot` while
+    // `mysql_transaction_isolation()` reads @@transaction_isolation. That is a
+    // transient post-connect load failure the backup path is meant to cover, so
+    // the isolation-read wrapper must keep the fallback sqlx error typed in its
+    // source chain instead of stringifying it. Reconstruct the EXACT production
+    // wrapper (via the shared helper) and pin that classification leaves it
+    // backup-eligible.
+    let primary_error = sqlx::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "connection reset by peer while reading @@transaction_isolation",
+    ));
+    let fallback_error = sqlx::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "connection reset by peer while reading @@tx_isolation",
+    ));
+    let wrapped = db_wrap_mysql_isolation_read_error(&primary_error, fallback_error);
+
+    assert!(
+        wrapped
+            .chain()
+            .any(|source| source.downcast_ref::<sqlx::Error>().is_some()),
+        "the isolation-read wrapper must retain a typed sqlx source: {wrapped:#}"
+    );
+
+    let classified = DatabaseStore::classify_initial_config_load_error(wrapped);
+    assert!(
+        !DatabaseStore::is_non_transient_init_error(&classified),
+        "a transient MySQL disconnect during the isolation read must remain backup-eligible: {classified}"
     );
 }
 

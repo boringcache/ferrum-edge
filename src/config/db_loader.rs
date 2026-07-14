@@ -577,6 +577,27 @@ fn is_transient_mysql_error_number(number: u16) -> bool {
     )
 }
 
+/// Fold a failed MySQL `@@transaction_isolation` read and its `@@tx_isolation`
+/// fallback into one error that PRESERVES the fallback `sqlx::Error` as its
+/// source.
+///
+/// A MySQL primary can drop mid-`configure_full_load_snapshot` while this read
+/// runs; that is a transient post-connect load failure the backup path is meant
+/// to cover. If we stringified both `sqlx` failures into an opaque `anyhow!`
+/// message, [`is_transient_config_load_error`] would find no typed
+/// `sqlx::Error` in the chain and [`DatabaseStore::classify_initial_config_load_error`]
+/// would mark the outage non-transient, refusing `FERRUM_DB_CONFIG_BACKUP_PATH`.
+/// Keeping the fallback error as the chained SOURCE keeps a transient disconnect
+/// backup-eligible while the primary error text survives in the context.
+pub(crate) fn wrap_mysql_isolation_read_error(
+    primary_error: &sqlx::Error,
+    fallback_error: sqlx::Error,
+) -> anyhow::Error {
+    anyhow::Error::new(fallback_error).context(format!(
+        "failed to read MySQL transaction isolation (primary @@transaction_isolation error: {primary_error})"
+    ))
+}
+
 impl DatabaseStore {
     /// Rewrite `?` placeholders to `$N` for PostgreSQL.
     ///
@@ -1728,18 +1749,12 @@ impl DatabaseStore {
             .await
         {
             Ok(value) => Ok(value),
-            Err(primary_error) => {
-                sqlx::query_scalar::<_, String>("SELECT @@tx_isolation")
-                    .fetch_one(&mut **tx)
-                    .await
-                    .map_err(|fallback_error| {
-                        anyhow::anyhow!(
-                            "failed to read MySQL transaction isolation: {}; fallback @@tx_isolation failed: {}",
-                            primary_error,
-                            fallback_error
-                        )
-                    })
-            }
+            Err(primary_error) => sqlx::query_scalar::<_, String>("SELECT @@tx_isolation")
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(|fallback_error| {
+                    wrap_mysql_isolation_read_error(&primary_error, fallback_error)
+                }),
         }
     }
 

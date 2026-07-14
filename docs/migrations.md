@@ -98,9 +98,15 @@ The applied-version read happens after the lock is acquired. When two replicas
 start together, the waiter therefore observes the winner's committed tracking
 row and skips the migration instead of racing the tracking insert. MongoDB
 index migration uses a renewable lease document in `_ferrum_migration_locks`.
-Lease expiry and renewal are evaluated with the MongoDB server clock (`$$NOW`),
-so client clock skew cannot let one replica take over another's still-active
-lease; a crashed owner stops renewing and its lease expires server-side.
+On real MongoDB, lease expiry and renewal are evaluated with the MongoDB server
+clock (an aggregation-pipeline `$$NOW` update), so client clock skew cannot let
+one replica take over another's still-active lease; a crashed owner stops
+renewing and its lease expires server-side. AWS DocumentDB does not support
+aggregation-pipeline-form updates, so on that backend Ferrum detects the
+rejection on the first acquire and falls back to a classic operator update
+stamped from the *client* clock for the whole migration run — same 120s window,
+ownership fencing, and safe release, but skew-safe only as far as the replicas'
+clocks agree (keep them on NTP). See [mongodb.md](mongodb.md#aws-documentdb).
 
 ### Migration Tracking Table
 

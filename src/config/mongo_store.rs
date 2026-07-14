@@ -201,6 +201,33 @@ mod inner {
             )
     }
 
+    /// Recognize an AWS DocumentDB rejection of an aggregation-pipeline-form
+    /// update (an `update` supplied as an array of stages).
+    ///
+    /// DocumentDB is documented as MongoDB-compatible and supports aggregation
+    /// *queries*, but it does NOT implement pipeline-form `findOneAndUpdate` /
+    /// `updateOne`. When the primary `$$NOW` acquire pipeline is issued, a
+    /// DocumentDB backend rejects the command up-front — before any lock
+    /// document is touched — with a server Command error whose message names the
+    /// unsupported feature (DocumentDB phrases such capability gaps as, e.g.,
+    /// "... is not supported" and, for this case, references the update pipeline
+    /// / aggregation update). We match NARROWLY on a Command error whose message
+    /// mentions BOTH that something is unsupported AND that it is an
+    /// update-pipeline/aggregation-update feature, so a transient connectivity
+    /// or contention error is never mistaken for this permanent capability gap.
+    /// A genuine MongoDB server accepts the pipeline and never reaches here.
+    fn is_pipeline_update_unsupported(err: &mongodb::error::Error) -> bool {
+        let mongodb::error::ErrorKind::Command(command_error) = err.kind.as_ref() else {
+            return false;
+        };
+        let message = command_error.message.to_ascii_lowercase();
+        let says_unsupported = message.contains("not supported") || message.contains("unsupported");
+        let names_pipeline_update = message.contains("pipeline")
+            || message.contains("aggregation")
+            || (message.contains("update") && message.contains("array"));
+        says_unsupported && names_pipeline_update
+    }
+
     fn mesh_route_dispatch_references_upstream_id(
         plugin: &PluginConfig,
         upstream_id: &str,
@@ -278,6 +305,25 @@ mod inner {
         _tls_temp_paths: Vec<tempfile::TempPath>,
     }
 
+    /// How a migration lease stamps its expiry/renewal timestamps.
+    ///
+    /// A lease picks its mode once, on the FIRST acquire attempt, and keeps it
+    /// for its whole lifecycle so acquire, renew, and release stay consistent.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MigrationLeaseMode {
+        /// Real MongoDB. Acquire/renew via aggregation-pipeline updates that
+        /// evaluate expiry and stamp timestamps from MongoDB SERVER time
+        /// (`$$NOW`), so client clock skew can never stomp an active lease.
+        ServerTimePipeline,
+        /// AWS DocumentDB fallback. DocumentDB is documented as MongoDB-
+        /// compatible but does NOT support aggregation-pipeline-form updates, so
+        /// acquire/renew use classic operator updates stamped from the CLIENT
+        /// clock (`BsonDateTime::now()`). This reintroduces client-clock-skew
+        /// sensitivity to the lease; that degradation is accepted ONLY for
+        /// DocumentDB, where server-time updates are unavailable.
+        ClientTimeClassic,
+    }
+
     struct MongoMigrationLease {
         // Collection handle bound to the DEDICATED lease client/pool (see
         // `acquire_migration_lease`), deliberately separate from the store's
@@ -285,6 +331,10 @@ mod inner {
         // be starved by a long-running create_index.
         collection: Collection<Document>,
         owner: String,
+        // The update mode chosen at acquisition, carried so release/diagnostics
+        // stay consistent with how acquire/renew stamped the lock. Release is a
+        // mode-independent `delete_one` by `_id`+`owner`, so it needs no branch.
+        mode: MigrationLeaseMode,
         stop_tx: Option<tokio::sync::watch::Sender<bool>>,
         renew_task: Option<tokio::task::JoinHandle<()>>,
         valid: Arc<AtomicBool>,
@@ -306,6 +356,9 @@ mod inner {
                 })?;
             }
 
+            // Release is mode-independent: the owning document is deleted by
+            // `_id`+`owner` regardless of how acquire/renew stamped it.
+            debug!("Releasing MongoDB migration lease (mode={:?})", self.mode);
             let result = self
                 .collection
                 .delete_one(doc! {
@@ -1045,6 +1098,76 @@ mod inner {
             }]
         }
 
+        /// The migration-lease duration in milliseconds (exposed for tests that
+        /// assert the classic acquire/renew builders stamp `now + duration`).
+        pub(crate) fn migration_lease_duration_millis() -> i64 {
+            MONGO_MIGRATION_LEASE_DURATION_MILLIS
+        }
+
+        /// Client-time expiry (`now + lease duration`) as a BSON `DateTime`, so
+        /// the classic DocumentDB fallback writes the same BSON type the
+        /// server-time (`$$NOW`) pipeline produces.
+        fn classic_lease_expiry(client_now: BsonDateTime) -> BsonDateTime {
+            BsonDateTime::from_millis(
+                client_now.timestamp_millis() + MONGO_MIGRATION_LEASE_DURATION_MILLIS,
+            )
+        }
+
+        /// Classic (non-pipeline) acquire FILTER for the DocumentDB fallback.
+        ///
+        /// Matches the lock when it is missing (`expires_at` absent), expired by
+        /// the CLIENT clock, or already owned by us. Combined with an upsert, a
+        /// lock held by another owner with an unexpired `expires_at` matches
+        /// nothing, so the upsert attempts an insert on the existing `_id` and
+        /// fails with a duplicate-key error the acquire loop treats as
+        /// contention (retry) — mirroring the pipeline path.
+        pub(crate) fn migration_lease_acquire_filter_classic(
+            owner: &str,
+            client_now: BsonDateTime,
+        ) -> Document {
+            doc! {
+                "_id": MONGO_MIGRATION_LOCK_ID,
+                "$or": [
+                    { "expires_at": { "$exists": false } },
+                    { "expires_at": { "$lte": client_now } },
+                    { "owner": owner },
+                ],
+            }
+        }
+
+        /// Classic (non-pipeline) acquire UPDATE for the DocumentDB fallback.
+        ///
+        /// Stamps the new owner plus a client-clock expiry/renewal, and sets
+        /// `created_at` only on insert. Client-time stamping carries the
+        /// accepted clock-skew degradation documented on
+        /// [`MigrationLeaseMode::ClientTimeClassic`].
+        pub(crate) fn migration_lease_acquire_update_classic(
+            owner: &str,
+            client_now: BsonDateTime,
+        ) -> Document {
+            doc! {
+                "$set": {
+                    "owner": owner,
+                    "expires_at": Self::classic_lease_expiry(client_now),
+                    "updated_at": client_now,
+                },
+                "$setOnInsert": { "created_at": client_now },
+            }
+        }
+
+        /// Classic (non-pipeline) renew UPDATE for the DocumentDB fallback. The
+        /// owner match stays in the query filter (`{_id, owner}`) so a renewal
+        /// that no longer owns the lock matches nothing, unchanged from the
+        /// pipeline path.
+        pub(crate) fn migration_lease_renew_update_classic(client_now: BsonDateTime) -> Document {
+            doc! {
+                "$set": {
+                    "expires_at": Self::classic_lease_expiry(client_now),
+                    "updated_at": client_now,
+                },
+            }
+        }
+
         async fn acquire_migration_lease(&self) -> Result<MongoMigrationLease, anyhow::Error> {
             // Give the lease acquire/renew/release (and Drop cleanup) path its
             // own dedicated connection pool, separate from the store's
@@ -1071,20 +1194,44 @@ mod inner {
                 .collection::<Document>("_ferrum_migration_locks");
             let owner = Uuid::new_v4().to_string();
 
+            // Start in server-time (`$$NOW`) pipeline mode, the skew-immune
+            // primary path for real MongoDB. Only the FIRST acquire attempt may
+            // probe the backend: if that pipeline update is rejected as
+            // unsupported (AWS DocumentDB), switch to the classic client-time
+            // mode for this lease's whole lifecycle and retry immediately.
+            let mut mode = MigrationLeaseMode::ServerTimePipeline;
+            let mut first_attempt = true;
             loop {
-                let result = collection
-                    .find_one_and_update(
-                        doc! { "_id": MONGO_MIGRATION_LOCK_ID },
-                        Self::migration_lease_acquire_pipeline(&owner),
-                    )
-                    .upsert(true)
-                    .return_document(ReturnDocument::After)
-                    .await;
+                let result = match mode {
+                    MigrationLeaseMode::ServerTimePipeline => {
+                        collection
+                            .find_one_and_update(
+                                doc! { "_id": MONGO_MIGRATION_LOCK_ID },
+                                Self::migration_lease_acquire_pipeline(&owner),
+                            )
+                            .upsert(true)
+                            .return_document(ReturnDocument::After)
+                            .await
+                    }
+                    MigrationLeaseMode::ClientTimeClassic => {
+                        let client_now = BsonDateTime::now();
+                        collection
+                            .find_one_and_update(
+                                Self::migration_lease_acquire_filter_classic(&owner, client_now),
+                                Self::migration_lease_acquire_update_classic(&owner, client_now),
+                            )
+                            .upsert(true)
+                            .return_document(ReturnDocument::After)
+                            .await
+                    }
+                };
 
+                let was_first_attempt = first_attempt;
+                first_attempt = false;
                 match result {
-                    // The server-evaluated pipeline only writes our owner when
-                    // the lease was claimable; a returned document owned by
-                    // someone else means a still-valid lease we must wait on.
+                    // Acquire only writes our owner when the lease was
+                    // claimable; a returned document owned by someone else means
+                    // a still-valid lease we must wait on.
                     Ok(Some(document))
                         if document.get_str("owner").ok() == Some(owner.as_str()) =>
                     {
@@ -1092,6 +1239,24 @@ mod inner {
                     }
                     Ok(_) => {}
                     Err(error) if is_duplicate_key(&error) => {}
+                    // DocumentDB rejects the aggregation-pipeline update up-front
+                    // (before touching the lock), detected only on the first
+                    // attempt. Permanently switch this lease to the classic
+                    // client-time path and retry immediately: the lock state is
+                    // unchanged, so this is a capability fallback, not backoff.
+                    Err(error)
+                        if was_first_attempt
+                            && mode == MigrationLeaseMode::ServerTimePipeline
+                            && is_pipeline_update_unsupported(&error) =>
+                    {
+                        warn!(
+                            "MongoDB rejected the aggregation-pipeline migration-lease update \
+                             (AWS DocumentDB-compatible backend); falling back to the classic \
+                             client-time lease for this migration run: {error}"
+                        );
+                        mode = MigrationLeaseMode::ClientTimeClassic;
+                        continue;
+                    }
                     Err(error) => return Err(error.into()),
                 }
                 tokio::time::sleep(MONGO_MIGRATION_LEASE_RETRY_INTERVAL).await;
@@ -1115,15 +1280,33 @@ mod inner {
                     }
 
                     loop {
-                        let renewal = renew_collection
-                            .update_one(
-                                doc! {
-                                    "_id": MONGO_MIGRATION_LOCK_ID,
-                                    "owner": &renew_owner,
-                                },
-                                MongoStore::migration_lease_renew_pipeline(),
-                            )
-                            .await;
+                        // Renew with the SAME mode the lease acquired under so a
+                        // DocumentDB lease never re-sends the unsupported
+                        // pipeline. The owner filter is identical in both modes.
+                        let renew_filter = doc! {
+                            "_id": MONGO_MIGRATION_LOCK_ID,
+                            "owner": &renew_owner,
+                        };
+                        let renewal = match mode {
+                            MigrationLeaseMode::ServerTimePipeline => {
+                                renew_collection
+                                    .update_one(
+                                        renew_filter,
+                                        MongoStore::migration_lease_renew_pipeline(),
+                                    )
+                                    .await
+                            }
+                            MigrationLeaseMode::ClientTimeClassic => {
+                                renew_collection
+                                    .update_one(
+                                        renew_filter,
+                                        MongoStore::migration_lease_renew_update_classic(
+                                            BsonDateTime::now(),
+                                        ),
+                                    )
+                                    .await
+                            }
+                        };
                         match renewal {
                             Ok(result) if result.matched_count == 1 => {
                                 valid_until =
@@ -1170,6 +1353,7 @@ mod inner {
             Ok(MongoMigrationLease {
                 collection,
                 owner,
+                mode,
                 stop_tx: Some(stop_tx),
                 renew_task: Some(renew_task),
                 valid,
