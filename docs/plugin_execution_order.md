@@ -404,6 +404,12 @@ Browser preflight (`OPTIONS`) requests must be answered before authentication. I
 
 Authentication plugins identify *who* the caller is (setting `ctx.identified_consumer` and/or `ctx.authenticated_identity`). Authorization plugins like `access_control` and `opa` then decide *whether* that identity is allowed — by consumer username, ACL group membership, or external policy. Running auth first is required — authorization checks are meaningless without a verified identity.
 
+When `opa.include_body` is enabled, the request body is collected after the
+authentication phase succeeds and before authorization callbacks run. This
+keeps unauthenticated requests eligible for an immediate `401` without body
+collection while still making the bounded body available to OPA's `authorize`
+callback on HTTP/1.1, HTTP/2, and HTTP/3.
+
 After all plugin phases complete, the gateway automatically injects `X-Consumer-Username` (and `X-Consumer-Custom-Id` when set) headers into the request forwarded to the backend, so upstream services can identify the authenticated caller. `X-Consumer-Username` uses the mapped Consumer username when available, otherwise an external auth header/display identity (for example from `jwks_auth`), otherwise the raw external authenticated identity.
 
 ### Rate limiting runs after auth (priority 2900)

@@ -132,5 +132,13 @@ auth_flow::impl_auth_plugin!(
     "key_auth",
     super::priority::KEY_AUTH,
     crate::plugins::HTTP_FAMILY_PROTOCOLS,
-    auth_flow::run_auth
+    auth_flow::run_auth;
+
+    fn mark_query_credentials_for_redaction(&self, ctx: &mut crate::plugins::RequestContext) {
+        if let Some(name) = self.query_param_name.as_deref()
+            && ctx.query_params.contains_key(name)
+        {
+            crate::plugins::utils::token_extract::mark_query_credential_metadata(ctx, name);
+        }
+    }
 );

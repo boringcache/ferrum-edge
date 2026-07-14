@@ -145,6 +145,9 @@ impl Plugin for PriorityOverridePlugin {
     ) -> PluginResult {
         self.inner.authenticate(ctx, consumer_index).await
     }
+    fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
+        self.inner.mark_query_credentials_for_redaction(ctx);
+    }
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         self.inner.authorize(ctx).await
     }
@@ -163,11 +166,20 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_request_body_before_authenticate(&self) -> bool {
         self.inner.requires_request_body_before_authenticate()
     }
+    fn requires_request_body_before_authorize(&self) -> bool {
+        self.inner.requires_request_body_before_authorize()
+    }
     fn requires_request_body_buffering(&self) -> bool {
         self.inner.requires_request_body_buffering()
     }
     fn needs_request_body_bytes(&self) -> bool {
         self.inner.needs_request_body_bytes()
+    }
+    fn needs_request_body_text(&self) -> bool {
+        self.inner.needs_request_body_text()
+    }
+    fn request_body_buffer_limit(&self) -> Option<usize> {
+        self.inner.request_body_buffer_limit()
     }
     async fn before_proxy(
         &self,
@@ -674,6 +686,7 @@ impl PluginCapabilities {
     pub const NEEDS_FINAL_REQUEST_BODY_CONTEXT: u16 = 1 << 7;
     pub const HAS_RESPONSE_COMMITTED_HOOK: u16 = 1 << 8;
     pub const HAS_RESPONSE_STREAM_HOOKS: u16 = 1 << 9;
+    pub const HAS_BODY_BEFORE_AUTHORIZE: u16 = 1 << 10;
 
     #[inline(always)]
     pub fn has(self, flag: u16) -> bool {
@@ -723,6 +736,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.requires_request_body_before_authenticate() {
             caps |= PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE;
+        }
+        if p.requires_request_body_before_authorize() {
+            caps |= PluginCapabilities::HAS_BODY_BEFORE_AUTHORIZE;
         }
         if p.needs_request_body_bytes() {
             caps |= PluginCapabilities::NEEDS_REQUEST_BODY_BYTES;

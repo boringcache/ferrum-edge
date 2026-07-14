@@ -20,6 +20,41 @@ use super::plugin_utils::assert_continue;
 
 struct InvalidSecondaryAuth;
 
+#[test]
+fn oauth2_marks_forwarded_custom_query_locations_for_opa_redaction() {
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": "http://127.0.0.1:8181/introspect",
+                "client_auth": {"method": "none"},
+                "from_params": ["opaque_sso_token"],
+                "forward_original_token": true
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/test".into());
+    ctx.query_params.insert(
+        "opaque_sso_token".to_string(),
+        "forwarded-opaque-token".to_string(),
+    );
+
+    plugin.mark_query_credentials_for_redaction(&mut ctx);
+
+    assert_eq!(
+        ctx.metadata
+            .get("auth.query_credential_param.opaque_sso_token")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.query_params.get("opaque_sso_token").map(String::as_str),
+        Some("forwarded-opaque-token"),
+        "OPA redaction markers must not change backend forwarding semantics"
+    );
+}
+
 #[async_trait]
 impl Plugin for InvalidSecondaryAuth {
     fn name(&self) -> &str {

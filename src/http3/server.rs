@@ -1477,14 +1477,15 @@ async fn handle_h3_request(
     // plugins can read `ctx.request_body_bytes`.
     // WebSocket Extended CONNECT is excluded: DATA frames after the H3 200 are
     // WebSocket bytes, not a request body that can be drained before upgrade.
-    let h3_requires_body_before_authenticate = allows_request_body_buffering
+    let authenticate_body_requirements = if allows_request_body_buffering
         && capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
-        && plugins.iter().any(|plugin| {
-            plugin.requires_request_body_before_authenticate()
-                && plugin.should_buffer_request_body(&ctx)
-        });
+    {
+        crate::proxy::request_body_requirements_before_authenticate(&plugins, &ctx)
+    } else {
+        crate::proxy::RequestBodyPhaseRequirements::default()
+    };
 
-    let mut prebuffered_body_data: Option<Vec<u8>> = if h3_requires_body_before_authenticate {
+    let mut prebuffered_body_data: Option<Vec<u8>> = if authenticate_body_requirements.required {
         let mut body_data = Vec::new();
         let max_body = if matches!(http_flavor, HttpFlavor::Grpc) {
             state.max_grpc_recv_size_bytes
@@ -1538,9 +1539,14 @@ async fn handle_h3_request(
                 return Ok(());
             }
         }
-        // Auth plugins that need bytes (hmac_auth digest verification) read
-        // `ctx.request_body_bytes`, so always populate the binary-safe handle.
-        crate::proxy::store_request_body_metadata(&mut ctx, &body_data, true);
+        crate::proxy::store_request_body_metadata(
+            &mut ctx,
+            &body_data,
+            authenticate_body_requirements.needs_text,
+            authenticate_body_requirements.needs_bytes,
+        );
+        ctx.bytes_sent_observed
+            .fetch_max(body_data.len() as u64, std::sync::atomic::Ordering::Release);
         Some(body_data)
     } else {
         None
@@ -1615,8 +1621,105 @@ async fn handle_h3_request(
     }
     plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
 
-    // Authorization phase (pre-computed authorize plugin list — zero allocation).
+    // Authorization plugins that inspect bodies buffer only after
+    // authentication succeeds. This avoids collecting unauthenticated H3
+    // uploads solely for a later authorization decision.
     let authorize_plugins = plugin_cache_view.authorize_plugins();
+    let authorize_body_requirements =
+        if capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_BODY_BEFORE_AUTHORIZE) {
+            crate::proxy::request_body_requirements_before_authorize(&authorize_plugins, &ctx)
+        } else {
+            crate::proxy::RequestBodyPhaseRequirements::default()
+        };
+    if authorize_body_requirements.required && allows_request_body_buffering {
+        let global_body_limit = if matches!(http_flavor, HttpFlavor::Grpc) {
+            state.max_grpc_recv_size_bytes
+        } else {
+            state.max_request_body_size_bytes
+        };
+        let body_limit = crate::proxy::effective_request_body_limit(
+            global_body_limit,
+            authorize_body_requirements.plugin_limit,
+        );
+        if prebuffered_body_data.is_none() {
+            let mut body_data = Vec::new();
+            let collect = async {
+                while let Some(chunk) = stream.recv_data().await? {
+                    let bytes = chunk.chunk();
+                    if body_limit > 0 && body_data.len().saturating_add(bytes.len()) > body_limit {
+                        return Ok::<_, h3::error::StreamError>(false);
+                    }
+                    body_data.extend_from_slice(bytes);
+                }
+                Ok(true)
+            };
+            match collect_h3_request_body_with_timeout(collect, proxy.backend_read_timeout_ms).await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    record_request(&state, 413);
+                    send_h3_error_flavor_aware(
+                        &mut stream,
+                        http_flavor,
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        r#"{"error":"Request body exceeds maximum size"}"#,
+                        crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                        "Request body exceeds maximum size",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(H3RequestBodyReadError::Read(error)) => return Err(error.into()),
+                Err(H3RequestBodyReadError::TimedOut) => {
+                    record_request(
+                        &state,
+                        if matches!(http_flavor, HttpFlavor::Grpc) {
+                            StatusCode::OK.as_u16()
+                        } else {
+                            StatusCode::REQUEST_TIMEOUT.as_u16()
+                        },
+                    );
+                    send_h3_error_flavor_aware(
+                        &mut stream,
+                        http_flavor,
+                        StatusCode::REQUEST_TIMEOUT,
+                        r#"{"error":"Request body read timed out"}"#,
+                        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                        "Request body read timed out",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+            prebuffered_body_data = Some(body_data);
+        }
+
+        if let Some(body_data) = prebuffered_body_data.as_ref() {
+            if body_limit > 0 && body_data.len() > body_limit {
+                record_request(&state, 413);
+                send_h3_error_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    r#"{"error":"Request body exceeds maximum size"}"#,
+                    crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                    "Request body exceeds maximum size",
+                )
+                .await?;
+                return Ok(());
+            }
+            crate::proxy::store_request_body_metadata(
+                &mut ctx,
+                body_data,
+                authorize_body_requirements.needs_text,
+                authorize_body_requirements.needs_bytes,
+            );
+            ctx.bytes_sent_observed
+                .fetch_max(body_data.len() as u64, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    // Authorization phase (pre-computed authorize plugin list — zero allocation).
     if !authorize_plugins.is_empty() {
         let phase_start = std::time::Instant::now();
         for plugin in authorize_plugins.iter() {
@@ -1705,8 +1808,21 @@ async fn handle_h3_request(
             plugin.requires_request_body_before_before_proxy()
                 && plugin.should_buffer_request_body(&ctx)
         });
-    let h3_needs_body_bytes = needs_request_body_before_before_proxy
-        && capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_REQUEST_BODY_BYTES);
+    let (h3_needs_body_text, h3_needs_body_bytes) = if needs_request_body_before_before_proxy {
+        let mut needs_text = false;
+        let mut needs_bytes = false;
+        for plugin in plugins.iter() {
+            if plugin.requires_request_body_before_before_proxy()
+                && plugin.should_buffer_request_body(&ctx)
+            {
+                needs_text |= plugin.needs_request_body_text();
+                needs_bytes |= plugin.needs_request_body_bytes();
+            }
+        }
+        (needs_text, needs_bytes)
+    } else {
+        (false, false)
+    };
 
     // If we already buffered above for the body-before-authenticate path, the
     // body is already drained from the stream — no extra recv_data work here.
@@ -1766,8 +1882,17 @@ async fn handle_h3_request(
                 return Ok(());
             }
         }
-        crate::proxy::store_request_body_metadata(&mut ctx, &body_data, h3_needs_body_bytes);
         prebuffered_body_data = Some(body_data);
+    }
+    if needs_request_body_before_before_proxy
+        && let Some(body_data) = prebuffered_body_data.as_ref()
+    {
+        crate::proxy::store_request_body_metadata(
+            &mut ctx,
+            body_data,
+            h3_needs_body_text,
+            h3_needs_body_bytes,
+        );
     }
 
     // before_proxy hooks — only clone headers if at least one plugin modifies them.

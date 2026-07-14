@@ -2300,24 +2300,88 @@ async fn buffer_request_body_for_before_proxy(
 pub(crate) fn store_request_body_metadata(
     ctx: &mut RequestContext,
     body: &[u8],
+    needs_body_text: bool,
     needs_body_bytes: bool,
 ) {
     ctx.metadata.insert(
         "request_body_size_bytes".to_string(),
         body.len().to_string(),
     );
-    if let Ok(body_str) = std::str::from_utf8(body) {
-        ctx.metadata
-            .insert("request_body".to_string(), body_str.to_string());
-    } else {
-        ctx.metadata.remove("request_body");
+    if needs_body_text && !ctx.metadata.contains_key("request_body") {
+        if let Ok(body_str) = std::str::from_utf8(body) {
+            ctx.metadata
+                .insert("request_body".to_string(), body_str.to_string());
+        } else {
+            ctx.metadata.remove("request_body");
+        }
     }
-    // Only allocate a binary copy when a plugin explicitly needs raw bytes
-    // (e.g., request_mirror with gRPC protobuf). This avoids a per-request
-    // Bytes::copy_from_slice for the common case where plugins only read
-    // the UTF-8 metadata string.
-    if needs_body_bytes {
+    // Allocate each representation only when an applicable plugin needs it.
+    // Binary-only consumers (including OPA) therefore avoid retaining a
+    // second full UTF-8 String alongside request_body_bytes.
+    if needs_body_bytes && ctx.request_body_bytes.is_none() {
         ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body));
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RequestBodyPhaseRequirements {
+    pub required: bool,
+    pub needs_text: bool,
+    pub needs_bytes: bool,
+    pub plugin_limit: Option<usize>,
+}
+
+pub(crate) fn request_body_requirements_before_authorize(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+) -> RequestBodyPhaseRequirements {
+    let mut requirements = RequestBodyPhaseRequirements::default();
+    for plugin in plugins {
+        if !plugin.requires_request_body_before_authorize()
+            || !plugin.should_buffer_request_body(ctx)
+        {
+            continue;
+        }
+        requirements.required = true;
+        requirements.needs_text |= plugin.needs_request_body_text();
+        requirements.needs_bytes |= plugin.needs_request_body_bytes();
+        if let Some(limit) = plugin.request_body_buffer_limit() {
+            requirements.plugin_limit = Some(
+                requirements
+                    .plugin_limit
+                    .map_or(limit, |current| current.min(limit)),
+            );
+        }
+    }
+    requirements
+}
+
+pub(crate) fn request_body_requirements_before_authenticate(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+) -> RequestBodyPhaseRequirements {
+    let mut requirements = RequestBodyPhaseRequirements::default();
+    for plugin in plugins {
+        if !plugin.requires_request_body_before_authenticate()
+            || !plugin.should_buffer_request_body(ctx)
+        {
+            continue;
+        }
+        requirements.required = true;
+        requirements.needs_text |= plugin.needs_request_body_text();
+        requirements.needs_bytes |= plugin.needs_request_body_bytes();
+    }
+    requirements
+}
+
+pub(crate) fn effective_request_body_limit(
+    global_limit: usize,
+    plugin_limit: Option<usize>,
+) -> usize {
+    match (global_limit, plugin_limit) {
+        (0, Some(plugin_limit)) => plugin_limit,
+        (global_limit, Some(plugin_limit)) => global_limit.min(plugin_limit),
+        (global_limit, None) => global_limit,
     }
 }
 
@@ -13779,6 +13843,14 @@ pub async fn run_authentication_phase(
     ctx: &mut RequestContext,
     consumer_index: &ConsumerIndex,
 ) -> Option<(u16, Vec<u8>, HashMap<String, String>)> {
+    // Mark every configured query credential location before multi-auth can
+    // stop at the first successful mechanism. Presence is enough to redact:
+    // an invalid token may coexist with a different successful credential and
+    // must not cross the OPA policy-service boundary.
+    for auth_plugin in auth_plugins {
+        auth_plugin.mark_query_credentials_for_redaction(ctx);
+    }
+
     match auth_mode {
         AuthMode::Multi => {
             // Execute auth plugins; first success stops iteration.
@@ -14826,15 +14898,16 @@ async fn handle_proxy_request_inner(
     // WebSocket Extended CONNECT is also excluded: DATA frames after the 200
     // response are WebSocket bytes, not an HTTP request body to drain before
     // authentication.
-    let requires_body_before_authenticate = !is_hbone_connect_any
+    let authenticate_body_requirements = if !is_hbone_connect_any
         && allows_request_body_buffering
         && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
-        && plugins.iter().any(|plugin| {
-            plugin.requires_request_body_before_authenticate()
-                && plugin.should_buffer_request_body(&ctx)
-        });
+    {
+        request_body_requirements_before_authenticate(&plugins, &ctx)
+    } else {
+        RequestBodyPhaseRequirements::default()
+    };
 
-    if requires_body_before_authenticate {
+    if authenticate_body_requirements.required {
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
                 match buffer_request_body_for_before_proxy(
@@ -14848,10 +14921,12 @@ async fn handle_proxy_request_inner(
                 {
                     Ok(buffered) => {
                         if let ClientRequestBody::Buffered(body) = &buffered {
-                            // Auth plugins that need bytes (hmac_auth digest
-                            // verification) read `ctx.request_body_bytes`, so
-                            // always populate the binary-safe handle here.
-                            store_request_body_metadata(&mut ctx, body, true);
+                            store_request_body_metadata(
+                                &mut ctx,
+                                body,
+                                authenticate_body_requirements.needs_text,
+                                authenticate_body_requirements.needs_bytes,
+                            );
                             ctx.bytes_sent_observed
                                 .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
                         }
@@ -14932,8 +15007,99 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
     }
 
-    // Authorization phase (pre-computed authorize plugin list — zero allocation)
+    // Authorization plugins that need a body buffer only after identity has
+    // been established. This keeps unauthenticated requests on the early
+    // rejection path without collecting their bodies.
     let authorize_plugins = plugin_cache_view.authorize_plugins();
+    let authorize_body_requirements =
+        if capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHORIZE) {
+            request_body_requirements_before_authorize(&authorize_plugins, &ctx)
+        } else {
+            RequestBodyPhaseRequirements::default()
+        };
+    if authorize_body_requirements.required
+        && !is_hbone_connect_any
+        && allows_request_body_buffering
+    {
+        let body_limit = effective_request_body_limit(
+            state.max_request_body_size_bytes,
+            authorize_body_requirements.plugin_limit,
+        );
+        client_request_body = match client_request_body {
+            ClientRequestBody::Streaming(request) => {
+                match buffer_request_body_for_before_proxy(
+                    *request,
+                    &method,
+                    &ctx.headers,
+                    body_limit,
+                    proxy.backend_read_timeout_ms,
+                )
+                .await
+                {
+                    Ok(buffered) => {
+                        if let ClientRequestBody::Buffered(body) = &buffered {
+                            store_request_body_metadata(
+                                &mut ctx,
+                                body,
+                                authorize_body_requirements.needs_text,
+                                authorize_body_requirements.needs_bytes,
+                            );
+                            ctx.bytes_sent_observed
+                                .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                        }
+                        buffered
+                    }
+                    Err(RequestBodyBufferError::TooLarge) => {
+                        record_request(&state, 413);
+                        return Ok(build_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            r#"{"error":"Request body exceeds maximum size"}"#,
+                        ));
+                    }
+                    Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
+                        error!(
+                            proxy_id = %proxy.id,
+                            path = %ctx.path,
+                            error_kind = "client_disconnect",
+                            error = %error_message,
+                            "Client disconnected while buffering request body before authorize"
+                        );
+                        record_request(&state, 499);
+                        return Ok(build_response(
+                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                            r#"{"error":"Client disconnected"}"#,
+                        ));
+                    }
+                    Err(RequestBodyBufferError::TimedOut) => {
+                        let response = build_request_body_timeout_response(
+                            is_grpc_request,
+                            grpc_web_response_content_type,
+                        );
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
+                    }
+                }
+            }
+            ClientRequestBody::Buffered(body) => {
+                if body_limit > 0 && body.len() > body_limit {
+                    record_request(&state, 413);
+                    return Ok(build_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        r#"{"error":"Request body exceeds maximum size"}"#,
+                    ));
+                }
+                store_request_body_metadata(
+                    &mut ctx,
+                    &body,
+                    authorize_body_requirements.needs_text,
+                    authorize_body_requirements.needs_bytes,
+                );
+                ClientRequestBody::Buffered(body)
+            }
+        };
+    }
+
+    // Authorization phase (pre-computed authorize plugin list — zero allocation)
     if !authorize_plugins.is_empty() {
         let phase_start = Instant::now();
         for plugin in authorize_plugins.iter() {
@@ -14990,8 +15156,21 @@ async fn handle_proxy_request_inner(
             plugin.requires_request_body_before_before_proxy()
                 && plugin.should_buffer_request_body(&ctx)
         });
-    let needs_body_bytes = requires_request_body_before_before_proxy
-        && capabilities.has(PluginCapabilities::NEEDS_REQUEST_BODY_BYTES);
+    let (needs_body_text, needs_body_bytes) = if requires_request_body_before_before_proxy {
+        let mut needs_text = false;
+        let mut needs_bytes = false;
+        for plugin in plugins.iter() {
+            if plugin.requires_request_body_before_before_proxy()
+                && plugin.should_buffer_request_body(&ctx)
+            {
+                needs_text |= plugin.needs_request_body_text();
+                needs_bytes |= plugin.needs_request_body_bytes();
+            }
+        }
+        (needs_text, needs_bytes)
+    } else {
+        (false, false)
+    };
 
     if requires_request_body_before_before_proxy {
         client_request_body = match client_request_body {
@@ -15007,7 +15186,12 @@ async fn handle_proxy_request_inner(
                 {
                     Ok(buffered) => {
                         if let ClientRequestBody::Buffered(body) = &buffered {
-                            store_request_body_metadata(&mut ctx, body, needs_body_bytes);
+                            store_request_body_metadata(
+                                &mut ctx,
+                                body,
+                                needs_body_text,
+                                needs_body_bytes,
+                            );
                             // Seed bytes_sent_observed from the prebuffered
                             // body so before_proxy rejects (logged via
                             // `log_rejected_request`) surface the real on-wire
@@ -15050,7 +15234,10 @@ async fn handle_proxy_request_inner(
                     }
                 }
             }
-            already_buffered => already_buffered,
+            ClientRequestBody::Buffered(body) => {
+                store_request_body_metadata(&mut ctx, &body, needs_body_text, needs_body_bytes);
+                ClientRequestBody::Buffered(body)
+            }
         };
     }
 

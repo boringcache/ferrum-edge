@@ -1908,25 +1908,32 @@ Delegates HTTP request authorization to [Open Policy Agent](https://www.openpoli
 | `opa_host` | String | **required** | Base OPA URL, `http://` or `https://`. Do not include URL credentials; use `headers` for OPA auth. |
 | `policy_path` | String | **required** | OPA data path appended under `/v1/data/`, for example `ferrum/authz/allow`. Must not start with `/`, contain percent-encoding, or contain empty, `.`, or `..` path segments. |
 | `headers` | Object | `{}` | Static headers sent to OPA on every decision request. `content-type` is managed by the plugin and cannot be configured. |
-| `timeout_ms` | Integer | `1000` | Per-decision request timeout. Values above `30000` are clamped. |
-| `fail_open` | Boolean | `false` | Continue the request when OPA is unavailable, times out, returns non-2xx, or returns malformed JSON. |
+| `timeout_ms` | Integer | `1000` | Requested per-decision timeout. Every positive value is accepted; the effective timeout is capped at `30000` ms. |
+| `max_response_bytes` | Integer | `262144` | Maximum decoded OPA response size. Oversized declared or streamed responses use the configured fail posture. |
+| `fail_open` | Boolean | `false` | Continue the request when OPA is unavailable, times out, returns non-2xx, returns malformed JSON, or exceeds `max_response_bytes`. |
 | `fail_closed` | Boolean | `true` | Inverse of `fail_open`, accepted for explicit fail-closed configs. Do not set both fields. |
 | `deny_status` | Integer | `403` | HTTP 4xx/5xx status returned when OPA returns a policy denial. |
 | `deny_body` | String | `{"error":"forbidden by policy"}` | Response body returned on policy denial. |
 | `deny_headers` | Object | `{}` | Headers added to the policy-denial response. Names and values are validated at config load. |
-| `fail_closed_status` | Integer | `503` | HTTP 4xx/5xx status returned when fail-closed handles OPA unavailability, timeouts, non-2xx responses, or malformed JSON. |
+| `fail_closed_status` | Integer | `503` | HTTP 4xx/5xx status returned when fail-closed handles OPA unavailability, timeouts, non-2xx responses, malformed JSON, or oversized responses. |
 | `fail_closed_body` | String | `{"error":"authorization service unavailable"}` | Response body returned on fail-closed OPA errors. |
 | `fail_closed_headers` | Object | `{}` | Headers added to fail-closed OPA error responses. Names and values are validated at config load. |
 | `decision_pointer` | String[] | `["result"]` | Path inside the OPA JSON response to evaluate. Use `["result","allow"]` for `{ "result": { "allow": true } }`. |
 | `include_method` | Boolean | `true` | Include `input.method`. |
 | `include_path` | Boolean | `true` | Include `input.path`. |
-| `include_query` | Boolean | `true` | Include decoded query parameters as `input.query`. |
+| `include_query` | Boolean | `true` | Include decoded, non-redacted query parameters as `input.query`. Query credentials are omitted by default. |
+| `include_query_credentials` | Boolean | `false` | Unsafe opt-in to send built-in and authentication-plugin-marked query credentials to OPA. Explicit `redact_query_keys` remain omitted. |
 | `include_headers` | Boolean | `true` | Include request headers as `input.headers` after redaction. |
-| `include_body` | Boolean | `false` | Buffer and forward the request body. UTF-8 bodies use `input.body`; non-UTF-8 raw bytes use `input.body_base64`. |
+| `include_body` | Boolean | `false` | After authentication succeeds, buffer and forward the request body. UTF-8 bodies use `input.body`; non-UTF-8 raw bytes use `input.body_base64`. |
+| `max_body_bytes` | Integer | `1048576` | Positive plugin-local request-body ceiling for `include_body`. The strictest of this value and the positive global limit applies; it remains bounded when the global limit is `0`. |
 | `include_consumer` | Boolean | `true` | Include mapped Consumer data or external authenticated identity. |
 | `include_client_ip` | Boolean | `true` | Include `input.client_ip`. |
 | `include_service` | Boolean | `true` | Include matched proxy/service data. |
+| `reject_duplicate_query_keys` | Boolean | `true` | Before calling OPA, reject conflicting duplicate query values (for example `id=1&id=2`) with `deny_status` / `deny_body`. Identical duplicates pass. Set `false` for intentional repeated-key APIs, or set `include_query: false` when policy does not inspect query data. |
 | `redact_headers` | String[] | built-ins | Additional request headers to omit from `input.headers`; built-in sensitive headers are always redacted. |
+| `redact_query_keys` | String[] | `[]` | Additional query parameter names to omit from `input.query`, matched case-insensitively. Built-in credential names and query locations used by authentication plugins are omitted automatically. |
+
+Unknown or misspelled top-level OPA config keys are rejected at config load.
 
 Allow decisions:
 
@@ -1934,7 +1941,9 @@ Allow decisions:
 - An object with `allow: true` at `decision_pointer` also continues the request.
 - Any other value denies with the configured policy-denial response.
 
-Built-in request-header redaction always removes `authorization`, `proxy-authorization`, `cookie`, `x-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, and `x-forwarded-authorization` before sending `input.headers` to OPA.
+Built-in request-header redaction always removes `authorization`, `proxy-authorization`, `cookie`, `x-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, and `x-forwarded-authorization` before sending `input.headers` to OPA. Query parameters with common credential names (including `api_key`, `access_token`, `id_token`, `jwt`, and `token`) and present custom query locations configured by authentication plugins are omitted from `input.query`, even when multi-auth succeeds through a different mechanism. Set `include_query_credentials: true` only when the policy service is explicitly trusted to receive credential material; operator-specified `redact_query_keys` still apply.
+
+`include_body` collection occurs only after authentication succeeds, so a `401` does not retain an OPA body copy. OPA's positive `max_body_bytes` limit is always enforced, including when `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0`. Successful OPA responses are streamed through the positive `max_response_bytes` ceiling before JSON parsing; body contents are never written to OPA error logs.
 
 The outbound OPA call uses the shared `PluginHttpClient`, so it shares connection pooling, DNS cache warmup, slow-call telemetry, and global outbound TLS settings such as `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`. Per-proxy backend TLS overrides do not apply; see [configuration.md#tls--mtls](configuration.md#tls--mtls).
 
@@ -1946,6 +1955,12 @@ config:
   timeout_ms: 500
   fail_open: false
   decision_pointer: ["result", "allow"]
+  max_response_bytes: 262144
+  include_body: true
+  max_body_bytes: 1048576
+  # Array-style API: allow repeated keys such as id=1&id=2.
+  reject_duplicate_query_keys: false
+  redact_query_keys: [session_id]
   headers:
     Authorization: "Bearer opa-client-token"
   deny_status: 403

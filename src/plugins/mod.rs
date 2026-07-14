@@ -2754,6 +2754,12 @@ pub trait Plugin: Send + Sync {
         PluginResult::Continue
     }
 
+    /// Marks configured query credential locations before authentication
+    /// starts. The authentication dispatcher calls this for every configured
+    /// auth plugin before multi-auth can stop at the first success, allowing
+    /// later authorization plugins to omit every possible query credential.
+    fn mark_query_credentials_for_redaction(&self, _ctx: &mut RequestContext) {}
+
     /// Authorization phase (after authentication).
     async fn authorize(&self, _ctx: &mut RequestContext) -> PluginResult {
         PluginResult::Continue
@@ -2804,6 +2810,16 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` if this plugin needs the raw request body to be available
+    /// during the `authorize` phase.
+    ///
+    /// This buffers only after authentication has succeeded, so authorization
+    /// plugins cannot make unauthenticated clients upload and retain a body
+    /// before an authentication plugin has had a chance to reject them.
+    fn requires_request_body_before_authorize(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin needs binary-safe access to the raw
     /// request body bytes via `ctx.request_body_bytes`.
     ///
@@ -2813,6 +2829,23 @@ pub trait Plugin: Send + Sync {
     /// this for plugins that handle non-UTF-8 payloads (e.g., gRPC protobuf).
     fn needs_request_body_bytes(&self) -> bool {
         false
+    }
+
+    /// Returns `true` if this plugin needs the UTF-8 request-body copy in
+    /// `ctx.metadata["request_body"]`.
+    ///
+    /// The compatibility default is `true`; binary-only consumers can override
+    /// it to avoid retaining a second full body representation.
+    fn needs_request_body_text(&self) -> bool {
+        true
+    }
+
+    /// Optional plugin-local request body ceiling. The proxy combines every
+    /// applicable plugin ceiling with the global request-body limit and uses
+    /// the strictest positive value. This keeps body-aware plugins bounded even
+    /// when the global limit is configured as unlimited (`0`).
+    fn request_body_buffer_limit(&self) -> Option<usize> {
+        None
     }
 
     /// Returns `true` if this plugin may require the request body to be
@@ -2825,6 +2858,7 @@ pub trait Plugin: Send + Sync {
         self.modifies_request_body()
             || self.requires_request_body_before_before_proxy()
             || self.requires_request_body_before_authenticate()
+            || self.requires_request_body_before_authorize()
     }
 
     /// Called just before the request is proxied to the backend.
