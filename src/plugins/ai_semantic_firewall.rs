@@ -3112,8 +3112,8 @@ impl StreamWindowEngine {
     /// into valid, uninspected SSE data.
     fn absorb_event(&mut self, raw: Vec<u8>, force_uninspectable: bool) {
         let raw_len = raw.len();
-        let raw_retained = self.hold_raw.then_some(raw_len).unwrap_or(0);
-        let frame_budget = self.store_frames.then_some(raw_len).unwrap_or(0);
+        let raw_retained = if self.hold_raw { raw_len } else { 0 };
+        let frame_budget = if self.store_frames { raw_len } else { 0 };
         // Reassembled strings cannot contain more payload bytes than the raw
         // event. Reserve that upper bound before parsing; if the aggregate
         // retained-state budget would be crossed, keep only the raw block-mode
