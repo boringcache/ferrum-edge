@@ -544,6 +544,126 @@ fn waf_scoring_weights_reject_unknown_severities() {
 }
 
 #[test]
+fn oidc_relying_party_schema_matches_strict_runtime_surface() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/OidcRelyingPartyConfig")
+        .expect("missing OidcRelyingPartyConfig schema");
+    assert_eq!(schema["additionalProperties"], false);
+
+    let provider = &schema["properties"]["providers"]["items"];
+    assert_eq!(provider["additionalProperties"], false);
+    let provider_fields: BTreeSet<_> = provider["properties"]
+        .as_object()
+        .expect("provider properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        provider_fields,
+        BTreeSet::from([
+            "audiences",
+            "authorization_endpoint",
+            "callback_path",
+            "claim_headers",
+            "client_auth",
+            "client_id",
+            "consumer_header_claim",
+            "consumer_identity_claim",
+            "discovery_url",
+            "end_session_endpoint",
+            "id_token_clock_skew_secs",
+            "issuer",
+            "jwks_uri",
+            "logout_path",
+            "post_logout_redirect_uri",
+            "redirect_uri",
+            "required_roles",
+            "required_scopes",
+            "role_claim",
+            "scope_claim",
+            "scopes",
+            "token_endpoint",
+            "userinfo_endpoint",
+        ])
+    );
+    assert!(
+        provider["properties"]
+            .get("post_logout_redirect_uri")
+            .is_some()
+    );
+    assert_eq!(
+        provider["properties"]["id_token_clock_skew_secs"]["default"],
+        60
+    );
+    assert_eq!(
+        provider["properties"]["client_auth"]["additionalProperties"],
+        false
+    );
+
+    let session = &schema["properties"]["session"];
+    assert_eq!(session["additionalProperties"], false);
+    assert!(session["properties"].get("redis_url").is_none());
+    let session_fields: BTreeSet<_> = session["properties"]
+        .as_object()
+        .expect("session properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        session_fields,
+        BTreeSet::from([
+            "cookie_name",
+            "domain",
+            "encryption_secret",
+            "encryption_secret_previous",
+            "http_only",
+            "idle_ttl_secs",
+            "max_cookie_bytes",
+            "path",
+            "same_site",
+            "secure",
+            "store",
+            "ttl_secs",
+        ])
+    );
+
+    let behavior = &schema["properties"]["behavior"];
+    assert_eq!(behavior["additionalProperties"], false);
+    let behavior_fields: BTreeSet<_> = behavior["properties"]
+        .as_object()
+        .expect("behavior properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        behavior_fields,
+        BTreeSet::from([
+            "challenge_api_status",
+            "challenge_html_status",
+            "html_accept_substrings",
+            "post_login_default_path",
+            "post_login_redirect_param",
+            "refresh_skew_secs",
+            "rp_initiated_logout",
+            "state_cache_max_entries",
+            "state_cache_max_entries_per_source",
+            "state_ttl_secs",
+            "trusted_redirect_hosts",
+        ])
+    );
+    assert_eq!(
+        behavior["properties"]["state_cache_max_entries"]["default"],
+        10_000
+    );
+    assert_eq!(
+        behavior["properties"]["state_cache_max_entries_per_source"]["default"],
+        32
+    );
+}
+
+#[test]
 fn access_control_schema_matches_runtime_validation() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -581,71 +701,175 @@ fn access_control_schema_matches_runtime_validation() {
 }
 
 #[test]
-fn ai_prompt_shield_schema_matches_runtime_validation() {
-    use ferrum_edge::plugins::ai_prompt_shield::AiPromptShield;
-
+fn ldap_auth_schema_matches_runtime_invariants() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
-    let pattern_schema = spec
-        .pointer("/components/schemas/AiPromptShieldConfig/properties/patterns")
-        .expect("missing ai_prompt_shield patterns schema");
-    let enum_names: BTreeSet<&str> = pattern_schema["items"]["enum"]
-        .as_array()
-        .expect("patterns.items.enum must be an array")
-        .iter()
-        .map(|value| value.as_str().expect("built-in enum names must be strings"))
-        .collect();
-    let expected_names: BTreeSet<&str> = [
-        "ssn",
-        "credit_card",
-        "email",
-        "phone_us",
-        "api_key",
-        "aws_key",
-        "ip_address",
-        "iban",
-    ]
-    .into_iter()
-    .collect();
-    assert_eq!(enum_names, expected_names);
-    let description = pattern_schema["description"]
-        .as_str()
-        .expect("patterns description must list built-ins");
-    for name in &expected_names {
-        assert!(
-            description.contains(name),
-            "patterns description omits built-in {name}"
-        );
-    }
 
     for config in [
-        json!({}),
-        json!({"patterns": ["email"], "max_scan_bytes": 1}),
         json!({
-            "patterns": [],
-            "custom_patterns": [{"name": "account", "regex": "ACCT-[0-9]+"}]
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com"
+        }),
+        json!({
+            "ldap_url": "ldap://ldap.example.com:389",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "starttls": true
+        }),
+        json!({
+            "ldap_url": "ldap://directory.example.test:389",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "allow_plaintext": true
+        }),
+        json!({
+            "ldap_url": "ldap://127.0.0.1:389",
+            "bind_dn_template": "uid={username},dc=example,dc=com"
+        }),
+        json!({
+            "ldap_url": "ldap://LOCALHOST:389",
+            "bind_dn_template": "uid={username},dc=example,dc=com"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "search_base_dn": "ou=users,dc=example,dc=com",
+            "search_filter": "(uid={username})",
+            "canonical_identity_attribute": "uid",
+            "service_account_dn": "cn=admin,dc=example,dc=com",
+            "service_account_password": "secret"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "group_base_dn": "ou=groups,dc=example,dc=com",
+            "required_groups": ["admins"]
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "group_base_dn": "ou=groups,dc=example,dc=com",
+            "group_filter": "(member={user_dn})",
+            "required_groups": ["admins"],
+            "connect_timeout_seconds": 300,
+            "request_timeout_seconds": 300,
+            "max_concurrent_requests": 1024,
+            "cache_ttl_seconds": 86400,
+            "max_cache_entries": 1
         }),
     ] {
-        assert_component_validity(&spec, "AiPromptShieldConfig", &config, true);
-        assert!(
-            AiPromptShield::new(&config).is_ok(),
-            "runtime should accept schema-valid config: {config}"
-        );
+        assert_component_validity(&spec, "LdapAuthConfig", &config, true);
     }
 
     for config in [
-        json!({"patterns": ["not_a_builtin"]}),
-        json!({"patterns": [], "custom_patterns": []}),
-        json!({"patterns": []}),
-        json!({"max_scan_bytes": 0}),
-        json!({"patterns": ["email"], "scan_field": "all"}),
+        json!({"ldap_url": "ldaps://ldap.example.com:636"}),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid=static,dc=example,dc=com"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "search_base_dn": "ou=users,dc=example,dc=com",
+            "search_filter": "(uid={username})",
+            "canonical_identity_attribute": "uid"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "search_base_dn": "ou=users,dc=example,dc=com",
+            "search_filter": "(uid={username})"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "search_base_dn": "ou=users,dc=example,dc=com",
+            "search_filter": "(uid=static)",
+            "canonical_identity_attribute": "uid",
+            "service_account_dn": "cn=admin,dc=example,dc=com",
+            "service_account_password": "secret"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "required_groups": ["admins"]
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "group_base_dn": "ou=groups,dc=example,dc=com",
+            "group_filter": "(cn=admins)",
+            "required_groups": ["admins"]
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "starttls": true
+        }),
+        json!({
+            "ldap_url": "ldap://directory.example.test:389",
+            "bind_dn_template": "uid={username},dc=example,dc=com"
+        }),
+        json!({
+            "ldap_url": "ldaps://admin:secret@ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "connect_timeout_seconds": 0
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "request_timeout_seconds": 301
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "max_concurrent_requests": 0
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "cache_ttl_seconds": 86401
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "max_cache_entries": 0
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "required_group": ["admins"]
+        }),
     ] {
-        assert_component_validity(&spec, "AiPromptShieldConfig", &config, false);
-        assert!(
-            AiPromptShield::new(&config).is_err(),
-            "runtime should reject schema-invalid config: {config}"
-        );
+        assert_component_validity(&spec, "LdapAuthConfig", &config, false);
     }
+}
+
+#[test]
+fn ldap_cache_documentation_and_openapi_defaults_match_runtime_constants() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/LdapAuthConfig/properties")
+        .expect("LdapAuthConfig properties exist");
+    assert_eq!(
+        schema["cache_ttl_seconds"]["default"],
+        json!(ferrum_edge::plugins::ldap_auth::LDAP_AUTH_DEFAULT_CACHE_TTL_SECONDS)
+    );
+    assert_eq!(
+        schema["cache_ttl_seconds"]["maximum"],
+        json!(ferrum_edge::plugins::ldap_auth::LDAP_AUTH_MAX_CACHE_TTL_SECONDS)
+    );
+    assert_eq!(
+        schema["max_cache_entries"]["default"],
+        json!(ferrum_edge::plugins::ldap_auth::LDAP_AUTH_DEFAULT_MAX_CACHE_ENTRIES)
+    );
+
+    let guide = include_str!("../../docs/cache_management.md");
+    assert!(guide.contains("**Default limit:** 10,000 entries. Caching is disabled by default."));
+    assert!(guide.contains("`cache_ttl_seconds` (default `0`, disabled; maximum `86,400`"));
+    assert!(guide.contains("`max_cache_entries` (default `10,000`)"));
+    assert!(guide.contains("| `ldap_auth` | `max_cache_entries` | `10000` |"));
+    assert!(guide.contains("| `ldap_auth` | `cache_ttl_seconds` | `0` |"));
 }
 
 #[test]
@@ -917,6 +1141,10 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         (
             "ai_request_guard",
             Some(json!({"require_user_field": false})),
+        ),
+        (
+            "ai_request_guard",
+            Some(json!({"max_messages": 10, "max_message": 10})),
         ),
         ("ai_response_guard", None),
         ("ai_response_guard", Some(json!({}))),
@@ -1430,4 +1658,72 @@ fn no_proxy_runtime_metrics_snapshot_is_covered_by_openapi() {
     let serialized = serde_json::to_value(snapshot).expect("runtime metrics snapshot serializes");
 
     assert_component_validity(&spec, "RuntimeMetricsSnapshot", &serialized, true);
+}
+
+#[test]
+fn ai_prompt_shield_schema_matches_runtime_validation() {
+    use ferrum_edge::plugins::ai_prompt_shield::AiPromptShield;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let pattern_schema = spec
+        .pointer("/components/schemas/AiPromptShieldConfig/properties/patterns")
+        .expect("missing ai_prompt_shield patterns schema");
+    let enum_names: BTreeSet<&str> = pattern_schema["items"]["enum"]
+        .as_array()
+        .expect("patterns.items.enum must be an array")
+        .iter()
+        .map(|value| value.as_str().expect("built-in enum names must be strings"))
+        .collect();
+    let expected_names: BTreeSet<&str> = [
+        "ssn",
+        "credit_card",
+        "email",
+        "phone_us",
+        "api_key",
+        "aws_key",
+        "ip_address",
+        "iban",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(enum_names, expected_names);
+    let description = pattern_schema["description"]
+        .as_str()
+        .expect("patterns description must list built-ins");
+    for name in &expected_names {
+        assert!(
+            description.contains(name),
+            "patterns description omits built-in {name}"
+        );
+    }
+
+    for config in [
+        json!({}),
+        json!({"patterns": ["email"], "max_scan_bytes": 1}),
+        json!({
+            "patterns": [],
+            "custom_patterns": [{"name": "account", "regex": "ACCT-[0-9]+"}]
+        }),
+    ] {
+        assert_component_validity(&spec, "AiPromptShieldConfig", &config, true);
+        assert!(
+            AiPromptShield::new(&config).is_ok(),
+            "runtime should accept schema-valid config: {config}"
+        );
+    }
+
+    for config in [
+        json!({"patterns": ["not_a_builtin"]}),
+        json!({"patterns": [], "custom_patterns": []}),
+        json!({"patterns": []}),
+        json!({"max_scan_bytes": 0}),
+        json!({"patterns": ["email"], "scan_field": "all"}),
+    ] {
+        assert_component_validity(&spec, "AiPromptShieldConfig", &config, false);
+        assert!(
+            AiPromptShield::new(&config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
+        );
+    }
 }

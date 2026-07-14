@@ -3697,11 +3697,7 @@ fn validate_plugin_config_definition(
     pc: &PluginConfig,
     http_client: plugins::PluginHttpClient,
 ) -> Result<(), String> {
-    match plugins::create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client) {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(format!("Unknown plugin name '{}'", pc.plugin_name)),
-        Err(err) => Err(err),
-    }
+    plugins::validate_plugin_config_with_http_client(&pc.plugin_name, &pc.config, http_client)
 }
 
 // ---- Metrics ----

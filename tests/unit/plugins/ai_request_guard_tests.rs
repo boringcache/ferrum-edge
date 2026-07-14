@@ -26,6 +26,15 @@ fn make_post_headers() -> HashMap<String, String> {
     headers
 }
 
+async fn transform_post_json(plugin: &AiRequestGuard, body: &[u8]) -> Option<Vec<u8>> {
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    let headers = make_post_headers();
+    plugin
+        .transform_request_body_with_context(&mut ctx, body, Some("application/json"), &headers)
+        .await
+}
+
 fn assert_reject_error(result: PluginResult, expected_status: u16, expected_error: &str) {
     match result {
         PluginResult::Reject {
@@ -94,6 +103,39 @@ fn test_invalid_config_shapes_rejected() {
 }
 
 #[test]
+fn unknown_config_keys_are_rejected_even_with_another_valid_policy() {
+    for typo in [
+        "max_token_limit",
+        "enforce_max_token",
+        "default_max_token",
+        "supported_shema",
+        "strct_schema",
+        "allowd_models",
+        "blockd_models",
+        "require_model_for_policy",
+        "require_usr_field",
+        "max_message",
+        "max_prompt_character",
+        "temperatue_range",
+        "block_system_prompt",
+        "system_prompt_alias",
+        "required_metadata_field",
+        "fail_on_uninspectable",
+    ] {
+        let mut config = json!({"max_messages": 10});
+        config
+            .as_object_mut()
+            .unwrap()
+            .insert(typo.to_string(), json!(true));
+        let error = AiRequestGuard::new(&config).err().unwrap();
+        assert!(
+            error.contains("unknown config field") && error.contains(typo),
+            "unexpected error for {typo}: {error}"
+        );
+    }
+}
+
+#[test]
 fn test_request_buffering_only_for_matching_json_requests() {
     let plugin = AiRequestGuard::new(&json!({"max_messages": 2})).unwrap();
     assert!(plugin.requires_request_body_buffering());
@@ -110,6 +152,76 @@ fn test_request_buffering_only_for_matching_json_requests() {
         .headers
         .insert("content-type".to_string(), "text/plain".to_string());
     assert!(!plugin.should_buffer_request_body(&text_ctx));
+}
+
+#[tokio::test]
+async fn body_transform_is_limited_to_context_verified_json_posts() {
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 128})).unwrap();
+    let body = br#"{"operation":"update"}"#;
+    let headers = make_post_headers();
+
+    let mut put_ctx = create_test_context();
+    put_ctx.method = "PUT".to_string();
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut put_ctx,
+                body,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "a co-located body plugin must not make the guard rewrite JSON PUTs"
+    );
+
+    let mut post_ctx = create_test_context();
+    post_ctx.method = "POST".to_string();
+    for content_type in ["text/plain", "application/grpc-web+json"] {
+        assert!(
+            plugin
+                .transform_request_body_with_context(
+                    &mut post_ctx,
+                    body,
+                    Some(content_type),
+                    &headers,
+                )
+                .await
+                .is_none()
+        );
+    }
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut post_ctx,
+                b"not-json",
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "malformed JSON must never be rewritten"
+    );
+
+    let transformed = plugin
+        .transform_request_body_with_context(
+            &mut post_ctx,
+            body,
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .unwrap();
+    let transformed: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(transformed["max_tokens"], 128);
+
+    assert!(
+        plugin
+            .transform_request_body(body, Some("application/json"), &headers)
+            .await
+            .is_none(),
+        "a context-free runner cannot prove the POST scope and must be a no-op"
+    );
 }
 
 // ─── Model blocking ────────────────────────────────────────────────────
@@ -402,9 +514,7 @@ async fn test_max_tokens_clamp_mode() {
 
     // transform_request_body should clamp the value
     let body = serde_json::to_vec(&json!({"model": "gpt-4", "max_tokens": 5000})).unwrap();
-    let result = plugin
-        .transform_request_body(&body, Some("application/json"), &HashMap::new())
-        .await;
+    let result = transform_post_json(&plugin, &body).await;
     assert!(result.is_some());
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(modified["max_tokens"], 1000);
@@ -519,9 +629,7 @@ async fn test_max_output_tokens_clamped() {
     .unwrap();
     let body =
         serde_json::to_vec(&json!({"model": "claude-3", "max_output_tokens": 2000})).unwrap();
-    let result = plugin
-        .transform_request_body(&body, Some("application/json"), &HashMap::new())
-        .await;
+    let result = transform_post_json(&plugin, &body).await;
     assert!(result.is_some());
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(modified["max_output_tokens"], 500);
@@ -561,6 +669,59 @@ async fn provider_native_token_fields_are_rejected_over_limit() {
 }
 
 #[tokio::test]
+async fn canonical_tgi_token_cap_is_enforced_in_strict_provider_native_mode() {
+    let plugin = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 100,
+        "strict_schema": true,
+        "supported_schema": "provider_native"
+    }))
+    .unwrap();
+
+    for body in [
+        json!({
+            "inputs": "hello",
+            "parameters": {"max_new_tokens": 5000}
+        }),
+        // A harmless-looking legacy alias must not hide the larger canonical cap.
+        json!({
+            "inputs": "hello",
+            "max_new_tokens": 1,
+            "parameters": {"max_new_tokens": 5000}
+        }),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject_error(result, 400, "max_tokens exceeds limit");
+    }
+}
+
+#[tokio::test]
+async fn canonical_tgi_token_cap_is_clamped_in_metadata_and_wire_transform() {
+    let plugin = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 100,
+        "enforce_max_tokens": "clamp"
+    }))
+    .unwrap();
+    let body = json!({
+        "inputs": "hello",
+        "parameters": {"max_new_tokens": 5000}
+    });
+
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let metadata_body: serde_json::Value =
+        serde_json::from_str(ctx.metadata.get("request_body").unwrap()).unwrap();
+    assert_eq!(metadata_body["parameters"]["max_new_tokens"], 100);
+
+    let body = serde_json::to_vec(&body).unwrap();
+    let transformed = transform_post_json(&plugin, &body).await.unwrap();
+    let transformed: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(transformed["parameters"]["max_new_tokens"], 100);
+}
+
+#[tokio::test]
 async fn provider_native_token_fields_are_clamped_in_metadata_and_transform() {
     let plugin = AiRequestGuard::new(&json!({
         "max_tokens_limit": 500,
@@ -586,9 +747,7 @@ async fn provider_native_token_fields_are_clamped_in_metadata_and_transform() {
         "inferenceConfig": {"maxTokens": 2000}
     }))
     .unwrap();
-    let result = plugin
-        .transform_request_body(&body, Some("application/json"), &HashMap::new())
-        .await;
+    let result = transform_post_json(&plugin, &body).await;
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(modified["inferenceConfig"]["maxTokens"], 500);
 }
@@ -602,9 +761,7 @@ async fn default_max_tokens_uses_provider_native_containers_when_detected() {
         "contents": [{"role": "user", "parts": [{"text": "hello"}]}]
     }))
     .unwrap();
-    let result = plugin
-        .transform_request_body(&gemini, Some("application/json"), &HashMap::new())
-        .await;
+    let result = transform_post_json(&plugin, &gemini).await;
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(modified["generationConfig"]["maxOutputTokens"], 256);
 
@@ -614,9 +771,7 @@ async fn default_max_tokens_uses_provider_native_containers_when_detected() {
         "inferenceConfig": {}
     }))
     .unwrap();
-    let result = plugin
-        .transform_request_body(&bedrock, Some("application/json"), &HashMap::new())
-        .await;
+    let result = transform_post_json(&plugin, &bedrock).await;
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(modified["inferenceConfig"]["maxTokens"], 256);
 }
@@ -636,13 +791,8 @@ async fn default_max_tokens_provider_native_bedrock_converse_gets_no_top_level()
         "inferenceConfig": {}
     }))
     .unwrap();
-    let modified: serde_json::Value = serde_json::from_slice(
-        &plugin
-            .transform_request_body(&body, Some("application/json"), &HashMap::new())
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let modified: serde_json::Value =
+        serde_json::from_slice(&transform_post_json(&plugin, &body).await.unwrap()).unwrap();
     assert_eq!(
         modified["inferenceConfig"]["maxTokens"], 256,
         "native Converse cap must be injected"
@@ -666,13 +816,8 @@ async fn default_max_tokens_model_less_inference_config_capped_in_auto_mode() {
         "inferenceConfig": {}
     }))
     .unwrap();
-    let modified: serde_json::Value = serde_json::from_slice(
-        &plugin
-            .transform_request_body(&body, Some("application/json"), &HashMap::new())
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let modified: serde_json::Value =
+        serde_json::from_slice(&transform_post_json(&plugin, &body).await.unwrap()).unwrap();
     assert_eq!(
         modified["max_tokens"], 256,
         "auto mode must keep the top-level cap for a model-less inferenceConfig body"
@@ -691,13 +836,8 @@ async fn default_max_tokens_chat_body_with_responses_marker_uses_max_tokens() {
         "input": "spoofed responses marker"
     }))
     .unwrap();
-    let modified: serde_json::Value = serde_json::from_slice(
-        &plugin
-            .transform_request_body(&body, Some("application/json"), &HashMap::new())
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let modified: serde_json::Value =
+        serde_json::from_slice(&transform_post_json(&plugin, &body).await.unwrap()).unwrap();
     assert_eq!(
         modified["max_tokens"], 256,
         "chat body must be capped via max_tokens"
@@ -726,27 +866,23 @@ async fn default_max_tokens_injects_into_target_field_despite_cross_provider_tok
         "max_tokens": 9999
     }))
     .unwrap();
-    let result = plugin
-        .transform_request_body(&gemini, Some("application/json"), &HashMap::new())
-        .await;
+    let result = transform_post_json(&plugin, &gemini).await;
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(
         modified["generationConfig"]["maxOutputTokens"], 256,
         "Gemini default cap must be injected even when a stray top-level max_tokens is present"
     );
 
-    // TGI / HuggingFace (routes to max_new_tokens). Same reasoning.
+    // TGI / HuggingFace (routes to parameters.max_new_tokens). Same reasoning.
     let tgi = serde_json::to_vec(&json!({
         "inputs": "hello",
         "max_tokens": 9999
     }))
     .unwrap();
-    let result = plugin
-        .transform_request_body(&tgi, Some("application/json"), &HashMap::new())
-        .await;
+    let result = transform_post_json(&plugin, &tgi).await;
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(
-        modified["max_new_tokens"], 256,
+        modified["parameters"]["max_new_tokens"], 256,
         "TGI default cap must be injected even when a stray top-level max_tokens is present"
     );
 
@@ -758,9 +894,7 @@ async fn default_max_tokens_injects_into_target_field_despite_cross_provider_tok
         "max_tokens": 100
     }))
     .unwrap();
-    let result = plugin
-        .transform_request_body(&openai, Some("application/json"), &HashMap::new())
-        .await;
+    let result = transform_post_json(&plugin, &openai).await;
     assert!(
         result.is_none(),
         "OpenAI bodies that already set the real top-level max_tokens must not be modified"
@@ -789,9 +923,7 @@ async fn default_max_tokens_adds_top_level_fallback_for_spoofed_provider_markers
         ),
     ] {
         let bytes = serde_json::to_vec(&body).unwrap();
-        let result = plugin
-            .transform_request_body(&bytes, Some("application/json"), &HashMap::new())
-            .await;
+        let result = transform_post_json(&plugin, &bytes).await;
         let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
         assert_eq!(
             modified["max_tokens"], 256,
@@ -810,27 +942,24 @@ async fn default_max_tokens_falls_back_when_spoofed_provider_container_is_malfor
     }))
     .unwrap();
 
-    let result = plugin
-        .transform_request_body(&body, Some("application/json"), &HashMap::new())
-        .await;
+    let result = transform_post_json(&plugin, &body).await;
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(modified["max_tokens"], 256);
     assert_eq!(modified["generationConfig"], "not an object");
 }
 
 #[tokio::test]
-async fn default_max_tokens_routes_tgi_bodies_to_max_new_tokens() {
-    // TGI / HuggingFace text-generation bodies cap output via `max_new_tokens`;
+async fn default_max_tokens_routes_tgi_bodies_to_parameters_max_new_tokens() {
+    // Canonical TGI / HuggingFace text-generation bodies cap output via
+    // `parameters.max_new_tokens`;
     // injecting a top-level `max_tokens` (which the backend ignores) would
     // silently drop the configured default cap.
     let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
 
     let tgi = serde_json::to_vec(&json!({"inputs": "hello"})).unwrap();
-    let result = plugin
-        .transform_request_body(&tgi, Some("application/json"), &HashMap::new())
-        .await;
+    let result = transform_post_json(&plugin, &tgi).await;
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
-    assert_eq!(modified["max_new_tokens"], 256);
+    assert_eq!(modified["parameters"]["max_new_tokens"], 256);
     assert!(
         modified.get("max_tokens").is_none(),
         "an unambiguously-native TGI body (no OpenAI-family top-level prompt) must \
@@ -852,13 +981,8 @@ async fn default_max_tokens_skips_top_level_for_native_bodies_without_openai_pro
         "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
     }))
     .unwrap();
-    let modified: serde_json::Value = serde_json::from_slice(
-        &plugin
-            .transform_request_body(&gemini, Some("application/json"), &HashMap::new())
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let modified: serde_json::Value =
+        serde_json::from_slice(&transform_post_json(&plugin, &gemini).await.unwrap()).unwrap();
     assert_eq!(modified["generationConfig"]["maxOutputTokens"], 256);
     assert!(
         modified.get("max_tokens").is_none(),
@@ -873,9 +997,7 @@ async fn default_max_tokens_skips_top_level_for_native_bodies_without_openai_pro
         "generationConfig": {"maxOutputTokens": 100}
     }))
     .unwrap();
-    let result = plugin
-        .transform_request_body(&gemini_capped, Some("application/json"), &HashMap::new())
-        .await;
+    let result = transform_post_json(&plugin, &gemini_capped).await;
     assert!(
         result.is_none(),
         "a native body that already caps output natively must not be modified"
@@ -896,32 +1018,30 @@ async fn default_max_tokens_top_level_fallback_when_openai_body_carries_native_m
         "inputs": "hi"
     }))
     .unwrap();
-    let modified: serde_json::Value = serde_json::from_slice(
-        &plugin
-            .transform_request_body(&spoof, Some("application/json"), &HashMap::new())
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let modified: serde_json::Value =
+        serde_json::from_slice(&transform_post_json(&plugin, &spoof).await.unwrap()).unwrap();
     assert_eq!(
         modified["max_tokens"], 256,
         "an OpenAI-shaped body keeps the top-level cap even with a native marker"
     );
     assert_eq!(
-        modified["max_new_tokens"], 256,
+        modified["parameters"]["max_new_tokens"], 256,
         "the native field is filled too for a native upstream"
     );
 }
 
 #[tokio::test]
 async fn default_max_tokens_not_injected_when_tgi_already_caps_output() {
-    // `max_new_tokens` already present means the client set its own cap, so the
+    // Canonical `parameters.max_new_tokens` already present means the client set
+    // its own cap, so the
     // guard must leave the body untouched.
     let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
-    let tgi = serde_json::to_vec(&json!({"inputs": "hello", "max_new_tokens": 16})).unwrap();
-    let result = plugin
-        .transform_request_body(&tgi, Some("application/json"), &HashMap::new())
-        .await;
+    let tgi = serde_json::to_vec(&json!({
+        "inputs": "hello",
+        "parameters": {"max_new_tokens": 16}
+    }))
+    .unwrap();
+    let result = transform_post_json(&plugin, &tgi).await;
     assert!(result.is_none());
 }
 
@@ -933,9 +1053,7 @@ async fn default_max_tokens_not_injected_when_responses_caps_max_output_tokens()
     // top-level `max_tokens`.
     let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
     let body = serde_json::to_vec(&json!({"input": "hi", "max_output_tokens": 16})).unwrap();
-    let result = plugin
-        .transform_request_body(&body, Some("application/json"), &HashMap::new())
-        .await;
+    let result = transform_post_json(&plugin, &body).await;
     assert!(
         result.is_none(),
         "existing max_output_tokens cap must suppress default max_tokens injection"
@@ -970,9 +1088,7 @@ async fn default_max_tokens_injected_when_only_cross_family_alias_present() {
     ] {
         let body = json!({ "prompt": "Human: hi\n\nAssistant:", alias: 16 });
         let bytes = serde_json::to_vec(&body).unwrap();
-        let result = plugin
-            .transform_request_body(&bytes, Some("application/json"), &HashMap::new())
-            .await;
+        let result = transform_post_json(&plugin, &bytes).await;
         let modified: serde_json::Value = serde_json::from_slice(
             &result.expect("cross-family alias must not suppress the family cap fallback"),
         )
@@ -1000,13 +1116,8 @@ async fn default_max_tokens_covers_all_top_level_capped_markers() {
     // Cohere v1 (`message`) + spoofed Gemini `generationConfig`. Cohere caps via
     // top-level `max_tokens`, so the fallback must land there.
     let cohere = serde_json::to_vec(&json!({"message": "hi", "generationConfig": {}})).unwrap();
-    let modified: serde_json::Value = serde_json::from_slice(
-        &plugin
-            .transform_request_body(&cohere, Some("application/json"), &HashMap::new())
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let modified: serde_json::Value =
+        serde_json::from_slice(&transform_post_json(&plugin, &cohere).await.unwrap()).unwrap();
     assert_eq!(
         modified["max_tokens"], 256,
         "a Cohere `message` body must keep the top-level max_tokens fallback"
@@ -1015,13 +1126,8 @@ async fn default_max_tokens_covers_all_top_level_capped_markers() {
     // Responses `instructions` + spoofed Gemini `generationConfig`.
     let responses =
         serde_json::to_vec(&json!({"instructions": "hi", "generationConfig": {}})).unwrap();
-    let modified: serde_json::Value = serde_json::from_slice(
-        &plugin
-            .transform_request_body(&responses, Some("application/json"), &HashMap::new())
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let modified: serde_json::Value =
+        serde_json::from_slice(&transform_post_json(&plugin, &responses).await.unwrap()).unwrap();
     assert_eq!(
         modified["max_output_tokens"], 256,
         "a Responses `instructions` body must get the Responses cap field"
@@ -1035,13 +1141,8 @@ async fn default_max_tokens_uses_max_output_tokens_for_responses_shape() {
     // `max_output_tokens` so a Responses upstream actually applies the cap.
     let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 256})).unwrap();
     let body = serde_json::to_vec(&json!({"input": "hi", "generationConfig": {}})).unwrap();
-    let modified: serde_json::Value = serde_json::from_slice(
-        &plugin
-            .transform_request_body(&body, Some("application/json"), &HashMap::new())
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let modified: serde_json::Value =
+        serde_json::from_slice(&transform_post_json(&plugin, &body).await.unwrap()).unwrap();
     assert_eq!(
         modified["max_output_tokens"], 256,
         "Responses bodies must be capped via max_output_tokens"
@@ -1065,13 +1166,8 @@ async fn default_max_tokens_native_alias_does_not_suppress_family_cap() {
         "max_new_tokens": 9999999
     }))
     .unwrap();
-    let modified: serde_json::Value = serde_json::from_slice(
-        &plugin
-            .transform_request_body(&body, Some("application/json"), &HashMap::new())
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let modified: serde_json::Value =
+        serde_json::from_slice(&transform_post_json(&plugin, &body).await.unwrap()).unwrap();
     assert_eq!(
         modified["max_tokens"], 256,
         "a stray max_new_tokens must not suppress the OpenAI-family max_tokens cap"
@@ -1084,9 +1180,7 @@ async fn test_default_max_tokens_injected() {
     assert!(plugin.modifies_request_body());
 
     let body = serde_json::to_vec(&json!({"model": "gpt-4", "messages": []})).unwrap();
-    let result = plugin
-        .transform_request_body(&body, Some("application/json"), &HashMap::new())
-        .await;
+    let result = transform_post_json(&plugin, &body).await;
     assert!(result.is_some());
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(modified["max_tokens"], 4096);
@@ -1096,9 +1190,7 @@ async fn test_default_max_tokens_injected() {
 async fn test_default_max_tokens_not_injected_when_present() {
     let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 4096})).unwrap();
     let body = serde_json::to_vec(&json!({"model": "gpt-4", "max_tokens": 100})).unwrap();
-    let result = plugin
-        .transform_request_body(&body, Some("application/json"), &HashMap::new())
-        .await;
+    let result = transform_post_json(&plugin, &body).await;
     // No modification needed
     assert!(result.is_none());
 }
@@ -1391,6 +1483,78 @@ async fn max_prompt_characters_counts_tools_arguments_and_rag_document_fields() 
 }
 
 #[tokio::test]
+async fn max_prompt_characters_counts_anthropic_text_document_sources() {
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 10})).unwrap();
+
+    for source in [
+        json!({
+            "type": "text",
+            "media_type": "text/plain",
+            "data": "this document is much too long"
+        }),
+        // Some adapters omit the redundant type but preserve the text media type.
+        json!({
+            "media_type": "text/markdown",
+            "data": "this document is much too long"
+        }),
+        // Media types are ASCII case-insensitive.
+        json!({
+            "media_type": "TEXT/PLAIN",
+            "data": "this document is much too long"
+        }),
+    ] {
+        let mut ctx = make_post_ctx(&json!({
+            "model": "claude-sonnet",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "document", "source": source}
+                ]
+            }]
+        }));
+        let mut headers = make_post_headers();
+        assert_reject_error(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            400,
+            "Prompt too long",
+        );
+    }
+}
+
+#[tokio::test]
+async fn max_prompt_characters_ignores_anthropic_binary_document_sources() {
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 10})).unwrap();
+
+    for source in [
+        // An explicit binary type wins even if a misleading text media type is set.
+        json!({
+            "type": "base64",
+            "media_type": "text/plain",
+            "data": "THIS_IS_A_LONG_BASE64_PAYLOAD"
+        }),
+        json!({
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": "THIS_IS_A_LONG_PDF_PAYLOAD"
+        }),
+    ] {
+        let mut ctx = make_post_ctx(&json!({
+            "model": "claude-sonnet",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "short"},
+                    {"type": "document", "source": source}
+                ]
+            }]
+        }));
+        let mut headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}
+
+#[tokio::test]
 async fn max_prompt_characters_counts_tgi_inputs_field() {
     // TGI / HuggingFace text-generation prompts live in the plural `inputs`
     // field; the prompt-character cap must count them so a large prompt cannot
@@ -1553,6 +1717,65 @@ async fn test_temperature_in_range() {
     let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
+}
+
+#[tokio::test]
+async fn provider_native_temperature_fields_enforce_range() {
+    let plugin = AiRequestGuard::new(&json!({"temperature_range": [0.0, 0.5]})).unwrap();
+
+    for body in [
+        json!({
+            "contents": [{"parts": [{"text": "hello"}]}],
+            "generationConfig": {"temperature": 2.0}
+        }),
+        json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "inferenceConfig": {"temperature": 1.0}
+        }),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        assert_reject_error(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            400,
+            "Temperature out of range",
+        );
+    }
+
+    let mut ctx = make_post_ctx(&json!({
+        "contents": [{"parts": [{"text": "hello"}]}],
+        "generationConfig": {"temperature": 0.25}
+    }));
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn provider_native_temperature_rejects_wrong_types_and_conflicting_aliases() {
+    let plugin = AiRequestGuard::new(&json!({"temperature_range": [0.0, 1.0]})).unwrap();
+
+    let mut wrong_type = make_post_ctx(&json!({
+        "contents": [{"parts": [{"text": "hello"}]}],
+        "generationConfig": {"temperature": "0.2"}
+    }));
+    let mut headers = make_post_headers();
+    assert_reject_error(
+        plugin.before_proxy(&mut wrong_type, &mut headers).await,
+        400,
+        "Invalid temperature",
+    );
+
+    let mut conflicting = make_post_ctx(&json!({
+        "messages": [{"role": "user", "content": "hello"}],
+        "temperature": 0.2,
+        "inferenceConfig": {"temperature": 0.8}
+    }));
+    let mut headers = make_post_headers();
+    assert_reject_error(
+        plugin.before_proxy(&mut conflicting, &mut headers).await,
+        400,
+        "Conflicting temperature fields",
+    );
 }
 
 #[test]
@@ -1998,8 +2221,8 @@ async fn strict_schema_rejects_payloads_outside_configured_schema_family() {
 async fn strict_chat_schema_rejects_provider_native_marker_bodies() {
     // A body carrying both a `messages` array and a provider-native top-level
     // marker (Anthropic `system`, Cohere `preamble`/`message`/`chat_history`,
-    // RAG `documents`/`tool_results`) is NOT OpenAI Chat Completions and must be
-    // rejected under strict `chat_completions`.
+    // TGI `inputs`, RAG `documents`/`tool_results`) is NOT OpenAI Chat
+    // Completions and must be rejected under strict `chat_completions`.
     let plugin = AiRequestGuard::new(&json!({
         "strict_schema": true,
         "supported_schema": "chat_completions"
@@ -2016,6 +2239,10 @@ async fn strict_chat_schema_rejects_provider_native_marker_bodies() {
         json!({
             "messages": [{"role": "user", "content": "hi"}],
             "documents": [{"text": "rag doc"}]
+        }),
+        json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "inputs": "TGI prompt"
         }),
     ] {
         let mut ctx = make_post_ctx(&body);
@@ -2558,7 +2785,7 @@ async fn grpc_content_type_not_buffered() {
 /// A gzipped JSON body is still compressed when `before_proxy` runs (the
 /// `compression` plugin decompresses in the later `transform_request_body`
 /// phase). `before_proxy` cannot inspect it, so it DEFERS to
-/// `on_final_request_body` by setting the deferred-compressed marker and
+/// `on_final_request_body` by setting the final-inspection marker and
 /// Continuing — it must not 400 as `non_utf8_body` here, and must not yet record
 /// uninspectable-body bookkeeping.
 #[tokio::test]
@@ -2585,7 +2812,7 @@ async fn gzip_encoded_body_deferred_in_before_proxy() {
         "before_proxy defers compressed bodies; the uninspectable decision is made in on_final_request_body"
     );
     assert_eq!(
-        ctx.metadata.get(plugin.deferred_compressed_marker_key()),
+        ctx.metadata.get(plugin.final_inspection_marker_key()),
         Some(&"true".to_string()),
         "before_proxy must mark the compressed body for deferred inspection"
     );
@@ -2608,7 +2835,7 @@ async fn brotli_encoded_body_deferred_in_before_proxy() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
     assert_eq!(
-        ctx.metadata.get(plugin.deferred_compressed_marker_key()),
+        ctx.metadata.get(plugin.final_inspection_marker_key()),
         Some(&"true".to_string())
     );
 }
@@ -2625,7 +2852,7 @@ async fn compressed_body_still_encoded_fails_closed_in_final_hook() {
     ctx.method = "POST".to_string();
     // before_proxy already ran and marked the deferral.
     ctx.metadata.insert(
-        plugin.deferred_compressed_marker_key().to_string(),
+        plugin.final_inspection_marker_key().to_string(),
         "true".to_string(),
     );
     // Final backend headers still carry the encoding (no compression plugin
@@ -2668,7 +2895,7 @@ async fn compressed_body_still_encoded_passes_in_compatibility_mode() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        plugin.deferred_compressed_marker_key().to_string(),
+        plugin.final_inspection_marker_key().to_string(),
         "true".to_string(),
     );
     let mut headers = HashMap::new();
@@ -2700,7 +2927,7 @@ async fn decompressed_body_validated_and_rejected_in_final_hook() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        plugin.deferred_compressed_marker_key().to_string(),
+        plugin.final_inspection_marker_key().to_string(),
         "true".to_string(),
     );
     // compression's before_proxy stripped Content-Encoding; transform_request_body
@@ -2728,7 +2955,7 @@ async fn decompressed_allowed_body_continues_in_final_hook() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        plugin.deferred_compressed_marker_key().to_string(),
+        plugin.final_inspection_marker_key().to_string(),
         "true".to_string(),
     );
     let mut headers = HashMap::new();
@@ -2740,18 +2967,18 @@ async fn decompressed_allowed_body_continues_in_final_hook() {
     assert_continue(result);
 }
 
-/// The final hook is a no-op for the common uncompressed path: without the
-/// deferred marker (set only for compressed bodies), it must Continue without
-/// re-validating, so plain bodies pay no second parse.
+/// Without this instance's marker, the request never entered the guard's JSON
+/// POST scope and the final hook must remain a no-op even if another plugin
+/// buffered it.
 #[tokio::test]
-async fn final_hook_noop_without_deferred_marker() {
+async fn final_hook_noop_without_scope_marker() {
     let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
-    // Even a blocked-model body Continues here — before_proxy already handled it
-    // on the uncompressed path, and the final hook must not double-validate.
+    // Even a blocked-model body Continues here because this instance never marked
+    // the request as in scope.
     let body = json!({"model": "evil"}).to_string().into_bytes();
     let result = plugin
         .on_final_request_body_with_context(&mut ctx, &headers, &body)
@@ -2763,6 +2990,128 @@ async fn final_hook_noop_without_deferred_marker() {
     );
 }
 
+#[tokio::test]
+async fn final_hook_rejects_protected_fields_added_by_later_body_transform() {
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["forbidden"]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "allowed",
+        "requested_model": "forbidden",
+        "messages": []
+    }));
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        ctx.metadata
+            .contains_key(plugin.final_inspection_marker_key())
+    );
+
+    // Simulates request_transformer renaming requested_model -> model.
+    let final_body = json!({"model": "forbidden", "messages": []})
+        .to_string()
+        .into_bytes();
+    assert_reject_error(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &final_body)
+            .await,
+        400,
+        "Model not allowed",
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key(plugin.final_inspection_marker_key())
+    );
+}
+
+#[tokio::test]
+async fn final_hook_enforces_clamp_and_default_after_later_body_transform() {
+    let clamp = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 100,
+        "enforce_max_tokens": "clamp"
+    }))
+    .unwrap();
+    let mut clamp_ctx = make_post_ctx(&json!({"model": "gpt-4", "max_tokens": 50}));
+    let mut headers = make_post_headers();
+    assert_continue(clamp.before_proxy(&mut clamp_ctx, &mut headers).await);
+    let expanded = json!({"model": "gpt-4", "max_tokens": 5000})
+        .to_string()
+        .into_bytes();
+    assert_reject_error(
+        clamp
+            .on_final_request_body_with_context(&mut clamp_ctx, &headers, &expanded)
+            .await,
+        400,
+        "max_tokens exceeds limit after request transforms",
+    );
+
+    let defaulted = AiRequestGuard::new(&json!({"default_max_tokens": 128})).unwrap();
+    let mut default_ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
+    let mut headers = make_post_headers();
+    assert_continue(defaulted.before_proxy(&mut default_ctx, &mut headers).await);
+    let cap_removed = json!({"model": "gpt-4", "messages": []})
+        .to_string()
+        .into_bytes();
+    assert_reject_error(
+        defaulted
+            .on_final_request_body_with_context(&mut default_ctx, &headers, &cap_removed)
+            .await,
+        400,
+        "Missing output token cap after request transforms",
+    );
+
+    for invalid_cap in [serde_json::Value::Null, json!("128")] {
+        let mut invalid_ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
+        let mut headers = make_post_headers();
+        assert_continue(defaulted.before_proxy(&mut invalid_ctx, &mut headers).await);
+        let invalid = json!({
+            "model": "gpt-4",
+            "messages": [],
+            "max_tokens": invalid_cap
+        })
+        .to_string()
+        .into_bytes();
+        assert_reject_error(
+            defaulted
+                .on_final_request_body_with_context(&mut invalid_ctx, &headers, &invalid)
+                .await,
+            400,
+            "Missing output token cap after request transforms",
+        );
+    }
+
+    let mut tgi_ctx = make_post_ctx(&json!({"inputs": "hello"}));
+    let mut headers = make_post_headers();
+    assert_continue(defaulted.before_proxy(&mut tgi_ctx, &mut headers).await);
+    let invalid_tgi = json!({
+        "inputs": "hello",
+        "parameters": {"max_new_tokens": "128"}
+    })
+    .to_string()
+    .into_bytes();
+    assert_reject_error(
+        defaulted
+            .on_final_request_body_with_context(&mut tgi_ctx, &headers, &invalid_tgi)
+            .await,
+        400,
+        "Missing output token cap after request transforms",
+    );
+
+    let mut compliant_ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
+    let mut headers = make_post_headers();
+    assert_continue(
+        defaulted
+            .before_proxy(&mut compliant_ctx, &mut headers)
+            .await,
+    );
+    let compliant = json!({"model": "gpt-4", "messages": [], "max_tokens": 128})
+        .to_string()
+        .into_bytes();
+    assert_continue(
+        defaulted
+            .on_final_request_body_with_context(&mut compliant_ctx, &headers, &compliant)
+            .await,
+    );
+}
+
 /// A decompressed body that turns out to be empty or malformed still fails
 /// closed in the final hook.
 #[tokio::test]
@@ -2771,7 +3120,7 @@ async fn final_hook_empty_decompressed_body_fails_closed() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        plugin.deferred_compressed_marker_key().to_string(),
+        plugin.final_inspection_marker_key().to_string(),
         "true".to_string(),
     );
     let mut headers = HashMap::new();
@@ -2843,49 +3192,47 @@ async fn plain_json_still_buffered_and_inspected() {
     assert_reject(result, Some(400));
 }
 
-/// Final-hook defensive content-type re-check: a deferred request whose
-/// content-type was relabeled to a non-JSON type by an earlier-phase plugin must
-/// Continue (the JSON policies do not apply), and must NOT record
-/// uninspectable-body bookkeeping. The deferred marker is still consumed.
+/// A request that entered scope cannot evade final validation when a later
+/// header transform relabels its still-JSON body.
 #[tokio::test]
-async fn final_hook_non_json_content_type_skips_after_deferral() {
+async fn final_hook_revalidates_after_non_json_content_type_relabel() {
     let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        plugin.deferred_compressed_marker_key().to_string(),
+        plugin.final_inspection_marker_key().to_string(),
         "true".to_string(),
     );
-    // Content-type is no longer JSON (relabeled), so the guard skips inspection.
+    // The content type is no longer JSON, but the per-instance marker proves the
+    // original request was a matching JSON POST.
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "text/plain".to_string());
     let body = json!({"model": "evil"}).to_string().into_bytes();
     let result = plugin
         .on_final_request_body_with_context(&mut ctx, &headers, &body)
         .await;
-    assert_continue(result);
+    assert_reject_error(result, 400, "Model not allowed");
     assert!(
         !ctx.metadata
             .contains_key("ai_request_guard.uninspectable_body"),
-        "a non-JSON content-type is out of scope, not uninspectable"
+        "a parseable relabeled body is a normal policy reject, not uninspectable"
     );
-    // The deferred marker must have been consumed by the hook.
+    // The scope marker must have been consumed by the hook.
     assert!(
         !ctx.metadata
-            .contains_key(plugin.deferred_compressed_marker_key())
+            .contains_key(plugin.final_inspection_marker_key())
     );
 }
 
-/// Final-hook defensive content-type re-check: a deferred request relabeled to
-/// framed gRPC (`application/grpc`) must Continue — framed gRPC wire bytes are
-/// never bare JSON, so they are skipped, not rejected.
+/// A header-only relabel to framed gRPC cannot suppress validation of a request
+/// that originally entered the plain-JSON scope.
 #[tokio::test]
-async fn final_hook_framed_grpc_content_type_skips_after_deferral() {
+async fn final_hook_revalidates_after_grpc_content_type_relabel() {
     let plugin = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        plugin.deferred_compressed_marker_key().to_string(),
+        plugin.final_inspection_marker_key().to_string(),
         "true".to_string(),
     );
     let mut headers = HashMap::new();
@@ -2893,13 +3240,13 @@ async fn final_hook_framed_grpc_content_type_skips_after_deferral() {
         "content-type".to_string(),
         "application/grpc+json".to_string(),
     );
-    // Even a blocked-model JSON payload Continues — the content-type marks this
-    // as framed gRPC, which is out of scope for JSON policy.
+    // The body is still JSON and violates policy; the relabeled header is not
+    // allowed to erase the original scope marker.
     let body = json!({"model": "evil"}).to_string().into_bytes();
     let result = plugin
         .on_final_request_body_with_context(&mut ctx, &headers, &body)
         .await;
-    assert_continue(result);
+    assert_reject_error(result, 400, "Model not allowed");
     assert!(
         !ctx.metadata
             .contains_key("ai_request_guard.uninspectable_body")
@@ -2915,7 +3262,7 @@ async fn final_hook_malformed_decompressed_body_fails_closed() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        plugin.deferred_compressed_marker_key().to_string(),
+        plugin.final_inspection_marker_key().to_string(),
         "true".to_string(),
     );
     let mut headers = HashMap::new();
@@ -2962,7 +3309,7 @@ async fn final_hook_malformed_decompressed_body_passes_in_compatibility_mode() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        plugin.deferred_compressed_marker_key().to_string(),
+        plugin.final_inspection_marker_key().to_string(),
         "true".to_string(),
     );
     let mut headers = HashMap::new();
@@ -3003,7 +3350,7 @@ async fn comma_separated_content_encoding_with_compression_deferred() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
     assert_eq!(
-        ctx.metadata.get(plugin.deferred_compressed_marker_key()),
+        ctx.metadata.get(plugin.final_inspection_marker_key()),
         Some(&"true".to_string()),
         "a comma-separated encoding list containing gzip must defer"
     );
@@ -3022,7 +3369,7 @@ async fn comma_separated_content_encoding_still_encoded_fails_closed_in_final_ho
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        plugin.deferred_compressed_marker_key().to_string(),
+        plugin.final_inspection_marker_key().to_string(),
         "true".to_string(),
     );
     let mut headers = HashMap::new();
@@ -3060,25 +3407,25 @@ async fn all_identity_content_encoding_list_is_inspected() {
     assert_reject(result, Some(400));
     assert!(
         !ctx.metadata
-            .contains_key(plugin.deferred_compressed_marker_key()),
-        "an all-identity encoding list must not defer"
+            .contains_key(plugin.final_inspection_marker_key()),
+        "a request rejected inline must not retain final-inspection bookkeeping"
     );
 }
 
-// ─── Multi-instance deferral markers are instance-specific ───────────────
+// ─── Multi-instance final-inspection markers are instance-specific ───────
 
 /// Two `ai_request_guard` instances configured differently on the same proxy
-/// must use DISTINCT deferral marker keys, and `before_proxy` on a compressed
+/// must use DISTINCT final-inspection marker keys, and `before_proxy` on a compressed
 /// body must leave both markers set on the shared `ctx` — neither instance may
 /// clobber or consume the other's marker.
 #[tokio::test]
-async fn two_instances_use_distinct_deferral_markers() {
+async fn two_instances_use_distinct_final_inspection_markers() {
     let guard_a = AiRequestGuard::new(&json!({"blocked_models": ["evil"]})).unwrap();
     let guard_b = AiRequestGuard::new(&json!({"allowed_models": ["claude"]})).unwrap();
     assert_ne!(
-        guard_a.deferred_compressed_marker_key(),
-        guard_b.deferred_compressed_marker_key(),
-        "co-located instances must have distinct deferral marker keys"
+        guard_a.final_inspection_marker_key(),
+        guard_b.final_inspection_marker_key(),
+        "co-located instances must have distinct final-inspection marker keys"
     );
 
     let mut ctx = create_test_context();
@@ -3099,11 +3446,11 @@ async fn two_instances_use_distinct_deferral_markers() {
 
     // Both markers must be present simultaneously — each deferred its own.
     assert_eq!(
-        ctx.metadata.get(guard_a.deferred_compressed_marker_key()),
+        ctx.metadata.get(guard_a.final_inspection_marker_key()),
         Some(&"true".to_string())
     );
     assert_eq!(
-        ctx.metadata.get(guard_b.deferred_compressed_marker_key()),
+        ctx.metadata.get(guard_b.final_inspection_marker_key()),
         Some(&"true".to_string())
     );
 }
@@ -3124,11 +3471,11 @@ async fn second_instance_still_inspects_after_first_clears_its_marker() {
     ctx.method = "POST".to_string();
     // Both instances deferred this compressed request in before_proxy.
     ctx.metadata.insert(
-        guard_a.deferred_compressed_marker_key().to_string(),
+        guard_a.final_inspection_marker_key().to_string(),
         "true".to_string(),
     );
     ctx.metadata.insert(
-        guard_b.deferred_compressed_marker_key().to_string(),
+        guard_b.final_inspection_marker_key().to_string(),
         "true".to_string(),
     );
 
@@ -3145,13 +3492,13 @@ async fn second_instance_still_inspects_after_first_clears_its_marker() {
     assert_continue(result_a);
     assert!(
         !ctx.metadata
-            .contains_key(guard_a.deferred_compressed_marker_key()),
+            .contains_key(guard_a.final_inspection_marker_key()),
         "A must clear its own marker"
     );
     // B's marker must survive A's run.
     assert!(
         ctx.metadata
-            .contains_key(guard_b.deferred_compressed_marker_key()),
+            .contains_key(guard_b.final_inspection_marker_key()),
         "A must not consume B's marker"
     );
 
@@ -3162,7 +3509,7 @@ async fn second_instance_still_inspects_after_first_clears_its_marker() {
     assert_reject(result_b, Some(400));
     assert!(
         !ctx.metadata
-            .contains_key(guard_b.deferred_compressed_marker_key()),
+            .contains_key(guard_b.final_inspection_marker_key()),
         "B must clear its own marker after inspecting"
     );
 }
@@ -3440,7 +3787,7 @@ async fn final_hook_compressed_body_reject_logs_detail_at_debug() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        plugin.deferred_compressed_marker_key().to_string(),
+        plugin.final_inspection_marker_key().to_string(),
         "true".to_string(),
     );
     let mut headers = HashMap::new();
@@ -3472,7 +3819,7 @@ async fn final_hook_empty_body_reject_logs_detail_at_debug() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        plugin.deferred_compressed_marker_key().to_string(),
+        plugin.final_inspection_marker_key().to_string(),
         "true".to_string(),
     );
     // Decompressed (Content-Encoding stripped) but empty body.
@@ -3504,7 +3851,7 @@ async fn final_hook_malformed_json_reject_logs_detail_at_debug() {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
-        plugin.deferred_compressed_marker_key().to_string(),
+        plugin.final_inspection_marker_key().to_string(),
         "true".to_string(),
     );
     // Decompressed but not valid JSON.

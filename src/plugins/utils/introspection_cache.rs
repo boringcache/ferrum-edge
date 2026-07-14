@@ -1,7 +1,9 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry as DashEntry;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -42,6 +44,7 @@ pub enum CacheLookup {
 
 pub struct IntrospectionCache {
     entries: DashMap<TokenKey, Entry>,
+    entry_count: AtomicUsize,
     max_entries: usize,
     positive_ttl: Duration,
     negative_ttl: Duration,
@@ -56,6 +59,7 @@ impl IntrospectionCache {
     ) -> Self {
         Self {
             entries: DashMap::with_shard_amount(shard_amount),
+            entry_count: AtomicUsize::new(0),
             max_entries,
             positive_ttl,
             negative_ttl,
@@ -77,7 +81,7 @@ impl IntrospectionCache {
             None => false,
         };
         if expired {
-            self.entries.remove(&key);
+            self.remove(&key);
         }
         CacheLookup::Miss
     }
@@ -117,49 +121,83 @@ impl IntrospectionCache {
     }
 
     fn insert(&self, key: TokenKey, entry: Entry, now: Instant) {
-        if self.entries.len() >= self.max_entries {
+        if self.max_entries == 0 {
+            return;
+        }
+        let mut entry = Some(entry);
+        loop {
+            match self.entries.entry(key.clone()) {
+                DashEntry::Occupied(mut occupied) => {
+                    if let Some(entry) = entry.take() {
+                        occupied.insert(entry);
+                    }
+                    return;
+                }
+                DashEntry::Vacant(vacant) => {
+                    let reserved = self
+                        .entry_count
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                            (count < self.max_entries).then_some(count + 1)
+                        })
+                        .is_ok();
+                    if reserved {
+                        if let Some(entry) = entry.take() {
+                            vacant.insert(entry);
+                        } else {
+                            self.release_slot();
+                        }
+                        return;
+                    }
+                    drop(vacant);
+                }
+            }
+
             self.evict_expired(now);
+            if self.entry_count.load(Ordering::Acquire) >= self.max_entries {
+                let victim = self.entries.iter().next().map(|entry| entry.key().clone());
+                if let Some(victim) = victim {
+                    self.remove(&victim);
+                }
+            }
         }
-        if self.entries.len() >= self.max_entries
-            && let Some(victim) = self.entries.iter().next().map(|entry| entry.key().clone())
-        {
-            self.entries.remove(&victim);
-        }
-        self.entries.insert(key, entry);
     }
 
     fn evict_expired(&self, now: Instant) {
-        self.entries.retain(|_, entry| match entry {
-            Entry::Active { expires_at, .. } | Entry::Negative { expires_at } => *expires_at > now,
-        });
+        let expired: Vec<TokenKey> = self
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let expired = match entry.value() {
+                    Entry::Active { expires_at, .. } | Entry::Negative { expires_at } => {
+                        *expires_at <= now
+                    }
+                };
+                expired.then(|| entry.key().clone())
+            })
+            .collect();
+        for key in expired {
+            self.remove(&key);
+        }
     }
-}
 
-static INTROSPECTION_CACHE: OnceLock<Arc<DashMap<String, Arc<IntrospectionCache>>>> =
-    OnceLock::new();
+    fn remove(&self, key: &TokenKey) {
+        if self.entries.remove(key).is_some() {
+            self.release_slot();
+        }
+    }
 
-fn global_cache() -> &'static Arc<DashMap<String, Arc<IntrospectionCache>>> {
-    INTROSPECTION_CACHE.get_or_init(|| Arc::new(DashMap::new()))
-}
+    fn release_slot(&self) {
+        let _ = self
+            .entry_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            });
+    }
 
-pub fn get_or_create_introspection_cache(
-    cache_key: &str,
-    max_entries: usize,
-    positive_ttl: Duration,
-    negative_ttl: Duration,
-    shard_amount: usize,
-) -> Arc<IntrospectionCache> {
-    global_cache()
-        .entry(cache_key.to_string())
-        .or_insert_with(|| {
-            Arc::new(IntrospectionCache::new(
-                max_entries,
-                positive_ttl,
-                negative_ttl,
-                shard_amount,
-            ))
-        })
-        .clone()
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entry_count.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(test)]
@@ -183,5 +221,30 @@ mod tests {
             cache.get("token", now + Duration::from_secs(2)),
             CacheLookup::Miss
         ));
+    }
+
+    #[test]
+    fn concurrent_inserts_never_exceed_capacity() {
+        let cache = Arc::new(IntrospectionCache::new(
+            100,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            4,
+        ));
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let cache = Arc::clone(&cache);
+                scope.spawn(move || {
+                    for token in 0..100 {
+                        cache.insert_negative(
+                            &format!("worker-{worker}-token-{token}"),
+                            Instant::now(),
+                        );
+                    }
+                });
+            }
+        });
+        assert!(cache.len() <= 100);
+        assert_eq!(cache.len(), cache.entries.len());
     }
 }

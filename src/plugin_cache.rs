@@ -376,6 +376,12 @@ impl Plugin for PriorityOverridePlugin {
     fn is_auth_plugin(&self) -> bool {
         self.inner.is_auth_plugin()
     }
+    fn authentication_challenge(&self) -> Option<&'static str> {
+        self.inner.authentication_challenge()
+    }
+    fn start_background_tasks(&self) -> Result<(), String> {
+        self.inner.start_background_tasks()
+    }
     fn warmup_hostnames(&self) -> Vec<String> {
         self.inner.warmup_hostnames()
     }
@@ -749,6 +755,28 @@ fn collect_active_jwks_uris(
         uris.extend(plugin.active_jwks_uris());
     }
     uris
+}
+
+fn start_background_tasks(
+    proxy_map: &ProxyPluginMap,
+    globals: &[Arc<dyn Plugin>],
+) -> Result<(), String> {
+    let mut started = HashSet::new();
+    for plugin in globals
+        .iter()
+        .chain(proxy_map.values().flat_map(|plugins| plugins.iter()))
+    {
+        let pointer = Arc::as_ptr(plugin) as *const () as usize;
+        if started.insert(pointer) {
+            plugin.start_background_tasks().map_err(|error| {
+                format!(
+                    "plugin '{}' background startup failed: {error}",
+                    plugin.name()
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// All plugin-cache state swapped as a single unit so a single load observes
@@ -1407,6 +1435,13 @@ impl PluginCache {
             ));
         }
 
+        if let Err(error) = start_background_tasks(&new_map, &new_globals) {
+            if rebuild_globals {
+                crate::plugins::utils::log_schema::registry::abort_reload();
+            }
+            return Err(format!("Config reload rejected: {error}"));
+        }
+
         // Rebuild protocol snapshot (plugins + phase data) for changed proxies.
         // Clone-and-patch from the current snapshot so unchanged proxies are preserved.
         let mut new_proxy_proto = current.protocol_snapshot.proxy.clone();
@@ -1880,6 +1915,11 @@ impl PluginCache {
                 plugin_errors.len(),
                 plugin_errors.join("; ")
             ));
+        }
+
+        if let Err(error) = start_background_tasks(&proxy_map, &global_plugins) {
+            crate::plugins::utils::log_schema::registry::abort_reload();
+            return Err(format!("Gateway startup aborted: {error}"));
         }
 
         // All plugins validated — promote the staged named schemas to live.

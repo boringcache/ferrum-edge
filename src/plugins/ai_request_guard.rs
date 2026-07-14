@@ -68,32 +68,47 @@ use super::utils::body_transform::is_json_content_type;
 use super::utils::json_escape::escape_json_string;
 use super::{Plugin, PluginResult, RequestContext};
 
-/// Prefix for the per-instance metadata marker set in `before_proxy` when a
-/// compressed request body was deferred to `on_final_request_body` (where the
-/// body is inspected after any `compression` `transform_request_body`
-/// decompression has run). Its presence tells the final-body hook that this
-/// request still needs JSON-policy evaluation; its absence means `before_proxy`
-/// already inspected the body, so the final-body hook must not re-validate
-/// (avoids double work on the common, uncompressed path).
+/// Prefix for the per-instance metadata marker set in `before_proxy` for every
+/// accepted in-scope JSON POST (and every compressed body whose inspection is
+/// deferred). Its presence tells `on_final_request_body` to validate the final
+/// backend-visible representation after all body transforms have run.
 ///
-/// The full marker key is `{DEFERRED_COMPRESSED_MARKER_PREFIX}{instance_id}`
-/// (see [`AiRequestGuard::deferred_compressed_marker_key`]). It MUST be
+/// The full marker key is `{FINAL_INSPECTION_MARKER_PREFIX}{instance_id}` (see
+/// [`AiRequestGuard::final_inspection_marker_key`]). It MUST be
 /// instance-specific: multiple `ai_request_guard` instances can run on the same
 /// proxy (e.g. two proxy/proxy-group configs with different policies, all on the
-/// same request). With a single shared marker the first instance's
-/// `on_final_request_body` would `remove()` the marker and every later instance
-/// would treat the decompressed body as already inspected — silently skipping
-/// its reject-style policy on compressed uploads. Keying by a unique per-instance
-/// id lets each instance defer, inspect, and clear its own marker independently.
-const DEFERRED_COMPRESSED_MARKER_PREFIX: &str = "ai_request_guard.deferred_compressed_body.";
+/// same request). With a single shared marker, the first instance's final hook
+/// would consume it and later instances would silently skip their policy. The
+/// marker also records the original request scope so a later header transform
+/// cannot evade final validation by relabeling the body.
+const FINAL_INSPECTION_MARKER_PREFIX: &str = "ai_request_guard.final_inspection.";
 
-/// Process-wide source of unique per-instance ids for the deferred-compressed
+/// Process-wide source of unique per-instance ids for the final-inspection
 /// marker. Mirrors the `openapi_validator` `INSTANCE_ID_COUNTER` pattern: a
 /// monotonically increasing counter assigned once at construction guarantees two
 /// `ai_request_guard` instances never collide on the same marker key, regardless
 /// of how they are configured. Starts at 1 so a marker key is never the bare
 /// prefix.
-static DEFERRED_MARKER_COUNTER: AtomicU64 = AtomicU64::new(1);
+static FINAL_INSPECTION_MARKER_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+const CONFIG_FIELDS: &[&str] = &[
+    "max_tokens_limit",
+    "enforce_max_tokens",
+    "default_max_tokens",
+    "supported_schema",
+    "strict_schema",
+    "allowed_models",
+    "blocked_models",
+    "require_model_for_model_policy",
+    "require_user_field",
+    "max_messages",
+    "max_prompt_characters",
+    "temperature_range",
+    "block_system_prompts",
+    "system_prompt_aliases",
+    "required_metadata_fields",
+    "fail_on_uninspectable_body",
+];
 
 /// True when `content-type` is a native gRPC media type (`application/grpc`,
 /// optionally with a `+subtype`/`;param`/OWS suffix), excluding
@@ -250,18 +265,26 @@ pub struct AiRequestGuard {
     needs_body_transform: bool,
     /// True when any configured policy needs the request body to be inspected.
     requires_request_body: bool,
-    /// Instance-specific metadata key used to defer a compressed request body
-    /// from `before_proxy` to `on_final_request_body`. Built once at
-    /// construction as `{DEFERRED_COMPRESSED_MARKER_PREFIX}{unique_id}` so that
-    /// co-located `ai_request_guard` instances never consume each other's
-    /// deferral marker. See [`DEFERRED_COMPRESSED_MARKER_PREFIX`].
-    deferred_compressed_marker: String,
+    /// Instance-specific metadata key recording that the request entered the
+    /// guard's JSON POST scope. The final-body hook consumes it after validating
+    /// the backend-visible representation.
+    final_inspection_marker: String,
 }
 
 impl AiRequestGuard {
     pub fn new(config: &Value) -> Result<Self, String> {
-        if !config.is_object() {
+        let Some(config_object) = config.as_object() else {
             return Err("ai_request_guard: config must be an object".to_string());
+        };
+
+        if let Some(unknown) = config_object
+            .keys()
+            .find(|field| !CONFIG_FIELDS.contains(&field.as_str()))
+        {
+            return Err(format!(
+                "ai_request_guard: unknown config field '{unknown}'; allowed fields: {}",
+                CONFIG_FIELDS.join(", ")
+            ));
         }
 
         let max_tokens_limit = optional_u64(config, "max_tokens_limit")?;
@@ -388,13 +411,10 @@ impl AiRequestGuard {
                 .to_string());
         }
 
-        // Assign a unique per-instance deferral-marker key so multiple
-        // `ai_request_guard` instances on the same proxy cannot consume each
-        // other's compressed-body marker (each defers / inspects / clears its
-        // own). See `DEFERRED_COMPRESSED_MARKER_PREFIX`.
-        let instance_id = DEFERRED_MARKER_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let deferred_compressed_marker =
-            format!("{DEFERRED_COMPRESSED_MARKER_PREFIX}{instance_id}");
+        // Assign a unique per-instance final-inspection marker so multiple guard
+        // instances on the same proxy cannot consume each other's scope marker.
+        let instance_id = FINAL_INSPECTION_MARKER_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let final_inspection_marker = format!("{FINAL_INSPECTION_MARKER_PREFIX}{instance_id}");
 
         Ok(Self {
             max_tokens_limit,
@@ -415,25 +435,25 @@ impl AiRequestGuard {
             fail_on_uninspectable_body,
             needs_body_transform,
             requires_request_body,
-            deferred_compressed_marker,
+            final_inspection_marker,
         })
     }
 
-    /// The instance-specific metadata key this guard uses to defer a compressed
-    /// request body from `before_proxy` to `on_final_request_body`. Exposed so
-    /// callers (and tests) can observe or simulate the deferral for this exact
-    /// instance; two instances always return distinct keys.
+    /// The instance-specific metadata key this guard uses to carry the original
+    /// JSON POST scope into `on_final_request_body`. Exposed so tests can observe
+    /// or simulate the final inspection for this exact instance; two instances
+    /// always return distinct keys.
     ///
     /// Only the external test crate (`tests/unit/plugins/ai_request_guard_tests.rs`)
-    /// calls this — production code reads `self.deferred_compressed_marker`
+    /// calls this — production code reads `self.final_inspection_marker`
     /// directly in `before_proxy` / `on_final_request_body`. The binary crate
     /// only ever uses `AiRequestGuard` as a `dyn Plugin`, so its dead-code pass
     /// (which can't see the separate test crate) would otherwise flag this
     /// accessor. `#[allow(dead_code)]` mirrors the established pattern for
     /// test-only `pub(crate)` accessors elsewhere in `src/plugins/`.
     #[allow(dead_code)]
-    pub fn deferred_compressed_marker_key(&self) -> &str {
-        &self.deferred_compressed_marker
+    pub fn final_inspection_marker_key(&self) -> &str {
+        &self.final_inspection_marker
     }
 
     /// Validate the request body JSON. Returns Err with a rejection tuple on failure.
@@ -550,18 +570,55 @@ impl AiRequestGuard {
             }
         }
 
-        // Temperature range
-        if let Some((min_temp, max_temp)) = self.temperature_range
-            && let Some(temp) = json.get("temperature").and_then(|v| v.as_f64())
-            && (temp < min_temp || temp > max_temp)
-        {
-            return Err((
-                "Temperature out of range".to_string(),
-                format!(
-                    "Temperature {} is outside allowed range [{}, {}]",
-                    temp, min_temp, max_temp
+        // Temperature range. Validate every supported alias rather than stopping
+        // at the top level: Gemini and Bedrock place this setting in their native
+        // generation containers. Present-but-numeric-invalid values and
+        // conflicting aliases fail closed so a backend cannot select a value the
+        // guard did not actually evaluate.
+        if let Some((min_temp, max_temp)) = self.temperature_range {
+            let mut observed: Option<(&'static str, f64)> = None;
+            for (field, value) in [
+                ("temperature", json.get("temperature")),
+                (
+                    "generationConfig.temperature",
+                    json.get("generationConfig")
+                        .and_then(|container| container.get("temperature")),
                 ),
-            ));
+                (
+                    "inferenceConfig.temperature",
+                    json.get("inferenceConfig")
+                        .and_then(|container| container.get("temperature")),
+                ),
+            ] {
+                let Some(value) = value else {
+                    continue;
+                };
+                let Some(temp) = value.as_f64().filter(|value| value.is_finite()) else {
+                    return Err((
+                        "Invalid temperature".to_string(),
+                        format!("'{field}' must be a finite number"),
+                    ));
+                };
+                if let Some((previous_field, previous)) = observed
+                    && previous != temp
+                {
+                    return Err((
+                        "Conflicting temperature fields".to_string(),
+                        format!(
+                            "'{previous_field}' and '{field}' specify different temperature values"
+                        ),
+                    ));
+                }
+                observed = Some((field, temp));
+                if temp < min_temp || temp > max_temp {
+                    return Err((
+                        "Temperature out of range".to_string(),
+                        format!(
+                            "Temperature {temp} in '{field}' is outside allowed range [{min_temp}, {max_temp}]"
+                        ),
+                    ));
+                }
+            }
         }
 
         // System prompt blocking
@@ -595,6 +652,59 @@ impl AiRequestGuard {
         }
 
         Ok(())
+    }
+
+    /// Validate the final backend-visible representation. Clamp/default policy
+    /// normally mutates the body before this phase, but a later body transformer
+    /// can overwrite or remove those caps. The final hook cannot replace bytes,
+    /// so it fails closed if the final representation would require another
+    /// clamp or default injection.
+    fn validate_final_body(&self, json: &Value) -> Result<(), (String, String)> {
+        self.validate(json)?;
+
+        if self.enforce_max_tokens == MaxTokensAction::Clamp
+            && let Some(limit) = self.max_tokens_limit
+            && let Some(requested) = max_requested_tokens(json)
+            && requested > limit
+        {
+            return Err((
+                "max_tokens exceeds limit after request transforms".to_string(),
+                format!("Final request asks for {requested} tokens, maximum allowed is {limit}"),
+            ));
+        }
+
+        if self.default_max_tokens.is_some()
+            && !has_required_default_token_cap(json, self.supported_schema)
+        {
+            return Err((
+                "Missing output token cap after request transforms".to_string(),
+                "A later request-body transform removed the output token cap required by gateway policy"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn transform_scoped_json_body(&self, body: &[u8]) -> Option<Vec<u8>> {
+        let mut json: Value = serde_json::from_slice(body).ok()?;
+        let mut modified = false;
+
+        if let Some(limit) = self.max_tokens_limit
+            && self.enforce_max_tokens == MaxTokensAction::Clamp
+        {
+            modified |= clamp_max_token_fields(&mut json, limit);
+        }
+
+        if let Some(default) = self.default_max_tokens {
+            modified |= inject_default_max_tokens(&mut json, default, self.supported_schema);
+        }
+
+        if modified {
+            serde_json::to_vec(&json).ok()
+        } else {
+            None
+        }
     }
 
     fn handle_uninspectable_body(
@@ -759,13 +869,14 @@ fn looks_like_chat_completions(json: &Value) -> bool {
         // Provider-native top-level markers disqualify the body from the OpenAI
         // Chat Completions family even when it also carries a `messages` array
         // (e.g. Anthropic `{"system": ..., "messages": [...]}`, Cohere
-        // `preamble`/`message`/`chat_history`, RAG `documents`). In strict
-        // `chat_completions` mode these must be rejected rather than admitted as
-        // chat schema.
+        // `preamble`/`message`/`chat_history`, TGI `inputs`, RAG `documents`). In
+        // strict `chat_completions` mode these must be rejected rather than
+        // admitted as chat schema.
         && json.get("system").is_none()
         && json.get("preamble").is_none()
         && json.get("message").is_none()
         && json.get("chat_history").is_none()
+        && json.get("inputs").is_none()
         && json.get("documents").is_none()
         && json.get("retrieved_context").is_none()
         && json.get("tool_results").is_none()
@@ -797,6 +908,9 @@ fn looks_like_provider_native(json: &Value) -> bool {
         // before the documented `textGenerationConfig` reject/clamp logic runs.
         || json.get("inputText").is_some()
         || json.get("textGenerationConfig").is_some()
+        // Hugging Face TGI uses `inputs` with generation controls nested under
+        // `parameters` (not the legacy top-level `max_new_tokens` alias).
+        || json.get("inputs").is_some()
         // Anthropic Messages and Cohere v2 can be indistinguishable from
         // OpenAI-style chat when they carry only a `messages` array.
         || json.get("messages").and_then(Value::as_array).is_some()
@@ -805,12 +919,13 @@ fn looks_like_provider_native(json: &Value) -> bool {
 /// Recognizes legacy text-completion and text-generation bodies that carry a
 /// single prompt string instead of a message array: OpenAI legacy completions
 /// (`{"model", "prompt"}`), TGI/HuggingFace text-generation
-/// (`{"inputs", "max_new_tokens"}`), and Amazon Titan text-generation
-/// (`{"inputText", "textGenerationConfig"}`). `prompt`/`inputs`/`inputText` are
-/// in `TOP_LEVEL_PROMPT_FIELDS`, `max_new_tokens`/`max_tokens_to_sample` are
-/// honored as token fields, and `textGenerationConfig.maxTokenCount` is read by
-/// `max_requested_tokens` / `clamp_max_token_fields`, so strict mode must admit
-/// these shapes rather than reject them as unsupported.
+/// (`{"inputs", "parameters":{"max_new_tokens":...}}`), and Amazon Titan
+/// text-generation (`{"inputText", "textGenerationConfig"}`).
+/// `prompt`/`inputs`/`inputText` are in `TOP_LEVEL_PROMPT_FIELDS`,
+/// `max_new_tokens`/`max_tokens_to_sample` are honored as token fields, and
+/// `textGenerationConfig.maxTokenCount` is read by `max_requested_tokens` /
+/// `clamp_max_token_fields`, so strict mode must admit these shapes rather than
+/// reject them as unsupported.
 fn looks_like_legacy_completions(json: &Value) -> bool {
     json.get("prompt").is_some()
         || json.get("inputs").is_some()
@@ -841,6 +956,12 @@ fn max_requested_tokens(json: &Value) -> Option<u64> {
             .and_then(|v| v.get("maxTokenCount"))
             .and_then(Value::as_u64),
     );
+    update_max_token(
+        &mut requested,
+        json.get("parameters")
+            .and_then(|v| v.get("max_new_tokens"))
+            .and_then(Value::as_u64),
+    );
     requested
 }
 
@@ -857,8 +978,9 @@ fn update_max_token(current: &mut Option<u64>, candidate: Option<u64>) {
 /// `has_any_max_token_field` check treated any token-looking top-level field as
 /// an existing cap, so a Gemini- or TGI-native body carrying a stray OpenAI
 /// `max_tokens` (which those backends ignore) suppressed injection into the
-/// real field (`generationConfig.maxOutputTokens` / `max_new_tokens`), silently
-/// dropping the documented default cap. We only treat the *target* provider's
+/// real field (`generationConfig.maxOutputTokens` /
+/// `parameters.max_new_tokens`), silently dropping the documented default cap.
+/// We only treat the *target* provider's
 /// own output-token field as an existing cap so injection still lands in the
 /// field the backend actually honors.
 fn target_already_caps_output(json: &Value, target: DefaultTokenTarget) -> bool {
@@ -869,7 +991,9 @@ fn target_already_caps_output(json: &Value, target: DefaultTokenTarget) -> bool 
         DefaultTokenTarget::Bedrock => json
             .get("inferenceConfig")
             .is_some_and(|v| v.get("maxTokens").is_some()),
-        DefaultTokenTarget::TextGeneration => json.get("max_new_tokens").is_some(),
+        DefaultTokenTarget::TextGeneration => json
+            .get("parameters")
+            .is_some_and(|v| v.get("max_new_tokens").is_some()),
         // The `TopLevel` target only injects a top-level `max_tokens`, so any
         // top-level token-cap field the plugin recognizes (`TOP_LEVEL_TOKEN_FIELDS`)
         // is the real cap for this target. That covers OpenAI Chat Completions
@@ -900,6 +1024,7 @@ fn clamp_max_token_fields(json: &mut Value, limit: u64) -> bool {
         ("generationConfig", "maxOutputTokens"),
         ("inferenceConfig", "maxTokens"),
         ("textGenerationConfig", "maxTokenCount"),
+        ("parameters", "max_new_tokens"),
     ] {
         if let Some(obj) = json.get_mut(container).and_then(Value::as_object_mut) {
             modified |= clamp_number_field(obj, field, limit);
@@ -1051,8 +1176,15 @@ fn inject_provider_default_max_tokens(
             }
         }
         DefaultTokenTarget::TextGeneration => {
-            obj.insert("max_new_tokens".to_string(), Value::Number(default.into()));
-            true
+            let entry = obj
+                .entry("parameters".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(parameters) = entry.as_object_mut() {
+                parameters.insert("max_new_tokens".to_string(), Value::Number(default.into()));
+                true
+            } else {
+                false
+            }
         }
         DefaultTokenTarget::TopLevel => false,
     }
@@ -1115,6 +1247,54 @@ fn inject_default_max_tokens(json: &mut Value, default: u64, schema: SupportedSc
     }
 
     modified
+}
+
+/// Whether the final request still carries every provider/family cap that
+/// `inject_default_max_tokens` would require for this body shape. This mirrors
+/// the injection routing without cloning or mutating the request JSON.
+fn has_required_default_token_cap(json: &Value, schema: SupportedSchema) -> bool {
+    let target = default_token_target(json);
+    let bedrock_converse_native = matches!(target, DefaultTokenTarget::Bedrock)
+        && matches!(schema, SupportedSchema::ProviderNative);
+    let wants_top_level_fallback = matches!(target, DefaultTokenTarget::TopLevel)
+        || (has_top_level_prompt_marker(json) && !bedrock_converse_native);
+
+    (!wants_top_level_fallback || top_level_numeric_cap_present(json))
+        && (matches!(target, DefaultTokenTarget::TopLevel)
+            || target_has_numeric_output_cap(json, target))
+}
+
+fn top_level_numeric_cap_present(json: &Value) -> bool {
+    if is_responses_shape(json) {
+        json.get("max_output_tokens")
+            .and_then(Value::as_u64)
+            .is_some()
+    } else {
+        ["max_tokens", "max_completion_tokens"]
+            .into_iter()
+            .any(|field| json.get(field).and_then(Value::as_u64).is_some())
+    }
+}
+
+fn target_has_numeric_output_cap(json: &Value, target: DefaultTokenTarget) -> bool {
+    match target {
+        DefaultTokenTarget::Gemini => json
+            .get("generationConfig")
+            .and_then(|value| value.get("maxOutputTokens"))
+            .and_then(Value::as_u64)
+            .is_some(),
+        DefaultTokenTarget::Bedrock => json
+            .get("inferenceConfig")
+            .and_then(|value| value.get("maxTokens"))
+            .and_then(Value::as_u64)
+            .is_some(),
+        DefaultTokenTarget::TextGeneration => json
+            .get("parameters")
+            .and_then(|value| value.get("max_new_tokens"))
+            .and_then(Value::as_u64)
+            .is_some(),
+        DefaultTokenTarget::TopLevel => top_level_numeric_cap_present(json),
+    }
 }
 
 fn count_message_entries(json: &Value) -> u64 {
@@ -1238,6 +1418,16 @@ fn count_text_value(value: Option<&Value>, total: &mut u64) {
                     count_text_value(Some(output), total);
                     return;
                 }
+                // Anthropic text documents keep model-visible prose under
+                // `source.data`. Count it before the typed non-text bailout;
+                // binary/base64 image and PDF sources remain excluded.
+                if part_type == "document"
+                    && let Some(source) = obj.get("source")
+                    && source_is_text_document(source)
+                {
+                    count_text_value(source.get("data"), total);
+                    return;
+                }
                 if is_typed_non_text_content_part(obj) {
                     return;
                 }
@@ -1258,6 +1448,28 @@ fn count_text_value(value: Option<&Value>, total: &mut u64) {
 
 fn is_text_content_part_type(part_type: &str) -> bool {
     matches!(part_type, "text" | "input_text" | "output_text")
+}
+
+fn source_is_text_document(source: &Value) -> bool {
+    let Some(source) = source.as_object() else {
+        return false;
+    };
+    match source.get("type").and_then(Value::as_str) {
+        Some("text") => true,
+        // Some provider adapters omit the redundant `type: text` but retain the
+        // text media type. An explicit non-text type (especially `base64`) wins
+        // so encoded bytes are never counted as prose.
+        None => source
+            .get("media_type")
+            .and_then(Value::as_str)
+            .is_some_and(|media_type| {
+                media_type
+                    .as_bytes()
+                    .get(..5)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"text/"))
+            }),
+        Some(_) => false,
+    }
 }
 
 fn is_typed_non_text_content_part(obj: &serde_json::Map<String, Value>) -> bool {
@@ -1605,7 +1817,7 @@ impl Plugin for AiRequestGuard {
         // section in this module's docs.
         if has_non_identity_content_encoding(headers) {
             ctx.metadata
-                .insert(self.deferred_compressed_marker.clone(), "true".to_string());
+                .insert(self.final_inspection_marker.clone(), "true".to_string());
             return PluginResult::Continue;
         }
 
@@ -1696,72 +1908,55 @@ impl Plugin for AiRequestGuard {
             ctx.metadata.insert("request_body".to_string(), new_body);
         }
 
+        // This instance accepted the original JSON POST. Carry that scope into
+        // the final hook so later body/header transforms cannot create a policy
+        // violation after admission.
+        ctx.metadata
+            .insert(self.final_inspection_marker.clone(), "true".to_string());
+
         PluginResult::Continue
     }
 
     fn needs_final_request_body_context(&self) -> bool {
         // The final-body hook records uninspectable-body bookkeeping in
-        // `ctx.metadata` (and reads the deferred-compressed marker), so it needs
+        // `ctx.metadata` and consumes the per-instance scope marker, so it needs
         // the real mutable context, not the no-op default wrapper.
         self.requires_request_body
     }
 
-    /// Re-inspect a deferred compressed request body after all
-    /// `transform_request_body` hooks (including the `compression` plugin's
-    /// `decompress_request`) have run.
+    /// Inspect the final backend-visible body after all `transform_request_body`
+    /// hooks (including request transformers and decompression) have run.
     ///
-    /// `before_proxy` cannot evaluate JSON policy on a still-compressed body, so
-    /// it sets this instance's deferral marker
-    /// ([`AiRequestGuard::deferred_compressed_marker_key`]) and Continues. This
-    /// hook closes that deferral:
+    /// `before_proxy` records this instance's JSON POST scope before validating
+    /// an ordinary body or deferring a compressed one. This hook then closes both
+    /// post-transform gaps:
     ///
-    /// - If the marker is absent, `before_proxy` already inspected the body
-    ///   (plain, uncompressed path) — Continue without re-validating so the
-    ///   common path pays no extra parse.
+    /// - If the marker is absent, the request was outside this guard's scope.
     /// - If `Content-Encoding` is still non-identity, decompression did not
     ///   happen (no `compression` plugin, or it could not decode the body): the
     ///   body is still compressed and uninspectable — fail closed via
     ///   `fail_on_uninspectable_body` (reason `compressed_body`).
-    /// - Otherwise the body is now plaintext JSON: parse and run `validate()`,
-    ///   rejecting on malformed JSON or any policy violation.
+    /// - Otherwise the body is plaintext JSON: parse and validate the final
+    ///   representation, rejecting policy violations introduced by later body
+    ///   transforms. Clamp/default controls fail closed if a later transform
+    ///   undoes them because this hook cannot replace body bytes.
     ///
-    /// Note: reject-style policy (model allow/block, token/prompt limits,
-    /// temperature, system-prompt blocking, required fields) is enforced here.
-    /// The `max_tokens` clamp / `default_max_tokens` injection is NOT re-applied
-    /// to compressed bodies — those mutate the body, and the H1/H2 final-body
-    /// hook contract only copies `ctx.metadata` back (body edits are dropped), so
-    /// attempting them here would be inconsistent across protocols. Clamp/inject
-    /// on compressed uploads remains a known limitation; the security-relevant
-    /// reject policies are fully enforced.
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        // Only act on bodies THIS instance deferred. The marker key is
-        // instance-specific (see `DEFERRED_COMPRESSED_MARKER_PREFIX`), so a
-        // sibling `ai_request_guard` instance on the same proxy cannot consume
-        // it — each instance inspects and clears its own deferral. The marker is
-        // set only for non-identity `Content-Encoding` requests, so the common
-        // (uncompressed) path skips this hook entirely.
-        if ctx
-            .metadata
-            .remove(&self.deferred_compressed_marker)
-            .is_none()
-        {
+        // Only act on requests THIS instance admitted into scope. The marker is
+        // instance-specific, so co-located guard instances cannot consume each
+        // other's final validation work.
+        if ctx.metadata.remove(&self.final_inspection_marker).is_none() {
             return PluginResult::Continue;
         }
 
-        // Defensive: a deferred request should still be JSON content-type and
-        // not framed gRPC, but re-check against the final headers in case an
-        // earlier-phase plugin relabeled the content-type. Skipping here matches
-        // the `before_proxy` content-type scope.
-        let content_type = headers
-            .get("content-type")
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        if !is_json_content_type(content_type) || is_framed_grpc_content_type(content_type) {
+        // The marker can only be set by `before_proxy` on a POST. Keep the method
+        // check defensive for direct hook callers and future runner changes.
+        if ctx.method != "POST" {
             return PluginResult::Continue;
         }
 
@@ -1794,9 +1989,9 @@ impl Plugin for AiRequestGuard {
             }
         };
 
-        if let Err((error, details)) = self.validate(&json) {
+        if let Err((error, details)) = self.validate_final_body(&json) {
             debug!(
-                "ai_request_guard: validation failed on decompressed body: {} - {}",
+                "ai_request_guard: validation failed on final request body: {} - {}",
                 error, details
             );
             return PluginResult::Reject {
@@ -1813,43 +2008,33 @@ impl Plugin for AiRequestGuard {
         PluginResult::Continue
     }
 
-    async fn transform_request_body(
+    async fn transform_request_body_with_context(
         &self,
+        ctx: &mut RequestContext,
         body: &[u8],
         content_type: Option<&str>,
         _request_headers: &std::collections::HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        // Only transform JSON
-        if let Some(ct) = content_type
-            && !is_json_content_type(ct)
+        if ctx.method != "POST"
+            || !content_type.is_some_and(|content_type| {
+                is_json_content_type(content_type) && !is_framed_grpc_content_type(content_type)
+            })
         {
             return None;
         }
+        self.transform_scoped_json_body(body)
+    }
 
-        let mut json: Value = match serde_json::from_slice(body) {
-            Ok(v) => v,
-            Err(_) => return None,
-        };
-
-        let mut modified = false;
-
-        // Clamp max_tokens if over limit
-        if let Some(limit) = self.max_tokens_limit
-            && self.enforce_max_tokens == MaxTokensAction::Clamp
-        {
-            modified |= clamp_max_token_fields(&mut json, limit);
-        }
-
-        // Inject default_max_tokens if not present
-        if let Some(default) = self.default_max_tokens {
-            modified |= inject_default_max_tokens(&mut json, default, self.supported_schema);
-        }
-
-        if modified {
-            serde_json::to_vec(&json).ok()
-        } else {
-            None
-        }
+    async fn transform_request_body(
+        &self,
+        _body: &[u8],
+        _content_type: Option<&str>,
+        _request_headers: &std::collections::HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        // Methodless runners cannot prove the documented JSON POST scope. The
+        // normal H1/H2/H3 paths provide RequestContext and use the override above;
+        // unsupported context-free paths must leave the body unchanged.
+        None
     }
 }
 

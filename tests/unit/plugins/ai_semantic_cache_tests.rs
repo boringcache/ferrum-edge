@@ -453,7 +453,8 @@ async fn validate_plugin_config_with_policy_screens_denied_direct_client_endpoin
 
     let ldap_denied = json!({
         "ldap_url": "ldap://169.254.169.254:389",
-        "bind_dn_template": "uid={username},dc=example,dc=com"
+        "bind_dn_template": "uid={username},dc=example,dc=com",
+        "allow_plaintext": true
     });
     assert!(
         validate_plugin_config_with_policy("ldap_auth", &ldap_denied, &default_policy).is_err(),
