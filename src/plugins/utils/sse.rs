@@ -289,6 +289,37 @@ impl SseReassembler {
         content + responses
     }
 
+    /// Total bytes retained across every reassembled text accumulator (assistant
+    /// prose, tool names/arguments, and Responses API text/arguments), without
+    /// allocating a snapshot. Windowed policy inspectors use this for their
+    /// aggregate retained-state budget.
+    pub fn retained_text_len(&self) -> usize {
+        let content = self
+            .content
+            .iter()
+            .map(|(_, text)| text.len())
+            .sum::<usize>();
+        let tool_calls = self
+            .tool_calls
+            .iter()
+            .map(|(_, call)| call.name.len().saturating_add(call.arguments.len()))
+            .sum::<usize>();
+        let responses_text = self
+            .responses_text
+            .iter()
+            .map(|(_, text)| text.len())
+            .sum::<usize>();
+        let responses_args = self
+            .responses_args
+            .iter()
+            .map(|(_, text)| text.len())
+            .sum::<usize>();
+        content
+            .saturating_add(tool_calls)
+            .saturating_add(responses_text)
+            .saturating_add(responses_args)
+    }
+
     /// Reassembled fragments as of now, **without** consuming the accumulator —
     /// the streamed `inspect` path inspects the current window repeatedly as the
     /// stream grows, so it cannot move the strings out the way

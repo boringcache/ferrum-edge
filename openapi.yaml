@@ -14891,6 +14891,7 @@ components:
         - type: boolean
           description: Boolean shorthand. true enables the pack with Ferrum defaults; false disables it.
         - type: object
+          additionalProperties: false
           properties:
             enabled:
               type: boolean
@@ -15075,6 +15076,7 @@ components:
 
     AiSemanticFirewallConfig:
       type: object
+      additionalProperties: false
       description: "Plugin: ai_semantic_firewall — Semantic LLM guardrails for prompt injection, jailbreaks, system/developer prompt exfiltration, data exfiltration intent, indirect prompt injection, tool abuse, business-topic allow/deny policy, response leakage, dry-run rollout, and audit metadata."
       allOf:
         - if:
@@ -15091,6 +15093,7 @@ components:
           default: true
         inspect:
           type: object
+          additionalProperties: false
           properties:
             request:
               type: boolean
@@ -15113,12 +15116,17 @@ components:
           enum: [reject, warn]
           default: reject
           description: Default action for built-in semantic rules.
+        fail_on_uninspectable_body:
+          type: boolean
+          default: true
+          description: When true, missing, empty, malformed, encoded, oversized, or governed LLM JSON with no extractable content is handled through on_error (rejecting by default in enforce mode). Set false only as an explicit compatibility opt-out on a generic shared JSON proxy that intentionally forwards such bodies uninspected.
         streaming_response:
           type: string
           enum: [skip, reject, buffer, inspect]
           description: "Behavior for stream:true requests when response-side inspection is active. The default is conditional and is NOT advertised as a static schema default on purpose: when omitted, enforce mode with response-side rules active defaults to reject (clients cannot bypass response inspection by streaming) while dry_run or request-only configurations default to skip. Tooling that materializes OpenAPI defaults must leave this field unset to inherit the correct default — sending an explicit reject for a dry_run/request-only config would flip request-body buffering on (requires_request_body_before_before_proxy) and buffer every JSON POST just to read the stream flag, unlike the omitted-field behavior. skip is an explicit fail-open opt-out that allows the streamed response uninspected and records ai_semantic_firewall.response_inspection_skipped when the request body is available; reject fails closed and rejects the request so a client cannot disable response inspection by streaming — clients retry with stream:false to receive an inspectable buffered response; buffer forces the streamed response onto the buffered path, reassembles its SSE deltas into coherent text, and runs the full response engine before anything reaches the client (most accurate, highest time-to-first-byte; an oversized stream fails closed via FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES); inspect inspects the stream progressively in windows (reassemble to a sentence/paragraph or byte-cap boundary, inspect, release if clean) and cuts the stream mid-flight on a violation with a terminal SSE error event — preserves streaming UX (low time-to-first-byte) at the cost of windowed granularity plus a per-window inspection. inspect records ai_semantic_firewall.response_inspection=streaming_windowed. Production enforcement should use reject, buffer, or inspect with on_error=reject."
         streaming:
           type: object
+          additionalProperties: false
           description: Windowed-inspection tuning. Only valid when streaming_response is inspect.
           properties:
             window:
@@ -15131,12 +15139,12 @@ components:
               format: uint
               minimum: 1
               default: 4096
-              description: Hard cap on held (un-released) raw bytes; forces a window even mid-sentence and bounds the un-terminated carry, bounding added latency and held memory. A single SSE event larger than this is treated as uninspectable (fails closed under on_error=reject, forwarded under warn/allow).
+              description: Hard aggregate cap for the current window's input and retained raw/frame/reassembled state. Coalesced chunks are expanded event-by-event, and an individual event that cannot fit is uninspectable (fails closed under on_error=reject, forwarded under warn/allow).
             overlap_bytes:
               type: integer
               format: uint
               default: 256
-              description: Bytes of already-cleared text re-inspected with the next window so a violation phrase split across a boundary is still caught. Also the amount of reassembled prose retained after a clean release, so memory stays bounded to roughly one window plus this overlap.
+              description: Bytes of already-cleared text re-inspected with the next window so a violation phrase split across a boundary is still caught. Must be less than max_window_bytes and is included within that aggregate retained-state cap.
             max_inspections:
               type: integer
               format: uint
@@ -15155,6 +15163,7 @@ components:
               description: block holds each window until it passes inspection, then releases it (or cuts the stream on a violation) — no un-inspected bytes reach the client, at the cost of windowing latency. detect is release-then-detect — bytes stream through immediately and a violation is only logged (to the structured log, never the client or metrics), never cut; use it to observe what would be blocked without affecting traffic.
         provider:
           type: object
+          additionalProperties: false
           required: [type, endpoint]
           properties:
             type:
@@ -15180,6 +15189,7 @@ components:
           description: Required when the plugin has active rules.
         builtins:
           type: object
+          additionalProperties: false
           properties:
             prompt_injection:
               $ref: '#/components/schemas/AiSemanticFirewallBuiltinPackConfig'
@@ -15198,15 +15208,32 @@ components:
           description: Built-in rule packs. When omitted, all built-ins are enabled; when provided, omitted packs are disabled. Object form can append or replace semantic examples per pack while keeping the built-in rule ID and pack metadata.
         extraction:
           type: object
+          additionalProperties: false
           properties:
             request_json_paths:
               type: array
+              minItems: 1
               items:
                 type: string
+                enum:
+                  - "$.messages[*].content"
+                  - "$.messages[*].tool_calls[*].function.name"
+                  - "$.messages[*].tool_calls[*].function.arguments"
+                  - "$.prompt"
+                  - "$.input"
+                  - "$.instructions"
+                  - "$.tools[*].function.name"
+                  - "$.tools[*].function.description"
+                  - "$.tools[*].function.parameters"
+                  - "$.context"
+                  - "$.documents[*].text"
+                  - "$.retrieved_context[*].content"
+                  - "$.tool_results[*].content"
               default:
                 - "$.messages[*].content"
                 - "$.messages[*].tool_calls[*].function.name"
                 - "$.messages[*].tool_calls[*].function.arguments"
+                - "$.prompt"
                 - "$.input"
                 - "$.instructions"
                 - "$.tools[*].function.name"
@@ -15219,9 +15246,22 @@ components:
               description: Supported simple request extraction paths. When configured, this list replaces the defaults.
             response_json_paths:
               type: array
+              minItems: 1
               items:
                 type: string
+                enum:
+                  - "$.choices[*].text"
+                  - "$.choices[*].message.content"
+                  - "$.choices[*].message.tool_calls[*].function.name"
+                  - "$.choices[*].message.tool_calls[*].function.arguments"
+                  - "$.choices[*].delta.content"
+                  - "$.choices[*].delta.tool_calls[*].function.name"
+                  - "$.choices[*].delta.tool_calls[*].function.arguments"
+                  - "$.output_text"
+                  - "$.output[*].content[*].text"
+                  - "$.output[*].arguments"
               default:
+                - "$.choices[*].text"
                 - "$.choices[*].message.content"
                 - "$.choices[*].message.tool_calls[*].function.name"
                 - "$.choices[*].message.tool_calls[*].function.arguments"
@@ -15236,6 +15276,7 @@ components:
           type: array
           items:
             type: object
+            additionalProperties: false
             required: [id, examples]
             properties:
               id:
@@ -15262,6 +15303,7 @@ components:
           type: array
           items:
             type: object
+            additionalProperties: false
             required: [id, examples]
             properties:
               id:
@@ -15288,6 +15330,7 @@ components:
           type: array
           items:
             type: object
+            additionalProperties: false
             required: [id, examples]
             properties:
               id:
@@ -15321,6 +15364,7 @@ components:
           description: Customer-defined semantic rules.
         privacy:
           type: object
+          additionalProperties: false
           properties:
             log_raw_text:
               type: boolean
