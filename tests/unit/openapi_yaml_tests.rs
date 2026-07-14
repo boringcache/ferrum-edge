@@ -531,6 +531,33 @@ fn access_control_schema_matches_runtime_validation() {
 }
 
 #[test]
+fn jwt_auth_schema_rejects_unknown_config_keys() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/JwtAuthConfig")
+        .expect("missing JwtAuthConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("JwtAuthConfig schema compiles");
+
+    assert!(
+        validator
+            .validate(&json!({"audiences": ["payments-api"]}))
+            .is_ok()
+    );
+    for config in [
+        json!({"audience": ["payments-api"]}),
+        json!({"expected_issue": "https://issuer.example"}),
+    ] {
+        assert!(
+            validator.validate(&config).is_err(),
+            "schema should reject unknown jwt_auth key: {config}"
+        );
+    }
+}
+
+#[test]
 fn ldap_auth_schema_matches_runtime_invariants() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

@@ -11469,6 +11469,7 @@ components:
     JwtAuthConfig:
       type: object
       description: "Plugin: jwt_auth — HS256 JWT Bearer token authentication."
+      additionalProperties: false
       properties:
         token_lookup:
           type: string
