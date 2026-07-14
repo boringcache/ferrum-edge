@@ -957,6 +957,21 @@ async fn test_mtls_append_normalizes_identity_before_uniqueness_and_persistence(
     .await
     .unwrap();
 
+    create_plugin_config(
+        &client,
+        admin_url,
+        &auth,
+        &json!({
+            "id": "mtls-dns-identity-policy",
+            "plugin_name": "mtls_auth",
+            "scope": "global",
+            "enabled": true,
+            "config": {"cert_field": "san_dns"}
+        }),
+    )
+    .await
+    .unwrap();
+
     create_consumer(&client, admin_url, &auth, "mtls-rotating", "mtls-rotating")
         .await
         .unwrap();

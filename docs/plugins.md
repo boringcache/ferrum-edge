@@ -1286,7 +1286,7 @@ For UDP+DTLS frontends, the underlying DTLS library exposes only the client leaf
 
 **Supported `cert_field` values:** `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, `san_email`, `fingerprint_sha256`, `serial`
 
-For `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, and `san_email`, Ferrum selects only the **first matching value in certificate order**. Later subject attributes or SAN entries are not fallback identities. DNS SAN identities are normalized with ASCII lowercase and compared case-insensitively; every other identity field is compared exactly. Consumer mTLS identities must be unique under ASCII case folding so a certificate cannot resolve ambiguously when a proxy uses `san_dns`.
+For `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, and `san_email`, Ferrum selects only the **first matching value in certificate order**. Later subject attributes or SAN entries are not fallback identities. DNS SAN identities are normalized with ASCII lowercase and compared case-insensitively; every other identity field is compared exactly. Consumer mTLS identities are always exact-unique; while an enabled `san_dns` mTLS policy exists, they must also be unique under ASCII case folding so a DNS certificate cannot resolve ambiguously.
 
 > **`serial` format.** The serial identity is the lowercase hex serial number value — no separators, matching the lowercase of `openssl x509 -serial -noout -in cert.pem` output. DER may include a leading `00` sign-padding byte for positive serials whose high bit is set, but OpenSSL's serial value omits that DER-only pad and Ferrum strips it before lookup (for example, DER bytes `00 C0 01` match stored identity `c001`). Preserve real serial value zeros, but do not add DER sign padding and do not use the colon-separated form from `openssl x509 -text`.
 
@@ -1299,7 +1299,7 @@ credentials:
 ```
 
 **Issuer Filtering:**
-When `allowed_issuers` is configured, every filter requires `ca_certificate_pem` containing exactly one CA certificate plus at least one of `cn`, `o`, or `ou`. The DN fields must match both the leaf issuer and the pinned CA subject (AND logic within one filter; OR across filters), and Ferrum cryptographically verifies a signature path from the leaf to that pinned CA key. Matching issuer text alone never authorizes a certificate, so two CAs with the same DN cannot impersonate each other.
+When `allowed_issuers` is configured, every filter requires `ca_certificate_pem` containing exactly one CA certificate plus at least one of `cn`, `o`, or `ou`. The DN fields describe and must match the pinned CA subject (AND logic within one filter; OR across filters), and Ferrum cryptographically verifies a signature path from the leaf through any presented intermediates to that pinned CA key. The pin may therefore be an intermediate or a higher-level root. Matching issuer text alone never authorizes a certificate, so two CAs with the same DN cannot impersonate each other.
 
 ```yaml
 plugin_name: mtls_auth
@@ -1322,7 +1322,7 @@ config:
 **CA Fingerprint Filtering:**
 When `allowed_ca_fingerprints_sha256` is configured, at least one certificate in the client's TLS chain must match a configured SHA-256 fingerprint. When both `allowed_issuers` and `allowed_ca_fingerprints_sha256` are configured, both constraints must pass (AND logic).
 
-On UDP+DTLS streams, `allowed_ca_fingerprints_sha256` is not usable and is rejected during configuration admission. The filter hashes only verified intermediate/CA chain certificates (never the leaf), while the dimpl-backed DTLS path exposes only the client leaf. For DTLS, use `allowed_issuers` with `ca_certificate_pem`; the configured pin can verify the leaf signature even though the root is absent from the presented chain. To pin one client certificate instead, use `cert_field: fingerprint_sha256` mapped to a consumer identity.
+On UDP+DTLS streams, `allowed_ca_fingerprints_sha256` is not usable and is rejected during configuration admission. The filter hashes only verified intermediate/CA chain certificates (never the leaf), while the dimpl-backed DTLS path exposes only the client leaf. For DTLS, use `allowed_issuers` with the immediate issuing CA in `ca_certificate_pem`, so the configured pin can verify the leaf directly; a higher-level root pin needs the intermediate chain that DTLS does not expose. To pin one client certificate instead, use `cert_field: fingerprint_sha256` mapped to a consumer identity.
 
 Issuer-constraint rejection bodies are always emitted as valid JSON even when certificate subject fields contain quotes, newlines, or other control characters.
 

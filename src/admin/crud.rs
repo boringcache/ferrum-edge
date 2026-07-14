@@ -93,9 +93,39 @@ async fn validate_mtls_auth_candidate(
             .plugin_configs
             .retain(|plugin| plugin.id != removed_plugin_id);
     }
-    config
+    let mut errors = config
         .validate_mtls_auth_compatibility()
-        .map_err(AfterValidateError::BadRequest)
+        .err()
+        .unwrap_or_default();
+    if let Err(credential_errors) = config.validate_unique_consumer_credentials() {
+        errors.extend(credential_errors);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AfterValidateError::BadRequest(errors))
+    }
+}
+
+pub(crate) async fn mtls_consumer_candidate_errors(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> DbResult<Vec<String>> {
+    let mut config = db.load_namespace_snapshot(namespace).await?;
+    if let Some(existing) = config
+        .consumers
+        .iter_mut()
+        .find(|item| item.id == consumer.id)
+    {
+        *existing = consumer.clone();
+    } else {
+        config.consumers.push(consumer.clone());
+    }
+    Ok(config
+        .validate_unique_consumer_credentials()
+        .err()
+        .unwrap_or_default())
 }
 
 impl ValidationError {
@@ -2185,6 +2215,10 @@ impl AdminResource for Consumer {
         consumer_response_body(resource)
     }
 
+    fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {
+        super::json_response(StatusCode::CONFLICT, &json!({"error": errors.join("; ")}))
+    }
+
     fn prepare_for_write(&mut self) -> Result<(), String> {
         hash_consumer_credentials(self)
     }
@@ -2247,6 +2281,27 @@ impl AdminResource for Consumer {
         }
 
         check_consumer_credential_uniqueness(db, namespace, resource, exclude_id).await
+    }
+
+    async fn after_validate(
+        db: &dyn DatabaseBackend,
+        _state: &AdminState,
+        namespace: &str,
+        resource: &Self,
+        _existing: Option<&Self>,
+        _ctx: &ValidationCtx<'_>,
+    ) -> Result<(), AfterValidateError> {
+        if !resource.has_credential("mtls_auth") {
+            return Ok(());
+        }
+        let errors = mtls_consumer_candidate_errors(db, namespace, resource)
+            .await
+            .map_err(AfterValidateError::Db)?;
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(AfterValidateError::BadRequest(errors))
+        }
     }
 }
 

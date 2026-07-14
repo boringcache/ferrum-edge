@@ -403,7 +403,7 @@ async fn consumer_credential_index_enforces_keyauth_uniqueness() {
 }
 
 #[tokio::test]
-async fn consumer_credential_index_enforces_case_insensitive_mtls_uniqueness() {
+async fn consumer_credential_index_preserves_exact_mtls_identity_semantics() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("consumer_mtls_identity_index.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
@@ -419,7 +419,7 @@ async fn consumer_credential_index_enforces_case_insensitive_mtls_uniqueness() {
     store.create_consumer(&c1).await.unwrap();
 
     assert!(
-        !store
+        store
             .check_mtls_identity_unique("ferrum", "api.example.com", None)
             .await
             .unwrap()
@@ -430,21 +430,34 @@ async fn consumer_credential_index_enforces_case_insensitive_mtls_uniqueness() {
         "mtls_auth".to_string(),
         json!([{ "identity": "api.example.com" }]),
     );
-    let error = store
+    store
         .create_consumer(&c2)
         .await
-        .expect_err("case-variant mTLS identity must violate credential index");
+        .expect("case-variant exact identities must coexist in the credential index");
+    let loaded = store.load_full_config("ferrum").await.unwrap();
+    assert_eq!(loaded.consumers.len(), 2);
+    assert_eq!(loaded.consumers[0].username, "alice");
+
+    let mut c3 = make_consumer("c3", "carol");
+    c3.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{ "identity": "API.Example.COM" }]),
+    );
+    let error = store
+        .create_consumer(&c3)
+        .await
+        .expect_err("an exact duplicate mTLS identity must violate the credential index");
     let message = error.to_string();
     assert!(
         message.contains("consumer_credential_index")
             || message.contains("UNIQUE")
             || message.contains("constraint"),
-        "unexpected duplicate-identity error: {message}"
+        "unexpected exact duplicate-identity error: {message}"
     );
 }
 
 #[tokio::test]
-async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_case_sensitive_index_rows() {
+async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_whitespace_index_rows() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir
         .path()
@@ -461,9 +474,9 @@ async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_case_sensitive_index
     );
     store.create_consumer(&consumer).await.unwrap();
 
-    // Simulate an index row written by the pre-canonicalization implementation:
-    // its hash cannot satisfy a lower-cased lookup, so admission must inspect
-    // the authoritative Consumer record instead of treating the miss as unique.
+    // Simulate an index row written before surrounding whitespace was
+    // canonicalized. A trimmed exact lookup misses this row, so admission must
+    // inspect the authoritative Consumer record instead of treating it as unique.
     sqlx::query(
         "UPDATE consumer_credential_index SET credential_hash = ? \
          WHERE namespace = ? AND consumer_id = ? AND credential_type = ?",
@@ -478,13 +491,19 @@ async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_case_sensitive_index
 
     assert!(
         !store
+            .check_mtls_identity_unique("ferrum", "API.Example.COM", None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
             .check_mtls_identity_unique("ferrum", "api.example.com", None)
             .await
             .unwrap()
     );
     assert!(
         store
-            .check_mtls_identity_unique("ferrum", "api.example.com", Some("legacy"))
+            .check_mtls_identity_unique("ferrum", "API.Example.COM", Some("legacy"))
             .await
             .unwrap()
     );

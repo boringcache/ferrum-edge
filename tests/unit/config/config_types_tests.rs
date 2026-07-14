@@ -1528,7 +1528,7 @@ fn test_unique_consumer_credentials_mtls_different_identities_ok() {
 }
 
 #[test]
-fn test_unique_consumer_credentials_rejects_case_variant_mtls_identities() {
+fn test_unique_consumer_credentials_scopes_case_folding_to_san_dns() {
     let mut c1 = make_consumer("c1", "alice");
     c1.credentials.insert(
         "mtls_auth".into(),
@@ -1542,9 +1542,28 @@ fn test_unique_consumer_credentials_rejects_case_variant_mtls_identities() {
     let mut config = empty_config();
     config.consumers = vec![c1, c2];
 
+    assert!(
+        config.validate_unique_consumer_credentials().is_ok(),
+        "exact-match certificate fields must permit case-variant identities"
+    );
+
+    let mut dns_plugin = mtls_plugin(
+        "dns-mtls",
+        PluginScope::Global,
+        None,
+        serde_json::json!({"cert_field": "san_dns"}),
+    );
+    dns_plugin.enabled = false;
+    config.plugin_configs.push(dns_plugin);
+    assert!(
+        config.validate_unique_consumer_credentials().is_ok(),
+        "a disabled san_dns policy must not constrain exact-match deployments"
+    );
+    config.plugin_configs[0].enabled = true;
+
     let errors = config.validate_unique_consumer_credentials().unwrap_err();
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].contains("case-insensitive"));
+    assert!(errors[0].contains("ASCII case-insensitive"));
 }
 
 // ---- Multi-credential (array format) tests ----

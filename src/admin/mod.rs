@@ -2778,6 +2778,24 @@ async fn ensure_credential_unique(
     }
 }
 
+async fn ensure_mtls_consumer_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> Result<(), Box<Response<Full<Bytes>>>> {
+    match crud::mtls_consumer_candidate_errors(db, namespace, consumer).await {
+        Ok(errors) if errors.is_empty() => Ok(()),
+        Ok(errors) => Err(Box::new(json_response(
+            StatusCode::CONFLICT,
+            &json!({"error": errors.join("; ")}),
+        ))),
+        Err(error) => Err(Box::new(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &db_error_response(&error),
+        ))),
+    }
+}
+
 async fn persist_consumer_update(
     db: &dyn DatabaseBackend,
     mut consumer: Consumer,
@@ -3366,6 +3384,11 @@ async fn handle_update_credentials(
     {
         return Ok(*resp);
     }
+    if cred_type == "mtls_auth"
+        && let Err(resp) = ensure_mtls_consumer_candidate(db.as_ref(), namespace, &consumer).await
+    {
+        return Ok(*resp);
+    }
 
     let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
     if response.status().is_success() {
@@ -3520,6 +3543,11 @@ async fn handle_append_credential(
             normalized_credential,
         )
         .await
+    {
+        return Ok(*resp);
+    }
+    if cred_type == "mtls_auth"
+        && let Err(resp) = ensure_mtls_consumer_candidate(db.as_ref(), namespace, &consumer).await
     {
         return Ok(*resp);
     }
@@ -4094,6 +4122,17 @@ async fn handle_batch_create(
 
     match db.load_namespace_snapshot(namespace).await {
         Ok(mut candidate_config) => {
+            for consumer in &batch.consumers {
+                if let Some(existing) = candidate_config
+                    .consumers
+                    .iter_mut()
+                    .find(|item| item.id == consumer.id)
+                {
+                    *existing = consumer.clone();
+                } else {
+                    candidate_config.consumers.push(consumer.clone());
+                }
+            }
             for proxy in &batch.proxies {
                 if let Some(existing) = candidate_config
                     .proxies
@@ -4119,9 +4158,12 @@ async fn handle_batch_create(
             if let Err(errors) = candidate_config.validate_mtls_auth_compatibility() {
                 validation_errors.extend(errors);
             }
+            if let Err(errors) = candidate_config.validate_unique_consumer_credentials() {
+                validation_errors.extend(errors);
+            }
         }
         Err(error) => validation_errors.push(format!(
-            "Failed to load namespace config for mTLS compatibility validation: {}",
+            "Failed to load namespace config for mTLS candidate validation: {}",
             error
         )),
     }

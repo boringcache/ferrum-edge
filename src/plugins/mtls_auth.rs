@@ -140,7 +140,7 @@ fn canonical_serial_bytes(raw_serial: &[u8]) -> &[u8] {
     }
 }
 
-/// Per-proxy issuer filter: matches descriptive issuer DN fields and a pinned CA key.
+/// Per-proxy issuer filter: binds descriptive CA subject fields to a pinned CA key.
 ///
 /// All specified fields must match (AND logic within a single filter).
 /// Multiple filters in `allowed_issuers` are OR'd — any one matching is sufficient.
@@ -246,11 +246,6 @@ impl IssuerFilter {
 
         true
     }
-
-    /// Check if this filter's descriptive DN attributes match the leaf issuer.
-    fn matches_issuer_name(&self, cert: &X509Certificate<'_>) -> bool {
-        self.matches_name(cert.issuer())
-    }
 }
 
 fn parse_ca_certificate_pem(pem: &str, context: &str) -> Result<Vec<u8>, String> {
@@ -301,9 +296,9 @@ fn parse_ca_certificate_pem(pem: &str, context: &str) -> Result<Vec<u8>, String>
 ///
 /// ## Issuer Filtering
 ///
-/// When `allowed_issuers` is set, the plugin verifies the peer certificate's
-/// issuer DN matches at least one filter and cryptographically verifies a path
-/// to that filter's `ca_certificate_pem`. DN labels alone never authorize a CA.
+/// When `allowed_issuers` is set, each filter's DN fields identify the pinned CA
+/// subject and the plugin cryptographically verifies a peer path to that
+/// filter's `ca_certificate_pem`. DN labels alone never authorize a CA.
 ///
 /// When `allowed_ca_fingerprints_sha256` is set, the plugin verifies that at
 /// least one certificate in the client's chain (intermediate/CA certs sent
@@ -372,18 +367,15 @@ impl MtlsAuth {
         peer_cert_der: &[u8],
         chain_der: Option<&[Vec<u8>]>,
     ) -> Result<(), String> {
-        // Check allowed_issuers against both the leaf issuer attributes and a
-        // cryptographically verified path to the pinned CA certificate. DN
-        // labels alone are not unique CA identities.
+        // Each filter's DN attributes were bound to the pinned certificate's
+        // subject at construction. Runtime authorization therefore depends on a
+        // cryptographically verified path to that pinned CA, which may be the
+        // immediate issuer, an intermediate, or a root. DN labels alone are not
+        // unique CA identities.
         if !self.allowed_issuers.is_empty() {
             let chain = chain_der.unwrap_or(&[]);
             let matched = self.allowed_issuers.iter().any(|filter| {
-                filter.matches_issuer_name(peer_cert)
-                    && self.chain_reaches_pinned_ca(
-                        peer_cert_der,
-                        chain,
-                        filter.ca_cert_der.as_slice(),
-                    )
+                self.chain_reaches_pinned_ca(peer_cert_der, chain, filter.ca_cert_der.as_slice())
             });
             if !matched {
                 let issuer_cn = peer_cert

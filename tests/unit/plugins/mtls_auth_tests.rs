@@ -90,6 +90,47 @@ fn create_ca_signed_cert(
     (ca_der, client_der)
 }
 
+/// Create root -> intermediate -> client certificate material.
+/// Returns (root_der, intermediate_der, client_der).
+fn create_intermediate_signed_cert(
+    root_cn: &str,
+    intermediate_cn: &str,
+    client_cn: &str,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut root_params = rcgen::CertificateParams::default();
+    let mut root_dn = rcgen::DistinguishedName::new();
+    root_dn.push(rcgen::DnType::CommonName, root_cn);
+    root_params.distinguished_name = root_dn;
+    root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let root_key = rcgen::KeyPair::generate().unwrap();
+    let root_cert = root_params.self_signed(&root_key).unwrap();
+    let root_der = root_cert.der().to_vec();
+    let root_issuer = rcgen::Issuer::new(root_params, root_key);
+
+    let mut intermediate_params = rcgen::CertificateParams::default();
+    let mut intermediate_dn = rcgen::DistinguishedName::new();
+    intermediate_dn.push(rcgen::DnType::CommonName, intermediate_cn);
+    intermediate_params.distinguished_name = intermediate_dn;
+    intermediate_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let intermediate_key = rcgen::KeyPair::generate().unwrap();
+    let intermediate_cert = intermediate_params
+        .signed_by(&intermediate_key, &root_issuer)
+        .unwrap();
+    let intermediate_der = intermediate_cert.der().to_vec();
+    let intermediate_issuer = rcgen::Issuer::new(intermediate_params, intermediate_key);
+
+    let mut client_params = rcgen::CertificateParams::default();
+    let mut client_dn = rcgen::DistinguishedName::new();
+    client_dn.push(rcgen::DnType::CommonName, client_cn);
+    client_params.distinguished_name = client_dn;
+    let client_key = rcgen::KeyPair::generate().unwrap();
+    let client_cert = client_params
+        .signed_by(&client_key, &intermediate_issuer)
+        .unwrap();
+
+    (root_der, intermediate_der, client_cert.der().to_vec())
+}
+
 fn cert_der_to_pem(cert_der: &[u8]) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(cert_der);
     let body = encoded
@@ -491,6 +532,32 @@ async fn test_mtls_auth_allowed_issuers_cn_match() {
     let result = plugin.authenticate(&mut ctx, &index).await;
     assert_continue(result);
     assert!(ctx.identified_consumer.is_some());
+}
+
+#[tokio::test]
+async fn test_mtls_auth_allowed_root_accepts_intermediate_issued_client() {
+    let (root_der, intermediate_der, client_der) = create_intermediate_signed_cert(
+        "Corporate Root CA",
+        "Issuing Intermediate CA",
+        "client.example.com",
+    );
+    let plugin = MtlsAuth::new(&json!({
+        "cert_field": "subject_cn",
+        "allowed_issuers": [issuer_filter(&root_der, Some("Corporate Root CA"), None, None)]
+    }))
+    .unwrap();
+    let index = ConsumerIndex::new(&[create_mtls_consumer("c1", "alice", "client.example.com")]);
+
+    let mut valid_ctx = create_ctx_with_cert_and_chain(client_der.clone(), vec![intermediate_der]);
+    assert_continue(plugin.authenticate(&mut valid_ctx, &index).await);
+
+    let mut missing_intermediate_ctx = create_ctx_with_cert(client_der);
+    assert_reject(
+        plugin
+            .authenticate(&mut missing_intermediate_ctx, &index)
+            .await,
+        Some(403),
+    );
 }
 
 #[tokio::test]

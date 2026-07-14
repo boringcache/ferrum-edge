@@ -6541,8 +6541,9 @@ components:
             `cert_field`. For subject and SAN fields Ferrum selects the first
             matching value in certificate order; it does not try later values.
             DNS SAN values are compared using ASCII case-insensitive matching;
-            all other certificate fields are compared exactly. Identities must
-            therefore be unique across consumers under ASCII case folding.
+            all other certificate fields are compared exactly. Identities are
+            always exact-unique across consumers and, while an enabled san_dns
+            mTLS policy exists, must also be unique under ASCII case folding.
       description: >-
         mTLS auth credential for the `mtls_auth` plugin. Indexed for O(1)
         lookup by certificate identity.
@@ -11016,7 +11017,8 @@ components:
                 description: >-
                   Exactly one PEM-encoded CA certificate. Ferrum verifies the
                   leaf signature path to this pinned key; DN labels alone never
-                  authorize an issuer.
+                  authorize an issuer. UDP+DTLS exposes no intermediate chain,
+                  so its pin must be the immediate issuing CA.
           description: >-
             Per-proxy issuer pins. DN fields are descriptive filters (AND within
             an entry, OR across entries) and must match the pinned CA subject;
