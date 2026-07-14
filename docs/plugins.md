@@ -4271,7 +4271,7 @@ config:
 
 ### `ai_response_guard`
 
-Validates and filters LLM response content before it reaches the client. Complements `ai_prompt_shield` (which guards inputs) by providing output-side guardrails including PII detection in responses, keyword/phrase blocklists, and response format validation.
+Validates and filters HTTP LLM response content before it reaches the client. Complements `ai_prompt_shield` (which guards inputs) by providing output-side guardrails including PII detection in responses, keyword/phrase blocklists, and response format validation. Native gRPC is intentionally unsupported: protobuf messages require schema-aware frame/decompression handling, so the plugin is excluded instead of advertising inert enforcement.
 
 **Priority:** 4075
 
@@ -4282,9 +4282,9 @@ Validates and filters LLM response content before it reaches the client. Complem
 | `custom_pii_patterns` | Object[] | `[]` | Custom `{name, regex}` PII patterns |
 | `blocked_phrases` | String[] | `[]` | Case-insensitive literal phrases to block |
 | `blocked_patterns` | Object[] | `[]` | Custom `{name, regex}` content patterns to block |
-| `scan_fields` | String | `"content"` | `content` (LLM completion fields only) or `all` (entire body) |
+| `scan_fields` | String | `"content"` | `content` (supported completion and tool/function-call fields) or `all` (entire body) |
 | `redaction_placeholder` | String | `"[REDACTED:{type}]"` | Template for redacted text |
-| `max_scan_bytes` | Integer | `1048576` | Skip scanning if body exceeds this size |
+| `max_scan_bytes` | Integer | `1048576` | Maximum governed buffered body size; reject/redact and structural rules fail closed above it, while warn-only content rules record a bounded warning and pass through |
 | `require_json` | bool | `false` | Reject responses that are not valid JSON |
 | `required_fields` | String[] | `[]` | Required top-level JSON fields (rejects with 502 if missing) |
 | `max_completion_length` | Integer | `0` | Maximum completion text length in characters — Unicode scalar values, not UTF-8 bytes (0 = unlimited) |
@@ -4297,11 +4297,13 @@ Unknown built-in pattern names and built-in patterns that fail to compile are fa
 
 In `scan_fields: "all"` mode, the recursive redactor preserves only **top-level scalar** structural fields (`id`, `model`, `created`, `role`, `type`, `index`, `finish_reason`, `usage`, etc.) so timestamps and identifiers that look like dotted-quad IPs or other PII patterns are not corrupted. It always recurses into nested objects and arrays — including nested occurrences of those same key names — so PII cannot evade redaction by being nested under a structural key (e.g. `{"choices":[{"message":{"type":"<SSN>"}}]}` is still redacted). When the body has a recognized AI response shape (`choices`, `content`, or `candidates`), the structured redactor that only touches completion fields is preferred.
 
-The `redaction_placeholder` template is emitted literally: any `$`-sequences in it (or in a pattern/phrase name interpolated into `{type}`, such as a blocked phrase `cost $5`) are written verbatim and are never interpreted as regex capture-group references.
+The `redaction_placeholder` template is emitted literally: any `$`-sequences in it or in an operator-supplied custom pattern name are written verbatim and are never interpreted as regex capture-group references. Literal blocked phrases never become public identifiers: placeholders, reject bodies, metadata, and logs use bounded positional IDs such as `blocked_phrase:0`, never the configured phrase itself.
 
-**Streaming (SSE) limitation:** In `redact` mode over `text/event-stream`, redaction is applied per `data:` frame. PII that spans two or more consecutive frames (e.g. half of a credit-card number per chunk) is detected on the accumulated stream but cannot be redacted per-frame, so it passes through to the client and only a `warn` log is emitted. Use `action: reject` for a hard guarantee that frame-straddling PII is blocked. (Note that genuine streaming clients — `Accept: text/event-stream` or upstream-detected streaming — are not buffered, so this redaction path runs only for buffered SSE-framed responses.)
+**Streaming (SSE):** Genuine streaming clients — `Accept: text/event-stream` or requests marked streaming by an earlier AI plugin — are never re-buffered. For an already-buffered SSE-framed response, the guard parses complete SSE events (including legal multi-`data:` events), redacts the joined JSON event, and preserves LF/CRLF framing. If restricted content spans events or otherwise cannot be rewritten, enforcing redaction fails closed with 502 instead of forwarding content while claiming it was redacted. Malformed or non-UTF-8 buffered SSE also fails closed for reject/redact policies.
 
-**Multi-provider support:** Extracts completion text from OpenAI (`choices[].message.content`), Anthropic (`content[].text`), and Google Gemini (`candidates[].content.parts[].text`) response formats.
+**Multi-provider support:** Content mode covers OpenAI chat text strings and content-part arrays, tool/function names and arguments, legacy `choices[].text`/`function_call`, Responses API `output_text` and `output[].{content,arguments}`, Anthropic `content[].text`, and Google Gemini `candidates[].content.parts[].text`. The buffered SSE path reassembles the corresponding OpenAI chat/tool and Responses API deltas before detection.
+
+Unknown root fields and unknown keys inside custom pattern objects are rejected at construction. Enforcing actions also fail closed when a governed response is oversized, malformed, non-UTF-8, or not representable in content mode. `scan_fields: all` can inspect and redact arbitrary UTF-8 response text; `warn` remains explicitly non-enforcing and records a bounded warning for uninspectable content.
 
 **Metadata keys** (for observability):
 - `ai_response_guard_detected` — comma-separated list of detected pattern types (warn mode)
@@ -4392,7 +4394,7 @@ plugins:
     config: {}
 ```
 
-> **Note:** When `ai_federation` is active, it short-circuits the proxy via `RejectBinary`, so `ai_token_metrics`, `ai_response_guard`, and `ai_semantic_cache` do not fire on the response path. The federation plugin writes the same metadata keys directly. The `ai_rate_limiter` records token usage via `applies_after_proxy_on_reject` on the rejection path.
+> **Note:** `ai_federation` short-circuits normal backend dispatch via `RejectBinary`, but successful buffered synthetic bodies still run through response-body hooks: `ai_response_guard` inspects/transforms the normalized provider body, and `ai_semantic_cache` can participate through its synthetic hit re-serving/final-response behavior. `ai_token_metrics` is the deliberate exception and does not inspect federation's synthetic response; federation writes the same token metadata keys directly. Separately, `ai_rate_limiter` records federation token usage through `applies_after_proxy_on_reject` on the rejection path.
 
 > **Limitation — `on_unmetered_response: "reject"` does not apply to federated responses.** Because `ai_federation` delivers the provider response through the proxy's *rejection* pipeline (`RejectBinary` from `before_proxy`), `ai_rate_limiter` runs its reconciliation via `apply_after_proxy_hooks_to_rejection`, which intentionally ignores any `Reject` an after-proxy-on-reject hook returns (the gateway is already committed to emitting that response and only logs a warning). As a result, a federated 2xx response **missing token-usage metadata is always returned to the client even under `reject` mode** — the policy only takes effect for normally backend-proxied responses. `charge_estimate` and `warn` still behave correctly for federation (the reservation accounting is applied; only the *reject* outcome is swallowed). If you need fail-closed behavior for unmetered federated responses, enforce it upstream of federation (e.g. require usage reporting at the provider) rather than relying on `on_unmetered_response`. For federation, `ai_rate_limiter`'s `before_proxy` never runs (federation rejects at an earlier priority), so there is no pre-reservation either — federated requests are charged purely by post-response reconciliation of the metadata `ai_federation` writes.
 

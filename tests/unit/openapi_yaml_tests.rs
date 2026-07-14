@@ -1961,3 +1961,83 @@ fn oidc_relying_party_schema_matches_strict_runtime_surface() {
         32
     );
 }
+
+#[test]
+fn ai_response_guard_schema_matches_strict_runtime_constraints() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiResponseGuardConfig")
+        .expect("AiResponseGuardConfig component exists");
+
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["pii_patterns"]["items"]["enum"],
+        json!([
+            "ssn",
+            "credit_card",
+            "email",
+            "phone_us",
+            "api_key",
+            "aws_key",
+            "ip_address",
+            "iban"
+        ])
+    );
+    assert_eq!(schema["properties"]["max_scan_bytes"]["minimum"], 1);
+    assert_eq!(schema["properties"]["max_completion_length"]["minimum"], 0);
+    for pointer in [
+        "/properties/blocked_phrases/items/minLength",
+        "/properties/required_fields/items/minLength",
+        "/properties/custom_pii_patterns/items/properties/name/minLength",
+        "/properties/custom_pii_patterns/items/properties/regex/minLength",
+        "/properties/blocked_patterns/items/properties/name/minLength",
+        "/properties/blocked_patterns/items/properties/regex/minLength",
+    ] {
+        assert_eq!(
+            schema.pointer(pointer),
+            Some(&json!(1)),
+            "missing {pointer}"
+        );
+    }
+    assert_eq!(
+        schema["properties"]["custom_pii_patterns"]["items"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        schema["properties"]["blocked_patterns"]["items"]["additionalProperties"],
+        false
+    );
+
+    for valid in [
+        json!({"pii_patterns": ["email"], "max_scan_bytes": 1}),
+        json!({"require_json": true, "max_completion_length": 0}),
+        json!({"blocked_phrases": ["x"]}),
+        json!({"required_fields": ["x"]}),
+        json!({"custom_pii_patterns": [{"name": "x", "regex": "x"}]}),
+        json!({"blocked_patterns": [{"name": "x", "regex": "x"}]}),
+    ] {
+        assert_component_validity(&spec, "AiResponseGuardConfig", &valid, true);
+    }
+
+    for invalid in [
+        json!({"pii_patterns": ["not-real"]}),
+        json!({"pii_patterns": ["email"], "max_scan_bytes": 0}),
+        json!({"require_json": true, "max_completion_length": -1}),
+        json!({"blocked_phrases": [""]}),
+        json!({"required_fields": [""]}),
+        json!({"custom_pii_patterns": [{"name": "", "regex": "x"}]}),
+        json!({"custom_pii_patterns": [{"name": "x", "regex": ""}]}),
+        json!({"blocked_patterns": [{"name": "", "regex": "x"}]}),
+        json!({"blocked_patterns": [{"name": "x", "regex": ""}]}),
+        json!({"require_json": true, "pii_pattern": ["email"]}),
+        json!({
+            "custom_pii_patterns": [{"name": "x", "regex": "x", "enabled": true}]
+        }),
+        json!({
+            "blocked_patterns": [{"name": "x", "regex": "x", "enabled": true}]
+        }),
+    ] {
+        assert_component_validity(&spec, "AiResponseGuardConfig", &invalid, false);
+    }
+}

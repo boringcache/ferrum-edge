@@ -1,6 +1,6 @@
 //! AI Response Guard Plugin
 //!
-//! Validates and filters LLM response content before it reaches the client.
+//! Validates and filters HTTP LLM response content before it reaches the client.
 //! Complements `ai_prompt_shield` (which guards inputs) by providing output-side
 //! guardrails including PII detection in responses, keyword/phrase blocklists,
 //! and response format validation.
@@ -9,7 +9,8 @@
 //! IPv4 addresses, and IBAN (shared with ai_prompt_shield).
 //!
 //! Actions: reject (return error to client), redact (replace matches with placeholders),
-//! or warn (add metadata/headers but pass through).
+//! or warn (add metadata/headers but pass through). Native gRPC protobuf
+//! messages are intentionally outside this JSON/SSE/text plugin's scope.
 
 use async_trait::async_trait;
 use regex::{NoExpand, Regex, RegexSet};
@@ -20,7 +21,9 @@ use tracing::{debug, warn};
 
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::json_escape::escape_json_string;
-use super::utils::sse::{is_sse_request, parse_sse_data_frames};
+use super::utils::sse::{
+    SseReassembler, is_sse_request, parse_sse_data_frames, parse_sse_data_frames_checked,
+};
 use super::{Plugin, PluginResult, RequestContext};
 
 /// JSON object keys that are structural metadata (IDs, timestamps, model
@@ -46,6 +49,28 @@ const STRUCTURAL_KEYS: &[&str] = &[
     "total_tokens",
 ];
 
+const CONFIG_KEYS: &[&str] = &[
+    "action",
+    "pii_patterns",
+    "custom_pii_patterns",
+    "blocked_phrases",
+    "blocked_patterns",
+    "scan_fields",
+    "redaction_placeholder",
+    "max_scan_bytes",
+    "require_json",
+    "required_fields",
+    "max_completion_length",
+];
+
+const RESPONSE_VALIDATORS: &[&str] = &[
+    "etag",
+    "last-modified",
+    "content-digest",
+    "digest",
+    "content-md5",
+];
+
 /// Action to take when guarded content is detected in the response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GuardAction {
@@ -68,7 +93,7 @@ struct ContentPattern {
 /// How to scan the response body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScanMode {
-    /// Only scan LLM completion content fields (choices[].message.content, choices[].delta.content).
+    /// Only scan supported client-visible completion and tool-call fields.
     Content,
     /// Scan the entire response body as text.
     All,
@@ -112,6 +137,7 @@ impl AiResponseGuard {
         if !config.is_object() {
             return Err("ai_response_guard: config must be an object".to_string());
         }
+        reject_unknown_keys(config, CONFIG_KEYS, "config")?;
 
         let action = match optional_string(config, "action")?.unwrap_or("reject") {
             "reject" => GuardAction::Reject,
@@ -185,6 +211,11 @@ impl AiResponseGuard {
                         "ai_response_guard: 'custom_pii_patterns[{idx}]' must be an object"
                     ));
                 }
+                reject_unknown_keys(
+                    entry,
+                    &["name", "regex"],
+                    &format!("custom_pii_patterns[{idx}]"),
+                )?;
                 let name = required_non_empty_string(entry, "custom_pii_patterns", idx, "name")?;
                 let regex_str =
                     required_non_empty_string(entry, "custom_pii_patterns", idx, "regex")?;
@@ -222,7 +253,11 @@ impl AiResponseGuard {
                 let escaped = regex::escape(phrase_str);
                 match Regex::new(&format!("(?i){}", escaped)) {
                     Ok(regex) => {
-                        let name = format!("blocked_phrase:{}", phrase_str);
+                        // Never derive a public identifier from the literal: the
+                        // identifier appears in placeholders, metadata, logs,
+                        // and reject bodies. Position is stable within a config
+                        // and reveals no configured secret phrase.
+                        let name = format!("blocked_phrase:{i}");
                         let placeholder = redaction_template.replace("{type}", &name);
                         blocked_phrases.push(ContentPattern {
                             name,
@@ -248,6 +283,11 @@ impl AiResponseGuard {
                         "ai_response_guard: 'blocked_patterns[{idx}]' must be an object"
                     ));
                 }
+                reject_unknown_keys(
+                    entry,
+                    &["name", "regex"],
+                    &format!("blocked_patterns[{idx}]"),
+                )?;
                 let name = required_non_empty_string(entry, "blocked_patterns", idx, "name")?;
                 let regex_str = required_non_empty_string(entry, "blocked_patterns", idx, "regex")?;
                 match Regex::new(regex_str) {
@@ -346,28 +386,39 @@ impl AiResponseGuard {
         }
     }
 
-    /// Extract completion text from LLM response JSON (OpenAI format).
+    /// Extract client-visible or executable completion text from supported AI
+    /// response families.
     fn extract_completion_texts<'a>(&self, json: &'a Value) -> Vec<&'a str> {
         let mut texts = Vec::new();
 
-        // OpenAI / compatible: choices[].message.content
+        // OpenAI chat/completions, including multimodal content parts and tool
+        // calls. Buffered delta-shaped payloads use the same selectors.
         if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
             for choice in choices {
-                if let Some(content) = choice
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_str())
+                collect_string_value(choice.get("text"), &mut texts);
+                for container in [choice.get("message"), choice.get("delta")]
+                    .into_iter()
+                    .flatten()
                 {
-                    texts.push(content);
+                    collect_content_value(container.get("content"), &mut texts);
+                    collect_function_value(container.get("function_call"), &mut texts);
+                    if let Some(tool_calls) = container.get("tool_calls").and_then(Value::as_array)
+                    {
+                        for tool_call in tool_calls {
+                            collect_function_value(tool_call.get("function"), &mut texts);
+                        }
+                    }
                 }
-                // Streaming delta
-                if let Some(content) = choice
-                    .get("delta")
-                    .and_then(|d| d.get("content"))
-                    .and_then(|c| c.as_str())
-                {
-                    texts.push(content);
-                }
+            }
+        }
+
+        // OpenAI Responses API buffered output.
+        collect_string_value(json.get("output_text"), &mut texts);
+        if let Some(output) = json.get("output").and_then(Value::as_array) {
+            for item in output {
+                collect_string_value(item.get("name"), &mut texts);
+                collect_string_value(item.get("arguments"), &mut texts);
+                collect_content_value(item.get("content"), &mut texts);
             }
         }
 
@@ -552,12 +603,12 @@ impl AiResponseGuard {
     /// The residual re-scan (`redact_leaves_residual`) runs the detection
     /// `RegexSet` over the body *after* redaction. Placeholders embed the
     /// pattern identity — e.g. the default template makes a blocked phrase
-    /// `cost $5` render as `[REDACTED:blocked_phrase:cost $5]`, and PII/custom
-    /// names render as `[REDACTED:pii:ssn]` / `[REDACTED:<custom name>]`. Those
-    /// marker strings would otherwise re-match the very pattern that produced
-    /// them (the literal phrase is echoed inside the marker, and a custom name
-    /// can coincide with its own regex), making a fully-redactable body look
-    /// like it still carries residual content and forcing a false 502.
+    /// render as `[REDACTED:blocked_phrase:0]`, and PII/custom names render as
+    /// `[REDACTED:pii:ssn]` / `[REDACTED:<custom name>]`. Those
+    /// marker strings can themselves match a configured expression (for
+    /// example, a custom name can coincide with its own regex), making a
+    /// fully-redactable body look like it still carries residual content and
+    /// forcing a false 502.
     /// Stripping the placeholders before the residual scan looks only at the
     /// bytes that will actually be delivered, not at text the redactor itself
     /// wrote. Placeholders are fixed strings rendered at construction, so this
@@ -597,9 +648,9 @@ impl AiResponseGuard {
     ///
     /// The residual scan also strips the redactor's own placeholder markers
     /// (`strip_known_placeholders`) before matching: a successfully redacted
-    /// phrase renders as e.g. `[REDACTED:blocked_phrase:cost $5]`, whose echoed
-    /// phrase text would otherwise re-match the same pattern and report a false
-    /// residual leak (turning a fully redacted body into a spurious 502).
+    /// custom pattern can render an identifier that matches its own regex. The
+    /// marker would otherwise report a false residual leak (turning a fully
+    /// redacted body into a spurious 502).
     fn redact_leaves_residual(&self, original: &Value) -> bool {
         if self.detection_pattern_count == 0 {
             return false;
@@ -672,6 +723,13 @@ impl AiResponseGuard {
             return true;
         };
         let frames = parse_sse_data_frames(&redacted);
+        if self.scan_mode == ScanMode::Content {
+            let accumulated = self.extract_sse_completion_texts(&frames);
+            return accumulated.iter().any(|text| {
+                self.detection_set
+                    .is_match(&self.strip_known_placeholders(text))
+            });
+        }
         let mut texts: Vec<Cow<'_, str>> = Vec::new();
         for frame in &frames {
             collect_decoded_json_strings(frame, &mut texts);
@@ -686,30 +744,84 @@ impl AiResponseGuard {
         self.detection_set.is_match(&cleaned_raw)
     }
 
-    /// Redact content in LLM response JSON.
-    fn redact_response_json(&self, json: &mut Value) {
-        // OpenAI / compatible: choices[].message.content
-        if let Some(choices) = json.get_mut("choices").and_then(|c| c.as_array_mut()) {
-            for choice in choices.iter_mut() {
-                if let Some(content) = choice
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_str())
-                {
-                    let redacted = self.redact_text(content);
-                    if redacted != content {
-                        choice["message"]["content"] = Value::String(redacted);
-                    }
+    fn redact_string_value(&self, value: &mut Value) {
+        let Some(text) = value.as_str() else {
+            return;
+        };
+        let redacted = self.redact_text(text);
+        if redacted != text {
+            *value = Value::String(redacted);
+        }
+    }
+
+    fn redact_content_value(&self, value: &mut Value) {
+        if value.is_string() {
+            self.redact_string_value(value);
+            return;
+        }
+        if let Some(parts) = value.as_array_mut() {
+            for part in parts {
+                if let Some(text) = part.get_mut("text") {
+                    self.redact_string_value(text);
                 }
-                if let Some(content) = choice
-                    .get("delta")
-                    .and_then(|d| d.get("content"))
-                    .and_then(|c| c.as_str())
-                {
-                    let redacted = self.redact_text(content);
-                    if redacted != content {
-                        choice["delta"]["content"] = Value::String(redacted);
-                    }
+            }
+        }
+    }
+
+    fn redact_function_value(&self, value: &mut Value) {
+        if let Some(name) = value.get_mut("name") {
+            self.redact_string_value(name);
+        }
+        if let Some(arguments) = value.get_mut("arguments") {
+            self.redact_string_value(arguments);
+        }
+    }
+
+    fn redact_message_like(&self, value: &mut Value) {
+        if let Some(content) = value.get_mut("content") {
+            self.redact_content_value(content);
+        }
+        if let Some(function_call) = value.get_mut("function_call") {
+            self.redact_function_value(function_call);
+        }
+        if let Some(tool_calls) = value.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            for tool_call in tool_calls {
+                if let Some(function) = tool_call.get_mut("function") {
+                    self.redact_function_value(function);
+                }
+            }
+        }
+    }
+
+    /// Redact content in supported AI response JSON shapes.
+    fn redact_response_json(&self, json: &mut Value) {
+        if let Some(choices) = json.get_mut("choices").and_then(Value::as_array_mut) {
+            for choice in choices {
+                if let Some(text) = choice.get_mut("text") {
+                    self.redact_string_value(text);
+                }
+                if let Some(message) = choice.get_mut("message") {
+                    self.redact_message_like(message);
+                }
+                if let Some(delta) = choice.get_mut("delta") {
+                    self.redact_message_like(delta);
+                }
+            }
+        }
+
+        if let Some(output_text) = json.get_mut("output_text") {
+            self.redact_string_value(output_text);
+        }
+        if let Some(output) = json.get_mut("output").and_then(Value::as_array_mut) {
+            for item in output {
+                if let Some(name) = item.get_mut("name") {
+                    self.redact_string_value(name);
+                }
+                if let Some(arguments) = item.get_mut("arguments") {
+                    self.redact_string_value(arguments);
+                }
+                if let Some(content) = item.get_mut("content") {
+                    self.redact_content_value(content);
                 }
             }
         }
@@ -729,19 +841,16 @@ impl AiResponseGuard {
         }
 
         // Google Gemini: candidates[].content.parts[].text
-        if let Some(candidates) = json.get_mut("candidates").and_then(|c| c.as_array_mut()) {
-            for candidate in candidates.iter_mut() {
+        if let Some(candidates) = json.get_mut("candidates").and_then(Value::as_array_mut) {
+            for candidate in candidates {
                 if let Some(parts) = candidate
                     .get_mut("content")
                     .and_then(|c| c.get_mut("parts"))
                     .and_then(|p| p.as_array_mut())
                 {
-                    for part in parts.iter_mut() {
-                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                            let redacted = self.redact_text(text);
-                            if redacted != text {
-                                part["text"] = Value::String(redacted);
-                            }
+                    for part in parts {
+                        if let Some(text) = part.get_mut("text") {
+                            self.redact_string_value(text);
                         }
                     }
                 }
@@ -793,6 +902,32 @@ impl AiResponseGuard {
         }
     }
 
+    fn respond_to_uninspectable(
+        &self,
+        ctx: &mut RequestContext,
+        reason: &'static str,
+        message: &'static str,
+    ) -> PluginResult {
+        let must_reject = self.require_json
+            || !self.required_fields.is_empty()
+            || self.action != GuardAction::Warn;
+        if must_reject {
+            Self::mark_rejected(ctx, reason);
+            PluginResult::Reject {
+                status_code: 502,
+                body: format!(
+                    r#"{{"error":"AI response guard could not safely inspect the response","reason":"{}"}}"#,
+                    escape_json_string(message)
+                ),
+                headers: HashMap::new(),
+            }
+        } else {
+            ctx.metadata
+                .insert("ai_response_guard_warning".to_string(), reason.to_string());
+            PluginResult::Continue
+        }
+    }
+
     /// Check max completion length constraint.
     ///
     /// `max_completion_length` is documented and configured in **characters**
@@ -826,20 +961,40 @@ impl AiResponseGuard {
     /// Returns one accumulated `String` per choice/block index, ordered by
     /// index (BTreeMap keeps output deterministic across runs).
     fn extract_sse_completion_texts(&self, frames: &[Value]) -> Vec<String> {
-        let mut texts: std::collections::BTreeMap<usize, String> =
+        let mut reassembler = SseReassembler::default();
+        let mut provider_texts: std::collections::BTreeMap<(u8, usize), String> =
             std::collections::BTreeMap::new();
 
         for frame in frames {
-            // OpenAI: choices[].delta.content
-            if let Some(choices) = frame.get("choices").and_then(|c| c.as_array()) {
-                for choice in choices {
-                    let index = choice.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                    if let Some(content) = choice
+            // Shared OpenAI chat/completions + Responses API reassembly covers
+            // prose, tool/function names and arguments, and Responses deltas.
+            reassembler.push_frame(frame);
+
+            // Legacy Chat Completions streamed `function_call` before the
+            // indexed `tool_calls` shape. Keep name and arguments in separate
+            // accumulators so neither field can hide a cross-frame match.
+            if let Some(choices) = frame.get("choices").and_then(Value::as_array) {
+                for (position, choice) in choices.iter().enumerate() {
+                    let index = choice
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .unwrap_or(position);
+                    if let Some(function_call) = choice
                         .get("delta")
-                        .and_then(|d| d.get("content"))
-                        .and_then(|c| c.as_str())
+                        .and_then(|delta| delta.get("function_call"))
                     {
-                        texts.entry(index).or_default().push_str(content);
+                        if let Some(name) = function_call.get("name").and_then(Value::as_str) {
+                            provider_texts.entry((2, index)).or_default().push_str(name);
+                        }
+                        if let Some(arguments) =
+                            function_call.get("arguments").and_then(Value::as_str)
+                        {
+                            provider_texts
+                                .entry((3, index))
+                                .or_default()
+                                .push_str(arguments);
+                        }
                     }
                 }
             }
@@ -852,7 +1007,7 @@ impl AiResponseGuard {
                     .and_then(|d| d.get("text"))
                     .and_then(|t| t.as_str())
                 {
-                    texts.entry(index).or_default().push_str(text);
+                    provider_texts.entry((0, index)).or_default().push_str(text);
                 }
             }
 
@@ -866,7 +1021,7 @@ impl AiResponseGuard {
                     {
                         for part in parts {
                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                texts.entry(idx).or_default().push_str(text);
+                                provider_texts.entry((1, idx)).or_default().push_str(text);
                             }
                         }
                     }
@@ -874,25 +1029,38 @@ impl AiResponseGuard {
             }
         }
 
-        texts.into_values().collect()
+        let mut texts: Vec<String> = reassembler
+            .into_texts()
+            .into_iter()
+            .map(|text| text.text)
+            .collect();
+        texts.extend(provider_texts.into_values());
+        texts
     }
 
-    /// Redact content fields in a single SSE frame (all three provider formats).
+    /// Redact content fields in a single parsed SSE frame.
     fn redact_sse_frame(&self, frame: &mut Value) {
-        // OpenAI: choices[].delta.content
-        if let Some(choices) = frame.get_mut("choices").and_then(|c| c.as_array_mut()) {
-            for choice in choices.iter_mut() {
-                if let Some(content) = choice
-                    .get("delta")
-                    .and_then(|d| d.get("content"))
-                    .and_then(|c| c.as_str())
-                {
-                    let redacted = self.redact_text(content);
-                    if redacted != content {
-                        choice["delta"]["content"] = Value::String(redacted);
-                    }
+        if let Some(choices) = frame.get_mut("choices").and_then(Value::as_array_mut) {
+            for choice in choices {
+                if let Some(text) = choice.get_mut("text") {
+                    self.redact_string_value(text);
+                }
+                if let Some(delta) = choice.get_mut("delta") {
+                    self.redact_message_like(delta);
                 }
             }
+        }
+
+        let is_responses_delta =
+            frame
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|event_type| {
+                    event_type.ends_with("output_text.delta")
+                        || event_type.ends_with("function_call_arguments.delta")
+                });
+        if is_responses_delta && let Some(delta) = frame.get_mut("delta") {
+            self.redact_string_value(delta);
         }
 
         // Anthropic streaming: content_block_delta
@@ -909,19 +1077,16 @@ impl AiResponseGuard {
         }
 
         // Gemini: candidates[].content.parts[].text
-        if let Some(candidates) = frame.get_mut("candidates").and_then(|c| c.as_array_mut()) {
-            for candidate in candidates.iter_mut() {
+        if let Some(candidates) = frame.get_mut("candidates").and_then(Value::as_array_mut) {
+            for candidate in candidates {
                 if let Some(parts) = candidate
                     .get_mut("content")
                     .and_then(|c| c.get_mut("parts"))
                     .and_then(|p| p.as_array_mut())
                 {
-                    for part in parts.iter_mut() {
-                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                            let redacted = self.redact_text(text);
-                            if redacted != text {
-                                part["text"] = Value::String(redacted);
-                            }
+                    for part in parts {
+                        if let Some(text) = part.get_mut("text") {
+                            self.redact_string_value(text);
                         }
                     }
                 }
@@ -929,7 +1094,64 @@ impl AiResponseGuard {
         }
     }
 
-    /// Redact an SSE response body, modifying individual `data:` frames while
+    fn redact_sse_event(&self, lines: &[&str]) -> Option<String> {
+        let mut data_lines = Vec::new();
+        let mut payloads = Vec::new();
+        for (idx, line) in lines.iter().enumerate() {
+            let content = line
+                .strip_suffix("\r\n")
+                .or_else(|| line.strip_suffix('\n'))
+                .unwrap_or(line);
+            if let Some(data) = content
+                .strip_prefix("data: ")
+                .or_else(|| content.strip_prefix("data:"))
+            {
+                data_lines.push(idx);
+                payloads.push(data);
+            }
+        }
+        if payloads.is_empty() {
+            return None;
+        }
+
+        let joined = payloads.join("\n");
+        let trimmed = joined.trim();
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            return None;
+        }
+        let mut json = serde_json::from_str::<Value>(trimmed).ok()?;
+        let original = json.clone();
+        if self.scan_mode == ScanMode::All {
+            redact_json_strings(&mut json, &self.pii_patterns, &self.blocked_phrases, true);
+        } else {
+            self.redact_sse_frame(&mut json);
+        }
+        if json == original {
+            return None;
+        }
+        let rewritten = serde_json::to_string(&json).ok()?;
+        let first_data_line = data_lines[0];
+        let mut output = String::new();
+        for (idx, line) in lines.iter().enumerate() {
+            if idx == first_data_line {
+                let ending = if line.ends_with("\r\n") {
+                    "\r\n"
+                } else if line.ends_with('\n') {
+                    "\n"
+                } else {
+                    ""
+                };
+                output.push_str("data: ");
+                output.push_str(&rewritten);
+                output.push_str(ending);
+            } else if data_lines.binary_search(&idx).is_err() {
+                output.push_str(line);
+            }
+        }
+        Some(output)
+    }
+
+    /// Redact an SSE response body, modifying complete SSE events while
     /// preserving the overall SSE framing. Returns `None` when no frame was
     /// modified (zero-copy happy path).
     ///
@@ -952,83 +1174,52 @@ impl AiResponseGuard {
                 .detect_matches_in_decoded_sse_frames(&frames, Some(body_str))
                 .is_empty()
         } else {
-            self.detection_set.is_match(body_str)
+            let frames = parse_sse_data_frames(body);
+            let accumulated = self.extract_sse_completion_texts(&frames);
+            let refs: Vec<&str> = accumulated.iter().map(String::as_str).collect();
+            !self.detect_matches(&refs).is_empty()
         };
         if !has_match {
             return None;
         }
 
-        let lines: Vec<&str> = body_str.split('\n').collect();
-        let mut output_lines: Vec<String> = Vec::with_capacity(lines.len());
+        let mut output = String::with_capacity(body_str.len());
+        let mut event_lines = Vec::new();
         let mut modified = false;
-
-        for line in &lines {
-            // Preserve the trailing CR (if any) so CRLF-encoded SSE streams
-            // round-trip losslessly when we rewrite a data line.
-            let (content, cr) = match line.strip_suffix('\r') {
-                Some(rest) => (rest, "\r"),
-                None => (*line, ""),
-            };
-
-            if let Some(data) = content
-                .strip_prefix("data: ")
-                .or_else(|| content.strip_prefix("data:"))
-            {
-                let trimmed = data.trim();
-                if !trimmed.is_empty()
-                    && trimmed != "[DONE]"
-                    && let Ok(mut json) = serde_json::from_str::<Value>(trimmed)
-                {
-                    if self.scan_mode == ScanMode::All {
-                        redact_json_strings(
-                            &mut json,
-                            &self.pii_patterns,
-                            &self.blocked_phrases,
-                            true,
-                        );
-                    } else {
-                        self.redact_sse_frame(&mut json);
-                    }
-                    if let Ok(new_data) = serde_json::to_string(&json) {
-                        if new_data != trimmed {
-                            modified = true;
-                        }
-                        output_lines.push(format!("data: {}{}", new_data, cr));
-                        continue;
+        for line in body_str.split_inclusive('\n') {
+            event_lines.push(line);
+            let content = line
+                .strip_suffix("\r\n")
+                .or_else(|| line.strip_suffix('\n'))
+                .unwrap_or(line);
+            if content.is_empty() {
+                if let Some(rewritten) = self.redact_sse_event(&event_lines) {
+                    output.push_str(&rewritten);
+                    modified = true;
+                } else {
+                    for original in &event_lines {
+                        output.push_str(original);
                     }
                 }
+                event_lines.clear();
             }
-            output_lines.push((*line).to_string());
+        }
+        if !event_lines.is_empty() {
+            if let Some(rewritten) = self.redact_sse_event(&event_lines) {
+                output.push_str(&rewritten);
+                modified = true;
+            } else {
+                for original in &event_lines {
+                    output.push_str(original);
+                }
+            }
         }
 
         if modified {
-            return Some(output_lines.join("\n").into_bytes());
+            Some(output.into_bytes())
+        } else {
+            None
         }
-
-        // Detection said something matched but per-frame redaction touched
-        // nothing. In structured-scan mode that almost always means a PII
-        // pattern straddles two SSE frames (e.g. half an SSN per chunk):
-        // accumulated detection in `on_response_body` will flag it, but
-        // single-frame redaction can't reach it. Surface this explicitly so
-        // operators know to switch to action="reject" when they need a hard
-        // guarantee. Scan-all mode walks the full JSON tree per frame, so a
-        // no-op there usually means the regex only hit a top-level scalar
-        // STRUCTURAL_KEYS field (id/timestamp/etc.) that is intentionally
-        // preserved — we don't warn for that.
-        if self.scan_mode != ScanMode::All {
-            let frames = parse_sse_data_frames(body);
-            let accumulated = self.extract_sse_completion_texts(&frames);
-            let refs: Vec<&str> = accumulated.iter().map(|s| s.as_str()).collect();
-            if !self.detect_matches(&refs).is_empty() {
-                warn!(
-                    "ai_response_guard: SSE response matched detection on accumulated content \
-                     but no individual frame could be redacted (pattern likely spans frames). \
-                     Use action=\"reject\" for guaranteed prevention."
-                );
-            }
-        }
-
-        None
     }
 }
 
@@ -1043,7 +1234,10 @@ impl Plugin for AiResponseGuard {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_GRPC_PROTOCOLS
+        // Native gRPC bodies are length-prefixed protobuf frames and cannot be
+        // inspected by this JSON/SSE/text guard. Do not advertise inert gRPC
+        // enforcement or force gRPC responses through full-body buffering.
+        super::HTTP_ONLY_PROTOCOLS
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -1076,28 +1270,48 @@ impl Plugin for AiResponseGuard {
         let is_sse = is_event_stream_content_type(content_type);
         let is_json = is_json_content_type(content_type);
 
-        if !is_sse && !is_json {
-            return PluginResult::Continue;
-        }
-
-        if body.is_empty() || body.len() > self.max_scan_bytes {
-            if body.len() > self.max_scan_bytes {
-                debug!(
-                    "ai_response_guard: body size {} exceeds max_scan_bytes {}, skipping",
-                    body.len(),
-                    self.max_scan_bytes
+        if body.is_empty() {
+            if self.require_json || !self.required_fields.is_empty() {
+                return self.respond_to_uninspectable(
+                    ctx,
+                    "empty_response_body",
+                    "response body is empty",
                 );
             }
             return PluginResult::Continue;
         }
 
+        if body.len() > self.max_scan_bytes {
+            debug!(
+                body_size = body.len(),
+                max_scan_bytes = self.max_scan_bytes,
+                "ai_response_guard: rejecting or warning on oversized governed response"
+            );
+            return self.respond_to_uninspectable(
+                ctx,
+                "body_exceeds_max_scan_bytes",
+                "response body exceeds max_scan_bytes",
+            );
+        }
+
         // --- SSE path: parse frames, extract accumulated texts, detect ---
         if is_sse {
-            let frames = parse_sse_data_frames(body);
-            // In scan-all mode the raw-body union pass (and the `[done]`-only /
-            // unparseable-frame cases) still need to run even when no `data:`
-            // payload parsed as JSON, so only short-circuit on empty frames for
-            // the structured (`Content`) path.
+            if self.require_json || !self.required_fields.is_empty() {
+                return self.respond_to_uninspectable(
+                    ctx,
+                    "sse_cannot_satisfy_json_structure",
+                    "SSE is not a single JSON response",
+                );
+            }
+            let parsed = parse_sse_data_frames_checked(body);
+            if !parsed.fully_parsed {
+                return self.respond_to_uninspectable(
+                    ctx,
+                    "uninspectable_sse",
+                    "SSE contains malformed, non-JSON, or non-UTF-8 data",
+                );
+            }
+            let frames = parsed.frames;
             if frames.is_empty() && self.scan_mode != ScanMode::All {
                 return PluginResult::Continue;
             }
@@ -1109,7 +1323,7 @@ impl Plugin for AiResponseGuard {
                 let refs: Vec<&str> = accumulated.iter().map(|s| s.as_str()).collect();
                 if let Some(reason) = self.check_completion_length(&refs) {
                     match self.action {
-                        GuardAction::Reject => {
+                        GuardAction::Reject | GuardAction::Redact => {
                             Self::mark_rejected(ctx, reason.clone());
                             return PluginResult::Reject {
                                 status_code: 502,
@@ -1120,7 +1334,7 @@ impl Plugin for AiResponseGuard {
                                 headers: HashMap::new(),
                             };
                         }
-                        GuardAction::Warn | GuardAction::Redact => {
+                        GuardAction::Warn => {
                             ctx.metadata
                                 .insert("ai_response_guard_warning".to_string(), reason);
                         }
@@ -1139,19 +1353,9 @@ impl Plugin for AiResponseGuard {
                 return PluginResult::Continue;
             }
 
-            // Scan-all redact mode can detect SSE content the per-frame redactor
-            // cannot rewrite (plaintext/malformed `data:` frames, cross-frame or
-            // structural-scalar matches surfaced by the raw-body union). The
-            // transform (`redact_sse_body`) would return `None` for those, so
-            // forwarding the body while reporting it `redacted` leaks PII. Fail
-            // closed (reject) when redaction would leave residual content, exactly
-            // as the JSON path does below.
-            if self.action == GuardAction::Redact
-                && self.scan_mode == ScanMode::All
-                && self.redact_sse_leaves_residual(body)
-            {
+            if self.action == GuardAction::Redact && self.redact_sse_leaves_residual(body) {
                 debug!(
-                    "ai_response_guard: scan-all redact leaves residual SSE content (types: {:?}), rejecting response",
+                    "ai_response_guard: redact leaves residual SSE content (types: {:?}), rejecting response",
                     detected
                 );
                 let types_json: Vec<String> = detected
@@ -1172,21 +1376,62 @@ impl Plugin for AiResponseGuard {
             return self.respond_to_detection(ctx, &detected);
         }
 
+        // Scan-all can safely inspect arbitrary UTF-8 representations as raw
+        // text. Structured content mode has no completion mapping for them, so
+        // enforcing actions fail closed instead of silently passing through.
+        if !is_json && !self.require_json && self.required_fields.is_empty() {
+            if self.scan_mode == ScanMode::All {
+                let Ok(text) = std::str::from_utf8(body) else {
+                    return self.respond_to_uninspectable(
+                        ctx,
+                        "non_utf8_response",
+                        "response body is not valid UTF-8",
+                    );
+                };
+                if let Some(reason) = self.check_completion_length(&[text]) {
+                    match self.action {
+                        GuardAction::Reject | GuardAction::Redact => {
+                            Self::mark_rejected(ctx, reason.clone());
+                            return PluginResult::Reject {
+                                status_code: 502,
+                                body: format!(
+                                    r#"{{"error":"AI response guard: {}"}}"#,
+                                    escape_json_string(&reason)
+                                ),
+                                headers: HashMap::new(),
+                            };
+                        }
+                        GuardAction::Warn => {
+                            ctx.metadata
+                                .insert("ai_response_guard_warning".to_string(), reason);
+                        }
+                    }
+                }
+                let detected = self.detect_matches(&[text]);
+                return if detected.is_empty() {
+                    PluginResult::Continue
+                } else {
+                    self.respond_to_detection(ctx, &detected)
+                };
+            }
+            return self.respond_to_uninspectable(
+                ctx,
+                "unsupported_response_content_type",
+                "response content type is not inspectable in content mode",
+            );
+        }
+
         // --- JSON path ---
 
         // Parse JSON
         let json: Value = match serde_json::from_slice(body) {
             Ok(v) => v,
             Err(_) => {
-                if self.require_json {
-                    Self::mark_rejected(ctx, "invalid_json");
-                    return PluginResult::Reject {
-                        status_code: 502,
-                        body: r#"{"error":"AI response is not valid JSON"}"#.to_string(),
-                        headers: HashMap::new(),
-                    };
-                }
-                return PluginResult::Continue;
+                return self.respond_to_uninspectable(
+                    ctx,
+                    "invalid_json",
+                    "response body is not valid JSON",
+                );
             }
         };
 
@@ -1217,7 +1462,7 @@ impl Plugin for AiResponseGuard {
             && let Some(reason) = self.check_completion_length(&texts)
         {
             match self.action {
-                GuardAction::Reject => {
+                GuardAction::Reject | GuardAction::Redact => {
                     Self::mark_rejected(ctx, reason.clone());
                     return PluginResult::Reject {
                         status_code: 502,
@@ -1228,7 +1473,7 @@ impl Plugin for AiResponseGuard {
                         headers: HashMap::new(),
                     };
                 }
-                GuardAction::Warn | GuardAction::Redact => {
+                GuardAction::Warn => {
                     ctx.metadata
                         .insert("ai_response_guard_warning".to_string(), reason);
                 }
@@ -1297,7 +1542,12 @@ impl Plugin for AiResponseGuard {
                 return self.redact_sse_body(body);
             }
             if !is_json_content_type(ct) {
-                return None;
+                if self.scan_mode != ScanMode::All {
+                    return None;
+                }
+                let text = std::str::from_utf8(body).ok()?;
+                let redacted = self.redact_text(text);
+                return (redacted != text).then(|| redacted.into_bytes());
             }
         }
 
@@ -1305,7 +1555,15 @@ impl Plugin for AiResponseGuard {
             return None;
         }
 
-        let mut json: Value = serde_json::from_slice(body).ok()?;
+        let mut json: Value = match serde_json::from_slice(body) {
+            Ok(json) => json,
+            Err(_) if self.scan_mode == ScanMode::All => {
+                let text = std::str::from_utf8(body).ok()?;
+                let redacted = self.redact_text(text);
+                return (redacted != text).then(|| redacted.into_bytes());
+            }
+            Err(_) => return None,
+        };
 
         if self.scan_mode == ScanMode::All {
             if self
@@ -1329,6 +1587,20 @@ impl Plugin for AiResponseGuard {
         }
 
         serde_json::to_vec(&json).ok()
+    }
+
+    fn on_response_body_transformed(
+        &self,
+        _ctx: &mut RequestContext,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        // These values describe the upstream representation and become stale
+        // whenever redaction changes the client-visible bytes. The proxy calls
+        // this hook only after a transform returns `Some`, so clean bodies keep
+        // their validators.
+        for header in RESPONSE_VALIDATORS {
+            response_headers.remove(*header);
+        }
     }
 }
 
@@ -1374,6 +1646,45 @@ fn collect_decoded_json_strings<'a>(value: &'a Value, texts: &mut Vec<Cow<'a, st
         // Bool / Null carry no PII; deliberately dropped.
         _ => {}
     }
+}
+
+fn collect_string_value<'a>(value: Option<&'a Value>, texts: &mut Vec<&'a str>) {
+    if let Some(text) = value.and_then(Value::as_str) {
+        texts.push(text);
+    }
+}
+
+fn collect_content_value<'a>(value: Option<&'a Value>, texts: &mut Vec<&'a str>) {
+    let Some(value) = value else {
+        return;
+    };
+    if let Some(text) = value.as_str() {
+        texts.push(text);
+        return;
+    }
+    if let Some(parts) = value.as_array() {
+        for part in parts {
+            collect_string_value(part.get("text"), texts);
+        }
+    }
+}
+
+fn collect_function_value<'a>(value: Option<&'a Value>, texts: &mut Vec<&'a str>) {
+    let Some(value) = value else {
+        return;
+    };
+    collect_string_value(value.get("name"), texts);
+    collect_string_value(value.get("arguments"), texts);
+}
+
+fn reject_unknown_keys(value: &Value, allowed: &[&str], path: &str) -> Result<(), String> {
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!("ai_response_guard: unknown field '{path}.{key}'"));
+    }
+    Ok(())
 }
 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
