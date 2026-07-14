@@ -531,6 +531,74 @@ fn access_control_schema_matches_runtime_validation() {
 }
 
 #[test]
+fn ai_prompt_shield_schema_matches_runtime_validation() {
+    use ferrum_edge::plugins::ai_prompt_shield::AiPromptShield;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let pattern_schema = spec
+        .pointer("/components/schemas/AiPromptShieldConfig/properties/patterns")
+        .expect("missing ai_prompt_shield patterns schema");
+    let enum_names: BTreeSet<&str> = pattern_schema["items"]["enum"]
+        .as_array()
+        .expect("patterns.items.enum must be an array")
+        .iter()
+        .map(|value| value.as_str().expect("built-in enum names must be strings"))
+        .collect();
+    let expected_names: BTreeSet<&str> = [
+        "ssn",
+        "credit_card",
+        "email",
+        "phone_us",
+        "api_key",
+        "aws_key",
+        "ip_address",
+        "iban",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(enum_names, expected_names);
+    let description = pattern_schema["description"]
+        .as_str()
+        .expect("patterns description must list built-ins");
+    for name in &expected_names {
+        assert!(
+            description.contains(name),
+            "patterns description omits built-in {name}"
+        );
+    }
+
+    for config in [
+        json!({}),
+        json!({"patterns": ["email"], "max_scan_bytes": 1}),
+        json!({
+            "patterns": [],
+            "custom_patterns": [{"name": "account", "regex": "ACCT-[0-9]+"}]
+        }),
+    ] {
+        assert_component_validity(&spec, "AiPromptShieldConfig", &config, true);
+        assert!(
+            AiPromptShield::new(&config).is_ok(),
+            "runtime should accept schema-valid config: {config}"
+        );
+    }
+
+    for config in [
+        json!({"patterns": ["not_a_builtin"]}),
+        json!({"patterns": [], "custom_patterns": []}),
+        json!({"patterns": []}),
+        json!({"max_scan_bytes": 0}),
+        json!({"patterns": ["email"], "scan_field": "all"}),
+    ] {
+        assert_component_validity(&spec, "AiPromptShieldConfig", &config, false);
+        assert!(
+            AiPromptShield::new(&config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
+        );
+    }
+}
+
+#[test]
 fn ai_tool_governor_schema_matches_runtime_invariants() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
