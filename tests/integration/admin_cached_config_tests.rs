@@ -3070,7 +3070,6 @@ async fn test_restore_hashes_consumer_secrets() {
                 "username": "hash_user",
                 "credentials": {
                     "basicauth": [{
-                        "username": "hash_user",
                         "password": "my_secret_password"
                     }]
                 }
