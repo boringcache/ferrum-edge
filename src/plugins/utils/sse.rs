@@ -461,6 +461,13 @@ impl SseReassembler {
         for (_key, text) in &mut self.responses_text {
             drain_one(text, &mut remaining);
         }
+
+        self.completion_text
+            .retain(|(_choice, text)| !text.is_empty());
+        self.completion_text_positions.clear();
+        for (position, (choice, _text)) in self.completion_text.iter().enumerate() {
+            self.completion_text_positions.insert(*choice, position);
+        }
     }
 
     /// Accumulate one already-parsed SSE `data:` frame.
@@ -916,6 +923,25 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
         }
         t.drain_assistant_prefix(100);
         assert!(t.texts().iter().any(|x| x.text == "exec"));
+    }
+
+    #[test]
+    fn drain_assistant_prefix_prunes_empty_legacy_completion_indexes() {
+        let mut reassembler = SseReassembler::new();
+        for index in 0..1024 {
+            reassembler.push_frame(&serde_json::json!({
+                "choices": [{"index": index, "text": "x"}]
+            }));
+            reassembler.drain_assistant_prefix(1);
+        }
+
+        assert!(reassembler.completion_text.is_empty());
+        assert!(reassembler.completion_text_positions.is_empty());
+
+        reassembler.push_frame(&serde_json::json!({
+            "choices": [{"index": 1024, "text": "tail"}]
+        }));
+        assert_eq!(reassembler.assistant_content(), "tail");
     }
 
     #[test]
