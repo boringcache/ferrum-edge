@@ -1455,10 +1455,10 @@ impl Plugin for AiPromptShield {
         }
 
         // Only transform JSON
-        if let Some(ct) = content_type {
-            if !is_json_content_type(ct) || is_framed_grpc_content_type(ct) {
-                return None;
-            }
+        if let Some(ct) = content_type
+            && (!is_json_content_type(ct) || is_framed_grpc_content_type(ct))
+        {
+            return None;
         }
 
         if has_non_identity_content_encoding(request_headers) {
