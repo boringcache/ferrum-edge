@@ -98,13 +98,17 @@ fn request_context(source: Option<&str>) -> RequestContext {
     ctx
 }
 
-fn ambient_udp_request_context(peer: &str, baggage: Option<&str>) -> RequestContext {
+fn hbone_relay_request_context(
+    peer: &str,
+    baggage: Option<&str>,
+    backend_host: &str,
+    backend_port: u16,
+) -> RequestContext {
     let mut ctx = request_context(Some(peer));
+    ctx.method = "CONNECT".to_string();
     ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
     ctx.metadata
         .insert("request_protocol".to_string(), "hbone".to_string());
-    ctx.metadata
-        .insert("hbone_datagram".to_string(), "udp".to_string());
     if let Some(baggage) = baggage {
         ctx.headers
             .insert("baggage".to_string(), baggage.to_string());
@@ -116,12 +120,27 @@ fn ambient_udp_request_context(peer: &str, baggage: Option<&str>) -> RequestCont
             "hosts": [],
             "listen_path": "/",
             "backend_scheme": "http",
-            "backend_host": "10.0.0.20",
-            "backend_port": 53
+            "backend_host": backend_host,
+            "backend_port": backend_port
         }))
         .expect("relay proxy"),
     ));
     ctx
+}
+
+fn ambient_udp_request_context(peer: &str, baggage: Option<&str>) -> RequestContext {
+    let mut ctx = hbone_relay_request_context(peer, baggage, "10.0.0.20", 53);
+    ctx.metadata
+        .insert("hbone_datagram".to_string(), "udp".to_string());
+    ctx
+}
+
+fn service_waypoint_byte_stream_request_context(
+    peer: &str,
+    baggage: Option<&str>,
+    backend_host: &str,
+) -> RequestContext {
+    hbone_relay_request_context(peer, baggage, backend_host, 8080)
 }
 
 fn ambient_udp_source_scoping_slice() -> MeshSlice {
@@ -859,12 +878,20 @@ fn ambient_udp_service_waypoint_slice(policies: Vec<MeshPolicy>) -> MeshSlice {
         services: vec![MeshService {
             name: "reviews".to_string(),
             namespace: "svc-ns".to_string(),
-            ports: vec![ServicePort {
-                port: 53,
-                protocol: AppProtocol::Udp,
-                name: Some("dns".to_string()),
-                target_port: None,
-            }],
+            ports: vec![
+                ServicePort {
+                    port: 53,
+                    protocol: AppProtocol::Udp,
+                    name: Some("dns".to_string()),
+                    target_port: None,
+                },
+                ServicePort {
+                    port: 8080,
+                    protocol: AppProtocol::Tcp,
+                    name: Some("tcp".to_string()),
+                    target_port: None,
+                },
+            ],
             workloads: vec![WorkloadRef {
                 spiffe_id: destination.spiffe_id,
             }],
@@ -907,6 +934,274 @@ fn principal_scoped_policy(
             action,
         }],
     }
+}
+
+/// Byte-stream HBONE must use the same exact ServiceWaypoint destination scope
+/// resolution as datagram HBONE. The waypoint namespace is deliberately
+/// different from the protected Service namespace so the construction-time
+/// retain drops this policy from the ordinary slice policy set.
+#[tokio::test]
+async fn mesh_authz_service_waypoint_byte_stream_resolves_destination_namespace_deny() {
+    let slice = ambient_udp_service_waypoint_slice(vec![policy_with_scope(
+        "dest-deny-all",
+        PolicyScope::Namespace {
+            namespace: "svc-ns".to_string(),
+        },
+        PolicyAction::Deny,
+    )]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = service_waypoint_byte_stream_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+        "10.0.2.30",
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "destination namespace DENY must block byte-stream HBONE, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("dest-deny-all")
+    );
+}
+
+/// An applicable destination ALLOW must admit only a matching source and raise
+/// the implicit-deny floor for every other authenticated peer. The successful
+/// decision also binds later route dispatch to the exact authorized backend.
+#[tokio::test]
+async fn mesh_authz_service_waypoint_byte_stream_enforces_destination_allow() {
+    let slice = ambient_udp_service_waypoint_slice(vec![principal_scoped_policy(
+        "dest-allow-client",
+        PolicyScope::Namespace {
+            namespace: "svc-ns".to_string(),
+        },
+        "spiffe://cluster.local/ns/client-ns/sa/client",
+        PolicyAction::Allow,
+    )]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+
+    let mut allowed = service_waypoint_byte_stream_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+        "10.0.2.30",
+    );
+    let allowed_result = plugin.authorize(&mut allowed).await;
+    assert!(
+        matches!(allowed_result, PluginResult::Continue),
+        "matching destination ALLOW should admit byte-stream HBONE, got {allowed_result:?}"
+    );
+    assert_eq!(
+        allowed
+            .metadata
+            .get("mesh_authz.node_waypoint_authorized_backend")
+            .map(String::as_str),
+        Some("10.0.2.30|8080"),
+        "route dispatch must remain bound to the authorized byte-stream destination"
+    );
+
+    let mut denied = service_waypoint_byte_stream_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some("source.principal=spiffe://cluster.local/ns/client-ns/sa/other"),
+        "10.0.2.30",
+    );
+    let denied_result = plugin.authorize(&mut denied).await;
+    assert!(
+        matches!(
+            denied_result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "non-matching source must hit destination ALLOW implicit-deny, got {denied_result:?}"
+    );
+    assert_eq!(
+        denied
+            .metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("implicit-deny")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_service_waypoint_byte_stream_uses_exact_destination_workload_scope() {
+    let destination_selector = WorkloadSelector {
+        labels: HashMap::from([("app".to_string(), "reviews".to_string())]),
+        namespace: Some("svc-ns".to_string()),
+    };
+    let mut slice = ambient_udp_service_waypoint_slice(vec![policy_with_scope(
+        "reviews-only-deny",
+        PolicyScope::WorkloadSelector {
+            selector: destination_selector,
+        },
+        PolicyAction::Deny,
+    )]);
+    let mut other_destination = slice.workloads[0].clone();
+    other_destination.spiffe_id =
+        SpiffeId::new("spiffe://cluster.local/ns/svc-ns/sa/ratings").expect("other spiffe");
+    other_destination.selector.labels = HashMap::from([("app".to_string(), "ratings".to_string())]);
+    other_destination.service_account = Some("ratings".to_string());
+    other_destination.addresses = vec!["10.0.2.31".to_string()];
+    other_destination.pod_uid = None;
+    slice.services[0].workloads.push(WorkloadRef {
+        spiffe_id: other_destination.spiffe_id.clone(),
+    });
+    slice.workloads.push(other_destination);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+
+    let mut reviews = service_waypoint_byte_stream_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+        "10.0.2.30",
+    );
+    let reviews_result = plugin.authorize(&mut reviews).await;
+    assert!(
+        matches!(
+            reviews_result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "selector DENY must apply to the selected reviews workload, got {reviews_result:?}"
+    );
+
+    let mut ratings = service_waypoint_byte_stream_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+        "10.0.2.31",
+    );
+    let ratings_result = plugin.authorize(&mut ratings).await;
+    assert!(
+        matches!(ratings_result, PluginResult::Continue),
+        "selector DENY for a sibling workload must not affect ratings, got {ratings_result:?}"
+    );
+    assert_eq!(
+        ratings
+            .metadata
+            .get("mesh_authz.node_waypoint_authorized_backend")
+            .map(String::as_str),
+        Some("10.0.2.31|8080")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_service_waypoint_byte_stream_missing_destination_scope_fails_closed() {
+    let slice = ambient_udp_service_waypoint_slice(vec![policy_with_scope(
+        "mesh-allow",
+        PolicyScope::MeshWide,
+        PolicyAction::Allow,
+    )]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = service_waypoint_byte_stream_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+        "10.0.2.99",
+    );
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.destination_scope_missing")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("destination_scope_missing")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_service_waypoint_byte_stream_materializes_destination_condition_inputs() {
+    let mut conditional_deny = policy_with_scope(
+        "blocked-team-deny",
+        PolicyScope::Namespace {
+            namespace: "svc-ns".to_string(),
+        },
+        PolicyAction::Deny,
+    );
+    conditional_deny.rules[0].when.push(ConditionMatch {
+        key: "request.headers[x-team]".to_string(),
+        values: vec!["blocked".to_string()],
+        not_values: Vec::new(),
+    });
+    conditional_deny.rules[0].to.push(RequestMatch {
+        headers: HashMap::from([("x-route".to_string(), "blocked".to_string())]),
+        ..RequestMatch::default()
+    });
+    let slice = ambient_udp_service_waypoint_slice(vec![conditional_deny]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "ambient_udp_source_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut ctx = service_waypoint_byte_stream_request_context(
+        "spiffe://cluster.local/ns/ferrum-system/sa/ztunnel",
+        Some(AMBIENT_UDP_CLIENT_BAGGAGE),
+        "10.0.2.30",
+    );
+    ctx.headers
+        .insert("x-team".to_string(), "blocked".to_string());
+    ctx.headers
+        .insert("x-route".to_string(), "blocked".to_string());
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "destination policy request and condition headers must be built from the relay superset, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh_authz.deny_policy")
+            .map(String::as_str),
+        Some("blocked-team-deny")
+    );
 }
 
 /// (a) A DESTINATION-namespace DENY-all must block a `udp` CONNECT even when the
