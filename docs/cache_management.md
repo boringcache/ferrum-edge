@@ -206,13 +206,13 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 ### LDAP Auth Cache
 
-**What it stores:** Successful LDAP bind results (username hash -> expiry timestamp) to avoid repeated LDAP round-trips.
+**What it stores:** Successful LDAP bind results (a process-random HMAC over the presented username/password -> canonical identity and expiry timestamp) to avoid repeated LDAP round-trips. The HMAC prevents a cache-only disclosure from exposing a reusable fast password verifier; a full process-memory compromise can still recover the in-process HMAC key.
 
-**Default limit:** 1,000 entries.
+**Default limit:** 10,000 entries. Caching is disabled by default.
 
-**Config field:** `cache_ttl_seconds` (default 300s, set to 0 to disable) and `max_cache_entries` (default 1,000).
+**Config field:** `cache_ttl_seconds` (default `0`, disabled; maximum `86,400` seconds / 24 hours) and `max_cache_entries` (default `10,000`).
 
-**Cleanup mechanism:** TTL-based expiration checked on lookup. When the cache reaches `max_cache_entries`, expired entries are purged. If still at capacity, the insert is skipped (the next request will re-authenticate against LDAP).
+**Cleanup mechanism:** TTL-based expiration is checked on lookup. Admission uses atomic entry accounting to preserve the hard cap during concurrent authentication. At capacity, one existing entry is replaced for each new admission; the request path never performs a full-cache scan.
 
 ### JWKS Cache
 
@@ -284,8 +284,8 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 | `request_deduplication` | `max_total_size_bytes` | `104857600` | Exact maximum retained local completed response-entry bytes |
 | `soap_ws_security` | `nonce_replay_protection.max_cache_size` | `10000` | Maximum tracked nonces |
 | `soap_ws_security` | `nonce_replay_protection.cache_ttl_seconds` | `300` | Nonce expiry TTL |
-| `ldap_auth` | `max_cache_entries` | `1000` | Maximum cached LDAP bind results |
-| `ldap_auth` | `cache_ttl_seconds` | `300` | LDAP cache entry TTL (`0` = disabled) |
+| `ldap_auth` | `max_cache_entries` | `10000` | Maximum cached LDAP bind results |
+| `ldap_auth` | `cache_ttl_seconds` | `0` | LDAP cache entry TTL (`0` = disabled; maximum `86400`) |
 | `jwks_auth` | `cache_ttl_seconds` | `3600` | JWKS key set refresh interval |
 | `api_chargeback` | `render_cache_ttl_seconds` | `60` | Rendered output cache TTL |
 | `prometheus_metrics` | `render_cache_ttl_seconds` | `60` | Rendered output cache TTL |

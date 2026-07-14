@@ -174,3 +174,26 @@ async fn test_empty_fetch_on_empty_store_stays_empty() {
     assert_eq!(count, 0);
     assert!(!store.has_keys());
 }
+
+#[tokio::test]
+async fn test_oversized_jwks_response_is_rejected_without_populating_store() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/jwks"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_bytes(vec![b' '; 1024 * 1024 + 1]),
+        )
+        .mount(&server)
+        .await;
+    let store = JwksKeyStore::new(
+        format!("{}/jwks", server.uri()),
+        PluginHttpClient::default(),
+    );
+
+    let error = store
+        .fetch_keys()
+        .await
+        .expect_err("oversized JWKS must be rejected");
+    assert!(error.contains("response rejected"));
+    assert!(!store.has_keys());
+}

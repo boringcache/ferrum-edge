@@ -18,10 +18,15 @@ use tracing::{debug, warn};
 use url::Url;
 
 use super::PluginHttpClient;
+use super::response_body::read_response_body_bounded;
 
 const EMPTY_STORE_RETRY_1: Duration = Duration::from_secs(5);
 const EMPTY_STORE_RETRY_2: Duration = Duration::from_secs(15);
 const EMPTY_STORE_RETRY_MAX: Duration = Duration::from_secs(30);
+const MAX_JWKS_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_JWKS_KEYS: usize = 256;
+const MAX_JWK_ID_BYTES: usize = 1024;
+const MAX_JWK_COMPONENT_BYTES: usize = 16 * 1024;
 
 fn redacted_jwks_uri(raw: &str) -> String {
     let Ok(mut url) = Url::parse(raw) else {
@@ -87,6 +92,31 @@ struct JwkKey {
     x: Option<String>,
     /// EC y coordinate (base64url-encoded).
     y: Option<String>,
+}
+
+fn validate_jwk_field_sizes(jwk: &JwkKey) -> Result<(), String> {
+    if jwk
+        .kid
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_JWK_ID_BYTES)
+    {
+        return Err("JWK kid exceeds the supported length".to_string());
+    }
+    for (name, value) in [
+        ("kty", Some(jwk.kty.as_str())),
+        ("alg", jwk.alg.as_deref()),
+        ("use", jwk.key_use.as_deref()),
+        ("n", jwk.n.as_deref()),
+        ("e", jwk.e.as_deref()),
+        ("crv", jwk.crv.as_deref()),
+        ("x", jwk.x.as_deref()),
+        ("y", jwk.y.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.len() > MAX_JWK_COMPONENT_BYTES) {
+            return Err(format!("JWK {name} exceeds the supported length"));
+        }
+    }
+    Ok(())
 }
 
 impl JwksKeyStore {
@@ -182,10 +212,11 @@ impl JwksKeyStore {
             return Err(format!("JWKS endpoint returned HTTP {}", response.status()));
         }
 
-        let jwks: JwksResponse = response
-            .json()
+        let body = read_response_body_bounded(response, MAX_JWKS_RESPONSE_BYTES)
             .await
-            .map_err(|e| format!("JWKS parse failed: {}", e))?;
+            .map_err(|e| format!("JWKS response rejected: {e}"))?;
+        let jwks: JwksResponse =
+            serde_json::from_slice(&body).map_err(|e| format!("JWKS parse failed: {e}"))?;
 
         let new_keys = Self::parse_jwks_response(&jwks)?;
 
@@ -220,6 +251,11 @@ impl JwksKeyStore {
 
     fn parse_jwks_response(jwks: &JwksResponse) -> Result<HashMap<String, CachedJwk>, String> {
         let total_keys = jwks.keys.len();
+        if total_keys > MAX_JWKS_KEYS {
+            return Err(format!(
+                "JWKS response contains {total_keys} keys, exceeding the limit of {MAX_JWKS_KEYS}"
+            ));
+        }
         let mut new_keys = HashMap::new();
 
         for (idx, jwk) in jwks.keys.iter().enumerate() {
@@ -231,9 +267,9 @@ impl JwksKeyStore {
             let kid = jwk
                 .kid
                 .clone()
-                .unwrap_or_else(|| format!("__unnamed_{}", idx));
+                .unwrap_or_else(|| format!("__unnamed_{idx}"));
 
-            match Self::parse_jwk(jwk) {
+            match validate_jwk_field_sizes(jwk).and_then(|()| Self::parse_jwk(jwk)) {
                 Ok(cached) => {
                     debug!("Cached JWKS key: kid={}, alg={:?}", kid, cached.algorithm);
                     new_keys.insert(kid, cached);
@@ -408,9 +444,11 @@ fn next_refresh_deadline(
 #[cfg(test)]
 mod tests {
     use super::{
-        EMPTY_STORE_RETRY_1, EMPTY_STORE_RETRY_2, EMPTY_STORE_RETRY_MAX,
-        empty_store_retry_interval, next_refresh_deadline, refresh_delay_after_attempt,
+        EMPTY_STORE_RETRY_1, EMPTY_STORE_RETRY_2, EMPTY_STORE_RETRY_MAX, JwksKeyStore,
+        JwksResponse, MAX_JWK_ID_BYTES, MAX_JWKS_KEYS, empty_store_retry_interval,
+        next_refresh_deadline, refresh_delay_after_attempt,
     };
+    use serde_json::json;
     use std::time::Duration;
     use tokio::time::Instant;
 
@@ -478,5 +516,36 @@ mod tests {
             next_refresh_deadline(started, completed, false, interval, 1),
             completed + EMPTY_STORE_RETRY_2
         );
+    }
+
+    #[test]
+    fn jwks_key_count_is_bounded() {
+        let keys = (0..=MAX_JWKS_KEYS)
+            .map(|idx| {
+                json!({
+                    "kty": "RSA",
+                    "kid": format!("key-{idx}"),
+                    "n": "AQAB",
+                    "e": "AQAB"
+                })
+            })
+            .collect::<Vec<_>>();
+        let response: JwksResponse =
+            serde_json::from_value(json!({"keys": keys})).expect("test JWKS parses");
+
+        assert!(JwksKeyStore::parse_jwks_response(&response).is_err());
+    }
+
+    #[test]
+    fn oversized_jwk_identifier_is_rejected() {
+        let response: JwksResponse = serde_json::from_value(json!({"keys": [{
+            "kty": "RSA",
+            "kid": "x".repeat(MAX_JWK_ID_BYTES + 1),
+            "n": "AQAB",
+            "e": "AQAB"
+        }]}))
+        .expect("test JWKS parses");
+
+        assert!(JwksKeyStore::parse_jwks_response(&response).is_err());
     }
 }

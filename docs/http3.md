@@ -143,6 +143,8 @@ Flow:
 
 Mirrors the H1/H2 proxy path's plugin-driven decision (see `ClientRequestBody::{Streaming, Buffered}` in `src/proxy/mod.rs`): stream the request body by default, buffer only when a plugin explicitly demands the body pre-`before_proxy` or when the caller pre-buffered it upstream.
 
+Every buffered upload drain — including bodies required before `authenticate` or `before_proxy` — is bounded by the proxy's `backend_read_timeout_ms`; `0` explicitly disables the deadline. Plain HTTP timeouts return `408`, while gRPC requests complete with trailers-only `DEADLINE_EXCEEDED`, matching the H1/H2 paths.
+
 **Plain flavor — request body streamed via an mpsc bridge.** `reqwest::Body::wrap_stream` requires a `'static + Send + Sync` stream, which cannot directly hold the `&mut RequestStream` borrow the H3 listener already has on the shared request stream. The bridge uses a bounded `tokio::sync::mpsc` channel:
 
 - One task (inlined via `tokio::join!`) reads `RequestStream::recv_data()` and pushes `Bytes` chunks into the `Sender`.

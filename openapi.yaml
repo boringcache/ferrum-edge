@@ -11146,14 +11146,17 @@ components:
 
     Oauth2IntrospectionConfig:
       type: object
-      description: "Plugin: oauth2_introspection — RFC 7662 bearer token introspection with multi-provider routing."
+      additionalProperties: false
+      description: "Plugin: oauth2_introspection — RFC 7662 bearer token introspection with bounded, explicit multi-provider routing."
       required: [providers]
       properties:
         providers:
           type: array
           minItems: 1
+          maxItems: 16
           items:
             type: object
+            additionalProperties: false
             properties:
               introspection_endpoint:
                 type: string
@@ -11168,7 +11171,8 @@ components:
                   OIDC discovery URL used to resolve introspection_endpoint. Must
                   use https when client_auth.method is credentialed and the host
                   is not loopback/localhost; http is only permitted for loopback
-                  hosts.
+                  hosts. The discovered endpoint must preserve the discovery
+                  URL's scheme, normalized host, and effective port.
               issuer:
                 type: string
                 description: Expected iss claim in active introspection responses
@@ -11179,6 +11183,7 @@ components:
                 description: Accepted aud claims; OR matched
               client_auth:
                 type: object
+                additionalProperties: false
                 properties:
                   method:
                     type: string
@@ -11212,6 +11217,7 @@ components:
                 type: array
                 items:
                   type: object
+                  additionalProperties: false
                   required: [name]
                   properties:
                     name:
@@ -11263,6 +11269,15 @@ components:
                 additionalProperties:
                   type: string
                 description: Claim path to upstream header mappings
+        allow_provider_fanout:
+          type: boolean
+          default: false
+          description: >-
+            Allow one Authorization bearer token to be submitted sequentially
+            to multiple providers. Enable only when every provider shares one
+            credential trust boundary. By default, multi-provider configs must
+            use distinct from_headers/from_params routing hints or have exactly
+            one provider that uses the Authorization location.
         scope_claim:
           type: string
           default: scope
@@ -11277,6 +11292,7 @@ components:
 
     OidcRelyingPartyConfig:
       type: object
+      additionalProperties: false
       description: "Plugin: oidc_relying_party — Browser OIDC relying party with authorization code + PKCE and encrypted sessions."
       required: [providers, session]
       properties:
@@ -11286,6 +11302,7 @@ components:
           maxItems: 1
           items:
             type: object
+            additionalProperties: false
             required: [issuer, client_id, redirect_uri]
             properties:
               issuer:
@@ -11304,10 +11321,14 @@ components:
                 type: string
               end_session_endpoint:
                 type: string
+              post_logout_redirect_uri:
+                type: string
+                description: Absolute HTTPS redirect URI sent to the provider after RP-initiated logout; HTTP is allowed only for localhost or literal loopback development endpoints.
               client_id:
                 type: string
               client_auth:
                 type: object
+                additionalProperties: false
                 properties:
                   method:
                     type: string
@@ -11366,9 +11387,10 @@ components:
               id_token_clock_skew_secs:
                 type: integer
                 format: uint64
-                default: 30
+                default: 60
         session:
           type: object
+          additionalProperties: false
           required: [encryption_secret]
           properties:
             encryption_secret:
@@ -11381,15 +11403,11 @@ components:
               description: Previous encryption secret accepted during rotation
             cookie_name:
               type: string
-              default: ferrum_session
+              description: Cookie name. When omitted, Ferrum derives a context-specific name from the provider and authorization policy.
             store:
               type: string
               enum: [cookie]
               default: cookie
-            redis_url:
-              type: string
-              deprecated: true
-              description: Reserved for future server-side sessions; redis store is rejected until implemented.
             ttl_secs:
               type: integer
               format: uint64
@@ -11419,11 +11437,26 @@ components:
               default: /
         behavior:
           type: object
+          additionalProperties: false
           properties:
             state_ttl_secs:
               type: integer
               format: uint64
               default: 600
+              minimum: 1
+              maximum: 3600
+            state_cache_max_entries:
+              type: integer
+              format: uint64
+              default: 10000
+              minimum: 1
+              description: Global maximum number of pending browser authorization flows for this plugin instance.
+            state_cache_max_entries_per_source:
+              type: integer
+              format: uint64
+              default: 32
+              minimum: 1
+              description: Maximum pending browser authorization flows per resolved client IP; must not exceed state_cache_max_entries.
             post_login_redirect_param:
               type: string
             trusted_redirect_hosts:
@@ -11507,6 +11540,7 @@ components:
 
     LdapAuthConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: ldap_auth — LDAP directory authentication with optional AD group
         filtering. Status codes distinguish failure classes: invalid credentials
@@ -11520,61 +11554,159 @@ components:
         directory permits anonymous reads of group objects, so a service account
         is recommended. TLS connections (`ldaps://`/STARTTLS) honor the gateway
         CRL (`FERRUM_TLS_CRL_FILE_PATH`), rejecting revoked server certificates.
+        Non-loopback plaintext `ldap://` is rejected unless the development-only
+        `allow_plaintext` override is explicitly enabled. Search-then-bind requires
+        a canonical identity attribute, rejects ambiguous searches, and exports the
+        selected entry's canonical value rather than the presented username.
       required:
         - ldap_url
+      allOf:
+        - anyOf:
+            - required: [bind_dn_template]
+            - required:
+                - search_base_dn
+                - search_filter
+                - canonical_identity_attribute
+                - service_account_dn
+                - service_account_password
+        - if:
+            required: [search_base_dn, search_filter]
+          then:
+            required: [service_account_dn, service_account_password]
+        - if:
+            required: [ldap_url]
+            properties:
+              ldap_url:
+                pattern: "^ldap://"
+          then:
+            anyOf:
+              - required: [starttls]
+                properties:
+                  starttls:
+                    const: true
+              - required: [allow_plaintext]
+                properties:
+                  allow_plaintext:
+                    const: true
+              - properties:
+                  ldap_url:
+                    pattern: '^ldap://(?:127(?:\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){3}|\[::1\]|(?:[^/?#@]+\.)?[lL][oO][cC][aA][lL][hH][oO][sS][tT]\.?)(?::[0-9]+)?(?:[/?#]|$)'
+        - if:
+            required: [required_groups]
+            properties:
+              required_groups:
+                minItems: 1
+          then:
+            required: [group_base_dn]
+            properties:
+              group_filter:
+                pattern: '\{(?:user_dn|username)\}'
+        - not:
+            required: [ldap_url, starttls]
+            properties:
+              ldap_url:
+                pattern: "^ldaps://"
+              starttls:
+                const: true
       properties:
         ldap_url:
           type: string
-          description: "LDAP server URL (ldap:// or ldaps://)"
-          example: "ldap://ldap.example.com:389"
+          minLength: 1
+          pattern: "^ldaps?://"
+          not:
+            pattern: "^ldaps?://[^/?#]*@"
+          description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. Embedded URL credentials are rejected."
+          example: "ldaps://ldap.example.com:636"
         bind_dn_template:
           type: string
+          minLength: 1
+          pattern: '\{username\}'
           description: "Direct bind DN template with {username} placeholder"
           example: "uid={username},ou=users,dc=example,dc=com"
         search_base_dn:
           type: string
+          minLength: 1
           description: "Base DN for search-then-bind user search"
         search_filter:
           type: string
+          minLength: 1
+          pattern: '\{username\}'
           description: "LDAP search filter with {username} placeholder"
           example: "(&(objectClass=user)(sAMAccountName={username}))"
+        canonical_identity_attribute:
+          type: string
+          minLength: 1
+          description: "Required for search-then-bind. Exactly one value from the uniquely selected entry becomes the authenticated identity and Consumer mapping key (for example uid or sAMAccountName). Attribute-name matching is LDAP case-insensitive."
         service_account_dn:
           type: string
+          minLength: 1
           description: "DN for the service account used in search-then-bind"
         service_account_password:
           type: string
+          minLength: 1
+          writeOnly: true
+          format: password
           description: "Password for the service account"
         group_base_dn:
           type: string
+          minLength: 1
           description: "Base DN for group membership search"
         group_filter:
           type: string
-          description: "Group search filter with {user_dn} and {username} placeholders"
+          minLength: 1
+          description: "Group search filter. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the presented login value; canonical_identity_attribute controls the exported Ferrum identity. Before authorization, every custom-filter match is rechecked against the exact returned group DN using member, uniqueMember, and memberUid so a static branch cannot fabricate membership."
         required_groups:
           type: array
           items:
             type: string
+            minLength: 1
           description: "LDAP/AD group names the user must belong to (OR logic)"
         group_attribute:
           type: string
+          minLength: 1
           default: "cn"
-          description: "Attribute containing the group name"
+          description: "Attribute containing the group name; returned LDAP attribute names are matched case-insensitively"
         starttls:
           type: boolean
           default: false
-          description: "Use STARTTLS to upgrade ldap:// connections"
+          description: "Use STARTTLS to upgrade ldap:// connections; invalid with ldaps://"
+        allow_plaintext:
+          type: boolean
+          default: false
+          description: "Development-only override allowing a non-loopback ldap:// endpoint without STARTTLS. Service-account and user passwords then have no transport confidentiality."
         connect_timeout_seconds:
           type: integer
+          format: uint64
           default: 5
-          description: "LDAP connection and operation timeout in seconds"
+          minimum: 1
+          maximum: 300
+          description: "Per-connection and per-operation timeout in seconds; also applied as the server-side LDAP search time limit"
+        request_timeout_seconds:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 300
+          description: "Strict wall-clock deadline in seconds for the complete uncached authentication and group-check flow. The effective default is 15 seconds, raised to connect_timeout_seconds when that value is larger."
+        max_concurrent_requests:
+          type: integer
+          format: uint64
+          default: 64
+          minimum: 1
+          maximum: 1024
+          description: "Maximum concurrent uncached LDAP authentication flows per plugin instance; excess requests fail immediately"
         cache_ttl_seconds:
           type: integer
+          format: uint64
           default: 0
-          description: "Cache TTL for successful auth results (0 = disabled)"
+          minimum: 0
+          maximum: 86400
+          description: "Cache TTL for successful auth results (0 = disabled, maximum 24 hours)"
         max_cache_entries:
           type: integer
+          format: uint64
           default: 10000
-          description: "Maximum entries in the auth result cache. Prevents unbounded growth from brute-force attempts with unique credentials"
+          minimum: 1
+          description: "Strict maximum entries in the auth result cache. At capacity, one existing entry is replaced without a full-cache scan."
         consumer_mapping:
           type: boolean
           default: true
@@ -15545,6 +15677,7 @@ components:
 
     AiRequestGuardConfig:
       type: object
+      additionalProperties: false
       description: "Plugin: ai_request_guard — Validates and constrains AI/LLM API requests."
       anyOf:
         - required: [max_tokens_limit]
@@ -15587,7 +15720,7 @@ components:
           description: Reject (400 error) or clamp (silently cap) max_tokens
         default_max_tokens:
           type: integer
-          description: Inject a default output-token limit if no supported token field is present; top-level-shaped bodies keep a family-correct top-level fallback (max_output_tokens for Responses, else max_tokens) so a spoofed provider marker or stray cross-provider alias cannot uncap them, while unambiguously provider-native bodies receive only their native cap
+          description: Inject a default output-token limit if no supported token field is present; top-level-shaped bodies keep a family-correct top-level fallback (max_output_tokens for Responses, else max_tokens) so a spoofed provider marker or stray cross-provider alias cannot uncap them, while unambiguously provider-native bodies receive only their native cap (including TGI parameters.max_new_tokens)
         supported_schema:
           type: string
           enum: [chat_completions, responses, provider_native, auto]
@@ -15622,7 +15755,7 @@ components:
           description: Maximum message entries across messages, Responses input, Gemini contents, and Cohere chat_history arrays
         max_prompt_characters:
           type: integer
-          description: Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, tools, tool arguments, document/RAG fields, and Azure "On Your Data" data_sources[]/dataSources[].parameters.role_information/roleInformation
+          description: Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, tools, tool arguments, document/RAG fields (including Anthropic text document source.data), and Azure "On Your Data" data_sources[]/dataSources[].parameters.role_information/roleInformation
         temperature_range:
           type: array
           items:
@@ -15630,7 +15763,7 @@ components:
             format: double
           minItems: 2
           maxItems: 2
-          description: "Allowed [min, max] range for temperature"
+          description: "Allowed [min, max] range for top-level temperature plus Gemini generationConfig.temperature and Bedrock inferenceConfig.temperature; conflicting aliases are rejected"
         block_system_prompts:
           type: boolean
           default: false
