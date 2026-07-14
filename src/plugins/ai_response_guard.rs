@@ -644,13 +644,13 @@ impl AiResponseGuard {
     /// remains, so the caller can fail closed (reject) instead of forwarding the
     /// body while reporting it `redacted`.
     ///
-    /// The all-mode redactor (`redact_response_json` + `redact_json_strings`)
-    /// rewrites string values, but cannot rewrite PII carried in an object key,
-    /// a numeric scalar, a cross-token/contextual custom pattern, or a
-    /// duplicate-key value dropped from the parsed tree. Because all-mode
-    /// detection now unions a raw-body pass, those are detected — so without this
-    /// re-scan the plugin would emit a false "redacted" telemetry while still
-    /// delivering the PII.
+    /// The all-mode redactor rewrites JSON string values (with serialized
+    /// argument documents handled structurally), but cannot rewrite PII carried
+    /// in an object key, a numeric scalar, a cross-token/contextual custom
+    /// pattern, or a duplicate-key value dropped from the parsed tree. Because
+    /// all-mode detection now unions a raw-body pass, those are detected — so
+    /// without this re-scan the plugin would emit false "redacted" telemetry
+    /// while still delivering the PII.
     ///
     /// This mirrors `redact_json_strings`' structural carve-out: top-level
     /// structural scalar values (`model`, `id`, token counts, …) are deliberately
@@ -672,16 +672,7 @@ impl AiResponseGuard {
             return false;
         }
         let mut redacted = original.clone();
-        let known_texts = self.extract_completion_texts(&redacted);
-        if !known_texts.is_empty() {
-            self.redact_response_json(&mut redacted);
-        }
-        redact_json_strings(
-            &mut redacted,
-            &self.pii_patterns,
-            &self.blocked_phrases,
-            true,
-        );
+        self.redact_all_strings_with_argument_shield(&mut redacted);
 
         if let Value::Object(map) = &mut redacted {
             for (key, value) in map.iter_mut() {
@@ -819,19 +810,25 @@ impl AiResponseGuard {
         }
     }
 
-    /// Redact a tool/function `arguments` string. The raw string is redacted
-    /// first (literal matches); when the string is itself a JSON document, its
-    /// decoded string values are redacted too and the document re-serialized,
+    /// Redact a tool/function `arguments` string.
+    ///
+    /// When the string parses as JSON, only its decoded string values are
+    /// redacted and the document re-serialized,
     /// so JSON escapes such as `\u0040` cannot carry content past redaction.
     /// Re-serialization is semantically transparent to the tool client, which
-    /// parses the arguments as JSON. Decoded keys and numeric scalars are not
-    /// rewritable here; the residual re-scan fails closed on them.
+    /// parses the arguments as JSON. Matches carried in structurally
+    /// unrewritable positions — decoded object keys and numeric scalars — are
+    /// deliberately left in place for the residual re-scan to fail closed on;
+    /// raw string replacement over the serialized document would instead
+    /// rename keys or turn a numeric document into non-JSON placeholder text
+    /// and erase the evidence that re-scan needs. A non-JSON arguments string
+    /// is plain text and is redacted directly.
     fn redact_arguments_value(&self, value: &mut Value) {
-        self.redact_string_value(value);
         let Some(text) = value.as_str() else {
             return;
         };
         let Ok(mut decoded) = serde_json::from_str::<Value>(text) else {
+            self.redact_string_value(value);
             return;
         };
         let original = decoded.clone();
@@ -846,6 +843,39 @@ impl AiResponseGuard {
         {
             *value = Value::String(rewritten);
         }
+    }
+
+    /// `ScanMode::All` raw string redaction with tool/function argument
+    /// documents handled structurally.
+    ///
+    /// To the generic raw pass (`redact_json_strings`) a serialized argument
+    /// document is just another string value, so it would rewrite a match in
+    /// a decoded object key or numeric scalar into a renamed key or non-JSON
+    /// placeholder text — and erase the evidence the residual re-scan needs
+    /// to fail closed on. Argument strings therefore first get the decoded
+    /// value-safe redaction (`redact_arguments_value`) and are then shielded
+    /// from the raw pass; argument positions holding non-string values keep
+    /// today's raw pass behavior. Both visits see the same positions in the
+    /// same order because shielding substitutes `Value::Null` without changing
+    /// the surrounding structure.
+    fn redact_all_strings_with_argument_shield(&self, json: &mut Value) {
+        let mut shielded: Vec<Option<Value>> = Vec::new();
+        for_each_argument_value(json, &mut |value| {
+            self.redact_arguments_value(value);
+            let arguments = if value.is_string() {
+                Some(value.take())
+            } else {
+                None
+            };
+            shielded.push(arguments);
+        });
+        redact_json_strings(json, &self.pii_patterns, &self.blocked_phrases, true);
+        let mut restored = shielded.into_iter();
+        for_each_argument_value(json, &mut |value| {
+            if let Some(Some(arguments)) = restored.next() {
+                *value = arguments;
+            }
+        });
     }
 
     fn redact_message_like(&self, value: &mut Value) {
@@ -1172,17 +1202,24 @@ impl AiResponseGuard {
             }
         }
 
-        let is_responses_delta =
-            frame
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|event_type| {
+        let (is_responses_delta, is_responses_arguments_delta) = frame
+            .get("type")
+            .and_then(Value::as_str)
+            .map(|event_type| {
+                (
                     event_type.ends_with("output_text.delta")
                         || event_type.ends_with("function_call_arguments.delta")
-                        || event_type.ends_with("refusal.delta")
-                });
+                        || event_type.ends_with("refusal.delta"),
+                    event_type.ends_with("function_call_arguments.delta"),
+                )
+            })
+            .unwrap_or((false, false));
         if is_responses_delta && let Some(delta) = frame.get_mut("delta") {
-            self.redact_string_value(delta);
+            if is_responses_arguments_delta {
+                self.redact_arguments_value(delta);
+            } else {
+                self.redact_string_value(delta);
+            }
         }
 
         // Anthropic streaming: content_block_delta
@@ -1244,7 +1281,7 @@ impl AiResponseGuard {
         let mut json = serde_json::from_str::<Value>(trimmed).ok()?;
         let original = json.clone();
         if self.scan_mode == ScanMode::All {
-            redact_json_strings(&mut json, &self.pii_patterns, &self.blocked_phrases, true);
+            self.redact_all_strings_with_argument_shield(&mut json);
         } else {
             self.redact_sse_frame(&mut json);
         }
@@ -1379,7 +1416,27 @@ impl Plugin for AiResponseGuard {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        // Only inspect successful responses
+        // Enforce the aggregate scan/work bound before the successful-response
+        // content gate. Buffered non-2xx error bodies still reach the transform
+        // phase, so returning before this check would let a large raw body evade
+        // the configured fail-closed/warn disposition and reach a redaction
+        // regex pass outside the bound.
+        if body.len() > self.max_scan_bytes {
+            debug!(
+                body_size = body.len(),
+                max_scan_bytes = self.max_scan_bytes,
+                "ai_response_guard: rejecting or warning on oversized governed response"
+            );
+            return self.respond_to_uninspectable(
+                ctx,
+                "body_exceeds_max_scan_bytes",
+                "response body exceeds max_scan_bytes",
+            );
+        }
+
+        // Content governance remains scoped to successful responses. The size
+        // policy above is representation-independent and applies to every
+        // buffered status.
         if !(200..300).contains(&response_status) {
             return PluginResult::Continue;
         }
@@ -1401,19 +1458,6 @@ impl Plugin for AiResponseGuard {
                 );
             }
             return PluginResult::Continue;
-        }
-
-        if body.len() > self.max_scan_bytes {
-            debug!(
-                body_size = body.len(),
-                max_scan_bytes = self.max_scan_bytes,
-                "ai_response_guard: rejecting or warning on oversized governed response"
-            );
-            return self.respond_to_uninspectable(
-                ctx,
-                "body_exceeds_max_scan_bytes",
-                "response body exceeds max_scan_bytes",
-            );
         }
 
         // --- SSE path: parse frames, extract accumulated texts, detect ---
@@ -1660,11 +1704,16 @@ impl Plugin for AiResponseGuard {
             return None;
         }
 
+        // This check intentionally precedes content-type dispatch and UTF-8
+        // conversion. Raw non-JSON bodies (including non-2xx error text skipped
+        // by content inspection) must never enter regex redaction above the
+        // configured aggregate scan/work limit.
+        if body.len() > self.max_scan_bytes {
+            return None;
+        }
+
         if let Some(ct) = content_type {
             if is_event_stream_content_type(ct) {
-                if body.len() > self.max_scan_bytes {
-                    return None;
-                }
                 return self.redact_sse_body(body);
             }
             if !is_json_content_type(ct) {
@@ -1675,10 +1724,6 @@ impl Plugin for AiResponseGuard {
                 let redacted = self.redact_text(text);
                 return (redacted != text).then(|| redacted.into_bytes());
             }
-        }
-
-        if body.len() > self.max_scan_bytes {
-            return None;
         }
 
         let mut json: Value = match serde_json::from_slice(body) {
@@ -1698,15 +1743,21 @@ impl Plugin for AiResponseGuard {
             {
                 return None;
             }
-            let known_texts = self.extract_completion_texts(&json);
-            if !known_texts.is_empty() {
-                self.redact_response_json(&mut json);
+            // `on_response_body` rejects this case in the normal pipeline.
+            // Keep the transform independently representation-safe as well:
+            // never mutate decoded keys, numbers, duplicate members, or other
+            // matches the value-only redactor cannot rewrite.
+            if self.redact_leaves_residual(&json) {
+                return None;
             }
-            redact_json_strings(&mut json, &self.pii_patterns, &self.blocked_phrases, true);
+            self.redact_all_strings_with_argument_shield(&mut json);
         } else {
             let texts = self.extract_completion_texts(&json);
             let has_match = !self.detect_matches(&texts).is_empty();
             if !has_match {
+                return None;
+            }
+            if self.content_redact_leaves_residual(&json) {
                 return None;
             }
             self.redact_response_json(&mut json);
@@ -1724,9 +1775,11 @@ impl Plugin for AiResponseGuard {
         // whenever redaction changes the client-visible bytes. The proxy calls
         // this hook only after a transform returns `Some`, so clean bodies keep
         // their validators.
-        for header in RESPONSE_VALIDATORS {
-            response_headers.remove(*header);
-        }
+        response_headers.retain(|key, _| {
+            !RESPONSE_VALIDATORS
+                .iter()
+                .any(|header| key.eq_ignore_ascii_case(header))
+        });
     }
 }
 
@@ -1891,6 +1944,58 @@ fn collect_decoded_argument_tokens<'a>(json: &'a Value, texts: &mut Vec<Cow<'a, 
         for item in output {
             collect_argument_value(item.get("arguments"), texts);
         }
+    }
+}
+
+/// Visit every tool/function argument value in the supported buffered and SSE
+/// response shapes. The traversal is deliberately shared by scan-all
+/// redaction's shield/restore passes so both passes observe identical positions
+/// without changing the surrounding arrays or objects.
+fn for_each_argument_value(json: &mut Value, visitor: &mut impl FnMut(&mut Value)) {
+    if let Some(choices) = json.get_mut("choices").and_then(Value::as_array_mut) {
+        for choice in choices {
+            for container_key in ["message", "delta"] {
+                let Some(container) = choice.get_mut(container_key) else {
+                    continue;
+                };
+                if let Some(arguments) = container
+                    .get_mut("function_call")
+                    .and_then(|function| function.get_mut("arguments"))
+                {
+                    visitor(arguments);
+                }
+                if let Some(tool_calls) = container
+                    .get_mut("tool_calls")
+                    .and_then(Value::as_array_mut)
+                {
+                    for tool_call in tool_calls {
+                        if let Some(arguments) = tool_call
+                            .get_mut("function")
+                            .and_then(|function| function.get_mut("arguments"))
+                        {
+                            visitor(arguments);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(output) = json.get_mut("output").and_then(Value::as_array_mut) {
+        for item in output {
+            if let Some(arguments) = item.get_mut("arguments") {
+                visitor(arguments);
+            }
+        }
+    }
+
+    if json
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| event_type.ends_with("function_call_arguments.delta"))
+        && let Some(delta) = json.get_mut("delta")
+    {
+        visitor(delta);
     }
 }
 

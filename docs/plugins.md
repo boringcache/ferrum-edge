@@ -4284,7 +4284,7 @@ Validates and filters HTTP LLM response content before it reaches the client. Co
 | `blocked_patterns` | Object[] | `[]` | Custom `{name, regex}` content patterns to block |
 | `scan_fields` | String | `"content"` | `content` (supported completion and tool/function-call fields) or `all` (entire body) |
 | `redaction_placeholder` | String | `"[REDACTED:{type}]"` | Template for redacted text |
-| `max_scan_bytes` | Integer | `1048576` | Maximum governed buffered body size; reject/redact and structural rules fail closed above it, while warn-only content rules record a bounded warning and pass through |
+| `max_scan_bytes` | Integer | `1048576` | Maximum governed buffered body size, including buffered non-2xx error bodies; reject/redact and structural rules fail closed above it, while warn-only content rules record a bounded warning and pass through |
 | `require_json` | bool | `false` | Reject responses that are not valid JSON |
 | `required_fields` | String[] | `[]` | Required top-level JSON fields (rejects with 502 if missing) |
 | `max_completion_length` | Integer | `0` | Maximum completion text length in characters — Unicode scalar values, not UTF-8 bytes (0 = unlimited) |

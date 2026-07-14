@@ -2143,6 +2143,50 @@ async fn test_max_scan_boundary_and_oversize_dispositions() {
 }
 
 #[tokio::test]
+async fn test_oversized_non_json_error_body_is_bounded_for_every_action() {
+    let body = format!("{} oversized-error@example.com", "x".repeat(128)).into_bytes();
+    let headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+
+    for action in ["reject", "redact", "warn"] {
+        let plugin = make_plugin(json!({
+            "pii_patterns": ["email"],
+            "scan_fields": "all",
+            "action": action,
+            "max_scan_bytes": 32
+        }));
+        let mut ctx = ctx_with_content_type("GET", "text/plain");
+        let result = plugin
+            .on_response_body(&mut ctx, 503, &headers, &body)
+            .await;
+
+        if action == "warn" {
+            assert!(matches!(result, PluginResult::Continue));
+            assert_eq!(
+                ctx.metadata.get("ai_response_guard_warning"),
+                Some(&"body_exceeds_max_scan_bytes".to_string())
+            );
+        } else {
+            assert!(
+                matches!(result, PluginResult::Reject { .. }),
+                "{action} must fail closed for an oversized non-2xx text body"
+            );
+            assert_eq!(
+                ctx.metadata.get("ai_response_guard_rejected"),
+                Some(&"body_exceeds_max_scan_bytes".to_string())
+            );
+        }
+
+        assert!(
+            plugin
+                .transform_response_body(&body, Some("text/plain"), &headers)
+                .await
+                .is_none(),
+            "{action} must not scan or rewrite raw text above max_scan_bytes"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_require_json_checks_actual_representation() {
     let plugin = make_plugin(json!({"require_json": true}));
     let headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
@@ -2407,11 +2451,11 @@ async fn test_representation_validators_removed_only_after_rewrite() {
         "action": "redact"
     }));
     let validators = [
-        "etag",
-        "last-modified",
-        "content-digest",
-        "digest",
-        "content-md5",
+        "ETag",
+        "LAST-Modified",
+        "Content-DIGEST",
+        "dIgEsT",
+        "CONTENT-md5",
     ];
     let mut original_headers =
         HashMap::from([("cache-control".to_string(), "private".to_string())]);
@@ -2451,7 +2495,12 @@ async fn test_representation_validators_removed_only_after_rewrite() {
         let mut ctx = ctx_with_content_type("POST", content_type);
         plugin.on_response_body_transformed(&mut ctx, &mut rewritten_headers);
         for validator in validators {
-            assert!(!rewritten_headers.contains_key(validator));
+            assert!(
+                rewritten_headers
+                    .keys()
+                    .all(|key| !key.eq_ignore_ascii_case(validator)),
+                "mixed-case {validator} survived a body rewrite"
+            );
         }
         assert_eq!(
             rewritten_headers.get("cache-control").map(String::as_str),
@@ -2728,6 +2777,95 @@ async fn test_unrewritable_escaped_argument_key_fails_closed_in_redact_mode() {
             "unrewritable escaped argument key did not fail closed in {scan_fields} mode"
         );
         assert!(ctx.metadata.contains_key("ai_response_guard_rejected"));
+    }
+}
+
+#[tokio::test]
+async fn test_unrewritable_argument_keys_and_numeric_scalars_fail_closed() {
+    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let cases = [
+        ("email", r#"{"user@example.com":true}"#),
+        ("ssn", "123456789"),
+    ];
+
+    for (pii_pattern, arguments) in cases {
+        let body = serde_json::to_vec(&json!({"choices": [{"message": {"tool_calls": [
+            {"function": {"name": "send", "arguments": arguments}}
+        ]}}]}))
+        .unwrap();
+
+        for scan_fields in ["content", "all"] {
+            let redact = make_plugin(json!({
+                "pii_patterns": [pii_pattern],
+                "scan_fields": scan_fields,
+                "action": "redact"
+            }));
+            let mut ctx = ctx_with_content_type("POST", "application/json");
+            assert!(
+                matches!(
+                    redact
+                        .on_response_body(&mut ctx, 200, &headers, &body)
+                        .await,
+                    PluginResult::Reject { .. }
+                ),
+                "{scan_fields} mode did not fail closed for unrewritable {arguments}"
+            );
+            assert_eq!(
+                ctx.metadata.get("ai_response_guard_rejected"),
+                Some(&format!("pii:{pii_pattern}"))
+            );
+            assert!(
+                redact
+                    .transform_response_body(&body, Some("application/json"), &headers)
+                    .await
+                    .is_none(),
+                "the transform must not rename a decoded key or rewrite a numeric JSON scalar"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_nested_argument_string_values_redact_with_valid_json_semantics() {
+    let arguments = r#"{"outer":[{"email":"nested\u0040example.com","count":7}],"enabled":true}"#;
+    let body = serde_json::to_vec(&json!({"choices": [{"message": {"tool_calls": [
+        {"function": {"name": "send", "arguments": arguments}}
+    ]}}]}))
+    .unwrap();
+    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    for scan_fields in ["content", "all"] {
+        let redact = make_plugin(json!({
+            "pii_patterns": ["email"],
+            "scan_fields": scan_fields,
+            "action": "redact"
+        }));
+        let mut ctx = ctx_with_content_type("POST", "application/json");
+        assert!(matches!(
+            redact
+                .on_response_body(&mut ctx, 200, &headers, &body)
+                .await,
+            PluginResult::Continue
+        ));
+
+        let transformed = redact
+            .transform_response_body(&body, Some("application/json"), &headers)
+            .await
+            .unwrap_or_else(|| panic!("nested argument value was not redacted in {scan_fields}"));
+        let response: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+        let rewritten_arguments =
+            response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap();
+        let decoded: serde_json::Value = serde_json::from_str(rewritten_arguments).unwrap();
+
+        assert_eq!(decoded["outer"][0]["email"], "[REDACTED:pii:email]");
+        assert_eq!(decoded["outer"][0]["count"], 7);
+        assert_eq!(decoded["enabled"], true);
+        assert!(
+            !rewritten_arguments.contains("nested@example.com")
+                && !rewritten_arguments.contains("u0040")
+        );
     }
 }
 
