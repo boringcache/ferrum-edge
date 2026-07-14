@@ -261,8 +261,13 @@ fn parse_string_set(
         let Some(raw) = entry.as_str() else {
             return Err(format!("access_control: '{field}' entries must be strings"));
         };
-        let canonical = raw.trim();
-        if canonical.is_empty() {
+        // Rules are stored byte-for-byte. Principals are never canonicalized:
+        // Consumer usernames may legally carry padding and external identity
+        // claims are preserved byte-for-byte (`meaningful_identity`), so
+        // trimming a rule like " alice " would silently rewrite it to a value
+        // that can never match the padded principal it targets — a fail-open
+        // deny-list. Only whitespace-only entries are rejected.
+        if raw.trim().is_empty() {
             return Err(format!(
                 "access_control: '{field}' entries must contain non-whitespace characters"
             ));
@@ -272,12 +277,12 @@ fn parse_string_set(
         } else {
             crate::config::types::MAX_USERNAME_LENGTH
         };
-        if canonical.len() > max_length {
+        if raw.len() > max_length {
             return Err(format!(
                 "access_control: '{field}' entries must not exceed {max_length} characters"
             ));
         }
-        parsed.insert(canonical.to_string());
+        parsed.insert(raw.to_string());
     }
 
     Ok(parsed)

@@ -1881,10 +1881,10 @@ UDP+DTLS streams via certificate-based consumer mapping.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. Entries are trimmed and must contain a non-whitespace value. |
-| `disallowed_consumers` | String[] | `[]` | Consumer usernames explicitly denied. Takes precedence over every allow rule. Entries are trimmed and must contain a non-whitespace value. |
-| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. Entries are trimmed and must contain a non-whitespace value. |
-| `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. Entries are trimmed and must contain a non-whitespace value. |
+| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `disallowed_consumers` | String[] | `[]` | Consumer usernames explicitly denied. Takes precedence over every allow rule. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
 | `allow_authenticated_identity` | bool | `false` | Allows requests with a meaningful, non-whitespace `ctx.authenticated_identity` even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
 
 At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`). Unknown/misspelled config keys are rejected so a typo cannot silently weaken the policy. All checks use `HashSet<String>` for O(1) membership.

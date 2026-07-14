@@ -147,24 +147,69 @@ async fn test_access_control_rejects_blank_rules() {
 }
 
 #[tokio::test]
-async fn test_access_control_canonicalizes_rule_whitespace() {
-    let allowed = AccessControl::new(&json!({
-        "allowed_consumers": ["  testuser  "]
+async fn test_access_control_rules_match_padded_principals_byte_for_byte() {
+    // Principals are never canonicalized: Consumer usernames may legally carry
+    // whitespace padding and external identity claims are preserved
+    // byte-for-byte. Rules must therefore be stored byte-for-byte too — a
+    // trimmed rule could never match the padded principal it targets, turning
+    // the deny-list fail-open.
+
+    // Padded deny rule revokes a padded signed external identity.
+    let deny_external = AccessControl::new(&json!({
+        "allow_authenticated_identity": true,
+        "disallowed_consumers": [" alice "]
     }))
     .unwrap();
-    let mut allowed_ctx = create_test_context();
-    assert_continue(allowed.authorize(&mut allowed_ctx).await);
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some(" alice ".to_string());
+    assert_reject(deny_external.authorize(&mut ctx).await, Some(403));
 
-    let denied = AccessControl::new(&json!({
+    // The padded rule targets exactly " alice "; the distinct principal
+    // "alice" is not covered by it.
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some("alice".to_string());
+    assert_continue(deny_external.authorize(&mut ctx).await);
+
+    // Padded deny rule matches a padded Consumer username.
+    let deny_consumer = AccessControl::new(&json!({
+        "disallowed_consumers": [" alice "]
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(" alice ", vec![])));
+    assert_reject(deny_consumer.authorize(&mut ctx).await, Some(403));
+
+    // Padded group deny rule matches the identical padded acl_group only.
+    let deny_group = AccessControl::new(&json!({
         "disallowed_groups": ["  contractors  "]
     }))
     .unwrap();
-    let mut denied_ctx = create_test_context();
-    denied_ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(
+        "testuser",
+        vec!["  contractors  "],
+    )));
+    assert_reject(deny_group.authorize(&mut ctx).await, Some(403));
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(
         "testuser",
         vec!["contractors"],
     )));
-    assert_reject(denied.authorize(&mut denied_ctx).await, Some(403));
+    assert_continue(deny_group.authorize(&mut ctx).await);
+
+    // Padded allow rule admits exactly the padded username, nothing else.
+    let allow_padded = AccessControl::new(&json!({
+        "allowed_consumers": [" alice "]
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(" alice ", vec![])));
+    assert_continue(allow_padded.authorize(&mut ctx).await);
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups("alice", vec![])));
+    assert_reject(allow_padded.authorize(&mut ctx).await, Some(403));
 }
 
 #[tokio::test]

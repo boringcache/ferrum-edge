@@ -13222,8 +13222,9 @@ components:
         keys are rejected. `allow_authenticated_identity=true` cannot be combined
         with an allow-list (`allowed_consumers`/`allowed_groups`) because the
         allow-list is not applied to unmapped external identities. Use
-        ip_restriction for IP/CIDR rules. Rule entries are trimmed and must
-        contain at least one non-whitespace character.
+        ip_restriction for IP/CIDR rules. Rule entries match principal values
+        byte-for-byte (no trimming) and must contain at least one
+        non-whitespace character.
       allOf:
         - anyOf:
             - required: [allowed_consumers]
