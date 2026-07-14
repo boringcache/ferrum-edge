@@ -444,6 +444,70 @@ async fn consumer_credential_index_enforces_case_insensitive_mtls_uniqueness() {
 }
 
 #[tokio::test]
+async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_case_sensitive_index_rows() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir
+        .path()
+        .join("consumer_legacy_mtls_identity_index.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    let mut consumer = make_consumer("legacy", "alice");
+    consumer.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{ "identity": " API.Example.COM " }]),
+    );
+    store.create_consumer(&consumer).await.unwrap();
+
+    // Simulate an index row written by the pre-canonicalization implementation:
+    // its hash cannot satisfy a lower-cased lookup, so admission must inspect
+    // the authoritative Consumer record instead of treating the miss as unique.
+    sqlx::query(
+        "UPDATE consumer_credential_index SET credential_hash = ? \
+         WHERE namespace = ? AND consumer_id = ? AND credential_type = ?",
+    )
+    .bind("legacy-case-sensitive-hash")
+    .bind("ferrum")
+    .bind("legacy")
+    .bind("mtls_auth")
+    .execute(&store.pool())
+    .await
+    .unwrap();
+
+    assert!(
+        !store
+            .check_mtls_identity_unique("ferrum", "api.example.com", None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .check_mtls_identity_unique("ferrum", "api.example.com", Some("legacy"))
+            .await
+            .unwrap()
+    );
+
+    sqlx::query("UPDATE consumers SET credentials = ? WHERE namespace = ? AND id = ?")
+        .bind("not-json")
+        .bind("ferrum")
+        .bind("legacy")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    let error = store
+        .check_mtls_identity_unique("ferrum", "other.example.com", None)
+        .await
+        .expect_err("malformed stored credentials must fail uniqueness closed");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to parse credentials JSON")
+    );
+}
+
+#[tokio::test]
 async fn consumer_credential_index_updates_on_consumer_update() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("consumer_credential_index_update.db");

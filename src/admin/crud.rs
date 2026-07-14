@@ -64,6 +64,7 @@ async fn validate_mtls_auth_candidate(
     namespace: &str,
     proxy: Option<&Proxy>,
     plugin: Option<&PluginConfig>,
+    removed_plugin_id: Option<&str>,
 ) -> Result<(), AfterValidateError> {
     let mut config = db
         .load_namespace_snapshot(namespace)
@@ -86,6 +87,11 @@ async fn validate_mtls_auth_candidate(
         } else {
             config.plugin_configs.push(plugin.clone());
         }
+    }
+    if let Some(removed_plugin_id) = removed_plugin_id {
+        config
+            .plugin_configs
+            .retain(|plugin| plugin.id != removed_plugin_id);
     }
     config
         .validate_mtls_auth_compatibility()
@@ -235,6 +241,16 @@ pub(crate) trait AdminResource:
         _namespace: &str,
         _resource: &Self,
         _existing: Option<&Self>,
+        _ctx: &ValidationCtx<'_>,
+    ) -> Result<(), AfterValidateError> {
+        Ok(())
+    }
+
+    async fn before_delete(
+        _db: &dyn DatabaseBackend,
+        _state: &AdminState,
+        _namespace: &str,
+        _existing: &Self,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
         Ok(())
@@ -408,6 +424,11 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         }
         Ok(Some(resource)) => resource,
     };
+
+    let validation_ctx = ValidationCtx::from_state(state);
+    if let Err(error) = R::before_delete(db, state, namespace, &existing, &validation_ctx).await {
+        return Ok(map_after_validate_error::<R>(error));
+    }
 
     match R::db_delete(db, namespace, id).await {
         Ok(true) => {
@@ -1611,7 +1632,7 @@ impl AdminResource for PluginConfig {
         state: &AdminState,
         namespace: &str,
         resource: &Self,
-        _existing: Option<&Self>,
+        existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
         let known_plugins = crate::plugins::available_plugins();
@@ -1673,10 +1694,25 @@ impl AdminResource for PluginConfig {
             return Err(AfterValidateError::BadRequest(retry_errors));
         }
 
-        if resource.plugin_name == "mtls_auth" {
-            validate_mtls_auth_candidate(db, namespace, None, Some(resource)).await?;
+        if resource.plugin_name == "mtls_auth"
+            || existing.is_some_and(|plugin| plugin.plugin_name == "mtls_auth")
+        {
+            validate_mtls_auth_candidate(db, namespace, None, Some(resource), None).await?;
         }
 
+        Ok(())
+    }
+
+    async fn before_delete(
+        db: &dyn DatabaseBackend,
+        _state: &AdminState,
+        namespace: &str,
+        existing: &Self,
+        _ctx: &ValidationCtx<'_>,
+    ) -> Result<(), AfterValidateError> {
+        if existing.plugin_name == "mtls_auth" {
+            validate_mtls_auth_candidate(db, namespace, None, None, Some(&existing.id)).await?;
+        }
         Ok(())
     }
 }
@@ -2036,7 +2072,7 @@ impl AdminResource for Proxy {
         }
 
         if resource.effective_scheme().is_stream() {
-            validate_mtls_auth_candidate(db, namespace, Some(resource), None).await?;
+            validate_mtls_auth_candidate(db, namespace, Some(resource), None, None).await?;
         }
 
         if resource.dispatch_kind.is_stream()
@@ -2221,6 +2257,14 @@ fn not_found_response<R: AdminResource>() -> Response<Full<Bytes>> {
     )
 }
 
+fn map_after_validate_error<R: AdminResource>(error: AfterValidateError) -> Response<Full<Bytes>> {
+    match error {
+        AfterValidateError::BadRequest(field_errors) => R::map_after_validate_errors(&field_errors),
+        AfterValidateError::Db(error) => R::map_precheck_db_error(&error),
+        AfterValidateError::Response(response) => response,
+    }
+}
+
 fn config_update_target_was_not_found(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let message = cause.to_string();
@@ -2365,13 +2409,7 @@ async fn handle_write<R: AdminResource>(
     )
     .await
     {
-        return Ok(match error {
-            AfterValidateError::BadRequest(field_errors) => {
-                R::map_after_validate_errors(&field_errors)
-            }
-            AfterValidateError::Db(error) => R::map_precheck_db_error(&error),
-            AfterValidateError::Response(response) => response,
-        });
+        return Ok(map_after_validate_error::<R>(error));
     }
 
     if let Err(message) = resource.prepare_for_write() {

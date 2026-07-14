@@ -3477,19 +3477,6 @@ async fn handle_append_credential(
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut new_cred) {
         return Ok(*resp);
     }
-    let uniqueness_probe = Value::Array(vec![new_cred.clone()]);
-    if let Err(resp) = ensure_credential_unique(
-        db.as_ref(),
-        namespace,
-        consumer_id,
-        cred_type,
-        &uniqueness_probe,
-    )
-    .await
-    {
-        return Ok(*resp);
-    }
-
     let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
         Ok(consumer) => consumer,
         Err(resp) => return Ok(*resp),
@@ -3519,9 +3506,22 @@ async fn handle_append_credential(
     consumer
         .credentials
         .insert(cred_type.to_string(), new_value);
+    consumer.normalize_fields();
 
     if let Err(field_errors) = consumer.validate_fields() {
         return Ok(invalid_credential_fields_response(&field_errors));
+    }
+    if let Some(normalized_credential) = consumer.credentials.get(cred_type)
+        && let Err(resp) = ensure_credential_unique(
+            db.as_ref(),
+            namespace,
+            consumer_id,
+            cred_type,
+            normalized_credential,
+        )
+        .await
+    {
+        return Ok(*resp);
     }
 
     let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;

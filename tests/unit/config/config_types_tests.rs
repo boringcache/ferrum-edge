@@ -1078,6 +1078,31 @@ fn local_mtls_auth_shadows_incompatible_global_fingerprint_policy() {
     };
 
     assert!(config.validate_mtls_auth_compatibility().is_ok());
+
+    let mut removed = config.clone();
+    removed
+        .plugin_configs
+        .retain(|plugin| plugin.id != "mtls-local");
+    let removal_errors = removed.validate_mtls_auth_compatibility().unwrap_err();
+    assert!(
+        removal_errors
+            .iter()
+            .any(|error| error.contains("UDP/DTLS does not expose"))
+    );
+
+    let mut renamed = config;
+    renamed
+        .plugin_configs
+        .iter_mut()
+        .find(|plugin| plugin.id == "mtls-local")
+        .expect("local plugin exists")
+        .plugin_name = "cors".to_string();
+    let rename_errors = renamed.validate_mtls_auth_compatibility().unwrap_err();
+    assert!(
+        rename_errors
+            .iter()
+            .any(|error| error.contains("UDP/DTLS does not expose"))
+    );
 }
 
 #[test]
