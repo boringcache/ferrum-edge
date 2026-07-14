@@ -11277,6 +11277,7 @@ components:
 
     OidcRelyingPartyConfig:
       type: object
+      additionalProperties: false
       description: "Plugin: oidc_relying_party — Browser OIDC relying party with authorization code + PKCE and encrypted sessions."
       required: [providers, session]
       properties:
@@ -11286,6 +11287,7 @@ components:
           maxItems: 1
           items:
             type: object
+            additionalProperties: false
             required: [issuer, client_id, redirect_uri]
             properties:
               issuer:
@@ -11304,10 +11306,14 @@ components:
                 type: string
               end_session_endpoint:
                 type: string
+              post_logout_redirect_uri:
+                type: string
+                description: Absolute HTTPS redirect URI sent to the provider after RP-initiated logout; HTTP is allowed only for localhost or literal loopback development endpoints.
               client_id:
                 type: string
               client_auth:
                 type: object
+                additionalProperties: false
                 properties:
                   method:
                     type: string
@@ -11366,9 +11372,10 @@ components:
               id_token_clock_skew_secs:
                 type: integer
                 format: uint64
-                default: 30
+                default: 60
         session:
           type: object
+          additionalProperties: false
           required: [encryption_secret]
           properties:
             encryption_secret:
@@ -11381,15 +11388,11 @@ components:
               description: Previous encryption secret accepted during rotation
             cookie_name:
               type: string
-              default: ferrum_session
+              description: Cookie name. When omitted, Ferrum derives a context-specific name from the provider and authorization policy.
             store:
               type: string
               enum: [cookie]
               default: cookie
-            redis_url:
-              type: string
-              deprecated: true
-              description: Reserved for future server-side sessions; redis store is rejected until implemented.
             ttl_secs:
               type: integer
               format: uint64
@@ -11419,11 +11422,26 @@ components:
               default: /
         behavior:
           type: object
+          additionalProperties: false
           properties:
             state_ttl_secs:
               type: integer
               format: uint64
               default: 600
+              minimum: 1
+              maximum: 3600
+            state_cache_max_entries:
+              type: integer
+              format: uint64
+              default: 10000
+              minimum: 1
+              description: Global maximum number of pending browser authorization flows for this plugin instance.
+            state_cache_max_entries_per_source:
+              type: integer
+              format: uint64
+              default: 32
+              minimum: 1
+              description: Maximum pending browser authorization flows per resolved client IP; must not exceed state_cache_max_entries.
             post_login_redirect_param:
               type: string
             trusted_redirect_hosts:

@@ -80,7 +80,13 @@ pub fn get_or_create_jwks_store(
 pub fn retain_active_uris(active_uris: &HashSet<String>) {
     let cache = global_cache();
     cache.retain(|uri, entry| {
-        if active_uris.contains(uri) {
+        // Keep a store while a plugin instance still owns it even if an
+        // asynchronous discovery publication races with the plugin-cache URI
+        // snapshot. The cache itself accounts for one strong reference; any
+        // additional reference is a live (or in-flight retired-generation)
+        // consumer. A later cleanup pass removes it after the last consumer is
+        // dropped.
+        if active_uris.contains(uri) || Arc::strong_count(&entry.store) > 1 {
             true
         } else {
             info!("JWKS cache: removing stale store for {}", uri);
