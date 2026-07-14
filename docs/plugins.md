@@ -1576,7 +1576,7 @@ credentials:
 
 ### `hmac_auth`
 
-Authenticates requests using HMAC signatures with mandatory request-body integrity protection (RFC 9421 / RFC 3230).
+Authenticates requests using Ferrum's versioned HMAC authorization scheme with mandatory request-body integrity protection. RFC 9530 defines the accepted `Content-Digest` representation; Ferrum's `Authorization: hmac` field and signing base are not RFC 9421 HTTP Message Signatures.
 
 **Priority:** 1400
 
@@ -1593,24 +1593,31 @@ hmac username="<username>", algorithm="hmac-sha256", signature="<base64>"
 - `algorithm` is optional and defaults to `hmac-sha256`
 - Supported algorithms: `hmac-sha256`, `hmac-sha512`
 - Unknown algorithms are rejected
+- Auth-param names are ASCII case-insensitive. Quoted values support HTTP quoted-pair escaping, so configured usernames containing commas, quotes, or backslashes remain representable. Malformed quotes and duplicate recognized parameters are rejected.
 - Requests must include a valid `Date` header (RFC 2822 or RFC 3339) within the configured skew window
 
 **Signing string**:
 
 ```text
-{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}
+ferrum-hmac-v1\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}
 ```
 
-where `{PATH}` is the request path component only, `{QUERY}` is the raw query string as received (percent-encoded, without the leading `?`, empty when there is no query), and `DIGEST_HEADER_VALUE` is the literal value of the `Digest:` or `Content-Digest:` header (e.g., `sha-256=<base64-of-sha256-of-body>`). Binding the query string means altering or adding query parameters invalidates the signature; clients must sign the byte-for-byte raw query string the gateway receives. Including the digest header means a tampered digest header (without re-signing) breaks the HMAC, and a tampered body (without recomputing the digest) breaks the digest verification.
+`{USERNAME}` is the decoded username auth-param. `{AUTHORITY}` is the validated request authority with an ASCII-lowercased hostname, no trailing DNS dot, no default `:80`/`:443` port, and any explicit non-default port retained; bracketed IPv6 remains bracketed. `{PATH}` is the request path component only and `{QUERY}` is the raw query string as received (percent-encoded, without the leading `?`, empty when there is no query). `DIGEST_HEADER_VALUE` is the literal value of the selected digest field. Binding username and authority prevents captured signatures from being relabeled to another Consumer or replayed across virtual hosts; binding the raw query prevents query alteration.
+
+For RFC 9530 `Content-Digest`, use structured-field byte-sequence syntax such as `sha-256=:<base64-of-sha256-of-body>:`. Legacy `Digest` compatibility accepts `sha-256=<base64-of-sha256-of-body>`. SHA-512 is also supported. Ferrum verifies the digest against the original client bytes and signs its literal field value.
+
+`hmac_auth` authenticates the client-to-gateway representation. It cannot be combined on one proxy with a plugin that transforms the request body: configuration fails closed instead of forwarding an Authorization signature and digest that describe different bytes. The HMAC pre-authentication path also enforces a 10 MiB hard body ceiling even when the general request-body limit is unlimited.
+
+> **HBONE limitation:** `hmac_auth` is incompatible with HBONE CONNECT and rejects it with 401. Ferrum must preserve CONNECT DATA for tunnel relay and cannot buffer it for digest verification.
 
 > **Replay protection is a freshness window, not single-use.** The signed `Date` header bounds requests to `now ± clock_skew_seconds`; there is no nonce/seen-signature store, so a captured valid request can be replayed verbatim until the window elapses. Keep `clock_skew_seconds` tight for non-idempotent routes and do not rely on `hmac_auth` alone for them.
 
-**Consumer credential** (`hmac_auth`) — array:
+**Consumer credential** (`hmac_auth`) — array. Every secret must contain at least 32 non-whitespace characters and must not be shared by different Consumers:
 ```yaml
 credentials:
   hmac_auth:
-    - secret: "shared-secret"
-    - secret: "new-secret"
+    - secret: "shared-secret-at-least-32-characters"
+    - secret: "rotated-secret-at-least-32-characters"
 ```
 
 ### ldap_auth

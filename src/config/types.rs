@@ -81,6 +81,8 @@ pub const MAX_CREDENTIALS_SIZE: usize = 65_536; // 64 KiB
 pub const MAX_CREDENTIAL_VALUE_LENGTH: usize = 4096;
 /// Minimum length for JWT secrets (admin API and consumer credentials).
 pub const MIN_JWT_SECRET_LENGTH: usize = 32;
+/// Minimum length for hmac_auth shared secrets.
+pub const MIN_HMAC_SECRET_LENGTH: usize = 32;
 /// Default maximum number of credential entries per type (for zero-downtime rotation).
 /// Overridable at runtime via `FERRUM_MAX_CREDENTIALS_PER_TYPE` env var / conf file.
 pub const DEFAULT_MAX_CREDENTIALS_PER_TYPE: usize = 2;
@@ -3461,7 +3463,8 @@ impl GatewayConfig {
 
     /// Validate that consumer credentials are unique across all consumers.
     ///
-    /// Checks keyauth API keys, basicauth usernames, and mTLS identities.
+    /// Checks keyauth API keys, basicauth usernames, HMAC shared secrets, and
+    /// mTLS identities.
     /// mTLS identities are exact by default and additionally ASCII-case-folded
     /// when an enabled `san_dns` mTLS policy can consume the DNS lookup index.
     /// If two consumers share the same credential, the ConsumerIndex silently
@@ -3469,6 +3472,7 @@ impl GatewayConfig {
     pub fn validate_unique_consumer_credentials(&self) -> Result<(), Vec<String>> {
         let mut seen_keyauth: HashMap<&str, &str> = HashMap::new();
         let mut seen_basicauth: HashMap<&str, &str> = HashMap::new();
+        let mut seen_hmac: HashMap<&str, &str> = HashMap::new();
         let mut seen_mtls: HashMap<&str, &str> = HashMap::new();
         let mut duplicates = Vec::new();
 
@@ -3494,6 +3498,22 @@ impl GatewayConfig {
                     "Duplicate basicauth username '{}' in consumer '{}' (conflicts with consumer '{}')",
                     consumer.username, consumer.id, existing_id
                 ));
+            }
+
+            // HMAC signs the credential identity, but a shared secret reused by
+            // two Consumers would still collapse their trust boundary. Reject
+            // cross-Consumer reuse without ever including the secret in the
+            // validation error.
+            for entry in consumer.credential_entries("hmac_auth") {
+                if let Some(secret) = entry.get("secret").and_then(|s| s.as_str())
+                    && let Some(existing_id) = seen_hmac.insert(secret, &consumer.id)
+                    && existing_id != consumer.id
+                {
+                    duplicates.push(format!(
+                        "Duplicate hmac_auth shared secret in consumer '{}' (conflicts with consumer '{}')",
+                        consumer.id, existing_id
+                    ));
+                }
             }
 
             // Check all mTLS entries.
@@ -5511,6 +5531,27 @@ impl Consumer {
                             errors.push(format!("{}.identity must not be empty", prefix));
                         }
                         Some(_) => errors.push(format!("{}.identity must be a string", prefix)),
+                        None => {}
+                    }
+                }
+                if cred_type == "hmac_auth" {
+                    if obj.len() != 1 || !obj.contains_key("secret") {
+                        errors.push(format!(
+                            "{} must contain exactly one field named 'secret'",
+                            prefix
+                        ));
+                    }
+                    match obj.get("secret") {
+                        Some(serde_json::Value::String(secret)) => {
+                            let strength = secret.chars().filter(|ch| !ch.is_whitespace()).count();
+                            if strength < MIN_HMAC_SECRET_LENGTH {
+                                errors.push(format!(
+                                    "{}.secret must be at least {} non-whitespace characters (got {})",
+                                    prefix, MIN_HMAC_SECRET_LENGTH, strength
+                                ));
+                            }
+                        }
+                        Some(_) => errors.push(format!("{}.secret must be a string", prefix)),
                         None => {}
                     }
                 }

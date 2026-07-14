@@ -10,7 +10,9 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_auth_acl
 
-use crate::common::{TestGateway, empty_digest_header, generate_hmac_signature};
+use crate::common::{
+    TestGateway, empty_digest_header, generate_hmac_signature, hmac_authority_from_url,
+};
 
 use base64::Engine;
 use chrono::Utc;
@@ -645,7 +647,7 @@ async fn test_auth_acl_comprehensive() {
         &auth_header,
         "consumer-alice",
         "hmac_auth",
-        &json!({"secret": "alice-hmac-shared-secret"}),
+        &json!({"secret": "alice-hmac-shared-secret-at-least-32-bytes"}),
     )
     .await
     .unwrap();
@@ -1255,11 +1257,19 @@ async fn test_auth_acl_comprehensive() {
     // ==========================================
 
     println!("\n=== HMAC AUTH TESTS ===");
+    let hmac_authority = hmac_authority_from_url(proxy_url);
 
     // Test 17: HMAC Auth — valid signature
     println!("\n--- Test 17: HMAC Auth — Valid Signature ---");
     let date = Utc::now().to_rfc2822();
-    let signature = generate_hmac_signature("GET", "/hmacauth", &date, "alice-hmac-shared-secret");
+    let signature = generate_hmac_signature(
+        "GET",
+        "/hmacauth",
+        &date,
+        "alice",
+        &hmac_authority,
+        "alice-hmac-shared-secret-at-least-32-bytes",
+    );
     let hmac_header = format!(
         "hmac username=\"alice\", algorithm=\"hmac-sha256\", signature=\"{}\"",
         signature
@@ -1284,7 +1294,14 @@ async fn test_auth_acl_comprehensive() {
     // Test 18: HMAC Auth — wrong secret (bad signature)
     println!("\n--- Test 18: HMAC Auth — Wrong Secret ---");
     let date = Utc::now().to_rfc2822();
-    let bad_sig = generate_hmac_signature("GET", "/hmacauth", &date, "wrong-secret");
+    let bad_sig = generate_hmac_signature(
+        "GET",
+        "/hmacauth",
+        &date,
+        "alice",
+        &hmac_authority,
+        "wrong-secret",
+    );
     let hmac_header = format!(
         "hmac username=\"alice\", algorithm=\"hmac-sha256\", signature=\"{}\"",
         bad_sig
@@ -1306,7 +1323,14 @@ async fn test_auth_acl_comprehensive() {
 
     // Test 19: HMAC Auth — missing Date header (replay protection)
     println!("\n--- Test 19: HMAC Auth — Missing Date Header ---");
-    let sig_no_date = generate_hmac_signature("GET", "/hmacauth", "", "alice-hmac-shared-secret");
+    let sig_no_date = generate_hmac_signature(
+        "GET",
+        "/hmacauth",
+        "",
+        "alice",
+        &hmac_authority,
+        "alice-hmac-shared-secret-at-least-32-bytes",
+    );
     let hmac_header = format!(
         "hmac username=\"alice\", algorithm=\"hmac-sha256\", signature=\"{}\"",
         sig_no_date
@@ -1328,7 +1352,14 @@ async fn test_auth_acl_comprehensive() {
     // Test 20: HMAC Auth — unknown consumer
     println!("\n--- Test 20: HMAC Auth — Unknown Consumer ---");
     let date = Utc::now().to_rfc2822();
-    let sig = generate_hmac_signature("GET", "/hmacauth", &date, "some-secret");
+    let sig = generate_hmac_signature(
+        "GET",
+        "/hmacauth",
+        &date,
+        "nonexistent",
+        &hmac_authority,
+        "some-secret",
+    );
     let hmac_header = format!(
         "hmac username=\"nonexistent\", algorithm=\"hmac-sha256\", signature=\"{}\"",
         sig
@@ -2230,8 +2261,8 @@ async fn test_hmac_auth_plus_acl() {
     let admin_url = &harness.admin_base_url;
     let proxy_url = &harness.proxy_base_url;
 
-    let alice_hmac = "hmac-alice-shared-secret-aaa";
-    let mallory_hmac = "hmac-mallory-shared-secret-zzz";
+    let alice_hmac = "hmac-alice-shared-secret-aaa-0001";
+    let mallory_hmac = "hmac-mallory-shared-secret-zzz-0002";
 
     create_consumer(&client, admin_url, &auth_header, "hmac-alice", "hmac-alice")
         .await
@@ -2315,9 +2346,14 @@ async fn test_hmac_auth_plus_acl() {
 
     tokio::time::sleep(Duration::from_secs(4)).await;
 
-    fn signed_request(path: &str, username: &str, secret: &str) -> (String, String) {
+    fn signed_request(
+        path: &str,
+        username: &str,
+        authority: &str,
+        secret: &str,
+    ) -> (String, String) {
         let date = Utc::now().to_rfc2822();
-        let signature = generate_hmac_signature("GET", path, &date, secret);
+        let signature = generate_hmac_signature("GET", path, &date, username, authority, secret);
         let header = format!(
             "hmac username=\"{}\", algorithm=\"hmac-sha256\", signature=\"{}\"",
             username, signature
@@ -2326,7 +2362,9 @@ async fn test_hmac_auth_plus_acl() {
     }
 
     // Allow list — alice OK, mallory blocked
-    let (header, date) = signed_request("/hmac-acl-allow", "hmac-alice", alice_hmac);
+    let hmac_authority = hmac_authority_from_url(proxy_url);
+    let (header, date) =
+        signed_request("/hmac-acl-allow", "hmac-alice", &hmac_authority, alice_hmac);
     let resp = client
         .get(format!("{}/hmac-acl-allow", proxy_url))
         .header("Authorization", header)
@@ -2341,7 +2379,12 @@ async fn test_hmac_auth_plus_acl() {
         resp.status()
     );
 
-    let (header, date) = signed_request("/hmac-acl-allow", "hmac-mallory", mallory_hmac);
+    let (header, date) = signed_request(
+        "/hmac-acl-allow",
+        "hmac-mallory",
+        &hmac_authority,
+        mallory_hmac,
+    );
     let resp = client
         .get(format!("{}/hmac-acl-allow", proxy_url))
         .header("Authorization", header)
@@ -2358,7 +2401,12 @@ async fn test_hmac_auth_plus_acl() {
     );
 
     // Allow list — bad signature still returns 401, not 403
-    let (header, date) = signed_request("/hmac-acl-allow", "hmac-alice", "totally-wrong-secret");
+    let (header, date) = signed_request(
+        "/hmac-acl-allow",
+        "hmac-alice",
+        &hmac_authority,
+        "totally-wrong-secret",
+    );
     let resp = client
         .get(format!("{}/hmac-acl-allow", proxy_url))
         .header("Authorization", header)
@@ -2375,7 +2423,12 @@ async fn test_hmac_auth_plus_acl() {
     );
 
     // Deny list — mallory blocked, alice OK
-    let (header, date) = signed_request("/hmac-acl-deny", "hmac-mallory", mallory_hmac);
+    let (header, date) = signed_request(
+        "/hmac-acl-deny",
+        "hmac-mallory",
+        &hmac_authority,
+        mallory_hmac,
+    );
     let resp = client
         .get(format!("{}/hmac-acl-deny", proxy_url))
         .header("Authorization", header)
@@ -2391,7 +2444,8 @@ async fn test_hmac_auth_plus_acl() {
         resp.status()
     );
 
-    let (header, date) = signed_request("/hmac-acl-deny", "hmac-alice", alice_hmac);
+    let (header, date) =
+        signed_request("/hmac-acl-deny", "hmac-alice", &hmac_authority, alice_hmac);
     let resp = client
         .get(format!("{}/hmac-acl-deny", proxy_url))
         .header("Authorization", header)

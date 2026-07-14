@@ -38,6 +38,9 @@ pub enum ExtractedCredential {
 #[derive(Debug, Clone)]
 pub struct HmacAuthCredential {
     pub username: String,
+    /// Canonical client-request authority bound into the versioned signature
+    /// base so a captured request cannot cross virtual-host boundaries.
+    pub authority: String,
     pub algorithm: String,
     pub signature: String,
     pub date: String,
@@ -47,12 +50,13 @@ pub struct HmacAuthCredential {
     /// into the signing string so query parameters cannot be altered without
     /// invalidating the HMAC. Empty when the request had no query.
     pub query: String,
-    /// Value of the `Digest:` (RFC 3230) or `Content-Digest:` (RFC 9421)
+    /// Value of legacy `Digest:` or RFC 9530 `Content-Digest:`
     /// header.
     pub digest_header: String,
-    /// Buffered request body bytes used to verify `digest_header`. Empty when
-    /// the request has no body.
-    pub request_body: Vec<u8>,
+    /// Hashes of the sole forwarding buffer used to verify `digest_header`
+    /// without retaining another full request-body copy.
+    pub request_body_sha256: [u8; 32],
+    pub request_body_sha512: [u8; 64],
 }
 
 /// Shared auth verification result, mapped to PluginResult by the dispatcher.

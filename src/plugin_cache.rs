@@ -130,6 +130,24 @@ fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> 
     Ok(())
 }
 
+/// HMAC authenticates the exact client-visible request body and digest. A later
+/// body transform would make the backend-visible bytes disagree with the
+/// signed `Digest`/`Content-Digest` and `Authorization` fields. Reject that
+/// composition at cache build time instead of forwarding stale integrity
+/// metadata or silently weakening authentication.
+fn validate_hmac_request_transform_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
+    if !plugins.iter().any(|plugin| plugin.name() == "hmac_auth") {
+        return Ok(());
+    }
+    if let Some(transformer) = plugins.iter().find(|plugin| plugin.modifies_request_body()) {
+        return Err(format!(
+            "hmac_auth cannot be combined with request-body transformer '{}' on the same proxy; HMAC authenticates the client-to-gateway representation and Ferrum will not forward stale signed digest metadata",
+            transformer.name()
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Plugin for PriorityOverridePlugin {
     fn name(&self) -> &str {
@@ -169,6 +187,14 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_request_body_before_authenticate(&self) -> bool {
         self.inner.requires_request_body_before_authenticate()
     }
+    fn should_buffer_request_body_before_authenticate(
+        &self,
+        ctx: &RequestContext,
+        consumer_index: &crate::consumer_index::ConsumerIndex,
+    ) -> bool {
+        self.inner
+            .should_buffer_request_body_before_authenticate(ctx, consumer_index)
+    }
     fn requires_request_body_before_authorize(&self) -> bool {
         self.inner.requires_request_body_before_authorize()
     }
@@ -177,6 +203,9 @@ impl Plugin for PriorityOverridePlugin {
     }
     fn needs_request_body_bytes(&self) -> bool {
         self.inner.needs_request_body_bytes()
+    }
+    fn needs_request_body_digests(&self) -> bool {
+        self.inner.needs_request_body_digests()
     }
     fn needs_request_body_text(&self) -> bool {
         self.inner.needs_request_body_text()
@@ -1337,6 +1366,9 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
                 plugin_errors.push(format!("global plugins: {e}"));
             }
+            if let Err(e) = validate_hmac_request_transform_composition(&global_plugins) {
+                plugin_errors.push(format!("global plugins: {e}"));
+            }
             Arc::new(global_plugins)
         } else {
             Arc::clone(&current.global_plugins)
@@ -1519,6 +1551,9 @@ impl PluginCache {
 
             merged.sort_by_key(|p| p.priority());
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
+            if let Err(e) = validate_hmac_request_transform_composition(&merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
             new_map.insert(proxy.id.clone(), Arc::new(merged));
@@ -2020,6 +2055,9 @@ impl PluginCache {
             if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
                 plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
             }
+            if let Err(e) = validate_hmac_request_transform_composition(&merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
 
             // Pre-compute whether any plugin requires response body buffering
             let needs_buffering = merged.iter().any(|p| p.requires_response_body_buffering());
@@ -2040,6 +2078,9 @@ impl PluginCache {
         // staged registry so ordering errors reject the whole cache build.
         global_plugins.sort_by_key(|p| p.priority());
         if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
+            plugin_errors.push(format!("global plugins: {e}"));
+        }
+        if let Err(e) = validate_hmac_request_transform_composition(&global_plugins) {
             plugin_errors.push(format!("global plugins: {e}"));
         }
 

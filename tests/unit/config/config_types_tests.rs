@@ -1445,6 +1445,39 @@ fn test_unique_consumer_credentials_duplicate_keyauth() {
 }
 
 #[test]
+fn test_unique_consumer_credentials_duplicate_hmac_secret_is_redacted() {
+    let secret = "same-hmac-secret-at-least-32-characters";
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials
+        .insert("hmac_auth".into(), serde_json::json!([{"secret": secret}]));
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials
+        .insert("hmac_auth".into(), serde_json::json!([{"secret": secret}]));
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+
+    let errors = config.validate_unique_consumer_credentials().unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("Duplicate hmac_auth shared secret"));
+    assert!(!errors[0].contains(secret));
+}
+
+#[test]
+fn test_unique_consumer_credentials_allows_hmac_rotation_within_one_consumer() {
+    let mut consumer = make_consumer("c1", "alice");
+    consumer.credentials.insert(
+        "hmac_auth".into(),
+        serde_json::json!([
+            {"secret": "first-hmac-secret-at-least-32-characters"},
+            {"secret": "second-hmac-secret-at-least-32-characters"}
+        ]),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![consumer];
+    assert!(config.validate_unique_consumer_credentials().is_ok());
+}
+
+#[test]
 fn test_unique_consumer_credentials_no_keyauth_ok() {
     // Consumers without keyauth credentials should not conflict
     let c1 = make_consumer("c1", "alice");
@@ -1819,6 +1852,42 @@ fn test_validate_fields_accepts_valid_jwt_secret() {
         serde_json::json!([{"secret": "this-is-a-valid-jwt-secret-key-32chars"}]),
     );
     assert!(c.validate_fields().is_ok());
+}
+
+#[test]
+fn test_validate_fields_rejects_malformed_or_weak_hmac_secrets() {
+    for credential in [
+        serde_json::json!({}),
+        serde_json::json!({"secret": null}),
+        serde_json::json!({"secret": 42}),
+        serde_json::json!({"secret": ""}),
+        serde_json::json!({"secret": "                                "}),
+        serde_json::json!({"secret": "short-secret"}),
+        serde_json::json!({"secret": "valid-hmac-secret-at-least-32-characters", "extra": true}),
+    ] {
+        let mut consumer = make_consumer("c1", "alice");
+        consumer
+            .credentials
+            .insert("hmac_auth".into(), serde_json::json!([credential]));
+        assert!(
+            consumer.validate_fields().is_err(),
+            "malformed HMAC credential must fail closed: {:?}",
+            consumer.credentials["hmac_auth"]
+        );
+    }
+}
+
+#[test]
+fn test_validate_fields_accepts_strong_hmac_rotation_entries() {
+    let mut consumer = make_consumer("c1", "alice");
+    consumer.credentials.insert(
+        "hmac_auth".into(),
+        serde_json::json!([
+            {"secret": "first-hmac-secret-at-least-32-characters"},
+            {"secret": "second-hmac-secret-at-least-32-characters"}
+        ]),
+    );
+    assert!(consumer.validate_fields().is_ok());
 }
 
 #[test]

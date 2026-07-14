@@ -587,7 +587,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `key_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `ldap_auth` | ✓ | ✓ | ✓ | | | Requires HTTP Basic auth header; authenticates against LDAP directory |
 | `basic_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
-| `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
+| `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers and a buffered request body; HBONE CONNECT fails closed as incompatible |
 | `soap_ws_security` | ✓ | | | | | SOAP XML body parsing (text/xml, application/soap+xml) |
 | `access_control` | ✓ | ✓ | ✓ | ✓ | ✓ | Needs authenticated identity from an auth plugin; supports consumer username and ACL group allow/deny lists |
 | `mesh_authz` | ✓ | ✓ | ✓ | ✓ | ✓ | Applies Layer 2 mesh policy using SPIFFE or HBONE identities |

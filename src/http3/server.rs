@@ -1224,6 +1224,9 @@ async fn handle_h3_request(
         .authority()
         .map(|a| a.as_str())
         .or_else(|| ctx.raw_header_get("host"));
+    ctx.request_authority = raw_host.and_then(|authority| {
+        crate::proxy::normalize_request_authority_for_signing(authority, Some("https"))
+    });
     let request_host: Option<String> = match raw_host {
         Some(h) => match crate::proxy::normalize_request_host_for_routing(h) {
             Some(normalized) => Some(normalized),
@@ -1477,21 +1480,26 @@ async fn handle_h3_request(
     // plugins can read `ctx.request_body_bytes`.
     // WebSocket Extended CONNECT is excluded: DATA frames after the H3 200 are
     // WebSocket bytes, not a request body that can be drained before upgrade.
+    let consumer_index = ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index));
     let authenticate_body_requirements = if allows_request_body_buffering
         && capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
     {
-        crate::proxy::request_body_requirements_before_authenticate(&plugins, &ctx)
+        crate::proxy::request_body_requirements_before_authenticate(&plugins, &ctx, &consumer_index)
     } else {
         crate::proxy::RequestBodyPhaseRequirements::default()
     };
 
     let mut prebuffered_body_data: Option<Vec<u8>> = if authenticate_body_requirements.required {
         let mut body_data = Vec::new();
-        let max_body = if matches!(http_flavor, HttpFlavor::Grpc) {
+        let protocol_max_body = if matches!(http_flavor, HttpFlavor::Grpc) {
             state.max_grpc_recv_size_bytes
         } else {
             state.max_request_body_size_bytes
         };
+        let max_body = crate::proxy::effective_request_body_limit(
+            protocol_max_body,
+            authenticate_body_requirements.plugin_limit,
+        );
         let collect = async {
             while let Some(chunk) = stream.recv_data().await? {
                 let bytes = chunk.chunk();
@@ -1544,6 +1552,7 @@ async fn handle_h3_request(
             &body_data,
             authenticate_body_requirements.needs_text,
             authenticate_body_requirements.needs_bytes,
+            authenticate_body_requirements.needs_digests,
         );
         ctx.bytes_sent_observed
             .fetch_max(body_data.len() as u64, std::sync::atomic::Ordering::Release);
@@ -1559,7 +1568,6 @@ async fn handle_h3_request(
     let auth_plugins = plugin_cache_view.auth_plugins();
 
     let auth_phase_start = std::time::Instant::now();
-    let consumer_index = ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index));
     if let Some((status_code, body, mut headers)) = run_authentication_phase(
         proxy.auth_mode.clone(),
         &auth_plugins,
@@ -1713,6 +1721,7 @@ async fn handle_h3_request(
                 body_data,
                 authorize_body_requirements.needs_text,
                 authorize_body_requirements.needs_bytes,
+                authorize_body_requirements.needs_digests,
             );
             ctx.bytes_sent_observed
                 .fetch_max(body_data.len() as u64, std::sync::atomic::Ordering::Release);
@@ -1892,6 +1901,7 @@ async fn handle_h3_request(
             body_data,
             h3_needs_body_text,
             h3_needs_body_bytes,
+            false,
         );
     }
 
