@@ -111,6 +111,30 @@ fn test_invalid_config_shapes_rejected() {
     }
 }
 
+#[test]
+fn test_unknown_config_fields_rejected_even_with_valid_policy() {
+    for typo in [
+        "acton",
+        "pattern",
+        "custom_pattern",
+        "scan_field",
+        "exclude_role",
+        "redaction_placeholdr",
+        "max_scan_byte",
+    ] {
+        let mut config = json!({"patterns": ["email"], "scan_fields": "all"});
+        config
+            .as_object_mut()
+            .unwrap()
+            .insert(typo.to_string(), json!("ignored"));
+        let error = AiPromptShield::new(&config).err().unwrap();
+        assert!(
+            error.contains("unknown config field") && error.contains(typo),
+            "unexpected error for {typo}: {error}"
+        );
+    }
+}
+
 // ─── SSN detection ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -907,6 +931,71 @@ async fn test_scan_all_mode_redacts_string_llm_parameter_values() {
 }
 
 #[tokio::test]
+async fn test_scan_all_actions_exempt_top_level_structural_scalars() {
+    for action in ["reject", "warn", "redact"] {
+        let plugin = AiPromptShield::new(&json!({
+            "patterns": ["ssn", "ip_address"],
+            "scan_fields": "all",
+            "action": action
+        }))
+        .unwrap();
+        let request = json!({
+            "model": "10.20.30.40",
+            "seed": 123456789i64,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let original = serde_json::to_string(&request).unwrap();
+        let mut ctx = make_post_ctx(&request);
+        let mut headers = make_post_headers();
+
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert!(
+            !ctx.metadata.contains_key("ai_shield_rejected")
+                && !ctx.metadata.contains_key("ai_shield_warnings")
+                && !ctx.metadata.contains_key("ai_shield_redacted"),
+            "{action} must not report an exempt top-level scalar"
+        );
+        assert_eq!(
+            ctx.metadata.get("request_body").map(String::as_str),
+            Some(original.as_str())
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_scan_all_still_detects_nested_structural_names_and_string_tuning_values() {
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ssn", "ip_address"],
+        "scan_fields": "all"
+    }))
+    .unwrap();
+
+    for request in [
+        json!({"metadata": {"model": "10.20.30.40"}}),
+        json!({"metadata": {"seed": 123456789i64}}),
+        json!({"seed": "123-45-6789"}),
+    ] {
+        let mut ctx = make_post_ctx(&request);
+        let mut headers = make_post_headers();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    }
+}
+
+#[tokio::test]
+async fn test_scan_all_contextual_pattern_around_exempt_scalar_still_enforced() {
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": [],
+        "custom_patterns": [{"name": "model_field", "regex": "\"model\"\\s*:"}],
+        "scan_fields": "all"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx_with_raw_body(r#"{"model" : "10.20.30.40"}"#);
+    let mut headers = make_post_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
 async fn test_scan_all_mode_redact_fails_closed_on_whitespace_sensitive_pattern() {
     // A contextual custom pattern that *requires* whitespace around the colon
     // matches the incoming raw body, but no token is rewritten. The residual
@@ -997,6 +1086,37 @@ async fn test_scan_all_mode_redact_fails_closed_on_raw_escape_only_value_pattern
 }
 
 #[tokio::test]
+async fn test_scan_all_redaction_handles_many_late_value_span_matches_linearly() {
+    // Adversarial regression for the match-to-value-span lookup: every later
+    // match lives in a later scalar span. Restarting at span zero for each one
+    // makes this workload quadratic; the production walk advances monotonically.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ssn"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+    let values: Vec<serde_json::Value> = (0..20_000)
+        .map(|offset| json!(100_000_000u64 + offset))
+        .collect();
+    let body = serde_json::to_vec(&json!({"values": values})).unwrap();
+    assert!(body.len() < 1_048_576);
+
+    let transformed = plugin
+        .transform_request_body(&body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("every numeric SSN-shaped scalar should be redacted");
+    let parsed: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    let redacted = parsed["values"].as_array().unwrap();
+    assert_eq!(redacted.len(), 20_000);
+    assert!(
+        redacted
+            .iter()
+            .all(|value| value == &json!("[REDACTED:ssn]"))
+    );
+}
+
+#[tokio::test]
 async fn test_scan_content_only_mode() {
     let plugin = AiPromptShield::new(&json!({
         "patterns": ["ssn"],
@@ -1018,17 +1138,59 @@ async fn test_scan_content_only_mode() {
 // ─── Max scan bytes ─────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_max_scan_bytes_exceeded() {
+async fn test_max_scan_bytes_boundary_is_inspected() {
+    let request = ai_request("My SSN is 123-45-6789");
+    let exact_size = serde_json::to_string(&request).unwrap().len();
     let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ssn"],
+        "max_scan_bytes": exact_size
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&request);
+    let mut headers = make_post_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_max_scan_bytes_exceeded_fails_closed_for_enforcing_actions() {
+    let request = ai_request("My SSN is 123-45-6789");
+    let body_size = serde_json::to_string(&request).unwrap().len();
+
+    for action in ["reject", "redact"] {
+        let plugin = AiPromptShield::new(&json!({
+            "action": action,
+            "patterns": ["ssn"],
+            "max_scan_bytes": body_size - 1
+        }))
+        .unwrap();
+        let mut ctx = make_post_ctx(&request);
+        let mut headers = make_post_headers();
+
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(413));
+        assert_eq!(
+            ctx.metadata.get("ai_shield_rejected").map(String::as_str),
+            Some("body_too_large")
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_max_scan_bytes_exceeded_warns_without_silent_skip() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "warn",
         "patterns": ["ssn"],
         "max_scan_bytes": 10
     }))
     .unwrap();
     let mut ctx = make_post_ctx(&ai_request("My SSN is 123-45-6789"));
     let mut headers = make_post_headers();
-    // Body is larger than 10 bytes — should skip scanning
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_continue(result);
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.metadata.get("ai_shield_warnings").map(String::as_str),
+        Some("body_too_large")
+    );
 }
 
 // ─── Multimodal content ─────────────────────────────────────────────────
@@ -1051,6 +1213,154 @@ async fn test_multimodal_content_scanned() {
     assert_reject(result, Some(400));
 }
 
+#[tokio::test]
+async fn test_adjacent_text_parts_detect_email_at_every_scalar_boundary() {
+    let plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
+    let sensitive = "alice@example.com";
+
+    for split in sensitive
+        .char_indices()
+        .map(|(index, _)| index)
+        .filter(|index| *index > 0)
+    {
+        let mut ctx = make_post_ctx(&json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": &sensitive[..split]},
+                    {"type": "text", "text": &sensitive[split..]}
+                ]
+            }]
+        }));
+        let mut headers = make_post_headers();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    }
+}
+
+#[tokio::test]
+async fn test_adjacent_text_parts_detect_many_part_and_unicode_custom_matches() {
+    let email_plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
+    let parts: Vec<serde_json::Value> = "alice@example.com"
+        .chars()
+        .map(|character| json!({"type": "text", "text": character.to_string()}))
+        .collect();
+    let mut ctx = make_post_ctx(&json!({
+        "messages": [{"role": "user", "content": parts}]
+    }));
+    let mut headers = make_post_headers();
+    assert_reject(
+        email_plugin.before_proxy(&mut ctx, &mut headers).await,
+        Some(400),
+    );
+
+    let unicode_plugin = AiPromptShield::new(&json!({
+        "patterns": [],
+        "custom_patterns": [{"name": "unicode_word", "regex": "café"}]
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "caf"},
+                {"type": "text", "text": "é"}
+            ]
+        }]
+    }));
+    let mut headers = make_post_headers();
+    assert_reject(
+        unicode_plugin.before_proxy(&mut ctx, &mut headers).await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn test_cross_part_match_warns_and_redact_fails_closed() {
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "alice@"},
+                {"type": "text", "text": "example.com"}
+            ]
+        }]
+    });
+
+    let warn_plugin = AiPromptShield::new(&json!({
+        "action": "warn",
+        "patterns": ["email"]
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&request);
+    let mut headers = make_post_headers();
+    assert_continue(warn_plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.metadata.get("ai_shield_warnings").map(String::as_str),
+        Some("email")
+    );
+
+    let redact_plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "patterns": ["email"]
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&request);
+    let mut headers = make_post_headers();
+    assert_reject(
+        redact_plugin.before_proxy(&mut ctx, &mut headers).await,
+        Some(400),
+    );
+    assert!(!ctx.metadata.contains_key("ai_shield_redacted"));
+}
+
+#[tokio::test]
+async fn test_cross_part_scan_respects_logical_boundaries() {
+    let plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
+
+    for request in [
+        json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "alice@"},
+                    {"type": "image_url", "image_url": {"url": "https://example.invalid/x"}},
+                    {"type": "text", "text": "example.com"}
+                ]
+            }]
+        }),
+        json!({
+            "messages": [
+                {"role": "user", "content": "alice@"},
+                {"role": "user", "content": "example.com"}
+            ]
+        }),
+    ] {
+        let mut ctx = make_post_ctx(&request);
+        let mut headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}
+
+#[tokio::test]
+async fn test_structured_responses_input_detects_cross_part_match() {
+    let plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4o",
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "alice@"},
+                {"type": "input_text", "text": "example.com"}
+            ]
+        }]
+    }));
+    let mut headers = make_post_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
 // ─── Custom redaction placeholder ───────────────────────────────────────
 
 #[tokio::test]
@@ -1070,6 +1380,54 @@ async fn test_custom_redaction_placeholder() {
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     let content = modified["messages"][0]["content"].as_str().unwrap();
     assert!(content.contains("***ssn***"));
+}
+
+#[tokio::test]
+async fn test_redaction_placeholders_are_literal_not_capture_expansions() {
+    for placeholder in ["$0", "$1", "${name}", "$$"] {
+        let plugin = AiPromptShield::new(&json!({
+            "action": "redact",
+            "patterns": ["email"],
+            "redaction_placeholder": placeholder
+        }))
+        .unwrap();
+        let mut ctx = make_post_ctx(&ai_request("Contact alice@example.com"));
+        let mut headers = make_post_headers();
+
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        let stored = ctx.metadata.get("request_body").unwrap();
+        assert!(
+            !stored.contains("alice@example.com"),
+            "{placeholder:?} must not reinsert the regex match: {stored}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(stored).unwrap();
+        assert_eq!(
+            parsed["messages"][0]["content"],
+            json!(format!("Contact {placeholder}"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_literal_placeholder_applies_to_recursive_strings_and_numeric_scalars() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "patterns": ["ssn"],
+        "scan_fields": "all",
+        "redaction_placeholder": "$0"
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "note": "123-45-6789",
+        "nested": {"ssn": 987654321i64}
+    }));
+    let mut headers = make_post_headers();
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let parsed: serde_json::Value =
+        serde_json::from_str(ctx.metadata.get("request_body").unwrap()).unwrap();
+    assert_eq!(parsed["note"], "$0");
+    assert_eq!(parsed["nested"]["ssn"], "$0");
 }
 
 // ─── Non-POST / non-JSON passthrough ────────────────────────────────────
@@ -1097,6 +1455,245 @@ async fn test_non_json_content_type_passes() {
     headers.insert("content-type".to_string(), "text/plain".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_framed_grpc_json_media_types_are_explicitly_skipped() {
+    let plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
+
+    for content_type in [
+        "application/grpc+json",
+        "application/grpc-web+json",
+        "application/grpc-web-text+json; charset=utf-8",
+    ] {
+        let mut ctx = create_test_context();
+        ctx.method = "POST".to_string();
+        ctx.headers
+            .insert("content-type".to_string(), content_type.to_string());
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            "\0\0\0\0\u{0012}{\"prompt\":\"a@b.com\"}".to_string(),
+        );
+        assert!(!plugin.should_buffer_request_body(&ctx));
+
+        let mut headers = ctx.headers.clone();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert!(
+            plugin
+                .transform_request_body(
+                    b"\0\0\0\0\x12{\"prompt\":\"a@b.com\"}",
+                    Some(content_type),
+                    &headers,
+                )
+                .await
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_compressed_body_is_deferred_then_reject_policy_runs_on_plaintext() {
+    let plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    let mut headers = make_post_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    ctx.headers = headers.clone();
+
+    assert!(plugin.should_buffer_request_body(&ctx));
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    headers.remove("content-encoding");
+    let body = serde_json::to_vec(&ai_request("Contact alice@example.com")).unwrap();
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "the deferral marker must prevent pre-decompression shield transforms even after the encoding header is stripped"
+    );
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn test_compressed_body_final_hook_handles_clean_warn_and_redact_actions() {
+    for (action, content, expected_reject, expected_metadata) in [
+        ("reject", "clean prompt", false, None),
+        ("warn", "Contact alice@example.com", false, Some("email")),
+        ("redact", "Contact alice@example.com", true, None),
+    ] {
+        let plugin = AiPromptShield::new(&json!({
+            "action": action,
+            "patterns": ["email"]
+        }))
+        .unwrap();
+        let mut ctx = create_test_context();
+        ctx.method = "POST".to_string();
+        let mut headers = make_post_headers();
+        headers.insert("content-encoding".to_string(), "br".to_string());
+        ctx.headers = headers.clone();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+        headers.remove("content-encoding");
+        let body = serde_json::to_vec(&ai_request(content)).unwrap();
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await;
+        if expected_reject {
+            assert_reject(result, Some(400));
+        } else {
+            assert_continue(result);
+        }
+        if let Some(expected) = expected_metadata {
+            assert_eq!(
+                ctx.metadata.get("ai_shield_warnings").map(String::as_str),
+                Some(expected)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_compressed_body_without_decompressor_fails_closed() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "redact",
+        "patterns": ["email"]
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    let mut headers = make_post_headers();
+    headers.insert("content-encoding".to_string(), "identity, gzip".to_string());
+    ctx.headers = headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, b"not-plaintext")
+            .await,
+        Some(400),
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_shield_rejected").map(String::as_str),
+        Some("compressed_body")
+    );
+}
+
+#[tokio::test]
+async fn test_deferred_body_fails_closed_on_malformed_or_non_utf8_plaintext() {
+    for (body, expected_reason) in [
+        (Vec::new(), "malformed_json"),
+        (b"{not-json".to_vec(), "malformed_json"),
+        (vec![0xff, 0xfe], "non_utf8_body"),
+    ] {
+        let plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
+        let mut ctx = create_test_context();
+        ctx.method = "POST".to_string();
+        let mut headers = make_post_headers();
+        headers.insert("content-encoding".to_string(), "gzip".to_string());
+        ctx.headers = headers.clone();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+        headers.remove("content-encoding");
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, &body)
+                .await,
+            Some(400),
+        );
+        assert_eq!(
+            ctx.metadata.get("ai_shield_rejected").map(String::as_str),
+            Some(expected_reason)
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_deferred_plaintext_above_scan_ceiling_fails_closed() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "reject",
+        "patterns": ["email"],
+        "max_scan_bytes": 10
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    let mut headers = make_post_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    ctx.headers = headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    headers.remove("content-encoding");
+    let body = serde_json::to_vec(&ai_request("Contact alice@example.com")).unwrap();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await,
+        Some(413),
+    );
+}
+
+#[tokio::test]
+async fn test_compressed_warn_without_decompressor_records_uninspectable_event() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "warn",
+        "patterns": ["email"]
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    let mut headers = make_post_headers();
+    headers.insert("content-encoding".to_string(), "gzip, br".to_string());
+    ctx.headers = headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, b"encoded")
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_shield_warnings").map(String::as_str),
+        Some("compressed_body")
+    );
+}
+
+#[tokio::test]
+async fn test_multiple_shield_instances_keep_independent_compressed_markers() {
+    let ssn_plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
+    let email_plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    let mut headers = make_post_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    ctx.headers = headers.clone();
+
+    assert_continue(ssn_plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(email_plugin.before_proxy(&mut ctx, &mut headers).await);
+    headers.remove("content-encoding");
+    let body = serde_json::to_vec(&ai_request("Contact alice@example.com")).unwrap();
+
+    assert_continue(
+        ssn_plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await,
+    );
+    assert_reject(
+        email_plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await,
+        Some(400),
+    );
 }
 
 #[tokio::test]

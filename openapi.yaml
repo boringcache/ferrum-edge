@@ -15727,7 +15727,19 @@ components:
 
     AiPromptShieldConfig:
       type: object
-      description: "Plugin: ai_prompt_shield — PII detection and redaction in prompts."
+      additionalProperties: false
+      description: "Plugin: ai_prompt_shield — PII detection and redaction in bare JSON AI prompts. Native protobuf/framed gRPC and gRPC-Web bodies are outside the JSON inspection scope."
+      anyOf:
+        - not:
+            required: [patterns]
+        - required: [patterns]
+          properties:
+            patterns:
+              minItems: 1
+        - required: [custom_patterns]
+          properties:
+            custom_patterns:
+              minItems: 1
       properties:
         action:
           type: string
@@ -15738,6 +15750,7 @@ components:
           type: array
           items:
             type: string
+            enum: [ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban]
           default: [ssn, credit_card, api_key, aws_key]
           description: "Built-in patterns: ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban"
         custom_patterns:
@@ -15756,7 +15769,7 @@ components:
           type: string
           enum: [content, all]
           default: content
-          description: "Which parts of the request to scan. 'content' scans LLM prompt fields only: chat messages[].content plus top-level prompt, input, and system (completions/responses/embeddings/Anthropic-system shapes). 'all' scans the entire request body recursively (structural keys like model/id/role excepted). Use 'all' for request shapes that carry prompt text in non-standard fields."
+          description: "Which parts of the request to scan. 'content' scans LLM prompt fields only: chat messages[].content plus top-level prompt, input, instructions, and system (completions/responses/embeddings/Anthropic-system shapes), including matches split across adjacent text parts. 'all' scans the entire request body recursively while exempting only top-level structural scalar values such as model/id/role and numeric tuning parameters; nested occurrences remain scannable. Use 'all' for request shapes that carry prompt text in non-standard fields."
         exclude_roles:
           type: array
           items:
@@ -15769,8 +15782,9 @@ components:
           description: Template for redacted text
         max_scan_bytes:
           type: integer
+          minimum: 1
           default: 1048576
-          description: Skip scanning if body exceeds this size
+          description: Maximum body size to scan; enforcing actions reject larger bodies instead of bypassing inspection
 
     AiPromptCompressorConfig:
       type: object

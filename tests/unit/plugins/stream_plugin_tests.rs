@@ -770,10 +770,7 @@ fn test_http_grpc_plugins_complete_coverage() {
         ("ai_token_metrics", json!({})),
         ("ai_request_guard", json!({"max_messages": 100})),
         ("ai_rate_limiter", json!({"token_limit": 1000})),
-        (
-            "ai_prompt_shield",
-            json!({"endpoint": "http://example.com/shield"}),
-        ),
+        ("ai_prompt_shield", json!({})),
     ];
 
     for (name, config) in plugins {
