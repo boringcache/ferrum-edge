@@ -35,13 +35,13 @@ spec:
   selector:
     {{- include "ferrum-gateway.selectorLabels" . | nindent 4 }}
   ports:
-    {{- if and (hasKey $ports "proxyHttp") (ne ($ports.proxyHttp | toString) "0") }}
+    {{- if $hasHttp }}
     - name: http
       port: {{ .Values.service.httpPort | default 80 }}
       targetPort: proxy-http
       protocol: TCP
     {{- end }}
-    {{- if and (hasKey $ports "proxyHttps") (ne ($ports.proxyHttps | toString) "0") $httpsListenerActive }}
+    {{- if $hasHttps }}
     - name: https
       port: {{ .Values.service.httpsPort | default 443 }}
       targetPort: proxy-https
