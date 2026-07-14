@@ -1,6 +1,13 @@
+use regex::Regex;
+use serde::Deserialize;
 use serde_json::json;
 use serde_yaml::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
+
+const OPENAPI_HTTP_METHODS: &[&str] = &[
+    "get", "post", "put", "patch", "delete", "head", "options", "trace",
+];
 
 fn get_path<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
     let mut current = value;
@@ -10,6 +17,443 @@ fn get_path<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
             .unwrap_or_else(|| panic!("missing OpenAPI path component: {key}"));
     }
     current
+}
+
+#[derive(Default)]
+struct SerdeStructFieldCollector {
+    fields: BTreeSet<String>,
+}
+
+// A derived `Deserialize` implementation passes its complete accepted field
+// list to `deserialize_struct` before reading any values. Capture that list so
+// new/renamed Rust fields fail parity without maintaining a second Rust-field
+// manifest in this test.
+impl<'de> serde::Deserializer<'de> for &mut SerdeStructFieldCollector {
+    type Error = serde::de::value::Error;
+
+    fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::Error::custom("expected a derived struct"))
+    }
+
+    fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        _visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.fields
+            .extend(fields.iter().map(|field| (*field).to_string()));
+        Err(serde::de::Error::custom("field inventory collected"))
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct
+        map enum identifier ignored_any
+    }
+}
+
+fn serde_struct_field_names<T>() -> BTreeSet<String>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut collector = SerdeStructFieldCollector::default();
+    let _ = T::deserialize(&mut collector);
+    assert!(
+        !collector.fields.is_empty(),
+        "{} did not deserialize through deserialize_struct",
+        std::any::type_name::<T>()
+    );
+    collector.fields
+}
+
+fn schema_property_names(
+    spec: &serde_json::Value,
+    schema_label: &str,
+    properties_pointer: &str,
+) -> BTreeSet<String> {
+    spec.pointer(properties_pointer)
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or_else(|| panic!("{schema_label} must define object properties"))
+        .keys()
+        .cloned()
+        .collect()
+}
+
+fn assert_serde_schema_field_parity<T>(
+    spec: &serde_json::Value,
+    schema_label: &str,
+    properties_pointer: &str,
+    intentionally_undocumented: &[&str],
+    schema_only: &[&str],
+) where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut serde_fields = serde_struct_field_names::<T>();
+    let mut schema_fields = schema_property_names(spec, schema_label, properties_pointer);
+
+    for field in intentionally_undocumented {
+        assert!(
+            serde_fields.remove(*field),
+            "stale undocumented-field exception {schema_label}.{field}"
+        );
+    }
+    for field in schema_only {
+        assert!(
+            schema_fields.remove(*field),
+            "stale schema-only exception {schema_label}.{field}"
+        );
+    }
+
+    assert_eq!(
+        serde_fields,
+        schema_fields,
+        "Serde/OpenAPI field inventory drift for {schema_label} ({})",
+        std::any::type_name::<T>()
+    );
+}
+
+fn assert_serde_component_field_parity<T>(
+    spec: &serde_json::Value,
+    component: &str,
+    intentionally_undocumented: &[&str],
+    schema_only: &[&str],
+) where
+    T: for<'de> Deserialize<'de>,
+{
+    assert_serde_schema_field_parity::<T>(
+        spec,
+        component,
+        &format!("/components/schemas/{component}/properties"),
+        intentionally_undocumented,
+        schema_only,
+    );
+}
+
+#[test]
+fn typed_component_properties_match_serde_field_inventories() {
+    use ferrum_edge::config::types::{
+        ActiveHealthCheck, BackendTlsConfig, CircuitBreakerConfig, ConsulConfig, Consumer,
+        DnsSdConfig, HashOnCookieConfig, HealthCheckConfig, KubernetesConfig, LocalityDistribute,
+        LocalityFailover, MeshSdConfig, PassiveHealthCheck, PluginAssociation, PluginConfig, Proxy,
+        RetryConfig, ServiceDiscoveryConfig, SubsetDefinition, SubsetTrafficPolicy,
+        TcpKeepaliveCfg, Upstream, UpstreamLocalityLbSetting, UpstreamPortOverride, UpstreamTarget,
+    };
+    use ferrum_edge::modes::mesh::config::MeshTrafficPolicyTls;
+    use ferrum_edge::modes::mesh::slice::{MeshEgressScopeResource, MeshEgressScopeSnapshot};
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    macro_rules! check {
+        ($type:ty, $component:literal) => {
+            assert_serde_component_field_parity::<$type>(&spec, $component, &[], &[])
+        };
+        ($type:ty, $component:literal, rust_only = [$($rust_only:literal),* $(,)?], schema_only = [$($schema_only:literal),* $(,)?]) => {
+            assert_serde_component_field_parity::<$type>(
+                &spec,
+                $component,
+                &[$($rust_only),*],
+                &[$($schema_only),*],
+            )
+        };
+    }
+
+    macro_rules! check_at {
+        ($type:ty, $schema_label:literal, $properties_pointer:literal) => {
+            assert_serde_schema_field_parity::<$type>(
+                &spec,
+                $schema_label,
+                $properties_pointer,
+                &[],
+                &[],
+            )
+        };
+    }
+
+    check!(Proxy, "Proxy");
+    check!(Consumer, "Consumer");
+    check!(PluginConfig, "PluginConfig");
+    check!(PluginAssociation, "PluginAssociation");
+    check!(Upstream, "Upstream");
+    check!(UpstreamTarget, "UpstreamTarget");
+    check!(SubsetDefinition, "SubsetDefinition");
+    check!(SubsetTrafficPolicy, "SubsetTrafficPolicy");
+    check!(UpstreamPortOverride, "UpstreamPortOverride");
+    check!(TcpKeepaliveCfg, "TcpKeepaliveCfg");
+    check!(UpstreamLocalityLbSetting, "UpstreamLocalityLbSetting");
+    check!(LocalityDistribute, "LocalityDistribute");
+    check!(LocalityFailover, "LocalityFailover");
+    check!(MeshTrafficPolicyTls, "MeshTrafficPolicyTls");
+    check!(BackendTlsConfig, "BackendTlsConfig");
+    check!(HealthCheckConfig, "HealthCheckConfig");
+    check!(ActiveHealthCheck, "ActiveHealthCheck");
+    check!(PassiveHealthCheck, "PassiveHealthCheck");
+    check!(HashOnCookieConfig, "HashOnCookieConfig");
+    check!(ServiceDiscoveryConfig, "ServiceDiscoveryConfig");
+    check_at!(
+        DnsSdConfig,
+        "ServiceDiscoveryConfig.dns_sd",
+        "/components/schemas/ServiceDiscoveryConfig/properties/dns_sd/properties"
+    );
+    check_at!(
+        KubernetesConfig,
+        "ServiceDiscoveryConfig.kubernetes",
+        "/components/schemas/ServiceDiscoveryConfig/properties/kubernetes/properties"
+    );
+    check_at!(
+        ConsulConfig,
+        "ServiceDiscoveryConfig.consul",
+        "/components/schemas/ServiceDiscoveryConfig/properties/consul/properties"
+    );
+    check_at!(
+        MeshSdConfig,
+        "ServiceDiscoveryConfig.mesh",
+        "/components/schemas/ServiceDiscoveryConfig/properties/mesh/properties"
+    );
+    check!(CircuitBreakerConfig, "CircuitBreakerConfig");
+    check!(RetryConfig, "RetryConfig");
+    check!(MeshEgressScopeSnapshot, "MeshEgressScopeSnapshot");
+    check!(MeshEgressScopeResource, "MeshEgressScopeResource");
+}
+
+fn normalized_path_template(path: &str) -> String {
+    static PATH_PARAMETER: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\{[^}]+\}").expect("path-template regex compiles"));
+    PATH_PARAMETER.replace_all(path, "{}").into_owned()
+}
+
+fn openapi_operations(spec: &serde_json::Value) -> BTreeSet<(String, String)> {
+    let paths = spec["paths"]
+        .as_object()
+        .expect("OpenAPI paths is an object");
+    let mut operations = BTreeSet::new();
+
+    for (path, path_item) in paths {
+        let path_item = path_item
+            .as_object()
+            .unwrap_or_else(|| panic!("path item {path} is an object"));
+        for method in OPENAPI_HTTP_METHODS {
+            if path_item.contains_key(*method) {
+                operations.insert((method.to_ascii_uppercase(), normalized_path_template(path)));
+            }
+        }
+    }
+
+    operations
+}
+
+fn implemented_admin_operations() -> BTreeSet<(String, String)> {
+    let source = include_str!("../../src/admin/mod.rs");
+    let match_arm =
+        Regex::new(r#"\(Method::(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS),\s*\[([^\]]*)\]\)"#)
+            .expect("admin match-arm regex compiles");
+    let direct_guard =
+        Regex::new(r#"if\s+path\s*==\s*"([^"]+)"\s*&&\s*method\s*==\s*Method::([A-Z]+)"#)
+            .expect("direct-route regex compiles");
+    let mut operations = BTreeSet::new();
+
+    for captures in match_arm.captures_iter(source) {
+        let method = captures[1].to_string();
+        let segments = captures[2]
+            .split(',')
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| {
+                segment
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                    .unwrap_or("{}")
+            })
+            .collect::<Vec<_>>();
+        operations.insert((method, format!("/{}", segments.join("/"))));
+    }
+
+    for captures in direct_guard.captures_iter(source) {
+        operations.insert((captures[2].to_string(), captures[1].to_string()));
+    }
+
+    // These probe handlers intentionally run before method-based dispatch.
+    // Keep their intended public GET contract explicit so adding another
+    // method-agnostic direct handler requires a conscious test update.
+    for path in ["/live", "/health", "/status"] {
+        assert!(source.contains(&format!("path == \"{path}\"")));
+        operations.insert(("GET".to_string(), path.to_string()));
+    }
+
+    operations
+}
+
+#[test]
+fn every_documented_operation_matches_an_admin_dispatch_route() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    assert_eq!(
+        openapi_operations(&spec),
+        implemented_admin_operations(),
+        "OpenAPI and src/admin/mod.rs method/path inventories diverged"
+    );
+}
+
+fn collect_openapi_inventory(
+    value: &serde_json::Value,
+    refs: &mut BTreeSet<String>,
+    deprecated_nullable_paths: &mut Vec<String>,
+    path: &str,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, child) in object {
+                let child_path = format!("{path}/{key}");
+                if key == "$ref" {
+                    refs.insert(
+                        child
+                            .as_str()
+                            .unwrap_or_else(|| panic!("$ref at {child_path} is a string"))
+                            .to_string(),
+                    );
+                }
+                if key == "nullable" {
+                    deprecated_nullable_paths.push(child_path.clone());
+                }
+                collect_openapi_inventory(child, refs, deprecated_nullable_paths, &child_path);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_openapi_inventory(
+                    child,
+                    refs,
+                    deprecated_nullable_paths,
+                    &format!("{path}/{index}"),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn openapi_inventory_has_unique_operations_resolved_refs_and_no_orphan_schemas() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let mut operation_ids = Vec::new();
+
+    for (path, path_item) in spec["paths"].as_object().expect("paths is an object") {
+        let path_item = path_item
+            .as_object()
+            .unwrap_or_else(|| panic!("path item {path} is an object"));
+        for method in OPENAPI_HTTP_METHODS {
+            let Some(operation) = path_item.get(*method) else {
+                continue;
+            };
+            operation_ids.push(
+                operation["operationId"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{method} {path} is missing operationId"))
+                    .to_string(),
+            );
+            assert!(
+                operation["responses"]
+                    .as_object()
+                    .is_some_and(|value| !value.is_empty()),
+                "{method} {path} must document at least one response"
+            );
+        }
+    }
+
+    let unique_operation_ids: BTreeSet<_> = operation_ids.iter().collect();
+    assert_eq!(
+        operation_ids.len(),
+        unique_operation_ids.len(),
+        "operationId values must be unique"
+    );
+
+    let mut refs = BTreeSet::new();
+    let mut deprecated_nullable_paths = Vec::new();
+    collect_openapi_inventory(&spec, &mut refs, &mut deprecated_nullable_paths, "");
+    assert!(
+        deprecated_nullable_paths.is_empty(),
+        "OpenAPI 3.1 must use native null unions instead of nullable: {deprecated_nullable_paths:?}"
+    );
+
+    for reference in &refs {
+        let pointer = reference
+            .strip_prefix('#')
+            .unwrap_or_else(|| panic!("external OpenAPI reference is unsupported: {reference}"));
+        assert!(
+            spec.pointer(pointer).is_some(),
+            "unresolved OpenAPI reference: {reference}"
+        );
+    }
+
+    let schemas = spec["components"]["schemas"]
+        .as_object()
+        .expect("component schemas is an object");
+    let mut path_refs = BTreeSet::new();
+    let mut ignored_nullable_paths = Vec::new();
+    collect_openapi_inventory(
+        &spec["paths"],
+        &mut path_refs,
+        &mut ignored_nullable_paths,
+        "/paths",
+    );
+    let mut pending_refs: Vec<_> = path_refs.into_iter().collect();
+    let mut reachable_refs = BTreeSet::new();
+    while let Some(reference) = pending_refs.pop() {
+        if !reachable_refs.insert(reference.clone()) {
+            continue;
+        }
+        let pointer = reference
+            .strip_prefix('#')
+            .unwrap_or_else(|| panic!("external OpenAPI reference is unsupported: {reference}"));
+        let referenced_value = spec
+            .pointer(pointer)
+            .unwrap_or_else(|| panic!("unresolved OpenAPI reference: {reference}"));
+        let mut nested_refs = BTreeSet::new();
+        collect_openapi_inventory(
+            referenced_value,
+            &mut nested_refs,
+            &mut ignored_nullable_paths,
+            pointer,
+        );
+        pending_refs.extend(nested_refs);
+    }
+
+    let referenced_schemas: BTreeSet<_> = reachable_refs
+        .iter()
+        .filter_map(|reference| {
+            reference
+                .strip_prefix("#/components/schemas/")
+                .and_then(|suffix| suffix.split('/').next())
+        })
+        .collect();
+    let orphan_schemas: Vec<_> = schemas
+        .keys()
+        .filter(|schema| !referenced_schemas.contains(schema.as_str()))
+        .collect();
+    assert!(
+        orphan_schemas.is_empty(),
+        "unreferenced component schemas: {orphan_schemas:?}"
+    );
+
+    for schema_name in schemas.keys() {
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$ref": format!("#/components/schemas/{schema_name}"),
+            "components": spec["components"].clone()
+        });
+        jsonschema::draft202012::options()
+            .build(&schema)
+            .unwrap_or_else(|error| panic!("{schema_name} schema compiles: {error}"));
+    }
 }
 
 #[test]
