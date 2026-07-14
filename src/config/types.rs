@@ -3083,6 +3083,14 @@ impl GatewayConfig {
             .collect()
     }
 
+    /// Whether the named proxy has at least one enabled `mtls_auth` instance
+    /// after resolving local association shadowing against global instances.
+    pub(crate) fn has_effective_mtls_auth_for_proxy(&self, proxy_id: &str) -> bool {
+        self.effective_mtls_auth_plugins_by_proxy()
+            .into_iter()
+            .any(|(proxy, plugins)| proxy.id == proxy_id && !plugins.is_empty())
+    }
+
     fn mtls_auth_compatibility_errors(&self) -> Vec<String> {
         let mut errors = Vec::new();
 

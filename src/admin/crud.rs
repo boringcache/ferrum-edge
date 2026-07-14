@@ -65,10 +65,18 @@ pub(crate) enum ValidationError {
 const MTLS_ADMISSION_LOCK_SHARDS: usize = 64;
 static MTLS_ADMISSION_LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
 
-/// Serialize mTLS-sensitive admin mutations for a namespace from candidate
-/// validation through persistence. A bounded process-global lock set covers
-/// every `AdminState` served by this process without retaining attacker-chosen
-/// namespace strings indefinitely.
+/// Best-effort serialization of mTLS-sensitive admin mutations for a namespace
+/// from candidate validation through persistence. A bounded process-global
+/// lock set covers every `AdminState` served by this process without retaining
+/// attacker-chosen namespace strings indefinitely.
+///
+/// The datastore's exact mTLS credential index remains the authoritative
+/// cross-process backstop for exact identities. The additional ASCII-folded
+/// `san_dns` constraint is conditional on effective plugin associations, so it
+/// cannot use an unconditional case-folded unique index without rejecting valid
+/// case variants used by exact-match policies. Fully serializing that dynamic
+/// check across SQL and MongoDB writers requires backend-specific transactions;
+/// this lock deliberately does not claim to coordinate separate admin processes.
 pub(crate) async fn lock_mtls_admission(namespace: &str) -> MutexGuard<'static, ()> {
     let locks = MTLS_ADMISSION_LOCKS.get_or_init(|| {
         (0..MTLS_ADMISSION_LOCK_SHARDS)
@@ -114,6 +122,11 @@ async fn validate_mtls_auth_candidate(
         config
             .plugin_configs
             .retain(|plugin| plugin.id != removed_plugin_id);
+    }
+    if proxy
+        .is_some_and(|candidate| !config.has_effective_mtls_auth_for_proxy(candidate.id.as_str()))
+    {
+        return Ok(());
     }
     let mut errors = config
         .validate_mtls_auth_compatibility()
@@ -2206,9 +2219,10 @@ impl AdminResource for Proxy {
         }
 
         // HTTP proxy associations can make a dormant/global `san_dns` policy
-        // effective just as stream proxies can, so candidate DNS identity
-        // validation is required for every transport. The compatibility
-        // validator itself remains stream-specific.
+        // effective just as stream proxies can. The candidate helper checks
+        // every transport but returns immediately when this proxy has no
+        // effective `mtls_auth` association; compatibility validation itself
+        // remains stream-specific.
         validate_mtls_auth_candidate(db, namespace, Some(resource), None, None).await?;
 
         if resource.dispatch_kind.is_stream()
