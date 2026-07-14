@@ -222,6 +222,21 @@ impl ServerlessFunction {
         }
         let error_status_code = raw_status as u16;
 
+        // Validate `function_url` whenever it is supplied, including for AWS
+        // Lambda where invocation uses a derived URL. This keeps runtime
+        // admission aligned with the OpenAPI field schema instead of silently
+        // accepting an invalid value only because this provider ignores it.
+        let configured_function_url = match config.get("function_url") {
+            Some(Value::String(url)) => {
+                validate_function_url(url)?;
+                Some(url.clone())
+            }
+            None => None,
+            Some(_) => {
+                return Err("serverless_function: 'function_url' must be a string".to_string());
+            }
+        };
+
         // Provider-specific config + URL construction.
         // Config fields take precedence; well-known env vars are used as fallback.
         let (function_url, aws_config, azure_function_key, gcp_authorization_header) =
@@ -330,12 +345,10 @@ impl ServerlessFunction {
                     (url, Some(aws_cfg), None, None)
                 }
                 Provider::AzureFunctions => {
-                    let url = optional_config_string(config, "function_url")?.ok_or_else(|| {
+                    let url = configured_function_url.ok_or_else(|| {
                         "serverless_function: 'function_url' is required for azure_functions"
                             .to_string()
                     })?;
-
-                    validate_function_url(&url)?;
 
                     let key = optional_config_string(config, "azure_function_key")?
                         .or_else(|| env_non_empty("AZURE_FUNCTIONS_KEY"));
@@ -353,12 +366,10 @@ impl ServerlessFunction {
                     (url, None, key, None)
                 }
                 Provider::GcpCloudFunctions => {
-                    let url = optional_config_string(config, "function_url")?.ok_or_else(|| {
+                    let url = configured_function_url.ok_or_else(|| {
                         "serverless_function: 'function_url' is required for gcp_cloud_functions"
                             .to_string()
                     })?;
-
-                    validate_function_url(&url)?;
 
                     let token = optional_config_string(config, "gcp_bearer_token")?
                         .or_else(|| env_non_empty("GCP_CLOUD_FUNCTIONS_BEARER_TOKEN"));

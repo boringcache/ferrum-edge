@@ -9,9 +9,10 @@ use ferrum_edge::config::types::{
     MAX_NAME_LENGTH, MAX_PLUGIN_CONFIG_SIZE, MAX_POOL_SQL_INTEGER_VALUE, MAX_SD_STRING_LENGTH,
     MAX_TARGETS_PER_UPSTREAM, MAX_TIMEOUT_MS, MAX_USERNAME_LENGTH, MAX_WEBSOCKET_IDLE_TIMEOUT,
     MIN_HTTP2_MAX_FRAME_SIZE, MIN_HTTP2_WINDOW_SIZE, MeshSdConfig, PassiveHealthCheck,
-    PluginConfig, PluginScope, Proxy, RetryConfig, SdProvider, ServiceDiscoveryConfig, Upstream,
-    UpstreamTarget,
+    PluginConfig, PluginScope, Proxy, RetryConfig, SdProvider, ServiceDiscoveryConfig,
+    SubsetDefinition, SubsetTrafficPolicy, Upstream, UpstreamTarget,
 };
+use ferrum_edge::modes::mesh::config::MeshTrafficPolicyTls;
 use std::collections::HashMap;
 
 /// Helper to create a minimal valid proxy.
@@ -982,6 +983,41 @@ fn test_upstream_locality_lb_setting_rejected_by_admin_api() {
     assert!(
         upstream.validate_fields().is_ok(),
         "validate_fields must not reject a mesh-projected locality_lb_setting on the runtime path"
+    );
+}
+
+#[test]
+fn test_upstream_mesh_projected_subset_fields_rejected_by_admin_api() {
+    let mut upstream = make_upstream("test");
+    upstream.subsets = Some(vec![SubsetDefinition {
+        name: "v1".to_string(),
+        labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+        traffic_policy: Some(SubsetTrafficPolicy {
+            load_balancer_algorithm: None,
+            hash_on: None,
+            tls: Some(MeshTrafficPolicyTls::default()),
+            connect_timeout_ms: Some(1_000),
+            passive_health_check: Some(PassiveHealthCheck::default()),
+        }),
+    }]);
+
+    let errors = upstream
+        .validate_operator_provided_fields()
+        .expect_err("mesh-projected subset fields must be rejected on operator writes");
+    for field in ["tls", "connect_timeout_ms", "passive_health_check"] {
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("subsets[0].traffic_policy")
+                    && error.contains(field)
+                    && error.contains("cannot be set directly via the admin API")
+            }),
+            "expected an operator-write rejection for {field}, got: {errors:?}"
+        );
+    }
+
+    assert!(
+        upstream.validate_fields().is_ok(),
+        "runtime mesh apply must continue accepting its projected subset fields"
     );
 }
 

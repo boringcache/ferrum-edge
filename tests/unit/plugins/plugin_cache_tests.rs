@@ -27,7 +27,7 @@ impl Plugin for LegacyAuthorizePlugin {
 }
 
 /// Returns the minimal valid config for a given plugin name so that `create_plugin` succeeds.
-fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
+pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
     match plugin_name {
         "access_control" => json!({"allowed_consumers": ["testuser"]}),
         "tcp_connection_throttle" => json!({"max_connections_per_key": 10}),

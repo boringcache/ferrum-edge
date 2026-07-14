@@ -1,6 +1,13 @@
+use regex::Regex;
+use serde::Deserialize;
 use serde_json::json;
 use serde_yaml::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
+
+const OPENAPI_HTTP_METHODS: &[&str] = &[
+    "get", "post", "put", "patch", "delete", "head", "options", "trace",
+];
 
 fn get_path<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
     let mut current = value;
@@ -10,6 +17,455 @@ fn get_path<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
             .unwrap_or_else(|| panic!("missing OpenAPI path component: {key}"));
     }
     current
+}
+
+#[derive(Default)]
+struct SerdeStructFieldCollector {
+    fields: BTreeSet<String>,
+}
+
+// A derived `Deserialize` implementation passes its complete accepted field
+// list to `deserialize_struct` before reading any values. Capture that list so
+// new/renamed Rust fields fail parity without maintaining a second Rust-field
+// manifest in this test.
+impl<'de> serde::Deserializer<'de> for &mut SerdeStructFieldCollector {
+    type Error = serde::de::value::Error;
+
+    fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::Error::custom("expected a derived struct"))
+    }
+
+    fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        _visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.fields
+            .extend(fields.iter().map(|field| (*field).to_string()));
+        Err(serde::de::Error::custom("field inventory collected"))
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct
+        map enum identifier ignored_any
+    }
+}
+
+fn serde_struct_field_names<T>() -> BTreeSet<String>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut collector = SerdeStructFieldCollector::default();
+    let _ = T::deserialize(&mut collector);
+    assert!(
+        !collector.fields.is_empty(),
+        "{} did not deserialize through deserialize_struct",
+        std::any::type_name::<T>()
+    );
+    collector.fields
+}
+
+fn schema_property_names(
+    spec: &serde_json::Value,
+    schema_label: &str,
+    properties_pointer: &str,
+) -> BTreeSet<String> {
+    spec.pointer(properties_pointer)
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or_else(|| panic!("{schema_label} must define object properties"))
+        .keys()
+        .cloned()
+        .collect()
+}
+
+fn assert_serde_schema_field_parity<T>(
+    spec: &serde_json::Value,
+    schema_label: &str,
+    properties_pointer: &str,
+    intentionally_undocumented: &[&str],
+    schema_only: &[&str],
+) where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut serde_fields = serde_struct_field_names::<T>();
+    let mut schema_fields = schema_property_names(spec, schema_label, properties_pointer);
+
+    for field in intentionally_undocumented {
+        assert!(
+            serde_fields.remove(*field),
+            "stale undocumented-field exception {schema_label}.{field}"
+        );
+    }
+    for field in schema_only {
+        assert!(
+            schema_fields.remove(*field),
+            "stale schema-only exception {schema_label}.{field}"
+        );
+    }
+
+    assert_eq!(
+        serde_fields,
+        schema_fields,
+        "Serde/OpenAPI field inventory drift for {schema_label} ({})",
+        std::any::type_name::<T>()
+    );
+}
+
+fn assert_serde_component_field_parity<T>(
+    spec: &serde_json::Value,
+    component: &str,
+    intentionally_undocumented: &[&str],
+    schema_only: &[&str],
+) where
+    T: for<'de> Deserialize<'de>,
+{
+    assert_serde_schema_field_parity::<T>(
+        spec,
+        component,
+        &format!("/components/schemas/{component}/properties"),
+        intentionally_undocumented,
+        schema_only,
+    );
+}
+
+#[test]
+fn typed_component_properties_match_serde_field_inventories() {
+    use ferrum_edge::config::types::{
+        ActiveHealthCheck, BackendTlsConfig, CircuitBreakerConfig, ConsulConfig, Consumer,
+        DnsSdConfig, HashOnCookieConfig, HealthCheckConfig, KubernetesConfig, LocalityDistribute,
+        LocalityFailover, MeshSdConfig, PassiveHealthCheck, PluginAssociation, PluginConfig, Proxy,
+        RetryConfig, ServiceDiscoveryConfig, SubsetDefinition, SubsetTrafficPolicy,
+        TcpKeepaliveCfg, Upstream, UpstreamLocalityLbSetting, UpstreamPortOverride, UpstreamTarget,
+    };
+    use ferrum_edge::modes::mesh::config::MeshTrafficPolicyTls;
+    use ferrum_edge::modes::mesh::slice::{MeshEgressScopeResource, MeshEgressScopeSnapshot};
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    macro_rules! check {
+        ($type:ty, $component:literal) => {
+            assert_serde_component_field_parity::<$type>(&spec, $component, &[], &[])
+        };
+        ($type:ty, $component:literal, rust_only = [$($rust_only:literal),* $(,)?], schema_only = [$($schema_only:literal),* $(,)?]) => {
+            assert_serde_component_field_parity::<$type>(
+                &spec,
+                $component,
+                &[$($rust_only),*],
+                &[$($schema_only),*],
+            )
+        };
+    }
+
+    macro_rules! check_at {
+        ($type:ty, $schema_label:literal, $properties_pointer:literal) => {
+            assert_serde_schema_field_parity::<$type>(
+                &spec,
+                $schema_label,
+                $properties_pointer,
+                &[],
+                &[],
+            )
+        };
+    }
+
+    check!(Proxy, "Proxy");
+    check!(Consumer, "Consumer");
+    check!(PluginConfig, "PluginConfig");
+    check!(PluginAssociation, "PluginAssociation");
+    check!(Upstream, "Upstream");
+    check!(UpstreamTarget, "UpstreamTarget");
+    check!(SubsetDefinition, "SubsetDefinition");
+    check!(SubsetTrafficPolicy, "SubsetTrafficPolicy");
+    check!(UpstreamPortOverride, "UpstreamPortOverride");
+    check!(TcpKeepaliveCfg, "TcpKeepaliveCfg");
+    check!(UpstreamLocalityLbSetting, "UpstreamLocalityLbSetting");
+    check!(LocalityDistribute, "LocalityDistribute");
+    check!(LocalityFailover, "LocalityFailover");
+    check!(MeshTrafficPolicyTls, "MeshTrafficPolicyTls");
+    check!(BackendTlsConfig, "BackendTlsConfig");
+    check!(HealthCheckConfig, "HealthCheckConfig");
+    check!(ActiveHealthCheck, "ActiveHealthCheck");
+    check!(PassiveHealthCheck, "PassiveHealthCheck");
+    check!(HashOnCookieConfig, "HashOnCookieConfig");
+    check!(ServiceDiscoveryConfig, "ServiceDiscoveryConfig");
+    check_at!(
+        DnsSdConfig,
+        "ServiceDiscoveryConfig.dns_sd",
+        "/components/schemas/ServiceDiscoveryConfig/properties/dns_sd/properties"
+    );
+    check_at!(
+        KubernetesConfig,
+        "ServiceDiscoveryConfig.kubernetes",
+        "/components/schemas/ServiceDiscoveryConfig/properties/kubernetes/properties"
+    );
+    check_at!(
+        ConsulConfig,
+        "ServiceDiscoveryConfig.consul",
+        "/components/schemas/ServiceDiscoveryConfig/properties/consul/properties"
+    );
+    check_at!(
+        MeshSdConfig,
+        "ServiceDiscoveryConfig.mesh",
+        "/components/schemas/ServiceDiscoveryConfig/properties/mesh/properties"
+    );
+    check!(CircuitBreakerConfig, "CircuitBreakerConfig");
+    check!(RetryConfig, "RetryConfig");
+    check!(MeshEgressScopeSnapshot, "MeshEgressScopeSnapshot");
+    check!(MeshEgressScopeResource, "MeshEgressScopeResource");
+}
+
+fn normalized_path_template(path: &str) -> String {
+    static PATH_PARAMETER: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\{[^}]+\}").expect("path-template regex compiles"));
+    PATH_PARAMETER.replace_all(path, "{}").into_owned()
+}
+
+fn openapi_operations(spec: &serde_json::Value) -> BTreeSet<(String, String)> {
+    let paths = spec["paths"]
+        .as_object()
+        .expect("OpenAPI paths is an object");
+    let mut operations = BTreeSet::new();
+
+    for (path, path_item) in paths {
+        let path_item = path_item
+            .as_object()
+            .unwrap_or_else(|| panic!("path item {path} is an object"));
+        for method in OPENAPI_HTTP_METHODS {
+            if path_item.contains_key(*method) {
+                operations.insert((method.to_ascii_uppercase(), normalized_path_template(path)));
+            }
+        }
+    }
+
+    operations
+}
+
+fn implemented_admin_operations() -> BTreeSet<(String, String)> {
+    let source = include_str!("../../src/admin/mod.rs");
+    let match_arm =
+        Regex::new(r#"\(Method::(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS),\s*\[([^\]]*)\]\)"#)
+            .expect("admin match-arm regex compiles");
+    let direct_guard =
+        Regex::new(r#"if\s+path\s*==\s*"([^"]+)"\s*&&\s*method\s*==\s*Method::([A-Z]+)"#)
+            .expect("direct-route regex compiles");
+    let mut operations = BTreeSet::new();
+
+    for captures in match_arm.captures_iter(source) {
+        let method = captures[1].to_string();
+        let segments = captures[2]
+            .split(',')
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| {
+                if let Some(literal) = segment
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                {
+                    return literal;
+                }
+
+                static IDENTIFIER: LazyLock<Regex> = LazyLock::new(|| {
+                    Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$")
+                        .expect("Rust identifier regex compiles")
+                });
+                assert!(
+                    IDENTIFIER.is_match(segment),
+                    "unsupported admin route pattern segment `{segment}`; update the inventory parser explicitly"
+                );
+                "{}"
+            })
+            .collect::<Vec<_>>();
+        operations.insert((method, format!("/{}", segments.join("/"))));
+    }
+
+    for captures in direct_guard.captures_iter(source) {
+        operations.insert((captures[2].to_string(), captures[1].to_string()));
+    }
+
+    // These probe handlers intentionally run before method-based dispatch.
+    // Keep their intended public GET contract explicit so adding another
+    // method-agnostic direct handler requires a conscious test update.
+    for path in ["/live", "/health", "/status"] {
+        assert!(source.contains(&format!("path == \"{path}\"")));
+        operations.insert(("GET".to_string(), path.to_string()));
+    }
+
+    operations
+}
+
+#[test]
+fn every_documented_operation_matches_an_admin_dispatch_route() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    assert_eq!(
+        openapi_operations(&spec),
+        implemented_admin_operations(),
+        "OpenAPI and src/admin/mod.rs method/path inventories diverged"
+    );
+}
+
+fn collect_openapi_inventory(
+    value: &serde_json::Value,
+    refs: &mut BTreeSet<String>,
+    deprecated_nullable_paths: &mut Vec<String>,
+    path: &str,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, child) in object {
+                let child_path = format!("{path}/{key}");
+                if key == "$ref" {
+                    refs.insert(
+                        child
+                            .as_str()
+                            .unwrap_or_else(|| panic!("$ref at {child_path} is a string"))
+                            .to_string(),
+                    );
+                }
+                if key == "nullable" {
+                    deprecated_nullable_paths.push(child_path.clone());
+                }
+                collect_openapi_inventory(child, refs, deprecated_nullable_paths, &child_path);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_openapi_inventory(
+                    child,
+                    refs,
+                    deprecated_nullable_paths,
+                    &format!("{path}/{index}"),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn openapi_inventory_has_unique_operations_resolved_refs_and_no_orphan_schemas() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let mut operation_ids = Vec::new();
+
+    for (path, path_item) in spec["paths"].as_object().expect("paths is an object") {
+        let path_item = path_item
+            .as_object()
+            .unwrap_or_else(|| panic!("path item {path} is an object"));
+        for method in OPENAPI_HTTP_METHODS {
+            let Some(operation) = path_item.get(*method) else {
+                continue;
+            };
+            operation_ids.push(
+                operation["operationId"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{method} {path} is missing operationId"))
+                    .to_string(),
+            );
+            assert!(
+                operation["responses"]
+                    .as_object()
+                    .is_some_and(|value| !value.is_empty()),
+                "{method} {path} must document at least one response"
+            );
+        }
+    }
+
+    let unique_operation_ids: BTreeSet<_> = operation_ids.iter().collect();
+    assert_eq!(
+        operation_ids.len(),
+        unique_operation_ids.len(),
+        "operationId values must be unique"
+    );
+
+    let mut refs = BTreeSet::new();
+    let mut deprecated_nullable_paths = Vec::new();
+    collect_openapi_inventory(&spec, &mut refs, &mut deprecated_nullable_paths, "");
+    assert!(
+        deprecated_nullable_paths.is_empty(),
+        "OpenAPI 3.1 must use native null unions instead of nullable: {deprecated_nullable_paths:?}"
+    );
+
+    for reference in &refs {
+        let pointer = reference
+            .strip_prefix('#')
+            .unwrap_or_else(|| panic!("external OpenAPI reference is unsupported: {reference}"));
+        assert!(
+            spec.pointer(pointer).is_some(),
+            "unresolved OpenAPI reference: {reference}"
+        );
+    }
+
+    let schemas = spec["components"]["schemas"]
+        .as_object()
+        .expect("component schemas is an object");
+    let mut path_refs = BTreeSet::new();
+    let mut ignored_nullable_paths = Vec::new();
+    collect_openapi_inventory(
+        &spec["paths"],
+        &mut path_refs,
+        &mut ignored_nullable_paths,
+        "/paths",
+    );
+    let mut pending_refs: Vec<_> = path_refs.into_iter().collect();
+    let mut reachable_refs = BTreeSet::new();
+    while let Some(reference) = pending_refs.pop() {
+        if !reachable_refs.insert(reference.clone()) {
+            continue;
+        }
+        let pointer = reference
+            .strip_prefix('#')
+            .unwrap_or_else(|| panic!("external OpenAPI reference is unsupported: {reference}"));
+        let referenced_value = spec
+            .pointer(pointer)
+            .unwrap_or_else(|| panic!("unresolved OpenAPI reference: {reference}"));
+        let mut nested_refs = BTreeSet::new();
+        collect_openapi_inventory(
+            referenced_value,
+            &mut nested_refs,
+            &mut ignored_nullable_paths,
+            pointer,
+        );
+        pending_refs.extend(nested_refs);
+    }
+
+    let referenced_schemas: BTreeSet<_> = reachable_refs
+        .iter()
+        .filter_map(|reference| {
+            reference
+                .strip_prefix("#/components/schemas/")
+                .and_then(|suffix| suffix.split('/').next())
+        })
+        .collect();
+    let orphan_schemas: Vec<_> = schemas
+        .keys()
+        .filter(|schema| !referenced_schemas.contains(schema.as_str()))
+        .collect();
+    assert!(
+        orphan_schemas.is_empty(),
+        "unreferenced component schemas: {orphan_schemas:?}"
+    );
+
+    for schema_name in schemas.keys() {
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$ref": format!("#/components/schemas/{schema_name}"),
+            "components": spec["components"].clone()
+        });
+        jsonschema::draft202012::options()
+            .build(&schema)
+            .unwrap_or_else(|error| panic!("{schema_name} schema compiles: {error}"));
+    }
 }
 
 #[test]
@@ -368,4 +824,492 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         validator.validate(&custom).is_ok(),
         "custom plugins should keep generic PluginConfig config shape"
     );
+}
+
+#[tokio::test]
+async fn runtime_valid_builtin_plugin_fixtures_match_their_openapi_schemas() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let mapping = plugin_config_schema_mapping(&spec);
+    let mut exercised = 0usize;
+
+    for (plugin_name, schema_ref) in mapping {
+        let config = super::plugins::minimal_plugin_config(&plugin_name);
+        let Ok(Some(_plugin)) = ferrum_edge::plugins::create_plugin(&plugin_name, &config) else {
+            continue;
+        };
+        let component = schema_ref
+            .strip_prefix("#/components/schemas/")
+            .unwrap_or_else(|| panic!("PluginConfig ref for {plugin_name} is not local"));
+        assert_component_validity(&spec, component, &config, true);
+        exercised += 1;
+    }
+
+    assert!(
+        exercised >= 50,
+        "expected broad plugin-schema coverage, exercised only {exercised} built-ins"
+    );
+}
+
+#[tokio::test]
+async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let mapping = plugin_config_schema_mapping(&spec);
+    let fixtures = [
+        (
+            "body_validator",
+            json!({"grpc_max_decompressed_size_bytes": 0}),
+        ),
+        (
+            "load_testing",
+            json!({
+                "key": "test-key",
+                "concurrent_clients": 1,
+                "duration_seconds": 1,
+                "max_response_body_bytes": 1024
+            }),
+        ),
+        (
+            "request_mirror",
+            json!({"mirror_host": "mirror.example", "max_in_flight": 8}),
+        ),
+        (
+            "request_transformer",
+            json!({
+                "rules": [{
+                    "operation": "add",
+                    "target": "header",
+                    "key": "x-audit",
+                    "value": "enabled"
+                }],
+                "runtime_overlay_scope": "ferrum.transform.request",
+                "default_enabled": false
+            }),
+        ),
+        (
+            "response_transformer",
+            json!({
+                "rules": [{
+                    "operation": "add",
+                    "target": "header",
+                    "key": "x-audit",
+                    "value": "enabled"
+                }],
+                "runtime_overlay_scope": "ferrum.transform.response",
+                "default_enabled": false
+            }),
+        ),
+        (
+            "serverless_function",
+            json!({
+                "provider": "aws_lambda",
+                "aws_region": "us-east-1",
+                "aws_access_key_id": "test-access-key",
+                "aws_secret_access_key": "test-secret-key",
+                "aws_function_name": "test-function",
+                "aws_endpoint_url": "http://127.0.0.1:4566"
+            }),
+        ),
+        (
+            "mesh_authz",
+            json!({
+                "mesh_policies": [],
+                "per_pod_policy_scoping": true,
+                "ambient_udp_source_scoping": true,
+                "cluster_domain": "cluster.local",
+                "cluster_domains": ["cluster.local", "cluster.internal"],
+                "node_waypoint_route_upstreams": [{
+                    "id": "istio-vs-upstream-reviews",
+                    "namespace": "ferrum",
+                    "targets": [{
+                        "host": "10.0.0.10",
+                        "port": 8080,
+                        "service_namespace": "ferrum",
+                        "service_name": "reviews",
+                        "service_port": 80
+                    }]
+                }]
+            }),
+        ),
+    ];
+
+    for (plugin_name, optional_fields) in fixtures {
+        let mut config = super::plugins::minimal_plugin_config(plugin_name);
+        let config_object = config
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("minimal {plugin_name} config is not an object"));
+        config_object.extend(
+            optional_fields
+                .as_object()
+                .unwrap_or_else(|| panic!("optional {plugin_name} fields are not an object"))
+                .clone(),
+        );
+        let created = ferrum_edge::plugins::create_plugin(plugin_name, &config)
+            .unwrap_or_else(|error| panic!("runtime rejected {plugin_name} fixture: {error}"));
+        assert!(created.is_some(), "missing built-in plugin {plugin_name}");
+        let schema_ref = mapping
+            .get(plugin_name)
+            .unwrap_or_else(|| panic!("missing OpenAPI mapping for {plugin_name}"));
+        let component = schema_ref
+            .strip_prefix("#/components/schemas/")
+            .unwrap_or_else(|| panic!("PluginConfig ref for {plugin_name} is not local"));
+        assert_component_validity(&spec, component, &config, true);
+    }
+
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({"provider": "azure_functions"}),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({"provider": "gcp_cloud_functions", "function_url": "ftp://functions.example"}),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "aws_lambda",
+            "aws_endpoint_url": "ftp://lambda.example"
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "aws_lambda",
+            "function_url": "not-a-url"
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https:///api/transform"
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "aws_lambda",
+            "aws_endpoint_url": "http:///lambda"
+        }),
+        false,
+    );
+
+    for component in ["RequestTransformerConfig", "ResponseTransformerConfig"] {
+        assert_component_validity(
+            &spec,
+            component,
+            &json!({
+                "rules": [{"operation": "remove", "key": "x-review-pin"}],
+                "runtime_overlay_scope": " \t "
+            }),
+            false,
+        );
+    }
+}
+
+fn assert_component_validity(
+    spec: &serde_json::Value,
+    component: &str,
+    instance: &serde_json::Value,
+    expected_valid: bool,
+) {
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": format!("#/components/schemas/{component}"),
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .unwrap_or_else(|error| panic!("{component} schema compiles: {error}"));
+    let actual_valid = validator.validate(instance).is_ok();
+    assert_eq!(
+        actual_valid, expected_valid,
+        "unexpected {component} validation result for {instance}"
+    );
+}
+
+#[test]
+fn upstream_runtime_serialization_is_covered_by_openapi() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let upstream: ferrum_edge::config::types::Upstream = serde_json::from_value(json!({
+        "targets": [{
+            "host": "backend.example",
+            "port": 8443,
+            "weight": 2,
+            "tags": {"version": "v1"},
+            "locality": "us-east/us-east-1/a",
+            "path": "/api"
+        }],
+        "service_discovery": {
+            "provider": "dns_sd",
+            "dns_sd": {"service_name": "_https._tcp.backend.example"}
+        },
+        "subsets": [{
+            "name": "v1",
+            "labels": {"version": "v1"},
+            "traffic_policy": {
+                "load_balancer_algorithm": "consistent_hashing",
+                "hash_on": "header:x-tenant",
+                "tls": {
+                    "mode": "simple",
+                    "sni": "backend.example"
+                },
+                "connect_timeout_ms": 750,
+                "passive_health_check": {}
+            }
+        }],
+        "port_overrides": {
+            "8443": {
+                "connect_timeout_ms": 500,
+                "algorithm": "least_connections",
+                "hash_on": "ip",
+                "passive_health_check": {},
+                "locality_lb_setting": {
+                    "enabled": true,
+                    "distribute": [{
+                        "from": "us-east/us-east-1/a",
+                        "to": {"us-east": 90, "us-west": 10}
+                    }]
+                },
+                "max_connections": 100,
+                "tcp_keepalive": {"time_seconds": 30, "interval_seconds": 10, "probes": 3},
+                "http_max_requests_per_connection": 1000,
+                "http_idle_timeout_ms": 30000,
+                "h2_max_concurrent_streams": 128,
+                "tls": {},
+                "h2_upgrade_policy": "UPGRADE",
+                "max_retries": 2,
+                "http1_max_pending_requests": 64
+            }
+        },
+        "source_locality": "us-east/us-east-1/a",
+        "locality_lb_strict": true,
+        "locality_lb_setting": {
+            "enabled": true,
+            "failover": [{"from": "us-east", "to": "us-west"}]
+        }
+    }))
+    .expect("representative upstream deserializes");
+    let serialized = serde_json::to_value(upstream).expect("upstream serializes");
+    assert!(
+        serialized
+            .pointer("/subsets/0/traffic_policy/tls/subject_alt_names")
+            .is_none(),
+        "empty subject_alt_names must be omitted by MeshTrafficPolicyTls serialization"
+    );
+
+    assert_component_validity(&spec, "Upstream", &serialized, true);
+}
+
+#[test]
+fn config_schemas_reject_nulls_that_rust_does_not_accept() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for (component, instance) in [
+        (
+            "Proxy",
+            json!({"id": null, "backend_host": "backend", "backend_port": 443}),
+        ),
+        ("Consumer", json!({"username": null})),
+        (
+            "PluginConfig",
+            json!({"plugin_name": null, "scope": "global", "enabled": true}),
+        ),
+        ("PluginAssociation", json!({"plugin_config_id": null})),
+        ("UpstreamTarget", json!({"host": null, "port": 443})),
+        ("ActiveHealthCheck", json!({"http_path": null})),
+    ] {
+        assert_component_validity(&spec, component, &instance, false);
+    }
+
+    assert_component_validity(
+        &spec,
+        "Proxy",
+        &json!({"id": "", "backend_host": "", "backend_port": 0}),
+        true,
+    );
+}
+
+#[test]
+fn service_discovery_schema_matches_provider_validation_and_serialization() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let provider_guards = spec
+        .pointer("/components/schemas/ServiceDiscoveryConfig/allOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("service discovery provider guards are an array");
+    let guarded_providers: BTreeSet<_> = provider_guards
+        .iter()
+        .map(|guard| {
+            assert_eq!(
+                guard["if"]["required"],
+                json!(["provider"]),
+                "each provider conditional must require the discriminator"
+            );
+            guard["if"]["properties"]["provider"]["const"]
+                .as_str()
+                .expect("provider guard has a string const")
+        })
+        .collect();
+    assert_eq!(
+        guarded_providers,
+        BTreeSet::from(["consul", "dns_sd", "kubernetes", "mesh"])
+    );
+
+    assert_component_validity(
+        &spec,
+        "ServiceDiscoveryConfig",
+        &json!({
+            "provider": "dns_sd",
+            "dns_sd": {"service_name": "_http._tcp.backend.example"},
+            "kubernetes": null,
+            "consul": null,
+            "mesh": null,
+            "default_weight": 1
+        }),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "ServiceDiscoveryConfig",
+        &json!({"provider": "dns_sd", "dns_sd": null}),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServiceDiscoveryConfig",
+        &json!({"provider": "consul", "consul": {"address": "http://consul:8500"}}),
+        false,
+    );
+}
+
+#[test]
+fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
+    use ferrum_edge::modes::mesh::runtime::MeshEgressScopeHealth;
+    use ferrum_edge::modes::mesh::slice::{MeshEgressScopeResource, MeshEgressScopeSnapshot};
+    use ferrum_edge::overload::{
+        ActionSnapshot, ConnPressure, FdPressure, NodeWaypointDropSnapshot, OverloadLevel,
+        OverloadSnapshot, PressureSnapshot, ReqPressure,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let resource = MeshEgressScopeResource {
+        namespace: "ferrum".to_string(),
+        name: "reviews".to_string(),
+        hosts: vec!["reviews.ferrum.svc.cluster.local".to_string()],
+        ports: vec![8080],
+    };
+    let scope = MeshEgressScopeSnapshot {
+        sidecar_enforced: true,
+        dry_run: false,
+        sidecar_applied: true,
+        sidecar_admitted_services: 1,
+        sidecar_denied_services: 0,
+        destination_rules: vec![resource.clone()],
+        sidecar_admitted_destination_rules: 1,
+        sidecar_denied_destination_rules: 0,
+        services: vec![resource],
+        service_entries: Vec::new(),
+        known_destinations: vec!["reviews.ferrum.svc.cluster.local:8080".to_string()],
+    };
+    let health = MeshEgressScopeHealth {
+        sidecar_admitted_services: 1,
+        sidecar_denied_services: 0,
+    };
+    let egress_response = json!({
+        "namespace": "ferrum",
+        "scope": scope,
+        "health": health
+    });
+    assert_component_validity(&spec, "MeshEgressScopeResponse", &egress_response, true);
+    assert_component_validity(
+        &spec,
+        "HealthResponse",
+        &json!({
+            "status": "ok",
+            "ready": true,
+            "mesh": {"egress_scope": health}
+        }),
+        true,
+    );
+
+    let mut overload = serde_json::to_value(OverloadSnapshot {
+        level: OverloadLevel::Normal,
+        draining: false,
+        active_connections: 2,
+        active_requests: 1,
+        red_drop_probability_pct: 0.0,
+        port_exhaustion_events: 0,
+        node_waypoint_drops: NodeWaypointDropSnapshot {
+            cookie_unavailable: 1,
+            unknown_cookie: 2,
+            missing_pod_uid: 3,
+            missing_workload_hash: 4,
+            unknown_pod: 5,
+            hash_mismatch: 6,
+        },
+        pressure: PressureSnapshot {
+            file_descriptors: FdPressure {
+                current: 10,
+                max: 100,
+                ratio: 0.1,
+            },
+            connections: ConnPressure {
+                current: 2,
+                max: 100,
+                ratio: 0.02,
+            },
+            requests: ReqPressure {
+                current: 1,
+                max: 100,
+                ratio: 0.01,
+            },
+            event_loop_latency_us: 50,
+        },
+        actions: ActionSnapshot {
+            disable_keepalive: false,
+            reject_new_connections: false,
+            reject_new_requests: false,
+        },
+    })
+    .expect("overload snapshot serializes");
+    overload
+        .as_object_mut()
+        .expect("overload snapshot is an object")
+        .insert(
+            "stream_listeners".to_string(),
+            json!({
+                "dtls_demux_sessions_total": 0,
+                "dtls_demux_sessions": [],
+                "bind_failures_total": 0,
+                "bind_failures": []
+            }),
+        );
+    assert_component_validity(&spec, "OverloadSnapshot", &overload, true);
+}
+
+#[test]
+fn no_proxy_runtime_metrics_snapshot_is_covered_by_openapi() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let snapshot = ferrum_edge::runtime_metrics::build_snapshot("node_agent", None);
+    let serialized = serde_json::to_value(snapshot).expect("runtime metrics snapshot serializes");
+
+    assert_component_validity(&spec, "RuntimeMetricsSnapshot", &serialized, true);
 }
