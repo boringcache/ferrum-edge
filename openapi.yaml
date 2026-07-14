@@ -15617,6 +15617,7 @@ components:
 
     AiRequestGuardConfig:
       type: object
+      additionalProperties: false
       description: "Plugin: ai_request_guard — Validates and constrains AI/LLM API requests."
       anyOf:
         - required: [max_tokens_limit]
@@ -15659,7 +15660,7 @@ components:
           description: Reject (400 error) or clamp (silently cap) max_tokens
         default_max_tokens:
           type: integer
-          description: Inject a default output-token limit if no supported token field is present; top-level-shaped bodies keep a family-correct top-level fallback (max_output_tokens for Responses, else max_tokens) so a spoofed provider marker or stray cross-provider alias cannot uncap them, while unambiguously provider-native bodies receive only their native cap
+          description: Inject a default output-token limit if no supported token field is present; top-level-shaped bodies keep a family-correct top-level fallback (max_output_tokens for Responses, else max_tokens) so a spoofed provider marker or stray cross-provider alias cannot uncap them, while unambiguously provider-native bodies receive only their native cap (including TGI parameters.max_new_tokens)
         supported_schema:
           type: string
           enum: [chat_completions, responses, provider_native, auto]
@@ -15694,7 +15695,7 @@ components:
           description: Maximum message entries across messages, Responses input, Gemini contents, and Cohere chat_history arrays
         max_prompt_characters:
           type: integer
-          description: Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, tools, tool arguments, document/RAG fields, and Azure "On Your Data" data_sources[]/dataSources[].parameters.role_information/roleInformation
+          description: Maximum total prompt characters across prompt/input/system fields, message text, text multimodal parts, tools, tool arguments, document/RAG fields (including Anthropic text document source.data), and Azure "On Your Data" data_sources[]/dataSources[].parameters.role_information/roleInformation
         temperature_range:
           type: array
           items:
@@ -15702,7 +15703,7 @@ components:
             format: double
           minItems: 2
           maxItems: 2
-          description: "Allowed [min, max] range for temperature"
+          description: "Allowed [min, max] range for top-level temperature plus Gemini generationConfig.temperature and Bedrock inferenceConfig.temperature; conflicting aliases are rejected"
         block_system_prompts:
           type: boolean
           default: false

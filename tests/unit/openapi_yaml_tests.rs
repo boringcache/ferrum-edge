@@ -972,6 +972,10 @@ fn plugin_config_schema_applies_plugin_specific_config() {
             "ai_request_guard",
             Some(json!({"require_user_field": false})),
         ),
+        (
+            "ai_request_guard",
+            Some(json!({"max_messages": 10, "max_message": 10})),
+        ),
         ("ai_response_guard", None),
         ("ai_response_guard", Some(json!({}))),
         ("ai_response_guard", Some(json!({"require_json": false}))),

@@ -1484,9 +1484,19 @@ async fn handle_h3_request(
         } else {
             state.max_request_body_size_bytes
         };
-        while let Some(chunk) = stream.recv_data().await? {
-            let bytes = chunk.chunk();
-            if max_body > 0 && body_data.len() + bytes.len() > max_body {
+        let collect = async {
+            while let Some(chunk) = stream.recv_data().await? {
+                let bytes = chunk.chunk();
+                if max_body > 0 && body_data.len() + bytes.len() > max_body {
+                    return Ok::<_, h3::error::StreamError>(false);
+                }
+                body_data.extend_from_slice(bytes);
+            }
+            Ok(true)
+        };
+        match collect_h3_request_body_with_timeout(collect, proxy.backend_read_timeout_ms).await {
+            Ok(true) => {}
+            Ok(false) => {
                 record_request(&state, 413);
                 send_h3_error_flavor_aware(
                     &mut stream,
@@ -1499,7 +1509,27 @@ async fn handle_h3_request(
                 .await?;
                 return Ok(());
             }
-            body_data.extend_from_slice(bytes);
+            Err(H3RequestBodyReadError::Read(error)) => return Err(error.into()),
+            Err(H3RequestBodyReadError::TimedOut) => {
+                record_request(
+                    &state,
+                    if matches!(http_flavor, HttpFlavor::Grpc) {
+                        StatusCode::OK.as_u16()
+                    } else {
+                        StatusCode::REQUEST_TIMEOUT.as_u16()
+                    },
+                );
+                send_h3_error_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    StatusCode::REQUEST_TIMEOUT,
+                    r#"{"error":"Request body read timed out"}"#,
+                    crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                    "Request body read timed out",
+                )
+                .await?;
+                return Ok(());
+            }
         }
         // Auth plugins that need bytes (hmac_auth digest verification) read
         // `ctx.request_body_bytes`, so always populate the binary-safe handle.
@@ -1682,9 +1712,19 @@ async fn handle_h3_request(
         } else {
             state.max_request_body_size_bytes
         };
-        while let Some(chunk) = stream.recv_data().await? {
-            let bytes = chunk.chunk();
-            if max_body > 0 && body_data.len() + bytes.len() > max_body {
+        let collect = async {
+            while let Some(chunk) = stream.recv_data().await? {
+                let bytes = chunk.chunk();
+                if max_body > 0 && body_data.len() + bytes.len() > max_body {
+                    return Ok::<_, h3::error::StreamError>(false);
+                }
+                body_data.extend_from_slice(bytes);
+            }
+            Ok(true)
+        };
+        match collect_h3_request_body_with_timeout(collect, proxy.backend_read_timeout_ms).await {
+            Ok(true) => {}
+            Ok(false) => {
                 record_request(&state, 413);
                 send_h3_error_flavor_aware(
                     &mut stream,
@@ -1697,7 +1737,27 @@ async fn handle_h3_request(
                 .await?;
                 return Ok(());
             }
-            body_data.extend_from_slice(bytes);
+            Err(H3RequestBodyReadError::Read(error)) => return Err(error.into()),
+            Err(H3RequestBodyReadError::TimedOut) => {
+                record_request(
+                    &state,
+                    if matches!(http_flavor, HttpFlavor::Grpc) {
+                        StatusCode::OK.as_u16()
+                    } else {
+                        StatusCode::REQUEST_TIMEOUT.as_u16()
+                    },
+                );
+                send_h3_error_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    StatusCode::REQUEST_TIMEOUT,
+                    r#"{"error":"Request body read timed out"}"#,
+                    crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                    "Request body read timed out",
+                )
+                .await?;
+                return Ok(());
+            }
         }
         crate::proxy::store_request_body_metadata(&mut ctx, &body_data, h3_needs_body_bytes);
         prebuffered_body_data = Some(body_data);
@@ -8687,6 +8747,27 @@ fn record_request(state: &ProxyState, status: u16) {
 
 #[cfg(test)]
 mod h3_request_body_timeout_tests {
+    #[tokio::test]
+    async fn completed_pre_policy_upload_returns_without_timeout() {
+        let upload = std::future::ready::<Result<usize, &'static str>>(Ok(7));
+        let result = super::collect_h3_request_body_with_timeout(upload, 100).await;
+        assert_eq!(result, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn zero_disables_pre_policy_upload_deadline() {
+        let upload = std::future::ready::<Result<usize, &'static str>>(Ok(11));
+        let result = super::collect_h3_request_body_with_timeout(upload, 0).await;
+        assert_eq!(result, Ok(11));
+    }
+
+    #[tokio::test]
+    async fn pre_policy_upload_preserves_stream_read_errors() {
+        let upload = std::future::ready::<Result<(), &'static str>>(Err("reset"));
+        let result = super::collect_h3_request_body_with_timeout(upload, 100).await;
+        assert_eq!(result, Err(super::H3RequestBodyReadError::Read("reset")));
+    }
+
     #[tokio::test]
     async fn stalled_buffered_probe_times_out_and_releases_slot_neutral() {
         use crate::circuit_breaker::CircuitBreaker;
