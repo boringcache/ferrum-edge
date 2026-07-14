@@ -121,7 +121,7 @@ Use `priority_override` to control the relative execution order of instances tha
 
 ## Multi-Authentication Mode
 
-When a proxy has `auth_mode: multi`, attached authentication plugins execute in priority order until the first attempt establishes a nonblank mapped Consumer or permitted external principal. Rejected, not-applicable, and principal-less attempts leave no claim headers, external identity header, mesh principal, or backend token-stripping state for a later credential to inherit. The first accepted attempt owns the request's identity-derived state; later instances cannot overwrite it. If no attempt succeeds, the request is rejected before authorization.
+When a proxy has `auth_mode: multi`, attached authentication plugins execute in priority order and stop after the first attempt establishes a nonblank mapped Consumer or permitted external principal. In `auth_mode: single`, all attached authentication plugins execute, but the first accepted attempt still owns the request's identity-derived state; later accepted credentials may add their own cleanup without overwriting it. In either mode, rejected, not-applicable, and principal-less attempts leave no claim headers, external identity header, mesh principal, rolling session cookie, or backend token-stripping state for another credential to inherit. If one or more authentication plugins are attached and none succeeds, the request is rejected before authorization.
 
 ## Consumer Identity Headers
 

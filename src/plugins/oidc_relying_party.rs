@@ -114,7 +114,7 @@ const BEHAVIOR_FIELDS: &[&str] = &[
     "rp_initiated_logout",
     "post_login_default_path",
 ];
-/// Carries a re-sealed rolling-session cookie from `authenticate` to
+/// Carries a committed rolling-session cookie from `authenticate` to
 /// `after_proxy`, which appends it as `Set-Cookie` on the proxied response. The
 /// key contains "cookie" so transaction-log metadata redaction masks its value.
 const SESSION_SET_COOKIE_METADATA_KEY: &str = "oidc_rp.session_set_cookie";
@@ -1129,7 +1129,8 @@ impl OidcRelyingParty {
 
         // Keep the session live: refresh tokens when due (which also re-derives
         // claims from any new ID token), then slide the idle window. Any change
-        // is re-sealed and emitted as a `Set-Cookie` by `after_proxy`.
+        // is re-sealed now, but only the accepted first principal commits the
+        // cookie for `after_proxy` to emit as `Set-Cookie`.
         let refresh = self.maybe_refresh_session(&mut payload, now).await;
 
         // Token-freshness gate: the ID token was validly verified at login, but
@@ -1142,13 +1143,16 @@ impl OidcRelyingParty {
             return self.challenge(ctx, true);
         }
 
+        let mut attempt = AuthenticationAttempt::new();
         let mut mutated = refresh.mutated || refresh.refreshed || backfilled_claims_expiry;
         mutated |= self.maybe_slide_session(&mut payload, now);
         if mutated {
             match self.seal_session_cookie(&payload) {
                 Ok(cookie) => {
-                    ctx.metadata
-                        .insert(SESSION_SET_COOKIE_METADATA_KEY.to_string(), cookie);
+                    attempt.stage_principal_metadata(
+                        SESSION_SET_COOKIE_METADATA_KEY.to_string(),
+                        cookie,
+                    );
                 }
                 Err(error) => {
                     warn!(
@@ -1173,7 +1177,6 @@ impl OidcRelyingParty {
         ) {
             return reject(status, body);
         }
-        let mut attempt = AuthenticationAttempt::new();
         emit_claim_headers_to_attempt(
             &mut attempt,
             &payload.claims,
@@ -3631,7 +3634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_session_slides_and_emits_rolling_cookie() {
+    async fn accepted_principal_session_slides_and_emits_rolling_cookie() {
         let plugin = build_plugin("https://idp.example.com/token");
         let now = chrono::Utc::now().timestamp();
         // last_touch 1000s ago (> touch_interval 900) but within idle/absolute ttl;
@@ -3644,6 +3647,9 @@ mod tests {
                 .await,
             PluginResult::Continue
         ));
+        assert_eq!(ctx.authenticated_identity.as_deref(), Some("user-1"));
+        assert_eq!(ctx.auth_method, Some("oidc_relying_party"));
+        assert!(ctx.metadata.contains_key(SESSION_SET_COOKIE_METADATA_KEY));
         let mut response_headers = HashMap::new();
         plugin
             .after_proxy(&mut ctx, 200, &mut response_headers)
@@ -3651,6 +3657,39 @@ mod tests {
         let rolled = emitted_session_payload(&plugin, &response_headers)
             .expect("rolling session cookie emitted");
         assert!(rolled.last_touch_unix >= now);
+        assert!(!ctx.metadata.contains_key(SESSION_SET_COOKIE_METADATA_KEY));
+    }
+
+    #[tokio::test]
+    async fn later_accepted_session_does_not_commit_rolling_cookie() {
+        let plugin = build_plugin("https://idp.example.com/token");
+        let now = chrono::Utc::now().timestamp();
+        let payload = session_payload(now - 1000, now - 1000, None, now + 100_000);
+        let mut ctx = ctx_with_session(&plugin, &payload);
+        ctx.authenticated_identity = Some("first@example.com".to_string());
+        ctx.auth_method = Some("jwks_auth");
+
+        assert!(matches!(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            ctx.authenticated_identity.as_deref(),
+            Some("first@example.com")
+        );
+        assert_eq!(ctx.auth_method, Some("jwks_auth"));
+        assert!(!ctx.metadata.contains_key(SESSION_SET_COOKIE_METADATA_KEY));
+
+        let mut response_headers = HashMap::new();
+        assert!(matches!(
+            plugin
+                .after_proxy(&mut ctx, 200, &mut response_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        assert!(!response_headers.contains_key("set-cookie"));
     }
 
     #[tokio::test]
@@ -4170,12 +4209,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn principal_less_session_discards_claim_header_and_identity_header_state() {
+    async fn principal_less_session_discards_claim_and_rolling_cookie_state() {
         let plugin = build_claim_identity_plugin(&[]);
         let now = chrono::Utc::now().timestamp();
 
         for email in [None, Some("   ")] {
-            let mut payload = session_payload(now - 100, now - 100, None, now + 100_000);
+            let mut payload = session_payload(now - 1000, now - 1000, None, now + 100_000);
             payload.claims = json!({
                 "sub": "user-1",
                 "display_name": "Header Without Principal",
@@ -4196,6 +4235,7 @@ mod tests {
             assert!(ctx.authenticated_identity.is_none());
             assert!(ctx.authenticated_identity_header.is_none());
             assert!(ctx.auth_method.is_none());
+            assert!(!ctx.metadata.contains_key(SESSION_SET_COOKIE_METADATA_KEY));
             assert!(
                 !ctx.metadata
                     .values()
@@ -4208,6 +4248,15 @@ mod tests {
                 PluginResult::Continue
             ));
             assert!(!headers.contains_key("x-tenant"));
+
+            let mut response_headers = HashMap::new();
+            assert!(matches!(
+                plugin
+                    .after_proxy(&mut ctx, 200, &mut response_headers)
+                    .await,
+                PluginResult::Continue
+            ));
+            assert!(!response_headers.contains_key("set-cookie"));
         }
     }
 
@@ -4252,10 +4301,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_session_authorization_leaves_no_claim_state() {
+    async fn rejected_session_authorization_leaves_no_claim_or_rolling_cookie_state() {
         let plugin = build_claim_identity_plugin(&["admin"]);
         let now = chrono::Utc::now().timestamp();
-        let mut payload = session_payload(now - 100, now - 100, None, now + 100_000);
+        let mut payload = session_payload(now - 1000, now - 1000, None, now + 100_000);
         payload.claims = json!({
             "sub": "user-1",
             "email": "accepted@example.com",
@@ -4277,6 +4326,7 @@ mod tests {
         assert!(ctx.authenticated_identity.is_none());
         assert!(ctx.authenticated_identity_header.is_none());
         assert!(ctx.auth_method.is_none());
+        assert!(!ctx.metadata.contains_key(SESSION_SET_COOKIE_METADATA_KEY));
 
         let mut headers = HashMap::new();
         assert!(matches!(
@@ -4284,6 +4334,15 @@ mod tests {
             PluginResult::Continue
         ));
         assert!(!headers.contains_key("x-tenant"));
+
+        let mut response_headers = HashMap::new();
+        assert!(matches!(
+            plugin
+                .after_proxy(&mut ctx, 403, &mut response_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        assert!(!response_headers.contains_key("set-cookie"));
     }
 
     // Finding #36 regression: during a discovery outage a browser challenge must
