@@ -289,7 +289,7 @@ export FERRUM_DB_TLS_MODE=require
 
 ### Using Connection String Options
 
-TLS can also be configured directly in the MongoDB connection string. Connection string options take precedence over `FERRUM_DB_TLS_*` environment variables.
+TLS can also be configured directly in the MongoDB connection string. Configure MongoDB TLS in exactly one source: either the `FERRUM_DB_TLS_*` environment variables **or** connection-string TLS options — not both. If `FERRUM_DB_TLS_MODE` is set and any configured MongoDB URI (`FERRUM_DB_URL` or a `FERRUM_DB_FAILOVER_URLS` entry) also carries TLS options (a `tls`/`ssl` query parameter or the implicit-TLS `mongodb+srv://` scheme), the gateway fails startup with a conflict error rather than silently letting one source win. Unset `FERRUM_DB_TLS_MODE` when you want the connection string to be authoritative.
 
 ```bash
 # TLS with CA verification
@@ -490,7 +490,7 @@ PostgreSQL requires the server key file to have `chmod 600` and be owned by the 
 
 ### Connection works without TLS env vars
 
-If the database URL already contains TLS parameters (for example, `?sslmode=require`), avoid also setting `FERRUM_DB_TLS_MODE` for that connection. The gateway logs a startup warning when it detects both sources. Env-derived parameters are appended to SQL URLs and duplicate driver options can conflict; for MongoDB, URI TLS options take precedence over env-derived `FERRUM_DB_TLS_*` settings.
+If the database URL already contains TLS parameters (for example, `?sslmode=require`), avoid also setting `FERRUM_DB_TLS_MODE` for that connection. For SQL backends (PostgreSQL/MySQL) the gateway logs a startup warning when it detects both sources — env-derived parameters are appended to the URL and duplicate driver options can conflict. For MongoDB the two sources are mutually exclusive: setting `FERRUM_DB_TLS_MODE` alongside a URI that carries TLS options (a `tls`/`ssl` query parameter or the `mongodb+srv://` implicit-TLS scheme) is a hard startup error, so configure MongoDB TLS in exactly one place.
 
 ## Failover and Read Replica URLs
 

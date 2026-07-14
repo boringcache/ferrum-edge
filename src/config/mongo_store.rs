@@ -84,8 +84,20 @@ mod inner {
     const MONGO_ERR_INDEX_ALREADY_EXISTS: i32 = 68;
     const MONGO_ERR_INDEX_OPTIONS_CONFLICT: i32 = 85;
     const MONGO_ERR_INDEX_KEY_SPECS_CONFLICT: i32 = 86;
+    const MONGO_ERR_DUPLICATE_KEY: i32 = 11_000;
     const CHANGE_LOG_BATCH_LIMIT: i64 = 10_000;
     const CHANGE_LOG_RETAIN_PER_NAMESPACE: u64 = 100_000;
+    const MONGO_MIGRATION_LOCK_ID: &str = "global";
+    const MONGO_MIGRATION_LEASE_DURATION: Duration = Duration::from_secs(120);
+    const MONGO_MIGRATION_LEASE_DURATION_MILLIS: i64 =
+        MONGO_MIGRATION_LEASE_DURATION.as_millis() as i64;
+    const MONGO_MIGRATION_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
+    const MONGO_MIGRATION_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+    // Dedicated migration-lease pool size. Lease upkeep only issues tiny
+    // update_one/delete_one operations, so a couple of connections is ample
+    // while keeping the lease client fully isolated from the migration-work
+    // pool that may be saturated by a long-running create_index.
+    const MONGO_MIGRATION_LEASE_POOL_SIZE: u32 = 2;
 
     #[derive(Clone, Copy)]
     struct ConfigChangeWrite<'a> {
@@ -179,6 +191,59 @@ mod inner {
         is_mongo_command_error_with_code(err, MONGO_ERR_INDEX_ALREADY_EXISTS)
     }
 
+    fn is_duplicate_key(err: &mongodb::error::Error) -> bool {
+        is_mongo_command_error_with_code(err, MONGO_ERR_DUPLICATE_KEY)
+            || matches!(
+                err.kind.as_ref(),
+                mongodb::error::ErrorKind::Write(
+                    mongodb::error::WriteFailure::WriteError(write_error)
+                ) if write_error.code == MONGO_ERR_DUPLICATE_KEY
+            )
+    }
+
+    /// Recognize an AWS DocumentDB rejection of an aggregation-pipeline-form
+    /// update (an `update` supplied as an array of stages).
+    ///
+    /// DocumentDB is documented as MongoDB-compatible and supports aggregation
+    /// *queries*, but it does NOT implement pipeline-form `findOneAndUpdate` /
+    /// `updateOne`. When the primary `$$NOW` acquire pipeline is issued, a
+    /// DocumentDB backend rejects the command up-front — before any lock
+    /// document is touched — either as an unsupported feature or as a type/parse
+    /// error because the update value is an array rather than an object.
+    ///
+    /// This check runs ONLY on the first acquire attempt in pipeline mode. A
+    /// false positive merely moves that lease to the fully functional classic
+    /// client-time path, while a false negative prevents DocumentDB migrations
+    /// from starting at all, so matching is deliberately moderately broad while
+    /// remaining restricted to Command errors that reference the update shape.
+    /// Connectivity and duplicate-key contention use other ErrorKind/code paths
+    /// and cannot trigger this capability fallback. A genuine MongoDB server
+    /// accepts the pipeline and never reaches here.
+    fn is_pipeline_update_unsupported(err: &mongodb::error::Error) -> bool {
+        let mongodb::error::ErrorKind::Command(command_error) = err.kind.as_ref() else {
+            return false;
+        };
+        let message = command_error.message.to_ascii_lowercase();
+        let says_unsupported = message.contains("not supported") || message.contains("unsupported");
+        let references_update = message.contains("update")
+            || message.contains("pipeline")
+            || message.contains("aggregation");
+        let names_pipeline_form = message.contains("pipeline")
+            || message.contains("aggregation")
+            || (message.contains("update") && message.contains("array"));
+        let names_value_type = message.contains("object") || message.contains("array");
+        let says_type_error = message.contains("must be")
+            || message.contains("expected")
+            || message.contains("wrong type")
+            || message.contains("badvalue")
+            || message.contains("typemismatch");
+        let has_pipeline_type_or_parse_code = matches!(command_error.code, 2 | 9 | 14);
+
+        (says_unsupported && names_pipeline_form)
+            || (references_update
+                && ((says_type_error && names_value_type) || has_pipeline_type_or_parse_code))
+    }
+
     fn mesh_route_dispatch_references_upstream_id(
         plugin: &PluginConfig,
         upstream_id: &str,
@@ -245,16 +310,133 @@ mod inner {
     struct MongoConnectionBundle {
         client: Client,
         db: Database,
+        // Fully materialized effective `ClientOptions` (TLS applied, primary
+        // read preference forced) captured before `Client::with_options`
+        // consumed a clone of them. The migration-lease upkeep path clones
+        // these to build a dedicated small pool so it never re-derives or
+        // forks the TLS materialization logic.
+        client_options: ClientOptions,
         // Own generated TLS PEM files for exactly as long as this driver
         // client can open new sockets using their paths.
         _tls_temp_paths: Vec<tempfile::TempPath>,
     }
 
+    /// How a migration lease stamps its expiry/renewal timestamps.
+    ///
+    /// A lease picks its mode once, on the FIRST acquire attempt, and keeps it
+    /// for its whole lifecycle so acquire, renew, and release stay consistent.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MigrationLeaseMode {
+        /// Real MongoDB. Acquire/renew via aggregation-pipeline updates that
+        /// evaluate expiry and stamp timestamps from MongoDB SERVER time
+        /// (`$$NOW`), so client clock skew can never stomp an active lease.
+        ServerTimePipeline,
+        /// AWS DocumentDB fallback. DocumentDB is documented as MongoDB-
+        /// compatible but does NOT support aggregation-pipeline-form updates, so
+        /// acquire/renew use classic operator updates stamped from the CLIENT
+        /// clock (`BsonDateTime::now()`). This reintroduces client-clock-skew
+        /// sensitivity to the lease; that degradation is accepted ONLY for
+        /// DocumentDB, where server-time updates are unavailable.
+        ClientTimeClassic,
+    }
+
+    struct MongoMigrationLease {
+        // Collection handle bound to the DEDICATED lease client/pool (see
+        // `acquire_migration_lease`), deliberately separate from the store's
+        // migration-work pool so acquire/renew/release/Drop cleanup can never
+        // be starved by a long-running create_index.
+        collection: Collection<Document>,
+        owner: String,
+        // The update mode chosen at acquisition, carried so release/diagnostics
+        // stay consistent with how acquire/renew stamped the lock. Release is a
+        // mode-independent `delete_one` by `_id`+`owner`, so it needs no branch.
+        mode: MigrationLeaseMode,
+        stop_tx: Option<tokio::sync::watch::Sender<bool>>,
+        renew_task: Option<tokio::task::JoinHandle<()>>,
+        valid: Arc<AtomicBool>,
+        released: bool,
+        // Keeps the live connection bundle — and the generated TLS PEM temp
+        // files it owns — alive for as long as the dedicated lease client may
+        // open new sockets, including the best-effort Drop cleanup task.
+        _connection: Arc<MongoConnectionBundle>,
+    }
+
+    impl MongoMigrationLease {
+        async fn release(&mut self) -> Result<(), anyhow::Error> {
+            if let Some(stop_tx) = self.stop_tx.take() {
+                let _ = stop_tx.send(true);
+            }
+            if let Some(renew_task) = self.renew_task.take() {
+                renew_task.await.map_err(|error| {
+                    anyhow::anyhow!("MongoDB migration lease renewal task failed: {error}")
+                })?;
+            }
+
+            // Release is mode-independent: the owning document is deleted by
+            // `_id`+`owner` regardless of how acquire/renew stamped it.
+            debug!("Releasing MongoDB migration lease (mode={:?})", self.mode);
+            let result = self
+                .collection
+                .delete_one(doc! {
+                    "_id": MONGO_MIGRATION_LOCK_ID,
+                    "owner": &self.owner,
+                })
+                .await?;
+            self.released = true;
+            if !self.valid.load(Ordering::Acquire) {
+                anyhow::bail!("MongoDB migration lease expired or was lost while migrations ran");
+            }
+            if result.deleted_count != 1 {
+                anyhow::bail!("MongoDB migration lease release did not match the owning document");
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for MongoMigrationLease {
+        fn drop(&mut self) {
+            if self.released {
+                return;
+            }
+            if let Some(stop_tx) = self.stop_tx.take() {
+                let _ = stop_tx.send(true);
+            }
+
+            let collection = self.collection.clone();
+            let owner = self.owner.clone();
+            let renew_task = self.renew_task.take();
+            // Keep the bundle (and its TLS temp files) alive for the whole
+            // best-effort cleanup so the dedicated lease client can still open
+            // a socket even if the store's bundle was already swapped/dropped.
+            let connection = self._connection.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let _cleanup_task = runtime.spawn(async move {
+                    let _connection = connection;
+                    if let Some(renew_task) = renew_task {
+                        let _ = renew_task.await;
+                    }
+                    let _ = collection
+                        .delete_one(doc! {
+                            "_id": MONGO_MIGRATION_LOCK_ID,
+                            "owner": owner,
+                        })
+                        .await;
+                });
+            }
+        }
+    }
+
     impl MongoConnectionBundle {
-        fn new(client: Client, db: Database, tls_temp_paths: Vec<tempfile::TempPath>) -> Self {
+        fn new(
+            client: Client,
+            db: Database,
+            client_options: ClientOptions,
+            tls_temp_paths: Vec<tempfile::TempPath>,
+        ) -> Self {
             Self {
                 client,
                 db,
+                client_options,
                 _tls_temp_paths: tls_temp_paths,
             }
         }
@@ -398,9 +580,10 @@ mod inner {
         ///   separate cert/key files (MongoDB requires a single file)
         /// - `FERRUM_DB_TLS_MODE=require` → `TlsOptions::allow_invalid_certificates`
         ///
-        /// TLS can also be configured directly via connection string options
-        /// (`tls=true&tlsCAFile=...`), which takes precedence over the programmatic
-        /// config when both are set.
+        /// TLS can alternatively be configured directly via connection string
+        /// options (`tls=true&tlsCAFile=...`) when `FERRUM_DB_TLS_MODE` is
+        /// unset. Mixing the two sources is rejected so URI options cannot
+        /// silently override the canonical environment policy.
         #[allow(clippy::too_many_arguments)]
         pub async fn connect(
             mongo_url: &str,
@@ -481,6 +664,17 @@ mod inner {
             tls_insecure: bool,
         ) -> Result<(MongoConnectionBundle, bool), anyhow::Error> {
             let mut client_options = ClientOptions::parse(mongo_url).await?;
+            if (tls_enabled
+                || tls_ca_cert_path.is_some()
+                || tls_client_cert_path.is_some()
+                || tls_client_key_path.is_some()
+                || tls_insecure)
+                && client_options.tls.is_some()
+            {
+                anyhow::bail!(
+                    "MongoDB URI TLS options conflict with FERRUM_DB_TLS_MODE; configure TLS in exactly one source"
+                );
+            }
             if client_options.selection_criteria.is_some() {
                 warn!(
                     "MongoDB readPreference from FERRUM_DB_URL is ignored; authoritative config reads use primary"
@@ -510,11 +704,10 @@ mod inner {
             client_options.connect_timeout =
                 Some(Duration::from_secs(settings.connect_timeout_secs));
 
-            // Configure TLS via the canonical database TLS env vars.
-            // Only set programmatic TLS if the connection string doesn't already
-            // include TLS options (connection string takes precedence).
+            // Configure TLS via the canonical database TLS env vars. URI TLS
+            // settings were rejected above whenever the canonical mode is set.
             let mut tls_temp_paths: Vec<tempfile::TempPath> = Vec::new();
-            if tls_enabled && client_options.tls.is_none() {
+            if tls_enabled {
                 let ca = tls_ca_cert_path
                     .map(|ca_path| {
                         Self::materialize_tls_source_to_file(
@@ -570,7 +763,10 @@ mod inner {
                 );
             }
 
-            let client = Client::with_options(client_options)?;
+            // Capture the fully materialized effective options before the
+            // client consumes a clone so the migration-lease path can build a
+            // dedicated pool from the identical TLS/read-preference settings.
+            let client = Client::with_options(client_options.clone())?;
             let db = client.database(&settings.database_name);
 
             // Verify connectivity
@@ -590,7 +786,7 @@ mod inner {
             );
 
             Ok((
-                MongoConnectionBundle::new(client, db, tls_temp_paths),
+                MongoConnectionBundle::new(client, db, client_options, tls_temp_paths),
                 replica_set_configured,
             ))
         }
@@ -863,6 +1059,327 @@ mod inner {
         /// from it.
         fn connection(&self) -> Arc<MongoConnectionBundle> {
             self.connection.load_full()
+        }
+
+        /// Aggregation-pipeline update that takes or holds the migration lease
+        /// using MongoDB SERVER time (`$$NOW`). Clock skew on the connecting
+        /// client can never enter the expiry comparison: the server both
+        /// evaluates whether the existing lease is expired and stamps the new
+        /// expiry/renewal timestamps in a single consistent `$$NOW` snapshot.
+        /// The lease is (re)claimed only when it is missing, server-expired, or
+        /// already owned by us; otherwise every field is left untouched so an
+        /// active owner is never stomped.
+        fn migration_lease_acquire_pipeline(owner: &str) -> Vec<Document> {
+            vec![
+                doc! {
+                    "$set": {
+                        "_ferrum_claimable": {
+                            "$or": [
+                                { "$eq": [ { "$type": "$expires_at" }, "missing" ] },
+                                { "$lte": [ "$expires_at", "$$NOW" ] },
+                                { "$eq": [ "$owner", owner ] },
+                            ],
+                        },
+                    },
+                },
+                doc! {
+                    "$set": {
+                        "owner": { "$cond": [ "$_ferrum_claimable", owner, "$owner" ] },
+                        "expires_at": {
+                            "$cond": [
+                                "$_ferrum_claimable",
+                                { "$add": [ "$$NOW", MONGO_MIGRATION_LEASE_DURATION_MILLIS ] },
+                                "$expires_at",
+                            ],
+                        },
+                        "updated_at": {
+                            "$cond": [ "$_ferrum_claimable", "$$NOW", "$updated_at" ],
+                        },
+                        "created_at": { "$ifNull": [ "$created_at", "$$NOW" ] },
+                    },
+                },
+                doc! { "$unset": "_ferrum_claimable" },
+            ]
+        }
+
+        /// Aggregation-pipeline update that renews the lease with a fresh
+        /// server-time (`$$NOW`) expiry. The owner match stays in the query
+        /// filter so a renewal that no longer owns the lock matches nothing.
+        fn migration_lease_renew_pipeline() -> Vec<Document> {
+            vec![doc! {
+                "$set": {
+                    "expires_at": { "$add": [ "$$NOW", MONGO_MIGRATION_LEASE_DURATION_MILLIS ] },
+                    "updated_at": "$$NOW",
+                },
+            }]
+        }
+
+        /// The migration-lease duration in milliseconds (exposed for tests that
+        /// assert the classic acquire/renew builders stamp `now + duration`).
+        pub(crate) fn migration_lease_duration_millis() -> i64 {
+            MONGO_MIGRATION_LEASE_DURATION_MILLIS
+        }
+
+        pub(crate) fn pipeline_update_unsupported_for_test(error: &mongodb::error::Error) -> bool {
+            is_pipeline_update_unsupported(error)
+        }
+
+        /// Client-time expiry (`now + lease duration`) as a BSON `DateTime`, so
+        /// the classic DocumentDB fallback writes the same BSON type the
+        /// server-time (`$$NOW`) pipeline produces.
+        fn classic_lease_expiry(client_now: BsonDateTime) -> BsonDateTime {
+            BsonDateTime::from_millis(
+                client_now.timestamp_millis() + MONGO_MIGRATION_LEASE_DURATION_MILLIS,
+            )
+        }
+
+        /// Classic (non-pipeline) acquire FILTER for the DocumentDB fallback.
+        ///
+        /// Matches the lock when it is missing (`expires_at` absent), expired by
+        /// the CLIENT clock, or already owned by us. Combined with an upsert, a
+        /// lock held by another owner with an unexpired `expires_at` matches
+        /// nothing, so the upsert attempts an insert on the existing `_id` and
+        /// fails with a duplicate-key error the acquire loop treats as
+        /// contention (retry) — mirroring the pipeline path.
+        pub(crate) fn migration_lease_acquire_filter_classic(
+            owner: &str,
+            client_now: BsonDateTime,
+        ) -> Document {
+            doc! {
+                "_id": MONGO_MIGRATION_LOCK_ID,
+                "$or": [
+                    { "expires_at": { "$exists": false } },
+                    { "expires_at": { "$lte": client_now } },
+                    { "owner": owner },
+                ],
+            }
+        }
+
+        /// Classic (non-pipeline) acquire UPDATE for the DocumentDB fallback.
+        ///
+        /// Stamps the new owner plus a client-clock expiry/renewal, and sets
+        /// `created_at` only on insert. Client-time stamping carries the
+        /// accepted clock-skew degradation documented on
+        /// [`MigrationLeaseMode::ClientTimeClassic`].
+        pub(crate) fn migration_lease_acquire_update_classic(
+            owner: &str,
+            client_now: BsonDateTime,
+        ) -> Document {
+            doc! {
+                "$set": {
+                    "owner": owner,
+                    "expires_at": Self::classic_lease_expiry(client_now),
+                    "updated_at": client_now,
+                },
+                "$setOnInsert": { "created_at": client_now },
+            }
+        }
+
+        /// Classic (non-pipeline) renew UPDATE for the DocumentDB fallback. The
+        /// owner match stays in the query filter (`{_id, owner}`) so a renewal
+        /// that no longer owns the lock matches nothing, unchanged from the
+        /// pipeline path.
+        pub(crate) fn migration_lease_renew_update_classic(client_now: BsonDateTime) -> Document {
+            doc! {
+                "$set": {
+                    "expires_at": Self::classic_lease_expiry(client_now),
+                    "updated_at": client_now,
+                },
+            }
+        }
+
+        async fn acquire_migration_lease(&self) -> Result<MongoMigrationLease, anyhow::Error> {
+            // Give the lease acquire/renew/release (and Drop cleanup) path its
+            // own dedicated connection pool, separate from the store's
+            // migration-work pool. Cloning the bundle's already-materialized
+            // effective `ClientOptions` reuses the exact TLS/read-preference
+            // setup with no re-derivation, while capping the pool at a couple
+            // of connections keeps it cheap — the lease only issues tiny
+            // update_one/delete_one commands. This isolation is what prevents a
+            // long-running `create_index` from holding the sole pooled
+            // connection (e.g. maxPoolSize=1) and starving the 30s renewal:
+            // otherwise the 120s lease could expire mid-migration and let a
+            // second replica run the index/drop sequence concurrently, or make
+            // this instance fail lease release after the indexes succeeded.
+            let connection = self.connection();
+            let mut lease_options = connection.client_options.clone();
+            lease_options.max_pool_size = Some(MONGO_MIGRATION_LEASE_POOL_SIZE);
+            // Never let a URL-derived minPoolSize exceed the capped max (which
+            // would fail client construction) or eagerly warm this throwaway
+            // upkeep pool.
+            lease_options.min_pool_size = None;
+            let lease_client = Client::with_options(lease_options)?;
+            let collection = lease_client
+                .database(connection.db.name())
+                .collection::<Document>("_ferrum_migration_locks");
+            let owner = Uuid::new_v4().to_string();
+
+            // Start in server-time (`$$NOW`) pipeline mode, the skew-immune
+            // primary path for real MongoDB. Only the FIRST acquire attempt may
+            // probe the backend: if that pipeline update is rejected as
+            // unsupported (AWS DocumentDB), switch to the classic client-time
+            // mode for this lease's whole lifecycle and retry immediately.
+            let mut mode = MigrationLeaseMode::ServerTimePipeline;
+            let mut first_attempt = true;
+            loop {
+                let result = match mode {
+                    MigrationLeaseMode::ServerTimePipeline => {
+                        collection
+                            .find_one_and_update(
+                                doc! { "_id": MONGO_MIGRATION_LOCK_ID },
+                                Self::migration_lease_acquire_pipeline(&owner),
+                            )
+                            .upsert(true)
+                            .return_document(ReturnDocument::After)
+                            .await
+                    }
+                    MigrationLeaseMode::ClientTimeClassic => {
+                        let client_now = BsonDateTime::now();
+                        collection
+                            .find_one_and_update(
+                                Self::migration_lease_acquire_filter_classic(&owner, client_now),
+                                Self::migration_lease_acquire_update_classic(&owner, client_now),
+                            )
+                            .upsert(true)
+                            .return_document(ReturnDocument::After)
+                            .await
+                    }
+                };
+
+                let was_first_attempt = first_attempt;
+                first_attempt = false;
+                match result {
+                    // Acquire only writes our owner when the lease was
+                    // claimable; a returned document owned by someone else means
+                    // a still-valid lease we must wait on.
+                    Ok(Some(document))
+                        if document.get_str("owner").ok() == Some(owner.as_str()) =>
+                    {
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error) if is_duplicate_key(&error) => {}
+                    // DocumentDB rejects the aggregation-pipeline update up-front
+                    // (before touching the lock), detected only on the first
+                    // attempt. Permanently switch this lease to the classic
+                    // client-time path and retry immediately: the lock state is
+                    // unchanged, so this is a capability fallback, not backoff.
+                    Err(error)
+                        if was_first_attempt
+                            && mode == MigrationLeaseMode::ServerTimePipeline
+                            && is_pipeline_update_unsupported(&error) =>
+                    {
+                        warn!(
+                            "MongoDB rejected the aggregation-pipeline migration-lease update \
+                             (AWS DocumentDB-compatible backend); falling back to the classic \
+                             client-time lease for this migration run: {error}"
+                        );
+                        mode = MigrationLeaseMode::ClientTimeClassic;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                tokio::time::sleep(MONGO_MIGRATION_LEASE_RETRY_INTERVAL).await;
+            }
+
+            let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+            let renew_collection = collection.clone();
+            let renew_owner = owner.clone();
+            let valid = Arc::new(AtomicBool::new(true));
+            let renew_valid = valid.clone();
+            let renew_task = tokio::spawn(async move {
+                let mut valid_until = tokio::time::Instant::now() + MONGO_MIGRATION_LEASE_DURATION;
+                loop {
+                    tokio::select! {
+                        changed = stop_rx.changed() => {
+                            if changed.is_err() || *stop_rx.borrow() {
+                                return;
+                            }
+                        }
+                        _ = tokio::time::sleep(MONGO_MIGRATION_LEASE_RENEW_INTERVAL) => {}
+                    }
+
+                    loop {
+                        // Renew with the SAME mode the lease acquired under so a
+                        // DocumentDB lease never re-sends the unsupported
+                        // pipeline. The owner filter is identical in both modes.
+                        let renew_filter = doc! {
+                            "_id": MONGO_MIGRATION_LOCK_ID,
+                            "owner": &renew_owner,
+                        };
+                        let renewal = match mode {
+                            MigrationLeaseMode::ServerTimePipeline => {
+                                renew_collection
+                                    .update_one(
+                                        renew_filter,
+                                        MongoStore::migration_lease_renew_pipeline(),
+                                    )
+                                    .await
+                            }
+                            MigrationLeaseMode::ClientTimeClassic => {
+                                renew_collection
+                                    .update_one(
+                                        renew_filter,
+                                        MongoStore::migration_lease_renew_update_classic(
+                                            BsonDateTime::now(),
+                                        ),
+                                    )
+                                    .await
+                            }
+                        };
+                        match renewal {
+                            Ok(result) if result.matched_count == 1 => {
+                                valid_until =
+                                    tokio::time::Instant::now() + MONGO_MIGRATION_LEASE_DURATION;
+                                break;
+                            }
+                            Ok(_) => {
+                                renew_valid.store(false, Ordering::Release);
+                                error!(
+                                    "MongoDB migration lease renewal lost the owning lock document"
+                                );
+                                return;
+                            }
+                            Err(error) => {
+                                if tokio::time::Instant::now()
+                                    + MONGO_MIGRATION_LEASE_RETRY_INTERVAL
+                                    >= valid_until
+                                {
+                                    renew_valid.store(false, Ordering::Release);
+                                    error!(
+                                        "MongoDB migration lease expired after renewal failures: {}",
+                                        error
+                                    );
+                                    return;
+                                }
+                                debug!(
+                                    "MongoDB migration lease renewal failed; retrying before expiry: {}",
+                                    error
+                                );
+                                tokio::select! {
+                                    changed = stop_rx.changed() => {
+                                        if changed.is_err() || *stop_rx.borrow() {
+                                            return;
+                                        }
+                                    }
+                                    _ = tokio::time::sleep(MONGO_MIGRATION_LEASE_RETRY_INTERVAL) => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            Ok(MongoMigrationLease {
+                collection,
+                owner,
+                mode,
+                stop_tx: Some(stop_tx),
+                renew_task: Some(renew_task),
+                valid,
+                released: false,
+                _connection: connection,
+            })
         }
 
         /// Snapshot of the current `Database` handle, tied to the bundle that
@@ -6409,458 +6926,483 @@ mod inner {
         }
 
         async fn run_migrations(&self) -> Result<(), anyhow::Error> {
-            // MongoDB doesn't use SQL migrations. Instead, ensure indexes exist.
-            // createIndex is idempotent — no-op if the index already exists.
+            let mut migration_lease = self.acquire_migration_lease().await?;
+            // Run every index/drop step inside a scoped future so a failure
+            // part-way through still falls through to the lease release below.
+            // Without this, an early `?` would exit `run_migrations` with the
+            // lease still held, forcing other replicas to wait out the full
+            // 120s lease window before they can migrate — the `Drop` path only
+            // spawns a best-effort async cleanup that may never run when the
+            // runtime is torn down in startup/migrate mode.
+            let migration_result: Result<(), anyhow::Error> = async {
+                // MongoDB doesn't use SQL migrations. Instead, ensure indexes exist.
+                // createIndex is idempotent — no-op if the index already exists.
 
-            // proxies indexes — uniqueness scoped to namespace
-            self.proxies()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "name": 1 })
-                        .options(
-                            IndexOptions::builder()
-                                .unique(true)
-                                .partial_filter_expression(doc! {
-                                    "name": { "$type": "string" }
-                                })
-                                .build(),
-                        )
-                        .build(),
-                )
-                .await?;
-            self.proxies()
-                .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
-                .await?;
-            self.proxies()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "upstream_id": 1 })
-                        .build(),
-                )
-                .await?;
-            self.proxies()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "plugins.plugin_config_id": 1 })
-                        .build(),
-                )
-                .await?;
-            self.proxies()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "listen_port": 1 })
-                        .options(
-                            IndexOptions::builder()
-                                .unique(true)
-                                .partial_filter_expression(doc! {
-                                    "listen_port": { "$type": "number" }
-                                })
-                                .build(),
-                        )
-                        .build(),
-                )
-                .await?;
-            // Intentionally NO unique index on (namespace, listen_path). Path
-            // uniqueness is host-scoped: two HTTP proxies may share a
-            // listen_path if their `hosts` lists do not overlap. A plain
-            // unique index would reject valid host-partitioned routes before
-            // the host-overlap check in `check_listen_path_unique` runs.
-            // Uniqueness is enforced at the application layer instead.
-            //
-            // No standalone {namespace} index: the {namespace, updated_at}
-            // compound below covers namespace-only lookups via the
-            // leading-column rule.
-            self.proxies()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "updated_at": 1 })
-                        .build(),
-                )
-                .await?;
-            // Supports incremental point-loads by namespace and changed IDs.
-            // Deletions come from `config_changes`; normal polls no longer scan
-            // full collection ID sets.
-            self.proxies()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "_id": 1 })
-                        .build(),
-                )
-                .await?;
+                // proxies indexes — uniqueness scoped to namespace
+                self.proxies()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "name": 1 })
+                            .options(
+                                IndexOptions::builder()
+                                    .unique(true)
+                                    .partial_filter_expression(doc! {
+                                        "name": { "$type": "string" }
+                                    })
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .await?;
+                self.proxies()
+                    .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
+                    .await?;
+                self.proxies()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "upstream_id": 1 })
+                            .build(),
+                    )
+                    .await?;
+                self.proxies()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "plugins.plugin_config_id": 1 })
+                            .build(),
+                    )
+                    .await?;
+                self.proxies()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "listen_port": 1 })
+                            .options(
+                                IndexOptions::builder()
+                                    .unique(true)
+                                    .partial_filter_expression(doc! {
+                                        "listen_port": { "$type": "number" }
+                                    })
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .await?;
+                // Intentionally NO unique index on (namespace, listen_path). Path
+                // uniqueness is host-scoped: two HTTP proxies may share a
+                // listen_path if their `hosts` lists do not overlap. A plain
+                // unique index would reject valid host-partitioned routes before
+                // the host-overlap check in `check_listen_path_unique` runs.
+                // Uniqueness is enforced at the application layer instead.
+                //
+                // No standalone {namespace} index: the {namespace, updated_at}
+                // compound below covers namespace-only lookups via the
+                // leading-column rule.
+                self.proxies()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "updated_at": 1 })
+                            .build(),
+                    )
+                    .await?;
+                // Supports incremental point-loads by namespace and changed IDs.
+                // Deletions come from `config_changes`; normal polls no longer scan
+                // full collection ID sets.
+                self.proxies()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "_id": 1 })
+                            .build(),
+                    )
+                    .await?;
 
-            // consumers indexes — uniqueness scoped to namespace.
-            //
-            // NOTE: the consumers collection's `_id` is the composite
-            // "{namespace}:{id}" (see `consumer_doc_id`), so consumer *id*
-            // uniqueness is per-namespace via `_id` itself — no extra index
-            // needed. The username/custom_id unique indexes below stay as
-            // secondary guards for their individual fields.
-            self.consumers()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "username": 1 })
-                        .options(IndexOptions::builder().unique(true).build())
-                        .build(),
-                )
-                .await?;
-            self.consumers()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "custom_id": 1 })
-                        .options(
-                            IndexOptions::builder()
-                                .unique(true)
-                                .partial_filter_expression(doc! {
-                                    "custom_id": { "$type": "string" }
-                                })
-                                .build(),
-                        )
-                        .build(),
-                )
-                .await?;
-            self.consumers()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "credentials.keyauth.key": 1 })
-                        .options(
-                            IndexOptions::builder()
-                                .unique(true)
-                                .partial_filter_expression(doc! {
-                                    "credentials.keyauth.key": { "$type": "string" }
-                                })
-                                .build(),
-                        )
-                        .build(),
-                )
-                .await?;
-            self.consumers()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "credentials.mtls_auth.identity": 1 })
-                        .options(
-                            IndexOptions::builder()
-                                .unique(true)
-                                .partial_filter_expression(doc! {
-                                    "credentials.mtls_auth.identity": { "$type": "string" }
-                                })
-                                .build(),
-                        )
-                        .build(),
-                )
-                .await?;
-            self.consumers()
-                .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
-                .await?;
-            // No standalone {namespace} index — covered by {namespace, updated_at} below.
-            self.consumers()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "updated_at": 1 })
-                        .build(),
-                )
-                .await?;
-            // Supports incremental point-loads by namespace and changed IDs.
-            self.consumers()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "_id": 1 })
-                        .build(),
-                )
-                .await?;
+                // consumers indexes — uniqueness scoped to namespace.
+                //
+                // NOTE: the consumers collection's `_id` is the composite
+                // "{namespace}:{id}" (see `consumer_doc_id`), so consumer *id*
+                // uniqueness is per-namespace via `_id` itself — no extra index
+                // needed. The username/custom_id unique indexes below stay as
+                // secondary guards for their individual fields.
+                self.consumers()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "username": 1 })
+                            .options(IndexOptions::builder().unique(true).build())
+                            .build(),
+                    )
+                    .await?;
+                self.consumers()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "custom_id": 1 })
+                            .options(
+                                IndexOptions::builder()
+                                    .unique(true)
+                                    .partial_filter_expression(doc! {
+                                        "custom_id": { "$type": "string" }
+                                    })
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .await?;
+                self.consumers()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "credentials.keyauth.key": 1 })
+                            .options(
+                                IndexOptions::builder()
+                                    .unique(true)
+                                    .partial_filter_expression(doc! {
+                                        "credentials.keyauth.key": { "$type": "string" }
+                                    })
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .await?;
+                self.consumers()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "credentials.mtls_auth.identity": 1 })
+                            .options(
+                                IndexOptions::builder()
+                                    .unique(true)
+                                    .partial_filter_expression(doc! {
+                                        "credentials.mtls_auth.identity": { "$type": "string" }
+                                    })
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .await?;
+                self.consumers()
+                    .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
+                    .await?;
+                // No standalone {namespace} index — covered by {namespace, updated_at} below.
+                self.consumers()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "updated_at": 1 })
+                            .build(),
+                    )
+                    .await?;
+                // Supports incremental point-loads by namespace and changed IDs.
+                self.consumers()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "_id": 1 })
+                            .build(),
+                    )
+                    .await?;
 
-            // consumer_identity_index — merged identity keyspace
-            // (id ∪ username ∪ custom_id) per namespace. Documents are keyed
-            // by `_id = "{namespace}:{identity_value}"`, so uniqueness needs
-            // no extra index; the non-unique {namespace} index supports
-            // namespace wipes (`delete_all_resources`) and per-consumer
-            // cleanup filters.
-            self.consumer_identity_index()
-                .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
-                .await?;
+                // consumer_identity_index — merged identity keyspace
+                // (id ∪ username ∪ custom_id) per namespace. Documents are keyed
+                // by `_id = "{namespace}:{identity_value}"`, so uniqueness needs
+                // no extra index; the non-unique {namespace} index supports
+                // namespace wipes (`delete_all_resources`) and per-consumer
+                // cleanup filters.
+                self.consumer_identity_index()
+                    .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
+                    .await?;
 
-            // proxy_route_locks and upstream_ref_guards are keyed purely by
-            // `_id` ("{namespace}:{route_key_hash}" /
-            // "{namespace}:{upstream_id}") and need no indexes — but they are
-            // written from INSIDE transactions, and MongoDB < 4.4 cannot
-            // implicitly create a collection in a multi-document transaction,
-            // so create them explicitly here. NamespaceExists (code 48) is
-            // tolerated for idempotent multi-instance startup.
-            for lock_collection in ["proxy_route_locks", "upstream_ref_guards"] {
-                match self.db().create_collection(lock_collection).await {
-                    Ok(()) => {}
-                    Err(e) if is_namespace_exists(&e) => {}
-                    Err(e) => return Err(e.into()),
+                // proxy_route_locks and upstream_ref_guards are keyed purely by
+                // `_id` ("{namespace}:{route_key_hash}" /
+                // "{namespace}:{upstream_id}") and need no indexes — but they are
+                // written from INSIDE transactions, and MongoDB < 4.4 cannot
+                // implicitly create a collection in a multi-document transaction,
+                // so create them explicitly here. NamespaceExists (code 48) is
+                // tolerated for idempotent multi-instance startup.
+                for lock_collection in ["proxy_route_locks", "upstream_ref_guards"] {
+                    match self.db().create_collection(lock_collection).await {
+                        Ok(()) => {}
+                        Err(e) if is_namespace_exists(&e) => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
-            }
 
-            // plugin_configs indexes
-            self.plugin_configs()
-                .create_index(IndexModel::builder().keys(doc! { "proxy_id": 1 }).build())
-                .await?;
-            self.plugin_configs()
-                .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
-                .await?;
-            // No standalone {namespace} index — covered by {namespace, updated_at} below.
-            self.plugin_configs()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "updated_at": 1 })
-                        .build(),
-                )
-                .await?;
-            // Supports incremental point-loads by namespace and changed IDs.
-            self.plugin_configs()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "_id": 1 })
-                        .build(),
-                )
-                .await?;
-            // Compound indexes for common admin API query patterns (V003)
-            self.plugin_configs()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "scope": 1 })
-                        .build(),
-                )
-                .await?;
-            self.plugin_configs()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "scope": 1, "_id": 1 })
-                        .build(),
-                )
-                .await?;
-            self.plugin_configs()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "plugin_name": 1 })
-                        .build(),
-                )
-                .await?;
-            // Cold-path index for cross-namespace mesh_route_dispatch lookups in
-            // `find_mesh_route_dispatch_upstream_ref_opt_session` and
-            // `ensure_no_external_spec_upstream_refs_opt_session`. Both query
-            // `{plugin_name: "mesh_route_dispatch", enabled: true}` across all
-            // namespaces (upstream IDs are globally unique, so a cross-namespace
-            // reference is real and must be caught). The partial filter halves
-            // index size and write amplification in deployments with many
-            // disabled plugin_configs.
-            self.plugin_configs()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "plugin_name": 1, "enabled": 1 })
-                        .options(
-                            IndexOptions::builder()
-                                .partial_filter_expression(doc! { "enabled": true })
-                                .build(),
-                        )
-                        .build(),
-                )
-                .await?;
+                // plugin_configs indexes
+                self.plugin_configs()
+                    .create_index(IndexModel::builder().keys(doc! { "proxy_id": 1 }).build())
+                    .await?;
+                self.plugin_configs()
+                    .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
+                    .await?;
+                // No standalone {namespace} index — covered by {namespace, updated_at} below.
+                self.plugin_configs()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "updated_at": 1 })
+                            .build(),
+                    )
+                    .await?;
+                // Supports incremental point-loads by namespace and changed IDs.
+                self.plugin_configs()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "_id": 1 })
+                            .build(),
+                    )
+                    .await?;
+                // Compound indexes for common admin API query patterns (V003)
+                self.plugin_configs()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "scope": 1 })
+                            .build(),
+                    )
+                    .await?;
+                self.plugin_configs()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "scope": 1, "_id": 1 })
+                            .build(),
+                    )
+                    .await?;
+                self.plugin_configs()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "plugin_name": 1 })
+                            .build(),
+                    )
+                    .await?;
+                // Cold-path index for cross-namespace mesh_route_dispatch lookups in
+                // `find_mesh_route_dispatch_upstream_ref_opt_session` and
+                // `ensure_no_external_spec_upstream_refs_opt_session`. Both query
+                // `{plugin_name: "mesh_route_dispatch", enabled: true}` across all
+                // namespaces (upstream IDs are globally unique, so a cross-namespace
+                // reference is real and must be caught). The partial filter halves
+                // index size and write amplification in deployments with many
+                // disabled plugin_configs.
+                self.plugin_configs()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "plugin_name": 1, "enabled": 1 })
+                            .options(
+                                IndexOptions::builder()
+                                    .partial_filter_expression(doc! { "enabled": true })
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .await?;
 
-            // Sparse index on api_spec_id for cascade queries (delete/replace by
-            // spec ownership).  Most plugin_configs have api_spec_id: null, so
-            // sparse avoids indexing the majority of documents.
-            self.plugin_configs()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "api_spec_id": 1 })
-                        .options(IndexOptions::builder().sparse(true).build())
-                        .build(),
-                )
-                .await?;
+                // Sparse index on api_spec_id for cascade queries (delete/replace by
+                // spec ownership).  Most plugin_configs have api_spec_id: null, so
+                // sparse avoids indexing the majority of documents.
+                self.plugin_configs()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "api_spec_id": 1 })
+                            .options(IndexOptions::builder().sparse(true).build())
+                            .build(),
+                    )
+                    .await?;
 
-            // upstreams indexes — uniqueness scoped to namespace
-            self.upstreams()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "name": 1 })
-                        .options(
-                            IndexOptions::builder()
-                                .unique(true)
-                                .partial_filter_expression(doc! {
-                                    "name": { "$type": "string" }
-                                })
-                                .build(),
-                        )
-                        .build(),
-                )
-                .await?;
-            self.upstreams()
-                .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
-                .await?;
-            // No standalone {namespace} index — covered by {namespace, updated_at} below.
-            // Sparse index on api_spec_id — mirrors plugin_configs above.
-            self.upstreams()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "api_spec_id": 1 })
-                        .options(IndexOptions::builder().sparse(true).build())
-                        .build(),
-                )
-                .await?;
-            self.upstreams()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "updated_at": 1 })
-                        .build(),
-                )
-                .await?;
-            // Supports incremental point-loads by namespace and changed IDs.
-            self.upstreams()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "_id": 1 })
-                        .build(),
-                )
-                .await?;
+                // upstreams indexes — uniqueness scoped to namespace
+                self.upstreams()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "name": 1 })
+                            .options(
+                                IndexOptions::builder()
+                                    .unique(true)
+                                    .partial_filter_expression(doc! {
+                                        "name": { "$type": "string" }
+                                    })
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .await?;
+                self.upstreams()
+                    .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
+                    .await?;
+                // No standalone {namespace} index — covered by {namespace, updated_at} below.
+                // Sparse index on api_spec_id — mirrors plugin_configs above.
+                self.upstreams()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "api_spec_id": 1 })
+                            .options(IndexOptions::builder().sparse(true).build())
+                            .build(),
+                    )
+                    .await?;
+                self.upstreams()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "updated_at": 1 })
+                            .build(),
+                    )
+                    .await?;
+                // Supports incremental point-loads by namespace and changed IDs.
+                self.upstreams()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "_id": 1 })
+                            .build(),
+                    )
+                    .await?;
 
-            // api_specs indexes (admin-only; runtime never reads this collection).
-            // Unique (namespace, proxy_id) mirrors the SQL unique index and prevents
-            // a second spec from claiming ownership of an already-spec-owned proxy.
-            // Partial filter mirrors the sparse-unique pattern used for
-            // (namespace, name), (namespace, custom_id), and (namespace, listen_port)
-            // elsewhere — guards against the null-collision case if a future doc
-            // is ever inserted without a proxy_id. SQL is safe via NOT NULL.
-            //
-            // Upgrade path: the previous V001 baseline created the same-keyed
-            // index with `unique(true)` only. MongoDB raises
-            // IndexOptionsConflict (code 85) when keys match but options
-            // differ, so a plain `create_index` fails on upgrade. Drop the
-            // legacy index on conflict and recreate — fresh DBs skip the
-            // branch, upgraded DBs take it exactly once. IndexNotFound on
-            // drop and IndexAlreadyExists on recreate are both tolerated to
-            // make the path safe under concurrent multi-instance startup.
-            let api_specs_unique = IndexModel::builder()
-                .keys(doc! { "namespace": 1, "proxy_id": 1 })
-                .options(
-                    IndexOptions::builder()
-                        .unique(true)
-                        .partial_filter_expression(doc! {
-                            "proxy_id": { "$type": "string" }
-                        })
-                        .build(),
-                )
-                .build();
-            match self
-                .api_specs()
-                .create_index(api_specs_unique.clone())
-                .await
-            {
-                Ok(_) => {}
-                Err(e) if is_index_options_conflict(&e) => {
-                    warn!(
-                        "MongoDB api_specs (namespace, proxy_id) unique index exists \
+                // api_specs indexes (admin-only; runtime never reads this collection).
+                // Unique (namespace, proxy_id) mirrors the SQL unique index and prevents
+                // a second spec from claiming ownership of an already-spec-owned proxy.
+                // Partial filter mirrors the sparse-unique pattern used for
+                // (namespace, name), (namespace, custom_id), and (namespace, listen_port)
+                // elsewhere — guards against the null-collision case if a future doc
+                // is ever inserted without a proxy_id. SQL is safe via NOT NULL.
+                //
+                // Upgrade path: the previous V001 baseline created the same-keyed
+                // index with `unique(true)` only. MongoDB raises
+                // IndexOptionsConflict (code 85) when keys match but options
+                // differ, so a plain `create_index` fails on upgrade. Drop the
+                // legacy index on conflict and recreate — fresh DBs skip the
+                // branch, upgraded DBs take it exactly once. IndexNotFound on
+                // drop and IndexAlreadyExists on recreate are both tolerated to
+                // make the path safe under concurrent multi-instance startup.
+                let api_specs_unique = IndexModel::builder()
+                    .keys(doc! { "namespace": 1, "proxy_id": 1 })
+                    .options(
+                        IndexOptions::builder()
+                            .unique(true)
+                            .partial_filter_expression(doc! {
+                                "proxy_id": { "$type": "string" }
+                            })
+                            .build(),
+                    )
+                    .build();
+                match self
+                    .api_specs()
+                    .create_index(api_specs_unique.clone())
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) if is_index_options_conflict(&e) => {
+                        warn!(
+                            "MongoDB api_specs (namespace, proxy_id) unique index exists \
                          without partialFilterExpression. Dropping the legacy index and \
                          recreating with the new options — one-time upgrade step."
-                    );
-                    match self.api_specs().drop_index("namespace_1_proxy_id_1").await {
-                        Ok(_) => {}
-                        Err(drop_err) if is_index_not_found(&drop_err) => {}
-                        Err(drop_err) => {
-                            return Err(anyhow::anyhow!(
-                                "Failed to drop legacy api_specs (namespace, proxy_id) index \
+                        );
+                        match self.api_specs().drop_index("namespace_1_proxy_id_1").await {
+                            Ok(_) => {}
+                            Err(drop_err) if is_index_not_found(&drop_err) => {}
+                            Err(drop_err) => {
+                                return Err(anyhow::anyhow!(
+                                    "Failed to drop legacy api_specs (namespace, proxy_id) index \
                                  during upgrade: {drop_err}. Run \
                                  `db.api_specs.dropIndex(\"namespace_1_proxy_id_1\")` \
                                  manually and restart."
-                            ));
+                                ));
+                            }
+                        }
+                        match self.api_specs().create_index(api_specs_unique).await {
+                            Ok(_) => {}
+                            Err(create_err) if is_index_already_exists(&create_err) => {}
+                            Err(create_err) => return Err(create_err.into()),
                         }
                     }
-                    match self.api_specs().create_index(api_specs_unique).await {
-                        Ok(_) => {}
-                        Err(create_err) if is_index_already_exists(&create_err) => {}
-                        Err(create_err) => return Err(create_err.into()),
-                    }
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) => return Err(e.into()),
+                self.api_specs()
+                    .create_index(IndexModel::builder().keys(doc! { "proxy_id": 1 }).build())
+                    .await?;
+                self.api_specs()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "updated_at": 1 })
+                            .build(),
+                    )
+                    .await?;
+                // Wave 5 indexes — spec_version filter, operation_count/created_at sorting,
+                // and tags multikey index for has_tag membership filter.
+                self.api_specs()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "spec_version": 1 })
+                            .build(),
+                    )
+                    .await?;
+                self.api_specs()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "operation_count": 1 })
+                            .build(),
+                    )
+                    .await?;
+                self.api_specs()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "created_at": -1 })
+                            .build(),
+                    )
+                    .await?;
+                self.api_specs()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "tags": 1 })
+                            .build(),
+                    )
+                    .await?;
+
+                // audit_events indexes (admin-only mutation log).
+                self.audit_events()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "ts": -1 })
+                            .build(),
+                    )
+                    .await?;
+                self.audit_events()
+                    .create_index(IndexModel::builder().keys(doc! { "actor": 1 }).build())
+                    .await?;
+                self.audit_events()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "action": 1 })
+                            .build(),
+                    )
+                    .await?;
+                self.audit_events()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "resource_type": 1 })
+                            .build(),
+                    )
+                    .await?;
+                self.audit_events()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "resource_id": 1 })
+                            .build(),
+                    )
+                    .await?;
+                self.config_changes()
+                    .create_index(
+                        IndexModel::builder()
+                            .keys(doc! { "namespace": 1, "sequence": 1 })
+                            .build(),
+                    )
+                    .await?;
+                self.config_changes()
+                    .create_index(IndexModel::builder().keys(doc! { "sequence": 1 }).build())
+                    .await?;
+
+                info!("MongoDB indexes ensured");
+                Ok(())
             }
-            self.api_specs()
-                .create_index(IndexModel::builder().keys(doc! { "proxy_id": 1 }).build())
-                .await?;
-            self.api_specs()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "updated_at": 1 })
-                        .build(),
-                )
-                .await?;
-            // Wave 5 indexes — spec_version filter, operation_count/created_at sorting,
-            // and tags multikey index for has_tag membership filter.
-            self.api_specs()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "spec_version": 1 })
-                        .build(),
-                )
-                .await?;
-            self.api_specs()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "operation_count": 1 })
-                        .build(),
-                )
-                .await?;
-            self.api_specs()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "created_at": -1 })
-                        .build(),
-                )
-                .await?;
-            self.api_specs()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "tags": 1 })
-                        .build(),
-                )
-                .await?;
+            .await;
 
-            // audit_events indexes (admin-only mutation log).
-            self.audit_events()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "ts": -1 })
-                        .build(),
-                )
-                .await?;
-            self.audit_events()
-                .create_index(IndexModel::builder().keys(doc! { "actor": 1 }).build())
-                .await?;
-            self.audit_events()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "action": 1 })
-                        .build(),
-                )
-                .await?;
-            self.audit_events()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "resource_type": 1 })
-                        .build(),
-                )
-                .await?;
-            self.audit_events()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "resource_id": 1 })
-                        .build(),
-                )
-                .await?;
-            self.config_changes()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "sequence": 1 })
-                        .build(),
-                )
-                .await?;
-            self.config_changes()
-                .create_index(IndexModel::builder().keys(doc! { "sequence": 1 }).build())
-                .await?;
-
-            info!("MongoDB indexes ensured");
-            Ok(())
+            // Always release the lease — on success and on error — then surface
+            // the combined outcome so a migration failure is not masked by a
+            // release failure (and vice versa). Mirrors the SQL side's
+            // run-body / capture-result / release / combine pattern.
+            let release_result = migration_lease.release().await;
+            match (migration_result, release_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(migration_err), Ok(())) => Err(migration_err),
+                (Ok(()), Err(release_err)) => Err(release_err),
+                (Err(migration_err), Err(release_err)) => Err(migration_err.context(format!(
+                    "MongoDB migration lease release also failed: {release_err:#}"
+                ))),
+            }
         }
 
         async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
@@ -9654,10 +10196,10 @@ mod inner {
             let opts = mongodb::options::ClientOptions::builder()
                 .hosts(vec![])
                 .build();
-            let client = mongodb::Client::with_options(opts)
+            let client = mongodb::Client::with_options(opts.clone())
                 .expect("Client::with_options should accept empty hosts");
             let db = client.database(&settings.database_name);
-            let connection = MongoConnectionBundle::new(client, db, Vec::new());
+            let connection = MongoConnectionBundle::new(client, db, opts, Vec::new());
             MongoStore {
                 connection: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(connection)),
                 conn_settings: settings,
@@ -9752,7 +10294,7 @@ mod inner {
             let opts = mongodb::options::ClientOptions::builder()
                 .hosts(vec![])
                 .build();
-            let new_client = mongodb::Client::with_options(opts).unwrap();
+            let new_client = mongodb::Client::with_options(opts.clone()).unwrap();
             let new_db = new_client.database("after_failover");
 
             // Confirm the accessor sees the original namespace before the swap.
@@ -9764,6 +10306,7 @@ mod inner {
                 .store(std::sync::Arc::new(MongoConnectionBundle::new(
                     new_client,
                     new_db,
+                    opts,
                     Vec::new(),
                 )));
 
@@ -9882,34 +10425,32 @@ mod inner {
             let temp_path = temp_path.expect("generated temp guard");
 
             let store = make_test_store(vec![]);
-            let old_client = mongodb::Client::with_options(
-                mongodb::options::ClientOptions::builder()
-                    .hosts(vec![])
-                    .build(),
-            )
-            .expect("old client");
+            let old_opts = mongodb::options::ClientOptions::builder()
+                .hosts(vec![])
+                .build();
+            let old_client = mongodb::Client::with_options(old_opts.clone()).expect("old client");
             let old_db = old_client.database("old_with_temp");
             store
                 .connection
                 .store(std::sync::Arc::new(MongoConnectionBundle::new(
                     old_client,
                     old_db,
+                    old_opts,
                     vec![temp_path],
                 )));
 
             let old_cursor_collection_guard = store.proxies();
-            let new_client = mongodb::Client::with_options(
-                mongodb::options::ClientOptions::builder()
-                    .hosts(vec![])
-                    .build(),
-            )
-            .expect("new client");
+            let new_opts = mongodb::options::ClientOptions::builder()
+                .hosts(vec![])
+                .build();
+            let new_client = mongodb::Client::with_options(new_opts.clone()).expect("new client");
             let new_db = new_client.database("new_without_temp");
             store
                 .connection
                 .store(std::sync::Arc::new(MongoConnectionBundle::new(
                     new_client,
                     new_db,
+                    new_opts,
                     Vec::new(),
                 )));
 

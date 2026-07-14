@@ -1,13 +1,58 @@
 use ferrum_edge::_test_support::{
-    DbPoolConfig, db_append_connect_timeout, db_diff_removed, parse_auth_mode, parse_scheme,
-    statement_timeout_sql,
+    DbPoolConfig, db_append_connect_timeout, db_code_is_transient, db_diff_removed,
+    db_mongo_error_is_transient, db_mysql_error_number_is_transient,
+    db_wrap_mysql_isolation_read_error, parse_auth_mode, parse_scheme, statement_timeout_sql,
 };
+use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, Upstream, UpstreamTarget,
 };
 use serde_json::json;
+use sqlx::error::{DatabaseError, ErrorKind};
+use std::borrow::Cow;
 use std::collections::HashSet;
+use std::error::Error as StdError;
+use std::fmt;
+
+#[derive(Debug)]
+struct TestDatabaseError {
+    code: &'static str,
+}
+
+impl fmt::Display for TestDatabaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "test database error {}", self.code)
+    }
+}
+
+impl StdError for TestDatabaseError {}
+
+impl DatabaseError for TestDatabaseError {
+    fn message(&self) -> &str {
+        "test database error"
+    }
+
+    fn code(&self) -> Option<Cow<'_, str>> {
+        Some(Cow::Borrowed(self.code))
+    }
+
+    fn as_error(&self) -> &(dyn StdError + Send + Sync + 'static) {
+        self
+    }
+
+    fn as_error_mut(&mut self) -> &mut (dyn StdError + Send + Sync + 'static) {
+        self
+    }
+
+    fn into_error(self: Box<Self>) -> Box<dyn StdError + Send + Sync + 'static> {
+        self
+    }
+
+    fn kind(&self) -> ErrorKind {
+        ErrorKind::Other
+    }
+}
 
 fn make_upstream(id: &str) -> Upstream {
     Upstream {
@@ -412,5 +457,377 @@ async fn consumer_credential_index_updates_on_consumer_update() {
             )
             .await
             .unwrap()
+    );
+}
+
+async fn seed_sqlite_namespace(db_url: &str, namespace: &str) {
+    let store = DatabaseStore::connect_with_pool_config("sqlite", db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO upstreams (id, namespace, name, targets) VALUES (?, ?, ?, '[]')")
+        .bind(format!("{namespace}-upstream"))
+        .bind(namespace)
+        .bind(format!("{namespace}-name"))
+        .execute(&store.pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn failover_does_not_mask_non_transient_schema_errors() {
+    sqlx::any::install_default_drivers();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("broken-primary.db");
+    let failover_path = temp_dir.path().join("healthy-failover.db");
+    let primary_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+
+    let raw_pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&primary_url)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE proxies (id TEXT PRIMARY KEY)")
+        .execute(&raw_pool)
+        .await
+        .unwrap();
+    raw_pool.close().await;
+
+    let result = DatabaseStore::connect_with_failover(
+        "sqlite",
+        &primary_url,
+        std::slice::from_ref(&failover_url),
+        DbPoolConfig::default(),
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("schema/query errors must stop instead of selecting failover"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("non-transient"),
+        "unexpected failover classification: {error}"
+    );
+    assert!(
+        DatabaseStore::is_non_transient_init_error(&error),
+        "a non-transient schema error must be classified so database::run refuses backup bootstrap: {error}"
+    );
+    assert!(
+        !failover_path.exists(),
+        "the failover database must not be opened for a permanent primary schema error"
+    );
+}
+
+#[tokio::test]
+async fn transient_connectivity_failure_stays_backup_eligible() {
+    // database::run may only bootstrap from FERRUM_DB_CONFIG_BACKUP_PATH for
+    // TRANSIENT failures; pin that a plain connectivity failure is classified
+    // transient (not marked non-transient) so backup bootstrap stays eligible.
+    sqlx::any::install_default_drivers();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let missing_path = temp_dir.path().join("missing-primary.db");
+    // mode=rw refuses to create the file, so opening a missing database is a
+    // transient connectivity failure (SQLITE_CANTOPEN).
+    let primary_url = format!("sqlite:{}?mode=rw", missing_path.to_string_lossy());
+    let no_failover: Vec<String> = Vec::new();
+
+    let error = match DatabaseStore::connect_with_failover(
+        "sqlite",
+        &primary_url,
+        &no_failover,
+        DbPoolConfig::default(),
+    )
+    .await
+    {
+        Ok(_) => panic!("opening a missing read-only sqlite database must fail"),
+        Err(error) => error,
+    };
+    assert!(
+        !DatabaseStore::is_non_transient_init_error(&error),
+        "a transient connectivity failure must remain backup-eligible: {error}"
+    );
+    assert!(
+        !missing_path.exists(),
+        "mode=rw must not create the database file"
+    );
+}
+
+#[test]
+fn initial_config_load_validation_error_is_non_transient() {
+    // A schema/data/validation load failure that carries no transient
+    // sqlx/mongodb error must be marked non-transient so database::run refuses
+    // to bootstrap from FERRUM_DB_CONFIG_BACKUP_PATH and fails startup instead
+    // of masking a broken database with stale on-disk config.
+    let raw = anyhow::anyhow!("proxy 'api' references unknown upstream 'missing'");
+    let classified = DatabaseStore::classify_initial_config_load_error(raw);
+    assert!(
+        DatabaseStore::is_non_transient_init_error(&classified),
+        "a non-transient config-load error must be marked so backup bootstrap is refused: {classified}"
+    );
+}
+
+#[test]
+fn initial_config_load_transient_sqlx_error_stays_backup_eligible() {
+    // A connectivity failure during the initial full load (the DB became
+    // unreachable between connect and load) must stay backup-eligible so the
+    // gateway can still come up serving FERRUM_DB_CONFIG_BACKUP_PATH.
+    let raw = anyhow::Error::new(sqlx::Error::PoolTimedOut)
+        .context("load_full_config: initial database query failed");
+    let classified = DatabaseStore::classify_initial_config_load_error(raw);
+    assert!(
+        !DatabaseStore::is_non_transient_init_error(&classified),
+        "a transient connectivity load failure must remain backup-eligible: {classified}"
+    );
+}
+
+#[test]
+fn mysql_transaction_isolation_read_disconnect_stays_backup_eligible() {
+    // A MySQL primary can drop mid-`configure_full_load_snapshot` while
+    // `mysql_transaction_isolation()` reads @@transaction_isolation. That is a
+    // transient post-connect load failure the backup path is meant to cover, so
+    // the isolation-read wrapper must keep the fallback sqlx error typed in its
+    // source chain instead of stringifying it. Reconstruct the EXACT production
+    // wrapper (via the shared helper) and pin that classification leaves it
+    // backup-eligible.
+    let primary_error = sqlx::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "connection reset by peer while reading @@transaction_isolation",
+    ));
+    let fallback_error = sqlx::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "connection reset by peer while reading @@tx_isolation",
+    ));
+    let wrapped = db_wrap_mysql_isolation_read_error(&primary_error, fallback_error);
+
+    assert!(
+        wrapped
+            .chain()
+            .any(|source| source.downcast_ref::<sqlx::Error>().is_some()),
+        "the isolation-read wrapper must retain a typed sqlx source: {wrapped:#}"
+    );
+
+    let classified = DatabaseStore::classify_initial_config_load_error(wrapped);
+    assert!(
+        !DatabaseStore::is_non_transient_init_error(&classified),
+        "a transient MySQL disconnect during the isolation read must remain backup-eligible: {classified}"
+    );
+}
+
+#[test]
+fn sqlite_low_byte_codes_stay_transient_only_for_sqlite() {
+    // SQLite reports base result codes in the low byte of extended codes.
+    // BUSY/LOCKED/CANTOPEN and their extended forms are temporary resource or
+    // connectivity failures, but only when emitted by the SQLite driver.
+    for code in ["5", "6", "14", "517", "262", "1038"] {
+        assert!(
+            db_code_is_transient(code, true),
+            "SQLite result code {code} must remain transient"
+        );
+        assert!(
+            !db_code_is_transient(code, false),
+            "non-SQLite result code {code} must not use SQLite low-byte classification"
+        );
+    }
+}
+
+fn mongo_command_error(code: i32, message: &str) -> mongodb::error::Error {
+    let command_error: mongodb::error::CommandError = mongodb::bson::from_document(
+        mongodb::bson::doc! { "code": code, "codeName": "TestCommandError", "errmsg": message },
+    )
+    .unwrap();
+    mongodb::error::ErrorKind::Command(command_error).into()
+}
+
+#[test]
+fn mongo_election_command_errors_stay_backup_eligible() {
+    let stepped_down = mongo_command_error(189, "primary stepped down during config read");
+    assert!(
+        db_mongo_error_is_transient(&stepped_down),
+        "PrimarySteppedDown must remain eligible for backup fallback"
+    );
+
+    for (code, name) in [(13, "Unauthorized"), (18, "AuthenticationFailed")] {
+        let auth_error = mongo_command_error(code, name);
+        assert!(
+            !db_mongo_error_is_transient(&auth_error),
+            "authentication-ish command code {code} must refuse backup fallback"
+        );
+    }
+}
+
+#[test]
+fn mysql_per_user_connection_limits_stay_transient() {
+    for code in [1203, 1226] {
+        assert!(
+            db_mysql_error_number_is_transient(code),
+            "temporary MySQL per-user resource limit {code} must remain failover/backup-eligible"
+        );
+    }
+    assert!(
+        !db_mysql_error_number_is_transient(1045),
+        "MySQL access denied must remain non-transient"
+    );
+}
+
+#[test]
+fn numeric_postgres_sqlstates_do_not_use_sqlite_low_byte_classification() {
+    // PostgreSQL has all-numeric SQLSTATEs whose low bytes collide with
+    // SQLITE_BUSY/CANTOPEN. They are data exceptions and must refuse failover
+    // and backup bootstrap rather than being treated as transient.
+    for code in ["22021", "22030"] {
+        assert!(
+            !db_code_is_transient(code, false),
+            "non-SQLite SQLSTATE {code} must not use SQLite low-byte classification"
+        );
+        let raw = anyhow::Error::new(sqlx::Error::Database(Box::new(TestDatabaseError { code })))
+            .context("load_full_config: PostgreSQL query failed");
+        let classified = DatabaseStore::classify_initial_config_load_error(raw);
+        assert!(
+            DatabaseStore::is_non_transient_init_error(&classified),
+            "PostgreSQL data-exception SQLSTATE {code} must refuse backup bootstrap: {classified}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn proxy_plugin_query_wrapper_preserves_typed_sqlx_source() {
+    sqlx::any::install_default_drivers();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("proxy_plugin_source.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    sqlx::query("DROP TABLE proxy_plugins")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    let error = store.load_full_config("ferrum").await.unwrap_err();
+    assert!(
+        error
+            .chain()
+            .any(|source| source.downcast_ref::<sqlx::Error>().is_some()),
+        "the association-load wrapper must retain the typed sqlx source: {error:#}"
+    );
+
+    let classified = DatabaseStore::classify_initial_config_load_error(error);
+    assert!(
+        DatabaseStore::is_non_transient_init_error(&classified),
+        "a retained non-transient schema error must still refuse backup bootstrap: {classified}"
+    );
+}
+
+#[test]
+fn non_transient_load_error_message_preserves_driver_cause() {
+    // main logs fatal errors with `{}` (outermost anyhow context only), so the
+    // surfaced startup message must fold in the underlying driver cause instead
+    // of hiding it behind the generic non-transient explanation.
+    let raw = anyhow::anyhow!("relation \"proxies\" does not exist");
+    let classified = DatabaseStore::classify_initial_config_load_error(raw);
+    let rendered = classified.to_string();
+    assert!(
+        rendered.contains("non-transient"),
+        "expected the non-transient explanation in the surfaced message: {rendered}"
+    );
+    assert!(
+        rendered.contains("relation \"proxies\" does not exist"),
+        "the underlying driver cause must survive in the Display output: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn read_replica_scheduling_state_tracks_failover_and_failback() {
+    // Pin the exact flags the poll scheduler branches on: while failed over the
+    // replica is suppressed (not broken) so no reconnect is scheduled; after
+    // failback it becomes unavailable-but-eligible, prompting exactly one
+    // reconnect before subsequent cycles observe it as healthy.
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("primary.db");
+    let failover_path = temp_dir.path().join("failover.db");
+    let replica_path = temp_dir.path().join("replica.db");
+    let primary_rw_url = format!("sqlite:{}?mode=rw", primary_path.to_string_lossy());
+    let primary_create_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+    let replica_url = format!("sqlite:{}?mode=rwc", replica_path.to_string_lossy());
+
+    // The primary (mode=rw) does not exist yet, so the store comes up on the
+    // failover topology.
+    let mut store = DatabaseStore::connect_with_failover(
+        "sqlite",
+        &primary_rw_url,
+        std::slice::from_ref(&failover_url),
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+    store.connect_read_replica(&replica_url).await.unwrap();
+
+    // Failed over: the replica belongs to the down primary topology. It must
+    // report as suppressed, not available, so the scheduler skips reconnects.
+    assert!(!store.read_replica_available());
+    assert!(store.read_replica_suppressed());
+
+    // Fail back to the now-reachable primary.
+    seed_sqlite_namespace(&primary_create_url, "primary-ns").await;
+    let active_url = store.try_failover_reconnect(&primary_rw_url).await.unwrap();
+    assert_eq!(active_url, primary_rw_url);
+
+    // Back on primary: the dormant failover-era pool was discarded. The
+    // scheduler now sees one unavailable-but-eligible replica and reconnects
+    // it; after that, later cycles see it as available and do not retry.
+    assert!(!store.read_replica_available());
+    assert!(!store.read_replica_suppressed());
+    store.reconnect_read_replica(&replica_url).await.unwrap();
+    assert!(store.read_replica_available());
+    assert!(!store.read_replica_suppressed());
+}
+
+#[tokio::test]
+async fn read_replica_tracks_primary_topology_across_failover_and_failback() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("primary.db");
+    let failover_path = temp_dir.path().join("failover.db");
+    let replica_path = temp_dir.path().join("replica.db");
+    let primary_rw_url = format!("sqlite:{}?mode=rw", primary_path.to_string_lossy());
+    let primary_create_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+    let replica_url = format!("sqlite:{}?mode=rwc", replica_path.to_string_lossy());
+
+    let mut store = DatabaseStore::connect_with_failover(
+        "sqlite",
+        &primary_rw_url,
+        std::slice::from_ref(&failover_url),
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO upstreams (id, namespace, name, targets) VALUES ('failover-upstream', 'failover-ns', 'failover-name', '[]')",
+    )
+    .execute(&store.pool())
+    .await
+    .unwrap();
+
+    seed_sqlite_namespace(&replica_url, "replica-ns").await;
+    store.connect_read_replica(&replica_url).await.unwrap();
+    assert_eq!(
+        store.list_namespaces().await.unwrap(),
+        vec!["failover-ns".to_string()],
+        "admin reads must stay on the active failover topology"
+    );
+
+    seed_sqlite_namespace(&primary_create_url, "primary-ns").await;
+    let active_url = store.try_failover_reconnect(&primary_rw_url).await.unwrap();
+    assert_eq!(active_url, primary_rw_url);
+    assert!(
+        !store.read_replica_available(),
+        "failback should require one fresh replica reconnect"
+    );
+    store.reconnect_read_replica(&replica_url).await.unwrap();
+    assert_eq!(
+        store.list_namespaces().await.unwrap(),
+        vec!["replica-ns".to_string()],
+        "the configured read replica should become eligible again after primary failback"
     );
 }

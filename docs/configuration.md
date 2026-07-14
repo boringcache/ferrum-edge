@@ -129,9 +129,9 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_DB_REJECTED_DELTA_BACKOFF_INITIAL_SECONDS` | No | `1` | Database-mode initial retry backoff after a DB incremental delta is rejected by validation. The poller retries after this delay and does not advance the accepted cursor. CP mode uses `FERRUM_DB_POLL_INTERVAL`. |
 | `FERRUM_DB_REJECTED_DELTA_BACKOFF_MAX_SECONDS` | No | `30` | Database-mode maximum retry backoff for the same rejected DB incremental delta. Values below the initial backoff are clamped up to the initial value. |
 | `FERRUM_DB_REJECTED_DELTA_FULL_RELOAD_THRESHOLD` | No | `3` | Database-mode number of identical rejected DB incremental deltas before attempting an authoritative primary-backed full reload while preserving the last known-good config if that snapshot fails or is rejected. |
-| `FERRUM_DB_CONFIG_BACKUP_PATH` | No | — | Path to externally provided JSON config backup. Used as startup fallback when the database is unreachable. |
-| `FERRUM_DB_FAILOVER_URLS` | No | — | Comma-separated failover database URLs. For MongoDB replica sets, prefer listing all members in `FERRUM_DB_URL` instead |
-| `FERRUM_DB_READ_REPLICA_URL` | No | — | SQL read replica URL for eligible admin-only reads. Runtime config polling and writes always use primary. MongoDB read preferences are ignored by Ferrum's config store |
+| `FERRUM_DB_CONFIG_BACKUP_PATH` | No | — | Path to externally provided JSON config backup, used as a startup fallback in two cases. (1) Connect-time bootstrap (**SQL backends only**): when every configured SQL database URL is unreachable at startup with a transient connectivity/resource/connect-timeout error, the gateway comes up on a lazy pool serving the backup while background polling retries the primary and failover URLs. MongoDB has no lazy-pool bootstrap — if all configured Mongo URLs are unreachable at startup the process exits. (2) Post-connect load fallback (**all backends, including MongoDB**): when the database connects/migrates but the initial config load fails transiently, the backup is served. In both cases a non-transient schema/auth/config/query failure fails startup instead of bootstrapping from the backup, so a broken primary is never masked by stale on-disk config. |
+| `FERRUM_DB_FAILOVER_URLS` | No | — | Comma-separated failover database URLs. SQL failover is attempted only for transient connectivity, resource-exhaustion, and connection-timeout errors; query/statement timeouts and other query, schema, data, constraint, authentication, and configuration errors fail startup/reconnect without switching databases. For MongoDB replica sets, prefer listing all members in `FERRUM_DB_URL` instead |
+| `FERRUM_DB_READ_REPLICA_URL` | No | — | SQL read replica URL for eligible admin-only reads. Runtime config polling and writes always use the active primary/failover pool. The configured read replica is eligible only while the configured primary topology is active; Ferrum closes and suppresses its pool during failover, then reconnects it once after primary failback. MongoDB read preferences are ignored by Ferrum's config store |
 | `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | No | — | Log database queries slower than this threshold |
 | `FERRUM_DB_FULL_LOAD_PAGE_SIZE` | No | `10000` | Max rows per query during full config loading (SQL only). Clamped to 100..=100000 |
 
@@ -238,6 +238,14 @@ keeps the last known-good runtime config instead of publishing a mixed snapshot.
 | `FERRUM_DB_TLS_CLIENT_KEY_SOURCE` | No | — | Source override for `FERRUM_DB_TLS_CLIENT_KEY_PATH`; accepts path, `file://`, inline PEM, or provider URI |
 | `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED` | No | `false` | Opt in to live reload of database TLS CA/client cert/client key sources in database and CP modes. On changed bytes, Ferrum reconnects the active primary pool/client and SQL admin-read replica pool so new database connections use rotated material. Inline PEM is static until config reload |
 | `FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS` | No | `30` | Poll interval for file-backed database TLS source watching. External sources use `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS` unless their URI includes `?poll=`. Ignored unless database TLS live reload is enabled |
+
+For MongoDB, configure TLS in exactly one place. When
+`FERRUM_DB_TLS_MODE` is set (including `disable`), `FERRUM_DB_URL` and every
+`FERRUM_DB_FAILOVER_URLS` entry must not contain MongoDB TLS/SSL query options,
+and must not use `mongodb+srv://` (which enables TLS implicitly). A conflict is
+a startup error; URI options never silently override the canonical environment
+policy. Leave `FERRUM_DB_TLS_MODE` unset when TLS is intentionally owned by a
+MongoDB URI or SRV record.
 
 See [database_tls.md](database_tls.md) for detailed configuration examples and TLS mode descriptions.
 

@@ -3737,6 +3737,15 @@ impl EnvConfig {
             return Ok(base_url.to_string());
         };
 
+        if db_type == "mongodb"
+            && let Some(source) = Self::mongodb_uri_tls_source(base_url)
+        {
+            return Err(format!(
+                "FERRUM_DB_TLS_MODE conflicts with MongoDB URI TLS settings ({source}) in {}. Configure MongoDB TLS in exactly one source",
+                redact_url(base_url)
+            ));
+        }
+
         Self::warn_on_existing_db_tls_url_params(base_url, db_type);
 
         let Some(params) = self.db_tls_params(db_type, mode)? else {
@@ -3891,12 +3900,6 @@ impl EnvConfig {
                 existing_tls_params = %existing_tls_params,
                 "FERRUM_DB_TLS_MODE is set but the database URL already contains potentially TLS-related query parameters; env-derived TLS parameters will be appended and duplicate or overlapping driver options can be ambiguous. Remove URL TLS parameters or unset FERRUM_DB_TLS_MODE"
             ),
-            "mongodb" => tracing::warn!(
-                db_type,
-                url = %redacted_url,
-                existing_tls_params = %existing_tls_params,
-                "FERRUM_DB_TLS_MODE is set but the MongoDB URL already contains TLS options; MongoDB URI TLS options take precedence over env-derived FERRUM_DB_TLS_* settings. Remove URI TLS options or unset FERRUM_DB_TLS_MODE"
-            ),
             _ => {}
         }
     }
@@ -3914,6 +3917,46 @@ impl EnvConfig {
         let mut existing = Vec::new();
         for (name, _) in parsed.query_pairs() {
             let name = name.to_ascii_lowercase();
+            if tls_param_names.iter().any(|known| name == *known) && !existing.contains(&name) {
+                existing.push(name);
+            }
+        }
+        existing
+    }
+
+    fn mongodb_uri_tls_source(base_url: &str) -> Option<String> {
+        let explicit = Self::mongodb_uri_tls_query_params(base_url);
+        if !explicit.is_empty() {
+            return Some(explicit.join(","));
+        }
+        if base_url
+            .get(..14)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("mongodb+srv://"))
+        {
+            return Some("mongodb+srv implicit TLS".to_string());
+        }
+        None
+    }
+
+    /// Extract MongoDB TLS/SSL query option names from a connection string
+    /// without going through `url::Url`, which rejects the common multi-host
+    /// seed-list authority (`mongodb://db0:27017,db1:27017/ferrum?tls=true`) as
+    /// unparseable and would silently miss the TLS option. Only the query
+    /// portion is inspected, so no credential/authority material is retained.
+    fn mongodb_uri_tls_query_params(base_url: &str) -> Vec<String> {
+        let tls_param_names = Self::db_tls_url_param_names("mongodb");
+        let Some((_, query)) = base_url.rsplit_once('?') else {
+            return Vec::new();
+        };
+        // Strip any fragment and split on the `&`/`;` option separators that
+        // MongoDB connection strings accept.
+        let query = query.split('#').next().unwrap_or(query);
+        let mut existing = Vec::new();
+        for pair in query.split(['&', ';']) {
+            let Some((name, _)) = url::form_urlencoded::parse(pair.as_bytes()).next() else {
+                continue;
+            };
+            let name = name.trim().to_ascii_lowercase();
             if tls_param_names.iter().any(|known| name == *known) && !existing.contains(&name) {
                 existing.push(name);
             }
@@ -3973,11 +4016,22 @@ impl EnvConfig {
 
     /// Returns the read replica URL with database TLS query parameters appended,
     /// using the same logic as `effective_db_url()`.
+    ///
+    /// `FERRUM_DB_READ_REPLICA_URL` is a SQL-only feature: the MongoDB config
+    /// store always reads from the primary and never opens a replica pool, so
+    /// the value is ignored for `mongodb` backends. Returning `None` here keeps
+    /// it consistent with that runtime behavior and, critically, prevents the
+    /// shared `append_db_tls_params_to_url()` MongoDB URI-TLS-conflict check
+    /// from failing startup over a stale/unused replica URI (e.g. one carrying
+    /// `?tls=true`) that would never actually be used.
     pub fn effective_db_read_replica_url(&self) -> Result<Option<String>, String> {
+        let db_type = self.db_type.as_deref().unwrap_or("");
+        if db_type == "mongodb" {
+            return Ok(None);
+        }
         let Some(base_url) = self.db_read_replica_url.as_ref() else {
             return Ok(None);
         };
-        let db_type = self.db_type.as_deref().unwrap_or("");
         self.append_db_tls_params_to_url(base_url, db_type)
             .map(Some)
     }
@@ -4074,6 +4128,14 @@ impl EnvConfig {
                         "MongoDB supports FERRUM_DB_TLS_MODE values: disable, require, verify-full. Use MongoDB URI TLS options for more specialized policies"
                             .into(),
                     );
+                }
+                for url in self.db_url.iter().chain(self.db_failover_urls.iter()) {
+                    if let Some(source) = Self::mongodb_uri_tls_source(url) {
+                        return Err(format!(
+                            "FERRUM_DB_TLS_MODE conflicts with MongoDB URI TLS settings ({source}) in {}. Configure MongoDB TLS in exactly one source",
+                            redact_url(url)
+                        ));
+                    }
                 }
             }
             "sqlite" => {

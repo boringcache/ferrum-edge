@@ -52,7 +52,7 @@
 //! aid `ALTER TABLE DROP CONSTRAINT` but do not change enforcement behavior.
 //! The inline tests below regression-guard this cross-dialect consistency.
 
-use sqlx::AnyPool;
+use sqlx::AnyConnection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SqlDialect {
@@ -81,14 +81,14 @@ impl V001SqlBuilder {
         Self { dialect }
     }
 
-    pub(super) async fn apply(&self, pool: &AnyPool) -> Result<(), anyhow::Error> {
+    pub(super) async fn apply(&self, connection: &mut AnyConnection) -> Result<(), anyhow::Error> {
         // MySQL auto-commits DDL, so a mid-V001 failure cannot be rolled back.
         // Keep every statement idempotent and only let MigrationRunner record
         // V001 after this full apply path returns successfully.
-        self.enable_sqlite_foreign_keys(pool).await?;
-        self.create_tables(pool).await?;
-        self.create_indexes(pool).await?;
-        self.create_unique_indexes(pool).await?;
+        self.enable_sqlite_foreign_keys(connection).await?;
+        self.create_tables(connection).await?;
+        self.create_indexes(connection).await?;
+        self.create_unique_indexes(connection).await?;
         Ok(())
     }
 
@@ -108,36 +108,39 @@ impl V001SqlBuilder {
     /// that have just applied V001 in full.
     pub(super) async fn ensure_compatibility_tables(
         &self,
-        pool: &AnyPool,
+        connection: &mut AnyConnection,
     ) -> Result<(), anyhow::Error> {
         sqlx::query(self.create_proxy_route_locks_sql())
-            .execute(pool)
+            .execute(&mut *connection)
             .await?;
         sqlx::query(self.create_config_change_locks_sql())
-            .execute(pool)
+            .execute(&mut *connection)
             .await?;
         sqlx::query(self.create_config_change_retention_sql())
-            .execute(pool)
+            .execute(&mut *connection)
             .await?;
         sqlx::query(self.create_config_changes_sql())
-            .execute(pool)
+            .execute(&mut *connection)
             .await?;
-        self.create_full_load_indexes(pool).await?;
-        self.create_config_change_indexes(pool).await?;
+        self.create_full_load_indexes(connection).await?;
+        self.create_config_change_indexes(connection).await?;
         Ok(())
     }
 
-    async fn enable_sqlite_foreign_keys(&self, pool: &AnyPool) -> Result<(), anyhow::Error> {
+    async fn enable_sqlite_foreign_keys(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
         if self.is_sqlite() {
             sqlx::query("PRAGMA foreign_keys = ON")
-                .execute(pool)
+                .execute(&mut *connection)
                 .await?;
         }
 
         Ok(())
     }
 
-    async fn create_tables(&self, pool: &AnyPool) -> Result<(), anyhow::Error> {
+    async fn create_tables(&self, connection: &mut AnyConnection) -> Result<(), anyhow::Error> {
         for sql in [
             self.create_upstreams_sql(),
             self.create_consumers_sql(),
@@ -161,13 +164,13 @@ impl V001SqlBuilder {
             // GatewayConfig and is never touched by proxy/runtime hot paths.
             self.create_audit_events_sql(),
         ] {
-            sqlx::query(sql).execute(pool).await?;
+            sqlx::query(sql).execute(&mut *connection).await?;
         }
 
         Ok(())
     }
 
-    async fn create_indexes(&self, pool: &AnyPool) -> Result<(), anyhow::Error> {
+    async fn create_indexes(&self, connection: &mut AnyConnection) -> Result<(), anyhow::Error> {
         let indexes = [
             "CREATE INDEX IF NOT EXISTS idx_proxies_upstream_id ON proxies (upstream_id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_proxy_id ON plugin_configs (proxy_id)",
@@ -229,54 +232,67 @@ impl V001SqlBuilder {
         ];
 
         for idx_sql in indexes {
-            self.execute_index_sql(pool, idx_sql).await?;
+            self.execute_index_sql(connection, idx_sql).await?;
         }
 
         Ok(())
     }
 
-    async fn create_unique_indexes(&self, pool: &AnyPool) -> Result<(), anyhow::Error> {
-        self.execute_index_sql(pool, self.unique_listen_port_sql())
+    async fn create_unique_indexes(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
+        self.execute_index_sql(connection, self.unique_listen_port_sql())
             .await?;
 
         for idx_sql in self.namespace_unique_index_sqls() {
-            self.execute_index_sql(pool, idx_sql).await?;
+            self.execute_index_sql(connection, idx_sql).await?;
         }
 
         Ok(())
     }
 
-    async fn create_config_change_indexes(&self, pool: &AnyPool) -> Result<(), anyhow::Error> {
+    async fn create_config_change_indexes(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
         for idx_sql in [
             "CREATE INDEX IF NOT EXISTS idx_config_changes_ns_sequence ON config_changes (namespace, sequence)",
             "CREATE INDEX IF NOT EXISTS idx_config_changes_sequence ON config_changes (sequence)",
         ] {
-            self.execute_index_sql(pool, idx_sql).await?;
+            self.execute_index_sql(connection, idx_sql).await?;
         }
 
         Ok(())
     }
 
-    async fn create_full_load_indexes(&self, pool: &AnyPool) -> Result<(), anyhow::Error> {
+    async fn create_full_load_indexes(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
         for idx_sql in [
             "CREATE INDEX IF NOT EXISTS idx_proxies_ns_id ON proxies (namespace, id)",
             "CREATE INDEX IF NOT EXISTS idx_consumers_ns_id ON consumers (namespace, id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_id ON plugin_configs (namespace, id)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_id ON upstreams (namespace, id)",
         ] {
-            self.execute_index_sql(pool, idx_sql).await?;
+            self.execute_index_sql(connection, idx_sql).await?;
         }
 
         Ok(())
     }
 
-    async fn execute_index_sql(&self, pool: &AnyPool, idx_sql: &str) -> Result<(), anyhow::Error> {
+    async fn execute_index_sql(
+        &self,
+        connection: &mut AnyConnection,
+        idx_sql: &str,
+    ) -> Result<(), anyhow::Error> {
         if self.is_mysql() {
             // MySQL does not reliably support CREATE INDEX IF NOT EXISTS, so we
             // strip the clause and ignore duplicate-key errors, matching the
             // previous migration behavior.
             let mysql_sql = idx_sql.replace("IF NOT EXISTS ", "");
-            match sqlx::query(&mysql_sql).execute(pool).await {
+            match sqlx::query(&mysql_sql).execute(&mut *connection).await {
                 Ok(_) => {}
                 Err(e) => {
                     let msg = e.to_string();
@@ -287,7 +303,7 @@ impl V001SqlBuilder {
                 }
             }
         } else {
-            sqlx::query(idx_sql).execute(pool).await?;
+            sqlx::query(idx_sql).execute(&mut *connection).await?;
         }
 
         Ok(())

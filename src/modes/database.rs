@@ -925,7 +925,14 @@ pub async fn run(
                     // so the gateway can still come up serving from the
                     // on-disk backup. The polling loop will retry the primary
                     // URL and flip `db_available` to true when it recovers.
-                    if env_config.db_config_backup_path.is_some() {
+                    //
+                    // Backup bootstrap is reserved for TRANSIENT connectivity/
+                    // resource/connect-timeout failures. A non-transient
+                    // schema/auth/config/query error must fail startup instead
+                    // of masking a broken primary by serving a stale backup.
+                    if env_config.db_config_backup_path.is_some()
+                        && !DatabaseStore::is_non_transient_init_error(&e)
+                    {
                         warn!(
                             "All database URLs failed ({}). \
                              FERRUM_DB_CONFIG_BACKUP_PATH is set — bootstrapping \
@@ -959,6 +966,9 @@ pub async fn run(
             // config polling remains primary-consistent.
             if let Some(ref replica_url) = effective_replica_url {
                 match store.connect_read_replica(replica_url).await {
+                    Ok(()) if store.read_replica_suppressed() => {
+                        info!("Read replica configured but suppressed until primary failback")
+                    }
                     Ok(()) => info!("Read replica connected for admin reads"),
                     Err(e) => {
                         let safe_error = db_backend::redact_error_text(&e, &[replica_url]);
@@ -1048,9 +1058,30 @@ pub async fn run(
             (cfg, Some(sequence))
         }
         Err(e) => {
-            // Initial database full load failed — try the configured backup
-            // for pod restart resilience.
+            // Classify the initial full-load failure for backup eligibility.
+            //
+            // A config-VALIDATION rejection (issue #2158) means the backend is
+            // reachable but returned a semantically-invalid snapshot: it is
+            // recoverable via in-band admin repair, so it stays backup-eligible
+            // (serve backup, keep admin writes enabled, publish config_rejected)
+            // and is left unclassified so no "refusing to bootstrap" wrapper
+            // clouds the rejection log. Every OTHER non-transient failure
+            // (schema drift, bad rows, decode, query, auth) is classified and
+            // must fail startup rather than mask a broken database with stale
+            // on-disk config — the same policy the connect path applies via
+            // `is_non_transient_init_error`. Only transient connectivity/
+            // resource errors are silently backup-eligible.
+            let e = if crate::modes::is_poll_validation_rejection(&e) {
+                e
+            } else {
+                DatabaseStore::classify_initial_config_load_error(e)
+            };
             if let Some(ref path) = backup_path {
+                if DatabaseStore::is_non_transient_init_error(&e) {
+                    return Err(e);
+                }
+                // Database unreachable, or reachable-but-invalid snapshot — try
+                // the configured backup for pod restart resilience.
                 warn!(
                     "Database load failed ({}), attempting backup file: {}",
                     e, path
@@ -1061,14 +1092,14 @@ pub async fn run(
                         if startup_config_rejected {
                             error!(
                                 "Initial database snapshot was rejected by runtime validation; \
-                                     starting with backup config, keeping admin writes enabled for \
-                                     in-band repair, and publishing config_rejected immediately: {}",
+                                 starting with backup config, keeping admin writes enabled for \
+                                 in-band repair, and publishing config_rejected immediately: {}",
                                 e
                             );
                         }
                         warn!(
                             "Starting with backup config ({} proxies, {} consumers). \
-                                 Database polling will retry and update when DB recovers.",
+                             Database polling will retry and update when DB recovers.",
                             cfg.proxies.len(),
                             cfg.consumers.len()
                         );

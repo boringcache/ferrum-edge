@@ -82,7 +82,7 @@ These `FERRUM_DB_*` settings apply to both SQL and MongoDB backends:
 | `FERRUM_DB_TYPE` | Set to `mongodb` |
 | `FERRUM_DB_URL` | MongoDB connection string (`mongodb://` or `mongodb+srv://`) |
 | `FERRUM_DB_POLL_INTERVAL` | Polling interval in seconds (same as SQL) |
-| `FERRUM_DB_CONFIG_BACKUP_PATH` | On-disk JSON backup for startup failover (same as SQL) |
+| `FERRUM_DB_CONFIG_BACKUP_PATH` | On-disk JSON backup served if the initial config load fails transiently after connect. Unlike SQL backends, MongoDB has no lazy-pool connect-time bootstrap: if every configured Mongo URL is unreachable at startup the process exits rather than serving the backup |
 | `FERRUM_DB_FAILOVER_URLS` | Comma-separated fallback MongoDB URLs (same pattern as SQL, but see [Failover](#failover) below) |
 | `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | Slow query warning threshold (same as SQL) |
 | `FERRUM_DB_TLS_MODE` | MongoDB TLS policy: `disable`, `require`, or `verify-full` (see [TLS](#tls)) |
@@ -291,6 +291,17 @@ FERRUM_DB_TLS_CA_CERT_PATH=/certs/rds-combined-ca-bundle.pem
 - When using `FERRUM_DB_TLS_MODE` and `FERRUM_DB_TLS_CA_CERT_PATH`, leave URI TLS options such as `tls=true` out of `FERRUM_DB_URL` so Ferrum builds the MongoDB driver's TLS options from the env settings.
   If you configure TLS in the URI instead, include `tlsCAFile` in the URI and omit the env CA path.
 - Change streams require enabling them on the cluster parameter group
+- **Migration lease uses the client clock on DocumentDB.** On real MongoDB the
+  migration lease evaluates expiry and stamps timestamps from MongoDB *server*
+  time (an aggregation-pipeline `$$NOW` update), so replica clock skew can never
+  stomp an active lease. DocumentDB does not support aggregation-pipeline-form
+  updates, so Ferrum detects that rejection on the first lease acquire and
+  transparently falls back to a classic operator update stamped from the
+  *client* clock for that migration run. Ownership fencing, the 120s lease
+  window, and safe release are unchanged, but the lease is only skew-safe to the
+  extent your DocumentDB replicas keep their clocks in sync (use NTP). This
+  affects concurrent startups running index migrations, not steady-state
+  proxying.
 
 ### Azure Cosmos DB (MongoDB API)
 

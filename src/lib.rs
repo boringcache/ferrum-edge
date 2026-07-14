@@ -465,6 +465,30 @@ pub mod _test_support {
         known.difference(current).cloned().collect()
     }
 
+    pub fn db_code_is_transient(code: &str, is_sqlite: bool) -> bool {
+        crate::config::db_loader::is_transient_database_code(code, is_sqlite)
+    }
+
+    pub fn db_mongo_error_is_transient(error: &mongodb::error::Error) -> bool {
+        crate::config::db_loader::is_transient_mongo_load_error(error)
+    }
+
+    pub fn db_mysql_error_number_is_transient(number: u16) -> bool {
+        crate::config::db_loader::is_transient_mysql_error_number(number)
+    }
+
+    /// Build the exact error shape `mysql_transaction_isolation` returns when
+    /// both the `@@transaction_isolation` and `@@tx_isolation` reads fail, so a
+    /// test can pin that a transient MySQL disconnect during that read stays
+    /// backup-eligible. `mysql_transaction_isolation` itself needs a live
+    /// transaction, so this reuses the production wrapper to avoid drift.
+    pub fn db_wrap_mysql_isolation_read_error(
+        primary_error: &sqlx::Error,
+        fallback_error: sqlx::Error,
+    ) -> anyhow::Error {
+        crate::config::db_loader::wrap_mysql_isolation_read_error(primary_error, fallback_error)
+    }
+
     pub fn parse_scheme(s: &str) -> Result<BackendScheme, String> {
         crate::config::db_loader::parse_scheme(s)
     }
@@ -483,6 +507,48 @@ pub mod _test_support {
 
     pub fn is_config_validation_rejection(error: &anyhow::Error) -> bool {
         crate::config::validation_pipeline::is_config_validation_rejection(error)
+    }
+
+    // ── config/mongo_store: classic (DocumentDB) migration-lease builders ─────
+    // The `$$NOW` aggregation pipeline is the primary skew-immune lease mode for
+    // real MongoDB; DocumentDB does not support pipeline-form updates, so the
+    // lease falls back to these classic client-time operator updates. These
+    // re-exports pin the pure builder shapes without a live backend. Millis are
+    // taken as `i64` so tests stay deterministic (no `DateTime::now()`).
+    pub fn mongo_migration_lease_duration_millis() -> i64 {
+        crate::config::mongo_store::MongoStore::migration_lease_duration_millis()
+    }
+
+    pub fn mongo_migration_lease_acquire_filter_classic(
+        owner: &str,
+        client_now_millis: i64,
+    ) -> mongodb::bson::Document {
+        crate::config::mongo_store::MongoStore::migration_lease_acquire_filter_classic(
+            owner,
+            mongodb::bson::DateTime::from_millis(client_now_millis),
+        )
+    }
+
+    pub fn mongo_migration_lease_acquire_update_classic(
+        owner: &str,
+        client_now_millis: i64,
+    ) -> mongodb::bson::Document {
+        crate::config::mongo_store::MongoStore::migration_lease_acquire_update_classic(
+            owner,
+            mongodb::bson::DateTime::from_millis(client_now_millis),
+        )
+    }
+
+    pub fn mongo_migration_lease_renew_update_classic(
+        client_now_millis: i64,
+    ) -> mongodb::bson::Document {
+        crate::config::mongo_store::MongoStore::migration_lease_renew_update_classic(
+            mongodb::bson::DateTime::from_millis(client_now_millis),
+        )
+    }
+
+    pub fn mongo_pipeline_update_unsupported(error: &mongodb::error::Error) -> bool {
+        crate::config::mongo_store::MongoStore::pipeline_update_unsupported_for_test(error)
     }
 
     // ── plugins/grpc_web ─────────────────────────────────────────────────────

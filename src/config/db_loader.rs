@@ -40,6 +40,7 @@ use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
@@ -95,11 +96,22 @@ type PluginConfigRefs = HashMap<String, PluginConfigRef>;
 #[derive(Debug)]
 pub(crate) struct ProxyPluginAssociationLoadError {
     message: String,
+    source: Option<sqlx::Error>,
 }
 
 impl ProxyPluginAssociationLoadError {
     fn new(message: String) -> Self {
-        Self { message }
+        Self {
+            message,
+            source: None,
+        }
+    }
+
+    fn with_source(message: String, source: sqlx::Error) -> Self {
+        Self {
+            message,
+            source: Some(source),
+        }
     }
 }
 
@@ -109,7 +121,13 @@ impl std::fmt::Display for ProxyPluginAssociationLoadError {
     }
 }
 
-impl std::error::Error for ProxyPluginAssociationLoadError {}
+impl std::error::Error for ProxyPluginAssociationLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
 
 pub(crate) fn is_proxy_plugin_association_load_error(error: &anyhow::Error) -> bool {
     error
@@ -397,6 +415,11 @@ pub struct DatabaseStore {
     pool: Arc<ArcSwap<AnyPool>>,
     read_replica_url: Option<String>,
     read_replica_pool: Arc<ArcSwapOption<AnyPool>>,
+    /// Read replicas belong to the configured primary topology. While the
+    /// active write/runtime pool points at a failover URL, admin reads must
+    /// stay on that same active pool rather than crossing into a replica of
+    /// the unavailable primary topology.
+    primary_topology_active: Arc<AtomicBool>,
     db_type: String,
     failover_urls: Vec<String>,
     pool_config: DbPoolConfig,
@@ -426,6 +449,196 @@ enum AdminReadSource {
 struct AdminReadPool {
     pool: AnyPool,
     source: AdminReadSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DatabaseTopology {
+    Primary,
+    Failover,
+}
+
+fn is_transient_failover_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|source| source.downcast_ref::<sqlx::Error>())
+        .is_some_and(is_transient_sqlx_error)
+}
+
+/// Marker carried by a database-initialization/reconnect error that a
+/// failover or backup caller must treat as permanent (non-transient). Attached
+/// under the human-readable context so the message is unchanged while the
+/// classification stays discoverable via `anyhow`'s chained downcast.
+#[derive(Debug)]
+struct NonTransientDbInitError;
+
+impl std::fmt::Display for NonTransientDbInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("non-transient database initialization error")
+    }
+}
+
+impl std::error::Error for NonTransientDbInitError {}
+
+/// Wrap a non-transient failure with the [`NonTransientDbInitError`] marker
+/// and an outer message that folds in the redacted driver cause.
+///
+/// `main` logs fatal startup/reconnect errors with `{}` (Display), which for an
+/// `anyhow::Error` renders only the outermost context. Attaching just a static
+/// explanation would therefore hide the actionable driver cause (bad password,
+/// missing table, constraint failure, ...). We render the cause chain now —
+/// before the marker/context are attached — redact any connection URLs in
+/// `secrets`, and append it to the outer message so operators see what to fix.
+/// The marker is kept below the message so it stays discoverable via `anyhow`'s
+/// chained downcast.
+fn mark_non_transient(
+    error: anyhow::Error,
+    context: impl std::fmt::Display,
+    secrets: &[&str],
+) -> anyhow::Error {
+    let cause = crate::config::db_backend::redact_error_text(format!("{error:#}"), secrets);
+    let message = format!("{context}: {cause}");
+    error.context(NonTransientDbInitError).context(message)
+}
+
+/// Returns true when a full-config load error is a transient
+/// connectivity/resource failure (SQL or MongoDB) a caller may recover from by
+/// serving `FERRUM_DB_CONFIG_BACKUP_PATH`. Schema drift, decode, query,
+/// authentication, and validation failures are non-transient and return false.
+fn is_transient_config_load_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        if let Some(sqlx_err) = source.downcast_ref::<sqlx::Error>() {
+            return is_transient_sqlx_error(sqlx_err);
+        }
+        if let Some(mongo_err) = source.downcast_ref::<mongodb::error::Error>() {
+            return is_transient_mongo_load_error(mongo_err);
+        }
+        false
+    })
+}
+
+/// MongoDB counterpart to [`is_transient_sqlx_error`] for the full-config load
+/// path: network I/O, connection-pool, server-selection, DNS, and retryable
+/// topology command failures are transient. Other command/write/auth/decode
+/// failures are non-transient.
+pub(crate) fn is_transient_mongo_load_error(error: &mongodb::error::Error) -> bool {
+    match error.kind.as_ref() {
+        mongodb::error::ErrorKind::Io(_)
+        | mongodb::error::ErrorKind::ConnectionPoolCleared { .. }
+        | mongodb::error::ErrorKind::ServerSelection { .. }
+        | mongodb::error::ErrorKind::DnsResolve { .. } => true,
+        mongodb::error::ErrorKind::Command(command_error) => {
+            // Prefer retryability labels supplied/derived by the driver, then
+            // cover topology command responses that may remain after its one
+            // retry and do not consistently carry a label across server
+            // versions.
+            error.contains_label(mongodb::error::RETRYABLE_WRITE_ERROR)
+                || error.contains_label(mongodb::error::RETRYABLE_ERROR)
+                || error.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR)
+                || is_transient_mongo_command_code(command_error.code)
+        }
+        _ => false,
+    }
+}
+
+// Retryable topology codes from the MongoDB retryable-reads specification and
+// the driver's retryable read/write code lists. Authentication, decode, and
+// write-concern validation codes are intentionally absent.
+const TRANSIENT_MONGO_COMMAND_CODES: &[i32] = &[
+    6,     // HostUnreachable
+    7,     // HostNotFound
+    89,    // NetworkTimeout
+    91,    // ShutdownInProgress
+    189,   // PrimarySteppedDown
+    262,   // ExceededTimeLimit
+    9001,  // SocketException
+    10107, // NotWritablePrimary
+    11600, // InterruptedAtShutdown
+    11602, // InterruptedDueToReplStateChange
+    13435, // NotPrimaryNoSecondaryOk
+    13436, // NotPrimaryOrSecondary
+];
+
+pub(crate) fn is_transient_mongo_command_code(code: i32) -> bool {
+    TRANSIENT_MONGO_COMMAND_CODES.contains(&code)
+}
+
+fn is_transient_sqlx_error(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Io(_)
+        | sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed => true,
+        sqlx::Error::Database(database_error) => {
+            if let Some(mysql_error) =
+                database_error.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+                && is_transient_mysql_error_number(mysql_error.number())
+            {
+                return true;
+            }
+            let is_sqlite = database_error
+                .try_downcast_ref::<sqlx::sqlite::SqliteError>()
+                .is_some();
+            database_error
+                .code()
+                .is_some_and(|code| is_transient_database_code(code.as_ref(), is_sqlite))
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn is_transient_database_code(code: &str, is_sqlite: bool) -> bool {
+    code.starts_with("08")
+        || is_sqlite
+            && code
+                .parse::<i32>()
+                .is_ok_and(|code| matches!(code & 0xff, 5 | 6 | 14))
+        || matches!(
+            code,
+            // PostgreSQL shutdown and resource-exhaustion connection failures
+            // are listed explicitly. SQLite base/extended codes are handled
+            // above only when the Any-driver error downcasts to SqliteError.
+            "53300" | "57P01" | "57P02" | "57P03"
+        )
+}
+
+pub(crate) fn is_transient_mysql_error_number(number: u16) -> bool {
+    matches!(
+        number,
+        // Connection/resource and network read/write failures. Query and lock
+        // wait timeouts (1205/3024) stay on the active topology.
+        1040
+            | 1158
+            | 1159
+            | 1160
+            | 1161
+            | 1203 // ER_TOO_MANY_USER_CONNECTIONS (max_user_connections)
+            | 1226 // ER_USER_LIMIT_REACHED (per-user resource quota)
+            | 2002
+            | 2003
+            | 2006
+            | 2013
+    )
+}
+
+/// Fold a failed MySQL `@@transaction_isolation` read and its `@@tx_isolation`
+/// fallback into one error that PRESERVES the fallback `sqlx::Error` as its
+/// source.
+///
+/// A MySQL primary can drop mid-`configure_full_load_snapshot` while this read
+/// runs; that is a transient post-connect load failure the backup path is meant
+/// to cover. If we stringified both `sqlx` failures into an opaque `anyhow!`
+/// message, [`is_transient_config_load_error`] would find no typed
+/// `sqlx::Error` in the chain and [`DatabaseStore::classify_initial_config_load_error`]
+/// would mark the outage non-transient, refusing `FERRUM_DB_CONFIG_BACKUP_PATH`.
+/// Keeping the fallback error as the chained SOURCE keeps a transient disconnect
+/// backup-eligible while the primary error text survives in the context.
+pub(crate) fn wrap_mysql_isolation_read_error(
+    primary_error: &sqlx::Error,
+    fallback_error: sqlx::Error,
+) -> anyhow::Error {
+    anyhow::Error::new(fallback_error).context(format!(
+        "failed to read MySQL transaction isolation (primary @@transaction_isolation error: {primary_error})"
+    ))
 }
 
 impl DatabaseStore {
@@ -860,6 +1073,7 @@ impl DatabaseStore {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
             read_replica_url: None,
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
+            primary_topology_active: Arc::new(AtomicBool::new(true)),
             db_type: db_type.to_string(),
             failover_urls: Vec::new(),
             pool_config,
@@ -917,6 +1131,7 @@ impl DatabaseStore {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
             read_replica_url: None,
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
+            primary_topology_active: Arc::new(AtomicBool::new(true)),
             db_type: db_type.to_string(),
             failover_urls: failover_urls.to_vec(),
             pool_config,
@@ -965,8 +1180,6 @@ impl DatabaseStore {
     ///   pool happened to connect on the first query and `reconnect()` never
     ///   fired — otherwise the flag would stay `true` indefinitely).
     pub async fn maybe_apply_deferred_migrations(&self) -> Result<bool, anyhow::Error> {
-        use std::sync::atomic::Ordering;
-
         // Only one caller wins the CAS and runs migrations; the rest see
         // `Ok(false)` and return early. Acquire on success ensures we see
         // the constructor's write of `true`; Release on the clear ensures
@@ -997,7 +1210,7 @@ impl DatabaseStore {
     fn proxy_plugin_association_query_error(
         operation: &str,
         namespace: Option<&str>,
-        source: impl std::fmt::Display,
+        source: sqlx::Error,
     ) -> anyhow::Error {
         let message = match namespace {
             Some(namespace) => format!(
@@ -1013,9 +1226,11 @@ impl DatabaseStore {
             // Snapshot callers must distinguish an unavailable database from a
             // row-integrity failure. Query failures are availability failures;
             // decode/dangling-association paths retain the typed marker below.
-            anyhow::anyhow!(message)
+            anyhow::Error::new(source).context(message)
         } else {
-            anyhow::Error::new(ProxyPluginAssociationLoadError::new(message))
+            anyhow::Error::new(ProxyPluginAssociationLoadError::with_source(
+                message, source,
+            ))
         }
     }
 
@@ -1024,11 +1239,13 @@ impl DatabaseStore {
         operation: &str,
     ) -> Result<String, anyhow::Error> {
         row.try_get::<String, _>("proxy_id").map_err(|e| {
-            anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
-                "operation={} resource=proxy_plugins column=proxy_id: failed to decode proxy/plugin association row: {}",
-                operation,
-                e
-            )))
+            anyhow::Error::new(ProxyPluginAssociationLoadError::with_source(
+                format!(
+                    "operation={} resource=proxy_plugins column=proxy_id: failed to decode proxy/plugin association row: {}",
+                    operation, e
+                ),
+                e,
+            ))
         })
     }
 
@@ -1038,12 +1255,13 @@ impl DatabaseStore {
         proxy_id: &str,
     ) -> Result<String, anyhow::Error> {
         row.try_get::<String, _>("plugin_config_id").map_err(|e| {
-            anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
-                "operation={} resource=proxy_plugins proxy_id={} column=plugin_config_id: failed to decode proxy/plugin association row: {}",
-                operation,
-                proxy_id,
-                e
-            )))
+            anyhow::Error::new(ProxyPluginAssociationLoadError::with_source(
+                format!(
+                    "operation={} resource=proxy_plugins proxy_id={} column=plugin_config_id: failed to decode proxy/plugin association row: {}",
+                    operation, proxy_id, e
+                ),
+                e,
+            ))
         })
     }
 
@@ -1051,15 +1269,18 @@ impl DatabaseStore {
         operation: &str,
         namespace: &str,
         column: Option<&str>,
-        source: impl std::fmt::Display,
+        source: sqlx::Error,
     ) -> anyhow::Error {
         let column_context = column
             .map(|column| format!(" column=plugin_configs.{column}"))
             .unwrap_or_default();
-        anyhow::Error::new(ProxyPluginAssociationLoadError::new(format!(
-            "operation={} resource=proxy_plugins namespace={}{}: failed to load plugin_config references for proxy/plugin association validation: {}",
-            operation, namespace, column_context, source
-        )))
+        anyhow::Error::new(ProxyPluginAssociationLoadError::with_source(
+            format!(
+                "operation={} resource=proxy_plugins namespace={}{}: failed to load plugin_config references for proxy/plugin association validation: {}",
+                operation, namespace, column_context, source
+            ),
+            source,
+        ))
     }
 
     fn push_proxy_plugin_association_row(
@@ -1571,18 +1792,12 @@ impl DatabaseStore {
             .await
         {
             Ok(value) => Ok(value),
-            Err(primary_error) => {
-                sqlx::query_scalar::<_, String>("SELECT @@tx_isolation")
-                    .fetch_one(&mut **tx)
-                    .await
-                    .map_err(|fallback_error| {
-                        anyhow::anyhow!(
-                            "failed to read MySQL transaction isolation: {}; fallback @@tx_isolation failed: {}",
-                            primary_error,
-                            fallback_error
-                        )
-                    })
-            }
+            Err(primary_error) => sqlx::query_scalar::<_, String>("SELECT @@tx_isolation")
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(|fallback_error| {
+                    wrap_mysql_isolation_read_error(&primary_error, fallback_error)
+                }),
         }
     }
 
@@ -5013,6 +5228,15 @@ impl DatabaseStore {
     /// FQDN now resolves to a different set of IPs. The old pool is closed
     /// gracefully in the background — in-flight queries complete normally.
     pub async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error> {
+        self.reconnect_for_topology(db_url, DatabaseTopology::Primary)
+            .await
+    }
+
+    async fn reconnect_for_topology(
+        &self,
+        db_url: &str,
+        topology: DatabaseTopology,
+    ) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
 
         let final_url = Self::append_connect_timeout(
@@ -5022,6 +5246,15 @@ impl DatabaseStore {
         );
 
         let new_pool = self.build_pool_options().connect(&final_url).await?;
+
+        // Disable and close the configured primary-topology replica before
+        // exposing a failover pool. Keeping the dormant pool would make it
+        // look immediately available on failback and skip the one reconnect
+        // that refreshes its connections after the topology transition.
+        if topology == DatabaseTopology::Failover {
+            self.primary_topology_active.store(false, Ordering::Release);
+            self.suppress_read_replica_pool();
+        }
 
         // Atomic swap — readers that already loaded the old pool keep using it.
         let old_pool = self.pool.swap(Arc::new(new_pool));
@@ -5044,6 +5277,10 @@ impl DatabaseStore {
         // twice, and restores the flag on failure so a transient error
         // doesn't silently skip migrations forever.
         self.maybe_apply_deferred_migrations().await?;
+
+        if topology == DatabaseTopology::Primary {
+            self.primary_topology_active.store(true, Ordering::Release);
+        }
 
         Ok(())
     }
@@ -5073,12 +5310,21 @@ impl DatabaseStore {
                 Ok(store)
             }
             Err(primary_err) => {
+                if !is_transient_failover_error(&primary_err) {
+                    return Err(mark_non_transient(
+                        primary_err,
+                        "Primary database initialization failed with a non-transient query, schema, data, constraint, authentication, or configuration error; failover was not attempted",
+                        &[primary_url],
+                    ));
+                }
                 if failover_urls.is_empty() {
                     return Err(primary_err);
                 }
+                let safe_primary_error =
+                    crate::config::db_backend::redact_error_text(&primary_err, &[primary_url]);
                 warn!(
                     "Primary database connection failed: {}. Trying {} failover URL(s)...",
-                    primary_err,
+                    safe_primary_error,
                     failover_urls.len()
                 );
                 for (i, url) in failover_urls.iter().enumerate() {
@@ -5090,21 +5336,36 @@ impl DatabaseStore {
                                 Self::redact_url(url)
                             );
                             store.failover_urls = failover_urls.to_vec();
+                            store
+                                .primary_topology_active
+                                .store(false, Ordering::Release);
                             return Ok(store);
                         }
                         Err(e) => {
+                            if !is_transient_failover_error(&e) {
+                                return Err(mark_non_transient(
+                                    e,
+                                    format!(
+                                        "Failover database #{} initialization returned a non-transient query, schema, data, constraint, authentication, or configuration error; no further failover URLs were attempted",
+                                        i + 1
+                                    ),
+                                    &[url.as_str()],
+                                ));
+                            }
+                            let safe_error =
+                                crate::config::db_backend::redact_error_text(&e, &[url]);
                             warn!(
                                 "Failover database #{} ({}) failed: {}",
                                 i + 1,
                                 Self::redact_url(url),
-                                e
+                                safe_error
                             );
                         }
                     }
                 }
                 Err(anyhow::anyhow!(
                     "All database URLs failed. Primary: {}. Tried {} failover URL(s).",
-                    primary_err,
+                    safe_primary_error,
                     failover_urls.len()
                 ))
             }
@@ -5118,6 +5379,13 @@ impl DatabaseStore {
     pub async fn connect_read_replica(&mut self, replica_url: &str) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
         self.read_replica_url = Some(replica_url.to_string());
+
+        if !self.primary_topology_active.load(Ordering::Acquire) {
+            info!(
+                "Read replica configured but connection deferred while the database is failed over"
+            );
+            return Ok(());
+        }
 
         let final_url = Self::append_connect_timeout(
             replica_url,
@@ -5144,7 +5412,8 @@ impl DatabaseStore {
     /// scans, and association validation must read from the primary pool so
     /// replica lag cannot hide changes or advance cursors incorrectly.
     fn admin_read_pool(&self) -> AdminReadPool {
-        if self.read_replica_url.is_some()
+        if self.primary_topology_active.load(Ordering::Acquire)
+            && self.read_replica_url.is_some()
             && let Some(replica) = self.read_replica_pool.load_full()
         {
             let pool = replica.as_ref().clone();
@@ -5195,6 +5464,21 @@ impl DatabaseStore {
         }
     }
 
+    /// Remove the primary-topology replica pool while failover is active.
+    /// The configured URL remains recorded so the scheduler reconnects it
+    /// once after primary failback makes the replica eligible again.
+    fn suppress_read_replica_pool(&self) {
+        let old_pool = self.read_replica_pool.swap(None);
+        if let Some(pool) = old_pool {
+            info!(
+                "Read replica pool suppressed while the database is failed over; it will reconnect after primary failback"
+            );
+            tokio::spawn(async move {
+                pool.close().await;
+            });
+        }
+    }
+
     /// Atomically replace the read replica pool with a freshly connected one.
     ///
     /// Called by the DB polling loop when DnsCache detects that the read
@@ -5202,6 +5486,11 @@ impl DatabaseStore {
     /// watcher, and after startup if the initial replica connection failed.
     pub async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
+
+        if !self.primary_topology_active.load(Ordering::Acquire) {
+            debug!("Read replica reconnect deferred while the database is failed over");
+            return Ok(());
+        }
 
         let final_url = Self::append_connect_timeout(
             replica_url,
@@ -5217,7 +5506,40 @@ impl DatabaseStore {
         let new_pool = self.build_pool_options().connect(&final_url).await?;
         sqlx::query("SELECT 1").fetch_one(&new_pool).await?;
 
+        // Failover may have started while the connection was opening. Do not
+        // publish a replica pool that admin reads must suppress; closing it
+        // leaves the post-failback scheduler responsible for one fresh retry.
+        if !self.primary_topology_active.load(Ordering::Acquire) {
+            new_pool.close().await;
+            debug!(
+                "Discarded read replica reconnect because the database failed over while it was opening"
+            );
+            return Ok(());
+        }
+
         let old_pool = self.read_replica_pool.swap(Some(Arc::new(new_pool)));
+
+        // Close the remaining race between the check above and publication:
+        // if failover flipped the topology and ran its first suppression just
+        // before this swap, remove the newly-published pool ourselves.
+        if !self.primary_topology_active.load(Ordering::Acquire) {
+            let raced_pool = self.read_replica_pool.swap(None);
+            if let Some(pool) = raced_pool {
+                tokio::spawn(async move {
+                    pool.close().await;
+                });
+            }
+            if let Some(pool) = old_pool {
+                tokio::spawn(async move {
+                    pool.close().await;
+                });
+            }
+            debug!(
+                "Discarded read replica reconnect because the database failed over while it was being published"
+            );
+            return Ok(());
+        }
+
         info!(
             "Read replica restored for admin reads (db_type={}). Old pool closing in background.",
             self.db_type,
@@ -5238,26 +5560,62 @@ impl DatabaseStore {
     /// Returns the URL that succeeded, or an error if all failed.
     pub async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error> {
         // Try primary first
-        if self.reconnect(primary_url).await.is_ok() {
-            info!("Reconnected to primary database");
-            return Ok(primary_url.to_string());
+        match self
+            .reconnect_for_topology(primary_url, DatabaseTopology::Primary)
+            .await
+        {
+            Ok(()) => {
+                info!("Reconnected to primary database");
+                return Ok(primary_url.to_string());
+            }
+            Err(error) if !is_transient_failover_error(&error) => {
+                return Err(mark_non_transient(
+                    error,
+                    "Primary database reconnect returned a non-transient query, schema, data, constraint, authentication, or configuration error; failover was not attempted",
+                    &[primary_url],
+                ));
+            }
+            Err(error) => {
+                let safe_error =
+                    crate::config::db_backend::redact_error_text(&error, &[primary_url]);
+                warn!("Primary database reconnect failed transiently: {safe_error}");
+            }
         }
 
         // Try failover URLs in order
         for (i, url) in self.failover_urls.iter().enumerate() {
-            if self.reconnect(url).await.is_ok() {
-                info!(
-                    "Reconnected to failover database #{} ({})",
-                    i + 1,
-                    Self::redact_url(url)
-                );
-                return Ok(url.clone());
+            match self
+                .reconnect_for_topology(url, DatabaseTopology::Failover)
+                .await
+            {
+                Ok(()) => {
+                    info!(
+                        "Reconnected to failover database #{} ({})",
+                        i + 1,
+                        Self::redact_url(url)
+                    );
+                    return Ok(url.clone());
+                }
+                Err(error) if !is_transient_failover_error(&error) => {
+                    return Err(mark_non_transient(
+                        error,
+                        format!(
+                            "Failover database #{} reconnect returned a non-transient query, schema, data, constraint, authentication, or configuration error; no further failover URLs were attempted",
+                            i + 1
+                        ),
+                        &[url.as_str()],
+                    ));
+                }
+                Err(error) => {
+                    let safe_error = crate::config::db_backend::redact_error_text(&error, &[url]);
+                    warn!(
+                        "Failover database #{} ({}) reconnect failed transiently: {}",
+                        i + 1,
+                        Self::redact_url(url),
+                        safe_error
+                    );
+                }
             }
-            warn!(
-                "Failover database #{} ({}) reconnect failed",
-                i + 1,
-                Self::redact_url(url)
-            );
         }
 
         Err(anyhow::anyhow!(
@@ -5271,6 +5629,41 @@ impl DatabaseStore {
     /// Delegates to [`crate::config::db_backend::redact_url`].
     pub fn redact_url(url: &str) -> String {
         crate::config::db_backend::redact_url(url)
+    }
+
+    /// Classify a [`connect_with_failover`](Self::connect_with_failover) (or
+    /// reconnect) error as permanent/non-transient.
+    ///
+    /// `database::run` uses this to decide backup eligibility: only transient
+    /// connectivity/resource/connect-timeout failures may bootstrap from
+    /// `FERRUM_DB_CONFIG_BACKUP_PATH`. A non-transient schema/auth/config/query
+    /// error must fail startup instead of silently serving a stale on-disk
+    /// backup.
+    pub fn is_non_transient_init_error(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<NonTransientDbInitError>().is_some()
+    }
+
+    /// Classify an initial full-config load failure for backup eligibility.
+    ///
+    /// `database::run` applies the same [`is_non_transient_init_error`] gate to
+    /// the initial load that it uses for connect failures: only transient
+    /// connectivity/resource failures may bootstrap from
+    /// `FERRUM_DB_CONFIG_BACKUP_PATH`. Schema drift, bad rows, decode, query,
+    /// authentication, and validation errors are marked non-transient here so
+    /// startup fails loudly instead of masking a broken database with stale
+    /// on-disk config. Works for both SQL and MongoDB backends.
+    ///
+    /// [`is_non_transient_init_error`]: Self::is_non_transient_init_error
+    pub fn classify_initial_config_load_error(error: anyhow::Error) -> anyhow::Error {
+        if is_transient_config_load_error(&error) {
+            error
+        } else {
+            mark_non_transient(
+                error,
+                "Initial database config load failed with a non-transient schema, data, query, decode, or validation error; refusing to bootstrap from FERRUM_DB_CONFIG_BACKUP_PATH",
+                &[],
+            )
+        }
     }
 
     /// Returns true if a read replica URL is configured.
@@ -6875,9 +7268,18 @@ impl DatabaseBackend for DatabaseStore {
     }
 
     fn read_replica_available(&self) -> bool {
-        self.read_replica_pool
-            .load_full()
-            .is_some_and(|pool| !pool.is_closed())
+        self.primary_topology_active.load(Ordering::Acquire)
+            && self
+                .read_replica_pool
+                .load_full()
+                .is_some_and(|pool| !pool.is_closed())
+    }
+
+    fn read_replica_suppressed(&self) -> bool {
+        // A configured replica is suppressed (not broken) precisely while the
+        // active write/runtime pool points at a failover URL. The scheduler
+        // skips reconnects in this state; failback re-enables eligibility.
+        self.read_replica_url.is_some() && !self.primary_topology_active.load(Ordering::Acquire)
     }
 
     fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {
@@ -6885,13 +7287,18 @@ impl DatabaseBackend for DatabaseStore {
         let size = primary.size();
         let idle = primary.num_idle() as u32;
 
-        let replica = self.read_replica_pool.load_full().map(|rp| {
-            Box::new(crate::config::db_backend::DbPoolStatsInner {
-                size: rp.size(),
-                idle: rp.num_idle() as u32,
-                active: rp.size().saturating_sub(rp.num_idle() as u32),
-            })
-        });
+        let replica = self
+            .primary_topology_active
+            .load(Ordering::Acquire)
+            .then(|| self.read_replica_pool.load_full())
+            .flatten()
+            .map(|rp| {
+                Box::new(crate::config::db_backend::DbPoolStatsInner {
+                    size: rp.size(),
+                    idle: rp.num_idle() as u32,
+                    active: rp.size().saturating_sub(rp.num_idle() as u32),
+                })
+            });
 
         Some(crate::config::db_backend::DbPoolStats {
             size,

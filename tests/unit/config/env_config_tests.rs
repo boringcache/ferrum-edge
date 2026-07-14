@@ -3379,6 +3379,140 @@ fn test_env_config_db_tls_accepts_mongodb_verify_full() {
 }
 
 #[test]
+fn test_env_config_db_tls_rejects_mongodb_uri_tls_conflict() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "mongodb"),
+            (
+                "FERRUM_DB_URL",
+                "mongodb://localhost:27017/ferrum?tls=false",
+            ),
+            ("FERRUM_DB_TLS_MODE", "verify-full"),
+        ],
+        || {
+            let error = EnvConfig::from_env().unwrap_err();
+            assert!(error.contains("conflicts with MongoDB URI TLS settings"));
+            assert!(error.contains("exactly one source"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_tls_rejects_mongodb_srv_implicit_tls_conflict() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "mongodb"),
+            ("FERRUM_DB_URL", "mongodb+srv://cluster.example.test/ferrum"),
+            ("FERRUM_DB_TLS_MODE", "disable"),
+        ],
+        || {
+            let error = EnvConfig::from_env().unwrap_err();
+            assert!(error.contains("mongodb+srv implicit TLS"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_tls_rejects_mongodb_failover_uri_tls_conflict() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "mongodb"),
+            ("FERRUM_DB_URL", "mongodb://primary:27017/ferrum"),
+            (
+                "FERRUM_DB_FAILOVER_URLS",
+                "mongodb://secondary:27017/ferrum?tls=true",
+            ),
+            ("FERRUM_DB_TLS_MODE", "require"),
+        ],
+        || {
+            let error = EnvConfig::from_env().unwrap_err();
+            assert!(error.contains("secondary:27017"));
+            assert!(error.contains("conflicts with MongoDB URI TLS settings"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_tls_rejects_mongodb_seed_list_uri_tls_conflict() {
+    // Multi-host seed lists are unparseable by `url::Url`; the conflict must
+    // still be caught by MongoDB-aware query parsing.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "mongodb"),
+            (
+                "FERRUM_DB_URL",
+                "mongodb://db0:27017,db1:27017/ferrum?tls=true",
+            ),
+            ("FERRUM_DB_TLS_MODE", "disable"),
+        ],
+        || {
+            let error = EnvConfig::from_env().unwrap_err();
+            assert!(
+                error.contains("conflicts with MongoDB URI TLS settings"),
+                "seed-list TLS option was not detected: {error}"
+            );
+            assert!(error.contains("tls"));
+            assert!(error.contains("exactly one source"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mongodb_ignores_read_replica_url_and_skips_tls_conflict() {
+    // FERRUM_DB_READ_REPLICA_URL is SQL-only; the MongoDB config store forces
+    // primary reads and never opens a replica pool. A stale/unused Mongo replica
+    // URI carrying TLS options must therefore NOT trip the MongoDB URI-TLS
+    // conflict check and fail startup — the value is simply ignored.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "mongodb"),
+            ("FERRUM_DB_URL", "mongodb://primary:27017/ferrum"),
+            (
+                "FERRUM_DB_READ_REPLICA_URL",
+                "mongodb://replica:27017/ferrum?tls=true",
+            ),
+            ("FERRUM_DB_TLS_MODE", "require"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            // The raw value is still parsed into the config...
+            assert_eq!(
+                config.db_read_replica_url.as_deref(),
+                Some("mongodb://replica:27017/ferrum?tls=true")
+            );
+            // ...but the effective replica URL is None for MongoDB (ignored),
+            // so the shared TLS-conflict path never runs for it.
+            assert!(config.effective_db_read_replica_url().unwrap().is_none());
+        },
+    );
+}
+
+#[test]
 fn test_env_config_db_tls_accepts_mongodb_combined_client_pem() {
     with_env_vars(
         &[

@@ -100,6 +100,14 @@ pub(crate) async fn schedule_admin_read_replica_reconnect_if_needed(
     };
 
     if !db.read_replica_available() {
+        // While the SQL store is failed over, the configured replica is
+        // intentionally suppressed (it belongs to the unavailable primary
+        // topology), not broken. Reconnecting it every cycle would never
+        // converge because admin reads stay on the failover pool until
+        // failback — so skip the reconnect until the replica is eligible again.
+        if db.read_replica_suppressed() {
+            return;
+        }
         spawn_admin_read_replica_reconnect(
             db,
             replica_url.to_string(),
