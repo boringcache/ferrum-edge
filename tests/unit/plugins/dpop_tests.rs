@@ -10,7 +10,8 @@
 //!     :80/:443 ports, query/fragment) before comparison, so a conformant
 //!     client whose `htu` differs only cosmetically is still accepted.
 
-use std::time::Duration;
+use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -308,6 +309,78 @@ fn canonical_htu_from_url_rejects_userinfo() {
     assert_eq!(
         canonical_htu_from_url("https://alice:secret@example.com/resource"),
         None
+    );
+}
+
+#[test]
+fn concurrent_identical_jti_at_capacity_admits_exactly_one_request() {
+    const WORKERS: usize = 32;
+    let cache = Arc::new(DpopJtiCache::new(1, Duration::from_secs(300), 4));
+    let barrier = Arc::new(Barrier::new(WORKERS));
+    let now = Instant::now();
+    assert!(cache.check_and_insert("old-jkt", "old-jti", now));
+
+    let workers = (0..WORKERS)
+        .map(|_| {
+            let cache = Arc::clone(&cache);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                cache.check_and_insert("same-jkt", "same-jti", now)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let admitted = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("worker should not panic"))
+        .filter(|admitted| *admitted)
+        .count();
+    assert_eq!(admitted, 1);
+}
+
+#[test]
+fn full_replay_cache_rejects_live_duplicate_before_evicting() {
+    let cache = DpopJtiCache::new(1, Duration::from_secs(60), 4);
+    let now = Instant::now();
+    assert!(cache.check_and_insert("jkt-a", "jti-a", now));
+    assert!(
+        !cache.check_and_insert("jkt-a", "jti-a", now + Duration::from_secs(1)),
+        "a live duplicate must be rejected before capacity eviction"
+    );
+    assert!(cache.check_and_insert("jkt-b", "jti-b", now + Duration::from_secs(1)));
+    assert!(!cache.check_and_insert("jkt-b", "jti-b", now + Duration::from_secs(2)));
+}
+
+#[test]
+fn concurrent_expired_evictions_admit_fresh_proofs_without_false_replays() {
+    const WORKERS: usize = 32;
+    let cache = Arc::new(DpopJtiCache::new(WORKERS, Duration::from_secs(1), 4));
+    let inserted_at = Instant::now();
+    for idx in 0..WORKERS {
+        assert!(cache.check_and_insert("jkt", &format!("expired-{idx}"), inserted_at));
+    }
+
+    let barrier = Arc::new(Barrier::new(WORKERS));
+    let workers = (0..WORKERS)
+        .map(|idx| {
+            let cache = Arc::clone(&cache);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                cache.check_and_insert(
+                    "jkt",
+                    &format!("fresh-{idx}"),
+                    inserted_at + Duration::from_secs(2),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        workers
+            .into_iter()
+            .all(|worker| worker.join().expect("worker should not panic"))
     );
 }
 
