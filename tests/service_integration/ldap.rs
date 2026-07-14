@@ -228,6 +228,7 @@ async fn ldap_search_then_bind_validates_credentials() {
         "ldap_url": ldap.url.clone(),
         "search_base_dn": "ou=people,dc=example,dc=org",
         "search_filter": "(uid={username})",
+        "canonical_identity_attribute": "uid",
         "service_account_dn": LDAP_ADMIN_DN,
         "service_account_password": LDAP_ADMIN_PASSWORD,
     }));

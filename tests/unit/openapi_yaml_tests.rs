@@ -531,6 +531,157 @@ fn access_control_schema_matches_runtime_validation() {
 }
 
 #[test]
+fn ldap_auth_schema_matches_runtime_invariants() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for config in [
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com"
+        }),
+        json!({
+            "ldap_url": "ldap://ldap.example.com:389",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "starttls": true
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "search_base_dn": "ou=users,dc=example,dc=com",
+            "search_filter": "(uid={username})",
+            "canonical_identity_attribute": "uid",
+            "service_account_dn": "cn=admin,dc=example,dc=com",
+            "service_account_password": "secret"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "group_base_dn": "ou=groups,dc=example,dc=com",
+            "required_groups": ["admins"]
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "group_base_dn": "ou=groups,dc=example,dc=com",
+            "group_filter": "(member={user_dn})",
+            "required_groups": ["admins"],
+            "connect_timeout_seconds": 300,
+            "request_timeout_seconds": 300,
+            "max_concurrent_requests": 1024,
+            "cache_ttl_seconds": 86400,
+            "max_cache_entries": 1
+        }),
+    ] {
+        assert_component_validity(&spec, "LdapAuthConfig", &config, true);
+    }
+
+    for config in [
+        json!({"ldap_url": "ldaps://ldap.example.com:636"}),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid=static,dc=example,dc=com"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "search_base_dn": "ou=users,dc=example,dc=com",
+            "search_filter": "(uid={username})",
+            "canonical_identity_attribute": "uid"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "search_base_dn": "ou=users,dc=example,dc=com",
+            "search_filter": "(uid={username})"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "search_base_dn": "ou=users,dc=example,dc=com",
+            "search_filter": "(uid=static)",
+            "canonical_identity_attribute": "uid",
+            "service_account_dn": "cn=admin,dc=example,dc=com",
+            "service_account_password": "secret"
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "required_groups": ["admins"]
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "group_base_dn": "ou=groups,dc=example,dc=com",
+            "group_filter": "(cn=admins)",
+            "required_groups": ["admins"]
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "starttls": true
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "connect_timeout_seconds": 0
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "request_timeout_seconds": 301
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "max_concurrent_requests": 0
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "cache_ttl_seconds": 86401
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "max_cache_entries": 0
+        }),
+        json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "required_group": ["admins"]
+        }),
+    ] {
+        assert_component_validity(&spec, "LdapAuthConfig", &config, false);
+    }
+}
+
+#[test]
+fn ldap_cache_documentation_and_openapi_defaults_match_runtime_constants() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/LdapAuthConfig/properties")
+        .expect("LdapAuthConfig properties exist");
+    assert_eq!(
+        schema["cache_ttl_seconds"]["default"],
+        json!(ferrum_edge::plugins::ldap_auth::LDAP_AUTH_DEFAULT_CACHE_TTL_SECONDS)
+    );
+    assert_eq!(
+        schema["cache_ttl_seconds"]["maximum"],
+        json!(ferrum_edge::plugins::ldap_auth::LDAP_AUTH_MAX_CACHE_TTL_SECONDS)
+    );
+    assert_eq!(
+        schema["max_cache_entries"]["default"],
+        json!(ferrum_edge::plugins::ldap_auth::LDAP_AUTH_DEFAULT_MAX_CACHE_ENTRIES)
+    );
+
+    let guide = include_str!("../../docs/cache_management.md");
+    assert!(guide.contains("**Default limit:** 10,000 entries. Caching is disabled by default."));
+    assert!(guide.contains("`cache_ttl_seconds` (default `0`, disabled; maximum `86,400`"));
+    assert!(guide.contains("`max_cache_entries` (default `10,000`)"));
+    assert!(guide.contains("| `ldap_auth` | `max_cache_entries` | `10000` |"));
+    assert!(guide.contains("| `ldap_auth` | `cache_ttl_seconds` | `0` |"));
+}
+
+#[test]
 fn ai_tool_governor_schema_matches_runtime_invariants() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

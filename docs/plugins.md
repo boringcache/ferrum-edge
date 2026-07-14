@@ -1576,33 +1576,37 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `ldap_url` | string | (required) | LDAP server URL (`ldap://` or `ldaps://`) |
+| `ldap_url` | string | (required) | LDAP server URL. Use `ldaps://` or `ldap://` with `starttls: true`; embedded URL credentials are rejected |
 | `bind_dn_template` | string | (none) | Direct bind DN template with `{username}` placeholder (e.g., `uid={username},ou=users,dc=example,dc=com`) |
 | `search_base_dn` | string | (none) | Base DN for search-then-bind user search |
 | `search_filter` | string | (none) | LDAP search filter with `{username}` placeholder (e.g., `(&(objectClass=user)(sAMAccountName={username}))`) |
+| `canonical_identity_attribute` | string | (none) | Required for search-then-bind. The uniquely selected entry must return exactly one value for this attribute; that value becomes the Ferrum identity and Consumer mapping key |
 | `service_account_dn` | string | (none) | DN for the service account used in search-then-bind |
 | `service_account_password` | string | (none) | Password for the service account |
 | `group_base_dn` | string | (none) | Base DN for group membership search (required when `required_groups` is set) |
-| `group_filter` | string | auto | Group search filter with `{user_dn}` and `{username}` placeholders. Default checks `member`, `uniqueMember`, and `memberUid` attributes |
+| `group_filter` | string | auto | Group search filter. A custom filter must contain `{user_dn}` or `{username}` when `required_groups` is set. Default checks `member`, `uniqueMember`, and `memberUid` attributes |
 | `required_groups` | string[] | `[]` | List of LDAP/AD group names the user must belong to (OR logic — at least one must match) |
-| `group_attribute` | string | `cn` | Attribute containing the group name for matching against `required_groups` |
+| `group_attribute` | string | `cn` | Attribute containing the group name for matching against `required_groups`; LDAP attribute-name matching is case-insensitive |
 | `starttls` | bool | `false` | Use STARTTLS to upgrade `ldap://` connections to TLS (cannot be used with `ldaps://`) |
-| `connect_timeout_seconds` | u64 | `5` | LDAP connection and operation timeout |
-| `cache_ttl_seconds` | u64 | `0` | How long to cache successful auth results (0 = disabled). Cache is keyed by username + password hash |
-| `max_cache_entries` | u64 | `10000` | Maximum entries in the auth result cache. Prevents unbounded growth from brute-force attempts with unique credentials |
+| `allow_plaintext` | bool | `false` | Development-only override for non-loopback `ldap://` without STARTTLS. Credentials have no transport confidentiality when enabled |
+| `connect_timeout_seconds` | u64 | `5` | Per-connection and per-operation timeout (1–300s), also sent as the LDAP server-side search time limit |
+| `request_timeout_seconds` | u64 | `15` | Strict wall-clock deadline (1–300s) for the complete uncached authentication and group-check flow |
+| `max_concurrent_requests` | u64 | `64` | Per-plugin cap (1–1,024) on concurrent uncached LDAP flows; excess requests fail immediately |
+| `cache_ttl_seconds` | u64 | `0` | How long to cache successful auth results (`0` = disabled, maximum `86400`). Cache keys are process-random HMACs over the presented username/password |
+| `max_cache_entries` | u64 | `10000` | Strict cache cap. Atomic admission preserves the cap under concurrency, and a saturated cache replaces one entry without a full-map scan |
 | `consumer_mapping` | bool | `true` | Whether to look up a matching gateway Consumer via `consumer_index.find_by_identity()` |
 
 **Authentication modes** (must configure one):
 
 1. **Direct bind** — set `bind_dn_template` with `{username}` placeholder. Fastest option, no service account needed.
-2. **Search-then-bind** — set `search_base_dn`, `search_filter`, `service_account_dn`, and `service_account_password`. The service account searches for the user's DN, then the plugin binds as the user.
+2. **Search-then-bind** — set `search_base_dn`, `search_filter`, `canonical_identity_attribute`, `service_account_dn`, and `service_account_password`. The service account performs a size-limited search, which must return exactly one entry, then the plugin binds as that user. The configured canonical attribute—not the client-supplied username—is exported and used for Consumer mapping.
 
 **Example — Direct bind:**
 ```yaml
 plugins:
   - name: ldap_auth
     config:
-      ldap_url: "ldap://ldap.example.com:389"
+      ldap_url: "ldaps://ldap.example.com:636"
       bind_dn_template: "uid={username},ou=users,dc=example,dc=com"
 ```
 
@@ -1614,6 +1618,7 @@ plugins:
       ldap_url: "ldaps://dc.contoso.com:636"
       search_base_dn: "OU=Users,DC=contoso,DC=com"
       search_filter: "(&(objectClass=user)(sAMAccountName={username}))"
+      canonical_identity_attribute: "sAMAccountName"
       service_account_dn: "CN=svc-proxy,OU=ServiceAccounts,DC=contoso,DC=com"
       service_account_password: "S3cret!"
       group_base_dn: "OU=Groups,DC=contoso,DC=com"
@@ -1624,7 +1629,7 @@ plugins:
       cache_ttl_seconds: 300
 ```
 
-The plugin sets `ctx.authenticated_identity` to the LDAP username. When `consumer_mapping` is enabled (default), it also attempts to find a matching gateway Consumer for ACL and rate-limiting integration.
+For direct bind, the plugin sets `ctx.authenticated_identity` to the presented LDAP username. For search-then-bind, it uses the validated `canonical_identity_attribute` value from the unique search result. When `consumer_mapping` is enabled (default), the same authenticated identity is used to find a matching gateway Consumer for ACL and rate-limiting integration.
 
 **Status codes:** The plugin distinguishes failure classes so clients and operators get an accurate signal:
 
@@ -1639,6 +1644,12 @@ A directory outage or a misconfigured service account therefore returns `500` (`
 **Group search and service accounts:** When `required_groups` is set, the group-membership search binds with the service account if one is configured. With direct bind and **no** service account, the search runs over an **anonymous** bind — many directories deny anonymous reads of group objects / `member` attributes, in which case the search returns no entries and an entitled user is wrongly denied (`403`). The plugin logs a startup warning for this configuration and a per-request warning when an anonymous group search returns zero entries. **Configure a service account whenever you use `required_groups`** unless the directory is known to permit anonymous group searches.
 
 **TLS and revocation:** `ldaps://` and STARTTLS connections use rustls with the gateway's CA settings (`FERRUM_TLS_CA_BUNDLE_PATH`, `FERRUM_TLS_NO_VERIFY`). When a CRL is configured (`FERRUM_TLS_CRL_FILE_PATH`) and verification is not disabled, revoked LDAP server certificates are rejected — the same revocation guarantee as the proxy backend, DTLS, frontend mTLS, and rustls logging-sink surfaces.
+
+Non-loopback plaintext `ldap://` endpoints are rejected by default because LDAP simple bind sends reusable service-account and user passwords without transport confidentiality. `allow_plaintext: true` is an explicit development-only escape hatch for isolated test environments. Literal loopback addresses and `localhost` remain available for local integration testing without the override.
+
+**Resource bounds:** Each bind/search/unbind operation gets `connect_timeout_seconds`, while `request_timeout_seconds` caps the complete uncached flow even if an LDAP server keeps a search alive with entries or referrals. User searches request at most two entries so ambiguity can be detected and rejected; group searches request at most 1,000 entries and fail closed if the directory exceeds the limit. `max_concurrent_requests` bounds simultaneous directory flows and rejects overflow immediately rather than creating more sockets/tasks.
+
+**Cache security and admission:** Cache keys use HMAC-SHA256 with a random, zeroized in-process key instead of storing a bare password digest. This protects a cache-only disclosure from becoming an offline password verifier, though a full process-memory compromise can recover both the cache and its HMAC key. Cache admission uses an atomic count; at capacity, it replaces one existing entry without scanning the full map.
 
 **Input escaping:** Usernames are automatically escaped before interpolation into LDAP queries — DN values are escaped per RFC 4514 and filter values per RFC 4515. This prevents LDAP injection attacks from usernames containing special characters like `*`, `(`, `)`, `\`, `,`, or `=`.
 
