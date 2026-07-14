@@ -1,7 +1,10 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use jsonwebtoken::jwk::{AlgorithmParameters, Jwk};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
@@ -15,10 +18,11 @@ pub struct DpopJtiCache {
     entries: DashMap<String, DpopJtiEntry>,
     max_entries: usize,
     ttl: Duration,
+    entry_count: AtomicUsize,
+    admission_lock: Mutex<()>,
 }
 
 struct DpopJtiEntry {
-    inserted_at: Instant,
     expires_at: Instant,
 }
 
@@ -28,58 +32,100 @@ impl DpopJtiCache {
             entries: DashMap::with_shard_amount(shard_amount),
             max_entries,
             ttl,
+            entry_count: AtomicUsize::new(0),
+            admission_lock: Mutex::new(()),
         }
     }
 
     pub fn check_and_insert(&self, jkt: &str, jti: &str, now: Instant) -> bool {
-        let key = format!("{jkt}|{jti}");
-        // A still-live entry for this (jkt, jti) is a replay. An expired entry
-        // is not: the proof carrying it would already have failed its own `exp`
-        // check before reaching here, so it is safe to overwrite. The `get`
-        // guard holds a shard lock, so it is scoped to this statement and
-        // dropped before the inserts/evictions below to avoid self-deadlock.
-        let is_live_replay = self
-            .entries
-            .get(&key)
-            .is_some_and(|existing| existing.expires_at > now);
-        if is_live_replay {
-            return false;
-        }
-        // Evict lazily, only when at capacity (mirrors IntrospectionCache), so
-        // the O(N) `retain` scan never runs on the per-request DPoP hot path.
-        if self.entries.len() >= self.max_entries {
-            self.evict_expired(now);
-            if self.entries.len() >= self.max_entries {
-                self.evict_one(now);
+        let mut key = format!("{jkt}|{jti}");
+        let mut admission_guard = None;
+        loop {
+            match self.entries.entry(key) {
+                Entry::Occupied(mut existing) => {
+                    if existing.get().expires_at > now {
+                        return false;
+                    }
+                    // The proof carrying an expired cache entry has already
+                    // passed its own `exp` check. Replacing that exact key is
+                    // atomic under the DashMap shard lock and does not consume
+                    // another capacity slot.
+                    existing.insert(DpopJtiEntry {
+                        expires_at: now + self.ttl,
+                    });
+                    return true;
+                }
+                Entry::Vacant(vacant) => {
+                    if self.try_reserve_slot() {
+                        vacant.insert(DpopJtiEntry {
+                            expires_at: now + self.ttl,
+                        });
+                        return true;
+                    }
+                    // Do not scan other shards while holding this vacant-entry
+                    // guard. After making room, the loop reacquires the entry
+                    // guard so the replay check and insertion stay atomic.
+                    key = vacant.into_key();
+                }
+            }
+
+            if admission_guard.is_none() {
+                // Serialize only the full-cache path. Recheck the JTI under
+                // this guard before evicting: another request may have inserted
+                // it while this request waited, and a live duplicate must be
+                // rejected without displacing that replay marker.
+                admission_guard = Some(self.admission_guard());
+                continue;
+            }
+            if !self.evict_oldest() {
+                // A zero-capacity cache cannot admit any proof.
+                return false;
             }
         }
-        self.entries.insert(
-            key,
-            DpopJtiEntry {
-                inserted_at: now,
-                expires_at: now + self.ttl,
-            },
-        );
-        true
     }
 
-    fn evict_expired(&self, now: Instant) {
-        self.entries.retain(|_, entry| entry.expires_at > now);
+    fn try_reserve_slot(&self) -> bool {
+        self.entry_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < self.max_entries).then_some(count + 1)
+            })
+            .is_ok()
     }
 
-    fn evict_one(&self, now: Instant) {
-        let victim = self
-            .entries
-            .iter()
-            .find_map(|entry| (entry.value().expires_at <= now).then(|| entry.key().clone()))
-            .or_else(|| {
-                self.entries
-                    .iter()
-                    .min_by_key(|entry| entry.value().inserted_at)
-                    .map(|entry| entry.key().clone())
-            });
-        if let Some(key) = victim {
-            self.entries.remove(&key);
+    fn admission_guard(&self) -> MutexGuard<'_, ()> {
+        self.admission_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn evict_oldest(&self) -> bool {
+        loop {
+            let victim = self
+                .entries
+                .iter()
+                // Every entry uses the same TTL, so expiry order is insertion
+                // order. The minimum also naturally prefers expired entries
+                // over live entries.
+                .min_by_key(|entry| entry.value().expires_at)
+                .map(|entry| (entry.key().clone(), entry.value().expires_at));
+            let Some((key, expires_at)) = victim else {
+                return self.entry_count.load(Ordering::Acquire) < self.max_entries;
+            };
+            if self
+                .entries
+                // Match the observed expiry as well as the key so a concurrent
+                // remove-and-reinsert cannot make us evict the newer marker.
+                .remove_if(&key, |_, entry| entry.expires_at == expires_at)
+                .is_some()
+            {
+                self.entry_count.fetch_sub(1, Ordering::AcqRel);
+                return true;
+            }
+            // Another request changed the victim. Retry admission when it made
+            // room, or select the current oldest entry while still full.
+            if self.entry_count.load(Ordering::Acquire) < self.max_entries {
+                return true;
+            }
         }
     }
 }
