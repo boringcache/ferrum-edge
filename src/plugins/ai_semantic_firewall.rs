@@ -900,6 +900,7 @@ impl AiSemanticFirewall {
         ctx: &mut RequestContext,
         json: &Value,
         body: &[u8],
+        was_governed: bool,
     ) -> PluginResult {
         let streaming_result = self.apply_streaming_request_policy(ctx, json);
         if !matches!(streaming_result, PluginResult::Continue) {
@@ -912,13 +913,19 @@ impl AiSemanticFirewall {
 
         let segments = extract_request_segments(json, &self.engine.extraction);
         if segments.is_empty() {
-            return if !self.engine.allow_topics.is_empty() || looks_like_governed_request_json(json)
+            return if was_governed
+                || !self.engine.allow_topics.is_empty()
+                || looks_like_governed_request_json(json)
             {
                 self.set_request_hash(ctx, sha256_hex_bytes(body));
                 self.engine.handle_uninspectable_body(
                     ctx,
                     Direction::Request,
-                    "no_extractable_content",
+                    if was_governed {
+                        "transformed_body_not_inspectable"
+                    } else {
+                        "no_extractable_content"
+                    },
                 )
             } else {
                 PluginResult::Continue
@@ -958,9 +965,11 @@ impl AiSemanticFirewall {
         ctx: &mut RequestContext,
         content_type: &str,
         body: &[u8],
+        was_governed: bool,
     ) -> PluginResult {
         let event_stream = is_event_stream_content_type(content_type);
-        let json_body = is_json_content_type(content_type) || looks_like_json(body);
+        let json_content_type = is_json_content_type(content_type);
+        let json_body = json_content_type || looks_like_json(body);
         if !event_stream && !json_body {
             return PluginResult::Continue;
         }
@@ -985,6 +994,17 @@ impl AiSemanticFirewall {
             let json: Value = match serde_json::from_slice(strip_json_bom(body)) {
                 Ok(json) => json,
                 Err(_) => {
+                    if !json_content_type {
+                        return if was_governed {
+                            self.engine.handle_uninspectable_body(
+                                ctx,
+                                Direction::Response,
+                                "transformed_body_not_inspectable",
+                            )
+                        } else {
+                            PluginResult::Continue
+                        };
+                    }
                     self.set_response_hash(ctx, sha256_hex_bytes(body));
                     return self.engine.handle_uninspectable_body(
                         ctx,
@@ -1012,7 +1032,16 @@ impl AiSemanticFirewall {
         };
 
         if segments.is_empty() {
-            return PluginResult::Continue;
+            return if was_governed {
+                self.set_response_hash(ctx, sha256_hex_bytes(body));
+                self.engine.handle_uninspectable_body(
+                    ctx,
+                    Direction::Response,
+                    "transformed_body_not_inspectable",
+                )
+            } else {
+                PluginResult::Continue
+            };
         }
 
         self.set_response_hash(ctx, sha256_hex_bytes(body));
@@ -1987,7 +2016,8 @@ impl Plugin for AiSemanticFirewall {
                 );
             }
         };
-        self.inspect_request_json(ctx, &json, body.as_bytes()).await
+        self.inspect_request_json(ctx, &json, body.as_bytes(), false)
+            .await
     }
 
     fn needs_final_request_body_context(&self) -> bool {
@@ -2047,7 +2077,8 @@ impl Plugin for AiSemanticFirewall {
                 );
             }
         };
-        self.inspect_request_json(ctx, &json, body).await
+        self.inspect_request_json(ctx, &json, body, was_governed)
+            .await
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -2252,7 +2283,8 @@ impl Plugin for AiSemanticFirewall {
                 .handle_uninspectable_body(ctx, Direction::Response, "encoded_body");
         }
 
-        self.inspect_response_bytes(ctx, content_type, body).await
+        self.inspect_response_bytes(ctx, content_type, body, false)
+            .await
     }
 
     /// Reinspect the final client-visible response after response transforms.
@@ -2312,7 +2344,7 @@ impl Plugin for AiSemanticFirewall {
                 return PluginResult::Continue;
             }
             return self
-                .inspect_response_bytes(ctx, content_type, &decoded)
+                .inspect_response_bytes(ctx, content_type, &decoded, was_governed)
                 .await;
         }
 
@@ -2337,7 +2369,8 @@ impl Plugin for AiSemanticFirewall {
                 .handle_uninspectable_body(ctx, Direction::Response, "empty_body");
         }
 
-        self.inspect_response_bytes(ctx, content_type, body).await
+        self.inspect_response_bytes(ctx, content_type, body, was_governed)
+            .await
     }
 }
 

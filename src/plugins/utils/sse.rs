@@ -461,6 +461,23 @@ impl SseReassembler {
         for (_key, text) in &mut self.responses_text {
             drain_one(text, &mut remaining);
         }
+
+        self.completion_text
+            .retain(|(_choice, text)| !text.is_empty());
+        self.completion_text_positions.clear();
+        for (position, (choice, _text)) in self.completion_text.iter().enumerate() {
+            self.completion_text_positions.insert(*choice, position);
+        }
+        self.content.retain(|(_choice, text)| !text.is_empty());
+        self.content_positions.clear();
+        for (position, (choice, _text)) in self.content.iter().enumerate() {
+            self.content_positions.insert(*choice, position);
+        }
+        self.responses_text.retain(|(_key, text)| !text.is_empty());
+        self.responses_text_positions.clear();
+        for (position, (key, _text)) in self.responses_text.iter().enumerate() {
+            self.responses_text_positions.insert(*key, position);
+        }
     }
 
     /// Accumulate one already-parsed SSE `data:` frame.
@@ -916,6 +933,49 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
         }
         t.drain_assistant_prefix(100);
         assert!(t.texts().iter().any(|x| x.text == "exec"));
+    }
+
+    #[test]
+    fn drain_assistant_prefix_prunes_all_empty_prose_indexes() {
+        let mut reassembler = SseReassembler::new();
+        for index in 0..1024 {
+            reassembler.push_frame(&serde_json::json!({
+                "choices": [{
+                    "index": index,
+                    "text": "x",
+                    "delta": {"content": "y"}
+                }]
+            }));
+            reassembler.push_frame(&serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": index,
+                "content_index": 0,
+                "delta": "z"
+            }));
+            reassembler.drain_assistant_prefix(3);
+        }
+
+        assert!(reassembler.completion_text.is_empty());
+        assert!(reassembler.completion_text_positions.is_empty());
+        assert!(reassembler.content.is_empty());
+        assert!(reassembler.content_positions.is_empty());
+        assert!(reassembler.responses_text.is_empty());
+        assert!(reassembler.responses_text_positions.is_empty());
+
+        reassembler.push_frame(&serde_json::json!({
+            "choices": [{
+                "index": 1024,
+                "text": "legacy",
+                "delta": {"content": "chat"}
+            }]
+        }));
+        reassembler.push_frame(&serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": 1024,
+            "content_index": 0,
+            "delta": "response"
+        }));
+        assert_eq!(reassembler.assistant_content(), "legacychatresponse");
     }
 
     #[test]
