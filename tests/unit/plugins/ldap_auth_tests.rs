@@ -1124,6 +1124,8 @@ async fn test_search_bind_rejects_ambiguous_results() {
 async fn assert_group_search_result(
     result_code: u8,
     returned_group: &'static str,
+    group_filter: &'static str,
+    returned_user_is_member: bool,
     expected_rejection_status: Option<u16>,
 ) {
     use tokio::io::AsyncWriteExt;
@@ -1144,10 +1146,11 @@ async fn assert_group_search_result(
 
         let (mut group_stream, _) = listener.accept().await.expect("accept group search");
         read_ldap_message(&mut group_stream).await;
+        let group_dn = "CN=unrelated-cn,OU=Groups,DC=example,DC=com";
         group_stream
             .write_all(&search_result_entry(
                 1,
-                "CN=unrelated-cn,OU=Groups,DC=example,DC=com",
+                group_dn,
                 &[("samaccountname", &[returned_group])],
             ))
             .await
@@ -1156,6 +1159,21 @@ async fn assert_group_search_result(
             .write_all(&search_result_done(1, result_code))
             .await
             .expect("write group search done");
+
+        // A custom-filter match against a required group must trigger a
+        // base-scope membership proof on that exact returned entry. Simulate
+        // the LDAP server evaluating the member/uniqueMember/memberUid filter.
+        read_ldap_message(&mut group_stream).await;
+        if returned_user_is_member {
+            group_stream
+                .write_all(&search_result_entry(2, group_dn, &[]))
+                .await
+                .expect("write returned-group membership proof");
+        }
+        group_stream
+            .write_all(&search_result_done(2, 0))
+            .await
+            .expect("write returned-group membership proof done");
     });
 
     let plugin = LdapAuth::new(
@@ -1163,7 +1181,7 @@ async fn assert_group_search_result(
             "ldap_url": format!("ldap://127.0.0.1:{port}"),
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
             "group_base_dn": "ou=groups,dc=example,dc=com",
-            "group_filter": "(member={user_dn})",
+            "group_filter": group_filter,
             "group_attribute": "sAMAccountName",
             "required_groups": ["gateway-admins"]
         }),
@@ -1189,17 +1207,34 @@ async fn assert_group_search_result(
 
 #[tokio::test]
 async fn test_group_attribute_lookup_is_case_insensitive() {
-    assert_group_search_result(0, "gateway-admins", None).await;
+    assert_group_search_result(0, "gateway-admins", "(member={user_dn})", true, None).await;
 }
 
 #[tokio::test]
 async fn test_size_limited_group_search_accepts_a_proven_required_match() {
-    assert_group_search_result(4, "gateway-admins", None).await;
+    assert_group_search_result(4, "gateway-admins", "(member={user_dn})", true, None).await;
 }
 
 #[tokio::test]
 async fn test_size_limited_group_search_without_a_match_fails_closed() {
-    assert_group_search_result(4, "unrelated-group", Some(500)).await;
+    assert_group_search_result(4, "unrelated-group", "(member={user_dn})", false, Some(500)).await;
+}
+
+#[tokio::test]
+async fn test_static_allow_branch_does_not_authorize_non_member() {
+    assert_group_search_result(
+        0,
+        "gateway-admins",
+        "(|(member={user_dn})(cn=gateway-admins))",
+        false,
+        Some(403),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_placeholder_only_group_filter_authorizes_real_member() {
+    assert_group_search_result(0, "gateway-admins", "(member={user_dn})", true, None).await;
 }
 
 #[tokio::test]

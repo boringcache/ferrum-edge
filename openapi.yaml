@@ -11621,7 +11621,7 @@ components:
         group_filter:
           type: string
           minLength: 1
-          description: "Group search filter. When required_groups is non-empty, a custom filter must contain {user_dn} or {username} so membership remains user-specific. {username} is the presented login value; canonical_identity_attribute controls the exported Ferrum identity."
+          description: "Group search filter. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the presented login value; canonical_identity_attribute controls the exported Ferrum identity. Before authorization, every custom-filter match is rechecked against the exact returned group DN using member, uniqueMember, and memberUid so a static branch cannot fabricate membership."
         required_groups:
           type: array
           items:

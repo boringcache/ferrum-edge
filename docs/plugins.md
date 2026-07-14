@@ -1584,7 +1584,7 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 | `service_account_dn` | string | (none) | DN for the service account used in search-then-bind |
 | `service_account_password` | string | (none) | Password for the service account |
 | `group_base_dn` | string | (none) | Base DN for group membership search (required when `required_groups` is set) |
-| `group_filter` | string | auto | Group search filter. A custom filter must contain `{user_dn}` or `{username}` when `required_groups` is set. `{username}` remains the presented login value even when the canonical identity differs. Default checks `member`, `uniqueMember`, and `memberUid` attributes |
+| `group_filter` | string | auto | Group search filter. A custom filter must contain `{user_dn}` or `{username}` when `required_groups` is set. `{username}` remains the presented login value even when the canonical identity differs. Default checks `member`, `uniqueMember`, and `memberUid`; custom-filter matches are rechecked against the returned group entry using those attributes before authorization |
 | `required_groups` | string[] | `[]` | List of LDAP/AD group names the user must belong to (OR logic — at least one must match) |
 | `group_attribute` | string | `cn` | Attribute containing the group name for matching against `required_groups`; LDAP attribute-name matching is case-insensitive |
 | `starttls` | bool | `false` | Use STARTTLS to upgrade `ldap://` connections to TLS (cannot be used with `ldaps://`) |
@@ -1642,6 +1642,8 @@ For direct bind, the plugin sets `ctx.authenticated_identity` to the presented L
 A directory outage or a misconfigured service account therefore returns `500` (`LDAP authentication temporarily unavailable`), **not** `401` — returning `401` would tell the client its credentials are wrong, prompting useless re-submission and masking the operational problem. The specific cause is logged (via `warn!`) but never sent to the client.
 
 **Group search and service accounts:** When `required_groups` is set, the group-membership search binds with the service account if one is configured. With direct bind and **no** service account, the search runs over an **anonymous** bind — many directories deny anonymous reads of group objects / `member` attributes, in which case the search returns no entries and an entitled user is wrongly denied (`403`). The plugin logs a startup warning for this configuration and a per-request warning when an anonymous group search returns zero entries. **Configure a service account whenever you use `required_groups`** unless the directory is known to permit anonymous group searches.
+
+For custom `group_filter` values, a required group returned by the initial search is not sufficient proof of membership. The plugin performs a base-scope search against that exact group DN and authorizes it only when the directory confirms the bound user's DN or presented username through `member`, `uniqueMember`, or `memberUid`. This prevents a static filter branch from returning an allowed group for every successfully bound user without downloading large group membership attributes.
 
 **TLS and revocation:** `ldaps://` and STARTTLS connections use rustls with the gateway's CA settings (`FERRUM_TLS_CA_BUNDLE_PATH`, `FERRUM_TLS_NO_VERIFY`). When a CRL is configured (`FERRUM_TLS_CRL_FILE_PATH`) and verification is not disabled, revoked LDAP server certificates are rejected — the same revocation guarantee as the proxy backend, DTLS, frontend mTLS, and rustls logging-sink surfaces.
 

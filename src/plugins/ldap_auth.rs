@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use dashmap::DashMap;
 use hmac::{Hmac, KeyInit, Mac};
-use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry, SearchOptions};
+use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Scope, SearchEntry, SearchOptions};
 use ring::rand::SecureRandom;
 use rustls::ClientConfig;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer};
@@ -827,10 +827,9 @@ impl LdapAuth {
             .await
             .map_err(|e| AuthError::Backend(format!("ldap_auth: group search failed: {e}")))?;
 
-        let _ = ldap.with_timeout(self.connect_timeout).unbind().await;
-
         let result_code = search_result.1.rc;
         if result_code != 0 && result_code != 4 {
+            let _ = ldap.with_timeout(self.connect_timeout).unbind().await;
             return Err(AuthError::Backend(format!(
                 "ldap_auth: group search error: {}",
                 search_result.1
@@ -854,23 +853,47 @@ impl LdapAuth {
             );
         }
 
+        let mut membership_result = Ok(false);
         for result_entry in rs {
             let entry = SearchEntry::construct(result_entry);
-            if let Some(group_names) =
-                ldap_attribute_values(&entry.attrs, &self.group_attribute, "group")?
+            let is_required_group = match self.entry_matches_required_group(&entry) {
+                Ok(is_match) => is_match,
+                Err(error) => {
+                    membership_result = Err(error);
+                    break;
+                }
+            };
+            if !is_required_group {
+                continue;
+            }
+
+            // The built-in filter itself is the membership proof. A custom
+            // filter may contain static branches that also return this group,
+            // so re-check the exact returned entry with a server-side,
+            // schema-aware membership predicate before authorizing it.
+            if self.group_filter.is_none() {
+                membership_result = Ok(true);
+                break;
+            }
+            match self
+                .returned_group_proves_membership(&mut ldap, &entry.dn, user_dn, presented_username)
+                .await
             {
-                for name in group_names {
-                    if self.required_group_lookup.contains(&name.to_lowercase()) {
-                        return Ok(true);
-                    }
+                Ok(true) => {
+                    membership_result = Ok(true);
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    membership_result = Err(error);
+                    break;
                 }
             }
-            // Also check the DN's CN component as a fallback
-            if let Some(cn) = extract_cn_from_dn(&entry.dn)
-                && self.required_group_lookup.contains(&cn.to_lowercase())
-            {
-                return Ok(true);
-            }
+        }
+
+        let _ = ldap.with_timeout(self.connect_timeout).unbind().await;
+        if membership_result? {
+            return Ok(true);
         }
 
         if size_limit_exceeded {
@@ -888,11 +911,9 @@ impl LdapAuth {
         // by the user search. The canonical identity is for Ferrum identity
         // export/Consumer mapping and may intentionally differ (for example,
         // email login versus an immutable directory ID).
+        let default_filter = group_membership_filter(user_dn, presented_username);
         let escaped_user_dn = escape_filter_value(user_dn);
         let escaped_username = escape_filter_value(presented_username);
-        let default_filter = format!(
-            "(|(member={escaped_user_dn})(uniqueMember={escaped_user_dn})(memberUid={escaped_username}))"
-        );
         self.group_filter
             .as_ref()
             .map(|filter| {
@@ -902,6 +923,68 @@ impl LdapAuth {
             })
             .unwrap_or(default_filter)
     }
+
+    fn entry_matches_required_group(&self, entry: &SearchEntry) -> Result<bool, AuthError> {
+        if let Some(group_names) =
+            ldap_attribute_values(&entry.attrs, &self.group_attribute, "group")?
+            && group_names
+                .iter()
+                .any(|name| self.required_group_lookup.contains(&name.to_lowercase()))
+        {
+            return Ok(true);
+        }
+
+        // Also check the DN's CN component as a fallback.
+        Ok(extract_cn_from_dn(&entry.dn)
+            .is_some_and(|cn| self.required_group_lookup.contains(&cn.to_lowercase())))
+    }
+
+    async fn returned_group_proves_membership(
+        &self,
+        ldap: &mut Ldap,
+        group_dn: &str,
+        user_dn: &str,
+        presented_username: &str,
+    ) -> Result<bool, AuthError> {
+        let membership_filter = group_membership_filter(user_dn, presented_username);
+        let (entries, _result) = ldap
+            .with_search_options(
+                SearchOptions::new()
+                    .sizelimit(1)
+                    .timelimit(self.search_time_limit_seconds),
+            )
+            .with_timeout(self.connect_timeout)
+            .search(group_dn, Scope::Base, &membership_filter, vec!["1.1"])
+            .await
+            .map_err(|e| {
+                AuthError::Backend(format!(
+                    "ldap_auth: returned group membership verification failed: {e}"
+                ))
+            })?
+            .success()
+            .map_err(|e| {
+                AuthError::Backend(format!(
+                    "ldap_auth: returned group membership verification error: {e}"
+                ))
+            })?;
+
+        match entries.len() {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(AuthError::Backend(
+                "ldap_auth: base-scope group membership verification returned multiple entries"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+fn group_membership_filter(user_dn: &str, presented_username: &str) -> String {
+    let escaped_user_dn = escape_filter_value(user_dn);
+    let escaped_username = escape_filter_value(presented_username);
+    format!(
+        "(|(member={escaped_user_dn})(uniqueMember={escaped_user_dn})(memberUid={escaped_username}))"
+    )
 }
 
 fn ldap_attribute_values<'a>(
