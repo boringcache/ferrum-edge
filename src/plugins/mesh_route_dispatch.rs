@@ -63,7 +63,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::types::{
-    BackendTlsConfig, MAX_BACKEND_HOST_LENGTH, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, RetryConfig,
+    BackendTlsConfig, BackoffStrategy, MAX_BACKEND_HOST_LENGTH,
+    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, RetryConfig,
     normalize_backend_tls_san_allow_list_entry, validate_backend_tls_san_allow_list_entry,
     validate_backend_tls_sni,
 };
@@ -458,6 +459,140 @@ fn compile_transform_field(
     Ok(Some(Arc::new(parsed)))
 }
 
+/// Route-local retry wire shape. `RetryConfig` is also deserialized from
+/// persisted proxy retry JSON, where unknown-field compatibility is broader;
+/// keep the strict boundary local to mesh route policy instead of changing
+/// every shared deserialization path.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteRetryConfig {
+    #[serde(default = "route_default_max_retries")]
+    max_retries: u32,
+    #[serde(default)]
+    retryable_status_codes: Vec<u16>,
+    #[serde(default = "route_default_retryable_methods")]
+    retryable_methods: Vec<String>,
+    #[serde(default)]
+    backoff: RouteBackoffStrategy,
+    #[serde(default = "route_default_true")]
+    retry_on_connect_failure: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RouteBackoffStrategy {
+    Fixed(RouteFixedBackoff),
+    Exponential(RouteExponentialBackoff),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteFixedBackoff {
+    delay_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteExponentialBackoff {
+    base_ms: u64,
+    max_ms: u64,
+}
+
+impl Default for RouteBackoffStrategy {
+    fn default() -> Self {
+        Self::Fixed(RouteFixedBackoff { delay_ms: 100 })
+    }
+}
+
+impl From<RouteBackoffStrategy> for BackoffStrategy {
+    fn from(value: RouteBackoffStrategy) -> Self {
+        match value {
+            RouteBackoffStrategy::Fixed(config) => Self::Fixed {
+                delay_ms: config.delay_ms,
+            },
+            RouteBackoffStrategy::Exponential(config) => Self::Exponential {
+                base_ms: config.base_ms,
+                max_ms: config.max_ms,
+            },
+        }
+    }
+}
+
+impl From<RouteRetryConfig> for RetryConfig {
+    fn from(value: RouteRetryConfig) -> Self {
+        Self {
+            max_retries: value.max_retries,
+            retryable_status_codes: value.retryable_status_codes,
+            retryable_methods: value.retryable_methods,
+            backoff: value.backoff.into(),
+            retry_on_connect_failure: value.retry_on_connect_failure,
+        }
+    }
+}
+
+fn route_default_max_retries() -> u32 {
+    RetryConfig::default().max_retries
+}
+
+fn route_default_retryable_methods() -> Vec<String> {
+    RetryConfig::default().retryable_methods
+}
+
+fn route_default_true() -> bool {
+    true
+}
+
+fn deserialize_route_retry<'de, D>(deserializer: D) -> Result<Option<RetryConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<RouteRetryConfig>::deserialize(deserializer).map(|retry| retry.map(RetryConfig::from))
+}
+
+/// Route-local backend TLS wire shape for the same reason as
+/// `RouteRetryConfig`: strict route policy must not silently accept typos, but
+/// the shared runtime type has other compatibility-sensitive input surfaces.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteBackendTlsConfig {
+    #[serde(default)]
+    client_cert_path: Option<String>,
+    #[serde(default)]
+    client_key_path: Option<String>,
+    #[serde(default)]
+    server_ca_cert_path: Option<String>,
+    #[serde(default = "route_default_true")]
+    verify_server_cert: bool,
+    #[serde(default)]
+    sni: Option<String>,
+    #[serde(default)]
+    san_allow_list: Vec<String>,
+}
+
+impl From<RouteBackendTlsConfig> for BackendTlsConfig {
+    fn from(value: RouteBackendTlsConfig) -> Self {
+        Self {
+            client_cert_path: value.client_cert_path,
+            client_key_path: value.client_key_path,
+            server_ca_cert_path: value.server_ca_cert_path,
+            verify_server_cert: value.verify_server_cert,
+            sni: value.sni,
+            san_allow_list: value.san_allow_list,
+            san_allow_list_key_digest: None,
+        }
+    }
+}
+
+fn deserialize_route_backend_tls<'de, D>(
+    deserializer: D,
+) -> Result<Option<BackendTlsConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<RouteBackendTlsConfig>::deserialize(deserializer)
+        .map(|tls| tls.map(BackendTlsConfig::from))
+}
+
 fn normalize_and_validate_backend_tls(
     rule_idx: usize,
     tls: &mut BackendTlsConfig,
@@ -535,7 +670,11 @@ pub struct RouteRule {
     #[serde(default, skip_serializing_if = "is_false")]
     pub timeout_disabled: bool,
     /// Override the proxy's retry policy for this rule.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_route_retry"
+    )]
     pub retry: Option<RetryConfig>,
     /// Explicitly clear the selected proxy's retry policy for this rule.
     /// Translator-generated collapsed rules use this to prevent a later
@@ -1018,7 +1157,11 @@ pub struct RouteDestination {
     pub backend_port: Option<u16>,
     /// Override the proxy's resolved backend TLS materials when the rule
     /// routes to a direct backend that uses different mTLS settings.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_route_backend_tls"
+    )]
     pub backend_tls: Option<BackendTlsConfig>,
     /// Trusted translator marker for destinations that enter NodeWaypoint
     /// Service authz. When scoped NodeWaypoint authz ran but did not stamp an

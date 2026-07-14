@@ -8158,6 +8158,99 @@ components:
             type: string
             maxLength: 2048
 
+    MeshRouteBackendTlsConfig:
+      type: object
+      additionalProperties: false
+      description: Strict route-local backend TLS override for mesh_route_dispatch.
+      properties:
+        client_cert_path:
+          type: [string, "null"]
+          minLength: 1
+        client_key_path:
+          type: [string, "null"]
+          minLength: 1
+        server_ca_cert_path:
+          type: [string, "null"]
+          minLength: 1
+        verify_server_cert:
+          type: boolean
+          default: true
+        sni:
+          type: [string, "null"]
+          maxLength: 253
+        san_allow_list:
+          type: array
+          maxItems: 256
+          default: []
+          items:
+            type: string
+            maxLength: 2048
+
+    MeshRouteRetryConfig:
+      type: object
+      additionalProperties: false
+      description: Strict route-local retry policy for mesh_route_dispatch.
+      properties:
+        max_retries:
+          type: integer
+          format: uint32
+          default: 3
+        retryable_status_codes:
+          type: array
+          items:
+            type: integer
+            format: uint16
+          default: []
+        retryable_methods:
+          type: array
+          items:
+            type: string
+            enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, TRACE, CONNECT]
+          maxItems: 9
+          default: [GET, HEAD, OPTIONS, PUT, DELETE]
+        backoff:
+          $ref: "#/components/schemas/MeshRouteBackoffStrategy"
+        retry_on_connect_failure:
+          type: boolean
+          default: true
+
+    MeshRouteBackoffStrategy:
+      description: Strict route-local retry delay strategy for mesh_route_dispatch.
+      oneOf:
+        - type: object
+          title: Fixed delay
+          required: [fixed]
+          additionalProperties: false
+          properties:
+            fixed:
+              type: object
+              required: [delay_ms]
+              additionalProperties: false
+              properties:
+                delay_ms:
+                  type: integer
+                  format: uint64
+                  default: 100
+        - type: object
+          title: Exponential backoff
+          required: [exponential]
+          additionalProperties: false
+          properties:
+            exponential:
+              type: object
+              required: [base_ms, max_ms]
+              additionalProperties: false
+              properties:
+                base_ms:
+                  type: integer
+                  format: uint64
+                max_ms:
+                  type: integer
+                  format: uint64
+      default:
+        fixed:
+          delay_ms: 100
+
     TcpKeepaliveCfg:
       type: object
       properties:
@@ -12237,7 +12330,7 @@ components:
                   backend_tls:
                     description: Optional per-rule backend TLS override (direct backends only).
                     oneOf:
-                      - $ref: "#/components/schemas/BackendTlsConfig"
+                      - $ref: "#/components/schemas/MeshRouteBackendTlsConfig"
                       - type: "null"
                   requires_node_waypoint_authz:
                     type: boolean
@@ -12261,7 +12354,7 @@ components:
                   response/read timeout. Cannot be true when `timeout_ms` is set.
               retry:
                 oneOf:
-                  - $ref: "#/components/schemas/RetryConfig"
+                  - $ref: "#/components/schemas/MeshRouteRetryConfig"
                   - type: "null"
                 description: |
                   Optional route-local retry policy. Mutually exclusive with

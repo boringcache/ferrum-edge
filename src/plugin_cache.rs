@@ -103,12 +103,15 @@ fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> 
     };
     let first_index = first_index.unwrap_or(last_index);
 
-    if plugins[first_index..=last_index]
-        .iter()
-        .any(|plugin| plugin.name() != MESH_ROUTE_DISPATCH_NAME)
-    {
+    if plugins[first_index..=last_index].iter().any(|plugin| {
+        plugin.name() != MESH_ROUTE_DISPATCH_NAME
+            && plugin
+                .supported_protocols()
+                .iter()
+                .any(|protocol| crate::plugins::HTTP_FAMILY_PROTOCOLS.contains(protocol))
+    }) {
         return Err(
-            "mesh_route_dispatch instances must remain contiguous so reject_unmatched is finalized before later short-circuit plugins; remove priority overrides that interleave another plugin"
+            "mesh_route_dispatch instances must remain contiguous in HTTP-family chains so reject_unmatched is finalized before later short-circuit plugins; remove priority overrides that interleave another HTTP-family plugin"
                 .to_string(),
         );
     }
