@@ -358,29 +358,22 @@ impl Oauth2Introspection {
             });
         }
 
-        let authorization_provider_count = providers
-            .iter()
-            .filter(|provider| provider.token_locations.is_empty())
-            .count();
-        if authorization_provider_count > 1 && !allow_provider_fanout {
-            return Err(
-                "oauth2_introspection: multiple providers use the Authorization bearer location; set 'allow_provider_fanout' to true only when every provider shares one trust boundary, or configure distinct from_headers/from_params routing hints"
-                    .to_string(),
-            );
-        }
         if !allow_provider_fanout {
             let mut location_owners: HashMap<String, usize> = HashMap::new();
             for (provider_idx, provider) in providers.iter().enumerate() {
+                if provider.token_locations.is_empty() {
+                    register_provider_location(
+                        &mut location_owners,
+                        "authorization-bearer".to_string(),
+                        provider_idx,
+                    )?;
+                }
                 for location in &provider.token_locations {
-                    let key = token_location_routing_key(location);
-                    if let Some(previous_provider_idx) = location_owners.insert(key, provider_idx)
-                        && previous_provider_idx != provider_idx
-                    {
-                        return Err(
-                            "oauth2_introspection: provider token locations must be distinct unless 'allow_provider_fanout' explicitly enables a shared trust boundary"
-                                .to_string(),
-                        );
-                    }
+                    register_provider_location(
+                        &mut location_owners,
+                        token_location_routing_key(location),
+                        provider_idx,
+                    )?;
                 }
             }
         }
@@ -441,7 +434,7 @@ impl Oauth2Introspection {
                 }
                 self.emit_claim_headers(ctx, &claims, provider);
                 if !provider.forward_original_token {
-                    mark_original_token_stripping_metadata(ctx, provider, candidate.source);
+                    self.mark_original_token_stripping_metadata(ctx, &token, candidate);
                 }
                 let outcome = self.resolve_identity(&claims, provider, consumer_index);
                 apply_verify_outcome(ctx, outcome, "oauth2_introspection")
@@ -788,6 +781,38 @@ impl Oauth2Introspection {
         emit_claim_headers_to_metadata(ctx, claims, &provider.claim_headers, ",");
     }
 
+    fn mark_original_token_stripping_metadata(
+        &self,
+        ctx: &mut RequestContext,
+        accepted_token: &str,
+        candidate: ProviderCandidate,
+    ) {
+        let Some(provider) = self.providers.get(candidate.provider_idx) else {
+            warn!(
+                plugin = "oauth2_introspection",
+                provider_idx = candidate.provider_idx,
+                "accepted token provider no longer exists"
+            );
+            return;
+        };
+        mark_credential_source_stripping_metadata(ctx, provider, candidate.source);
+
+        // A client can repeat one credential in several supported locations.
+        // Stripping only the location selected during routing would leave an
+        // equivalent copy available to the backend, so remove every configured
+        // occurrence of the accepted token while preserving unrelated values.
+        if authorization_bearer_matches(ctx, accepted_token) {
+            mark_authorization_stripping_metadata(ctx);
+        }
+        for provider in &self.providers {
+            for location in &provider.token_locations {
+                if token_location_matches(location, ctx, accepted_token) {
+                    mark_token_location_stripping_metadata(ctx, location);
+                }
+            }
+        }
+    }
+
     fn extract_credential(&self, ctx: &RequestContext) -> Oauth2ExtractedCredential {
         let mut first_invalid_format = None;
         for (idx, provider) in self.providers.iter().enumerate() {
@@ -798,6 +823,25 @@ impl Oauth2Introspection {
                         first_invalid_format.get_or_insert(body);
                     }
                     TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token)) => {
+                        if self.allow_provider_fanout && is_authorization_bearer_location(location)
+                        {
+                            let candidates = self
+                                .providers
+                                .iter()
+                                .enumerate()
+                                .map(|(provider_idx, provider)| ProviderCandidate {
+                                    provider_idx,
+                                    source: provider_location_extracting_token(
+                                        &provider.token_locations,
+                                        ctx,
+                                        &token,
+                                    )
+                                    .map(CredentialSource::ProviderLocation)
+                                    .unwrap_or(CredentialSource::Authorization),
+                                })
+                                .collect();
+                            return Oauth2ExtractedCredential::BearerToken { token, candidates };
+                        }
                         let mut candidates = vec![ProviderCandidate {
                             provider_idx: idx,
                             source: CredentialSource::ProviderLocation(location_idx),
@@ -891,8 +935,27 @@ fn provider_location_extracting_token(
         )
 }
 
+fn register_provider_location(
+    location_owners: &mut HashMap<String, usize>,
+    key: String,
+    provider_idx: usize,
+) -> Result<(), String> {
+    if let Some(previous_provider_idx) = location_owners.insert(key, provider_idx)
+        && previous_provider_idx != provider_idx
+    {
+        return Err(
+            "oauth2_introspection: provider token locations must be distinct unless 'allow_provider_fanout' explicitly enables a shared trust boundary"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn token_location_routing_key(location: &TokenLocation) -> String {
     match location {
+        TokenLocation::Header(_) if is_authorization_bearer_location(location) => {
+            "authorization-bearer".to_string()
+        }
         TokenLocation::Header(header) => {
             let prefix = header.prefix.as_deref().unwrap_or("");
             let mut key = String::with_capacity(
@@ -911,6 +974,18 @@ fn token_location_routing_key(location: &TokenLocation) -> String {
             key
         }
     }
+}
+
+fn is_authorization_bearer_location(location: &TokenLocation) -> bool {
+    let TokenLocation::Header(header) = location else {
+        return false;
+    };
+    header.name.eq_ignore_ascii_case("authorization")
+        && header
+            .prefix
+            .as_deref()
+            .and_then(|prefix| prefix.strip_suffix(' '))
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer"))
 }
 
 #[derive(Clone)]
@@ -1769,18 +1844,13 @@ fn audience_matches(claims: &Value, audiences: &[String]) -> bool {
     }
 }
 
-fn mark_original_token_stripping_metadata(
+fn mark_credential_source_stripping_metadata(
     ctx: &mut RequestContext,
     provider: &IntrospectionProvider,
     source: CredentialSource,
 ) {
     match source {
-        CredentialSource::Authorization => {
-            ctx.metadata.insert(
-                STRIP_AUTHORIZATION_METADATA_KEY.to_string(),
-                "true".to_string(),
-            );
-        }
+        CredentialSource::Authorization => mark_authorization_stripping_metadata(ctx),
         CredentialSource::ProviderLocation(location_idx) => {
             let Some(location) = provider.token_locations.get(location_idx) else {
                 warn!(
@@ -1789,21 +1859,61 @@ fn mark_original_token_stripping_metadata(
                 );
                 return;
             };
-            match location {
-                TokenLocation::Header(header) => {
-                    ctx.metadata.insert(
-                        format!("{STRIP_HEADER_METADATA_PREFIX}{}", header.name),
-                        "true".to_string(),
-                    );
-                }
-                TokenLocation::QueryParam(name) => {
-                    ctx.metadata.insert(
-                        format!("{STRIP_QUERY_PARAM_METADATA_PREFIX}{name}"),
-                        "true".to_string(),
-                    );
-                    ctx.query_params.remove(name);
-                }
-            }
+            mark_token_location_stripping_metadata(ctx, location);
+        }
+    }
+}
+
+fn authorization_bearer_matches(ctx: &RequestContext, expected_token: &str) -> bool {
+    ctx.headers
+        .get("authorization")
+        .and_then(|value| value.split_once(' '))
+        .is_some_and(|(scheme, token)| {
+            scheme.eq_ignore_ascii_case("bearer") && token == expected_token
+        })
+}
+
+fn token_location_matches(
+    location: &TokenLocation,
+    ctx: &RequestContext,
+    expected_token: &str,
+) -> bool {
+    match location {
+        TokenLocation::Header(header) => ctx.headers.get(&header.name).is_some_and(|value| {
+            let token = match header.prefix.as_deref() {
+                Some(prefix) => value.strip_prefix(prefix),
+                None => Some(value.as_str()),
+            };
+            token == Some(expected_token)
+        }),
+        TokenLocation::QueryParam(name) => ctx
+            .query_params
+            .get(name)
+            .is_some_and(|token| token == expected_token),
+    }
+}
+
+fn mark_authorization_stripping_metadata(ctx: &mut RequestContext) {
+    ctx.metadata.insert(
+        STRIP_AUTHORIZATION_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+}
+
+fn mark_token_location_stripping_metadata(ctx: &mut RequestContext, location: &TokenLocation) {
+    match location {
+        TokenLocation::Header(header) => {
+            ctx.metadata.insert(
+                format!("{STRIP_HEADER_METADATA_PREFIX}{}", header.name),
+                "true".to_string(),
+            );
+        }
+        TokenLocation::QueryParam(name) => {
+            ctx.metadata.insert(
+                format!("{STRIP_QUERY_PARAM_METADATA_PREFIX}{name}"),
+                "true".to_string(),
+            );
+            ctx.query_params.remove(name);
         }
     }
 }

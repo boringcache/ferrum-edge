@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use base64::Engine as _;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::AuthMode;
@@ -16,6 +17,31 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::plugin_utils::assert_continue;
+
+struct InvalidSecondaryAuth;
+
+#[async_trait]
+impl Plugin for InvalidSecondaryAuth {
+    fn name(&self) -> &str {
+        "invalid_secondary_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    async fn authenticate(
+        &self,
+        _ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 401,
+            body: r#"{"error":"Invalid secondary credential"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
 
 fn make_ctx(token: &str) -> RequestContext {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/test".into());
@@ -546,6 +572,23 @@ fn new_bounds_provider_count_and_requires_explicit_shared_trust_for_fanout() {
         )
         .is_err()
     );
+
+    let implicit_authorization = json!({
+        "introspection_endpoint": "http://localhost/introspect",
+        "client_auth": {"method": "none"}
+    });
+    let explicit_authorization = json!({
+        "introspection_endpoint": "http://localhost/introspect",
+        "client_auth": {"method": "none"},
+        "from_headers": [{"name": "Authorization", "prefix": "bEaReR "}]
+    });
+    let error = Oauth2Introspection::new(
+        &json!({"providers": [implicit_authorization, explicit_authorization]}),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("explicit and implicit Authorization bearer sources must conflict");
+    assert!(error.contains("allow_provider_fanout"));
 }
 
 #[tokio::test]
@@ -725,6 +768,40 @@ async fn unavailable_provider_takes_precedence_over_inactive_fanout_result() {
 }
 
 #[tokio::test]
+async fn provider_unavailable_survives_later_multi_auth_401() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let oauth: Arc<dyn Plugin> = Arc::new(
+        Oauth2Introspection::new(
+            &config(&format!("{}/introspect", server.uri())),
+            PluginHttpClient::default(),
+        )
+        .unwrap(),
+    );
+    let invalid_secondary: Arc<dyn Plugin> = Arc::new(InvalidSecondaryAuth);
+    let mut ctx = make_ctx("provider-outage-token");
+    let rejection = run_authentication_phase(
+        AuthMode::Multi,
+        &[oauth, invalid_secondary],
+        &mut ctx,
+        &ConsumerIndex::new(&[]),
+    )
+    .await
+    .expect("provider outage must fail closed");
+    assert_eq!(rejection.0, 503);
+    assert!(
+        rejection
+            .2
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("www-authenticate"))
+    );
+}
+
+#[tokio::test]
 async fn missing_credentials_advertise_bearer_in_single_and_multi_auth_modes() {
     for auth_mode in [AuthMode::Single, AuthMode::Multi] {
         let plugin: Arc<dyn Plugin> = Arc::new(
@@ -878,6 +955,66 @@ async fn authorization_fallback_strips_the_actual_source_for_query_only_provider
         headers
             .keys()
             .all(|name| !name.eq_ignore_ascii_case("authorization"))
+    );
+}
+
+#[tokio::test]
+async fn accepted_token_is_stripped_from_every_duplicate_location() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"active": true, "username": "u"})),
+        )
+        .mount(&server)
+        .await;
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": format!("{}/introspect", server.uri()),
+                "client_auth": {"method": "none"},
+                "from_headers": [
+                    {"name": "x-access-token"},
+                    {"name": "x-unrelated-token"}
+                ],
+                "from_params": ["access_token"],
+                "forward_original_token": false
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx("duplicate-token");
+    ctx.headers
+        .insert("x-access-token".to_string(), "duplicate-token".to_string());
+    ctx.headers.insert(
+        "x-unrelated-token".to_string(),
+        "different-token".to_string(),
+    );
+    ctx.query_params
+        .insert("access_token".to_string(), "duplicate-token".to_string());
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+
+    let mut headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("authorization"))
+    );
+    assert!(!headers.contains_key("x-access-token"));
+    assert_eq!(
+        headers.get("x-unrelated-token").map(String::as_str),
+        Some("different-token")
+    );
+    assert!(!ctx.query_params.contains_key("access_token"));
+    assert!(
+        ctx.metadata
+            .contains_key("auth.strip_query_param.access_token")
     );
 }
 

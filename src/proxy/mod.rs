@@ -13779,12 +13779,20 @@ pub async fn run_authentication_phase(
             // Multi-auth success includes external identity auth (e.g. jwks_auth)
             // even when no gateway Consumer record exists.
             let mut last_reject: Option<(u16, Vec<u8>, HashMap<String, String>)> = None;
+            let mut server_reject: Option<(u16, Vec<u8>, HashMap<String, String>)> = None;
             for auth_plugin in auth_plugins {
                 match auth_plugin.authenticate(ctx, consumer_index).await {
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
                         if let Some(reject) = plugin_result_into_reject_parts(reject) {
-                            last_reject = Some((reject.status_code, reject.body, reject.headers));
+                            let reject = (reject.status_code, reject.body, reject.headers);
+                            if reject.0 >= 500 {
+                                if server_reject.is_none() {
+                                    server_reject = Some(reject);
+                                }
+                            } else {
+                                last_reject = Some(reject);
+                            }
                         }
                     }
                     PluginResult::Continue => {
@@ -13806,7 +13814,11 @@ pub async fn run_authentication_phase(
             {
                 None
             } else {
-                Some(last_reject.unwrap_or_else(|| missing_authentication_reject(auth_plugins)))
+                Some(
+                    server_reject
+                        .or(last_reject)
+                        .unwrap_or_else(|| missing_authentication_reject(auth_plugins)),
+                )
             }
         }
         AuthMode::Single => {
