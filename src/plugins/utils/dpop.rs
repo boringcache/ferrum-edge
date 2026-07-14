@@ -128,6 +128,11 @@ impl DpopJtiCache {
             }
         }
     }
+
+    /// Configured capacity, exposed for default-contract regression tests.
+    pub(crate) fn max_entries(&self) -> usize {
+        self.max_entries
+    }
 }
 
 pub struct DpopVerifyInput<'a> {
