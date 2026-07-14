@@ -421,14 +421,18 @@ impl MtlsAuth {
         chain: &'a [Vec<u8>],
         pinned_ca_der: &[u8],
     ) -> bool {
-        let Ok((_, mut current)) = X509Certificate::from_der(leaf_der) else {
+        let Ok((_, leaf)) = X509Certificate::from_der(leaf_der) else {
             return false;
         };
         let Ok((_, pinned_ca)) = X509Certificate::from_der(pinned_ca_der) else {
             return false;
         };
 
-        let mut used = vec![false; chain.len()];
+        // 0 = unseen, 1 = reachable and pending, 2 = processed. Reusing one
+        // state vector as the work queue keeps path search iterative and
+        // bounded to O(n^2), including alternate and cyclic presented chains.
+        let mut states = vec![0u8; chain.len()];
+        let mut current = leaf;
         loop {
             if current.issuer() == pinned_ca.subject()
                 && current
@@ -438,9 +442,8 @@ impl MtlsAuth {
                 return true;
             }
 
-            let mut next_idx = None;
             for (idx, cert_der) in chain.iter().enumerate() {
-                if used[idx] {
+                if states[idx] != 0 {
                     continue;
                 }
                 let Ok((_, candidate)) = X509Certificate::from_der(cert_der) else {
@@ -451,17 +454,16 @@ impl MtlsAuth {
                         .verify_signature(Some(candidate.public_key()))
                         .is_ok()
                 {
-                    next_idx = Some(idx);
-                    break;
+                    states[idx] = 1;
                 }
             }
 
-            let Some(idx) = next_idx else {
+            let Some(next_idx) = states.iter().position(|state| *state == 1) else {
                 return false;
             };
-            used[idx] = true;
-            let Ok((_, parsed)) = X509Certificate::from_der(&chain[idx]) else {
-                return false;
+            states[next_idx] = 2;
+            let Ok((_, parsed)) = X509Certificate::from_der(&chain[next_idx]) else {
+                continue;
             };
             current = parsed;
         }

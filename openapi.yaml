@@ -6544,6 +6544,8 @@ components:
             all other certificate fields are compared exactly. Identities are
             always exact-unique across consumers and, while an enabled san_dns
             mTLS policy exists, must also be unique under ASCII case folding.
+            Database snapshots that violate the DNS rule are rejected before
+            runtime indexes are published.
       description: >-
         mTLS auth credential for the `mtls_auth` plugin. Indexed for O(1)
         lookup by certificate identity.

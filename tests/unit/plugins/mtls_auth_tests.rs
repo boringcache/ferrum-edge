@@ -131,6 +131,66 @@ fn create_intermediate_signed_cert(
     (root_der, intermediate_der, client_cert.der().to_vec())
 }
 
+/// Create a client chain with two cross-signed versions of the same
+/// intermediate key. Only the second intermediate reaches the pinned root.
+/// Returns (pinned_root_der, unpinned_intermediate_der,
+/// pinned_intermediate_der, client_der).
+fn create_cross_signed_intermediate_chain() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut unpinned_root_params = rcgen::CertificateParams::default();
+    let mut unpinned_root_dn = rcgen::DistinguishedName::new();
+    unpinned_root_dn.push(rcgen::DnType::CommonName, "Unpinned Root CA");
+    unpinned_root_params.distinguished_name = unpinned_root_dn;
+    unpinned_root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let unpinned_root_key = rcgen::KeyPair::generate().unwrap();
+    let unpinned_root_issuer = rcgen::Issuer::new(unpinned_root_params, unpinned_root_key);
+
+    let mut pinned_root_params = rcgen::CertificateParams::default();
+    let mut pinned_root_dn = rcgen::DistinguishedName::new();
+    pinned_root_dn.push(rcgen::DnType::CommonName, "Pinned Root CA");
+    pinned_root_params.distinguished_name = pinned_root_dn;
+    pinned_root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let pinned_root_key = rcgen::KeyPair::generate().unwrap();
+    let pinned_root_cert = pinned_root_params.self_signed(&pinned_root_key).unwrap();
+    let pinned_root_der = pinned_root_cert.der().to_vec();
+    let pinned_root_issuer = rcgen::Issuer::new(pinned_root_params, pinned_root_key);
+
+    let mut intermediate_params = rcgen::CertificateParams::default();
+    let mut intermediate_dn = rcgen::DistinguishedName::new();
+    intermediate_dn.push(rcgen::DnType::CommonName, "Cross-Signed Intermediate CA");
+    intermediate_params.distinguished_name = intermediate_dn;
+    intermediate_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let intermediate_key = rcgen::KeyPair::generate().unwrap();
+    let unpinned_intermediate = intermediate_params
+        .signed_by(&intermediate_key, &unpinned_root_issuer)
+        .unwrap()
+        .der()
+        .to_vec();
+    let pinned_intermediate = intermediate_params
+        .signed_by(&intermediate_key, &pinned_root_issuer)
+        .unwrap()
+        .der()
+        .to_vec();
+    let intermediate_issuer = rcgen::Issuer::new(intermediate_params, intermediate_key);
+
+    let mut client_params = rcgen::CertificateParams::default();
+    let mut client_dn = rcgen::DistinguishedName::new();
+    client_dn.push(rcgen::DnType::CommonName, "client.example.com");
+    client_params.distinguished_name = client_dn;
+    let client_key = rcgen::KeyPair::generate().unwrap();
+    let client_der = client_params
+        .signed_by(&client_key, &intermediate_issuer)
+        .unwrap()
+        .der()
+        .to_vec();
+
+    (
+        pinned_root_der,
+        unpinned_intermediate,
+        pinned_intermediate,
+        client_der,
+    )
+}
+
 fn cert_der_to_pem(cert_der: &[u8]) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(cert_der);
     let body = encoded
@@ -556,6 +616,35 @@ async fn test_mtls_auth_allowed_root_accepts_intermediate_issued_client() {
         plugin
             .authenticate(&mut missing_intermediate_ctx, &index)
             .await,
+        Some(403),
+    );
+}
+
+#[tokio::test]
+async fn test_mtls_auth_backtracks_across_cross_signed_intermediates() {
+    let (pinned_root, unpinned_intermediate, pinned_intermediate, client_der) =
+        create_cross_signed_intermediate_chain();
+    let plugin = MtlsAuth::new(&json!({
+        "cert_field": "subject_cn",
+        "allowed_issuers": [issuer_filter(&pinned_root, Some("Pinned Root CA"), None, None)]
+    }))
+    .unwrap();
+    let index = ConsumerIndex::new(&[create_mtls_consumer("c1", "alice", "client.example.com")]);
+
+    let mut valid_ctx = create_ctx_with_cert_and_chain(
+        client_der.clone(),
+        vec![
+            vec![0, 1, 2, 3],
+            unpinned_intermediate.clone(),
+            pinned_intermediate,
+        ],
+    );
+    assert_continue(plugin.authenticate(&mut valid_ctx, &index).await);
+
+    let mut unpinned_only_ctx =
+        create_ctx_with_cert_and_chain(client_der, vec![unpinned_intermediate]);
+    assert_reject(
+        plugin.authenticate(&mut unpinned_only_ctx, &index).await,
         Some(403),
     );
 }

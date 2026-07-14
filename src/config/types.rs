@@ -3470,16 +3470,6 @@ impl GatewayConfig {
         let mut seen_keyauth: HashMap<&str, &str> = HashMap::new();
         let mut seen_basicauth: HashMap<&str, &str> = HashMap::new();
         let mut seen_mtls: HashMap<&str, &str> = HashMap::new();
-        let dns_identity_matching_enabled = self.plugin_configs.iter().any(|plugin| {
-            plugin.enabled
-                && plugin.plugin_name == "mtls_auth"
-                && plugin
-                    .config
-                    .get("cert_field")
-                    .and_then(|value| value.as_str())
-                    == Some("san_dns")
-        });
-        let mut seen_mtls_dns = dns_identity_matching_enabled.then(HashMap::<String, &str>::new);
         let mut duplicates = Vec::new();
 
         for consumer in &self.consumers {
@@ -3508,29 +3498,63 @@ impl GatewayConfig {
 
             // Check all mTLS entries.
             for entry in consumer.credential_entries("mtls_auth") {
-                if let Some(identity) = entry.get("identity").and_then(|s| s.as_str()) {
-                    let exact_duplicate = if let Some(existing_id) =
-                        seen_mtls.insert(identity, &consumer.id)
-                    {
-                        duplicates.push(format!(
-                            "Duplicate mtls_auth identity '{}' in consumer '{}' (conflicts with consumer '{}')",
-                            identity, consumer.id, existing_id
-                        ));
-                        true
-                    } else {
-                        false
-                    };
+                if let Some(identity) = entry.get("identity").and_then(|s| s.as_str())
+                    && let Some(existing_id) = seen_mtls.insert(identity, &consumer.id)
+                {
+                    duplicates.push(format!(
+                        "Duplicate mtls_auth identity '{}' in consumer '{}' (conflicts with consumer '{}')",
+                        identity, consumer.id, existing_id
+                    ));
+                }
+            }
+        }
 
-                    if !exact_duplicate
-                        && let Some(seen_mtls_dns) = seen_mtls_dns.as_mut()
-                        && let Some(existing_id) =
-                            seen_mtls_dns.insert(identity.to_ascii_lowercase(), &consumer.id)
-                    {
-                        duplicates.push(format!(
-                            "Duplicate mtls_auth DNS identity '{}' (ASCII case-insensitive) in consumer '{}' (conflicts with consumer '{}')",
-                            identity, consumer.id, existing_id
-                        ));
-                    }
+        if let Err(dns_duplicates) = self.validate_unique_mtls_dns_identities() {
+            duplicates.extend(dns_duplicates);
+        }
+
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            Err(duplicates)
+        }
+    }
+
+    /// Reject case-variant identities before publishing the lower-cased DNS
+    /// lookup index. Exact-match mTLS policies remain case-sensitive.
+    pub fn validate_unique_mtls_dns_identities(&self) -> Result<(), Vec<String>> {
+        let dns_identity_matching_enabled = self.plugin_configs.iter().any(|plugin| {
+            plugin.enabled
+                && plugin.plugin_name == "mtls_auth"
+                && plugin
+                    .config
+                    .get("cert_field")
+                    .and_then(|value| value.as_str())
+                    == Some("san_dns")
+        });
+        if !dns_identity_matching_enabled {
+            return Ok(());
+        }
+
+        let mut seen_exact: HashMap<&str, &str> = HashMap::new();
+        let mut seen_dns: HashMap<String, &str> = HashMap::new();
+        let mut duplicates = Vec::new();
+        for consumer in &self.consumers {
+            for entry in consumer.credential_entries("mtls_auth") {
+                let Some(identity) = entry.get("identity").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                if seen_exact.insert(identity, &consumer.id).is_some() {
+                    // The general credential validator reports exact duplicates.
+                    continue;
+                }
+                if let Some(existing_id) =
+                    seen_dns.insert(identity.to_ascii_lowercase(), &consumer.id)
+                {
+                    duplicates.push(format!(
+                        "Duplicate mtls_auth DNS identity '{}' (ASCII case-insensitive) in consumer '{}' (conflicts with consumer '{}')",
+                        identity, consumer.id, existing_id
+                    ));
                 }
             }
         }

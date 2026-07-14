@@ -1,12 +1,14 @@
 use ferrum_edge::_test_support::{
     DbPoolConfig, db_append_connect_timeout, db_code_is_transient, db_diff_removed,
     db_mongo_error_is_transient, db_mysql_error_number_is_transient,
-    db_wrap_mysql_isolation_read_error, parse_auth_mode, parse_scheme, statement_timeout_sql,
+    db_wrap_mysql_isolation_read_error, is_config_validation_rejection, parse_auth_mode,
+    parse_scheme, statement_timeout_sql,
 };
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, Upstream, UpstreamTarget,
+    AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, PluginConfig, PluginScope, Upstream,
+    UpstreamTarget,
 };
 use serde_json::json;
 use sqlx::error::{DatabaseError, ErrorKind};
@@ -437,6 +439,29 @@ async fn consumer_credential_index_preserves_exact_mtls_identity_semantics() {
     let loaded = store.load_full_config("ferrum").await.unwrap();
     assert_eq!(loaded.consumers.len(), 2);
     assert_eq!(loaded.consumers[0].username, "alice");
+
+    let now = chrono::Utc::now();
+    store
+        .create_plugin_config(&PluginConfig {
+            id: "dns-mtls".to_string(),
+            plugin_name: "mtls_auth".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({"cert_field": "san_dns"}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    let error = store
+        .load_full_config("ferrum")
+        .await
+        .expect_err("DNS identity collisions must reject the runtime snapshot");
+    assert!(is_config_validation_rejection(&error));
 
     let mut c3 = make_consumer("c3", "carol");
     c3.credentials.insert(
