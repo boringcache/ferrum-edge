@@ -90,14 +90,28 @@ impl Plugin for MeshRouteDispatchFinalizer {
 /// the execution boundary after the final `mesh_route_dispatch` instance.
 /// Existing finalizers may be present when a global list is cloned during an
 /// incremental rebuild, so remove them before recomputing the boundary.
-fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) {
+fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), String> {
     plugins.retain(|plugin| plugin.name() != MESH_ROUTE_DISPATCH_FINALIZER_NAME);
+    let first_index = plugins
+        .iter()
+        .position(|plugin| plugin.name() == MESH_ROUTE_DISPATCH_NAME);
     let Some(last_index) = plugins
         .iter()
         .rposition(|plugin| plugin.name() == MESH_ROUTE_DISPATCH_NAME)
     else {
-        return;
+        return Ok(());
     };
+    let first_index = first_index.unwrap_or(last_index);
+
+    if plugins[first_index..=last_index]
+        .iter()
+        .any(|plugin| plugin.name() != MESH_ROUTE_DISPATCH_NAME)
+    {
+        return Err(
+            "mesh_route_dispatch instances must remain contiguous so reject_unmatched is finalized before later short-circuit plugins; remove priority overrides that interleave another plugin"
+                .to_string(),
+        );
+    }
 
     for plugin in plugins
         .iter()
@@ -110,6 +124,7 @@ fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) {
         last_index + 1,
         Arc::new(MeshRouteDispatchFinalizer { priority }),
     );
+    Ok(())
 }
 
 #[async_trait]
@@ -1247,7 +1262,9 @@ impl PluginCache {
                 }
             }
             global_plugins.sort_by_key(|p| p.priority());
-            install_mesh_route_dispatch_finalizer(&mut global_plugins);
+            if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
+                plugin_errors.push(format!("global plugins: {e}"));
+            }
             Arc::new(global_plugins)
         } else {
             Arc::clone(&current.global_plugins)
@@ -1429,7 +1446,9 @@ impl PluginCache {
             }
 
             merged.sort_by_key(|p| p.priority());
-            install_mesh_route_dispatch_finalizer(&mut merged);
+            if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
             new_map.insert(proxy.id.clone(), Arc::new(merged));
         }
 
@@ -1919,7 +1938,9 @@ impl PluginCache {
 
             // Sort by priority so execution order is deterministic
             merged.sort_by_key(|p| p.priority());
-            install_mesh_route_dispatch_finalizer(&mut merged);
+            if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
 
             // Pre-compute whether any plugin requires response body buffering
             let needs_buffering = merged.iter().any(|p| p.requires_response_body_buffering());
@@ -1934,6 +1955,13 @@ impl PluginCache {
             ws_frame_map.insert(proxy.id.clone(), needs_ws_frame);
 
             proxy_map.insert(proxy.id.clone(), Arc::new(merged));
+        }
+
+        // Sort and validate the global fallback list before committing the
+        // staged registry so ordering errors reject the whole cache build.
+        global_plugins.sort_by_key(|p| p.priority());
+        if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
+            plugin_errors.push(format!("global plugins: {e}"));
         }
 
         // If any enabled plugin failed validation or could not be resolved,
@@ -1958,9 +1986,6 @@ impl PluginCache {
         // Pairs with the `begin_reload` at the start of this function.
         crate::plugins::utils::log_schema::registry::commit_reload();
 
-        // Sort global fallback list too
-        global_plugins.sort_by_key(|p| p.priority());
-        install_mesh_route_dispatch_finalizer(&mut global_plugins);
         let global_needs_buffering = global_plugins
             .iter()
             .any(|p| p.requires_response_body_buffering());

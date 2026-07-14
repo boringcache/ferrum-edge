@@ -272,6 +272,61 @@ async fn mesh_route_dispatch_reject_unmatched_is_aggregated_across_instances() {
     );
 }
 
+#[test]
+fn mesh_route_dispatch_rejects_priority_interleaving_before_fail_closed_finalization() {
+    let first_route = make_plugin_config_with_json(
+        "first-route",
+        "mesh_route_dispatch",
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "get-backend"}
+            }],
+            "reject_unmatched": true
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let mut second_route = make_plugin_config_with_json(
+        "second-route",
+        "mesh_route_dispatch",
+        json!({
+            "rules": [{
+                "match": {"methods": ["POST"]},
+                "destination": {"upstream_id": "post-backend"}
+            }],
+            "reject_unmatched": true
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    second_route.priority_override = Some(3040);
+    let response_mock = make_plugin_config_with_json(
+        "mock",
+        "response_mock",
+        json!({
+            "rules": [{"path": "/api", "status_code": 200, "body": "mocked"}]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["first-route", "mock", "second-route"],
+        )],
+        vec![first_route, response_mock, second_route],
+    );
+
+    let error = match PluginCache::new(&config) {
+        Ok(_) => panic!("an interleaved short-circuit plugin must reject cache construction"),
+        Err(error) => error,
+    };
+    assert!(error.contains("must remain contiguous"), "got: {error}");
+    assert!(error.contains("priority overrides"), "got: {error}");
+}
+
 fn plugin_ptr_by_name(plugins: &[Arc<dyn Plugin>], name: &str) -> usize {
     let plugin = plugins
         .iter()

@@ -272,6 +272,9 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 instances: a local miss never short-circuits a later instance, and the request
 returns 404 only after every instance has run, fail-closed behavior was requested,
 and no instance matched or earlier route override exists.
+All attached instances must remain a contiguous priority block so this
+finalization runs before later short-circuit plugins. Cache construction rejects
+priority overrides that interleave another plugin between dispatch instances.
 
 When a `mesh_route_dispatch` rule matches on query params, the plugin opts the whole proxy into decoded query-param materialization for HTTP/3 so its `query_params` predicates see the same percent-decoded values as HTTP/1.1 and HTTP/2. That means every plugin on that proxy observes decoded `ctx.query_params` while the query-rule instance is configured.
 
