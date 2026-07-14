@@ -30,8 +30,8 @@ fn make_ctx() -> RequestContext {
     )
 }
 
-#[test]
-fn jwks_marks_forwarded_custom_query_locations_for_opa_redaction() {
+#[tokio::test]
+async fn jwks_marks_forwarded_custom_query_locations_for_opa_redaction() {
     let plugin = JwksAuth::new(
         &json!({
             "providers": [{

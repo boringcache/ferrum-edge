@@ -25,7 +25,7 @@ fn oauth2_marks_forwarded_custom_query_locations_for_opa_redaction() {
     let plugin = Oauth2Introspection::new(
         &json!({
             "providers": [{
-                "introspection_endpoint": "https://idp.example.com/introspect",
+                "introspection_endpoint": "http://127.0.0.1:8181/introspect",
                 "client_auth": {"method": "none"},
                 "from_params": ["opaque_sso_token"],
                 "forward_original_token": true
