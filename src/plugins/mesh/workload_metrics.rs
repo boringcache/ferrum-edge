@@ -365,11 +365,11 @@ impl WorkloadMetrics {
                 // never reported as the application source. Other outbound
                 // topologies continue to attribute the local workload.
                 let node_waypoint_source_identity = if ctx.node_waypoint_pod_uid.is_some() {
-                    ctx.peer_spiffe_id.clone()
+                    ctx.peer_spiffe_id.as_ref()
                 } else {
                     None
                 };
-                if let Some(identity) = node_waypoint_source_identity.as_ref() {
+                if let Some(identity) = node_waypoint_source_identity {
                     insert_source_spiffe_labels(&mut ctx.metadata, identity);
                     self.insert_remote_source_workload_labels(&mut ctx.metadata, Some(identity));
                 } else {
@@ -1001,10 +1001,10 @@ enum ParsedTagOperation<'a> {
     Set(&'a str),
 }
 
-fn parse_tag_operation(
+fn parse_tag_operation<'a>(
     name: &str,
-    operation: &serde_json::Map<String, Value>,
-) -> Result<ParsedTagOperation<'_>, String> {
+    operation: &'a serde_json::Map<String, Value>,
+) -> Result<ParsedTagOperation<'a>, String> {
     match operation.get("type").and_then(Value::as_str) {
         Some("remove") => Ok(ParsedTagOperation::Remove),
         Some("rename") => operation
