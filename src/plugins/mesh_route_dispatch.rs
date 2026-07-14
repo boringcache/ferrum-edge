@@ -792,9 +792,7 @@ impl AuthorityMatcher {
         match self {
             AuthorityMatcher::Exact(expected) => authority == expected.as_str(),
             AuthorityMatcher::Prefix(prefix) => authority.starts_with(prefix.as_str()),
-            AuthorityMatcher::Regex(re) => re
-                .find(authority)
-                .is_some_and(|m| m.start() == 0 && m.end() == authority.len()),
+            AuthorityMatcher::Regex(re) => re.is_match(authority),
         }
     }
 }
@@ -835,10 +833,11 @@ pub enum MethodStringMatch {
 /// recompiles.
 ///
 /// `Prefix` is uppercased at compile time (methods are conventionally
-/// uppercase ASCII per RFC 9110 §9.1). Regex patterns are compiled verbatim
-/// and must span the full method. `Exact` retains the operator's casing exactly
-/// so `method_match_is_case_sensitive` stays truthful — operators who write
-/// `"get"` continue to match only literal `"get"` requests, never `"GET"`.
+/// uppercase ASCII per RFC 9110 §9.1). Regex patterns are embedded verbatim
+/// inside absolute input anchors and must span the full method. `Exact` retains
+/// the operator's casing exactly so `method_match_is_case_sensitive` stays
+/// truthful — operators who write `"get"` continue to match only literal
+/// `"get"` requests, never `"GET"`.
 #[derive(Debug, Clone)]
 pub(crate) enum MethodMatcher {
     Exact(String),
@@ -851,9 +850,7 @@ impl MethodMatcher {
         match self {
             MethodMatcher::Exact(expected) => method == expected.as_str(),
             MethodMatcher::Prefix(prefix) => method.starts_with(prefix.as_str()),
-            MethodMatcher::Regex(re) => re
-                .find(method)
-                .is_some_and(|m| m.start() == 0 && m.end() == method.len()),
+            MethodMatcher::Regex(re) => re.is_match(method),
         }
     }
 }
@@ -903,9 +900,7 @@ impl HeaderMatcher {
         match self {
             HeaderMatcher::Exact(expected) => value == expected.as_str(),
             HeaderMatcher::Prefix(prefix) => value.starts_with(prefix.as_str()),
-            HeaderMatcher::Regex(re) => re
-                .find(value)
-                .is_some_and(|m| m.start() == 0 && m.end() == value.len()),
+            HeaderMatcher::Regex(re) => re.is_match(value),
         }
     }
 }
@@ -973,11 +968,18 @@ impl UriMatcher {
                     path.starts_with(value.as_str())
                 }
             }
-            UriMatcher::Regex(re) => re
-                .find(path)
-                .is_some_and(|m| m.start() == 0 && m.end() == path.len()),
+            UriMatcher::Regex(re) => re.is_match(path),
         }
     }
+}
+
+/// Compile a regex that can match only the complete input. Anchoring at the
+/// cold config boundary avoids relying on the first leftmost alternative from
+/// `Regex::find`, which may be a shorter prefix even when a later alternative
+/// spans the whole input. The operator pattern stays in its own non-capturing
+/// group so inline flags and alternation retain their original semantics.
+fn compile_full_match_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    Regex::new(&format!(r"\A(?:{pattern})\z"))
 }
 
 /// Allocation-free byte-level case-insensitive `starts_with`. ASCII fold
@@ -1352,7 +1354,7 @@ fn compile_authority_matcher(
                     "mesh_route_dispatch.rules[{rule_idx}].match.authority.regex must not be empty"
                 ));
             }
-            let re = Regex::new(pattern).map_err(|e| {
+            let re = compile_full_match_regex(pattern).map_err(|e| {
                 format!(
                     "mesh_route_dispatch.rules[{rule_idx}].match.authority.regex is invalid: {e}"
                 )
@@ -1436,7 +1438,7 @@ fn compile_uri_matcher(
                     "mesh_route_dispatch.rules[{rule_idx}].match.uri.regex must not be empty"
                 ));
             }
-            let re = Regex::new(pattern).map_err(|e| {
+            let re = compile_full_match_regex(pattern).map_err(|e| {
                 format!("mesh_route_dispatch.rules[{rule_idx}].match.uri.regex is invalid: {e}")
             })?;
             UriMatcher::Regex(re)
@@ -1468,8 +1470,8 @@ fn normalize_header_match_keys(
 }
 
 /// Compile each per-method matcher once, at config load. Regex compilation is
-/// the cold-path work; the request hot path checks that one `Regex::find`
-/// spans the complete method.
+/// the cold-path work; absolute anchors make the request hot path one
+/// `Regex::is_match` call.
 /// Invalid regex (or an empty pattern after the operator-provided string) is a
 /// hard error from `Plugin::new()`, per CLAUDE.md's "no Ok-with-runtime-panic"
 /// plugin-config-validation rule.
@@ -1477,11 +1479,11 @@ fn normalize_header_match_keys(
 /// HTTP methods are conventionally uppercase ASCII (RFC 9110 §9.1). `Prefix`
 /// patterns are uppercased here at compile time so the hot path can do a
 /// single case-sensitive compare against the request method. Regex patterns
-/// are compiled verbatim because changing their casing can rewrite regex
-/// syntax (for example `\d` -> `\D`). `Exact` deliberately preserves the
-/// operator's casing so the existing `method_match_is_case_sensitive` test
-/// continues to pass (operators who write `"get"` continue to match only
-/// literal `"get"` requests).
+/// are embedded verbatim between full-input anchors because changing their
+/// casing can rewrite regex syntax (for example `\d` -> `\D`). `Exact`
+/// deliberately preserves the operator's casing so the existing
+/// `method_match_is_case_sensitive` test continues to pass (operators who
+/// write `"get"` continue to match only literal `"get"` requests).
 fn compile_method_matchers(
     rule_idx: usize,
     methods: &[MethodMatchOp],
@@ -1509,7 +1511,7 @@ fn compile_method_matchers(
                          must not be empty"
                     ));
                 }
-                let re = Regex::new(pattern).map_err(|e| {
+                let re = compile_full_match_regex(pattern).map_err(|e| {
                     format!(
                         "mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].regex \
                          is invalid: {e}"
@@ -1524,7 +1526,8 @@ fn compile_method_matchers(
 }
 
 /// Compile each per-header matcher once, at config load. Regex compilation is
-/// the cold-path work; the request hot path checks full-value match bounds.
+/// the cold-path work; absolute anchors make the request hot path one
+/// `Regex::is_match` call.
 /// Invalid regex (or an empty pattern after the operator-provided string) is a
 /// hard error from `Plugin::new()`, per CLAUDE.md's "no Ok-with-runtime-panic"
 /// plugin-config-validation rule.
@@ -1555,7 +1558,7 @@ fn compile_header_matchers(
                          must not be empty"
                     ));
                 }
-                let re = Regex::new(pattern).map_err(|e| {
+                let re = compile_full_match_regex(pattern).map_err(|e| {
                     format!(
                         "mesh_route_dispatch.rules[{rule_idx}].match.headers[`{name}`].regex \
                          is invalid: {e}"

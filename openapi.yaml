@@ -11916,7 +11916,7 @@ components:
                             `exact` / `prefix` / `regex`. Prefix patterns are
                             uppercased at compile time (methods are uppercase
                             ASCII per RFC 9110 §9.1); regex patterns are
-                            compiled verbatim and must match the full method.
+                            interpreted verbatim inside full-input anchors.
                           additionalProperties: false
                           properties:
                             exact:

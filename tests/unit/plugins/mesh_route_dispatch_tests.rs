@@ -240,13 +240,13 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
 async fn mesh_route_dispatch_method_regex_requires_a_full_match() {
     let plugin = MeshRouteDispatch::new(&json!({
         "rules": [{
-            "match": {"methods": [{"regex": "GET|POST"}]},
+            "match": {"methods": [{"regex": "GET|GETTING|POST"}]},
             "destination": {"upstream_id": "sensitive"}
         }]
     }))
     .expect("plugin config");
 
-    for method in ["GET", "POST"] {
+    for method in ["GET", "GETTING", "POST"] {
         let mut request = RequestContext::new(
             "127.0.0.1".to_string(),
             method.to_string(),
@@ -279,24 +279,23 @@ async fn mesh_route_dispatch_method_regex_requires_a_full_match() {
 async fn mesh_route_dispatch_uri_regex_requires_a_full_match() {
     let plugin = MeshRouteDispatch::new(&json!({
         "rules": [{
-            "match": {"uri": {"regex": "/admin"}},
+            "match": {"uri": {"regex": "/admin|/admin/settings"}},
             "destination": {"upstream_id": "admin"}
         }]
     }))
     .expect("plugin config");
 
-    let mut exact = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "GET".to_string(),
-        "/admin".to_string(),
-    );
-    assert!(matches!(
-        plugin.before_proxy(&mut exact, &mut HashMap::new()).await,
-        PluginResult::Continue
-    ));
-    assert_eq!(exact.route_override_upstream_id.as_deref(), Some("admin"));
+    for path in ["/admin", "/admin/settings"] {
+        let mut exact =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
+        assert!(matches!(
+            plugin.before_proxy(&mut exact, &mut HashMap::new()).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(exact.route_override_upstream_id.as_deref(), Some("admin"));
+    }
 
-    for path in ["/public/admin", "/admin/settings", "x/admin"] {
+    for path in ["/public/admin", "/admin/settings/child", "x/admin"] {
         let mut request =
             RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
         let result = plugin.before_proxy(&mut request, &mut HashMap::new()).await;
@@ -306,6 +305,38 @@ async fn mesh_route_dispatch_uri_regex_requires_a_full_match() {
             "substring URI {path} must not select the admin route"
         );
     }
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_anchored_regexes_allow_longer_alternatives() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {
+                "authority": {"regex": "api|api\\.internal"},
+                "headers": {"x-tier": {"regex": "gold|gold-plus"}}
+            },
+            "destination": {"upstream_id": "specific"}
+        }]
+    }))
+    .expect("plugin config");
+    let mut request = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::from([
+        ("host".to_string(), "api.internal".to_string()),
+        ("x-tier".to_string(), "gold-plus".to_string()),
+    ]);
+
+    let result = plugin.before_proxy(&mut request, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        request.route_override_upstream_id.as_deref(),
+        Some("specific"),
+        "a shorter first alternative must not hide a later full-input match"
+    );
 }
 
 #[tokio::test]
