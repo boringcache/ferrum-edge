@@ -17645,6 +17645,15 @@ async fn handle_proxy_request_inner(
                     );
                     response_headers = plugin_response_headers;
                 }
+                // Health/circuit-breaker accounting intentionally retains the
+                // pristine backend status above. Metrics and logs instead track
+                // the final status after response hooks reconciled their edits
+                // back onto the client-visible header/trailer maps.
+                grpc_proxy::refresh_grpc_status_metadata(
+                    &mut ctx.metadata,
+                    &response_trailers,
+                    &response_headers,
+                );
                 if response_body.is_empty() {
                     // True Trailers-Only encoding: no DATA frame, grpc-status
                     // and friends ride in the initial HEADERS with END_STREAM.

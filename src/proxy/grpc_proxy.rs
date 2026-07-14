@@ -1296,6 +1296,7 @@ impl std::error::Error for GrpcProxyError {
 
 /// gRPC status codes for gateway-generated errors.
 pub mod grpc_status {
+    pub const UNKNOWN: u32 = 2;
     pub const INVALID_ARGUMENT: u32 = 3;
     pub const DEADLINE_EXCEEDED: u32 = 4;
     pub const NOT_FOUND: u32 = 5;
@@ -1396,6 +1397,21 @@ pub(crate) fn grpc_status_from_maps(
 /// bucket.
 pub(crate) fn parse_grpc_status_value(status: &str) -> u32 {
     status.trim().parse::<u32>().unwrap_or(u32::MAX)
+}
+
+/// Refresh transaction metadata from the final client-visible gRPC response.
+///
+/// Response hooks can rewrite or remove terminal metadata after the backend
+/// status was captured for health accounting. Missing terminal status is
+/// gRPC UNKNOWN for the client, so it must not leave a stale backend status in
+/// Prometheus/log metadata.
+pub(crate) fn refresh_grpc_status_metadata(
+    metadata: &mut HashMap<String, String>,
+    trailers: &HashMap<String, String>,
+    headers: &HashMap<String, String>,
+) {
+    let status = grpc_status_from_maps(trailers, headers).unwrap_or(grpc_status::UNKNOWN);
+    metadata.insert("grpc_status".to_string(), status.to_string());
 }
 
 /// Effective request-body cap for the sidecar mesh-mTLS dispatch path (issue
@@ -2782,6 +2798,17 @@ mod tests {
             grpc_admission_status_from_maps(&malformed, &HashMap::new(), 200),
             500
         );
+    }
+
+    #[test]
+    fn final_grpc_status_metadata_tracks_rewrites_and_missing_status() {
+        let mut metadata = HashMap::from([("grpc_status".to_string(), "14".to_string())]);
+        let rewritten = HashMap::from([("grpc-status".to_string(), "7".to_string())]);
+        refresh_grpc_status_metadata(&mut metadata, &rewritten, &HashMap::new());
+        assert_eq!(metadata.get("grpc_status").map(String::as_str), Some("7"));
+
+        refresh_grpc_status_metadata(&mut metadata, &HashMap::new(), &HashMap::new());
+        assert_eq!(metadata.get("grpc_status").map(String::as_str), Some("2"));
     }
 
     /// Build a minimal `Proxy` for thread-local key tests. Uses HTTPS so the

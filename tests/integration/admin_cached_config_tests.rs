@@ -1598,6 +1598,149 @@ async fn test_batch_create_plugin_configs() {
 }
 
 #[tokio::test]
+async fn prometheus_plugin_crud_rejects_a_second_enabled_registry_owner() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let first = json!({
+        "id": "prometheus-owner",
+        "plugin_name": "prometheus_metrics",
+        "scope": "global",
+        "enabled": true,
+        "config": {}
+    });
+
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &first).await;
+    assert_eq!(status, 201, "first owner should be admitted: {body:?}");
+
+    let (status, body) = admin_put(
+        &base_url,
+        "/plugins/config/prometheus-owner",
+        &token,
+        &first,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "in-place owner update should be admitted: {body:?}"
+    );
+
+    let disabled = json!({
+        "id": "prometheus-disabled",
+        "plugin_name": "prometheus_metrics",
+        "scope": "global",
+        "enabled": false,
+        "config": {}
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &disabled).await;
+    assert_eq!(
+        status, 201,
+        "disabled config should not compete for ownership: {body:?}"
+    );
+
+    let mut enabled = disabled.clone();
+    enabled["enabled"] = json!(true);
+    let (status, body) = admin_put(
+        &base_url,
+        "/plugins/config/prometheus-disabled",
+        &token,
+        &enabled,
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "enabling a second owner must conflict: {body:?}"
+    );
+    assert!(body["error"].as_str().unwrap_or("").contains("at most one"));
+
+    let third = json!({
+        "id": "prometheus-second-create",
+        "plugin_name": "prometheus_metrics",
+        "scope": "global",
+        "enabled": true,
+        "config": {}
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &third).await;
+    assert_eq!(
+        status, 409,
+        "creating a second owner must conflict: {body:?}"
+    );
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/plugins/config"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Ferrum-Namespace", "other-tenant")
+        .json(&json!({
+            "id": "prometheus-other-namespace",
+            "plugin_name": "prometheus_metrics",
+            "scope": "global",
+            "enabled": true,
+            "config": {}
+        }))
+        .send()
+        .await
+        .expect("cross-namespace create request");
+    assert_eq!(
+        response.status().as_u16(),
+        409,
+        "the process-wide registry owner must be unique across namespaces"
+    );
+}
+
+#[tokio::test]
+async fn prometheus_plugin_batch_rejects_duplicate_and_existing_owners() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let duplicate_batch = json!({
+        "plugin_configs": [
+            {"id": "prometheus-batch-a", "plugin_name": "prometheus_metrics", "scope": "global", "enabled": true, "config": {}},
+            {"id": "prometheus-batch-b", "plugin_name": "prometheus_metrics", "scope": "global", "enabled": true, "config": {}}
+        ]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &duplicate_batch).await;
+    assert_eq!(status, 400, "same-batch owners must be rejected: {body:?}");
+    assert!(
+        body["validation_errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|error| error
+                .as_str()
+                .is_some_and(|error| error.contains("at most one"))))
+    );
+
+    let owner = json!({
+        "id": "prometheus-existing-owner",
+        "plugin_name": "prometheus_metrics",
+        "scope": "global",
+        "enabled": true,
+        "config": {}
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &owner).await;
+    assert_eq!(status, 201, "owner seed should succeed: {body:?}");
+
+    let existing_conflict = json!({
+        "plugin_configs": [
+            {"id": "prometheus-batch-new", "plugin_name": "prometheus_metrics", "scope": "global", "enabled": true, "config": {}}
+        ]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &existing_conflict).await;
+    assert_eq!(
+        status, 400,
+        "batch must reject a persisted owner conflict: {body:?}"
+    );
+    assert!(
+        body["validation_errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|error| error
+                .as_str()
+                .is_some_and(|error| error.contains("already owns"))))
+    );
+}
+
+#[tokio::test]
 async fn test_batch_create_proxy_and_proxy_plugin_association_same_request() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

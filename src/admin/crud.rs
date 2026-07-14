@@ -1565,11 +1565,20 @@ impl AdminResource for PluginConfig {
     }
 
     async fn check_uniqueness(
-        _db: &dyn DatabaseBackend,
-        _namespace: &str,
-        _resource: &Self,
-        _exclude_id: Option<&str>,
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        resource: &Self,
+        exclude_id: Option<&str>,
     ) -> DbResult<Option<String>> {
+        if resource.enabled
+            && resource.plugin_name == "prometheus_metrics"
+            && enabled_prometheus_metrics_owner_exists(db, namespace, exclude_id).await?
+        {
+            return Ok(Some(
+                "prometheus_metrics permits at most one enabled global instance; another config already owns the process registry"
+                    .to_string(),
+            ));
+        }
         Ok(None)
     }
 
@@ -1642,6 +1651,50 @@ impl AdminResource for PluginConfig {
 
         Ok(())
     }
+}
+
+/// Check for an enabled Prometheus registry owner already persisted anywhere.
+///
+/// Direct CRUD and batch admission both call this before writing so neither can
+/// persist a snapshot that the runtime ownership validator will reject on the
+/// next poll. `exclude_id` makes an in-place PUT of the current namespace owner
+/// valid without exempting an identically named resource in another namespace.
+pub(crate) async fn enabled_prometheus_metrics_owner_exists(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    exclude_id: Option<&str>,
+) -> DbResult<bool> {
+    const PAGE_SIZE: i64 = 1_000;
+    let mut namespaces = db.list_namespaces_authoritative().await?;
+    namespaces.push(namespace.to_string());
+    namespaces.sort_unstable();
+    namespaces.dedup();
+
+    for candidate_namespace in namespaces {
+        let mut offset = 0_i64;
+        loop {
+            let page = db
+                .list_plugin_configs_paginated(&candidate_namespace, PAGE_SIZE, offset)
+                .await?;
+            let items_len = page.items.len() as i64;
+            if page.items.into_iter().any(|plugin| {
+                plugin.enabled
+                    && plugin.plugin_name == "prometheus_metrics"
+                    && !(candidate_namespace == namespace && exclude_id == Some(plugin.id.as_str()))
+            }) {
+                return Ok(true);
+            }
+            if items_len == 0 {
+                break;
+            }
+            offset += items_len;
+            if offset >= page.total {
+                break;
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 impl AdminResource for Proxy {

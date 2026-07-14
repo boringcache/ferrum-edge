@@ -3680,6 +3680,13 @@ where
                 &resp.headers,
                 &header_shadowed_trailer_keys,
             );
+            // Admission retains the pristine backend status; transaction
+            // metadata follows the post-hook status that the H3 client sees.
+            crate::proxy::grpc_proxy::refresh_grpc_status_metadata(
+                &mut ctx.metadata,
+                &response_trailers,
+                &plugin_response_headers,
+            );
             let mut response_headers = plugin_response_headers;
             for k in response_trailers.keys() {
                 if !header_shadowed_trailer_keys.contains(k) {
