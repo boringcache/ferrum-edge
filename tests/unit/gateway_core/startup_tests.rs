@@ -187,7 +187,7 @@ fn test_cp_admin_serve_failure_flips_effective_readiness() {
 
     assert!(degraded.load(Ordering::Acquire));
     assert!(
-        !(ready.load(Ordering::Acquire) && !degraded.load(Ordering::Acquire)),
+        !ready.load(Ordering::Acquire) || degraded.load(Ordering::Acquire),
         "CP admin serve failure must remain visible after startup-ready is restored"
     );
 }
@@ -209,7 +209,7 @@ fn mesh_post_start_listener_failure_is_sticky_and_recorded_safely() {
     ready.store(true, Ordering::Release);
 
     assert!(degraded.load(Ordering::Acquire));
-    assert!(!(ready.load(Ordering::Acquire) && !degraded.load(Ordering::Acquire)));
+    assert!(!ready.load(Ordering::Acquire) || degraded.load(Ordering::Acquire));
     let snapshot = failures.snapshot();
     assert_eq!(snapshot.failures_total, 1);
     assert_eq!(snapshot.failures[0].listener, "Mesh traffic listener");

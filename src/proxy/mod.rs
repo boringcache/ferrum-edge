@@ -13882,6 +13882,7 @@ pub async fn handle_proxy_request(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_proxy_request_on_frontend_port(
     req: Request<Incoming>,
     state: Arc<ProxyState>,
@@ -13957,6 +13958,7 @@ async fn handle_proxy_request_on_frontend_port(
 
 /// Inner implementation of [`handle_proxy_request`] — separated so the outer
 /// function can attach the [`RequestGuard`] to the response body.
+#[allow(clippy::too_many_arguments)]
 async fn handle_proxy_request_inner(
     req: Request<Incoming>,
     state: Arc<ProxyState>,

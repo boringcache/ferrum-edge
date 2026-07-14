@@ -3888,15 +3888,12 @@ impl DatabaseStore {
             .bind(credential_hash)
             .fetch_optional(&self.pool())
             .await?;
-        match row {
-            Some(row) => {
-                let consumer_id: String = row.try_get("consumer_id")?;
-                if exclude_consumer_id != Some(consumer_id.as_str()) {
-                    self.check_slow_query("check_mtls_identity_unique", start);
-                    return Ok(false);
-                }
+        if let Some(row) = row {
+            let consumer_id: String = row.try_get("consumer_id")?;
+            if exclude_consumer_id != Some(consumer_id.as_str()) {
+                self.check_slow_query("check_mtls_identity_unique", start);
+                return Ok(false);
             }
-            None => {}
         }
 
         // Rows written before surrounding whitespace was normalized have a hash
