@@ -13,7 +13,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_perc
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -390,6 +390,11 @@ struct McpCatalog {
     resource_templates_refreshed_at: Option<Instant>,
     resource_templates_last_attempted_at: HashMap<String, Instant>,
     last_refreshed_wall: DateTime<Utc>,
+    // `(server_id, catalog family)` pairs whose most recent list refresh
+    // failed and whose entries (if any) are being served stale from the last
+    // good refresh. Bounded by configured servers x catalog families; exposed
+    // through `mcp.catalog_degraded` metadata.
+    degraded: BTreeSet<(String, &'static str)>,
 }
 
 impl Default for McpCatalog {
@@ -404,6 +409,7 @@ impl Default for McpCatalog {
             resource_templates_refreshed_at: None,
             resource_templates_last_attempted_at: HashMap::new(),
             last_refreshed_wall: Utc::now(),
+            degraded: BTreeSet::new(),
         }
     }
 }
@@ -673,6 +679,26 @@ impl McpGateway {
         ctx.metadata
             .entry("mcp.schema_validation".to_string())
             .or_insert_with(|| "skipped".to_string());
+    }
+
+    /// Emit the degraded (server, family) pairs a catalog is serving stale as
+    /// bounded `mcp.catalog_degraded` metadata (sorted `server:family` pairs).
+    /// Server ids are operator config, never upstream URLs or credentials.
+    fn emit_catalog_degraded_metadata(&self, ctx: &mut RequestContext, catalog: &McpCatalog) {
+        if !self.observability.emit_metadata || catalog.degraded.is_empty() {
+            return;
+        }
+        let mut degraded = String::new();
+        for (server_id, family) in &catalog.degraded {
+            if !degraded.is_empty() {
+                degraded.push(',');
+            }
+            degraded.push_str(server_id);
+            degraded.push(':');
+            degraded.push_str(family);
+        }
+        ctx.metadata
+            .insert("mcp.catalog_degraded".to_string(), degraded);
     }
 
     fn emit_envelope_metadata(&self, ctx: &mut RequestContext, envelope: &McpEnvelope) {
@@ -1247,10 +1273,19 @@ impl McpGateway {
         Ok(())
     }
 
+    /// The gateway's preferred protocol version: the first configured entry in
+    /// `endpoint.protocol_versions`. This is the version negotiated on
+    /// `initialize` when the client requests an unsupported version and the
+    /// default whenever no session version is known. Indexing is safe: config
+    /// validation rejects an empty `protocol_versions` list.
+    fn preferred_protocol_version(&self) -> &str {
+        &self.supported_protocol_versions[0]
+    }
+
     fn protocol_version_for_session(&self, downstream_session_id: &str) -> String {
         self.downstream_session_clone(downstream_session_id)
             .map(|session| session.protocol_version.clone())
-            .unwrap_or_else(|| self.supported_protocol_versions[0].clone())
+            .unwrap_or_else(|| self.preferred_protocol_version().to_string())
     }
 
     fn protocol_version_for_upstream(
@@ -1266,7 +1301,7 @@ impl McpGateway {
                     .and_then(|upstream| upstream.protocol_version.clone())
                     .or(Some(session.protocol_version))
             })
-            .unwrap_or_else(|| self.supported_protocol_versions[0].clone())
+            .unwrap_or_else(|| self.preferred_protocol_version().to_string())
     }
 
     /// Remove a session from the store without any upstream I/O. Splitting the
@@ -1641,11 +1676,20 @@ impl McpGateway {
         let mut collided_tools = HashSet::new();
         let mut collided_prompts = HashSet::new();
         let mut collided_resources = HashSet::new();
+        // A single unavailable upstream must not abort the whole refresh: each
+        // failed `*/list` keeps that (server, family)'s last-good entries stale
+        // and is recorded as degraded, while other upstreams and families
+        // refresh normally. Only iterated (enabled + exposed) servers can carry
+        // entries forward, so disabled/removed/unexposed servers still drop out.
+        let mut degraded: Vec<(String, &'static str)> = Vec::new();
+        let mut attempted_lists = 0usize;
+        let mut carried_stale = 0usize;
         let discovered_at = Utc::now();
 
         for server in self.servers.values().filter(|server| server.enabled) {
             if self.discovery.aggregate_tools && server.expose_tools {
-                let items = self
+                attempted_lists += 1;
+                match self
                     .request_upstream_list_pages(
                         ctx,
                         downstream_session_id,
@@ -1653,25 +1697,44 @@ impl McpGateway {
                         "tools/list",
                         "tools",
                     )
-                    .await?;
-                for item in items {
-                    if let Some(entry) =
-                        self.tool_entry_from_value(server, item, discovered_at, &old_catalog)
-                    {
-                        let public_name = entry.public_name.clone();
-                        insert_catalog_entry(
+                    .await
+                {
+                    Ok(items) => {
+                        for item in items {
+                            if let Some(entry) = self.tool_entry_from_value(
+                                server,
+                                item,
+                                discovered_at,
+                                &old_catalog,
+                            ) {
+                                let public_name = entry.public_name.clone();
+                                insert_catalog_entry(
+                                    &mut tools,
+                                    &mut collided_tools,
+                                    public_name,
+                                    entry,
+                                    &server.server_id,
+                                    "tool",
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        carried_stale += carry_stale_entries(
+                            &old_catalog.tools,
                             &mut tools,
                             &mut collided_tools,
-                            public_name,
-                            entry,
+                            |entry| entry.server_id == server.server_id,
                             &server.server_id,
                             "tool",
                         );
+                        degraded.push((server.server_id.clone(), "tools"));
                     }
                 }
             }
             if self.discovery.aggregate_prompts && server.expose_prompts {
-                let items = self
+                attempted_lists += 1;
+                match self
                     .request_upstream_list_pages(
                         ctx,
                         downstream_session_id,
@@ -1679,23 +1742,41 @@ impl McpGateway {
                         "prompts/list",
                         "prompts",
                     )
-                    .await?;
-                for item in items {
-                    if let Some(entry) = self.prompt_entry_from_value(server, item, discovered_at) {
-                        let public_name = entry.public_name.clone();
-                        insert_catalog_entry(
+                    .await
+                {
+                    Ok(items) => {
+                        for item in items {
+                            if let Some(entry) =
+                                self.prompt_entry_from_value(server, item, discovered_at)
+                            {
+                                let public_name = entry.public_name.clone();
+                                insert_catalog_entry(
+                                    &mut prompts,
+                                    &mut collided_prompts,
+                                    public_name,
+                                    entry,
+                                    &server.server_id,
+                                    "prompt",
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        carried_stale += carry_stale_entries(
+                            &old_catalog.prompts,
                             &mut prompts,
                             &mut collided_prompts,
-                            public_name,
-                            entry,
+                            |entry| entry.server_id == server.server_id,
                             &server.server_id,
                             "prompt",
                         );
+                        degraded.push((server.server_id.clone(), "prompts"));
                     }
                 }
             }
             if self.discovery.aggregate_resources && server.expose_resources {
-                let items = self
+                attempted_lists += 1;
+                match self
                     .request_upstream_list_pages(
                         ctx,
                         downstream_session_id,
@@ -1703,22 +1784,55 @@ impl McpGateway {
                         "resources/list",
                         "resources",
                     )
-                    .await?;
-                for item in items {
-                    if let Some(entry) = self.resource_entry_from_value(server, item, discovered_at)
-                    {
-                        let public_uri = entry.public_uri.clone();
-                        insert_catalog_entry(
+                    .await
+                {
+                    Ok(items) => {
+                        for item in items {
+                            if let Some(entry) =
+                                self.resource_entry_from_value(server, item, discovered_at)
+                            {
+                                let public_uri = entry.public_uri.clone();
+                                insert_catalog_entry(
+                                    &mut resources,
+                                    &mut collided_resources,
+                                    public_uri,
+                                    entry,
+                                    &server.server_id,
+                                    "resource",
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        carried_stale += carry_stale_entries(
+                            &old_catalog.resources,
                             &mut resources,
                             &mut collided_resources,
-                            public_uri,
-                            entry,
+                            |entry| entry.server_id == server.server_id,
                             &server.server_id,
                             "resource",
                         );
+                        degraded.push((server.server_id.clone(), "resources"));
                     }
                 }
             }
+        }
+
+        // Total outage with nothing stale to serve: keep the catalog stale (the
+        // next request retries) and surface the refresh error instead of
+        // publishing a misleading empty catalog. The per-request warnings above
+        // already carry the failure detail.
+        if attempted_lists > 0 && degraded.len() == attempted_lists && carried_stale == 0 {
+            return Err(format!(
+                "all {attempted_lists} MCP upstream catalog list requests failed"
+            ));
+        }
+        for (server_id, family) in &degraded {
+            warn!(
+                server_id = %server_id,
+                family,
+                "MCP upstream catalog list failed; serving that upstream's last-good entries stale"
+            );
         }
 
         let mut catalog = catalog_lock.write().await;
@@ -1733,6 +1847,10 @@ impl McpGateway {
         catalog.tools = tools;
         catalog.prompts = prompts;
         catalog.resources = resources;
+        catalog
+            .degraded
+            .retain(|(_, family)| *family == "resource_templates");
+        catalog.degraded.extend(degraded);
         if changed || catalog.version == 0 {
             catalog.version = catalog.version.saturating_add(1);
         }
@@ -1747,7 +1865,15 @@ impl McpGateway {
         downstream_session_id: &str,
         catalog_lock: &Arc<RwLock<McpCatalog>>,
     ) -> Result<(), String> {
+        let old_catalog = catalog_lock.read().await.clone();
         let mut resource_templates = HashMap::new();
+        // Same per-upstream degradation policy as refresh_catalog: a failing
+        // upstream keeps its last-good templates stale instead of aborting the
+        // refresh for every other upstream. Public template URIs are prefixed
+        // with the server id, so carried entries cannot collide across servers.
+        let mut degraded: Vec<String> = Vec::new();
+        let mut attempted_lists = 0usize;
+        let mut carried_stale = 0usize;
         let discovered_at = Utc::now();
 
         if self.discovery.aggregate_resources {
@@ -1756,7 +1882,8 @@ impl McpGateway {
                 .values()
                 .filter(|server| server.enabled && server.expose_resources)
             {
-                let items = self
+                attempted_lists += 1;
+                match self
                     .request_upstream_list_pages(
                         ctx,
                         downstream_session_id,
@@ -1764,21 +1891,54 @@ impl McpGateway {
                         "resources/templates/list",
                         "resourceTemplates",
                     )
-                    .await?;
-                for item in items {
-                    if let Some(entry) =
-                        self.resource_template_entry_from_value(server, item, discovered_at)
-                    {
-                        resource_templates.insert(entry.public_uri_template.clone(), entry);
+                    .await
+                {
+                    Ok(items) => {
+                        for item in items {
+                            if let Some(entry) =
+                                self.resource_template_entry_from_value(server, item, discovered_at)
+                            {
+                                resource_templates.insert(entry.public_uri_template.clone(), entry);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        for (public_uri_template, entry) in &old_catalog.resource_templates {
+                            if entry.server_id != server.server_id {
+                                continue;
+                            }
+                            resource_templates.insert(public_uri_template.clone(), entry.clone());
+                            carried_stale += 1;
+                        }
+                        warn!(
+                            server_id = %server.server_id,
+                            family = "resource_templates",
+                            "MCP upstream catalog list failed; serving that upstream's last-good entries stale"
+                        );
+                        degraded.push(server.server_id.clone());
                     }
                 }
             }
+        }
+
+        if attempted_lists > 0 && degraded.len() == attempted_lists && carried_stale == 0 {
+            return Err(format!(
+                "all {attempted_lists} MCP upstream resource template list requests failed"
+            ));
         }
 
         let mut catalog = catalog_lock.write().await;
         let changed = catalog.resource_templates.keys().collect::<HashSet<_>>()
             != resource_templates.keys().collect();
         catalog.resource_templates = resource_templates;
+        catalog
+            .degraded
+            .retain(|(_, family)| *family != "resource_templates");
+        catalog.degraded.extend(
+            degraded
+                .into_iter()
+                .map(|server_id| (server_id, "resource_templates")),
+        );
         if changed || catalog.version == 0 {
             catalog.version = catalog.version.saturating_add(1);
         }
@@ -1811,7 +1971,7 @@ impl McpGateway {
             .get(server_id)
             .filter(|server| server.enabled && server.expose_resources)
             .ok_or_else(|| format!("unknown or disabled MCP resource server {server_id:?}"))?;
-        let items = self
+        let items = match self
             .request_upstream_list_pages(
                 ctx,
                 downstream_session_id,
@@ -1819,7 +1979,17 @@ impl McpGateway {
                 "resources/templates/list",
                 "resourceTemplates",
             )
-            .await?;
+            .await
+        {
+            Ok(items) => items,
+            Err(error) => {
+                let mut catalog = catalog_lock.write().await;
+                catalog
+                    .degraded
+                    .insert((server_id.to_string(), "resource_templates"));
+                return Err(error);
+            }
+        };
         let discovered_at = Utc::now();
         let mut resource_templates = HashMap::new();
         for item in items {
@@ -1842,6 +2012,9 @@ impl McpGateway {
             .resource_templates
             .retain(|_, entry| entry.server_id != server_id);
         catalog.resource_templates.extend(resource_templates);
+        catalog
+            .degraded
+            .remove(&(server_id.to_string(), "resource_templates"));
         if changed || catalog.version == 0 {
             catalog.version = catalog.version.saturating_add(1);
         }
@@ -2123,6 +2296,7 @@ impl McpGateway {
                 catalog.version.to_string(),
             );
         }
+        self.emit_catalog_degraded_metadata(ctx, &catalog);
         let tools: Vec<Value> = catalog
             .tools
             .values()
@@ -2167,6 +2341,7 @@ impl McpGateway {
                 catalog.version.to_string(),
             );
         }
+        self.emit_catalog_degraded_metadata(ctx, &catalog);
         let prompts: Vec<Value> = catalog
             .prompts
             .values()
@@ -2207,6 +2382,7 @@ impl McpGateway {
                 catalog.version.to_string(),
             );
         }
+        self.emit_catalog_degraded_metadata(ctx, &catalog);
         let resources: Vec<Value> = catalog
             .resources
             .values()
@@ -2260,6 +2436,7 @@ impl McpGateway {
                 catalog.version.to_string(),
             );
         }
+        self.emit_catalog_degraded_metadata(ctx, &catalog);
         json_response(
             200,
             json!({
@@ -2309,6 +2486,7 @@ impl McpGateway {
             return session_not_found_response();
         };
         let catalog = catalog_lock.read().await;
+        self.emit_catalog_degraded_metadata(ctx, &catalog);
         let Some(entry) = catalog.tools.get(&public_name).cloned() else {
             if self.observability.emit_metadata {
                 ctx.metadata
@@ -2477,6 +2655,7 @@ impl McpGateway {
             return session_not_found_response();
         };
         let catalog = catalog_lock.read().await;
+        self.emit_catalog_degraded_metadata(ctx, &catalog);
         let Some(entry) = catalog.prompts.get(&public_name).cloned() else {
             return json_rpc_error(envelope.id.clone(), -32008, "Unknown MCP prompt", None);
         };
@@ -3004,16 +3183,30 @@ impl Plugin for McpGateway {
 
         match method {
             "initialize" => {
-                let version =
-                    protocol_version.unwrap_or_else(|| self.supported_protocol_versions[0].clone());
-                if !self.supported_protocol_versions.contains(&version) {
-                    return json_rpc_error(
-                        envelope.id.clone(),
-                        -32602,
-                        "Unsupported MCP protocol version",
-                        None,
-                    );
-                }
+                // MCP initialize is a negotiation, not a gate: echo a supported
+                // requested version; otherwise answer with the gateway's
+                // preferred supported version and let the client decide whether
+                // to continue on it. Post-initialize requests still fail closed
+                // above when the MCP-Protocol-Version header is unsupported.
+                let version = match protocol_version {
+                    Some(requested)
+                        if self
+                            .supported_protocol_versions
+                            .iter()
+                            .any(|supported| supported == &requested) =>
+                    {
+                        requested
+                    }
+                    Some(_) => {
+                        let negotiated = self.preferred_protocol_version().to_string();
+                        ctx.metadata.insert(
+                            "mcp.protocol_version_negotiated".to_string(),
+                            negotiated.clone(),
+                        );
+                        negotiated
+                    }
+                    None => self.preferred_protocol_version().to_string(),
+                };
                 let client_info = envelope
                     .params
                     .as_ref()
@@ -3975,6 +4168,38 @@ fn insert_catalog_entry<T>(
         return;
     }
     map.insert(key, entry);
+}
+
+/// Carry one failed upstream's last-good entries for a single catalog family
+/// into the rebuilt catalog so a per-upstream refresh failure degrades only
+/// that upstream. Carried entries still pass through `insert_catalog_entry`,
+/// so a stale name colliding with another upstream's fresh name is dropped for
+/// both and can never route ambiguously. Returns the number of entries carried
+/// (counted before collision handling, i.e. entries that existed to serve).
+fn carry_stale_entries<T: Clone>(
+    old_entries: &HashMap<String, T>,
+    entries: &mut HashMap<String, T>,
+    collided: &mut HashSet<String>,
+    belongs_to_server: impl Fn(&T) -> bool,
+    server_id: &str,
+    item_kind: &str,
+) -> usize {
+    let mut carried = 0usize;
+    for (key, entry) in old_entries {
+        if !belongs_to_server(entry) {
+            continue;
+        }
+        insert_catalog_entry(
+            entries,
+            collided,
+            key.clone(),
+            entry.clone(),
+            server_id,
+            item_kind,
+        );
+        carried += 1;
+    }
+    carried
 }
 
 /// HTTP 400 for a request that requires an MCP session but carried no session

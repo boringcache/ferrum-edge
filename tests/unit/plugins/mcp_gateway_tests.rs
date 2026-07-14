@@ -3554,3 +3554,482 @@ async fn aggregate_routed_call_forwards_upstream_negotiated_protocol_version() {
         Some("2025-06-18")
     );
 }
+
+/// Catch-all upstream serving one tool and empty prompt/resource/template
+/// families; the shared body doubles as an initialize/notification response.
+async fn start_mcp_single_tool_server(tool_name: &str) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "upstream",
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "serverInfo": { "name": "single-tool", "version": "1" },
+                "tools": [
+                    { "name": tool_name, "inputSchema": { "type": "object" } }
+                ],
+                "prompts": [],
+                "resources": [],
+                "resourceTemplates": []
+            }
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+fn multi_server_tools_config(github_url: &str, flaky_url: &str) -> Value {
+    json!({
+        "enabled": true,
+        "mode": "aggregate_router",
+        "endpoint": { "path": "/mcp", "protocol_versions": ["2025-11-25"] },
+        "sessions": { "initialize_upstreams": "passthrough" },
+        "discovery": {
+            "aggregate_tools": true,
+            "aggregate_resources": false,
+            "aggregate_prompts": false,
+            "namespace_separator": ".",
+            "cache_ttl_seconds": 1,
+            "on_new_tool": "allow"
+        },
+        "policy": { "default_action": "allow" },
+        "servers": {
+            "github": {
+                "upstream_url": github_url,
+                "namespace": "github",
+                "enabled": true,
+                "expose_tools": true
+            },
+            "flaky": {
+                "upstream_url": flaky_url,
+                "namespace": "flaky",
+                "enabled": true,
+                "expose_tools": true
+            }
+        }
+    })
+}
+
+async fn tools_list_with_metadata(
+    plugin: &Arc<dyn ferrum_edge::plugins::Plugin>,
+    session_id: &str,
+    request_id: i64,
+) -> (u16, Value, ferrum_edge::plugins::RequestContext) {
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "tools/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id.to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, _) = reject_json(result);
+    (status, body, ctx)
+}
+
+fn sorted_tool_names(body: &Value) -> Vec<String> {
+    let mut names: Vec<String> = body["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tools/list result missing tools array: {body}"))
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn aggregate_partial_upstream_transport_failure_keeps_healthy_upstreams_usable() {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({"initialize_upstreams": "passthrough"});
+    // Nothing listens on discard port 9: every list request to this upstream
+    // fails at the transport layer (connection refused).
+    config["servers"]["jira"] = json!({
+        "upstream_url": "http://127.0.0.1:9/mcp",
+        "namespace": "jira",
+        "enabled": true,
+        "expose_tools": true,
+        "expose_resources": true,
+        "expose_prompts": true
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (status, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 90).await;
+    assert_eq!(status, 200);
+    assert!(
+        body["error"].is_null(),
+        "healthy tools must not 32006: {body}"
+    );
+    assert_eq!(sorted_tool_names(&body), vec!["github.create_pr"]);
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("jira:prompts,jira:resources,jira:tools")
+    );
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 91,
+        "method": "prompts/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id.clone());
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(body["result"]["prompts"][0]["name"], "github.code_review");
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 92,
+        "method": "resources/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id.clone());
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["result"]["resources"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    // The healthy upstream's tool stays callable during the outage.
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 93,
+        "method": "tools/call",
+        "params": { "name": "github.create_pr", "arguments": { "repo": "payments-api" } }
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn aggregate_partial_upstream_non_2xx_failure_keeps_healthy_upstreams_usable() {
+    let server = start_mcp_catalog_server().await;
+    let failing = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&failing)
+        .await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({"initialize_upstreams": "passthrough"});
+    config["servers"]["flaky"] = json!({
+        "upstream_url": format!("{}/mcp", failing.uri()),
+        "namespace": "flaky",
+        "enabled": true,
+        "expose_tools": true
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (status, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 94).await;
+    assert_eq!(status, 200);
+    assert!(
+        body["error"].is_null(),
+        "healthy tools must not 32006: {body}"
+    );
+    assert_eq!(sorted_tool_names(&body), vec!["github.create_pr"]);
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("flaky:tools")
+    );
+}
+
+#[tokio::test]
+async fn aggregate_partial_upstream_json_rpc_list_failure_keeps_healthy_upstreams_usable() {
+    let server = start_mcp_catalog_server().await;
+    let failing = start_mcp_error_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({"initialize_upstreams": "passthrough"});
+    config["servers"]["flaky"] = json!({
+        "upstream_url": format!("{}/mcp", failing.uri()),
+        "namespace": "flaky",
+        "enabled": true,
+        "expose_tools": true
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (status, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 95).await;
+    assert_eq!(status, 200);
+    assert!(
+        body["error"].is_null(),
+        "healthy tools must not 32006: {body}"
+    );
+    assert_eq!(sorted_tool_names(&body), vec!["github.create_pr"]);
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("flaky:tools")
+    );
+    // The failure was at the JSON-RPC layer: the upstream did answer tools/list.
+    let requests = failing.received_requests().await.unwrap();
+    assert!(requests.iter().any(|request| {
+        request
+            .body_json::<Value>()
+            .ok()
+            .and_then(|body| {
+                body.get("method")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .as_deref()
+            == Some("tools/list")
+    }));
+}
+
+#[tokio::test]
+async fn aggregate_failed_upstream_serves_last_good_entries_stale_and_recovers() {
+    let github = start_mcp_single_tool_server("steady_tool").await;
+    let flaky = MockServer::start().await;
+    let list_requests = Arc::new(AtomicUsize::new(0));
+    let response_counter = Arc::clone(&list_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            match response_counter.fetch_add(1, Ordering::SeqCst) {
+                0 => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": "tools", "result": {"tools": [
+                        {"name": "flaky_tool", "inputSchema": {"type": "object"}}
+                    ]}
+                })),
+                1 => ResponseTemplate::new(500),
+                _ => ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": "tools", "result": {"tools": [
+                        {"name": "replacement_tool", "inputSchema": {"type": "object"}}
+                    ]}
+                })),
+            }
+        })
+        .mount(&flaky)
+        .await;
+    let config = multi_server_tools_config(
+        &format!("{}/mcp", github.uri()),
+        &format!("{}/mcp", flaky.uri()),
+    );
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 96).await;
+    assert_eq!(
+        sorted_tool_names(&body),
+        vec!["flaky.flaky_tool", "github.steady_tool"]
+    );
+    assert!(ctx.metadata.get("mcp.catalog_degraded").is_none());
+
+    // Outage: the failed upstream's last-good tool is served stale alongside
+    // the healthy upstream's fresh entries and the degraded state is emitted.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 97).await;
+    assert_eq!(
+        sorted_tool_names(&body),
+        vec!["flaky.flaky_tool", "github.steady_tool"]
+    );
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("flaky:tools")
+    );
+
+    // Recovery: a successful refresh replaces the stale entries and clears the
+    // degraded state.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (_, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 98).await;
+    assert_eq!(
+        sorted_tool_names(&body),
+        vec!["flaky.replacement_tool", "github.steady_tool"]
+    );
+    assert!(ctx.metadata.get("mcp.catalog_degraded").is_none());
+    assert_eq!(list_requests.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn aggregate_serves_full_catalog_stale_when_all_upstreams_fail() {
+    let flaky = MockServer::start().await;
+    let list_requests = Arc::new(AtomicUsize::new(0));
+    let response_counter = Arc::clone(&list_requests);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |_: &wiremock::Request| {
+            if response_counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "jsonrpc": "2.0", "id": "tools", "result": {"tools": [
+                        {"name": "only_tool", "inputSchema": {"type": "object"}}
+                    ]}
+                }))
+            } else {
+                ResponseTemplate::new(500)
+            }
+        })
+        .mount(&flaky)
+        .await;
+    let mut config = multi_server_tools_config(
+        &format!("{}/mcp", flaky.uri()),
+        &format!("{}/mcp", flaky.uri()),
+    );
+    config["servers"]["flaky"]["enabled"] = json!(false);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (_, body, _) = tools_list_with_metadata(&plugin, &session_id, 99).await;
+    assert_eq!(sorted_tool_names(&body), vec!["github.only_tool"]);
+
+    // With last-good entries available, a refresh where every upstream fails
+    // serves the previous catalog stale instead of erasing it with -32006.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (status, body, ctx) = tools_list_with_metadata(&plugin, &session_id, 100).await;
+    assert_eq!(status, 200);
+    assert_eq!(sorted_tool_names(&body), vec!["github.only_tool"]);
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("github:tools")
+    );
+}
+
+#[tokio::test]
+async fn aggregate_initialize_negotiates_unsupported_newer_version_to_supported() {
+    let server = start_mcp_catalog_server().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2026-03-01",
+            "capabilities": {},
+            "clientInfo": { "name": "unit-test", "version": "1" }
+        }
+    }));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, response_headers) = reject_json(result);
+    assert_eq!(status, 200);
+    assert!(
+        body["error"].is_null(),
+        "negotiation must not error: {body}"
+    );
+    assert_eq!(body["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.protocol_version_negotiated")
+            .map(String::as_str),
+        Some("2025-11-25")
+    );
+    let session_id = response_headers
+        .get("mcp-session-id")
+        .expect("negotiated initialize must mint a session")
+        .clone();
+
+    // The session carries the negotiated version: post-initialize requests on
+    // it succeed and the lazily initialized upstream receives it.
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id.clone());
+    headers.insert("mcp-protocol-version".to_string(), "2025-11-25".to_string());
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(sorted_tool_names(&body), vec!["github.create_pr"]);
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.iter().any(|request| {
+        request.body_json::<Value>().ok().is_some_and(|body| {
+            body.get("method").and_then(Value::as_str) == Some("initialize")
+                && body
+                    .get("params")
+                    .and_then(|params| params.get("protocolVersion"))
+                    .and_then(Value::as_str)
+                    == Some("2025-11-25")
+        })
+    }));
+
+    // Post-initialize header validation stays fail-closed for the version the
+    // client originally requested.
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/list",
+        "params": {}
+    }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    headers.insert("mcp-protocol-version".to_string(), "2026-03-01".to_string());
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["message"], "Unsupported MCP protocol version");
+}
+
+#[tokio::test]
+async fn aggregate_initialize_negotiates_unsupported_older_version_to_supported() {
+    let server = start_mcp_catalog_server().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "unit-test", "version": "1" }
+        }
+    }));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, response_headers) = reject_json(result);
+    assert_eq!(status, 200);
+    assert!(
+        body["error"].is_null(),
+        "negotiation must not error: {body}"
+    );
+    assert_eq!(body["result"]["protocolVersion"], "2025-11-25");
+    assert!(response_headers.contains_key("mcp-session-id"));
+}
+
+#[tokio::test]
+async fn aggregate_initialize_echoes_requested_supported_version() {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["endpoint"]["protocol_versions"] = json!(["2025-11-25", "2025-06-18"]);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "unit-test", "version": "1" }
+        }
+    }));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (status, body, response_headers) = reject_json(result);
+    assert_eq!(status, 200);
+    // A supported requested version is echoed, not replaced by the preferred one.
+    assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
+    assert!(
+        ctx.metadata
+            .get("mcp.protocol_version_negotiated")
+            .is_none()
+    );
+    assert!(response_headers.contains_key("mcp-session-id"));
+}
