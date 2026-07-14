@@ -2179,8 +2179,12 @@ fn validate_discovered_url(discovery_url: &str, raw: &str, field: &str) -> Resul
 }
 
 fn is_local_auth_host(hostname: &str) -> bool {
-    hostname.eq_ignore_ascii_case("localhost")
-        || hostname
+    let literal = hostname
+        .strip_prefix('[')
+        .and_then(|hostname| hostname.strip_suffix(']'))
+        .unwrap_or(hostname);
+    literal.eq_ignore_ascii_case("localhost")
+        || literal
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
 }
