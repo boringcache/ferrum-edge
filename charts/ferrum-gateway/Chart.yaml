@@ -1,0 +1,15 @@
+apiVersion: v2
+name: ferrum-gateway
+description: Ferrum Edge core gateway (database, file, control-plane, and data-plane modes)
+type: application
+version: 0.1.0
+appVersion: "0.9.0"
+home: https://github.com/ferrum-edge/ferrum-edge
+sources:
+  - https://github.com/ferrum-edge/ferrum-edge
+keywords:
+  - api-gateway
+  - proxy
+  - ferrum-edge
+  - control-plane
+  - data-plane

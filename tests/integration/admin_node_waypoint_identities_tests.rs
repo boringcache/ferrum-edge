@@ -138,6 +138,7 @@ fn make_admin_state(jwt: JwtManager, with_resolver: bool) -> AdminState {
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
+        config_rejected: None,
         admin_restore_max_body_size_mib: 100,
         admin_spec_max_body_size_mib: 25,
         reserved_ports: std::collections::HashSet::new(),

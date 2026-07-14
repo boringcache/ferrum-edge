@@ -1,0 +1,61 @@
+Ferrum Edge core gateway installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Mode:     {{ .Values.mode }}
+Image:    {{ include "ferrum-gateway.image" . }}
+Replicas: {{ if .Values.autoscaling.enabled }}{{ .Values.autoscaling.minReplicas }}-{{ .Values.autoscaling.maxReplicas }} (HPA){{ else }}{{ .Values.replicaCount }}{{ end }}
+
+Check rollout:
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "ferrum-gateway.fullname" . }}
+
+{{- if eq .Values.mode "database" }}
+
+DATABASE MODE (read/write admin + proxy)
+- Proxy Service: {{ include "ferrum-gateway.fullname" . }} (ports http/https)
+- Admin binds to loopback by default; reach it in-pod:
+    kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "ferrum-gateway.fullname" . }} -- /app/ferrum-edge health
+{{- end }}
+
+{{- if eq .Values.mode "file" }}
+
+FILE MODE (read-only admin + proxy)
+- Config source: {{ if .Values.file.existingConfigMap }}existing ConfigMap {{ .Values.file.existingConfigMap }}{{ else }}inline ConfigMap {{ include "ferrum-gateway.configMapName" . }}{{ end }}
+  mounted at {{ include "ferrum-gateway.fileConfigPath" . }}
+- Kubernetes does not SIGHUP on ConfigMap change. After editing config:
+    kubectl -n {{ .Release.Namespace }} rollout restart deployment/{{ include "ferrum-gateway.fullname" . }}
+{{- end }}
+
+{{- if eq .Values.mode "cp" }}
+
+CONTROL-PLANE MODE (read/write admin, no proxy, gRPC distribution)
+- gRPC Service for data planes:
+{{- if .Values.cp.service.enabled }}
+    {{ include "ferrum-gateway.cpGrpcServiceName" . }}:{{ include "ferrum-gateway.cpGrpcPort" . }}
+- Point data planes at:
+    FERRUM_DP_CP_GRPC_URLS = http(s)://{{ include "ferrum-gateway.cpGrpcServiceName" . }}.{{ .Release.Namespace }}.svc:{{ include "ferrum-gateway.cpGrpcPort" . }}
+{{- else }}
+    (cp.service.enabled=false — no gRPC Service rendered)
+{{- end }}
+{{- $cpGrpcTls := (.Values.tls | default dict).cpGrpc | default dict }}
+{{- $cpGrpcTlsSet := include "ferrum-gateway.serverTlsConfigured" (dict "root" . "surface" $cpGrpcTls "certSource" "FERRUM_CP_GRPC_TLS_CERT_SOURCE" "keySource" "FERRUM_CP_GRPC_TLS_KEY_SOURCE") }}
+{{- if not $cpGrpcTlsSet }}
+- NOTE: CP gRPC TLS is not configured (tls.cpGrpc or cert/key SOURCE pair).
+  Configure it before serving DPs on the non-loopback listener; do not rely on
+  plaintext outside local dev.
+{{- end }}
+{{- end }}
+
+{{- if eq .Values.mode "dp" }}
+
+DATA-PLANE MODE (read-only admin + proxy, config from CP)
+- CP gRPC URLs: {{ .Values.dp.cpGrpcUrls }}
+- The pod becomes Ready once its admin listener is up; routes appear after the
+  CP pushes config. Proxy Service: {{ include "ferrum-gateway.fullname" . }}.
+{{- end }}
+
+{{- if .Values.admin.service.enabled }}
+
+Admin Service is ENABLED ({{ include "ferrum-gateway.adminServiceName" . }}). Ensure a NetworkPolicy
+restricts access to the admin port(s).
+{{- end }}
+
+Full docs: docs/kubernetes_deployment.md

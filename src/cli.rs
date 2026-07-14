@@ -100,6 +100,14 @@ pub struct HealthArgs {
     /// Skip TLS certificate verification (for self-signed certs / testing only).
     #[arg(long)]
     pub tls_no_verify: bool,
+
+    /// Probe liveness (GET /live) instead of readiness (GET /health).
+    /// `/live` returns 200 whenever the process and admin listener are up — even
+    /// during startup or while serving degraded — so a Kubernetes livenessProbe
+    /// won't restart-loop an alive-but-unready pod. Without this flag the check
+    /// hits `/health`, which returns 503 until the gateway is ready.
+    #[arg(long)]
+    pub live: bool,
 }
 
 // ── Smart path resolution ───────────────────────────────────────────────────
@@ -308,7 +316,13 @@ pub fn execute_validate() -> Result<(), String> {
     Ok(())
 }
 
-/// Check gateway health by connecting to the admin API /health endpoint.
+/// Check gateway health by connecting to the admin API.
+///
+/// By default this probes readiness via `GET /health` (503 until the gateway is
+/// ready). With `--live` it probes liveness via `GET /live`, which returns 200
+/// whenever the process and admin listener are up — the correct target for a
+/// Kubernetes livenessProbe so an alive-but-unready pod is not restart-looped.
+///
 /// Uses a raw TCP connection + minimal HTTP/1.1 request to avoid pulling in
 /// async runtime or reqwest for this one-shot diagnostic.
 ///
@@ -356,8 +370,9 @@ pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
         .map_err(|e| format!("Failed to set read timeout: {}", e))?;
 
     let host_header = format_host_port(&args.host, port);
+    let path = if args.live { "/live" } else { "/health" };
     let request =
-        format!("GET /health HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
+        format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
 
     let response = if use_tls {
         health_request_tls(stream, &request, &args.host, args.tls_no_verify)?
@@ -548,6 +563,7 @@ mod tests {
             host: "::1".to_string(),
             tls: false,
             tls_no_verify: false,
+            live: false,
         };
 
         execute_health(&args).unwrap();

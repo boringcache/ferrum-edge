@@ -485,6 +485,10 @@ pub mod _test_support {
         crate::config::db_loader::statement_timeout_sql(timeout_seconds, is_postgres, is_mysql)
     }
 
+    pub fn is_config_validation_rejection(error: &anyhow::Error) -> bool {
+        crate::config::validation_pipeline::is_config_validation_rejection(error)
+    }
+
     // ── plugins/grpc_web ─────────────────────────────────────────────────────
     pub const GRPC_FRAME_DATA: u8 = crate::plugins::grpc_web::GRPC_FRAME_DATA;
     pub const GRPC_FRAME_TRAILER: u8 = crate::plugins::grpc_web::GRPC_FRAME_TRAILER;

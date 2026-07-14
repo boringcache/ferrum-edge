@@ -3182,9 +3182,18 @@ mod inner {
                 for msg in &validation_errors {
                     error!("MongoDB config rejected — {}", msg);
                 }
-                anyhow::bail!(
-                    "MongoDB configuration validation failed: {} rejecting error(s) found",
-                    validation_errors.len()
+                // Return a typed, downcast-discoverable rejection (not a bare
+                // `bail!`) so the database-mode poll loop can tell this apart
+                // from a connectivity failure: MongoDB was reachable, the
+                // snapshot is merely invalid, so admin writes must stay enabled
+                // as the in-band repair path (issue #2158). Runtime caches / CP
+                // broadcast still fail closed because this is an `Err`.
+                return Err(
+                    crate::config::validation_pipeline::ConfigValidationRejection {
+                        backend: "MongoDB",
+                        errors: validation_errors,
+                    }
+                    .into_anyhow(),
                 );
             }
 
@@ -10717,17 +10726,17 @@ mod inner {
                 "the rejecting validation guard must sit between the shared validation call and \
                  the Ok(config) success return"
             );
-            let bail_start = guard_block.find("anyhow::bail!(").expect(
-                "the non-empty rejecting validation guard itself must bail, not merely log",
-            );
-            let bail_call = &guard_block[bail_start..];
-            let bail_end = bail_call
-                .find(");")
-                .expect("validation guard bail invocation must terminate");
+            // The guard must fail closed by RETURNING a typed
+            // `ConfigValidationRejection` (issue #2158) rather than merely
+            // logging — a bare `anyhow::bail!` would be indistinguishable from
+            // a connectivity failure to the database-mode poll loop.
             assert!(
-                bail_call[..bail_end].contains("MongoDB configuration validation failed"),
-                "the guard's bail invocation itself must carry the MongoDB validation failure \
-                 message"
+                guard_block.contains("return Err(")
+                    && guard_block.contains("ConfigValidationRejection")
+                    && guard_block.contains("backend: \"MongoDB\"")
+                    && guard_block.contains(".into_anyhow()"),
+                "the non-empty rejecting validation guard itself must return a typed \
+                 MongoDB ConfigValidationRejection, not merely log"
             );
         }
 

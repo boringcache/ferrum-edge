@@ -27,7 +27,8 @@ use crate::config::types::{
     ResponseBodyMode, RetryConfig, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
 use crate::config::validation_pipeline::{
-    ValidationAction, ValidationPipeline, collect_rejecting_runtime_config_errors,
+    ConfigValidationRejection, ValidationAction, ValidationPipeline,
+    collect_rejecting_runtime_config_errors,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -1462,13 +1463,23 @@ impl DatabaseStore {
         config: &GatewayConfig,
     ) -> Result<(), anyhow::Error> {
         if let Err(errors) = config.validate_plugin_references() {
-            return Err(anyhow::Error::new(ProxyPluginAssociationLoadError::new(
-                format!(
-                    "operation={} resource=proxy_plugins: invalid proxy/plugin associations: {}",
-                    operation,
-                    errors.join("; ")
-                ),
-            )));
+            let context = format!(
+                "operation={} resource=proxy_plugins: invalid proxy/plugin associations: {}",
+                operation,
+                errors.join("; ")
+            );
+            // A malformed association graph is a semantic rejection from a
+            // reachable database, not a connectivity failure. Preserve the
+            // operation/resource detail as outer context while carrying the
+            // same typed marker used by the rest of the runtime validation
+            // contract so database-mode polling keeps admin writes available
+            // for in-band repair (issue #2158).
+            return Err(ConfigValidationRejection {
+                backend: "Database",
+                errors,
+            }
+            .into_anyhow()
+            .context(context));
         }
         Ok(())
     }
@@ -1544,9 +1555,18 @@ impl DatabaseStore {
             for message in &validation_errors {
                 tracing::error!("Database config rejected — {}", message);
             }
-            anyhow::bail!(
-                "Database configuration validation failed: {} rejecting error(s) found",
-                validation_errors.len()
+            // Typed, downcast-discoverable rejection (parity with the Mongo
+            // loader) so the database-mode poll loop classifies this as a
+            // reachable-but-invalid snapshot and keeps admin writes enabled for
+            // in-band repair (issue #2158), rather than treating it as a
+            // connectivity outage. Still an `Err`, so caches / CP broadcast
+            // fail closed.
+            return Err(
+                crate::config::validation_pipeline::ConfigValidationRejection {
+                    backend: "Database",
+                    errors: validation_errors,
+                }
+                .into_anyhow(),
             );
         }
 

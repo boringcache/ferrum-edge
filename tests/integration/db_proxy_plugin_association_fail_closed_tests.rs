@@ -241,7 +241,15 @@ async fn one_invalid_association_rejects_the_full_snapshot() {
         .await
         .expect("cross-namespace association insert must succeed");
 
-    let message = error_text(store.load_full_config("ferrum").await);
+    let error = store
+        .load_full_config("ferrum")
+        .await
+        .expect_err("invalid association must reject the full snapshot");
+    assert!(
+        ferrum_edge::_test_support::is_config_validation_rejection(&error),
+        "invalid runtime association must be classified as a reachable validation rejection"
+    );
+    let message = error.to_string();
     assert_association_error_context(&message, "load_full_config");
     assert!(
         message.contains("plugin-other"),

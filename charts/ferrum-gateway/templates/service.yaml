@@ -1,0 +1,64 @@
+{{- $ports := .Values.ports | default dict -}}
+{{- $frontendTls := (.Values.tls | default dict).frontend | default dict -}}
+{{/* file/database only start the HTTPS proxy listener when frontend TLS material
+     is configured, so the Service HTTPS port is gated on a complete cert/key
+     pair. The pair may come from the first-class mounted Secret or from supported
+     FERRUM_FRONTEND_TLS_{CERT,KEY}_SOURCE envs (including resolver-suffixed and
+     valueFrom forms). A dp binds the HTTPS listener whenever the port is nonzero
+     (empty dynamic slot hot-swapped with CP-delivered Gateway TLS,
+     src/modes/data_plane.rs), so its Service HTTPS port tracks the port alone. */}}
+{{- $frontendTlsSet := include "ferrum-gateway.serverTlsConfigured" (dict "root" . "surface" $frontendTls "certSource" "FERRUM_FRONTEND_TLS_CERT_SOURCE" "keySource" "FERRUM_FRONTEND_TLS_KEY_SOURCE") -}}
+{{- $httpsListenerActive := or $frontendTlsSet (eq .Values.mode "dp") -}}
+{{- $hasHttp := and (hasKey $ports "proxyHttp") (ne ($ports.proxyHttp | toString) "0") -}}
+{{- $hasHttps := and (hasKey $ports "proxyHttps") (ne ($ports.proxyHttps | toString) "0") $httpsListenerActive -}}
+{{/* HTTP/3 (QUIC) rides UDP on the SAME HTTPS port; when enabled the Service must
+     publish a UDP port next to the TCP one or kube-proxy drops the QUIC datagrams. */}}
+{{- $hasHttp3 := and $hasHttps (eq (include "ferrum-gateway.http3Enabled" .) "true") -}}
+{{- $hasStreamSvc := false -}}
+{{- range .Values.streamPorts -}}{{- if .service -}}{{- $hasStreamSvc = true -}}{{- end -}}{{- end -}}
+{{/* Skip the Service entirely when no port would be published — a ClusterIP with
+     an empty ports block is rejected by the API server. */}}
+{{- if and .Values.service.enabled (ne .Values.mode "cp") (or $hasHttp $hasHttps $hasStreamSvc) }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ferrum-gateway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferrum-gateway.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "ferrum-gateway.selectorLabels" . | nindent 4 }}
+  ports:
+    {{- if $hasHttp }}
+    - name: http
+      port: {{ .Values.service.httpPort | default 80 }}
+      targetPort: proxy-http
+      protocol: TCP
+    {{- end }}
+    {{- if $hasHttps }}
+    - name: https
+      port: {{ .Values.service.httpsPort | default 443 }}
+      targetPort: proxy-https
+      protocol: TCP
+    {{- if $hasHttp3 }}
+    - name: https-quic
+      port: {{ .Values.service.httpsPort | default 443 }}
+      targetPort: proxy-h3-udp
+      protocol: UDP
+    {{- end }}
+    {{- end }}
+    {{- range .Values.streamPorts }}
+    {{- if .service }}
+    - name: {{ .name }}
+      port: {{ .servicePort | default .containerPort }}
+      targetPort: {{ .name }}
+      protocol: {{ .protocol | default "TCP" }}
+    {{- end }}
+    {{- end }}
+{{- end }}
