@@ -12836,8 +12836,8 @@ components:
           default: true
           description: >-
             Include decoded, non-redacted query parameters as input.query.
-            Query parameters that supplied authenticated credentials are
-            omitted by default.
+            Present query parameters configured as authentication credential
+            locations are omitted by default.
         include_query_credentials:
           type: boolean
           default: false

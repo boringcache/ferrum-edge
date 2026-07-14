@@ -64,6 +64,9 @@ impl Plugin for PriorityOverridePlugin {
     ) -> PluginResult {
         self.inner.authenticate(ctx, consumer_index).await
     }
+    fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
+        self.inner.mark_query_credentials_for_redaction(ctx);
+    }
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         self.inner.authorize(ctx).await
     }

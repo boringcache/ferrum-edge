@@ -429,6 +429,7 @@ async fn test_jwt_auth_query_param_lookup() {
     ctx.query_params.insert("jwt".to_string(), token);
     ctx.identified_consumer = None;
 
+    plugin.mark_query_credentials_for_redaction(&mut ctx);
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
     assert!(ctx.identified_consumer.is_some());

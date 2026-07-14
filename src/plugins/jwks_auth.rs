@@ -28,7 +28,7 @@ use super::utils::token_extract::{
     STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
     extract_authorization_bearer, extract_from_location,
     mark_original_token_stripping_metadata as mark_token_stripping_metadata,
-    provider_locations_extract_token,
+    mark_present_query_credential_locations, provider_locations_extract_token,
 };
 use super::{JwtAuthAttributeValue, PluginResult, RequestContext};
 
@@ -897,6 +897,12 @@ impl super::Plugin for JwksAuth {
         consumer_index: &ConsumerIndex,
     ) -> PluginResult {
         self.authenticate_request(ctx, consumer_index).await
+    }
+
+    fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
+        for provider in &self.providers {
+            mark_present_query_credential_locations(ctx, &provider.token_locations);
+        }
     }
 
     fn modifies_request_headers(&self) -> bool {

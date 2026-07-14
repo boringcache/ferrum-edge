@@ -1538,6 +1538,8 @@ async fn handle_h3_request(
             authenticate_body_requirements.needs_text,
             authenticate_body_requirements.needs_bytes,
         );
+        ctx.bytes_sent_observed
+            .fetch_max(body_data.len() as u64, std::sync::atomic::Ordering::Release);
         Some(body_data)
     } else {
         None
@@ -1632,6 +1634,59 @@ async fn handle_h3_request(
             global_body_limit,
             authorize_body_requirements.plugin_limit,
         );
+        if prebuffered_body_data.is_none() {
+            let mut body_data = Vec::new();
+            let collect = async {
+                while let Some(chunk) = stream.recv_data().await? {
+                    let bytes = chunk.chunk();
+                    if body_limit > 0 && body_data.len().saturating_add(bytes.len()) > body_limit {
+                        return Ok::<_, h3::error::StreamError>(false);
+                    }
+                    body_data.extend_from_slice(bytes);
+                }
+                Ok(true)
+            };
+            match collect_h3_request_body_with_timeout(collect, proxy.backend_read_timeout_ms).await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    record_request(&state, 413);
+                    send_h3_error_flavor_aware(
+                        &mut stream,
+                        http_flavor,
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        r#"{"error":"Request body exceeds maximum size"}"#,
+                        crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                        "Request body exceeds maximum size",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(H3RequestBodyReadError::Read(error)) => return Err(error.into()),
+                Err(H3RequestBodyReadError::TimedOut) => {
+                    record_request(
+                        &state,
+                        if matches!(http_flavor, HttpFlavor::Grpc) {
+                            StatusCode::OK.as_u16()
+                        } else {
+                            StatusCode::REQUEST_TIMEOUT.as_u16()
+                        },
+                    );
+                    send_h3_error_flavor_aware(
+                        &mut stream,
+                        http_flavor,
+                        StatusCode::REQUEST_TIMEOUT,
+                        r#"{"error":"Request body read timed out"}"#,
+                        crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+                        "Request body read timed out",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+            prebuffered_body_data = Some(body_data);
+        }
+
         if let Some(body_data) = prebuffered_body_data.as_ref() {
             if body_limit > 0 && body_data.len() > body_limit {
                 record_request(&state, 413);
@@ -1652,32 +1707,8 @@ async fn handle_h3_request(
                 authorize_body_requirements.needs_text,
                 authorize_body_requirements.needs_bytes,
             );
-        } else {
-            let mut body_data = Vec::new();
-            while let Some(chunk) = stream.recv_data().await? {
-                let bytes = chunk.chunk();
-                if body_limit > 0 && body_data.len().saturating_add(bytes.len()) > body_limit {
-                    record_request(&state, 413);
-                    send_h3_error_flavor_aware(
-                        &mut stream,
-                        http_flavor,
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        r#"{"error":"Request body exceeds maximum size"}"#,
-                        crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-                        "Request body exceeds maximum size",
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                body_data.extend_from_slice(bytes);
-            }
-            crate::proxy::store_request_body_metadata(
-                &mut ctx,
-                &body_data,
-                authorize_body_requirements.needs_text,
-                authorize_body_requirements.needs_bytes,
-            );
-            prebuffered_body_data = Some(body_data);
+            ctx.bytes_sent_observed
+                .fetch_max(body_data.len() as u64, std::sync::atomic::Ordering::Release);
         }
     }
 

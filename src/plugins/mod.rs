@@ -2722,6 +2722,12 @@ pub trait Plugin: Send + Sync {
         PluginResult::Continue
     }
 
+    /// Marks configured query credential locations before authentication
+    /// starts. The authentication dispatcher calls this for every configured
+    /// auth plugin before multi-auth can stop at the first success, allowing
+    /// later authorization plugins to omit every possible query credential.
+    fn mark_query_credentials_for_redaction(&self, _ctx: &mut RequestContext) {}
+
     /// Authorization phase (after authentication).
     async fn authorize(&self, _ctx: &mut RequestContext) -> PluginResult {
         PluginResult::Continue

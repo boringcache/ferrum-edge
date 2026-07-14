@@ -30,7 +30,7 @@ use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::token_extract::{
     STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
-    extract_authorization_bearer, extract_from_location,
+    extract_authorization_bearer, extract_from_location, mark_present_query_credential_locations,
 };
 use super::{PluginResult, RequestContext};
 
@@ -1156,6 +1156,12 @@ impl super::Plugin for Oauth2Introspection {
         consumer_index: &ConsumerIndex,
     ) -> PluginResult {
         self.authenticate_request(ctx, consumer_index).await
+    }
+
+    fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
+        for provider in &self.providers {
+            mark_present_query_credential_locations(ctx, &provider.token_locations);
+        }
     }
 
     fn modifies_request_headers(&self) -> bool {

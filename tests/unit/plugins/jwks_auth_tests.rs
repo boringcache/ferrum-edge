@@ -30,6 +30,38 @@ fn make_ctx() -> RequestContext {
     )
 }
 
+#[test]
+fn jwks_marks_forwarded_custom_query_locations_for_opa_redaction() {
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks_uri": "https://idp.example.com/.well-known/jwks.json",
+                "from_params": ["sso_token"],
+                "forward_original_token": true
+            }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.query_params
+        .insert("sso_token".to_string(), "forwarded-jwt".to_string());
+
+    plugin.mark_query_credentials_for_redaction(&mut ctx);
+
+    assert_eq!(
+        ctx.metadata
+            .get("auth.query_credential_param.sso_token")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.query_params.get("sso_token").map(String::as_str),
+        Some("forwarded-jwt"),
+        "OPA redaction markers must not change backend forwarding semantics"
+    );
+}
+
 fn create_consumer(username: &str) -> ferrum_edge::config::types::Consumer {
     use chrono::Utc;
     ferrum_edge::config::types::Consumer {

@@ -142,6 +142,7 @@ async fn test_key_auth_plugin_query_parameter() {
         .query_params
         .insert("api_key".to_string(), "test-api-key".to_string());
 
+    plugin.mark_query_credentials_for_redaction(&mut valid_ctx);
     let result = plugin.authenticate(&mut valid_ctx, &consumer_index).await;
     assert_continue(result);
     assert!(valid_ctx.identified_consumer.is_some());

@@ -355,6 +355,36 @@ struct BodySuffixPlugin {
 
 struct MissingCredentialContinueAuth;
 
+struct SkippedQueryCredentialAuth;
+
+#[async_trait]
+impl Plugin for SkippedQueryCredentialAuth {
+    fn name(&self) -> &str {
+        "skipped_query_credential_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
+    fn mark_query_credentials_for_redaction(&self, ctx: &mut RequestContext) {
+        if ctx.query_params.contains_key("custom_token") {
+            ctx.metadata.insert(
+                "auth.query_credential_param.custom_token".to_string(),
+                "true".to_string(),
+            );
+        }
+    }
+
+    async fn authenticate(
+        &self,
+        _ctx: &mut RequestContext,
+        _consumer_index: &ConsumerIndex,
+    ) -> PluginResult {
+        panic!("multi-auth should stop before the later query mechanism")
+    }
+}
+
 #[async_trait]
 impl Plugin for MissingCredentialContinueAuth {
     fn name(&self) -> &str {
@@ -414,6 +444,32 @@ async fn test_multi_auth_accepts_external_identity_without_consumer() {
     assert!(result.is_none());
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("external-user"));
     assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn test_multi_auth_marks_query_credentials_before_first_success_short_circuits() {
+    let external: Arc<dyn Plugin> = Arc::new(ExternalIdentityAuth);
+    let skipped_query: Arc<dyn Plugin> = Arc::new(SkippedQueryCredentialAuth);
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![external, skipped_query];
+    let consumer_index = ConsumerIndex::new(&[]);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/multi-auth".to_string(),
+    );
+    ctx.query_params
+        .insert("custom_token".to_string(), "must-not-reach-opa".to_string());
+
+    let result =
+        run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index).await;
+
+    assert!(result.is_none());
+    assert_eq!(
+        ctx.metadata
+            .get("auth.query_credential_param.custom_token")
+            .map(String::as_str),
+        Some("true")
+    );
 }
 
 #[tokio::test]

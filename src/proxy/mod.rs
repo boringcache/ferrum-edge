@@ -13837,6 +13837,14 @@ pub async fn run_authentication_phase(
     ctx: &mut RequestContext,
     consumer_index: &ConsumerIndex,
 ) -> Option<(u16, Vec<u8>, HashMap<String, String>)> {
+    // Mark every configured query credential location before multi-auth can
+    // stop at the first successful mechanism. Presence is enough to redact:
+    // an invalid token may coexist with a different successful credential and
+    // must not cross the OPA policy-service boundary.
+    for auth_plugin in auth_plugins {
+        auth_plugin.mark_query_credentials_for_redaction(ctx);
+    }
+
     match auth_mode {
         AuthMode::Multi => {
             // Execute auth plugins; first success stops iteration.

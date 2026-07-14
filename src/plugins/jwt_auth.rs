@@ -138,13 +138,6 @@ impl AuthMechanism for JwtAuth {
         "jwt_auth"
     }
 
-    fn authenticated_query_param_name(&self) -> Option<&str> {
-        match &self.token_lookup {
-            TokenLookup::Query(name) => Some(name),
-            TokenLookup::Header { .. } => None,
-        }
-    }
-
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
         match self.extract_token(ctx) {
             Some(token) => ExtractedCredential::BearerToken(token),
@@ -228,7 +221,15 @@ auth_flow::impl_auth_plugin!(
     "jwt_auth",
     super::priority::JWT_AUTH,
     crate::plugins::HTTP_FAMILY_PROTOCOLS,
-    auth_flow::run_auth
+    auth_flow::run_auth;
+
+    fn mark_query_credentials_for_redaction(&self, ctx: &mut crate::plugins::RequestContext) {
+        if let TokenLookup::Query(name) = &self.token_lookup
+            && ctx.query_params.contains_key(name)
+        {
+            crate::plugins::utils::token_extract::mark_query_credential_metadata(ctx, name);
+        }
+    }
 );
 
 fn parse_token_lookup(value: Option<&Value>) -> Result<TokenLookup, String> {
