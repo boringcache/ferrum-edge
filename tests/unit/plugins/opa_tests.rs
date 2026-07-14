@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::plugins::{
-    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, opa::Opa, priority,
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, opa::Opa,
+    priority, validate_plugin_config,
 };
 use serde_json::{Value, json};
 use tracing_subscriber::fmt::MakeWriter;
@@ -146,6 +147,9 @@ fn opa_validates_config() {
         json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "headers": {"Invalid Header": "value"}}),
         json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "headers": {"Content-Type": "text/plain"}}),
         json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "fail_open": true, "fail_closed": false}),
+        json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "max_response_bytes": 0}),
+        json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "max_body_bytes": 0}),
+        json!({"opa_host": "http://localhost:8181", "policy_path": POLICY_PATH, "redact_query_keys": [""]}),
     ];
 
     for config in invalid_configs {
@@ -202,8 +206,60 @@ fn opa_plugin_contract() {
     )
     .unwrap();
     assert!(body_plugin.requires_request_body_buffering());
-    assert!(body_plugin.requires_request_body_before_authenticate());
+    assert!(!body_plugin.requires_request_body_before_authenticate());
+    assert!(body_plugin.requires_request_body_before_authorize());
     assert!(body_plugin.needs_request_body_bytes());
+    assert!(!body_plugin.needs_request_body_text());
+    assert_eq!(body_plugin.request_body_buffer_limit(), Some(1024 * 1024));
+
+    let bounded_body_plugin = Opa::new(
+        &json!({
+            "opa_host": "http://localhost:8181",
+            "policy_path": POLICY_PATH,
+            "include_body": true,
+            "max_body_bytes": 4096,
+        }),
+        default_client(),
+    )
+    .unwrap();
+    assert_eq!(bounded_body_plugin.request_body_buffer_limit(), Some(4096));
+}
+
+#[test]
+fn opa_accepts_and_clamps_timeout_above_runtime_cap() {
+    let config = json!({
+        "opa_host": "http://localhost:8181",
+        "policy_path": POLICY_PATH,
+        "timeout_ms": 45000,
+    });
+
+    assert!(Opa::new(&config, default_client()).is_ok());
+    assert!(validate_plugin_config("opa", &config).is_ok());
+}
+
+#[test]
+fn opa_rejects_unknown_security_sensitive_config_keys() {
+    for typo in [
+        "decision_pointr",
+        "fail_opne",
+        "include_heders",
+        "include_bdy",
+        "redact_heders",
+        "redact_query_key",
+        "reject_duplicate_query_key",
+    ] {
+        let mut config = base_config("http://localhost:8181");
+        config
+            .as_object_mut()
+            .expect("base config is an object")
+            .insert(typo.to_string(), json!(true));
+        let error = match Opa::new(&config, default_client()) {
+            Ok(_) => panic!("unknown OPA key {typo} must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("unknown config key"), "got: {error}");
+        assert!(error.contains(typo), "got: {error}");
+    }
 }
 
 #[tokio::test]
@@ -362,6 +418,21 @@ async fn opa_allows_object_with_allow_true() {
     let result = plugin.authorize(&mut ctx).await;
 
     assert_continue(result);
+}
+
+#[tokio::test]
+async fn opa_nested_false_decision_cannot_fall_back_to_enclosing_allow_true() {
+    let server = MockServer::start().await;
+    mount_opa(
+        &server,
+        200,
+        json!({"result": {"allow": true, "decision": false}}),
+    )
+    .await;
+    let plugin = plugin(&server, json!({"decision_pointer": ["result", "decision"]}));
+
+    let mut ctx = make_ctx();
+    assert_reject(plugin.authorize(&mut ctx).await, Some(403));
 }
 
 #[tokio::test]
@@ -545,6 +616,89 @@ async fn opa_malformed_json_fails_closed() {
 }
 
 #[tokio::test]
+async fn opa_accepts_response_exactly_at_byte_limit() {
+    let body = r#"{"result":true}"#;
+    let server = MockServer::start().await;
+    mount_opa_raw(&server, 200, body).await;
+    let plugin = plugin(&server, json!({"max_response_bytes": body.len()}));
+
+    let mut ctx = make_ctx();
+    assert_continue(plugin.authorize(&mut ctx).await);
+}
+
+#[tokio::test]
+async fn opa_oversized_declared_response_fails_closed() {
+    let server = MockServer::start().await;
+    mount_opa_raw(
+        &server,
+        200,
+        r#"{"result":true,"padding":"policy-service-controlled"}"#,
+    )
+    .await;
+    let plugin = plugin(&server, json!({"max_response_bytes": 16}));
+
+    let mut ctx = make_ctx();
+    assert_reject(plugin.authorize(&mut ctx).await, Some(503));
+}
+
+#[tokio::test]
+async fn opa_oversized_streamed_response_honors_fail_open() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        loop {
+            let read = socket.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        for chunk in [
+            b"{\"result\":false,".as_slice(),
+            b"\"padding\":\"policy-service-controlled\"}".as_slice(),
+        ] {
+            let header = format!("{:x}\r\n", chunk.len());
+            if socket.write_all(header.as_bytes()).await.is_err()
+                || socket.write_all(chunk).await.is_err()
+                || socket.write_all(b"\r\n").await.is_err()
+            {
+                return;
+            }
+        }
+        let _ = socket.write_all(b"0\r\n\r\n").await;
+    });
+
+    let mut config = base_config(&format!("http://{addr}"));
+    config
+        .as_object_mut()
+        .expect("base config is an object")
+        .extend([
+            ("max_response_bytes".to_string(), json!(16)),
+            ("fail_open".to_string(), json!(true)),
+        ]);
+    let plugin = Opa::new(&config, default_client()).unwrap();
+
+    let mut ctx = make_ctx();
+    assert_continue(plugin.authorize(&mut ctx).await);
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn opa_forwards_configured_headers_to_opa() {
     let server = MockServer::start().await;
     mount_opa(&server, 200, json!({"result": true})).await;
@@ -626,6 +780,69 @@ async fn opa_custom_redact_headers_are_additive() {
 }
 
 #[tokio::test]
+async fn opa_redacts_default_and_authenticated_query_credentials() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string(
+        "action=read&api_key=default-secret&custom_credential=verified-secret&oauth_custom=oauth-secret"
+            .to_string(),
+    );
+    ctx.metadata.insert(
+        "auth.query_credential_param.custom_credential".to_string(),
+        "true".to_string(),
+    );
+    ctx.metadata.insert(
+        "auth.strip_query_param.oauth_custom".to_string(),
+        "true".to_string(),
+    );
+
+    assert_continue(plugin.authorize(&mut ctx).await);
+    let payload = received_opa_payload(&server).await;
+    let query = &payload["input"]["query"];
+    assert_eq!(query["action"], "read");
+    assert!(query.get("api_key").is_none());
+    assert!(query.get("custom_credential").is_none());
+    assert!(query.get("oauth_custom").is_none());
+    let serialized = serde_json::to_string(&payload).unwrap();
+    assert!(!serialized.contains("default-secret"));
+    assert!(!serialized.contains("verified-secret"));
+    assert!(!serialized.contains("oauth-secret"));
+}
+
+#[tokio::test]
+async fn opa_query_credential_opt_in_preserves_explicit_redactions() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(
+        &server,
+        json!({
+            "include_query_credentials": true,
+            "redact_query_keys": ["Session_ID"],
+        }),
+    );
+
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string(
+        "api_key=explicitly-forwarded&custom_credential=also-forwarded&session_id=redacted"
+            .to_string(),
+    );
+    ctx.metadata.insert(
+        "auth.query_credential_param.custom_credential".to_string(),
+        "true".to_string(),
+    );
+
+    assert_continue(plugin.authorize(&mut ctx).await);
+    let payload = received_opa_payload(&server).await;
+    let query = &payload["input"]["query"];
+    assert_eq!(query["api_key"], "explicitly-forwarded");
+    assert_eq!(query["custom_credential"], "also-forwarded");
+    assert!(query.get("session_id").is_none());
+}
+
+#[tokio::test]
 async fn opa_body_is_forwarded_only_when_configured() {
     let server = MockServer::start().await;
     mount_opa(&server, 200, json!({"result": true})).await;
@@ -634,7 +851,7 @@ async fn opa_body_is_forwarded_only_when_configured() {
     let mut ctx = make_ctx();
     ctx.metadata.insert(
         "request_body".to_string(),
-        "{\"hello\":\"world\"}".to_string(),
+        "stale duplicate that must not be forwarded".to_string(),
     );
     ctx.request_body_bytes = Some(bytes::Bytes::from_static(br#"{"hello":"world"}"#));
     assert_continue(plugin_without_body.authorize(&mut ctx).await);
@@ -650,7 +867,7 @@ async fn opa_body_is_forwarded_only_when_configured() {
     let mut ctx = make_ctx();
     ctx.metadata.insert(
         "request_body".to_string(),
-        "{\"hello\":\"world\"}".to_string(),
+        "stale duplicate that must not be forwarded".to_string(),
     );
     ctx.request_body_bytes = Some(bytes::Bytes::from_static(br#"{"hello":"world"}"#));
     assert_continue(plugin_with_body.authorize(&mut ctx).await);
@@ -685,8 +902,16 @@ async fn opa_error_logs_do_not_include_request_fields() {
     let guard = tracing::subscriber::set_default(subscriber);
     {
         let server = MockServer::start().await;
-        mount_opa(&server, 500, json!({"error": "unavailable"})).await;
-        let plugin = plugin(&server, json!({"include_body": true}));
+        mount_opa_raw(
+            &server,
+            200,
+            r#"{"result":false,"policy_response_secret":"never-log-this"}"#,
+        )
+        .await;
+        let plugin = plugin(
+            &server,
+            json!({"include_body": true, "max_response_bytes": 16}),
+        );
 
         let mut ctx = make_ctx();
         ctx.path = "/private/bearer".to_string();
@@ -704,15 +929,15 @@ async fn opa_error_logs_do_not_include_request_fields() {
     drop(guard);
 
     let logs = writer.contents();
-    // The mock returns 500, so the OPA plugin normally logs
-    // `opa_non_success_status`. Under heavy parallel test load the request to
+    // The mock returns an oversized body, so the OPA plugin normally logs
+    // `opa_response_too_large`. Under heavy parallel test load the request to
     // the local mock can instead fail transiently before reaching it, which the
     // plugin logs as `opa_call_failed` (and still rejects 503). Either way an
     // OPA error was logged and the property under test — no request fields in
     // the error log — must hold, so accept either reason rather than coupling
     // to the exact (environment-dependent) error path.
     assert!(
-        logs.contains("opa_non_success_status") || logs.contains("opa_call_failed"),
+        logs.contains("opa_response_too_large") || logs.contains("opa_call_failed"),
         "an OPA error must be logged on a failed decision; logs={logs}"
     );
     for secret in [
@@ -720,6 +945,7 @@ async fn opa_error_logs_do_not_include_request_fields() {
         "Bearer client-token",
         "/private/bearer",
         "client body secret",
+        "never-log-this",
     ] {
         assert!(
             !logs.contains(secret),

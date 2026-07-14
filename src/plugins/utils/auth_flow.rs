@@ -139,6 +139,13 @@ pub(crate) use impl_auth_plugin;
 pub trait AuthMechanism: Send + Sync {
     fn mechanism_name(&self) -> &'static str;
 
+    /// Query parameter that supplied this mechanism's credential, if any.
+    /// The shared auth flow records it only after verification succeeds so
+    /// later authorization plugins can redact the credential value.
+    fn authenticated_query_param_name(&self) -> Option<&str> {
+        None
+    }
+
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential;
 
     async fn verify(
@@ -184,6 +191,9 @@ async fn run_auth_impl<M: AuthMechanism>(
                 external_identity,
                 external_identity_header,
             } => {
+                if let Some(name) = mechanism.authenticated_query_param_name() {
+                    super::token_extract::mark_query_credential_metadata(ctx, name);
+                }
                 let consumer_identified = consumer.is_some();
                 let external_identity_identified =
                     allow_external_identity && external_identity.is_some();

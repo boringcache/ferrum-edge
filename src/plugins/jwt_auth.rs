@@ -138,6 +138,13 @@ impl AuthMechanism for JwtAuth {
         "jwt_auth"
     }
 
+    fn authenticated_query_param_name(&self) -> Option<&str> {
+        match &self.token_lookup {
+            TokenLookup::Query(name) => Some(name),
+            TokenLookup::Header { .. } => None,
+        }
+    }
+
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
         match self.extract_token(ctx) {
             Some(token) => ExtractedCredential::BearerToken(token),

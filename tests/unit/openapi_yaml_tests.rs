@@ -1217,6 +1217,51 @@ fn assert_component_validity(
 }
 
 #[test]
+fn opa_schema_matches_runtime_validation_contract() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let component = spec
+        .pointer("/components/schemas/OpaPluginConfig")
+        .expect("OpaPluginConfig component exists");
+
+    assert_eq!(component.get("additionalProperties"), Some(&json!(false)));
+    assert!(
+        component
+            .pointer("/properties/timeout_ms/maximum")
+            .is_none(),
+        "runtime accepts positive timeout_ms values above 30000 and clamps the effective timeout"
+    );
+
+    let base = json!({
+        "opa_host": "http://opa.internal:8181",
+        "policy_path": "ferrum/authz/allow",
+        "timeout_ms": 45000,
+        "max_response_bytes": 262144,
+        "headers": {"X-OPA-Tenant": "blue"},
+        "deny_headers": {"X-Policy": "denied"},
+        "include_body": true,
+        "max_body_bytes": 1048576,
+        "redact_query_keys": ["session_id"],
+    });
+    assert_component_validity(&spec, "OpaPluginConfig", &base, true);
+
+    let mut unknown = base.clone();
+    unknown
+        .as_object_mut()
+        .expect("OPA test config is an object")
+        .insert("decision_pointr".to_string(), json!(["result", "allow"]));
+    assert_component_validity(&spec, "OpaPluginConfig", &unknown, false);
+
+    for field in ["max_response_bytes", "max_body_bytes"] {
+        let mut zero = base.clone();
+        zero.as_object_mut()
+            .expect("OPA test config is an object")
+            .insert(field.to_string(), json!(0));
+        assert_component_validity(&spec, "OpaPluginConfig", &zero, false);
+    }
+}
+
+#[test]
 fn upstream_runtime_serialization_is_covered_by_openapi() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

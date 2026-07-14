@@ -10,6 +10,20 @@ use super::auth_flow::ExtractedCredential;
 /// there, leaking the token to the backend.
 pub(crate) const STRIP_QUERY_PARAM_METADATA_PREFIX: &str = "auth.strip_query_param.";
 
+/// Metadata-key prefix identifying a query parameter that supplied a
+/// successfully verified credential. Authorization plugins such as OPA use
+/// this marker to keep credentials out of secondary policy-service payloads.
+/// Unlike [`STRIP_QUERY_PARAM_METADATA_PREFIX`], this marker does not change
+/// the query forwarded to the primary backend.
+pub(crate) const QUERY_CREDENTIAL_METADATA_PREFIX: &str = "auth.query_credential_param.";
+
+pub(crate) fn mark_query_credential_metadata(ctx: &mut RequestContext, name: &str) {
+    let mut key = String::with_capacity(QUERY_CREDENTIAL_METADATA_PREFIX.len() + name.len());
+    key.push_str(QUERY_CREDENTIAL_METADATA_PREFIX);
+    key.push_str(name);
+    ctx.metadata.insert(key, String::from("true"));
+}
+
 #[derive(Clone)]
 pub struct TokenHeaderLocation {
     pub name: String,

@@ -145,6 +145,13 @@ async fn test_key_auth_plugin_query_parameter() {
     let result = plugin.authenticate(&mut valid_ctx, &consumer_index).await;
     assert_continue(result);
     assert!(valid_ctx.identified_consumer.is_some());
+    assert_eq!(
+        valid_ctx
+            .metadata
+            .get("auth.query_credential_param.api_key")
+            .map(String::as_str),
+        Some("true")
+    );
 }
 
 #[tokio::test]

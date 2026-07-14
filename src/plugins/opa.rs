@@ -2,8 +2,9 @@
 //!
 //! Delegates HTTP request authorization to OPA's Data API by POSTing an
 //! `input` document to `/v1/data/{policy_path}` during the `authorize` phase.
-//! The plugin fails closed by default and redacts sensitive client headers
-//! before forwarding request context to OPA.
+//! The plugin fails closed by default, bounds policy responses, and redacts
+//! sensitive client headers and query credentials before forwarding request
+//! context to OPA.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -11,21 +12,93 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine;
 use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
-use serde_json::{Map, Value, json};
+use serde::Serialize;
+use serde::ser::SerializeMap;
+use serde_json::{Map, Value};
 use tracing::{info, warn};
 use url::{Host, Url};
 
 use crate::retry::classify_reqwest_error;
 
+use super::utils::response_body::{
+    BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
+};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 const DEFAULT_TIMEOUT_MS: u64 = 1000;
 const MAX_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 256 * 1024;
+const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_DENY_STATUS: u16 = 403;
 const DEFAULT_DENY_BODY: &str = r#"{"error":"forbidden by policy"}"#;
 const DEFAULT_FAIL_CLOSED_STATUS: u16 = 503;
 const DEFAULT_FAIL_CLOSED_BODY: &str = r#"{"error":"authorization service unavailable"}"#;
 const OPA_DATA_PREFIX: &str = "/v1/data/";
+const OPA_CONFIG_KEYS: &[&str] = &[
+    "opa_host",
+    "policy_path",
+    "headers",
+    "timeout_ms",
+    "max_response_bytes",
+    "fail_open",
+    "fail_closed",
+    "deny_status",
+    "deny_body",
+    "deny_headers",
+    "fail_closed_status",
+    "fail_closed_body",
+    "fail_closed_headers",
+    "decision_pointer",
+    "include_method",
+    "include_path",
+    "include_query",
+    "include_query_credentials",
+    "include_headers",
+    "include_body",
+    "max_body_bytes",
+    "include_consumer",
+    "include_client_ip",
+    "include_service",
+    "reject_duplicate_query_keys",
+    "redact_headers",
+    "redact_query_keys",
+];
+
+#[derive(Serialize)]
+struct OpaDecisionPayload<'a> {
+    input: OpaInputPayload<'a>,
+}
+
+struct OpaInputPayload<'a> {
+    fields: Map<String, Value>,
+    body: Option<OpaBody<'a>>,
+}
+
+enum OpaBody<'a> {
+    Text(&'a str),
+    Base64(String),
+    Null,
+}
+
+impl Serialize for OpaInputPayload<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let body_field_count = if self.body.is_some() { 1 } else { 0 };
+        let mut map = serializer.serialize_map(Some(self.fields.len() + body_field_count))?;
+        for (key, value) in &self.fields {
+            map.serialize_entry(key, value)?;
+        }
+        match self.body.as_ref() {
+            Some(OpaBody::Text(body)) => map.serialize_entry("body", body)?,
+            Some(OpaBody::Base64(body)) => map.serialize_entry("body_base64", body)?,
+            Some(OpaBody::Null) => map.serialize_entry("body", &Value::Null)?,
+            None => {}
+        }
+        map.end()
+    }
+}
 
 pub struct Opa {
     http_client: PluginHttpClient,
@@ -33,6 +106,7 @@ pub struct Opa {
     decision_hostname: String,
     custom_headers: Vec<(HeaderName, HeaderValue)>,
     timeout: Duration,
+    max_response_bytes: usize,
     fail_open: bool,
     deny_status: u16,
     deny_body: String,
@@ -44,13 +118,16 @@ pub struct Opa {
     include_method: bool,
     include_path: bool,
     include_query: bool,
+    include_query_credentials: bool,
     include_headers: bool,
     include_body: bool,
+    max_body_bytes: usize,
     include_consumer: bool,
     include_client_ip: bool,
     include_service: bool,
     reject_duplicate_query_keys: bool,
     redact_headers: HashSet<String>,
+    redact_query_keys: HashSet<String>,
 }
 
 impl Opa {
@@ -58,6 +135,7 @@ impl Opa {
         let object = config
             .as_object()
             .ok_or_else(|| "opa: config must be a JSON object".to_string())?;
+        reject_unknown_keys(object)?;
 
         let (decision_url, decision_hostname) = parse_decision_endpoint(object)?;
         if decision_url.starts_with("https://") {
@@ -73,6 +151,14 @@ impl Opa {
             return Err("opa: 'timeout_ms' must be greater than zero".to_string());
         }
         let timeout_ms = timeout_ms.min(MAX_TIMEOUT_MS);
+        let max_response_bytes = parse_max_response_body_bytes(
+            config,
+            "opa",
+            "max_response_bytes",
+            DEFAULT_MAX_RESPONSE_BYTES,
+        )?;
+        let max_body_bytes =
+            parse_max_response_body_bytes(config, "opa", "max_body_bytes", DEFAULT_MAX_BODY_BYTES)?;
         let fail_open = parse_fail_open(object)?;
         let deny_status = parse_response_status(object, "deny_status", DEFAULT_DENY_STATUS)?;
         let deny_body = parse_optional_string(object, "deny_body")?
@@ -85,6 +171,7 @@ impl Opa {
         let fail_closed_headers = parse_string_header_map(object, "fail_closed_headers", "opa")?;
         let decision_pointer = parse_decision_pointer(object)?;
         let redact_headers = parse_redact_headers(object)?;
+        let redact_query_keys = parse_redact_query_keys(object)?;
 
         Ok(Self {
             http_client,
@@ -92,6 +179,7 @@ impl Opa {
             decision_hostname,
             custom_headers,
             timeout: Duration::from_millis(timeout_ms),
+            max_response_bytes,
             fail_open,
             deny_status,
             deny_body,
@@ -103,8 +191,11 @@ impl Opa {
             include_method: parse_optional_bool(object, "include_method")?.unwrap_or(true),
             include_path: parse_optional_bool(object, "include_path")?.unwrap_or(true),
             include_query: parse_optional_bool(object, "include_query")?.unwrap_or(true),
+            include_query_credentials: parse_optional_bool(object, "include_query_credentials")?
+                .unwrap_or(false),
             include_headers: parse_optional_bool(object, "include_headers")?.unwrap_or(true),
             include_body: parse_optional_bool(object, "include_body")?.unwrap_or(false),
+            max_body_bytes,
             include_consumer: parse_optional_bool(object, "include_consumer")?.unwrap_or(true),
             include_client_ip: parse_optional_bool(object, "include_client_ip")?.unwrap_or(true),
             include_service: parse_optional_bool(object, "include_service")?.unwrap_or(true),
@@ -114,10 +205,11 @@ impl Opa {
             )?
             .unwrap_or(true),
             redact_headers,
+            redact_query_keys,
         })
     }
 
-    fn build_input(&self, ctx: &mut RequestContext) -> Value {
+    fn build_input(&self, ctx: &mut RequestContext) -> Map<String, Value> {
         let mut input = Map::new();
 
         if self.include_method {
@@ -128,7 +220,7 @@ impl Opa {
         }
         if self.include_query {
             ctx.materialize_query_params();
-            input.insert("query".to_string(), string_map_to_value(&ctx.query_params));
+            input.insert("query".to_string(), self.query_input(ctx));
         }
         if self.include_headers {
             ctx.materialize_headers();
@@ -146,11 +238,25 @@ impl Opa {
         if self.include_consumer {
             input.insert("consumer".to_string(), self.consumer_input(ctx));
         }
-        if self.include_body {
-            self.insert_body_input(&mut input, ctx);
-        }
+        input
+    }
 
-        Value::Object(input)
+    fn query_input(&self, ctx: &RequestContext) -> Value {
+        let mut query = Map::with_capacity(ctx.query_params.len());
+        for (key, value) in &ctx.query_params {
+            if self
+                .redact_query_keys
+                .iter()
+                .any(|redacted| redacted.eq_ignore_ascii_case(key))
+                || (!self.include_query_credentials
+                    && (is_default_sensitive_query_key(key)
+                        || query_key_marked_as_credential(ctx, key)))
+            {
+                continue;
+            }
+            query.insert(key.clone(), Value::String(value.clone()));
+        }
+        Value::Object(query)
     }
 
     fn header_input(&self, ctx: &RequestContext) -> Value {
@@ -232,25 +338,25 @@ impl Opa {
         Value::Null
     }
 
-    fn insert_body_input(&self, input: &mut Map<String, Value>, ctx: &RequestContext) {
+    fn body_input<'a>(&self, ctx: &'a RequestContext) -> Option<OpaBody<'a>> {
+        if !self.include_body {
+            return None;
+        }
+
         if let Some(bytes) = ctx.request_body_bytes.as_ref() {
-            if let Some(body) = ctx.metadata.get("request_body") {
-                input.insert("body".to_string(), Value::String(body.clone()));
-            } else if let Ok(body) = std::str::from_utf8(bytes) {
-                input.insert("body".to_string(), Value::String(body.to_string()));
+            if let Ok(body) = std::str::from_utf8(bytes) {
+                return Some(OpaBody::Text(body));
             } else {
-                input.insert(
-                    "body_base64".to_string(),
-                    Value::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
-                );
+                return Some(OpaBody::Base64(
+                    base64::engine::general_purpose::STANDARD.encode(bytes),
+                ));
             }
-            return;
         }
 
         if let Some(body) = ctx.metadata.get("request_body") {
-            input.insert("body".to_string(), Value::String(body.clone()));
+            Some(OpaBody::Text(body))
         } else {
-            input.insert("body".to_string(), Value::Null);
+            Some(OpaBody::Null)
         }
     }
 
@@ -339,7 +445,13 @@ impl Plugin for Opa {
             return self.reject_policy_denial();
         }
 
-        let payload = json!({ "input": self.build_input(ctx) });
+        let input = self.build_input(ctx);
+        let payload = OpaDecisionPayload {
+            input: OpaInputPayload {
+                fields: input,
+                body: self.body_input(ctx),
+            },
+        };
         let mut request = self
             .http_client
             .get()
@@ -356,10 +468,33 @@ impl Plugin for Opa {
             .await
         {
             Ok(response) if response.status().is_success() => {
-                match response.json::<Value>().await {
-                    Ok(body) => self.evaluate(&body),
-                    Err(error) => self.on_error(
-                        "opa_response_parse_failed",
+                if response
+                    .content_length()
+                    .is_some_and(|length| length > self.max_response_bytes as u64)
+                {
+                    return self.on_error(
+                        "opa_response_too_large",
+                        format!(
+                            "declared response length exceeds {} bytes",
+                            self.max_response_bytes
+                        ),
+                    );
+                }
+
+                match read_response_body_bounded(response, self.max_response_bytes).await {
+                    Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                        Ok(body) => self.evaluate(&body),
+                        Err(error) => self.on_error("opa_response_parse_failed", error.to_string()),
+                    },
+                    Err(BoundedReadError::LimitExceeded { .. }) => self.on_error(
+                        "opa_response_too_large",
+                        format!(
+                            "response exceeded configured {} byte limit",
+                            self.max_response_bytes
+                        ),
+                    ),
+                    Err(BoundedReadError::Stream(error)) => self.on_error(
+                        "opa_response_read_failed",
                         classify_reqwest_error(&error).to_string(),
                     ),
                 }
@@ -375,9 +510,7 @@ impl Plugin for Opa {
         }
     }
 
-    fn requires_request_body_before_authenticate(&self) -> bool {
-        // There is no authorize-phase body-buffering hook yet; this is the
-        // earliest hook that makes the buffered body available to authorize().
+    fn requires_request_body_before_authorize(&self) -> bool {
         self.include_body
     }
 
@@ -387,6 +520,14 @@ impl Plugin for Opa {
 
     fn needs_request_body_bytes(&self) -> bool {
         self.include_body
+    }
+
+    fn needs_request_body_text(&self) -> bool {
+        false
+    }
+
+    fn request_body_buffer_limit(&self) -> Option<usize> {
+        self.include_body.then_some(self.max_body_bytes)
     }
 
     fn requires_decoded_query_params(&self) -> bool {
@@ -483,6 +624,15 @@ fn parse_fail_open(object: &Map<String, Value>) -> Result<bool, String> {
     }
 }
 
+fn reject_unknown_keys(object: &Map<String, Value>) -> Result<(), String> {
+    for key in object.keys() {
+        if !OPA_CONFIG_KEYS.contains(&key.as_str()) {
+            return Err(format!("opa: unknown config key '{key}'"));
+        }
+    }
+    Ok(())
+}
+
 fn parse_decision_pointer(object: &Map<String, Value>) -> Result<Vec<String>, String> {
     let Some(value) = object.get("decision_pointer") else {
         return Ok(vec!["result".to_string()]);
@@ -519,6 +669,53 @@ fn parse_redact_headers(object: &Map<String, Value>) -> Result<HashSet<String>, 
         headers.insert(header_name.as_str().to_string());
     }
     Ok(headers)
+}
+
+fn parse_redact_query_keys(object: &Map<String, Value>) -> Result<HashSet<String>, String> {
+    let Some(value) = object.get("redact_query_keys") else {
+        return Ok(HashSet::new());
+    };
+    let array = value
+        .as_array()
+        .ok_or_else(|| "opa: 'redact_query_keys' must be an array of strings".to_string())?;
+    let mut keys = HashSet::with_capacity(array.len());
+    for (idx, value) in array.iter().enumerate() {
+        let key = value
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("opa: 'redact_query_keys[{idx}]' must be a non-empty string"))?;
+        keys.insert(key.to_ascii_lowercase());
+    }
+    Ok(keys)
+}
+
+fn is_default_sensitive_query_key(key: &str) -> bool {
+    [
+        "access_token",
+        "api_key",
+        "apikey",
+        "auth",
+        "authorization",
+        "bearer_token",
+        "id_token",
+        "jwt",
+        "key",
+        "token",
+    ]
+    .iter()
+    .any(|sensitive| sensitive.eq_ignore_ascii_case(key))
+}
+
+fn query_key_marked_as_credential(ctx: &RequestContext, query_key: &str) -> bool {
+    ctx.metadata.keys().any(|metadata_key| {
+        metadata_key
+            .strip_prefix(super::utils::token_extract::QUERY_CREDENTIAL_METADATA_PREFIX)
+            .or_else(|| {
+                metadata_key
+                    .strip_prefix(super::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX)
+            })
+            .is_some_and(|credential_key| credential_key.eq_ignore_ascii_case(query_key))
+    })
 }
 
 fn default_redact_headers() -> HashSet<String> {
@@ -675,12 +872,4 @@ fn parse_optional_u16(
             u16::try_from(raw).map_err(|_| format!("opa: '{field}' is too large"))
         })
         .transpose()
-}
-
-fn string_map_to_value(map: &HashMap<String, String>) -> Value {
-    Value::Object(
-        map.iter()
-            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
-            .collect(),
-    )
 }

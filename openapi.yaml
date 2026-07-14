@@ -12721,6 +12721,7 @@ components:
 
     OpaPluginConfig:
       type: object
+      additionalProperties: false
       required: [opa_host, policy_path]
       description: |
         Plugin: opa — Delegates HTTP request authorization to Open Policy
@@ -12728,8 +12729,9 @@ components:
         `{ "input": ... }` to `{opa_host}/v1/data/{policy_path}` and allows
         only `true` decisions or objects with `allow: true` at
         `decision_pointer`. Fails closed by default; `fail_open: true` is the
-        opt-in availability mode. Request headers are redacted before being
-        sent to OPA.
+        opt-in availability mode. Unknown configuration keys are rejected.
+        Request headers and query-located credentials are redacted before
+        being sent to OPA.
       properties:
         opa_host:
           type: string
@@ -12760,13 +12762,23 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          maximum: 30000
           default: 1000
-          description: Per-decision timeout in milliseconds. Values above 30000 are clamped.
+          description: >-
+            Requested per-decision timeout in milliseconds. Every positive
+            value is accepted; the effective runtime timeout is capped at
+            30000 milliseconds.
+        max_response_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 262144
+          description: >-
+            Maximum decoded OPA response size. Oversized declared or streamed
+            responses use the configured fail-open/fail-closed posture.
         fail_open:
           type: boolean
           default: false
-          description: Continue when OPA is unavailable, times out, returns non-2xx, or returns malformed JSON.
+          description: Continue when OPA is unavailable, times out, returns non-2xx, returns malformed JSON, or exceeds max_response_bytes.
         fail_closed:
           type: boolean
           default: true
@@ -12796,7 +12808,7 @@ components:
           default: 503
           description: >-
             HTTP status returned when fail-closed handles OPA unavailability,
-            timeouts, non-2xx responses, or malformed JSON.
+            timeouts, non-2xx responses, malformed JSON, or oversized responses.
         fail_closed_body:
           type: string
           default: '{"error":"authorization service unavailable"}'
@@ -12822,6 +12834,17 @@ components:
         include_query:
           type: boolean
           default: true
+          description: >-
+            Include decoded, non-redacted query parameters as input.query.
+            Query parameters that supplied authenticated credentials are
+            omitted by default.
+        include_query_credentials:
+          type: boolean
+          default: false
+          description: >-
+            Unsafe opt-in to include built-in and authentication-plugin-marked
+            query credentials in input.query. Keys listed in redact_query_keys
+            remain redacted.
         include_headers:
           type: boolean
           default: true
@@ -12829,8 +12852,19 @@ components:
           type: boolean
           default: false
           description: >-
-            Buffer and forward the request body. UTF-8 bodies use `body`;
-            non-UTF-8 raw bytes use `body_base64`.
+            After authentication succeeds, buffer and forward the request
+            body. UTF-8 bodies use `body`; non-UTF-8 raw bytes use
+            `body_base64`.
+        max_body_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 1048576
+          description: >-
+            Plugin-local request body ceiling when include_body is enabled.
+            The strictest of this value and the positive global request body
+            limit is enforced; this value remains active when the global
+            limit is unlimited (0).
         include_consumer:
           type: boolean
           default: true
@@ -12867,6 +12901,17 @@ components:
           description: >-
             Additional request headers to redact from `input.headers`. Built-in
             sensitive headers are always redacted.
+        redact_query_keys:
+          type: array
+          items:
+            type: string
+            minLength: 1
+          default: []
+          description: >-
+            Additional query parameter names to omit from input.query,
+            matched case-insensitively. Built-in credential names and query
+            locations marked by authentication plugins are already omitted
+            unless include_query_credentials is explicitly enabled.
 
     AccessControlConfig:
       type: object

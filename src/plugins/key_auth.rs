@@ -96,6 +96,10 @@ impl AuthMechanism for KeyAuth {
         "key_auth"
     }
 
+    fn authenticated_query_param_name(&self) -> Option<&str> {
+        self.query_param_name.as_deref()
+    }
+
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
         match self.extract_key(ctx) {
             Some(key) => ExtractedCredential::ApiKey(key),

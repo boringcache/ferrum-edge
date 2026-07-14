@@ -3384,6 +3384,48 @@ fn test_decoded_query_params_capability_preserved_with_priority_override() {
 }
 
 #[test]
+fn test_opa_body_buffering_is_deferred_until_after_authentication() {
+    let mut plugin_config = make_plugin_config_with_json(
+        "ps1",
+        "opa",
+        json!({
+            "opa_host": "http://opa.internal:8181",
+            "policy_path": "ferrum/authz/allow",
+            "include_body": true,
+            "max_body_bytes": 4096
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin_config.priority_override = Some(2081);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![plugin_config],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let caps = cache.get_capabilities("p1", ProxyProtocol::Http);
+    assert!(
+        caps.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHORIZE),
+        "OPA include_body must advertise post-authentication authorize buffering"
+    );
+    assert!(
+        !caps.has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE),
+        "OPA must not force unauthenticated body buffering"
+    );
+    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let opa = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "opa")
+        .expect("OPA plugin is cached");
+    assert_eq!(
+        opa.request_body_buffer_limit(),
+        Some(4096),
+        "priority wrappers must preserve OPA's positive local body ceiling"
+    );
+}
+
+#[test]
 fn test_waf_sets_needs_final_request_body_context_capability() {
     // WAF returns true for `needs_final_request_body_context()` because it
     // annotates request metadata (`waf.rule_hits`, `waf.action`, etc.) from
