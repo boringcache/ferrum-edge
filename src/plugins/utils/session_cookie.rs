@@ -24,6 +24,9 @@ pub struct SessionCookieCodec {
 }
 
 impl SessionCookieCodec {
+    /// Convenience constructor with no additional AAD, used only by tests;
+    /// production paths use `new_with_aad` for context binding.
+    #[cfg(test)]
     pub fn new(
         current_secret: &str,
         previous_secret: Option<&str>,

@@ -4,23 +4,23 @@ use ferrum_edge::plugins::utils::jwks_cache::{
 };
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 fn client() -> PluginHttpClient {
     PluginHttpClient::default()
 }
 
-fn cache_test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+fn cache_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 #[tokio::test]
 async fn test_same_jwks_uri_reuses_cached_store() {
     let server = wiremock::MockServer::start().await;
     let uri = format!("{}/.well-known/jwks.json", server.uri());
-    let _guard = cache_test_lock().lock().unwrap();
+    let _guard = cache_test_lock().lock().await;
     clear_jwks_cache();
 
     let first = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
@@ -35,7 +35,7 @@ async fn test_different_jwks_uris_get_distinct_store_entries() {
     let server = wiremock::MockServer::start().await;
     let uri_a = format!("{}/issuer-a/jwks.json", server.uri());
     let uri_b = format!("{}/issuer-b/jwks.json", server.uri());
-    let _guard = cache_test_lock().lock().unwrap();
+    let _guard = cache_test_lock().lock().await;
     clear_jwks_cache();
 
     let first = get_or_create_jwks_store(&uri_a, &client(), Duration::from_secs(300));
@@ -49,7 +49,7 @@ async fn test_different_jwks_uris_get_distinct_store_entries() {
 async fn test_clear_jwks_cache_forces_store_recreation() {
     let server = wiremock::MockServer::start().await;
     let uri = format!("{}/.well-known/jwks.json", server.uri());
-    let _guard = cache_test_lock().lock().unwrap();
+    let _guard = cache_test_lock().lock().await;
     clear_jwks_cache();
 
     let first = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
@@ -66,7 +66,7 @@ async fn test_retain_active_uris_removes_stale_entries() {
     let uri_a = format!("{}/issuer-a/jwks.json", server.uri());
     let uri_b = format!("{}/issuer-b/jwks.json", server.uri());
     let uri_c = format!("{}/issuer-c/jwks.json", server.uri());
-    let _guard = cache_test_lock().lock().unwrap();
+    let _guard = cache_test_lock().lock().await;
     clear_jwks_cache();
 
     let store_a = get_or_create_jwks_store(&uri_a, &client(), Duration::from_secs(300));
@@ -104,7 +104,7 @@ async fn test_retain_active_uris_removes_stale_entries() {
 async fn test_retain_active_uris_empty_set_clears_all() {
     let server = wiremock::MockServer::start().await;
     let uri = format!("{}/.well-known/jwks.json", server.uri());
-    let _guard = cache_test_lock().lock().unwrap();
+    let _guard = cache_test_lock().lock().await;
     clear_jwks_cache();
     let original = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
     let weak = Arc::downgrade(&original);
@@ -131,7 +131,7 @@ async fn test_retain_active_uris_empty_set_clears_all() {
 async fn test_retired_store_revival_cancels_pending_reaper() {
     let server = wiremock::MockServer::start().await;
     let uri = format!("{}/.well-known/jwks.json", server.uri());
-    let _guard = cache_test_lock().lock().unwrap();
+    let _guard = cache_test_lock().lock().await;
     clear_jwks_cache();
     let old_generation = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
 
