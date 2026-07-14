@@ -1091,6 +1091,15 @@ async fn run_udp_egress_session(
     // right after selection (below) rather than pinning the generation for the
     // session's lifetime.
     let proxy = entry.relay_proxy.as_ref();
+    let mut observability = super::mesh_egress_observability::CapturedMeshEgressLifecycle::start(
+        &epoch,
+        proxy,
+        crate::plugins::ProxyProtocol::Udp,
+        key.client.ip(),
+        &entry.service_fqdn,
+        key.orig_dst.port(),
+    )
+    .await;
 
     // ── Fail-closed egress gates (mirrors handle_mesh_tcp_egress) ──────────
     // Engage the per-port LB lane (algorithm / locality) when all upstream
@@ -1194,6 +1203,9 @@ async fn run_udp_egress_session(
     drop(epoch);
     let _lb_guard =
         LoadBalancerConnectionGuard::new(Some(std::sync::Arc::clone(&target)), balancer);
+    if let Some(observability) = observability.as_mut() {
+        observability.set_target(&target);
+    }
 
     if state.gateway_svid_bundle.load().is_none() {
         warn!(
@@ -1473,6 +1485,8 @@ async fn run_udp_egress_session(
     let return_client = key.client;
     let return_socket = reply_socket.clone();
     let return_activity = last_activity.clone();
+    let bytes_received = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let return_bytes_received = std::sync::Arc::clone(&bytes_received);
     let return_path = async move {
         let mut buf = bytes::BytesMut::with_capacity(super::mesh_udp_frame::MAX_FRAME_PAYLOAD);
         loop {
@@ -1492,6 +1506,8 @@ async fn run_udp_egress_session(
                         );
                         break;
                     }
+                    return_bytes_received
+                        .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 Ok(None) => break, // tunnel half-closed
                 Err(_) => break,   // tunnel read error
@@ -1505,6 +1521,8 @@ async fn run_udp_egress_session(
     // by `write_deadline` so a stalled HBONE peer tears the session down instead
     // of leaking this task (codex r2 P2).
     let egress_activity = last_activity.clone();
+    let bytes_sent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let egress_bytes_sent = std::sync::Arc::clone(&bytes_sent);
     // Moved into the egress loop: it is the sole drainer, so it owns releasing
     // the byte reservations. (The recv loop only ever ADDS to this counter.)
     let egress_queued_bytes = queued_bytes;
@@ -1529,7 +1547,10 @@ async fn run_udp_egress_session(
                 continue;
             }
             match tokio::time::timeout(write_deadline, tunnel_write.write_all(&frame)).await {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    egress_bytes_sent
+                        .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 Ok(Err(e)) => {
                     debug!(error = %e, "Mesh UDP egress: tunnel write failed; ending session");
                     break;
@@ -1581,11 +1602,18 @@ async fn run_udp_egress_session(
 
     // Any arm completing ends the session (and, on return, the caller's
     // `remove_session_if_owned` frees the slot + decrements `active_sessions`).
-    tokio::select! {
-        _ = return_path => {}
-        _ = egress_loop => {}
-        _ = watchdog => {}
-        _ = producer_cancelled => {}
+    let outcome = tokio::select! {
+        _ = return_path => super::mesh_egress_observability::CapturedUdpOutcome::ReturnPathEnded,
+        _ = egress_loop => super::mesh_egress_observability::CapturedUdpOutcome::EgressPathEnded,
+        _ = watchdog => super::mesh_egress_observability::CapturedUdpOutcome::IdleTimeout,
+        _ = producer_cancelled => super::mesh_egress_observability::CapturedUdpOutcome::ProducerShutdown,
+    };
+    if let Some(observability) = observability.as_mut() {
+        observability.complete_udp(
+            bytes_sent.load(std::sync::atomic::Ordering::Relaxed),
+            bytes_received.load(std::sync::atomic::Ordering::Relaxed),
+            outcome,
+        );
     }
 }
 

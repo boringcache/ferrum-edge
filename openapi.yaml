@@ -12665,14 +12665,25 @@ components:
           description: Tracing sampling percentage 0.0–100.0 (from Istio Telemetry CRD).
         custom_tags:
           type: object
+          maxProperties: 32
           additionalProperties:
             type: string
-          description: Custom tags injected into every transaction's metadata.
+            maxLength: 1024
+          description: |
+            Custom tags injected into transaction metadata and exported spans.
+            Names are limited to 128 ASCII letters, digits, `.`, `_`, or `-`
+            and cannot collide with reserved, sensitive, `mesh.*`, trace, or
+            authorization keys.
         custom_header_tags:
           type: object
+          maxProperties: 32
           additionalProperties:
             type: string
-          description: Custom tags populated from request headers (`tag_name -> header_name`).
+          description: |
+            Custom tags populated from request headers (`tag_name ->
+            header_name`). Credential-bearing source headers and reserved or
+            sensitive destination names are rejected; runtime values over 1024
+            bytes are omitted.
         metrics:
           type: object
           description: |
@@ -12685,9 +12696,17 @@ components:
                 type: object
                 required: [name, operation]
                 properties:
+                  metric:
+                    type: string
+                    description: |
+                      Metric family targeted by this override. Supported values
+                      are `REQUEST_COUNT`, `REQUEST_DURATION`, their Ferrum
+                      metric names, and `ALL_METRICS`; omitted means all metrics.
                   name:
                     type: string
-                    description: Tag name to override.
+                    description: |
+                      Tag name to override. Accepts Istio names such as
+                      `source_workload` and Ferrum `mesh.*` label names.
                   operation:
                     type: object
                     required: [type]
@@ -12710,7 +12729,10 @@ components:
               type: array
               items:
                 type: string
-              description: Names of metrics suppressed by this workload (Istio Telemetry CRD).
+              description: |
+                Names of metrics suppressed by this workload. Supported values
+                are `REQUEST_COUNT`, `REQUEST_DURATION`, their Ferrum metric
+                names, and `ALL_METRICS`.
         tracing_providers:
           type: array
           items:

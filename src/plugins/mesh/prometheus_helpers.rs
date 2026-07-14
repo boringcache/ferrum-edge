@@ -68,6 +68,120 @@ pub struct MeshRequestKey {
     pub response_code: u16,
     pub response_flags: Arc<str>,
     pub connection_security_policy: Arc<str>,
+    /// Bitset of labels removed by a Telemetry metric tag override. The
+    /// underlying values stay populated so ordered rename operations can copy a
+    /// value before removing its source label.
+    removed_labels: u16,
+}
+
+pub(crate) const MESH_METRICS_DISABLED_METADATA: &str = "mesh.metrics.disabled";
+pub(crate) const MESH_REQUEST_COUNT_OVERRIDES_METADATA: &str =
+    "mesh.metrics.request_count.tag_overrides";
+pub(crate) const MESH_REQUEST_DURATION_OVERRIDES_METADATA: &str =
+    "mesh.metrics.request_duration.tag_overrides";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MeshMetricFamily {
+    RequestCount,
+    RequestDuration,
+}
+
+impl MeshMetricFamily {
+    pub(crate) fn from_config_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_uppercase().as_str() {
+            "REQUEST_COUNT" | "FERRUM_MESH_REQUESTS_TOTAL" => Some(Self::RequestCount),
+            "REQUEST_DURATION" | "FERRUM_MESH_REQUEST_DURATION_MS" => Some(Self::RequestDuration),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn override_metadata_key(self) -> &'static str {
+        match self {
+            Self::RequestCount => MESH_REQUEST_COUNT_OVERRIDES_METADATA,
+            Self::RequestDuration => MESH_REQUEST_DURATION_OVERRIDES_METADATA,
+        }
+    }
+
+    fn disabled_name(self) -> &'static str {
+        match self {
+            Self::RequestCount => "request_count",
+            Self::RequestDuration => "request_duration",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum MeshMetricLabel {
+    SourceWorkload = 0,
+    SourceNamespace = 1,
+    SourcePrincipal = 2,
+    SourceApp = 3,
+    SourceService = 4,
+    DestinationWorkload = 5,
+    DestinationNamespace = 6,
+    DestinationPrincipal = 7,
+    DestinationApp = 8,
+    DestinationService = 9,
+    RequestProtocol = 10,
+    ResponseFlags = 11,
+    ConnectionSecurityPolicy = 12,
+}
+
+impl MeshMetricLabel {
+    pub(crate) fn from_config_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "mesh.source.workload" | "source_workload" => Some(Self::SourceWorkload),
+            "mesh.source.namespace" | "source_namespace" | "source_workload_namespace" => {
+                Some(Self::SourceNamespace)
+            }
+            "mesh.source.principal" | "source_principal" => Some(Self::SourcePrincipal),
+            "mesh.source.app" | "source_app" => Some(Self::SourceApp),
+            "mesh.source.service" | "source_service" | "source_canonical_service" => {
+                Some(Self::SourceService)
+            }
+            "mesh.destination.workload" | "destination_workload" => Some(Self::DestinationWorkload),
+            "mesh.destination.namespace"
+            | "destination_namespace"
+            | "destination_workload_namespace" => Some(Self::DestinationNamespace),
+            "mesh.destination.principal" | "destination_principal" => {
+                Some(Self::DestinationPrincipal)
+            }
+            "mesh.destination.app" | "destination_app" => Some(Self::DestinationApp),
+            "mesh.destination.service"
+            | "destination_service"
+            | "destination_canonical_service" => Some(Self::DestinationService),
+            "mesh.request_protocol" | "request_protocol" => Some(Self::RequestProtocol),
+            "mesh.response_flags" | "response_flags" => Some(Self::ResponseFlags),
+            "mesh.connection_security_policy" | "connection_security_policy" => {
+                Some(Self::ConnectionSecurityPolicy)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn index(self) -> u8 {
+        self as u8
+    }
+
+    fn from_index(index: u8) -> Option<Self> {
+        match index {
+            0 => Some(Self::SourceWorkload),
+            1 => Some(Self::SourceNamespace),
+            2 => Some(Self::SourcePrincipal),
+            3 => Some(Self::SourceApp),
+            4 => Some(Self::SourceService),
+            5 => Some(Self::DestinationWorkload),
+            6 => Some(Self::DestinationNamespace),
+            7 => Some(Self::DestinationPrincipal),
+            8 => Some(Self::DestinationApp),
+            9 => Some(Self::DestinationService),
+            10 => Some(Self::RequestProtocol),
+            11 => Some(Self::ResponseFlags),
+            12 => Some(Self::ConnectionSecurityPolicy),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -283,11 +397,14 @@ pub fn record_mesh_config_received(namespace: impl AsRef<str>) {
 
 pub fn increment_mesh_federation_poll_failure(
     trust_domain: impl AsRef<str>,
-    endpoint: impl AsRef<str>,
+    _endpoint: impl AsRef<str>,
 ) {
     let key = MeshFederationPollFailureKey {
         trust_domain: Arc::from(trust_domain.as_ref()),
-        endpoint: Arc::from(endpoint.as_ref()),
+        // Federation URLs may carry credentials in userinfo, path, query, or
+        // fragment components. Keep even authenticated observability output
+        // free of those values by retaining only a fixed compatibility label.
+        endpoint: Arc::from("redacted"),
     };
     MESH_FEDERATION_POLL_FAILURES
         .entry(key)
@@ -929,7 +1046,155 @@ pub fn mesh_request_key(summary: &TransactionSummary) -> Option<MeshRequestKey> 
         response_code: summary.response_status_code,
         response_flags,
         connection_security_policy,
+        removed_labels: 0,
     })
+}
+
+pub(crate) fn mesh_metric_disabled(summary: &TransactionSummary, family: MeshMetricFamily) -> bool {
+    summary
+        .metadata
+        .get(MESH_METRICS_DISABLED_METADATA)
+        .is_some_and(|disabled| {
+            disabled
+                .split(',')
+                .any(|name| name == family.disabled_name())
+        })
+}
+
+/// Apply the prevalidated, length-prefixed metric override plan emitted by
+/// `workload_metrics` to a finalized mesh key. The compact plan is parsed in
+/// place without JSON parsing, allocation, or a lock on the request-log path.
+pub(crate) fn mesh_request_key_for_family(
+    summary: &TransactionSummary,
+    base: &MeshRequestKey,
+    family: MeshMetricFamily,
+) -> MeshRequestKey {
+    let Some(plan) = summary.metadata.get(family.override_metadata_key()) else {
+        return base.clone();
+    };
+    let mut key = base.clone();
+    apply_metric_override_plan(&mut key, plan);
+    key
+}
+
+fn apply_metric_override_plan(key: &mut MeshRequestKey, mut plan: &str) {
+    while !plan.is_empty() {
+        let Some(op) = plan.as_bytes().first().copied() else {
+            return;
+        };
+        plan = &plan[1..];
+        match op {
+            b'r' => {
+                let Some((index, rest)) = take_number_until(plan, b';') else {
+                    return;
+                };
+                let Some(label) = u8::try_from(index)
+                    .ok()
+                    .and_then(MeshMetricLabel::from_index)
+                else {
+                    return;
+                };
+                key.removed_labels |= 1u16 << label.index();
+                plan = rest;
+            }
+            b'n' => {
+                let Some((from, after_from)) = take_number_until(plan, b',') else {
+                    return;
+                };
+                let Some((to, rest)) = take_number_until(after_from, b';') else {
+                    return;
+                };
+                let Some(from) = u8::try_from(from)
+                    .ok()
+                    .and_then(MeshMetricLabel::from_index)
+                else {
+                    return;
+                };
+                let Some(to) = u8::try_from(to).ok().and_then(MeshMetricLabel::from_index) else {
+                    return;
+                };
+                if key.removed_labels & (1u16 << from.index()) == 0 {
+                    let value = metric_label_value(key, from);
+                    set_metric_label_value(key, to, value);
+                    key.removed_labels &= !(1u16 << to.index());
+                }
+                key.removed_labels |= 1u16 << from.index();
+                plan = rest;
+            }
+            b's' => {
+                let Some((index, after_index)) = take_number_until(plan, b',') else {
+                    return;
+                };
+                let Some((length, value_and_rest)) = take_number_until(after_index, b':') else {
+                    return;
+                };
+                let Some(label) = u8::try_from(index)
+                    .ok()
+                    .and_then(MeshMetricLabel::from_index)
+                else {
+                    return;
+                };
+                let Some(value) = value_and_rest.get(..length) else {
+                    return;
+                };
+                let Some(rest) = value_and_rest.get(length..) else {
+                    return;
+                };
+                let Some(rest) = rest.strip_prefix(';') else {
+                    return;
+                };
+                set_metric_label_value(key, label, intern_label(value));
+                key.removed_labels &= !(1u16 << label.index());
+                plan = rest;
+            }
+            _ => return,
+        }
+    }
+}
+
+fn take_number_until(value: &str, delimiter: u8) -> Option<(usize, &str)> {
+    let delimiter_index = value
+        .as_bytes()
+        .iter()
+        .position(|byte| *byte == delimiter)?;
+    let number = value.get(..delimiter_index)?.parse::<usize>().ok()?;
+    Some((number, value.get(delimiter_index + 1..)?))
+}
+
+fn metric_label_value(key: &MeshRequestKey, label: MeshMetricLabel) -> Arc<str> {
+    match label {
+        MeshMetricLabel::SourceWorkload => Arc::clone(&key.source_workload),
+        MeshMetricLabel::SourceNamespace => Arc::clone(&key.source_namespace),
+        MeshMetricLabel::SourcePrincipal => Arc::clone(&key.source_principal),
+        MeshMetricLabel::SourceApp => Arc::clone(&key.source_app),
+        MeshMetricLabel::SourceService => Arc::clone(&key.source_service),
+        MeshMetricLabel::DestinationWorkload => Arc::clone(&key.destination_workload),
+        MeshMetricLabel::DestinationNamespace => Arc::clone(&key.destination_namespace),
+        MeshMetricLabel::DestinationPrincipal => Arc::clone(&key.destination_principal),
+        MeshMetricLabel::DestinationApp => Arc::clone(&key.destination_app),
+        MeshMetricLabel::DestinationService => Arc::clone(&key.destination_service),
+        MeshMetricLabel::RequestProtocol => Arc::clone(&key.request_protocol),
+        MeshMetricLabel::ResponseFlags => Arc::clone(&key.response_flags),
+        MeshMetricLabel::ConnectionSecurityPolicy => Arc::clone(&key.connection_security_policy),
+    }
+}
+
+fn set_metric_label_value(key: &mut MeshRequestKey, label: MeshMetricLabel, value: Arc<str>) {
+    match label {
+        MeshMetricLabel::SourceWorkload => key.source_workload = value,
+        MeshMetricLabel::SourceNamespace => key.source_namespace = value,
+        MeshMetricLabel::SourcePrincipal => key.source_principal = value,
+        MeshMetricLabel::SourceApp => key.source_app = value,
+        MeshMetricLabel::SourceService => key.source_service = value,
+        MeshMetricLabel::DestinationWorkload => key.destination_workload = value,
+        MeshMetricLabel::DestinationNamespace => key.destination_namespace = value,
+        MeshMetricLabel::DestinationPrincipal => key.destination_principal = value,
+        MeshMetricLabel::DestinationApp => key.destination_app = value,
+        MeshMetricLabel::DestinationService => key.destination_service = value,
+        MeshMetricLabel::RequestProtocol => key.request_protocol = value,
+        MeshMetricLabel::ResponseFlags => key.response_flags = value,
+        MeshMetricLabel::ConnectionSecurityPolicy => key.connection_security_policy = value,
+    }
 }
 
 fn metadata_arc(metadata: &HashMap<String, String>, key: &str, default: &str) -> Arc<str> {
@@ -1022,25 +1287,118 @@ pub fn mesh_label_fragment(key: &MeshRequestKey, le: Option<&str>) -> String {
 
 fn mesh_label_base_fragment(key: &MeshRequestKey) -> String {
     let mut labels = String::with_capacity(512);
-    let _ = write!(
-        labels,
-        "source_workload=\"{}\",source_namespace=\"{}\",source_principal=\"{}\",source_app=\"{}\",source_service=\"{}\",destination_workload=\"{}\",destination_namespace=\"{}\",destination_principal=\"{}\",destination_app=\"{}\",destination_service=\"{}\",request_protocol=\"{}\",response_code=\"{}\",response_flags=\"{}\",connection_security_policy=\"{}\"",
-        escape_label_value(&key.source_workload),
-        escape_label_value(&key.source_namespace),
-        escape_label_value(&key.source_principal),
-        escape_label_value(&key.source_app),
-        escape_label_value(&key.source_service),
-        escape_label_value(&key.destination_workload),
-        escape_label_value(&key.destination_namespace),
-        escape_label_value(&key.destination_principal),
-        escape_label_value(&key.destination_app),
-        escape_label_value(&key.destination_service),
-        escape_label_value(&key.request_protocol),
-        key.response_code,
-        escape_label_value(&key.response_flags),
-        escape_label_value(&key.connection_security_policy)
+    write_optional_mesh_label(
+        &mut labels,
+        key,
+        MeshMetricLabel::SourceWorkload,
+        "source_workload",
+        &key.source_workload,
+    );
+    write_optional_mesh_label(
+        &mut labels,
+        key,
+        MeshMetricLabel::SourceNamespace,
+        "source_namespace",
+        &key.source_namespace,
+    );
+    write_optional_mesh_label(
+        &mut labels,
+        key,
+        MeshMetricLabel::SourcePrincipal,
+        "source_principal",
+        &key.source_principal,
+    );
+    write_optional_mesh_label(
+        &mut labels,
+        key,
+        MeshMetricLabel::SourceApp,
+        "source_app",
+        &key.source_app,
+    );
+    write_optional_mesh_label(
+        &mut labels,
+        key,
+        MeshMetricLabel::SourceService,
+        "source_service",
+        &key.source_service,
+    );
+    write_optional_mesh_label(
+        &mut labels,
+        key,
+        MeshMetricLabel::DestinationWorkload,
+        "destination_workload",
+        &key.destination_workload,
+    );
+    write_optional_mesh_label(
+        &mut labels,
+        key,
+        MeshMetricLabel::DestinationNamespace,
+        "destination_namespace",
+        &key.destination_namespace,
+    );
+    write_optional_mesh_label(
+        &mut labels,
+        key,
+        MeshMetricLabel::DestinationPrincipal,
+        "destination_principal",
+        &key.destination_principal,
+    );
+    write_optional_mesh_label(
+        &mut labels,
+        key,
+        MeshMetricLabel::DestinationApp,
+        "destination_app",
+        &key.destination_app,
+    );
+    write_optional_mesh_label(
+        &mut labels,
+        key,
+        MeshMetricLabel::DestinationService,
+        "destination_service",
+        &key.destination_service,
+    );
+    write_optional_mesh_label(
+        &mut labels,
+        key,
+        MeshMetricLabel::RequestProtocol,
+        "request_protocol",
+        &key.request_protocol,
+    );
+    if !labels.is_empty() {
+        labels.push(',');
+    }
+    let _ = write!(labels, "response_code=\"{}\"", key.response_code);
+    write_optional_mesh_label(
+        &mut labels,
+        key,
+        MeshMetricLabel::ResponseFlags,
+        "response_flags",
+        &key.response_flags,
+    );
+    write_optional_mesh_label(
+        &mut labels,
+        key,
+        MeshMetricLabel::ConnectionSecurityPolicy,
+        "connection_security_policy",
+        &key.connection_security_policy,
     );
     labels
+}
+
+fn write_optional_mesh_label(
+    labels: &mut String,
+    key: &MeshRequestKey,
+    label: MeshMetricLabel,
+    name: &str,
+    value: &str,
+) {
+    if key.removed_labels & (1u16 << label.index()) != 0 {
+        return;
+    }
+    if !labels.is_empty() {
+        labels.push(',');
+    }
+    let _ = write!(labels, "{}=\"{}\"", name, escape_label_value(value));
 }
 
 /// Current value of the aggregate ADS stream rejection counter. Test-only
@@ -1077,6 +1435,92 @@ pub fn xds_first_slice_nack_count(namespace: &str, type_url: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mesh_key() -> MeshRequestKey {
+        MeshRequestKey {
+            source_workload: Arc::from("frontend"),
+            source_namespace: Arc::from("default"),
+            source_principal: Arc::from("source-principal"),
+            source_app: Arc::from("frontend"),
+            source_service: Arc::from("frontend"),
+            destination_workload: Arc::from("backend"),
+            destination_namespace: Arc::from("default"),
+            destination_principal: Arc::from("destination-principal"),
+            destination_app: Arc::from("backend"),
+            destination_service: Arc::from("backend"),
+            request_protocol: Arc::from("http"),
+            response_code: 200,
+            response_flags: Arc::from("-"),
+            connection_security_policy: Arc::from("mutual_tls"),
+            removed_labels: 0,
+        }
+    }
+
+    #[test]
+    fn metric_override_plan_applies_after_base_attribution_in_order() {
+        let summary = TransactionSummary {
+            metadata: HashMap::from([(
+                MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
+                // Copy the source workload into destination workload, then set
+                // the source to a new value. The order is observable.
+                "n0,5;s0,4:edge;".to_string(),
+            )]),
+            ..TransactionSummary::default()
+        };
+
+        let transformed =
+            mesh_request_key_for_family(&summary, &mesh_key(), MeshMetricFamily::RequestCount);
+        let labels = mesh_label_fragment(&transformed, None);
+
+        assert!(labels.contains("source_workload=\"edge\""), "{labels}");
+        assert!(
+            labels.contains("destination_workload=\"frontend\""),
+            "{labels}"
+        );
+    }
+
+    #[test]
+    fn metric_disable_marker_is_family_specific() {
+        let summary = TransactionSummary {
+            metadata: HashMap::from([(
+                MESH_METRICS_DISABLED_METADATA.to_string(),
+                "request_duration".to_string(),
+            )]),
+            ..TransactionSummary::default()
+        };
+
+        assert!(!mesh_metric_disabled(
+            &summary,
+            MeshMetricFamily::RequestCount
+        ));
+        assert!(mesh_metric_disabled(
+            &summary,
+            MeshMetricFamily::RequestDuration
+        ));
+    }
+
+    #[test]
+    fn federation_failure_metric_never_renders_endpoint_secrets() {
+        let trust_domain = format!("security-{}-{}.example", std::process::id(), line!());
+        increment_mesh_federation_poll_failure(
+            &trust_domain,
+            "https://user:password@federation.example/secret/path?token=query-secret#fragment",
+        );
+        let mut output = String::new();
+        render_mesh_observability_metrics(&mut output);
+        let line = output
+            .lines()
+            .find(|line| {
+                line.starts_with("ferrum_mesh_federation_poll_failures_total")
+                    && line.contains(&trust_domain)
+            })
+            .expect("federation failure metric");
+
+        assert!(line.contains("endpoint=\"redacted\""), "{line}");
+        for secret in ["user", "password", "secret", "token", "fragment"] {
+            assert!(!line.contains(secret), "{secret} leaked in {line}");
+        }
+    }
 
     #[test]
     fn render_mesh_observability_metrics_evicts_stale_expired_series() {

@@ -4496,18 +4496,26 @@ fn telemetry(
             let mut disabled_metrics = Vec::new();
             if let Some(overrides) = m.get("overrides").and_then(Value::as_array) {
                 for ovr in overrides {
+                    let matched_metric = ovr
+                        .get("match")
+                        .and_then(|matcher| matcher.get("metric"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("ALL_METRICS");
                     if ovr.get("disabled").and_then(Value::as_bool).unwrap_or(false) {
-                        let metric_name = ovr
-                            .get("match")
-                            .and_then(|m| m.get("metric"))
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| {
+                        if matched_metric == "ALL_METRICS"
+                            && ovr
+                                .get("match")
+                                .and_then(|matcher| matcher.get("metric"))
+                                .is_none()
+                        {
+                            return Err(
                                 invalid_resource(
                                     object,
                                     "Telemetry metrics.overrides[].match.metric is required when disabled=true",
                                 )
-                            })?;
-                        disabled_metrics.push(metric_name.to_string());
+                            );
+                        }
+                        disabled_metrics.push(matched_metric.to_string());
                     }
                     if let Some(tags) = ovr.get("tagOverrides").and_then(Value::as_object) {
                         for (tag_name, tag_spec) in tags {
@@ -4528,6 +4536,7 @@ fn telemetry(
                                 _ => continue,
                             };
                             tag_overrides.push(MetricTagOverride {
+                                metric: Some(matched_metric.to_string()),
                                 name: tag_name.clone(),
                                 operation,
                             });
@@ -6907,6 +6916,53 @@ mod tests {
             Some("us-east")
         );
         assert!(!tracing.custom_tags.contains_key("tenant"));
+    }
+
+    #[test]
+    fn telemetry_metric_tag_overrides_preserve_match_scope() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "metrics": [{
+                        "overrides": [
+                            {
+                                "match": {"metric": "REQUEST_COUNT"},
+                                "tagOverrides": {
+                                    "source_workload": {"operation": "REMOVE"}
+                                }
+                            },
+                            {
+                                "match": {"metric": "REQUEST_DURATION"},
+                                "tagOverrides": {
+                                    "response_flags": {
+                                        "operation": "UPSERT",
+                                        "value": "duration-only"
+                                    }
+                                }
+                            }
+                        ]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let metrics = result.config.mesh.expect("mesh config").telemetry_resources[0]
+            .config
+            .metrics
+            .clone()
+            .expect("metrics config");
+        assert_eq!(metrics.tag_overrides.len(), 2);
+        assert_eq!(
+            metrics.tag_overrides[0].metric.as_deref(),
+            Some("REQUEST_COUNT")
+        );
+        assert_eq!(
+            metrics.tag_overrides[1].metric.as_deref(),
+            Some("REQUEST_DURATION")
+        );
     }
 
     #[test]

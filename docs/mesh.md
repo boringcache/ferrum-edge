@@ -1651,20 +1651,22 @@ Each section (tracing, metrics, access logging) is merged independently. Within 
 
 **Tracing configuration**:
 
-- `sampling_percentage`: 0.0--100.0 (deterministic hash-based sampling).
+- `sampling_percentage`: 0.0--100.0. New root traces use a probabilistic PRNG decision; valid upstream W3C `traceparent` and B3 sampling decisions are inherited unchanged.
 - `custom_tags`: literal key-value tags injected into every span. Tags merge by key across matching Telemetry scopes; a more-specific scope overrides only keys it names.
-- `custom_header_tags`: tags resolved from request headers at runtime. Header tags merge by key with the same more-specific-overrides behavior as literal tags.
-- Istio `customTags.environment` resolves environment variable values during translation and emits them as span tags. Treat write access to Telemetry resources as privileged: referencing secret-bearing env vars can expose those values through tracing sinks.
+- `custom_header_tags`: tags resolved from request headers at runtime. Header tags merge by key with the same more-specific-overrides behavior as literal tags. Credential-bearing source headers (`Authorization`, cookies, API/auth/CSRF tokens, and operator-configured sensitive metadata names) are rejected. Custom tag names cannot collide with `mesh.*`, `mesh_authz.*`, trace identity/sampling controls, or other reserved telemetry keys. A workload-metrics instance accepts at most 32 custom tags, 128-byte names, and 1024-byte values; an oversized runtime header value is omitted.
+- Istio `customTags.environment` never reads the Ferrum Edge process environment. `defaultValue` is the only supported value; an environment tag without `defaultValue` is omitted and emits a debug diagnostic naming the tag and requested variable. This prevents Telemetry resources from selecting process secrets by environment-variable name.
 - `providers`: inline span exporters for Zipkin v2, Datadog Agent `/v0.3/traces`, Lightstep OTLP, and OpenTelemetry OTLP/HTTP JSON. Lightstep uses `accessTokenEnv` so bearer credentials stay in the local process environment instead of mesh config JSON. Multiple providers receive the same sampled span.
 - `disable_span_reporting` / Istio `disableSpanReporting`: when explicitly true, suppresses span export while leaving the rest of the merged tracing config visible. Omitted values inherit from less-specific scopes; explicit false can re-enable a more-specific scope.
 - `match.mode` (`SERVER` / `CLIENT` / `CLIENT_AND_SERVER`, default `SERVER`): each mesh listener stamps a traffic direction onto every accepted request — sidecar / ambient / HBONE / egress inbound listeners stamp `Inbound`, sidecar/ambient outbound capture stamps `Outbound`. The translator unions every `tracing[].match.mode` across the merged Telemetry block into a single `direction_emit` on the auto-injected `workload_metrics` plugin. The plugin emits SERVER-kind spans on inbound directions and CLIENT-kind spans on outbound directions and drops the export entirely when the listener direction is not enabled. Span payloads carry the kind in every provider format: OTLP enum `2` / `3` (SERVER / CLIENT), Zipkin v2 top-level `"kind": "SERVER"` / `"CLIENT"`, and Datadog `meta["span.kind"]` set to `"server"` / `"client"`. Non-mesh listeners (file / db / cp / dp HTTP entrypoints) leave the direction unset and the plugin falls back to its server-only default.
+- Attribution follows listener direction for HTTP and stream traffic: outbound observations use the local workload as source and the routed service/selected peer as destination; inbound observations use the local workload as destination and only an authenticated peer or trusted HBONE baggage identity as source. Anonymous permissive inbound traffic never inherits the local workload's principal as its source.
+- Request-mirror backend attempts are excluded from workload-metrics spans, matching their exclusion from client-facing RED metrics and the service graph. The primary request retains the sole span for its `(trace_id, span_id)`.
 
 Datadog export groups spans by trace in the Agent v0.3 payload shape and sends the upper 64 bits of W3C 128-bit trace IDs via `_dd.p.tid` while the numeric `trace_id` field carries the low 64 bits.
 
 **Metrics configuration**:
 
-- `tag_overrides`: rename, remove, or set custom values for metric tags.
-- `disabled_metrics`: specific metric names to suppress.
+- `tag_overrides`: remove, rename, or set labels on the finalized mesh metric key. Istio label names such as `source_workload`, `destination_service`, and `response_flags` are normalized to Ferrum's `mesh.*` metadata vocabulary. Overrides preserve their `match.metric` scope and apply in declaration order. Supported metric selectors are `REQUEST_COUNT`, `REQUEST_DURATION`, `ferrum_mesh_requests_total`, `ferrum_mesh_request_duration_ms`, and `ALL_METRICS`. A changed label shape creates a new Prometheus series; the previous series ages out under the configured stale-entry TTL.
+- `disabled_metrics`: suppresses only the selected mesh metric family before its counter or histogram is updated. It accepts the same metric selectors as `tag_overrides`. Newly accepted Telemetry configuration affects subsequent transactions immediately; an already-created series remains visible at its last value until the Prometheus stale-entry TTL evicts it, and re-enabling resumes recording without a restart.
 
 **Access logging configuration**:
 
