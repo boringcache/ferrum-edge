@@ -214,9 +214,9 @@ need the body (caching, compression, response transforms, or `waf` for an
 allowlisted type) are unaffected. With retries configured, ordinary responses
 stay buffered. An active buffering plugin may explicitly opt an inherently
 streaming representation out after headers arrive only when every other active
-buffering plugin reports that it does not need that content type; MCP uses this
-for `text/event-stream`, whose retry decision is complete from status and
-headers and whose body must not be collected to EOF.
+buffering plugin reports that it does not need that content type; the MCP and
+A2A gateways use this for `text/event-stream`, whose retry decision is complete
+from status and headers and whose body must not be collected to EOF.
 
 **Protocol coverage.** The downgrade applies on the HTTP/1.1 + HTTP/2 (reqwest),
 direct-HTTP/2, and HBONE backend paths. **Native HTTP/3**, the **HTTP/3
