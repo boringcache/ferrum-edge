@@ -546,6 +546,19 @@ fn ldap_auth_schema_matches_runtime_invariants() {
             "starttls": true
         }),
         json!({
+            "ldap_url": "ldap://directory.example.test:389",
+            "bind_dn_template": "uid={username},dc=example,dc=com",
+            "allow_plaintext": true
+        }),
+        json!({
+            "ldap_url": "ldap://127.0.0.1:389",
+            "bind_dn_template": "uid={username},dc=example,dc=com"
+        }),
+        json!({
+            "ldap_url": "ldap://LOCALHOST:389",
+            "bind_dn_template": "uid={username},dc=example,dc=com"
+        }),
+        json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "search_base_dn": "ou=users,dc=example,dc=com",
             "search_filter": "(uid={username})",
@@ -617,6 +630,10 @@ fn ldap_auth_schema_matches_runtime_invariants() {
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
             "starttls": true
+        }),
+        json!({
+            "ldap_url": "ldap://directory.example.test:389",
+            "bind_dn_template": "uid={username},dc=example,dc=com"
         }),
         json!({
             "ldap_url": "ldaps://admin:secret@ldap.example.com:636",

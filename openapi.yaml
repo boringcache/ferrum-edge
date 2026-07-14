@@ -11541,6 +11541,24 @@ components:
           then:
             required: [service_account_dn, service_account_password]
         - if:
+            required: [ldap_url]
+            properties:
+              ldap_url:
+                pattern: "^ldap://"
+          then:
+            anyOf:
+              - required: [starttls]
+                properties:
+                  starttls:
+                    const: true
+              - required: [allow_plaintext]
+                properties:
+                  allow_plaintext:
+                    const: true
+              - properties:
+                  ldap_url:
+                    pattern: '^ldap://(?:127(?:\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){3}|\[::1\]|(?:[^/?#@]+\.)?[lL][oO][cC][aA][lL][hH][oO][sS][tT]\.?)(?::[0-9]+)?(?:[/?#]|$)'
+        - if:
             required: [required_groups]
             properties:
               required_groups:
