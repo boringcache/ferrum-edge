@@ -53,6 +53,7 @@ impl JwtAuth {
         let config_obj = config
             .as_object()
             .ok_or_else(|| format!("jwt_auth: config must be an object, got: {config}"))?;
+        reject_unknown_keys(config_obj)?;
         let token_lookup = parse_token_lookup(config_obj.get("token_lookup"))?;
         let consumer_claim_field = parse_non_empty_string(
             config_obj.get("consumer_claim_field"),
@@ -130,6 +131,27 @@ impl JwtAuth {
             TokenLookup::Query(param_name) => ctx.query_params.get(param_name.as_str()).cloned(),
         }
     }
+}
+
+/// Reject unrecognized config keys so misspelled issuer or audience policy
+/// fails configuration validation instead of silently disabling enforcement.
+fn reject_unknown_keys(config: &serde_json::Map<String, Value>) -> Result<(), String> {
+    const KNOWN_KEYS: [&str; 8] = [
+        "token_lookup",
+        "consumer_claim_field",
+        "require_exp",
+        "require_nbf",
+        "expected_issuer",
+        "expected_issuers",
+        "audiences",
+        "leeway_secs",
+    ];
+    for key in config.keys() {
+        if !KNOWN_KEYS.contains(&key.as_str()) {
+            return Err(format!("jwt_auth: unknown config key '{key}'"));
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]

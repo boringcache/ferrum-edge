@@ -705,10 +705,7 @@ async fn test_http_family_plugins_complete_coverage() {
             "jwks_auth",
             json!({"providers": [{"issuer": "test", "jwks_uri": "http://127.0.0.1:9/.well-known/jwks.json"}]}),
         ),
-        (
-            "jwt_auth",
-            json!({"secret": "test-secret-key-at-least-32-chars-long!!"}),
-        ),
+        ("jwt_auth", json!({})),
     ];
 
     for (name, config) in plugins {

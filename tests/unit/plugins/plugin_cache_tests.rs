@@ -1243,6 +1243,62 @@ fn test_apply_delta_rejects_invalid_security_plugin() {
 }
 
 #[test]
+fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
+    let config1 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc1"])],
+        vec![make_plugin_config(
+            "pc1",
+            "stdout_logging",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+
+    let config2 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc1", "pc2"])],
+        vec![
+            make_plugin_config(
+                "pc1",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            PluginConfig {
+                id: "pc2".to_string(),
+                namespace: ferrum_edge::config::types::default_namespace(),
+                plugin_name: "jwt_auth".to_string(),
+                config: json!({"audience": ["payments-api"]}),
+                scope: PluginScope::Proxy,
+                proxy_id: Some("p1".to_string()),
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        ],
+    );
+
+    let proxy_ids = std::collections::HashSet::from(["p1".to_string()]);
+    let error = cache
+        .apply_delta(&config2, &proxy_ids, &[], false)
+        .expect_err("unknown jwt_auth key must reject the reload");
+    assert!(
+        error
+            .to_string()
+            .contains("jwt_auth: unknown config key 'audience'"),
+        "unexpected reload error: {error}"
+    );
+
+    let plugins = cache.get_plugins("p1");
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].name(), "stdout_logging");
+}
+
+#[test]
 fn test_plugin_cache_rejects_invalid_waf_config_as_security_plugin() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["pc1"])],
