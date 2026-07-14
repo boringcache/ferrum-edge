@@ -688,8 +688,27 @@ impl JwksAuth {
                         external_identity,
                         external_identity_header,
                     } => {
+                        let external_identity =
+                            external_identity.filter(|identity| !identity.trim().is_empty());
+                        let external_identity_header = external_identity_header
+                            .filter(|identity_header| !identity_header.trim().is_empty());
                         let consumer_identified = consumer.is_some();
                         let external_identity_identified = external_identity.is_some();
+
+                        // Transactional commit: a verified token that resolves
+                        // no principal (blank/missing identity claim) must
+                        // leave no identity-derived state behind. In
+                        // `auth_mode: multi` a later credential can still
+                        // authenticate this request, and claim-header, mesh
+                        // principal, or token-stripping metadata staged here
+                        // would then be applied under that other credential's
+                        // authority in `before_proxy`.
+                        if !consumer_identified && !external_identity_identified {
+                            debug!(
+                                "jwks_auth: token verified but no principal resolved; skipping identity side effects"
+                            );
+                            return PluginResult::Continue;
+                        }
 
                         if let Some(consumer) = consumer
                             && ctx.identified_consumer.is_none()
@@ -705,9 +724,7 @@ impl JwksAuth {
                             ctx.authenticated_identity_header = Some(external_identity_header);
                         }
 
-                        if ctx.auth_method.is_none()
-                            && (consumer_identified || external_identity_identified)
-                        {
+                        if ctx.auth_method.is_none() {
                             ctx.auth_method = Some("jwks_auth");
                         }
                         if self.emit_mesh_request_principal_metadata {

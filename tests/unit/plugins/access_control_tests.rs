@@ -144,6 +144,19 @@ async fn test_access_control_rejects_blank_rules() {
         }))
         .is_err()
     );
+    assert!(
+        AccessControl::new(&json!({
+            "allowed_groups": ["a".repeat(256)]
+        }))
+        .is_err()
+    );
+    assert!(
+        AccessControl::new(&json!({
+            "disallowed_consumers": ["a".repeat(4097)],
+            "allow_authenticated_identity": true
+        }))
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -526,6 +539,39 @@ async fn test_access_control_disallowed_external_identity_is_rejected() {
     ctx.authenticated_identity = Some("alice".to_string());
     let result = plugin.authorize(&mut ctx).await;
     assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn test_access_control_can_revoke_long_external_identity_exactly() {
+    let long_identity = format!("spiffe://example.test/workload/{}", "a".repeat(300));
+    let plugin = AccessControl::new(&json!({
+        "disallowed_consumers": [long_identity],
+        "allow_authenticated_identity": true
+    }))
+    .unwrap();
+
+    let mut denied = create_test_context();
+    denied.identified_consumer = None;
+    denied.authenticated_identity = Some(long_identity.clone());
+    assert_reject(plugin.authorize(&mut denied).await, Some(403));
+
+    let mut distinct = create_test_context();
+    distinct.identified_consumer = None;
+    distinct.authenticated_identity = Some(format!("{long_identity}-other"));
+    assert_continue(plugin.authorize(&mut distinct).await);
+}
+
+#[tokio::test]
+async fn test_access_control_fails_closed_for_external_identity_beyond_rule_bound() {
+    let plugin = AccessControl::new(&json!({
+        "allow_authenticated_identity": true
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some("a".repeat(4097));
+
+    assert_reject(plugin.authorize(&mut ctx).await, Some(403));
 }
 
 #[tokio::test]

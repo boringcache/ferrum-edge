@@ -1882,7 +1882,7 @@ UDP+DTLS streams via certificate-based consumer mapping.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
-| `disallowed_consumers` | String[] | `[]` | Consumer usernames explicitly denied. Takes precedence over every allow rule. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
+| `disallowed_consumers` | String[] | `[]` | Consumer usernames or, with `allow_authenticated_identity`, external principals explicitly denied. Takes precedence over every allow rule. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and may be up to 4096 characters so JWT/OIDC/SPIFFE-style principals are not constrained by the 255-character gateway Consumer username ceiling. |
 | `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
 | `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
 | `allow_authenticated_identity` | bool | `false` | Allows requests with a meaningful, non-whitespace `ctx.authenticated_identity` even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
@@ -1896,7 +1896,8 @@ so the combination would silently bypass the allow-list for every
 externally-authenticated-but-unmapped caller. The combination is rejected at
 config validation. The `disallowed_consumers` deny-list is still applied to the
 external identity string, so it may be combined with `allow_authenticated_identity`
-to revoke a compromised principal.
+to revoke a compromised principal. External identities longer than the 4096-character
+exact-rule bound fail closed instead of bypassing the deny-list.
 
 An authenticated external identity that is not enabled by this policy is an
 authorization denial: HTTP requests receive 403 and native gRPC requests receive

@@ -13279,12 +13279,16 @@ components:
           items:
             type: string
             minLength: 1
-            maxLength: 255
+            maxLength: 4096
             pattern: '\S'
           default: []
           description: >-
-            Consumer usernames that are explicitly denied. Takes precedence
-            over every allow rule.
+            Consumer usernames or, when allow_authenticated_identity is true,
+            exact external principals that are explicitly denied. Takes
+            precedence over every allow rule. The 4096-character bound is
+            independent of the 255-character gateway Consumer username ceiling
+            so JWT, OIDC, and SPIFFE-style principals can be revoked; longer
+            external identities fail closed at runtime.
         allowed_groups:
           type: array
           items:

@@ -1,15 +1,18 @@
 //! Tests for jwks_auth plugin
 
 use ferrum_edge::ConsumerIndex;
+use ferrum_edge::config::types::AuthMode;
 use ferrum_edge::plugins::{
     HTTP_FAMILY_PROTOCOLS, JwtAuthAttributeValue, Plugin, PluginHttpClient, RequestContext,
-    jwks_auth::JwksAuth, priority,
+    jwks_auth::JwksAuth, key_auth::KeyAuth, priority,
 };
+use ferrum_edge::proxy::run_authentication_phase;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::plugin_utils::{assert_continue, assert_reject};
+use super::plugin_utils::{assert_continue, assert_reject, create_test_consumer};
 
 static JWKS_TEST_PATH_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -1428,6 +1431,72 @@ async fn test_jwks_auth_signed_tokens_do_not_authenticate_blank_identity_claims(
         assert!(ctx.authenticated_identity.is_none());
         assert!(ctx.effective_identity().is_none());
         assert!(ctx.auth_method.is_none());
+    }
+}
+
+#[tokio::test]
+async fn jwks_multi_auth_does_not_commit_failed_attempt_header_side_effects() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let jwks = Arc::new(
+        JwksAuth::new(
+            &json!({
+                "providers": [{
+                    "jwks_uri": jwks_uri,
+                    "forward_original_token": false,
+                    "claim_headers": {"email": "X-Untrusted-Email"}
+                }]
+            }),
+            default_client(),
+        )
+        .unwrap(),
+    );
+    jwks.warmup_jwks().await;
+    let key_auth: Arc<dyn Plugin> =
+        Arc::new(KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap());
+    let consumers = [create_test_consumer()];
+    let consumer_index = ConsumerIndex::new(&consumers);
+
+    let attempted_tokens = [
+        create_rs256_token(
+            &json!({"email": "missing-principal@example.test"}),
+            private_key_pem,
+        ),
+        create_rs256_token(
+            &json!({"sub": "  \t", "email": "blank-principal@example.test"}),
+            private_key_pem,
+        ),
+        "not-a-jwt".to_string(),
+    ];
+
+    for attempted_token in attempted_tokens {
+        let mut ctx = make_ctx();
+        let expected_authorization = format!("Bearer {attempted_token}");
+        ctx.headers
+            .insert("authorization".to_string(), expected_authorization.clone());
+        ctx.headers
+            .insert("x-api-key".to_string(), "test-api-key".to_string());
+
+        let jwks_plugin: Arc<dyn Plugin> = jwks.clone();
+        let auth_plugins: Vec<Arc<dyn Plugin>> = vec![jwks_plugin, Arc::clone(&key_auth)];
+        let rejection =
+            run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+                .await;
+        assert!(rejection.is_none(), "later key_auth must authenticate");
+        assert_eq!(ctx.auth_method, Some("key_auth"));
+
+        let mut headers = ctx.headers.clone();
+        assert_continue(jwks.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some(expected_authorization.as_str()),
+            "an uncommitted JWKS attempt must not strip its credential"
+        );
+        assert!(
+            !headers.contains_key("x-untrusted-email"),
+            "an uncommitted JWKS attempt must not fan out claims"
+        );
     }
 }
 

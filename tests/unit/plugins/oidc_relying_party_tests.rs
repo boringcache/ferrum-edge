@@ -1,13 +1,18 @@
+use ferrum_edge::_test_support::oidc_sealed_session_cookie_for_test;
 use ferrum_edge::ConsumerIndex;
+use ferrum_edge::config::types::AuthMode;
 use ferrum_edge::plugins::validate_plugin_config;
 use ferrum_edge::plugins::{
-    Plugin, PluginHttpClient, PluginResult, RequestContext, oidc_relying_party::OidcRelyingParty,
-    priority,
+    Plugin, PluginHttpClient, PluginResult, RequestContext, key_auth::KeyAuth,
+    oidc_relying_party::OidcRelyingParty, priority,
 };
+use ferrum_edge::proxy::run_authentication_phase;
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Arc;
 use url::Url;
 
-use super::plugin_utils::assert_reject;
+use super::plugin_utils::{assert_continue, assert_reject, create_test_consumer};
 
 fn base_config() -> serde_json::Value {
     json!({
@@ -51,6 +56,139 @@ async fn new_accepts_minimal_cookie_store_config() {
     let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default()).unwrap();
     assert_eq!(plugin.name(), "oidc_relying_party");
     assert_eq!(plugin.priority(), priority::OIDC_RELYING_PARTY);
+}
+
+#[tokio::test]
+async fn oidc_success_commits_claim_headers_and_rolling_cookie_together() {
+    let mut config = base_config();
+    config["providers"][0]["consumer_identity_claim"] = json!("email");
+    config["providers"][0]["claim_headers"] = json!({"role": "X-Trusted-Role"});
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let set_cookie = oidc_sealed_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "external@example.test",
+            "role": "operator",
+            "exp": now + 3600
+        }),
+        true,
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+    ctx.headers.insert(
+        "cookie".to_string(),
+        set_cookie.split(';').next().unwrap().to_string(),
+    );
+
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert_eq!(
+        ctx.authenticated_identity.as_deref(),
+        Some("external@example.test")
+    );
+    assert_eq!(ctx.auth_method, Some("oidc_relying_party"));
+
+    let mut request_headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut request_headers).await);
+    assert_eq!(
+        request_headers.get("x-trusted-role").map(String::as_str),
+        Some("operator")
+    );
+    let mut response_headers = HashMap::new();
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+    );
+    assert!(response_headers.contains_key("set-cookie"));
+}
+
+#[tokio::test]
+async fn oidc_multi_auth_discards_uncommitted_attempt_metadata() {
+    let mut config = base_config();
+    config["providers"][0]["consumer_identity_claim"] = json!("email");
+    config["providers"][0]["claim_headers"] = json!({"role": "X-Untrusted-Role"});
+    config["providers"][0]["required_scopes"] = json!(["admin"]);
+    let oidc = Arc::new(OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap());
+    let key_auth: Arc<dyn Plugin> =
+        Arc::new(KeyAuth::new(&json!({"key_location": "header:X-API-Key"})).unwrap());
+    let consumers = [create_test_consumer()];
+    let consumer_index = ConsumerIndex::new(&consumers);
+    let now = chrono::Utc::now().timestamp();
+    let attempted_cookies = [
+        oidc_sealed_session_cookie_for_test(
+            &oidc,
+            json!({
+                "sub": "oidc-subject",
+                "email": "   ",
+                "role": "attacker",
+                "scope": "admin",
+                "exp": now + 3600
+            }),
+            true,
+        )
+        .unwrap(),
+        oidc_sealed_session_cookie_for_test(
+            &oidc,
+            json!({
+                "sub": "oidc-subject",
+                "role": "attacker",
+                "scope": "admin",
+                "exp": now + 3600
+            }),
+            true,
+        )
+        .unwrap(),
+        oidc_sealed_session_cookie_for_test(
+            &oidc,
+            json!({
+                "sub": "oidc-subject",
+                "email": "rejected@example.test",
+                "role": "attacker",
+                "scope": "viewer",
+                "exp": now + 3600
+            }),
+            true,
+        )
+        .unwrap(),
+        "ferrum_session=invalid-session".to_string(),
+    ];
+
+    for attempted_cookie in attempted_cookies {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+        ctx.headers.insert(
+            "cookie".to_string(),
+            attempted_cookie.split(';').next().unwrap().to_string(),
+        );
+        ctx.headers
+            .insert("x-api-key".to_string(), "test-api-key".to_string());
+        let oidc_plugin: Arc<dyn Plugin> = oidc.clone();
+
+        let rejection = run_authentication_phase(
+            AuthMode::Multi,
+            &[oidc_plugin, Arc::clone(&key_auth)],
+            &mut ctx,
+            &consumer_index,
+        )
+        .await;
+        assert!(rejection.is_none(), "later key_auth must authenticate");
+        assert_eq!(ctx.auth_method, Some("key_auth"));
+
+        let mut request_headers = HashMap::new();
+        assert_continue(oidc.before_proxy(&mut ctx, &mut request_headers).await);
+        assert!(!request_headers.contains_key("x-untrusted-role"));
+        let mut response_headers = HashMap::new();
+        assert_continue(oidc.after_proxy(&mut ctx, 200, &mut response_headers).await);
+        assert!(
+            !response_headers.contains_key("set-cookie"),
+            "an uncommitted OIDC attempt must not publish rolling session state"
+        );
+    }
 }
 
 #[test]

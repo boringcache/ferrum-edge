@@ -95,6 +95,26 @@ impl VerifyOutcome {
     pub fn consumer(consumer: Arc<Consumer>) -> Self {
         Self::success(Some(consumer), None, None)
     }
+
+    /// True when this outcome established a principal: a mapped Consumer or a
+    /// nonblank external identity. Auth attempts must treat this as the commit
+    /// gate for every identity-derived side effect (claim-header fanout,
+    /// token-stripping metadata, identity header staging): an attempt that
+    /// verifies a credential but resolves no principal is not an
+    /// authentication, and in `auth_mode: multi` a later credential can still
+    /// authenticate the request — any state staged by the failed attempt would
+    /// then be applied under that other credential's authority.
+    pub fn establishes_principal(&self) -> bool {
+        matches!(
+            self,
+            Self::Success {
+                consumer,
+                external_identity,
+                ..
+            } if consumer.is_some()
+                || crate::plugins::meaningful_identity(external_identity.as_deref()).is_some()
+        )
+    }
 }
 
 macro_rules! impl_auth_plugin {
@@ -196,6 +216,19 @@ async fn run_auth_impl<M: AuthMechanism>(
                 let external_identity_identified =
                     allow_external_identity && external_identity.is_some();
 
+                // Transactional commit: an attempt that verified a credential
+                // but resolved no principal contributes nothing to the request
+                // context. Without this, a nonblank header claim paired with a
+                // blank identity claim would stage `authenticated_identity_header`
+                // residue that a later successful credential then forwards.
+                if !consumer_identified && !external_identity_identified {
+                    debug!(
+                        "{}: credential verified but no principal resolved; skipping identity commit",
+                        mechanism.mechanism_name()
+                    );
+                    return PluginResult::Continue;
+                }
+
                 if let Some(consumer) = consumer
                     && ctx.identified_consumer.is_none()
                 {
@@ -216,9 +249,7 @@ async fn run_auth_impl<M: AuthMechanism>(
                     }
                 }
 
-                if ctx.auth_method.is_none()
-                    && (consumer_identified || external_identity_identified)
-                {
+                if ctx.auth_method.is_none() {
                     ctx.auth_method = Some(mechanism.mechanism_name());
                 }
                 PluginResult::Continue

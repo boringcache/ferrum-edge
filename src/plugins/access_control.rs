@@ -35,6 +35,13 @@ use tracing::warn;
 
 use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
 
+// External principals (JWT/OIDC subjects, SPIFFE IDs, LDAP DNs, and similar)
+// are not gateway Consumer usernames and can legitimately exceed the internal
+// username ceiling. Keep an independent finite bound for exact deny rules and
+// fail closed for larger external identities so no admitted principal is too
+// large to revoke through this plugin.
+const MAX_EXTERNAL_IDENTITY_LENGTH: usize = 4096;
+
 pub struct AccessControl {
     /// O(1) consumer allow list (empty = no restriction).
     allowed_consumers: HashSet<String>,
@@ -60,10 +67,30 @@ impl AccessControl {
         reject_removed_ip_keys(object)?;
         reject_unknown_keys(object)?;
 
-        let allowed = parse_string_set(object, "allowed_consumers")?;
-        let disallowed = parse_string_set(object, "disallowed_consumers")?;
-        let allowed_groups = parse_string_set(object, "allowed_groups")?;
-        let disallowed_groups = parse_string_set(object, "disallowed_groups")?;
+        let allowed = parse_string_set(
+            object,
+            "allowed_consumers",
+            crate::config::types::MAX_USERNAME_LENGTH,
+            false,
+        )?;
+        let disallowed = parse_string_set(
+            object,
+            "disallowed_consumers",
+            MAX_EXTERNAL_IDENTITY_LENGTH,
+            true,
+        )?;
+        let allowed_groups = parse_string_set(
+            object,
+            "allowed_groups",
+            crate::config::types::MAX_ACL_GROUP_LENGTH,
+            false,
+        )?;
+        let disallowed_groups = parse_string_set(
+            object,
+            "disallowed_groups",
+            crate::config::types::MAX_ACL_GROUP_LENGTH,
+            false,
+        )?;
         let allow_authenticated_identity =
             parse_bool(object, "allow_authenticated_identity")?.unwrap_or(false);
         let has_allow_rules = !allowed.is_empty() || !allowed_groups.is_empty();
@@ -121,9 +148,21 @@ impl AccessControl {
                     // not consulted here; `new()` rejects combining it with
                     // `allow_authenticated_identity`, so `has_allow_rules` is always
                     // false on this path.
+                    if identity.chars().count() > MAX_EXTERNAL_IDENTITY_LENGTH {
+                        warn!(
+                            client_ip = %client_ip,
+                            plugin = "access_control",
+                            reason = "external_identity_too_long",
+                            "External identity exceeded access-control admission bound"
+                        );
+                        return PluginResult::Reject {
+                            status_code: 403,
+                            body: r#"{"error":"Identity is not allowed"}"#.into(),
+                            headers: HashMap::new(),
+                        };
+                    }
                     if self.disallowed_consumers.contains(identity) {
                         warn!(
-                            consumer = %identity,
                             client_ip = %client_ip,
                             plugin = "access_control",
                             reason = "external_identity_disallowed",
@@ -247,6 +286,8 @@ fn reject_unknown_keys(object: &serde_json::Map<String, Value>) -> Result<(), St
 fn parse_string_set(
     object: &serde_json::Map<String, Value>,
     field: &str,
+    max_length: usize,
+    count_unicode_characters: bool,
 ) -> Result<HashSet<String>, String> {
     let Some(value) = object.get(field) else {
         return Ok(HashSet::new());
@@ -272,12 +313,12 @@ fn parse_string_set(
                 "access_control: '{field}' entries must contain non-whitespace characters"
             ));
         }
-        let max_length = if field.ends_with("_groups") {
-            crate::config::types::MAX_ACL_GROUP_LENGTH
+        let raw_length = if count_unicode_characters {
+            raw.chars().count()
         } else {
-            crate::config::types::MAX_USERNAME_LENGTH
+            raw.len()
         };
-        if raw.len() > max_length {
+        if raw_length > max_length {
             return Err(format!(
                 "access_control: '{field}' entries must not exceed {max_length} characters"
             ));

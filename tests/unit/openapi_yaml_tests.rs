@@ -560,6 +560,10 @@ fn access_control_schema_matches_runtime_validation() {
         json!({"allow_authenticated_identity": true}),
         json!({"allow_authenticated_identity": true, "allowed_consumers": []}),
         json!({"allowed_consumers": ["  alice  "]}),
+        json!({
+            "disallowed_consumers": ["a".repeat(256)],
+            "allow_authenticated_identity": true
+        }),
     ] {
         assert!(
             validator.validate(&config).is_ok(),
@@ -582,6 +586,10 @@ fn access_control_schema_matches_runtime_validation() {
         json!({"allowed_groups": ["\n"]}),
         json!({"disallowed_groups": ["   "]}),
         json!({"allowed_consumers": ["a".repeat(256)]}),
+        json!({
+            "disallowed_consumers": ["a".repeat(4097)],
+            "allow_authenticated_identity": true
+        }),
     ] {
         assert!(
             validator.validate(&config).is_err(),

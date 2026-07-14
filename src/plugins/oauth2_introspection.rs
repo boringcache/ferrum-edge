@@ -432,11 +432,20 @@ impl Oauth2Introspection {
                 if let Err((status, body)) = self.check_claims_authorization(&claims, provider) {
                     return reject(status, body);
                 }
-                self.emit_claim_headers(ctx, &claims, provider);
-                if !provider.forward_original_token {
-                    self.mark_original_token_stripping_metadata(ctx, &token, candidate);
-                }
+                // Transactional commit: resolve the principal before staging
+                // any identity-derived side effects. A token that introspects
+                // as active but resolves no principal (blank/missing identity
+                // claim) must not leave claim-header or token-stripping
+                // metadata behind — in `auth_mode: multi` a later credential
+                // can authenticate this request and that staged state would be
+                // applied under the other credential's authority.
                 let outcome = self.resolve_identity(&claims, provider, consumer_index);
+                if outcome.establishes_principal() {
+                    self.emit_claim_headers(ctx, &claims, provider);
+                    if !provider.forward_original_token {
+                        self.mark_original_token_stripping_metadata(ctx, &token, candidate);
+                    }
+                }
                 apply_verify_outcome(ctx, outcome, "oauth2_introspection")
             }
         }
@@ -1236,8 +1245,18 @@ fn apply_verify_outcome(
             external_identity,
             external_identity_header,
         } => {
+            let external_identity =
+                external_identity.filter(|identity| !identity.trim().is_empty());
+            let external_identity_header = external_identity_header
+                .filter(|identity_header| !identity_header.trim().is_empty());
             let consumer_identified = consumer.is_some();
             let external_identity_identified = external_identity.is_some();
+            // No principal resolved: commit nothing, including a nonblank
+            // header claim, so no identity residue survives into a request a
+            // later credential authenticates.
+            if !consumer_identified && !external_identity_identified {
+                return PluginResult::Continue;
+            }
             if let Some(consumer) = consumer
                 && ctx.identified_consumer.is_none()
             {
@@ -1249,7 +1268,7 @@ fn apply_verify_outcome(
             if let Some(external_identity_header) = external_identity_header {
                 ctx.authenticated_identity_header = Some(external_identity_header);
             }
-            if ctx.auth_method.is_none() && (consumer_identified || external_identity_identified) {
+            if ctx.auth_method.is_none() {
                 ctx.auth_method = Some(auth_method);
             }
             PluginResult::Continue
