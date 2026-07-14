@@ -9,7 +9,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use ferrum_edge::config::types::{
     BackendTlsConfig, GatewayConfig, PluginConfig, PluginScope, Proxy, ResolvedPortOverride,
-    Upstream, UpstreamPortOverride,
+    RetryConfig, Upstream, UpstreamPortOverride,
 };
 use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
@@ -227,6 +227,32 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
                 "redirect": {"redirect_code": 308, "redirect_cod": 307}
             }]
         }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "retry": {"max_retry": 2}
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "retry": {
+                    "backoff": {"fixed": {"delay_ms": 25, "delay_millis": 25}}
+                }
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {
+                    "backend_host": "api.internal",
+                    "backend_port": 443,
+                    "backend_tls": {"client_certpath": "/tls/client.pem"}
+                }
+            }]
+        }),
     ];
 
     for config in invalid_configs {
@@ -234,6 +260,18 @@ fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
             .expect_err("unknown mesh_route_dispatch fields must fail closed");
         assert!(error.contains("unknown field"), "got: {error}");
     }
+}
+
+#[test]
+fn mesh_route_dispatch_strict_nested_policy_does_not_change_shared_types() {
+    let retry = serde_json::from_value::<RetryConfig>(json!({"max_retry": 2}))
+        .expect("shared retry config keeps its existing compatibility boundary");
+    assert_eq!(retry, RetryConfig::default());
+
+    let tls =
+        serde_json::from_value::<BackendTlsConfig>(json!({"client_certpath": "/tls/client.pem"}))
+            .expect("shared backend TLS config keeps its existing compatibility boundary");
+    assert_eq!(tls, BackendTlsConfig::default_verify());
 }
 
 #[tokio::test]

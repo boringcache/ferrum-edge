@@ -325,6 +325,77 @@ fn mesh_route_dispatch_rejects_priority_interleaving_before_fail_closed_finaliza
     };
     assert!(error.contains("must remain contiguous"), "got: {error}");
     assert!(error.contains("priority overrides"), "got: {error}");
+    assert!(error.contains("HTTP-family"), "got: {error}");
+}
+
+#[test]
+fn mesh_route_dispatch_ignores_non_http_interleaving_when_finalizing() {
+    let first_route = make_plugin_config_with_json(
+        "first-route",
+        "mesh_route_dispatch",
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "get-backend"}
+            }],
+            "reject_unmatched": true
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let mut tcp_only = make_plugin_config(
+        "tcp-throttle",
+        "tcp_connection_throttle",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    tcp_only.priority_override = Some(3030);
+    let mut second_route = make_plugin_config_with_json(
+        "second-route",
+        "mesh_route_dispatch",
+        json!({
+            "rules": [{
+                "match": {"methods": ["POST"]},
+                "destination": {"upstream_id": "post-backend"}
+            }],
+            "reject_unmatched": true
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    second_route.priority_override = Some(3040);
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["first-route", "tcp-throttle", "second-route"],
+        )],
+        vec![first_route, tcp_only, second_route],
+    );
+
+    let cache = PluginCache::new(&config)
+        .expect("TCP-only plugins do not interleave the HTTP-family execution chain");
+    let http_names: Vec<_> = cache
+        .get_plugins_for_protocol("p1", ProxyProtocol::Http)
+        .iter()
+        .map(|plugin| plugin.name())
+        .collect();
+    assert_eq!(
+        http_names,
+        [
+            "mesh_route_dispatch",
+            "mesh_route_dispatch",
+            "__mesh_route_dispatch_finalizer"
+        ]
+    );
+
+    let tcp_names: Vec<_> = cache
+        .get_plugins_for_protocol("p1", ProxyProtocol::Tcp)
+        .iter()
+        .map(|plugin| plugin.name())
+        .collect();
+    assert_eq!(tcp_names, ["tcp_connection_throttle"]);
 }
 
 fn plugin_ptr_by_name(plugins: &[Arc<dyn Plugin>], name: &str) -> usize {
