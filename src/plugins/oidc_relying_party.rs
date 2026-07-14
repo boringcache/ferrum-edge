@@ -35,8 +35,16 @@ use super::{PluginResult, RequestContext};
 
 const CLAIM_HEADER_METADATA_PREFIX: &str = "oidc_rp.claim_header.";
 const DEFAULT_JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(900);
+const DEFAULT_ID_TOKEN_CLOCK_SKEW_SECS: u64 = 60;
+const DEFAULT_SESSION_TTL_SECS: u64 = 3600;
+const DEFAULT_SESSION_IDLE_TTL_SECS: u64 = 1800;
+const DEFAULT_SESSION_MAX_COOKIE_BYTES: u64 = 8000;
+const DEFAULT_STATE_TTL_SECS: u64 = 600;
 const DEFAULT_STATE_CACHE_MAX_ENTRIES: usize = 10_000;
 const DEFAULT_STATE_CACHE_MAX_ENTRIES_PER_SOURCE: usize = 32;
+const DEFAULT_REFRESH_SKEW_SECS: u64 = 30;
+const DEFAULT_CHALLENGE_HTML_STATUS: u64 = 302;
+const DEFAULT_CHALLENGE_API_STATUS: u64 = 401;
 const MAX_STATE_TTL_SECS: u64 = 3600;
 const STATE_EXPIRY_BUCKET_SECS: u64 = 1;
 const SESSION_PAYLOAD_VERSION: u8 = 2;
@@ -157,7 +165,7 @@ struct SessionRuntime {
     cookie_name: String,
     cookie_attrs: String,
     context_id: String,
-    correlation_cookie_name: String,
+    correlation_cookie_name_prefix: String,
     correlation_cookie_attrs: String,
     max_cookie_bytes: usize,
     ttl: Duration,
@@ -253,6 +261,82 @@ struct SessionPayload {
     last_touch_unix: i64,
     nonce: String,
     claims: Value,
+}
+
+#[derive(Serialize)]
+struct NormalizedSessionContextSeed {
+    version: u8,
+    provider: NormalizedProviderContext,
+    session: NormalizedSessionContext,
+    behavior: NormalizedBehaviorContext,
+}
+
+#[derive(Serialize)]
+struct NormalizedProviderContext {
+    issuer: String,
+    discovery_url: Option<String>,
+    authorization_endpoint: Option<String>,
+    token_endpoint: Option<String>,
+    userinfo_endpoint: Option<String>,
+    jwks_uri: Option<String>,
+    end_session_endpoint: Option<String>,
+    client_id: String,
+    client_auth: NormalizedClientAuthContext,
+    redirect_uri: String,
+    callback_path: String,
+    logout_path: String,
+    post_logout_redirect_uri: Option<String>,
+    scopes: Vec<String>,
+    audiences: Vec<String>,
+    required_scopes: Vec<String>,
+    required_roles: Vec<String>,
+    scope_claim: String,
+    role_claim: String,
+    consumer_identity_claim: String,
+    consumer_header_claim: String,
+    claim_headers: Vec<NormalizedClaimHeaderContext>,
+    id_token_clock_skew_secs: u64,
+}
+
+#[derive(Serialize)]
+struct NormalizedClientAuthContext {
+    method: String,
+    private_key_jwt_alg: Option<String>,
+    private_key_jwt_kid: Option<String>,
+}
+
+#[derive(Serialize)]
+struct NormalizedClaimHeaderContext {
+    claim_path: String,
+    metadata_key: String,
+}
+
+#[derive(Serialize)]
+struct NormalizedSessionContext {
+    store: String,
+    ttl_secs: u64,
+    idle_ttl_secs: u64,
+    max_cookie_bytes: u64,
+    secure: bool,
+    http_only: bool,
+    same_site: String,
+    domain: Option<String>,
+    path: String,
+}
+
+#[derive(Serialize)]
+struct NormalizedBehaviorContext {
+    state_ttl_secs: u64,
+    state_cache_max_entries: u64,
+    state_cache_max_entries_per_source: u64,
+    post_login_redirect_param: Option<String>,
+    trusted_redirect_hosts: Vec<String>,
+    refresh_skew_secs: u64,
+    challenge_html_status: u64,
+    challenge_api_status: u64,
+    html_accept_substrings: Vec<String>,
+    rp_initiated_logout: bool,
+    post_login_default_path: String,
 }
 
 #[derive(Deserialize)]
@@ -454,7 +538,8 @@ impl OidcRelyingParty {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(session_context);
         let mut session_aad = b"ferrum-edge/oidc-session/v2\0".to_vec();
         session_aad.extend_from_slice(&session_context);
-        let correlation_cookie_name = derived_cookie_name("ferrum_oidc_state", &session_context);
+        let correlation_cookie_name_prefix =
+            derived_cookie_name("ferrum_oidc_state", &session_context);
         let store = optional_string(session_obj, "store", "session")?
             .unwrap_or_else(|| "cookie".to_string());
         if store != "cookie" {
@@ -463,10 +548,15 @@ impl OidcRelyingParty {
         let encryption_secret = required_string(session_obj, "encryption_secret", "session")?;
         let previous_secret =
             optional_string(session_obj, "encryption_secret_previous", "session")?;
-        let ttl_secs = optional_u64(session_obj, "ttl_secs", 3600)?;
-        let idle_ttl_secs = optional_u64(session_obj, "idle_ttl_secs", 1800)?;
-        let max_cookie_bytes = optional_u64(session_obj, "max_cookie_bytes", 8000)?;
-        if max_cookie_bytes > 8000 {
+        let ttl_secs = optional_u64(session_obj, "ttl_secs", DEFAULT_SESSION_TTL_SECS)?;
+        let idle_ttl_secs =
+            optional_u64(session_obj, "idle_ttl_secs", DEFAULT_SESSION_IDLE_TTL_SECS)?;
+        let max_cookie_bytes = optional_u64(
+            session_obj,
+            "max_cookie_bytes",
+            DEFAULT_SESSION_MAX_COOKIE_BYTES,
+        )?;
+        if max_cookie_bytes > DEFAULT_SESSION_MAX_COOKIE_BYTES {
             return Err("oidc_relying_party: session.max_cookie_bytes must be <= 8000".to_string());
         }
         let secure = optional_bool(session_obj, "secure")?.unwrap_or(true);
@@ -487,8 +577,11 @@ impl OidcRelyingParty {
             optional_string(session_obj, "path", "session")?.unwrap_or_else(|| "/".to_string());
         let cookie_attrs =
             build_cookie_attrs(secure, http_only, &same_site, domain.as_deref(), &path);
-        let state_ttl =
-            Duration::from_secs(optional_behavior_u64(behavior_obj, "state_ttl_secs", 600)?);
+        let state_ttl = Duration::from_secs(optional_behavior_u64(
+            behavior_obj,
+            "state_ttl_secs",
+            DEFAULT_STATE_TTL_SECS,
+        )?);
         if state_ttl.is_zero() {
             return Err(
                 "oidc_relying_party: behavior.state_ttl_secs must be greater than zero".to_string(),
@@ -525,9 +618,9 @@ impl OidcRelyingParty {
             cookie_name,
             cookie_attrs,
             context_id: session_context_id,
-            correlation_cookie_name,
+            correlation_cookie_name_prefix,
             correlation_cookie_attrs: build_cookie_attrs(
-                true,
+                secure,
                 true,
                 "Lax",
                 domain.as_deref(),
@@ -551,7 +644,8 @@ impl OidcRelyingParty {
         if post_login_redirect_param.is_some() && trusted_redirect_hosts.is_empty() {
             return Err("oidc_relying_party: behavior.trusted_redirect_hosts is required when post_login_redirect_param is set".to_string());
         }
-        let refresh_skew_secs = optional_behavior_u64(behavior_obj, "refresh_skew_secs", 30)?;
+        let refresh_skew_secs =
+            optional_behavior_u64(behavior_obj, "refresh_skew_secs", DEFAULT_REFRESH_SKEW_SECS)?;
         if refresh_skew_secs > ttl_secs / 2 {
             return Err(
                 "oidc_relying_party: behavior.refresh_skew_secs must be <= session.ttl_secs / 2"
@@ -561,12 +655,20 @@ impl OidcRelyingParty {
 
         let behavior = Arc::new(BehaviorConfig {
             challenge_html_status: parse_status(
-                optional_behavior_u64(behavior_obj, "challenge_html_status", 302)?,
+                optional_behavior_u64(
+                    behavior_obj,
+                    "challenge_html_status",
+                    DEFAULT_CHALLENGE_HTML_STATUS,
+                )?,
                 &[302, 303, 307],
                 "challenge_html_status",
             )?,
             challenge_api_status: parse_status(
-                optional_behavior_u64(behavior_obj, "challenge_api_status", 401)?,
+                optional_behavior_u64(
+                    behavior_obj,
+                    "challenge_api_status",
+                    DEFAULT_CHALLENGE_API_STATUS,
+                )?,
                 &[401, 403],
                 "challenge_api_status",
             )?,
@@ -662,7 +764,7 @@ impl OidcRelyingParty {
             id_token_clock_skew: Duration::from_secs(optional_u64(
                 provider_obj,
                 "id_token_clock_skew_secs",
-                60,
+                DEFAULT_ID_TOKEN_CLOCK_SKEW_SECS,
             )?),
             http_client,
             warmup_hostnames: discovery_url
@@ -681,10 +783,15 @@ impl OidcRelyingParty {
 
     async fn handle_callback(&self, ctx: &mut RequestContext) -> PluginResult {
         let Some(state) = ctx.query_params.get("state").cloned() else {
-            return self.callback_reject(400, r#"{"error":"Missing state"}"#.to_string());
+            return self.callback_reject(400, r#"{"error":"Missing state"}"#.to_string(), None);
         };
-        let Some(browser_binding) = cookie_value(ctx, &self.session.correlation_cookie_name) else {
-            return self.callback_reject(400, r#"{"error":"Invalid state"}"#.to_string());
+        let correlation_cookie_name = self.correlation_cookie_name(&state);
+        let Some(browser_binding) = cookie_value(ctx, &correlation_cookie_name) else {
+            return self.callback_reject(
+                400,
+                r#"{"error":"Invalid state"}"#.to_string(),
+                Some(&state),
+            );
         };
         let browser_binding_hash: [u8; 32] = Sha256::digest(browser_binding.as_bytes()).into();
         let Some(flow) = self
@@ -692,28 +799,39 @@ impl OidcRelyingParty {
             .state_cache
             .take_bound(&state, &browser_binding_hash)
         else {
-            return self.callback_reject(400, r#"{"error":"Invalid state"}"#.to_string());
+            return self.callback_reject(
+                400,
+                r#"{"error":"Invalid state"}"#.to_string(),
+                Some(&state),
+            );
         };
         if let Some(error) = ctx.query_params.get("error") {
-            return self.callback_reject(400, json!({"error": error}).to_string());
+            return self.callback_reject(400, json!({"error": error}).to_string(), Some(&state));
         };
         let Some(code) = ctx.query_params.get("code").cloned() else {
-            return self.callback_reject(400, r#"{"error":"Missing code"}"#.to_string());
+            return self.callback_reject(
+                400,
+                r#"{"error":"Missing code"}"#.to_string(),
+                Some(&state),
+            );
         };
         let Some(discovery) = self.provider.discovery.load().as_ref().as_ref().cloned() else {
-            return self
-                .callback_reject(400, r#"{"error":"OIDC discovery unavailable"}"#.to_string());
+            return self.callback_reject(
+                400,
+                r#"{"error":"OIDC discovery unavailable"}"#.to_string(),
+                Some(&state),
+            );
         };
         let token = match self
             .exchange_code(&discovery, &code, &flow.code_verifier)
             .await
         {
             Ok(token) => token,
-            Err(body) => return self.callback_reject(400, body),
+            Err(body) => return self.callback_reject(400, body, Some(&state)),
         };
         let claims = match self.verify_id_token(&token.id_token, &flow.nonce).await {
             Ok(claims) => claims,
-            Err(body) => return self.callback_reject(400, body),
+            Err(body) => return self.callback_reject(400, body, Some(&state)),
         };
         let merged_claims = if let Some(userinfo_endpoint) = &discovery.userinfo_endpoint {
             match self
@@ -723,7 +841,7 @@ impl OidcRelyingParty {
                 Ok(Some(userinfo)) => {
                     match merge_claims(claims.clone(), userinfo, &self.provider) {
                         Ok(claims) => claims,
-                        Err(body) => return self.callback_reject(400, body),
+                        Err(body) => return self.callback_reject(400, body, Some(&state)),
                     }
                 }
                 Ok(None) => claims,
@@ -746,7 +864,11 @@ impl OidcRelyingParty {
                 .unwrap_or(self.session.ttl.as_secs() as i64);
         let claims_expires_at = claim_expiry(&merged_claims).unwrap_or(expires_at);
         let Ok(sub) = required_subject(&merged_claims, "ID token") else {
-            return self.callback_reject(400, r#"{"error":"Invalid ID token"}"#.to_string());
+            return self.callback_reject(
+                400,
+                r#"{"error":"Invalid ID token"}"#.to_string(),
+                Some(&state),
+            );
         };
         let payload = SessionPayload {
             version: SESSION_PAYLOAD_VERSION,
@@ -769,12 +891,15 @@ impl OidcRelyingParty {
         };
         let cookie = match self.seal_session_cookie(&payload) {
             Ok(cookie) => cookie,
-            Err(body) => return self.callback_reject(400, body),
+            Err(body) => return self.callback_reject(400, body, Some(&state)),
         };
         redirect(
             302,
             &self.sanitize_redirect(&flow.original_url),
-            Some(join_set_cookies(cookie, self.clear_correlation_cookie())),
+            Some(join_set_cookies(
+                cookie,
+                self.clear_correlation_cookie(&state),
+            )),
         )
     }
 
@@ -1225,7 +1350,7 @@ impl OidcRelyingParty {
                 self.session.state_cache.take(&state);
                 return reject(503, r#"{"error":"OIDC discovery unavailable"}"#.to_string());
             };
-            let correlation_cookie = self.correlation_cookie(&browser_binding);
+            let correlation_cookie = self.correlation_cookie(&state, &browser_binding);
             let cookie = if clear {
                 join_set_cookies(correlation_cookie, self.clear_cookie())
             } else {
@@ -1338,25 +1463,41 @@ impl OidcRelyingParty {
         )
     }
 
-    fn correlation_cookie(&self, value: &str) -> String {
+    fn correlation_cookie_name(&self, state: &str) -> String {
+        let state_hash: [u8; 32] = Sha256::digest(state.as_bytes()).into();
+        derived_cookie_name(&self.session.correlation_cookie_name_prefix, &state_hash)
+    }
+
+    fn correlation_cookie(&self, state: &str, value: &str) -> String {
         format!(
             "{}={value}; Max-Age={}; {}",
-            self.session.correlation_cookie_name,
+            self.correlation_cookie_name(state),
             self.behavior.state_ttl.as_secs(),
             self.session.correlation_cookie_attrs
         )
     }
 
-    fn clear_correlation_cookie(&self) -> String {
+    fn clear_correlation_cookie(&self, state: &str) -> String {
         format!(
             "{}=; Max-Age=0; {}",
-            self.session.correlation_cookie_name, self.session.correlation_cookie_attrs
+            self.correlation_cookie_name(state),
+            self.session.correlation_cookie_attrs
         )
     }
 
-    fn callback_reject(&self, status_code: u16, body: String) -> PluginResult {
+    fn callback_reject(
+        &self,
+        status_code: u16,
+        body: String,
+        correlation_state: Option<&str>,
+    ) -> PluginResult {
         let mut headers = HashMap::new();
-        headers.insert("set-cookie".to_string(), self.clear_correlation_cookie());
+        if let Some(state) = correlation_state {
+            headers.insert(
+                "set-cookie".to_string(),
+                self.clear_correlation_cookie(state),
+            );
+        }
         PluginResult::Reject {
             status_code,
             body,
@@ -1876,25 +2017,178 @@ fn session_context_seed(
     session: &Map<String, Value>,
     behavior: Option<&Map<String, Value>>,
 ) -> Result<[u8; 32], String> {
-    let mut provider = provider.clone();
-    if let Some(Value::Object(client_auth)) = provider.get_mut("client_auth") {
-        client_auth.remove("client_secret");
-        client_auth.remove("private_key_pem");
-    }
-    let mut session = session.clone();
-    session.remove("encryption_secret");
-    session.remove("encryption_secret_previous");
-    // The default cookie name is derived from this seed, so the name is added
-    // in the second-stage context hash below instead of creating a cycle.
-    session.remove("cookie_name");
-    let serialized = serde_json::to_vec(&json!({
-        "version": SESSION_PAYLOAD_VERSION,
-        "provider": provider,
-        "session": session,
-        "behavior": behavior,
-    }))
-    .map_err(|_| "oidc_relying_party: failed to derive session context".to_string())?;
+    let mut claim_headers = parse_claim_headers(
+        provider,
+        "claim_headers",
+        "oidc_relying_party",
+        CLAIM_HEADER_METADATA_PREFIX,
+    )?
+    .into_iter()
+    .map(|mapping| NormalizedClaimHeaderContext {
+        claim_path: mapping.claim_path,
+        metadata_key: mapping.metadata_key,
+    })
+    .collect::<Vec<_>>();
+    claim_headers.sort_unstable_by(|left, right| {
+        left.claim_path
+            .cmp(&right.claim_path)
+            .then_with(|| left.metadata_key.cmp(&right.metadata_key))
+    });
+
+    let html_accept_substrings = parse_behavior_string_array(behavior, "html_accept_substrings")?
+        .pipe_default(vec!["text/html".to_string()]);
+    let normalized = NormalizedSessionContextSeed {
+        version: SESSION_PAYLOAD_VERSION,
+        provider: NormalizedProviderContext {
+            issuer: required_string(provider, "issuer", "provider[0]")?,
+            discovery_url: optional_string(provider, "discovery_url", "provider[0]")?,
+            authorization_endpoint: optional_string(
+                provider,
+                "authorization_endpoint",
+                "provider[0]",
+            )?,
+            token_endpoint: optional_string(provider, "token_endpoint", "provider[0]")?,
+            userinfo_endpoint: optional_string(provider, "userinfo_endpoint", "provider[0]")?,
+            jwks_uri: optional_string(provider, "jwks_uri", "provider[0]")?,
+            end_session_endpoint: optional_string(provider, "end_session_endpoint", "provider[0]")?,
+            client_id: required_string(provider, "client_id", "provider[0]")?,
+            client_auth: normalized_client_auth_context(provider),
+            redirect_uri: required_string(provider, "redirect_uri", "provider[0]")?,
+            callback_path: optional_string(provider, "callback_path", "provider[0]")?
+                .unwrap_or_else(|| "/oauth/callback".to_string()),
+            logout_path: optional_string(provider, "logout_path", "provider[0]")?
+                .unwrap_or_else(|| "/oauth/logout".to_string()),
+            post_logout_redirect_uri: optional_string(
+                provider,
+                "post_logout_redirect_uri",
+                "provider[0]",
+            )?,
+            scopes: parse_string_array(provider, "scopes", "provider[0]")?,
+            audiences: parse_string_array(provider, "audiences", "provider[0]")?,
+            required_scopes: parse_string_array(provider, "required_scopes", "provider[0]")?,
+            required_roles: parse_string_array(provider, "required_roles", "provider[0]")?,
+            scope_claim: optional_string(provider, "scope_claim", "provider[0]")?
+                .unwrap_or_else(|| "scope".to_string()),
+            role_claim: optional_string(provider, "role_claim", "provider[0]")?
+                .unwrap_or_else(|| "roles".to_string()),
+            consumer_identity_claim: optional_string(
+                provider,
+                "consumer_identity_claim",
+                "provider[0]",
+            )?
+            .unwrap_or_else(|| "sub".to_string()),
+            consumer_header_claim: optional_string(
+                provider,
+                "consumer_header_claim",
+                "provider[0]",
+            )?
+            .unwrap_or_else(|| "sub".to_string()),
+            claim_headers,
+            id_token_clock_skew_secs: optional_u64(
+                provider,
+                "id_token_clock_skew_secs",
+                DEFAULT_ID_TOKEN_CLOCK_SKEW_SECS,
+            )?,
+        },
+        session: NormalizedSessionContext {
+            store: optional_string(session, "store", "session")?
+                .unwrap_or_else(|| "cookie".to_string()),
+            ttl_secs: optional_u64(session, "ttl_secs", DEFAULT_SESSION_TTL_SECS)?,
+            idle_ttl_secs: optional_u64(session, "idle_ttl_secs", DEFAULT_SESSION_IDLE_TTL_SECS)?,
+            max_cookie_bytes: optional_u64(
+                session,
+                "max_cookie_bytes",
+                DEFAULT_SESSION_MAX_COOKIE_BYTES,
+            )?,
+            secure: optional_bool(session, "secure")?.unwrap_or(true),
+            http_only: optional_bool(session, "http_only")?.unwrap_or(true),
+            same_site: optional_string(session, "same_site", "session")?
+                .unwrap_or_else(|| "lax".to_string())
+                .to_ascii_lowercase(),
+            domain: optional_string(session, "domain", "session")?,
+            path: optional_string(session, "path", "session")?.unwrap_or_else(|| "/".to_string()),
+        },
+        behavior: NormalizedBehaviorContext {
+            state_ttl_secs: optional_behavior_u64(
+                behavior,
+                "state_ttl_secs",
+                DEFAULT_STATE_TTL_SECS,
+            )?,
+            state_cache_max_entries: optional_behavior_u64(
+                behavior,
+                "state_cache_max_entries",
+                DEFAULT_STATE_CACHE_MAX_ENTRIES as u64,
+            )?,
+            state_cache_max_entries_per_source: optional_behavior_u64(
+                behavior,
+                "state_cache_max_entries_per_source",
+                DEFAULT_STATE_CACHE_MAX_ENTRIES_PER_SOURCE as u64,
+            )?,
+            post_login_redirect_param: optional_behavior_string(
+                behavior,
+                "post_login_redirect_param",
+            )?,
+            trusted_redirect_hosts: parse_behavior_string_array(
+                behavior,
+                "trusted_redirect_hosts",
+            )?,
+            refresh_skew_secs: optional_behavior_u64(
+                behavior,
+                "refresh_skew_secs",
+                DEFAULT_REFRESH_SKEW_SECS,
+            )?,
+            challenge_html_status: optional_behavior_u64(
+                behavior,
+                "challenge_html_status",
+                DEFAULT_CHALLENGE_HTML_STATUS,
+            )?,
+            challenge_api_status: optional_behavior_u64(
+                behavior,
+                "challenge_api_status",
+                DEFAULT_CHALLENGE_API_STATUS,
+            )?,
+            html_accept_substrings,
+            rp_initiated_logout: optional_behavior_bool(behavior, "rp_initiated_logout")?
+                .unwrap_or(true),
+            post_login_default_path: optional_behavior_string(behavior, "post_login_default_path")?
+                .unwrap_or_else(|| "/".to_string()),
+        },
+    };
+    // Struct field order plus the sorted claim-header list make the byte
+    // representation deterministic, independent of input object key order.
+    let serialized = serde_json::to_vec(&normalized)
+        .map_err(|_| "oidc_relying_party: failed to derive session context".to_string())?;
     Ok(Sha256::digest(serialized).into())
+}
+
+fn normalized_client_auth_context(provider: &Map<String, Value>) -> NormalizedClientAuthContext {
+    let client_auth = provider.get("client_auth").and_then(Value::as_object);
+    let method = client_auth
+        .and_then(|auth| auth.get("method"))
+        .and_then(Value::as_str)
+        .unwrap_or("client_secret_basic")
+        .to_string();
+    let is_private_key_jwt = method == "private_key_jwt";
+    NormalizedClientAuthContext {
+        method,
+        private_key_jwt_alg: is_private_key_jwt.then(|| {
+            client_auth
+                .and_then(|auth| auth.get("private_key_jwt_alg"))
+                .and_then(Value::as_str)
+                .unwrap_or("RS256")
+                .to_string()
+        }),
+        private_key_jwt_kid: if is_private_key_jwt {
+            client_auth
+                .and_then(|auth| auth.get("private_key_jwt_kid"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        } else {
+            None
+        },
+    }
 }
 
 fn session_context_id(seed: &[u8; 32], cookie_name: &str) -> [u8; 32] {
@@ -2797,6 +3091,201 @@ mod tests {
         ctx.headers
             .insert("cookie".to_string(), "theme=dark; consent".to_string());
         assert_eq!(cookie_value(&ctx, "ferrum_session"), None);
+    }
+
+    fn plugin_config_without_optional_defaults(redirect_uri: &str) -> Value {
+        json!({
+            "providers": [{
+                "issuer": "https://idp.example.com",
+                "client_id": "client-1",
+                "authorization_endpoint": "https://idp.example.com/authorize",
+                "token_endpoint": "https://idp.example.com/token",
+                "jwks_uri": "https://idp.example.com/jwks",
+                "scopes": ["openid"],
+                "redirect_uri": redirect_uri,
+                "client_auth": {"client_secret": "shhh"}
+            }],
+            "session": {
+                "encryption_secret": "0123456789012345678901234567890123"
+            }
+        })
+    }
+
+    fn build_plugin_without_workers(config: &Value) -> OidcRelyingParty {
+        OidcRelyingParty::new_internal(config, PluginHttpClient::default(), false)
+            .expect("OIDC test config is valid")
+    }
+
+    #[test]
+    fn concurrent_browser_challenges_keep_distinct_state_bindings() {
+        let config =
+            plugin_config_without_optional_defaults("https://app.example.com/oauth/callback");
+        let plugin = build_plugin_without_workers(&config);
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+        ctx.headers
+            .insert("accept".to_string(), "text/html".to_string());
+
+        let mut issue_challenge = || {
+            let PluginResult::Reject {
+                status_code,
+                headers,
+                ..
+            } = plugin.challenge(&mut ctx, false)
+            else {
+                panic!("browser challenge must redirect");
+            };
+            assert_eq!(status_code, 302);
+            let location = headers.get("location").expect("challenge location");
+            let state = Url::parse(location)
+                .expect("absolute authorization URL")
+                .query_pairs()
+                .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+                .expect("state query parameter");
+            let cookie_pair = headers
+                .get("set-cookie")
+                .expect("correlation cookie")
+                .split(';')
+                .next()
+                .expect("cookie pair");
+            let (name, value) = cookie_pair.split_once('=').expect("named cookie");
+            (state, name.to_string(), value.to_string())
+        };
+
+        let first = issue_challenge();
+        let second = issue_challenge();
+        assert_ne!(first.0, second.0);
+        assert_ne!(first.1, second.1, "each state needs its own cookie name");
+        assert_eq!(first.1, plugin.correlation_cookie_name(&first.0));
+        assert_eq!(second.1, plugin.correlation_cookie_name(&second.0));
+
+        let mut callback =
+            RequestContext::new("127.0.0.1".into(), "GET".into(), "/oauth/callback".into());
+        callback.headers.insert(
+            "cookie".to_string(),
+            format!("{}={}; {}={}", first.1, first.2, second.1, second.2),
+        );
+        assert_eq!(cookie_value(&callback, &first.1), Some(first.2.as_str()));
+        assert_eq!(cookie_value(&callback, &second.1), Some(second.2.as_str()));
+
+        let first_hash: [u8; 32] = Sha256::digest(first.2.as_bytes()).into();
+        let second_hash: [u8; 32] = Sha256::digest(second.2.as_bytes()).into();
+        assert!(
+            plugin
+                .session
+                .state_cache
+                .take_bound(&first.0, &first_hash)
+                .is_some()
+        );
+        assert!(
+            plugin
+                .session
+                .state_cache
+                .take_bound(&second.0, &second_hash)
+                .is_some(),
+            "consuming one browser-bound flow must not evict its sibling"
+        );
+    }
+
+    #[test]
+    fn session_context_is_stable_across_omitted_and_explicit_defaults() {
+        let omitted_config =
+            plugin_config_without_optional_defaults("https://app.example.com/oauth/callback");
+        let explicit_config = json!({
+            "providers": [{
+                "issuer": "https://idp.example.com",
+                "discovery_url": null,
+                "authorization_endpoint": "https://idp.example.com/authorize",
+                "token_endpoint": "https://idp.example.com/token",
+                "userinfo_endpoint": null,
+                "jwks_uri": "https://idp.example.com/jwks",
+                "end_session_endpoint": null,
+                "client_id": "client-1",
+                "client_auth": {
+                    "method": "client_secret_basic",
+                    "client_secret": "shhh"
+                },
+                "redirect_uri": "https://app.example.com/oauth/callback",
+                "callback_path": "/oauth/callback",
+                "logout_path": "/oauth/logout",
+                "post_logout_redirect_uri": null,
+                "scopes": ["openid"],
+                "audiences": [],
+                "required_scopes": [],
+                "required_roles": [],
+                "scope_claim": "scope",
+                "role_claim": "roles",
+                "consumer_identity_claim": "sub",
+                "consumer_header_claim": "sub",
+                "claim_headers": {},
+                "id_token_clock_skew_secs": 60
+            }],
+            "session": {
+                "encryption_secret": "0123456789012345678901234567890123",
+                "encryption_secret_previous": null,
+                "store": "cookie",
+                "ttl_secs": 3600,
+                "idle_ttl_secs": 1800,
+                "max_cookie_bytes": 8000,
+                "secure": true,
+                "http_only": true,
+                "same_site": "lax",
+                "domain": null,
+                "path": "/"
+            },
+            "behavior": {
+                "state_ttl_secs": 600,
+                "state_cache_max_entries": 10000,
+                "state_cache_max_entries_per_source": 32,
+                "post_login_redirect_param": null,
+                "trusted_redirect_hosts": [],
+                "refresh_skew_secs": 30,
+                "challenge_html_status": 302,
+                "challenge_api_status": 401,
+                "html_accept_substrings": [],
+                "rp_initiated_logout": true,
+                "post_login_default_path": "/"
+            }
+        });
+        let omitted = build_plugin_without_workers(&omitted_config);
+        let explicit = build_plugin_without_workers(&explicit_config);
+
+        assert_eq!(omitted.session.cookie_name, explicit.session.cookie_name);
+        assert_eq!(omitted.session.context_id, explicit.session.context_id);
+
+        let now = chrono::Utc::now().timestamp();
+        let mut payload = session_payload(now - 10, now - 10, None, now + 1000);
+        payload.context_id = omitted.session.context_id.clone();
+        let cookie = omitted
+            .seal_session_cookie(&payload)
+            .expect("omitted-default context seals");
+        assert!(
+            explicit
+                .open_session(sealed_cookie_value(&cookie))
+                .is_some(),
+            "an explicitly defaulted reload must retain the same session AAD"
+        );
+    }
+
+    #[test]
+    fn localhost_http_callback_honors_insecure_correlation_cookie_setting() {
+        for redirect_uri in [
+            "http://localhost/oauth/callback",
+            "http://127.0.0.1/oauth/callback",
+            "http://[::1]/oauth/callback",
+        ] {
+            let mut config = plugin_config_without_optional_defaults(redirect_uri);
+            config["session"]["secure"] = Value::Bool(false);
+            let plugin = build_plugin_without_workers(&config);
+            let correlation_cookie = plugin.correlation_cookie("state", "browser-binding");
+
+            assert!(!plugin.session.cookie_attrs.contains("; Secure"));
+            assert!(
+                !correlation_cookie.contains("; Secure"),
+                "local HTTP callback cookie must match session.secure=false for {redirect_uri}"
+            );
+            assert!(correlation_cookie.contains("; HttpOnly"));
+            assert!(correlation_cookie.contains("SameSite=Lax"));
+        }
     }
 
     #[test]

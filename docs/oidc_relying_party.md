@@ -34,7 +34,7 @@ Exactly one provider is supported. Use `discovery_url` for normal OIDC providers
 - Sessions are sealed with AES-256-GCM and cryptographically bound to a versioned provider/client/audience/policy context. `session.encryption_secret` must be at least 32 bytes; `session.encryption_secret_previous` supports cookie rotation within the same context.
 - When `session.cookie_name` is omitted, Ferrum derives a context-specific name so differently configured relying parties on one host do not reuse a default cookie.
 - `session.store` supports only `cookie`; Redis-backed server-side sessions are rejected until implemented.
-- Browser authorization state is bound to a short-lived Secure/HttpOnly/SameSite correlation cookie. Pending flows are bounded globally by `behavior.state_cache_max_entries` (default `10000`) and per resolved client IP by `behavior.state_cache_max_entries_per_source` (default `32`).
+- Browser authorization state is bound to a distinct short-lived HttpOnly/SameSite correlation cookie for each pending flow. Correlation cookies follow `session.secure` (secure by default; set it to `false` only for allowed localhost or literal-loopback HTTP development callbacks). Pending flows are bounded globally by `behavior.state_cache_max_entries` (default `10000`) and per resolved client IP by `behavior.state_cache_max_entries_per_source` (default `32`).
 - `behavior.trusted_redirect_hosts` gates post-login redirects. If no trusted redirect is available, the plugin uses `behavior.post_login_default_path`.
 - UserInfo `sub` must match the ID token `sub`, and UserInfo cannot override protected ID token claims.
 - Claim header mappings reject reserved headers, including `Authorization`, `Host`, hop-by-hop headers, and Ferrum consumer identity headers.
