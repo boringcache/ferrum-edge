@@ -2072,7 +2072,17 @@ wait_for_ambient_mesh_slice() {
   local drift_dir="$RESULTS_DIR/mesh-drift"
   mkdir -p "$drift_dir"
 
-  for attempt in $(seq 1 60); do
+  # Watch-based pod discovery normally reaches the slice in seconds, but the
+  # CP's watch -> translate -> rebuild -> broadcast pipeline has no periodic
+  # reconcile fallback, so slow or recovering propagation can take far longer.
+  # Give it a generous window (~7 min): a live run exceeded the previous
+  # ~3 min window while the proxies still held a pre-workload slice
+  # (2026-07-14, actions run 29307789287). The bound is ELAPSED time, not an
+  # attempt count — when admin port-forwards are unusable each attempt burns
+  # ~10s+ in curl retries, and an attempt-count bound would balloon that
+  # failure mode to ~30 min of the live job's budget.
+  local slice_wait_deadline=$((SECONDS + 420))
+  while ((SECONDS < slice_wait_deadline)); do
     local -a ambient_pods
     mapfile -t ambient_pods < <(ambient_pods)
     if [[ "${#ambient_pods[@]}" -lt 2 ]]; then
@@ -2127,6 +2137,20 @@ wait_for_ambient_mesh_slice() {
   for file in "$drift_dir"/*; do
     echo "--- $file" >&2
     cat "$file" >&2 || true
+  done
+  # The drift files above only show what the proxies last RECEIVED. When this
+  # check fails, the missing evidence is CP-side: did the K8s controller see
+  # the workload pods, and did it rebuild and broadcast a fresh slice? Dump
+  # control-plane and ambient logs so a recurrence is root-causable. List
+  # ambient pods UNFILTERED here — `ambient_pods` returns only Ready pods, and
+  # a never-Ready (crash-looping / probe-failing) ambient pod is exactly the
+  # one whose logs matter in this failure dump.
+  echo "--- control-plane logs (tail)" >&2
+  kubectl -n "$MESH_NS" logs deployment/ferrum-mesh-control-plane --tail=300 >&2 || true
+  for pod in $(kubectl -n "$MESH_NS" get pods \
+    -l app.kubernetes.io/name=ferrum-mesh-ambient -o name 2>/dev/null); do
+    echo "--- $pod logs (tail)" >&2
+    kubectl -n "$MESH_NS" logs "$pod" --tail=100 --all-containers >&2 || true
   done
   exit 1
 }
