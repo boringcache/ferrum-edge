@@ -6470,8 +6470,10 @@ components:
       properties:
         key:
           type: string
+          minLength: 1
           description: >-
-            API key value. Must be globally unique across all consumers.
+            API key value. Must be non-empty after trimming and globally unique
+            across all consumers.
       description: "API key credential for the `key_auth` authentication plugin."
 
     BasicAuthCredential:
@@ -11676,12 +11678,21 @@ components:
 
     KeyAuthConfig:
       type: object
+      additionalProperties: false
       description: "Plugin: key_auth — API key authentication."
       properties:
         key_location:
           type: string
           default: "header:X-API-Key"
+          pattern: "^(header:[!#$%&'*+.^_`|~0-9A-Za-z-]+|query:.+)$"
           description: "Where to find the key (header:<name> or query:<name>)"
+        hide_credentials:
+          type: boolean
+          default: true
+          description: >-
+            Remove a successfully authenticated API key from the header or
+            query string before forwarding the request upstream. Disable only
+            when a legacy backend explicitly requires the reusable credential.
 
     BasicAuthConfig:
       type: object

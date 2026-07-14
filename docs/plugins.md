@@ -65,7 +65,7 @@ plugin_configs:
     plugin_name: key_auth
     scope: proxy_group
     config:
-      key_names: ["x-api-key"]
+      key_location: header:X-API-Key
 
 proxies:
   # Both internal proxies share the same auth + rate limit group plugins
@@ -1549,6 +1549,11 @@ Authenticates requests using an API key matched against consumer credentials.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `key_location` | String | `header:X-API-Key` | Where to find the key (`header:<name>` or `query:<name>`) |
+| `hide_credentials` | Boolean | `true` | Remove a successfully authenticated key before proxying. Set to `false` only for a legacy backend that explicitly requires the reusable credential. |
+
+Header locations must use a valid HTTP header name. Query names and values use
+the same percent-decoded representation on HTTP/1.1, HTTP/2, and HTTP/3.
+Unknown configuration fields are rejected.
 
 **Consumer credential** (`keyauth`) — array:
 ```yaml

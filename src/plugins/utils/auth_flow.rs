@@ -142,6 +142,13 @@ pub trait AuthMechanism: Send + Sync {
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential;
 
+    /// Record mechanism-specific state after successful verification.
+    ///
+    /// Authentication plugins use this for security-sensitive follow-up work
+    /// that must happen only after a credential has been accepted, such as
+    /// staging the credential's removal from the backend request.
+    fn on_success(&self, _ctx: &mut RequestContext) {}
+
     async fn verify(
         &self,
         credential: ExtractedCredential,
@@ -185,6 +192,7 @@ async fn run_auth_impl<M: AuthMechanism>(
                 external_identity,
                 external_identity_header,
             } => {
+                mechanism.on_success(ctx);
                 let consumer_identified = consumer.is_some();
                 let external_identity_identified =
                     allow_external_identity && external_identity.is_some();

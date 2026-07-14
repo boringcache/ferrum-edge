@@ -14835,6 +14835,7 @@ async fn handle_proxy_request_inner(
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
     let plugins = plugin_cache_view.plugins();
+    ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
     // Pre-computed capability bitset and phase-specific plugin lists — avoids
     // per-request `iter().filter().collect()` and `iter().any()` scans.
     let capabilities = plugin_cache_view.capabilities();
@@ -31065,7 +31066,7 @@ mod tests {
 
         let stripped = query_string_after_plugin_strips(
             &ctx,
-            "a=1&access_token=secret&encoded%20token=secret2&keep=2",
+            "a=1&access_token=first&encoded%20token=secret2&access_token=last&keep=2",
         );
 
         assert_eq!(stripped.as_ref(), "a=1&keep=2");

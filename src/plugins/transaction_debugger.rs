@@ -67,7 +67,7 @@ impl TransactionDebugger {
     /// Header names are normally lowercased by hyper, but tests/custom callers
     /// may provide different ASCII casing; compare case-insensitively without
     /// allocating.
-    fn is_sensitive(&self, header_name: &str) -> bool {
+    fn is_sensitive(&self, ctx: &RequestContext, header_name: &str) -> bool {
         SENSITIVE_HEADERS
             .iter()
             .any(|h| header_name.eq_ignore_ascii_case(h))
@@ -75,14 +75,19 @@ impl TransactionDebugger {
                 .extra_redacted_headers
                 .iter()
                 .any(|h| header_name.eq_ignore_ascii_case(h))
+            || ctx.request_header_requires_redaction(header_name)
     }
 
     /// Create a redacted copy of headers for safe logging.
-    fn redact_headers(&self, headers: &HashMap<String, String>) -> HashMap<String, String> {
+    fn redact_headers(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
         headers
             .iter()
             .map(|(k, v)| {
-                if self.is_sensitive(k) {
+                if self.is_sensitive(ctx, k) {
                     (k.clone(), REDACTED.to_string())
                 } else {
                     (k.clone(), v.clone())
@@ -108,7 +113,7 @@ impl Plugin for TransactionDebugger {
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         if tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG) {
-            let safe_headers = self.redact_headers(&ctx.headers);
+            let safe_headers = self.redact_headers(ctx, &ctx.headers);
             tracing::debug!(target: "transaction_debug", method = %ctx.method, path = %ctx.path, client_ip = %ctx.client_ip, headers = ?safe_headers, "Incoming request");
             if self.log_request_body {
                 tracing::debug!(target: "transaction_debug", "Request body logging enabled");
@@ -124,7 +129,7 @@ impl Plugin for TransactionDebugger {
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG) {
-            let safe_headers = self.redact_headers(response_headers);
+            let safe_headers = self.redact_headers(ctx, response_headers);
             tracing::debug!(target: "transaction_debug", status = response_status, method = %ctx.method, path = %ctx.path, headers = ?safe_headers, "Backend response");
             if self.log_response_body {
                 tracing::debug!(target: "transaction_debug", "Response body logging enabled");
