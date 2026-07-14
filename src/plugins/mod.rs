@@ -495,6 +495,14 @@ pub struct RequestContext {
     /// markers (a hash over the raw request body including tool-call arguments),
     /// so they remain off `metadata` too.
     pub(crate) ai_tool_governor_request_hashes: HashMap<u64, String>,
+    /// Per-`ai_semantic_firewall`-instance hashes of request bodies already
+    /// inspected before request transforms. Kept outside serialized metadata so
+    /// prompt-derived digests never enter transaction logs.
+    pub(crate) ai_semantic_firewall_request_hashes: HashMap<u64, String>,
+    /// Per-instance response-body hashes used to skip unchanged final bodies and
+    /// re-evaluate transformed client-visible representations. Also private for
+    /// the same prompt/response confidentiality reason.
+    pub(crate) ai_semantic_firewall_response_hashes: HashMap<u64, String>,
     /// Process-unique id for an attached response-stream inspector chain.
     /// Assigned only after at least one configured plugin opts into streaming
     /// hooks for the response, and cleared again when every factory returns
@@ -599,6 +607,15 @@ pub struct RequestContext {
     /// Set on HTTP/3 via quinn's `into_0rtt()` detection, and on HTTPS via the
     /// `Early-Data: 1` header (RFC 8470) from upstream proxies/CDNs.
     pub is_early_data: bool,
+    /// Aggregate fail-closed decision staged by cache-managed
+    /// `mesh_route_dispatch` instances. The cache inserts a finalizer directly
+    /// after the last instance so disjoint rules can all participate before a
+    /// 404 is emitted. Kept out of public metadata and transaction logs.
+    pub(crate) mesh_route_dispatch_reject_unmatched: bool,
+    /// Whether any cache-managed `mesh_route_dispatch` instance matched.
+    /// Kept separate from route overrides because rewrite-only and transform-
+    /// only rules are successful matches too.
+    pub(crate) mesh_route_dispatch_matched: bool,
     /// Plugin-set override for the proxy's `upstream_id`. When `Some`, the
     /// dispatch path uses this instead of `proxy.upstream_id`. Used by
     /// `mesh_route_dispatch` to implement Istio `VirtualService` header/method
@@ -765,6 +782,8 @@ impl RequestContext {
             ai_tool_governor_response_hashes: HashMap::new(),
             ai_tool_governor_call_hashes: HashMap::new(),
             ai_tool_governor_request_hashes: HashMap::new(),
+            ai_semantic_firewall_request_hashes: HashMap::new(),
+            ai_semantic_firewall_response_hashes: HashMap::new(),
             response_stream_id: None,
             response_stream_completion: None,
             a2a_gateway_detected: false,
@@ -786,6 +805,8 @@ impl RequestContext {
             request_body_bytes: None,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             is_early_data: false,
+            mesh_route_dispatch_reject_unmatched: false,
+            mesh_route_dispatch_matched: false,
             route_override_upstream_id: None,
             route_override_backend_host: None,
             route_override_backend_scheme: None,
@@ -857,6 +878,8 @@ impl RequestContext {
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
             ai_tool_governor_call_hashes: self.ai_tool_governor_call_hashes.clone(),
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
+            ai_semantic_firewall_request_hashes: self.ai_semantic_firewall_request_hashes.clone(),
+            ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,
@@ -878,6 +901,8 @@ impl RequestContext {
             request_body_bytes: None,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
             is_early_data: self.is_early_data,
+            mesh_route_dispatch_reject_unmatched: self.mesh_route_dispatch_reject_unmatched,
+            mesh_route_dispatch_matched: self.mesh_route_dispatch_matched,
             route_override_upstream_id: self.route_override_upstream_id.clone(),
             route_override_backend_host: self.route_override_backend_host.clone(),
             route_override_backend_scheme: self.route_override_backend_scheme,
@@ -2838,6 +2863,11 @@ pub trait Plugin: Send + Sync {
         PluginResult::Continue
     }
 
+    /// Enables cache-managed aggregation of a plugin's unmatched decision.
+    /// The default is a no-op; `mesh_route_dispatch` uses this to preserve
+    /// standalone behavior while coordinating multiple cached instances.
+    fn enable_deferred_unmatched_rejection(&self) {}
+
     /// Returns `true` if this plugin participates in target-aware backend
     /// admission after load balancing and before backend dispatch.
     fn is_backend_admission_plugin(&self) -> bool {
@@ -3613,10 +3643,9 @@ pub trait Plugin: Send + Sync {
 
     /// Returns the JWKS URIs this plugin is actively using.
     ///
-    /// Only meaningful for `jwks_auth` — returns the JWKS endpoint URIs from
-    /// its configured providers. Used by the plugin cache to clean up stale
-    /// JWKS cache entries (and their background refresh tasks) when plugins
-    /// are removed from config.
+    /// Implemented by plugins such as `jwks_auth` and `oidc_relying_party` that
+    /// retain shared JWKS stores. Used by the plugin cache to clean up stale
+    /// entries (and their background refresh tasks) when plugins are removed.
     fn active_jwks_uris(&self) -> Vec<String> {
         Vec::new()
     }
@@ -3933,8 +3962,9 @@ pub fn create_plugin_with_http_client(
 /// Validate a plugin configuration by attempting to instantiate the plugin,
 /// with a default-open egress policy.
 ///
-/// The plugin instance is created and immediately dropped — only the config
-/// validation side effects of the plugin's `new()` constructor matter.
+/// Most plugin instances are created and immediately dropped. Plugins with
+/// persistent constructor side effects use a dedicated shape-only validation
+/// path instead.
 ///
 /// Production config-load paths (file/db/admin/spec) use
 /// [`validate_plugin_config_with_policy`] so a plugin's literal-IP endpoints
@@ -3947,7 +3977,23 @@ pub fn create_plugin_with_http_client(
 /// Returns `Ok(())` if the config is valid, `Err(msg)` if validation fails.
 #[allow(dead_code)]
 pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> {
-    match create_plugin(name, config)? {
+    validate_plugin_config_with_http_client(name, config, PluginHttpClient::default())
+}
+
+/// Validate a plugin configuration with a caller-supplied HTTP policy without
+/// retaining runtime workers. OIDC discovery/JWKS construction is explicitly
+/// shape-only here so admin validation and config admission cannot leak retry
+/// tasks that outlive the temporary instance.
+pub(crate) fn validate_plugin_config_with_http_client(
+    name: &str,
+    config: &Value,
+    http_client: PluginHttpClient,
+) -> Result<(), String> {
+    if name == "oidc_relying_party" {
+        screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
+        return oidc_relying_party::OidcRelyingParty::validate_config(config, http_client);
+    }
+    match create_plugin_with_http_client(name, config, http_client)? {
         Some(_) => Ok(()),
         None => Err(format!("Unknown plugin name '{}'", name)),
     }
@@ -3965,30 +4011,26 @@ pub fn validate_plugin_config_with_policy(
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
     let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone());
-    match create_plugin_with_http_client(name, config, http_client)? {
-        Some(_) => {
-            // The HTTP-endpoint screen above does not cover a plugin's own
-            // literal-IP backend fields that aren't dialed through the shared
-            // client (mesh_route_dispatch route destinations).
-            if name == "mesh_route_dispatch"
-                && let Err(errs) = screen_mesh_route_dispatch_egress(config, backend_allow_ips)
-            {
-                return Err(errs.join("; "));
-            }
-            // Redis-backed plugins (rate_limit / request_deduplication /
-            // ai_semantic_cache with sync_mode=redis) build their client from
-            // `redis_url` WITHOUT the egress policy, and the client skips literals
-            // / falls back to the hostname on a DNS denial — so a denied literal
-            // endpoint must be rejected here at config-load.
-            screen_redis_endpoint_egress(config, backend_allow_ips)?;
-            // NOTE: ldap_auth / kafka_logging / ws_logging literal endpoints are
-            // screened *inside* `create_plugin_with_http_client` above (before the
-            // dial task spawns), so no explicit `screen_direct_client_endpoint_egress`
-            // call is needed here — that path already failed closed on a denial.
-            Ok(())
-        }
-        None => Err(format!("Unknown plugin name '{}'", name)),
+    validate_plugin_config_with_http_client(name, config, http_client)?;
+    // The HTTP-endpoint screen above does not cover a plugin's own
+    // literal-IP backend fields that aren't dialed through the shared
+    // client (mesh_route_dispatch route destinations).
+    if name == "mesh_route_dispatch"
+        && let Err(errs) = screen_mesh_route_dispatch_egress(config, backend_allow_ips)
+    {
+        return Err(errs.join("; "));
     }
+    // Redis-backed plugins (rate_limit / request_deduplication /
+    // ai_semantic_cache with sync_mode=redis) build their client from
+    // `redis_url` WITHOUT the egress policy, and the client skips literals
+    // / falls back to the hostname on a DNS denial — so a denied literal
+    // endpoint must be rejected here at config-load.
+    screen_redis_endpoint_egress(config, backend_allow_ips)?;
+    // NOTE: ldap_auth / kafka_logging / ws_logging literal endpoints are
+    // screened *inside* `create_plugin_with_http_client` above (before the
+    // dial task spawns), so no explicit `screen_direct_client_endpoint_egress`
+    // call is needed here — that path already failed closed on a denial.
+    Ok(())
 }
 
 /// Screen a `mesh_route_dispatch` plugin's per-rule `destination.backend_host`

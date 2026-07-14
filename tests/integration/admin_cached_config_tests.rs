@@ -1598,6 +1598,43 @@ async fn test_batch_create_plugin_configs() {
 }
 
 #[tokio::test]
+async fn test_admin_create_rejects_unknown_jwt_auth_policy_keys() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    for (id, config, unknown_key) in [
+        (
+            "jwt-audience-typo",
+            json!({"audience": ["payments-api"]}),
+            "audience",
+        ),
+        (
+            "jwt-issuer-typo",
+            json!({"expected_issue": "https://issuer.example"}),
+            "expected_issue",
+        ),
+    ] {
+        let plugin = json!({
+            "id": id,
+            "plugin_name": "jwt_auth",
+            "scope": "global",
+            "enabled": true,
+            "config": config
+        });
+        let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+
+        assert_eq!(status, 400, "unknown jwt_auth key was admitted: {body}");
+        assert!(
+            body.to_string()
+                .contains(&format!("jwt_auth: unknown config key '{unknown_key}'")),
+            "unexpected admin validation response: {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_batch_create_proxy_and_proxy_plugin_association_same_request() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

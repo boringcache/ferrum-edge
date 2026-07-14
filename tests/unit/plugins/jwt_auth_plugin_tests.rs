@@ -107,6 +107,42 @@ fn test_jwt_auth_rejects_invalid_config() {
     }
 }
 
+#[test]
+fn test_jwt_auth_rejects_unknown_security_policy_keys() {
+    for (config, unknown_key) in [
+        (json!({"audience": ["payments-api"]}), "audience"),
+        (
+            json!({"expected_issuer_url": "https://issuer.example"}),
+            "expected_issuer_url",
+        ),
+        (
+            json!({"audiences": ["payments-api"], "__proto__": {"audiences": []}}),
+            "__proto__",
+        ),
+    ] {
+        let err = JwtAuth::new(&config)
+            .err()
+            .expect("unknown jwt_auth config key must fail closed");
+        assert_eq!(err, format!("jwt_auth: unknown config key '{unknown_key}'"));
+    }
+}
+
+#[test]
+fn test_jwt_auth_accepts_every_known_config_key() {
+    let plugin = JwtAuth::new(&json!({
+        "token_lookup": "query:token",
+        "consumer_claim_field": "client_id",
+        "require_exp": true,
+        "require_nbf": true,
+        "expected_issuers": ["https://issuer.example"],
+        "audiences": ["payments-api"],
+        "leeway_secs": 30
+    }))
+    .expect("all documented jwt_auth config keys should be accepted");
+
+    assert_eq!(plugin.name(), "jwt_auth");
+}
+
 #[tokio::test]
 async fn test_jwt_auth_rejects_missing_exp_by_default() {
     let plugin = JwtAuth::new(&json!({})).unwrap();

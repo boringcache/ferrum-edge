@@ -192,6 +192,8 @@ pub fn last_paragraph_boundary(s: &str) -> Option<usize> {
 /// it onto their own segment taxonomy without re-deriving the JSON shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SseTextKind {
+    /// Legacy Completions assistant text (`$.choices[*].text`).
+    CompletionText,
     /// Chat-completions assistant text (`$.choices[*].delta.content`).
     ChatContent,
     /// Chat-completions streaming tool/function-call name
@@ -239,6 +241,10 @@ struct ToolCallAccumulator {
 /// deterministic.
 #[derive(Debug, Default, Clone)]
 pub struct SseReassembler {
+    /// `choice_index -> legacy Completions text`.
+    completion_text: Vec<(usize, String)>,
+    /// Lookup table for `completion_text`, avoiding linear scans over untrusted indexes.
+    completion_text_positions: HashMap<usize, usize>,
     /// `choice_index -> assistant content`.
     content: Vec<(usize, String)>,
     /// Lookup table for `content`, avoiding linear scans over untrusted indexes.
@@ -262,14 +268,17 @@ impl SseReassembler {
         Self::default()
     }
 
-    /// The assistant prose reassembled so far — chat-completion `delta.content`
-    /// across choices (in choice-index order) followed by Responses-API output
-    /// text. This is the stream that windowed inspection scans for sentence /
-    /// paragraph boundaries; tool-call arguments are inspected separately. With
-    /// parallel choices (`n > 1`) the texts are concatenated, which is an
-    /// approximation — `n = 1` is the dominant streaming case.
+    /// The assistant prose reassembled so far — legacy Completions `text`,
+    /// chat-completion `delta.content`, and Responses-API output text. This is
+    /// the stream that windowed inspection scans for sentence / paragraph
+    /// boundaries; tool-call arguments are inspected separately. With parallel
+    /// choices (`n > 1`) the texts are concatenated, which is an approximation —
+    /// `n = 1` is the dominant streaming case.
     pub fn assistant_content(&self) -> String {
         let mut combined = String::new();
+        for (_choice, text) in &self.completion_text {
+            combined.push_str(text);
+        }
         for (_choice, text) in &self.content {
             combined.push_str(text);
         }
@@ -284,9 +293,49 @@ impl SseReassembler {
     /// event to track window/release offsets, so building the full string each
     /// time would be O(n²) in the completion length.
     pub fn assistant_content_len(&self) -> usize {
+        let completion_text: usize = self.completion_text.iter().map(|(_, t)| t.len()).sum();
         let content: usize = self.content.iter().map(|(_, t)| t.len()).sum();
         let responses: usize = self.responses_text.iter().map(|(_, t)| t.len()).sum();
-        content + responses
+        completion_text
+            .saturating_add(content)
+            .saturating_add(responses)
+    }
+
+    /// Total bytes retained across every reassembled text accumulator (assistant
+    /// prose, tool names/arguments, and Responses API text/arguments), without
+    /// allocating a snapshot. Windowed policy inspectors use this for their
+    /// aggregate retained-state budget.
+    pub fn retained_text_len(&self) -> usize {
+        let completion_text = self
+            .completion_text
+            .iter()
+            .map(|(_, text)| text.len())
+            .sum::<usize>();
+        let content = self
+            .content
+            .iter()
+            .map(|(_, text)| text.len())
+            .sum::<usize>();
+        let tool_calls = self
+            .tool_calls
+            .iter()
+            .map(|(_, call)| call.name.len().saturating_add(call.arguments.len()))
+            .sum::<usize>();
+        let responses_text = self
+            .responses_text
+            .iter()
+            .map(|(_, text)| text.len())
+            .sum::<usize>();
+        let responses_args = self
+            .responses_args
+            .iter()
+            .map(|(_, text)| text.len())
+            .sum::<usize>();
+        completion_text
+            .saturating_add(content)
+            .saturating_add(tool_calls)
+            .saturating_add(responses_text)
+            .saturating_add(responses_args)
     }
 
     /// Reassembled fragments as of now, **without** consuming the accumulator —
@@ -297,46 +346,97 @@ impl SseReassembler {
         self.clone().into_texts()
     }
 
-    /// Trim each streamed tool-call argument accumulator (and Responses-API
-    /// function-call arguments) to its last `keep_tail` bytes, dropping the
-    /// already-inspected prefix.
+    /// Trim streamed tool-call names/arguments and Responses-API function-call
+    /// arguments to a shared tail budget, dropping already-inspected prefixes.
     ///
     /// Counterpart to [`drain_assistant_prefix`](Self::drain_assistant_prefix)
     /// for the non-prose accumulators: streamed `inspect` mode inspects tool-call
-    /// arguments alongside prose, so without trimming, a large `tool_calls[].
-    /// arguments` payload would be retained (and re-inspected) in full until EOF.
+    /// names/arguments alongside prose, so without trimming a large name, large
+    /// arguments payload, or many parallel calls could be retained in full.
     /// The caller trims only AFTER a window inspected those bytes clean, so the
-    /// dropped prefix was already evaluated; the kept tail preserves the
-    /// re-inspection overlap. Tool-call *names* are left intact (bounded by the
-    /// function name length). `keep_tail` is snapped up to a char boundary so the
-    /// retained tail never starts mid-character.
-    pub fn truncate_streamed_tool_args(&mut self, keep_tail: usize) {
-        fn trim(text: &mut String, keep_tail: usize) {
-            if text.len() > keep_tail {
-                let drop = floor_char_boundary(text, text.len() - keep_tail);
+    /// dropped prefix was already evaluated; the bounded aggregate tail
+    /// preserves cross-window context without multiplying `keep_total` by the
+    /// attacker-controlled number of tool indexes. Empty accumulators are
+    /// removed so their lookup tables cannot grow for the rest of the stream.
+    pub fn truncate_streamed_tool_state(&mut self, keep_total: usize) {
+        fn retain_tail_within_budget(text: &mut String, remaining: &mut usize) {
+            if *remaining == 0 {
+                text.clear();
+                return;
+            }
+            if text.len() > *remaining {
+                let mut drop = text.len() - *remaining;
+                while drop < text.len() && !text.is_char_boundary(drop) {
+                    drop += 1;
+                }
                 text.drain(..drop);
             }
+            *remaining = (*remaining).saturating_sub(text.len());
         }
-        for (_key, accum) in &mut self.tool_calls {
-            trim(&mut accum.arguments, keep_tail);
+
+        let has_names = self
+            .tool_calls
+            .iter()
+            .any(|(_key, accum)| !accum.name.is_empty());
+        let has_arguments = self
+            .tool_calls
+            .iter()
+            .any(|(_key, accum)| !accum.arguments.is_empty())
+            || self
+                .responses_args
+                .iter()
+                .any(|(_output, text)| !text.is_empty());
+        let argument_budget = if has_names && has_arguments {
+            keep_total.div_ceil(2)
+        } else if has_arguments {
+            keep_total
+        } else {
+            0
+        };
+        let name_budget = keep_total.saturating_sub(argument_budget);
+
+        // Keep argument and name tails under separate shares when both exist.
+        // A hostile long function name must not consume the entire tool budget
+        // and erase the argument overlap needed for cross-window inspection.
+        let mut argument_remaining = argument_budget;
+        for (_key, accum) in self.tool_calls.iter_mut().rev() {
+            retain_tail_within_budget(&mut accum.arguments, &mut argument_remaining);
         }
-        for (_output, text) in &mut self.responses_args {
-            trim(text, keep_tail);
+        for (_output, text) in self.responses_args.iter_mut().rev() {
+            retain_tail_within_budget(text, &mut argument_remaining);
+        }
+        let mut name_remaining = name_budget;
+        for (_key, accum) in self.tool_calls.iter_mut().rev() {
+            retain_tail_within_budget(&mut accum.name, &mut name_remaining);
+        }
+
+        self.tool_calls
+            .retain(|(_key, accum)| !accum.name.is_empty() || !accum.arguments.is_empty());
+        self.tool_call_positions.clear();
+        for (position, (key, _accum)) in self.tool_calls.iter().enumerate() {
+            self.tool_call_positions.insert(*key, position);
+        }
+        self.responses_args
+            .retain(|(_output, text)| !text.is_empty());
+        self.responses_args_positions.clear();
+        for (position, (output, _text)) in self.responses_args.iter().enumerate() {
+            self.responses_args_positions.insert(*output, position);
         }
     }
 
     /// Drop the first `prefix_len` bytes of the logical
-    /// [`assistant_content`](Self::assistant_content) (chat-completion content
-    /// across choices, then Responses-API output text), keeping the tail.
+    /// [`assistant_content`](Self::assistant_content) (legacy Completions text,
+    /// chat-completion content, then Responses-API output text), keeping the tail.
     ///
     /// Streamed `inspect` mode calls this after releasing an inspected-clean
     /// window so retained prose stays bounded to roughly one window plus the
     /// re-inspection overlap, rather than growing with the whole completion.
-    /// Tool-call accumulators are intentionally left intact — they are bounded
-    /// by the size of the function-call payloads, not the prose length, and have
-    /// no linear release offset. `prefix_len` is snapped down to a char boundary
-    /// per entry, so a value landing mid-character simply retains a few extra
-    /// bytes (always safe — never drops un-inspected content).
+    /// Tool-call accumulators are intentionally left intact by this prose-only
+    /// operation; the window engine bounds them separately with
+    /// [`truncate_streamed_tool_state`](Self::truncate_streamed_tool_state).
+    /// `prefix_len` is snapped down to a char boundary per entry, so a value
+    /// landing mid-character simply retains a few extra bytes (always safe —
+    /// never drops un-inspected content).
     pub fn drain_assistant_prefix(&mut self, prefix_len: usize) {
         let mut remaining = prefix_len;
         let drain_one = |text: &mut String, remaining: &mut usize| {
@@ -352,6 +452,9 @@ impl SseReassembler {
                 *remaining = 0;
             }
         };
+        for (_choice, text) in &mut self.completion_text {
+            drain_one(text, &mut remaining);
+        }
         for (_choice, text) in &mut self.content {
             drain_one(text, &mut remaining);
         }
@@ -370,6 +473,15 @@ impl SseReassembler {
     /// that reassembled to an empty string.
     pub fn into_texts(self) -> Vec<SseText> {
         let mut out = Vec::new();
+        for (choice, text) in self.completion_text {
+            if !text.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::CompletionText,
+                    json_path: format!("$.choices[{choice}].text"),
+                    text,
+                });
+            }
+        }
         for (choice, text) in self.content {
             if !text.is_empty() {
                 out.push(SseText {
@@ -426,6 +538,9 @@ impl SseReassembler {
         };
         for (positional, choice) in choices.iter().enumerate() {
             let choice_index = index_field(choice, "index").unwrap_or(positional);
+            if let Some(text) = choice.get("text").and_then(Value::as_str) {
+                self.completion_text_mut(choice_index).push_str(text);
+            }
             let Some(delta) = choice.get("delta") else {
                 continue;
             };
@@ -478,6 +593,19 @@ impl SseReassembler {
             let output = index_field(frame, "output_index").unwrap_or(0);
             self.responses_args_mut(output).push_str(delta);
         }
+    }
+
+    fn completion_text_mut(&mut self, choice: usize) -> &mut String {
+        let pos = match self.completion_text_positions.get(&choice).copied() {
+            Some(pos) => pos,
+            None => {
+                let pos = self.completion_text.len();
+                self.completion_text.push((choice, String::new()));
+                self.completion_text_positions.insert(choice, pos);
+                pos
+            }
+        };
+        &mut self.completion_text[pos].1
     }
 
     fn content_mut(&mut self, choice: usize) -> &mut String {
@@ -791,7 +919,7 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
     }
 
     #[test]
-    fn truncate_streamed_tool_args_bounds_arguments_keeping_tail() {
+    fn truncate_streamed_tool_state_bounds_names_and_arguments_keeping_tail() {
         let mut r = SseReassembler::new();
         // A long tool-call argument stream (well past any small keep_tail).
         let big = "X".repeat(500);
@@ -801,7 +929,7 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
         for f in parse_sse_data_frames(frame.as_bytes()) {
             r.push_frame(&f);
         }
-        r.truncate_streamed_tool_args(64);
+        r.truncate_streamed_tool_state(64);
         let args = r
             .texts()
             .into_iter()
@@ -813,9 +941,32 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
             "args bounded to ~keep_tail, got {}",
             args.len()
         );
+        assert!(!args.is_empty(), "argument overlap must be retained");
         assert!(args.chars().all(|c| c == 'X'), "kept the argument tail");
-        // The tool NAME is never trimmed.
+        // A normal-sized tool name remains while the hostile argument is bounded.
         assert!(r.texts().iter().any(|t| t.text == "run"));
+    }
+
+    #[test]
+    fn truncate_streamed_tool_state_uses_one_budget_across_parallel_calls() {
+        let mut r = SseReassembler::new();
+        let name = "N".repeat(200);
+        let arguments = "A".repeat(200);
+        let frame = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"name\":\"{name}\",\"arguments\":\"{arguments}\"}}}},{{\"index\":1,\"function\":{{\"name\":\"{name}\",\"arguments\":\"{arguments}\"}}}}]}}}}]}}\n\n"
+        );
+        for parsed in parse_sse_data_frames(frame.as_bytes()) {
+            r.push_frame(&parsed);
+        }
+        assert!(r.retained_text_len() > 64);
+
+        r.truncate_streamed_tool_state(64);
+
+        assert!(
+            r.retained_text_len() <= 64,
+            "parallel tool state exceeded shared tail budget: {}",
+            r.retained_text_len()
+        );
     }
 
     #[test]
@@ -868,6 +1019,18 @@ data: [DONE]\n\n";
         assert_eq!(texts[0].kind, SseTextKind::ChatContent);
         assert_eq!(texts[0].text, "Hello world");
         assert_eq!(texts[0].json_path, "$.choices[0].delta.content");
+    }
+
+    #[test]
+    fn reassembles_legacy_completion_text_chunks() {
+        let body = b"data: {\"choices\":[{\"index\":0,\"text\":\"My system \"}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"text\":\"prompt is secret.\"}]}\n\n\
+data: [DONE]\n\n";
+        let texts = reassemble(body);
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].kind, SseTextKind::CompletionText);
+        assert_eq!(texts[0].text, "My system prompt is secret.");
+        assert_eq!(texts[0].json_path, "$.choices[0].text");
     }
 
     #[test]

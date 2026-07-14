@@ -55,6 +55,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -85,6 +86,7 @@ const FAULT_ACTION_MAX_DELAY_MS: u64 = 3_600_000;
 
 /// Top-level config for the plugin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshRouteDispatchConfig {
     /// Ordered list of rules. First match wins; rules with no match criteria
     /// are rejected at config-load time to avoid silently-overriding catch-alls.
@@ -230,6 +232,12 @@ impl MeshRouteDispatchConfig {
                      backend_host and backend_port so TLS overrides only apply to a direct backend"
                 ));
             }
+            rule.destination.node_waypoint_backend_match_key = rule
+                .destination
+                .backend_host
+                .as_deref()
+                .zip(rule.destination.backend_port)
+                .and_then(|(host, port)| node_waypoint_backend_metadata_value(host, port));
             if let Some(tls) = rule.destination.backend_tls.as_mut() {
                 normalize_and_validate_backend_tls(idx, tls)?;
             }
@@ -454,14 +462,21 @@ fn normalize_and_validate_backend_tls(
     rule_idx: usize,
     tls: &mut BackendTlsConfig,
 ) -> Result<(), String> {
-    let has_client_cert = tls
-        .client_cert_path
-        .as_deref()
-        .is_some_and(|path| !path.is_empty());
-    let has_client_key = tls
-        .client_key_path
-        .as_deref()
-        .is_some_and(|path| !path.is_empty());
+    for (field, path) in [
+        ("client_cert_path", tls.client_cert_path.as_deref()),
+        ("client_key_path", tls.client_key_path.as_deref()),
+        ("server_ca_cert_path", tls.server_ca_cert_path.as_deref()),
+    ] {
+        if path.is_some_and(str::is_empty) {
+            return Err(format!(
+                "mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.{field} \
+                 must not be empty"
+            ));
+        }
+    }
+
+    let has_client_cert = tls.client_cert_path.is_some();
+    let has_client_key = tls.client_key_path.is_some();
     if has_client_cert != has_client_key {
         return Err(format!(
             "mesh_route_dispatch.rules[{rule_idx}].destination.backend_tls.client_cert_path \
@@ -497,6 +512,7 @@ fn normalize_and_validate_backend_tls(
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteRule {
     /// Match criteria — all configured fields must match for the rule to fire.
     #[serde(default, rename = "match")]
@@ -617,6 +633,7 @@ pub struct RouteRule {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MatchCriteria {
     /// HTTP methods (any-of). Empty = no method restriction. Each entry is
     /// one of:
@@ -627,11 +644,10 @@ pub struct MatchCriteria {
     ///   Istio `StringMatch` shape, projected from VirtualService translation.
     ///
     /// HTTP methods are conventionally uppercase ASCII (RFC 9110 §9.1). The
-    /// translator preserves operator casing on the wire, but the plugin
-    /// uppercases `prefix` / `regex` patterns at compile time so the hot
-    /// path can do a single case-sensitive compare against the request
-    /// method without per-request casing work. `Exact` keeps the operator's
-    /// literal casing to preserve the existing `method_match_is_case_sensitive`
+    /// translator preserves operator casing on the wire. The plugin uppercases
+    /// `prefix` patterns at compile time; `regex` patterns remain verbatim and
+    /// must span the full request method. `Exact` keeps the operator's literal
+    /// casing to preserve the existing `method_match_is_case_sensitive`
     /// contract.
     ///
     /// Regexes compile at config-load time (cold path); the hot path reads
@@ -776,9 +792,7 @@ impl AuthorityMatcher {
         match self {
             AuthorityMatcher::Exact(expected) => authority == expected.as_str(),
             AuthorityMatcher::Prefix(prefix) => authority.starts_with(prefix.as_str()),
-            AuthorityMatcher::Regex(re) => re
-                .find(authority)
-                .is_some_and(|m| m.start() == 0 && m.end() == authority.len()),
+            AuthorityMatcher::Regex(re) => re.is_match(authority),
         }
     }
 }
@@ -818,9 +832,9 @@ pub enum MethodStringMatch {
 /// `Arc`-backed internally and clones are refcount bumps, not pattern
 /// recompiles.
 ///
-/// `Prefix` and `Regex` are uppercased at compile time (methods are
-/// conventionally uppercase ASCII per RFC 9110 §9.1) so the hot path is a
-/// single case-sensitive compare against the request method. `Exact` retains
+/// `Prefix` is uppercased at compile time (methods are conventionally
+/// uppercase ASCII per RFC 9110 §9.1). Regex patterns are embedded verbatim
+/// inside absolute input anchors and must span the full method. `Exact` retains
 /// the operator's casing exactly so `method_match_is_case_sensitive` stays
 /// truthful — operators who write `"get"` continue to match only literal
 /// `"get"` requests, never `"GET"`.
@@ -886,9 +900,7 @@ impl HeaderMatcher {
         match self {
             HeaderMatcher::Exact(expected) => value == expected.as_str(),
             HeaderMatcher::Prefix(prefix) => value.starts_with(prefix.as_str()),
-            HeaderMatcher::Regex(re) => re
-                .find(value)
-                .is_some_and(|m| m.start() == 0 && m.end() == value.len()),
+            HeaderMatcher::Regex(re) => re.is_match(value),
         }
     }
 }
@@ -961,6 +973,15 @@ impl UriMatcher {
     }
 }
 
+/// Compile a regex that can match only the complete input. Anchoring at the
+/// cold config boundary avoids relying on the first leftmost alternative from
+/// `Regex::find`, which may be a shorter prefix even when a later alternative
+/// spans the whole input. The operator pattern stays in its own non-capturing
+/// group so inline flags and alternation retain their original semantics.
+fn compile_full_match_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    Regex::new(&format!(r"\A(?:{pattern})\z"))
+}
+
 /// Allocation-free byte-level case-insensitive `starts_with`. ASCII fold
 /// only: non-ASCII bytes match byte-for-byte (matches Istio's semantics and
 /// is documented as such in the operator-facing docs). Returns `false` when
@@ -981,6 +1002,7 @@ fn starts_with_ignore_ascii_case(path: &str, prefix: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteDestination {
     /// Override the proxy's `upstream_id`. Wins over `proxy.upstream_id`
     /// at upstream-target selection time.
@@ -1003,6 +1025,11 @@ pub struct RouteDestination {
     /// authorized destination, matching this rule must fail closed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub requires_node_waypoint_authz: bool,
+    /// Canonical direct-backend key compared against the NodeWaypoint authz
+    /// stamp. Built once during config normalization so the request path can
+    /// borrow it without lowercasing or formatting on every match.
+    #[serde(skip)]
+    node_waypoint_backend_match_key: Option<String>,
 }
 
 impl RouteDestination {
@@ -1056,15 +1083,11 @@ fn reject_node_waypoint_authz_destination_override(
     }
     if let Some(authorized_backend) = authorized_backend
         && destination.upstream_id.is_none()
-        && let Some(destination_backend) = destination.backend_host.as_deref().and_then(|host| {
-            destination
-                .backend_port
-                .and_then(|port| node_waypoint_backend_metadata_value(host, port))
-        })
-        && (destination_backend == *authorized_backend
+        && let Some(destination_backend) = destination.node_waypoint_backend_match_key.as_deref()
+        && (destination_backend == authorized_backend.as_str()
             || node_waypoint_backend_metadata_contains(
                 authorized_backend_aliases.map(String::as_str),
-                &destination_backend,
+                destination_backend,
             ))
     {
         return None;
@@ -1104,6 +1127,7 @@ fn node_waypoint_backend_metadata_contains(values: Option<&str>, backend: &str) 
 /// At least one of `delay` / `abort` must be present; an empty fault
 /// object is rejected at config-load time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct FaultActionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay: Option<FaultDelayConfig>,
@@ -1112,6 +1136,7 @@ pub struct FaultActionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct FaultDelayConfig {
     /// How long to delay when the percentile roll hits, in milliseconds.
     /// Bounded to `[1, 3_600_000]` (1 ms to 1 hour) so a misconfigured
@@ -1124,6 +1149,7 @@ pub struct FaultDelayConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct FaultAbortConfig {
     /// HTTP status code returned to the client. `200..=599`.
     pub status_code: u16,
@@ -1162,6 +1188,7 @@ pub struct FaultAbortConfig {
 /// The rewrite is applied AFTER any route override destination is chosen, so a
 /// canary route can both re-target an upstream and rewrite the path it sees.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RouteRewriteConfig {
     /// Replacement request path (or path prefix when `match_prefix` is set).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1193,6 +1220,7 @@ impl RouteRewriteConfig {
 /// the original request URL and only changes the status code. `redirect_code`
 /// defaults to 301 and is constrained to the 3xx range.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RouteRedirectConfig {
     /// Replacement path for the `Location` header. When unset, the request's
     /// own path is preserved.
@@ -1226,12 +1254,16 @@ fn default_redirect_code() -> u16 {
 #[derive(Debug)]
 pub struct MeshRouteDispatch {
     config: MeshRouteDispatchConfig,
+    aggregate_reject_unmatched: AtomicBool,
 }
 
 impl MeshRouteDispatch {
     pub fn new(config: &serde_json::Value) -> Result<Self, String> {
         let parsed = MeshRouteDispatchConfig::from_value_normalized(config)?;
-        Ok(Self { config: parsed })
+        Ok(Self {
+            config: parsed,
+            aggregate_reject_unmatched: AtomicBool::new(false),
+        })
     }
 
     /// Public for tests.
@@ -1322,7 +1354,7 @@ fn compile_authority_matcher(
                     "mesh_route_dispatch.rules[{rule_idx}].match.authority.regex must not be empty"
                 ));
             }
-            let re = Regex::new(pattern).map_err(|e| {
+            let re = compile_full_match_regex(pattern).map_err(|e| {
                 format!(
                     "mesh_route_dispatch.rules[{rule_idx}].match.authority.regex is invalid: {e}"
                 )
@@ -1406,7 +1438,7 @@ fn compile_uri_matcher(
                     "mesh_route_dispatch.rules[{rule_idx}].match.uri.regex must not be empty"
                 ));
             }
-            let re = Regex::new(pattern).map_err(|e| {
+            let re = compile_full_match_regex(pattern).map_err(|e| {
                 format!("mesh_route_dispatch.rules[{rule_idx}].match.uri.regex is invalid: {e}")
             })?;
             UriMatcher::Regex(re)
@@ -1438,7 +1470,8 @@ fn normalize_header_match_keys(
 }
 
 /// Compile each per-method matcher once, at config load. Regex compilation is
-/// the cold-path work; the request hot path only calls `Regex::is_match`.
+/// the cold-path work; absolute anchors make the request hot path one
+/// `Regex::is_match` call.
 /// Invalid regex (or an empty pattern after the operator-provided string) is a
 /// hard error from `Plugin::new()`, per CLAUDE.md's "no Ok-with-runtime-panic"
 /// plugin-config-validation rule.
@@ -1446,11 +1479,11 @@ fn normalize_header_match_keys(
 /// HTTP methods are conventionally uppercase ASCII (RFC 9110 §9.1). `Prefix`
 /// patterns are uppercased here at compile time so the hot path can do a
 /// single case-sensitive compare against the request method. Regex patterns
-/// are compiled verbatim because changing their casing can rewrite regex
-/// syntax (for example `\d` -> `\D`). `Exact` deliberately preserves the
-/// operator's casing so the existing `method_match_is_case_sensitive` test
-/// continues to pass (operators who write `"get"` continue to match only
-/// literal `"get"` requests).
+/// are embedded verbatim between full-input anchors because changing their
+/// casing can rewrite regex syntax (for example `\d` -> `\D`). `Exact`
+/// deliberately preserves the operator's casing so the existing
+/// `method_match_is_case_sensitive` test continues to pass (operators who
+/// write `"get"` continue to match only literal `"get"` requests).
 fn compile_method_matchers(
     rule_idx: usize,
     methods: &[MethodMatchOp],
@@ -1478,7 +1511,7 @@ fn compile_method_matchers(
                          must not be empty"
                     ));
                 }
-                let re = Regex::new(pattern).map_err(|e| {
+                let re = compile_full_match_regex(pattern).map_err(|e| {
                     format!(
                         "mesh_route_dispatch.rules[{rule_idx}].match.methods[{op_idx}].regex \
                          is invalid: {e}"
@@ -1493,7 +1526,8 @@ fn compile_method_matchers(
 }
 
 /// Compile each per-header matcher once, at config load. Regex compilation is
-/// the cold-path work; the request hot path only calls `Regex::is_match`.
+/// the cold-path work; absolute anchors make the request hot path one
+/// `Regex::is_match` call.
 /// Invalid regex (or an empty pattern after the operator-provided string) is a
 /// hard error from `Plugin::new()`, per CLAUDE.md's "no Ok-with-runtime-panic"
 /// plugin-config-validation rule.
@@ -1524,7 +1558,7 @@ fn compile_header_matchers(
                          must not be empty"
                     ));
                 }
-                let re = Regex::new(pattern).map_err(|e| {
+                let re = compile_full_match_regex(pattern).map_err(|e| {
                     format!(
                         "mesh_route_dispatch.rules[{rule_idx}].match.headers[`{name}`].regex \
                          is invalid: {e}"
@@ -1578,6 +1612,11 @@ impl Plugin for MeshRouteDispatch {
             .any(|rule| rule.rewrite.as_ref().is_some_and(|r| r.authority.is_some()))
     }
 
+    fn enable_deferred_unmatched_rejection(&self) {
+        self.aggregate_reject_unmatched
+            .store(true, Ordering::Relaxed);
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -1592,6 +1631,7 @@ impl Plugin for MeshRouteDispatch {
         }
         for rule in &self.config.rules {
             if rule_matches(rule, ctx, headers) {
+                ctx.mesh_route_dispatch_matched = true;
                 // Per-rule redirect (Istio `http[].redirect`): answer the
                 // request ourselves with a 3xx + `Location`. Highest
                 // precedence — a redirect short-circuits before fault and
@@ -1695,13 +1735,21 @@ impl Plugin for MeshRouteDispatch {
             // backend would receive traffic the operator explicitly excluded
             // (e.g., a GET-only canary route serving POST). 404 matches
             // Envoy's behavior when no Istio route matches a request.
-            return PluginResult::Reject {
-                status_code: 404,
-                body: "no route matched mesh_route_dispatch predicates".to_string(),
-                headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
-            };
+            if self.aggregate_reject_unmatched.load(Ordering::Relaxed) {
+                ctx.mesh_route_dispatch_reject_unmatched = true;
+                return PluginResult::Continue;
+            }
+            return reject_unmatched_result();
         }
         PluginResult::Continue
+    }
+}
+
+pub(crate) fn reject_unmatched_result() -> PluginResult {
+    PluginResult::Reject {
+        status_code: 404,
+        body: "no route matched mesh_route_dispatch predicates".to_string(),
+        headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
     }
 }
 

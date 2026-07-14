@@ -1602,3 +1602,312 @@ fn ai_prompt_shield_schema_matches_runtime_validation() {
         );
     }
 }
+
+#[test]
+fn jwt_auth_schema_rejects_unknown_config_keys() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/JwtAuthConfig")
+        .expect("missing JwtAuthConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("JwtAuthConfig schema compiles");
+
+    assert!(
+        validator
+            .validate(&json!({"audiences": ["payments-api"]}))
+            .is_ok()
+    );
+    for config in [
+        json!({"audience": ["payments-api"]}),
+        json!({"expected_issue": "https://issuer.example"}),
+    ] {
+        assert!(
+            validator.validate(&config).is_err(),
+            "schema should reject unknown jwt_auth key: {config}"
+        );
+    }
+}
+
+#[test]
+fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
+    use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let representative = json!({
+        "rules": [
+            {
+                "match": {
+                    "methods": [{"regex": "GET|POST"}],
+                    "uri": {"regex": "/api/[a-z]+"}
+                },
+                "destination": {
+                    "backend_host": "api.internal.example",
+                    "backend_port": 8443,
+                    "backend_tls": {
+                        "client_cert_path": "/tls/client.pem",
+                        "client_key_path": "/tls/client.key",
+                        "server_ca_cert_path": "/tls/ca.pem",
+                        "verify_server_cert": true,
+                        "sni": "api.internal.example",
+                        "san_allow_list": ["api.internal.example"]
+                    },
+                    "requires_node_waypoint_authz": true
+                },
+                "timeout_ms": 1500,
+                "retry": {
+                    "max_retries": 2,
+                    "retryable_status_codes": [502],
+                    "retryable_methods": ["GET"],
+                    "backoff": {"fixed": {"delay_ms": 25}},
+                    "retry_on_connect_failure": true
+                },
+                "request_transform": [
+                    {
+                        "operation": "add",
+                        "target": "header",
+                        "key": "x-route",
+                        "value": "api"
+                    },
+                    {"operation": "remove", "key": "x-internal"}
+                ],
+                "response_transform": [{
+                    "operation": "update",
+                    "key": "x-served-by",
+                    "value": "edge"
+                }],
+                "fault": {"delay": {"duration_ms": 1, "percentage": 1.0}},
+                "rewrite": {"uri": "/v2", "match_prefix": "/api"}
+            },
+            {
+                "match": {"methods": ["HEAD"]},
+                "redirect": {"redirect_code": 308}
+            },
+            {
+                "match": {"methods": ["PUT"]},
+                "destination": {"upstream_id": "fallback"},
+                "timeout_ms": null,
+                "timeout_disabled": true,
+                "retry": null,
+                "retry_disabled": true
+            }
+        ],
+        "reject_unmatched": true
+    });
+
+    assert_component_validity(&spec, "MeshRouteDispatchConfig", &representative, true);
+    MeshRouteDispatch::new(&representative).expect("representative config is runtime-valid");
+
+    let documented_old_transform = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "api"},
+            "request_transform": [{"op": "update", "key": "x-route", "value": "api"}]
+        }]
+    });
+    assert_component_validity(
+        &spec,
+        "MeshRouteDispatchConfig",
+        &documented_old_transform,
+        false,
+    );
+    assert!(MeshRouteDispatch::new(&documented_old_transform).is_err());
+
+    for invalid_transform in [
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "request_transform": [{"operation": "add", "key": "x-route"}]
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "request_transform": [{
+                    "operation": "remove",
+                    "key": "x-route",
+                    "value": "unexpected"
+                }]
+            }]
+        }),
+    ] {
+        assert_component_validity(&spec, "MeshRouteDispatchConfig", &invalid_transform, false);
+        assert!(MeshRouteDispatch::new(&invalid_transform).is_err());
+    }
+
+    // These nested types are shared with the general Proxy model, whose
+    // unknown-field compatibility is intentionally broader than the
+    // mesh-route-owned object boundaries above.
+    for compatible_shared_policy in [
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {
+                    "backend_host": "api.internal",
+                    "backend_port": 443,
+                    "backend_tls": {"client_certpath": "/tls/client.pem"}
+                }
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "retry": {"max_retry": 2}
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "retry": {"backoff": {"fixed": {"delay_ms": 25, "delay_millis": 25}}}
+            }]
+        }),
+    ] {
+        assert_component_validity(
+            &spec,
+            "MeshRouteDispatchConfig",
+            &compatible_shared_policy,
+            true,
+        );
+        assert!(MeshRouteDispatch::new(&compatible_shared_policy).is_ok());
+    }
+
+    let status_only_redirect = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "redirect": {"redirect_code": 308}
+        }]
+    });
+    assert_component_validity(
+        &spec,
+        "MeshRouteDispatchConfig",
+        &status_only_redirect,
+        true,
+    );
+    MeshRouteDispatch::new(&status_only_redirect).expect("status-only redirects are runtime-valid");
+}
+
+#[test]
+fn oidc_relying_party_schema_matches_strict_runtime_surface() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/OidcRelyingPartyConfig")
+        .expect("missing OidcRelyingPartyConfig schema");
+    assert_eq!(schema["additionalProperties"], false);
+
+    let provider = &schema["properties"]["providers"]["items"];
+    assert_eq!(provider["additionalProperties"], false);
+    let provider_fields: BTreeSet<_> = provider["properties"]
+        .as_object()
+        .expect("provider properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        provider_fields,
+        BTreeSet::from([
+            "audiences",
+            "authorization_endpoint",
+            "callback_path",
+            "claim_headers",
+            "client_auth",
+            "client_id",
+            "consumer_header_claim",
+            "consumer_identity_claim",
+            "discovery_url",
+            "end_session_endpoint",
+            "id_token_clock_skew_secs",
+            "issuer",
+            "jwks_uri",
+            "logout_path",
+            "post_logout_redirect_uri",
+            "redirect_uri",
+            "required_roles",
+            "required_scopes",
+            "role_claim",
+            "scope_claim",
+            "scopes",
+            "token_endpoint",
+            "userinfo_endpoint",
+        ])
+    );
+    assert!(
+        provider["properties"]
+            .get("post_logout_redirect_uri")
+            .is_some()
+    );
+    assert_eq!(
+        provider["properties"]["id_token_clock_skew_secs"]["default"],
+        60
+    );
+    assert_eq!(
+        provider["properties"]["client_auth"]["additionalProperties"],
+        false
+    );
+
+    let session = &schema["properties"]["session"];
+    assert_eq!(session["additionalProperties"], false);
+    assert!(session["properties"].get("redis_url").is_none());
+    let session_fields: BTreeSet<_> = session["properties"]
+        .as_object()
+        .expect("session properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        session_fields,
+        BTreeSet::from([
+            "cookie_name",
+            "domain",
+            "encryption_secret",
+            "encryption_secret_previous",
+            "http_only",
+            "idle_ttl_secs",
+            "max_cookie_bytes",
+            "path",
+            "same_site",
+            "secure",
+            "store",
+            "ttl_secs",
+        ])
+    );
+
+    let behavior = &schema["properties"]["behavior"];
+    assert_eq!(behavior["additionalProperties"], false);
+    let behavior_fields: BTreeSet<_> = behavior["properties"]
+        .as_object()
+        .expect("behavior properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        behavior_fields,
+        BTreeSet::from([
+            "challenge_api_status",
+            "challenge_html_status",
+            "html_accept_substrings",
+            "post_login_default_path",
+            "post_login_redirect_param",
+            "refresh_skew_secs",
+            "rp_initiated_logout",
+            "state_cache_max_entries",
+            "state_cache_max_entries_per_source",
+            "state_ttl_secs",
+            "trusted_redirect_hosts",
+        ])
+    );
+    assert_eq!(
+        behavior["properties"]["state_cache_max_entries"]["default"],
+        10_000
+    );
+    assert_eq!(
+        behavior["properties"]["state_cache_max_entries_per_source"]["default"],
+        32
+    );
+}
