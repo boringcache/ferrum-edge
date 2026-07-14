@@ -3233,6 +3233,107 @@ async fn head_responses_skip_empty_body_inspection() {
 }
 
 #[tokio::test]
+async fn unrelated_buffered_responses_remain_out_of_scope() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+
+    let mut generic_json_ctx = create_test_context();
+    assert_continue(
+        firewall
+            .on_response_body(
+                &mut generic_json_ctx,
+                200,
+                &response_headers(),
+                br#"{"ordinary_api_field":"value"}"#,
+            )
+            .await,
+    );
+    let text_headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    assert_continue(
+        firewall
+            .on_final_response_body(
+                &mut generic_json_ctx,
+                200,
+                &text_headers,
+                b"transformed ordinary text",
+            )
+            .await,
+    );
+
+    let encoded_html_headers = HashMap::from([
+        ("content-type".to_string(), "text/html".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+    ]);
+    let mut encoded_html_ctx = create_test_context();
+    assert_continue(
+        firewall
+            .on_response_body(
+                &mut encoded_html_ctx,
+                200,
+                &encoded_html_headers,
+                b"opaque origin bytes",
+            )
+            .await,
+    );
+    assert_continue(
+        firewall
+            .on_final_response_body(
+                &mut encoded_html_ctx,
+                200,
+                &encoded_html_headers,
+                b"opaque origin bytes",
+            )
+            .await,
+    );
+
+    let large_download = vec![b'x'; 10 * 1024 * 1024 + 1];
+    let download_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/octet-stream".to_string(),
+    )]);
+    let mut download_ctx = create_test_context();
+    assert_continue(
+        firewall
+            .on_response_body(&mut download_ctx, 200, &download_headers, &large_download)
+            .await,
+    );
+
+    for ctx in [&generic_json_ctx, &encoded_html_ctx, &download_ctx] {
+        assert!(
+            !ctx.metadata
+                .contains_key("ai_semantic_firewall.uninspectable_body")
+        );
+    }
+}
+
+#[tokio::test]
+async fn response_only_stream_detection_does_not_govern_unrelated_requests() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let mut ctx = make_post_ctx(&json!({"ordinary_api_field": "value"}));
+
+    assert_continue(firewall.before_proxy(&mut ctx, &mut json_headers()).await);
+    let text_headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    assert_continue(
+        firewall
+            .on_final_request_body_with_context(&mut ctx, &text_headers, b"rewritten ordinary text")
+            .await,
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_semantic_firewall.uninspectable_body")
+    );
+}
+
+#[tokio::test]
 async fn successful_api_key_resolution_is_cached_per_plugin_instance() {
     const ENV_NAME: &str = "FERRUM_EDGE_TEST_SEMANTIC_FIREWALL_CACHED_KEY_2255";
     unsafe { std::env::set_var(ENV_NAME, "cache-me") };

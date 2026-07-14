@@ -901,7 +901,6 @@ impl AiSemanticFirewall {
         json: &Value,
         body: &[u8],
     ) -> PluginResult {
-        self.set_request_hash(ctx, sha256_hex_bytes(body));
         let streaming_result = self.apply_streaming_request_policy(ctx, json);
         if !matches!(streaming_result, PluginResult::Continue) {
             return streaming_result;
@@ -914,6 +913,7 @@ impl AiSemanticFirewall {
         let segments = extract_request_segments(json, &self.engine.extraction);
         if segments.is_empty() {
             return if looks_like_governed_request_json(json) {
+                self.set_request_hash(ctx, sha256_hex_bytes(body));
                 self.engine.handle_uninspectable_body(
                     ctx,
                     Direction::Request,
@@ -923,6 +923,8 @@ impl AiSemanticFirewall {
                 PluginResult::Continue
             };
         }
+
+        self.set_request_hash(ctx, sha256_hex_bytes(body));
 
         let outcome = self
             .engine
@@ -956,6 +958,11 @@ impl AiSemanticFirewall {
         content_type: &str,
         body: &[u8],
     ) -> PluginResult {
+        let event_stream = is_event_stream_content_type(content_type);
+        let json_body = is_json_content_type(content_type) || looks_like_json(body);
+        if !event_stream && !json_body {
+            return PluginResult::Continue;
+        }
         if body.len() > MAX_INSPECTION_BODY_BYTES {
             return self.engine.handle_uninspectable_body(
                 ctx,
@@ -963,21 +970,21 @@ impl AiSemanticFirewall {
                 "body_too_large",
             );
         }
-        self.set_response_hash(ctx, sha256_hex_bytes(body));
-
-        let segments = if is_event_stream_content_type(content_type) {
+        let segments = if event_stream {
             let (segments, fully_parsed) =
                 reassemble_sse_response_segments(body, &self.engine.extraction);
             if (buffer_streaming_marker_set(ctx) || windowed_streaming_marker_set(ctx))
                 && (!fully_parsed || segments.is_empty())
             {
+                self.set_response_hash(ctx, sha256_hex_bytes(body));
                 return self.engine.handle_uninspectable_buffered_stream(ctx);
             }
             segments
-        } else if is_json_content_type(content_type) || looks_like_json(body) {
+        } else {
             let json: Value = match serde_json::from_slice(strip_json_bom(body)) {
                 Ok(json) => json,
                 Err(_) => {
+                    self.set_response_hash(ctx, sha256_hex_bytes(body));
                     return self.engine.handle_uninspectable_body(
                         ctx,
                         Direction::Response,
@@ -993,6 +1000,7 @@ impl AiSemanticFirewall {
                 &mut segments,
             );
             if segments.is_empty() && looks_like_governed_response_json(&json) {
+                self.set_response_hash(ctx, sha256_hex_bytes(body));
                 return self.engine.handle_uninspectable_body(
                     ctx,
                     Direction::Response,
@@ -1000,13 +1008,13 @@ impl AiSemanticFirewall {
                 );
             }
             segments
-        } else {
-            return PluginResult::Continue;
         };
 
         if segments.is_empty() {
             return PluginResult::Continue;
         }
+
+        self.set_response_hash(ctx, sha256_hex_bytes(body));
 
         let outcome = self
             .engine
@@ -2219,21 +2227,26 @@ impl Plugin for AiSemanticFirewall {
             return PluginResult::Continue;
         }
 
+        let content_type = header_value(response_headers, "content-type").unwrap_or("");
+        let encoded_body = has_non_identity_content_encoding(response_headers)
+            && !gateway_response_compression_planned(ctx, response_headers);
+        if !response_content_type_is_inspection_candidate(content_type)
+            && (encoded_body || !looks_like_json(body))
+        {
+            return PluginResult::Continue;
+        }
         if body.is_empty() {
             return self
                 .engine
                 .handle_uninspectable_body(ctx, Direction::Response, "empty_body");
         }
-        if has_non_identity_content_encoding(response_headers)
-            && !gateway_response_compression_planned(ctx, response_headers)
-        {
+        if encoded_body {
             self.set_response_hash(ctx, sha256_hex_bytes(body));
             return self
                 .engine
                 .handle_uninspectable_body(ctx, Direction::Response, "encoded_body");
         }
 
-        let content_type = header_value(response_headers, "content-type").unwrap_or("");
         self.inspect_response_bytes(ctx, content_type, body).await
     }
 
@@ -2257,19 +2270,20 @@ impl Plugin for AiSemanticFirewall {
             return PluginResult::Continue;
         }
 
-        let was_governed = self.response_hash(ctx).is_some();
-        let raw_hash = sha256_hex_bytes(body);
-        if self.response_hash(ctx) == Some(raw_hash.as_str()) {
-            return PluginResult::Continue;
-        }
-        if body.is_empty() {
-            return self
-                .engine
-                .handle_uninspectable_body(ctx, Direction::Response, "empty_body");
-        }
-
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
+        let was_governed = self.response_hash(ctx).is_some();
+        let type_candidate = response_content_type_is_inspection_candidate(content_type);
         if let Some(encoding) = content_encoding_value(response_headers) {
+            if !was_governed && !type_candidate {
+                return PluginResult::Continue;
+            }
+            if body.is_empty() {
+                return self.engine.handle_uninspectable_body(
+                    ctx,
+                    Direction::Response,
+                    "empty_body",
+                );
+            }
             let Some(decoded) = decompress_within_limit(encoding, body) else {
                 return self.engine.handle_uninspectable_body(
                     ctx,
@@ -2277,6 +2291,17 @@ impl Plugin for AiSemanticFirewall {
                     "encoded_body",
                 );
             };
+            if !type_candidate && !looks_like_json(&decoded) {
+                return if was_governed {
+                    self.engine.handle_uninspectable_body(
+                        ctx,
+                        Direction::Response,
+                        "transformed_body_not_inspectable",
+                    )
+                } else {
+                    PluginResult::Continue
+                };
+            }
             let decoded_hash = sha256_hex_bytes(&decoded);
             if self.response_hash(ctx) == Some(decoded_hash.as_str()) {
                 return PluginResult::Continue;
@@ -2286,23 +2311,25 @@ impl Plugin for AiSemanticFirewall {
                 .await;
         }
 
-        if !is_json_content_type(content_type)
-            && !is_event_stream_content_type(content_type)
-            && !looks_like_json(body)
-            && !was_governed
-        {
+        if !type_candidate && !looks_like_json(body) {
+            return if was_governed {
+                self.engine.handle_uninspectable_body(
+                    ctx,
+                    Direction::Response,
+                    "transformed_body_not_inspectable",
+                )
+            } else {
+                PluginResult::Continue
+            };
+        }
+        let raw_hash = sha256_hex_bytes(body);
+        if self.response_hash(ctx) == Some(raw_hash.as_str()) {
             return PluginResult::Continue;
         }
-        if !is_json_content_type(content_type)
-            && !is_event_stream_content_type(content_type)
-            && !looks_like_json(body)
-            && was_governed
-        {
-            return self.engine.handle_uninspectable_body(
-                ctx,
-                Direction::Response,
-                "transformed_body_not_inspectable",
-            );
+        if body.is_empty() {
+            return self
+                .engine
+                .handle_uninspectable_body(ctx, Direction::Response, "empty_body");
         }
 
         self.inspect_response_bytes(ctx, content_type, body).await
@@ -4834,6 +4861,10 @@ fn content_encoding_value(headers: &HashMap<String, String>) -> Option<&str> {
 
 fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool {
     content_encoding_value(headers).is_some()
+}
+
+fn response_content_type_is_inspection_candidate(content_type: &str) -> bool {
+    is_json_content_type(content_type) || is_event_stream_content_type(content_type)
 }
 
 /// The compression plugin advertises its selected encoding in headers during
