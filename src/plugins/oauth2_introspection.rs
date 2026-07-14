@@ -515,11 +515,9 @@ impl Oauth2Introspection {
             key: token_key,
             cell: Arc::clone(&cell),
         });
-        let result = cell
-            .get_or_init(|| self.introspect_uncached(token, provider, provider_idx))
+        cell.get_or_init(|| self.introspect_uncached(token, provider, provider_idx))
             .await
-            .clone();
-        result
+            .clone()
     }
 
     async fn introspect_uncached(
