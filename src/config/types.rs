@@ -3580,19 +3580,18 @@ impl GatewayConfig {
                     .and_then(|value| value.as_str())
                     == Some("san_dns")
         };
-        let dns_identity_matching_enabled = self
-            .effective_mtls_auth_plugins_by_proxy()
-            .into_iter()
-            .flat_map(|(_, plugins)| plugins)
-            .any(&is_dns_identity_plugin)
-            // The plugin cache keeps global plugins as the fallback for proxy
-            // IDs absent from the config (including synthesized mesh relays).
-            // With no registered proxy there is no local association that can
-            // shadow this fallback, so it remains an effective DNS consumer.
-            || (self.proxies.is_empty()
-                && self.plugin_configs.iter().any(|plugin| {
-                    plugin.scope == PluginScope::Global && is_dns_identity_plugin(plugin)
-                }));
+        // The plugin cache keeps globals as the fallback for every proxy ID
+        // absent from its association map, including synthesized mesh relays.
+        // Local associations can shadow a global on registered proxies, but
+        // cannot make that global dormant for unknown proxy IDs.
+        let dns_identity_matching_enabled =
+            self.plugin_configs.iter().any(|plugin| {
+                plugin.scope == PluginScope::Global && is_dns_identity_plugin(plugin)
+            }) || self
+                .effective_mtls_auth_plugins_by_proxy()
+                .into_iter()
+                .flat_map(|(_, plugins)| plugins)
+                .any(&is_dns_identity_plugin);
         if !dns_identity_matching_enabled {
             return Ok(());
         }

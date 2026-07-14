@@ -7,8 +7,8 @@ use ferrum_edge::_test_support::{
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, PluginConfig, PluginScope, Proxy,
-    Upstream, UpstreamTarget,
+    AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, PluginConfig, PluginScope, Upstream,
+    UpstreamTarget,
 };
 use serde_json::json;
 use sqlx::error::{DatabaseError, ErrorKind};
@@ -439,20 +439,6 @@ async fn consumer_credential_index_preserves_exact_mtls_identity_semantics() {
     let loaded = store.load_full_config("ferrum").await.unwrap();
     assert_eq!(loaded.consumers.len(), 2);
     assert_eq!(loaded.consumers[0].username, "alice");
-
-    // A global plugin is effective only when the namespace has a proxy. Keep
-    // the exact-index assertions above independent of DNS folding, then add a
-    // proxy before verifying the effective san_dns runtime constraint.
-    let proxy: Proxy = serde_json::from_value(json!({
-        "id": "p1",
-        "namespace": "ferrum",
-        "listen_path": "/",
-        "backend_scheme": "http",
-        "backend_host": "127.0.0.1",
-        "backend_port": 8080
-    }))
-    .unwrap();
-    store.create_proxy(&proxy).await.unwrap();
 
     let now = chrono::Utc::now();
     store
