@@ -1120,8 +1120,11 @@ async fn test_search_bind_rejects_ambiguous_results() {
     task.abort();
 }
 
-#[tokio::test]
-async fn test_group_attribute_lookup_is_case_insensitive() {
+async fn assert_group_search_result(
+    result_code: u8,
+    returned_group: &'static str,
+    expected_rejection_status: Option<u16>,
+) {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
@@ -1144,12 +1147,12 @@ async fn test_group_attribute_lookup_is_case_insensitive() {
             .write_all(&search_result_entry(
                 1,
                 "CN=unrelated-cn,OU=Groups,DC=example,DC=com",
-                &[("samaccountname", &["gateway-admins"])],
+                &[("samaccountname", &[returned_group])],
             ))
             .await
             .expect("write group search entry");
         group_stream
-            .write_all(&search_result_done(1, 0))
+            .write_all(&search_result_done(1, result_code))
             .await
             .expect("write group search done");
     });
@@ -1175,8 +1178,27 @@ async fn test_group_attribute_lookup_is_case_insensitive() {
     let result = plugin
         .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
         .await;
-    assert_continue(result);
+    if let Some(status) = expected_rejection_status {
+        assert_reject(result, Some(status));
+    } else {
+        assert_continue(result);
+    }
     task.abort();
+}
+
+#[tokio::test]
+async fn test_group_attribute_lookup_is_case_insensitive() {
+    assert_group_search_result(0, "gateway-admins", None).await;
+}
+
+#[tokio::test]
+async fn test_size_limited_group_search_accepts_a_proven_required_match() {
+    assert_group_search_result(4, "gateway-admins", None).await;
+}
+
+#[tokio::test]
+async fn test_size_limited_group_search_without_a_match_fails_closed() {
+    assert_group_search_result(4, "unrelated-group", Some(500)).await;
 }
 
 #[tokio::test]

@@ -1584,13 +1584,13 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 | `service_account_dn` | string | (none) | DN for the service account used in search-then-bind |
 | `service_account_password` | string | (none) | Password for the service account |
 | `group_base_dn` | string | (none) | Base DN for group membership search (required when `required_groups` is set) |
-| `group_filter` | string | auto | Group search filter. A custom filter must contain `{user_dn}` or `{username}` when `required_groups` is set. Default checks `member`, `uniqueMember`, and `memberUid` attributes |
+| `group_filter` | string | auto | Group search filter. A custom filter must contain `{user_dn}` or `{username}` when `required_groups` is set. `{username}` remains the presented login value even when the canonical identity differs. Default checks `member`, `uniqueMember`, and `memberUid` attributes |
 | `required_groups` | string[] | `[]` | List of LDAP/AD group names the user must belong to (OR logic — at least one must match) |
 | `group_attribute` | string | `cn` | Attribute containing the group name for matching against `required_groups`; LDAP attribute-name matching is case-insensitive |
 | `starttls` | bool | `false` | Use STARTTLS to upgrade `ldap://` connections to TLS (cannot be used with `ldaps://`) |
 | `allow_plaintext` | bool | `false` | Development-only override for non-loopback `ldap://` without STARTTLS. Credentials have no transport confidentiality when enabled |
 | `connect_timeout_seconds` | u64 | `5` | Per-connection and per-operation timeout (1–300s), also sent as the LDAP server-side search time limit |
-| `request_timeout_seconds` | u64 | `15` | Strict wall-clock deadline (1–300s) for the complete uncached authentication and group-check flow |
+| `request_timeout_seconds` | u64 | `max(15, connect timeout)` | Strict wall-clock deadline (1–300s) for the complete uncached authentication and group-check flow. Set it explicitly to use a shorter deadline than an individual operation |
 | `max_concurrent_requests` | u64 | `64` | Per-plugin cap (1–1,024) on concurrent uncached LDAP flows; excess requests fail immediately |
 | `cache_ttl_seconds` | u64 | `0` | How long to cache successful auth results (`0` = disabled, maximum `86400`). Cache keys are process-random HMACs over the presented username/password |
 | `max_cache_entries` | u64 | `10000` | Strict cache cap. Atomic admission preserves the cap under concurrency, and a saturated cache replaces one entry without a full-map scan |
@@ -1647,7 +1647,7 @@ A directory outage or a misconfigured service account therefore returns `500` (`
 
 Non-loopback plaintext `ldap://` endpoints are rejected by default because LDAP simple bind sends reusable service-account and user passwords without transport confidentiality. `allow_plaintext: true` is an explicit development-only escape hatch for isolated test environments. Literal loopback addresses and `localhost` remain available for local integration testing without the override.
 
-**Resource bounds:** Each bind/search/unbind operation gets `connect_timeout_seconds`, while `request_timeout_seconds` caps the complete uncached flow even if an LDAP server keeps a search alive with entries or referrals. User searches request at most two entries so ambiguity can be detected and rejected; group searches request at most 1,000 entries and fail closed if the directory exceeds the limit. `max_concurrent_requests` bounds simultaneous directory flows and rejects overflow immediately rather than creating more sockets/tasks.
+**Resource bounds:** Each bind/search/unbind operation gets `connect_timeout_seconds`, while `request_timeout_seconds` caps the complete uncached flow even if an LDAP server keeps a search alive with entries or referrals. When omitted, the request deadline defaults to 15 seconds or the configured connection/operation timeout, whichever is larger. User searches request at most two entries so ambiguity can be detected and rejected. Group searches request at most 1,000 entries; a required-group match in size-limited partial results is definitive, while an incomplete search without a match fails closed. `max_concurrent_requests` bounds simultaneous directory flows and rejects overflow immediately rather than creating more sockets/tasks.
 
 **Cache security and admission:** Cache keys use HMAC-SHA256 with a random, zeroized in-process key instead of storing a bare password digest. This protects a cache-only disclosure from becoming an offline password verifier, though a full process-memory compromise can recover both the cache and its HMAC key. Cache admission uses an atomic count; at capacity, it replaces one existing entry without scanning the full map.
 

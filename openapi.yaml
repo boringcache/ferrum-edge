@@ -11562,6 +11562,8 @@ components:
           type: string
           minLength: 1
           pattern: "^ldaps?://"
+          not:
+            pattern: "^ldaps?://[^/?#]*@"
           description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. Embedded URL credentials are rejected."
           example: "ldaps://ldap.example.com:636"
         bind_dn_template:
@@ -11601,7 +11603,7 @@ components:
         group_filter:
           type: string
           minLength: 1
-          description: "Group search filter. When required_groups is non-empty, a custom filter must contain {user_dn} or {username} so membership remains user-specific."
+          description: "Group search filter. When required_groups is non-empty, a custom filter must contain {user_dn} or {username} so membership remains user-specific. {username} is the presented login value; canonical_identity_attribute controls the exported Ferrum identity."
         required_groups:
           type: array
           items:
@@ -11631,10 +11633,9 @@ components:
         request_timeout_seconds:
           type: integer
           format: uint64
-          default: 15
           minimum: 1
           maximum: 300
-          description: "Strict wall-clock deadline in seconds for the complete uncached authentication and group-check flow"
+          description: "Strict wall-clock deadline in seconds for the complete uncached authentication and group-check flow. The effective default is 15 seconds, raised to connect_timeout_seconds when that value is larger."
         max_concurrent_requests:
           type: integer
           format: uint64

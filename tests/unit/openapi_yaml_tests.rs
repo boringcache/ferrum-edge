@@ -619,6 +619,10 @@ fn ldap_auth_schema_matches_runtime_invariants() {
             "starttls": true
         }),
         json!({
+            "ldap_url": "ldaps://admin:secret@ldap.example.com:636",
+            "bind_dn_template": "uid={username},dc=example,dc=com"
+        }),
+        json!({
             "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},dc=example,dc=com",
             "connect_timeout_seconds": 0

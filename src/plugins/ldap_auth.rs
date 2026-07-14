@@ -352,10 +352,12 @@ impl LdapAuth {
                 .to_string()
         })?;
 
+        let default_request_timeout_secs =
+            LDAP_AUTH_DEFAULT_REQUEST_TIMEOUT_SECONDS.max(connect_timeout_secs);
         let request_timeout_secs = parse_u64(
             config_obj,
             "request_timeout_seconds",
-            LDAP_AUTH_DEFAULT_REQUEST_TIMEOUT_SECONDS,
+            default_request_timeout_secs,
         )?;
         if request_timeout_secs == 0 {
             return Err(
@@ -773,7 +775,7 @@ impl LdapAuth {
     async fn check_group_membership(
         &self,
         user_dn: &str,
-        username: &str,
+        presented_username: &str,
     ) -> Result<bool, AuthError> {
         if self.required_groups.is_empty() {
             return Ok(true);
@@ -781,21 +783,7 @@ impl LdapAuth {
 
         let group_base = self.group_base_dn.as_deref().unwrap_or_default();
 
-        // Default filter checks both `member` (AD/static groups) and `memberUid` (posixGroup).
-        // DN values in filters must be filter-escaped (RFC 4515), not DN-escaped.
-        let escaped_user_dn = escape_filter_value(user_dn);
-        let escaped_username = escape_filter_value(username);
-        let default_filter = format!(
-            "(|(member={escaped_user_dn})(uniqueMember={escaped_user_dn})(memberUid={escaped_username}))"
-        );
-        let filter = self
-            .group_filter
-            .as_ref()
-            .map(|f| {
-                f.replace("{user_dn}", &escaped_user_dn)
-                    .replace("{username}", &escaped_username)
-            })
-            .unwrap_or(default_filter);
+        let filter = self.group_search_filter(user_dn, presented_username);
 
         // Bind with the service account when one is configured; otherwise the
         // group search runs over an ANONYMOUS-bound connection. Many directories
@@ -823,7 +811,7 @@ impl LdapAuth {
             false
         };
 
-        let (rs, _result) = ldap
+        let search_result = ldap
             .with_search_options(
                 SearchOptions::new()
                     .sizelimit(LDAP_AUTH_GROUP_SEARCH_SIZE_LIMIT)
@@ -837,11 +825,19 @@ impl LdapAuth {
                 vec![self.group_attribute.as_str()],
             )
             .await
-            .map_err(|e| AuthError::Backend(format!("ldap_auth: group search failed: {e}")))?
-            .success()
-            .map_err(|e| AuthError::Backend(format!("ldap_auth: group search error: {e}")))?;
+            .map_err(|e| AuthError::Backend(format!("ldap_auth: group search failed: {e}")))?;
 
         let _ = ldap.with_timeout(self.connect_timeout).unbind().await;
+
+        let result_code = search_result.1.rc;
+        if result_code != 0 && result_code != 4 {
+            return Err(AuthError::Backend(format!(
+                "ldap_auth: group search error: {}",
+                search_result.1
+            )));
+        }
+        let size_limit_exceeded = result_code == 4;
+        let rs = search_result.0;
 
         // A zero-entry result is ambiguous: the user may genuinely belong to no
         // group, OR the directory may have silently returned nothing because an
@@ -854,7 +850,7 @@ impl LdapAuth {
                  anonymous bind; this is either a genuine no-membership result or the directory \
                  restricts anonymous reads of group objects — configure 'service_account_dn'/\
                  'service_account_password' if groups are not being matched",
-                username, group_base
+                presented_username, group_base
             );
         }
 
@@ -877,7 +873,34 @@ impl LdapAuth {
             }
         }
 
+        if size_limit_exceeded {
+            return Err(AuthError::Backend(
+                "ldap_auth: group search exceeded the configured size limit before proving required membership"
+                    .to_string(),
+            ));
+        }
+
         Ok(false)
+    }
+
+    fn group_search_filter(&self, user_dn: &str, presented_username: &str) -> String {
+        // `{username}` retains its documented meaning as the login value used
+        // by the user search. The canonical identity is for Ferrum identity
+        // export/Consumer mapping and may intentionally differ (for example,
+        // email login versus an immutable directory ID).
+        let escaped_user_dn = escape_filter_value(user_dn);
+        let escaped_username = escape_filter_value(presented_username);
+        let default_filter = format!(
+            "(|(member={escaped_user_dn})(uniqueMember={escaped_user_dn})(memberUid={escaped_username}))"
+        );
+        self.group_filter
+            .as_ref()
+            .map(|filter| {
+                filter
+                    .replace("{user_dn}", &escaped_user_dn)
+                    .replace("{username}", &escaped_username)
+            })
+            .unwrap_or(default_filter)
     }
 }
 
@@ -1446,10 +1469,7 @@ impl LdapAuth {
 
         if !self.required_groups.is_empty() {
             match self
-                .check_group_membership(
-                    &authenticated_user.dn,
-                    &authenticated_user.canonical_identity,
-                )
+                .check_group_membership(&authenticated_user.dn, presented_username)
                 .await
             {
                 Ok(true) => {}
@@ -1558,6 +1578,52 @@ mod tests {
             ),
             "build cached LDAP plugin",
         )
+    }
+
+    #[test]
+    fn raised_connect_timeout_raises_the_default_whole_flow_deadline() {
+        let plugin = must(
+            LdapAuth::new(
+                &serde_json::json!({
+                    "ldap_url": "ldap://127.0.0.1:389",
+                    "bind_dn_template": "uid={username},dc=example,dc=com",
+                    "connect_timeout_seconds": 60
+                }),
+                PluginHttpClient::default(),
+            ),
+            "build LDAP plugin with raised operation timeout",
+        );
+
+        assert_eq!(plugin.request_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn group_username_placeholder_keeps_the_presented_login_value() {
+        let plugin = must(
+            LdapAuth::new(
+                &serde_json::json!({
+                    "ldap_url": "ldap://127.0.0.1:389",
+                    "search_base_dn": "ou=users,dc=example,dc=com",
+                    "search_filter": "(mail={username})",
+                    "canonical_identity_attribute": "entryUUID",
+                    "service_account_dn": "cn=admin,dc=example,dc=com",
+                    "service_account_password": "service-secret",
+                    "group_base_dn": "ou=groups,dc=example,dc=com",
+                    "group_filter": "(memberUid={username})",
+                    "required_groups": ["admins"]
+                }),
+                PluginHttpClient::default(),
+            ),
+            "build search-bind LDAP plugin",
+        );
+
+        assert_eq!(
+            plugin.group_search_filter(
+                "entryUUID=immutable-id,ou=users,dc=example,dc=com",
+                "alice@example.com",
+            ),
+            "(memberUid=alice@example.com)"
+        );
     }
 
     #[test]
