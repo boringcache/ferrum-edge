@@ -5,12 +5,34 @@
 //!
 //! Built-in patterns: SSN, credit card, email, US phone, API keys, AWS keys,
 //! IPv4 addresses, and IBAN. Custom regex patterns can be added via config.
+//!
+//! ## Inspection scope
+//!
+//! The shield inspects bare JSON AI request bodies. Native gRPC and gRPC-Web
+//! media types carry length-prefixed wire frames (and may carry protobuf or
+//! base64 payloads), even when the media type ends in `+json`; those framed
+//! bodies are explicitly outside this JSON policy's scope and are passed
+//! through without buffering or inspection.
+//!
+//! ## Compressed request bodies
+//!
+//! Request decompression runs in the later `transform_request_body` phase, so a
+//! body with a non-identity `Content-Encoding` cannot be inspected during
+//! `before_proxy`. The shield marks that request for deferred inspection and
+//! re-evaluates the final backend-visible body in `on_final_request_body`, after
+//! request transforms have run. Reject policy is enforced there, warn policy
+//! records its event there, and redact policy fails closed when PII is present
+//! because the final-body hook cannot safely rewrite the wire body. If no
+//! decompressor removed the encoding, enforcing actions reject the uninspectable
+//! request instead of silently forwarding it.
 
 use async_trait::async_trait;
-use regex::{Regex, RegexSet};
+use regex::{NoExpand, Regex, RegexSet};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 
 use super::utils::body_transform::is_json_content_type;
@@ -61,6 +83,32 @@ const NUMERIC_LLM_PARAMETER_KEYS: &[&str] = &[
 /// be a string, an array of strings, or an array of `{type:"text", text:"..."}`
 /// parts.
 const CONTENT_SCAN_FIELDS: &[&str] = &["prompt", "input", "instructions", "system"];
+
+/// Every accepted top-level configuration property. Configuration is parsed
+/// manually from `serde_json::Value`, so this allow-list is the fail-closed
+/// equivalent of `#[serde(deny_unknown_fields)]`.
+const ALLOWED_CONFIG_KEYS: &[&str] = &[
+    "action",
+    "patterns",
+    "custom_patterns",
+    "scan_fields",
+    "exclude_roles",
+    "redaction_placeholder",
+    "max_scan_bytes",
+];
+
+/// Prefix for the instance-specific marker used to defer compressed request
+/// inspection until after all request-body transforms. Multiple shield
+/// instances may coexist on a proxy, so each instance must own an independent
+/// marker or one instance could consume another's deferred policy check.
+const DEFERRED_COMPRESSED_MARKER_PREFIX: &str = "ai_prompt_shield.deferred_compressed_body.";
+
+static DEFERRED_MARKER_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Adjacent text parts in one logical message are joined without inserting
+/// model-visible content. Boundary byte offsets are retained separately, and a
+/// detection is added only when a regex match actually crosses one of them.
+const LOGICAL_TEXT_PART_SEPARATOR: &str = "";
 
 /// Action to take when PII is detected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +170,8 @@ pub struct AiPromptShield {
     needs_body_transform: bool,
     /// True when the plugin has valid patterns and may need to inspect bodies.
     requires_request_body: bool,
+    /// Instance-specific metadata marker for compressed-body deferral.
+    deferred_compressed_marker: String,
 }
 
 /// Built-in PII pattern definitions.
@@ -132,10 +182,45 @@ fn builtin_pattern(name: &str) -> Option<&'static str> {
     crate::plugins::utils::ai_pii::builtin_pii_pattern(name)
 }
 
+/// True when a JSON-looking media type actually carries framed native gRPC or
+/// gRPC-Web bytes instead of a bare JSON document. This mirrors the explicit
+/// scope guard in `ai_request_guard`.
+fn is_framed_grpc_content_type(content_type: &str) -> bool {
+    if crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes()) {
+        return true;
+    }
+
+    const GRPC_WEB_PREFIX: &[u8] = b"application/grpc-web";
+    let bytes = content_type.as_bytes();
+    bytes
+        .get(..GRPC_WEB_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(GRPC_WEB_PREFIX))
+}
+
+/// True when any comma-separated content-encoding token is non-identity.
+fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool {
+    headers.get("content-encoding").is_some_and(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .any(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"))
+    })
+}
+
 impl AiPromptShield {
     pub fn new(config: &Value) -> Result<Self, String> {
-        if !config.is_object() {
+        let Some(config_object) = config.as_object() else {
             return Err("ai_prompt_shield: config must be an object".to_string());
+        };
+
+        if let Some(unknown) = config_object
+            .keys()
+            .find(|key| !ALLOWED_CONFIG_KEYS.contains(&key.as_str()))
+        {
+            return Err(format!(
+                "ai_prompt_shield: unknown config field {unknown:?}; allowed fields: {}",
+                ALLOWED_CONFIG_KEYS.join(", ")
+            ));
         }
 
         let action = match optional_string(config, "action")?.unwrap_or("reject") {
@@ -259,6 +344,8 @@ impl AiPromptShield {
                     e
                 )
             })?;
+        let marker_id = DEFERRED_MARKER_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let deferred_compressed_marker = format!("{DEFERRED_COMPRESSED_MARKER_PREFIX}{marker_id}");
 
         Ok(Self {
             action,
@@ -269,6 +356,7 @@ impl AiPromptShield {
             max_scan_bytes,
             needs_body_transform,
             requires_request_body,
+            deferred_compressed_marker,
         })
     }
 
@@ -297,7 +385,10 @@ impl AiPromptShield {
                         // Array content (multimodal)
                         if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
                             for part in parts {
-                                if part.get("type").and_then(|t| t.as_str()) == Some("text")
+                                if part
+                                    .get("type")
+                                    .and_then(|t| t.as_str())
+                                    .is_some_and(is_text_content_part_type)
                                     && let Some(text) = part.get("text").and_then(|t| t.as_str())
                                 {
                                     texts.push(text);
@@ -360,6 +451,170 @@ impl AiPromptShield {
             .collect()
     }
 
+    /// Content-mode detection over both individual prompt fragments and a
+    /// boundary-aware view of adjacent text parts in each logical message.
+    ///
+    /// Individual fragments preserve the established behavior. The additional
+    /// pass joins only consecutive text-part objects and records their byte
+    /// boundaries; a pattern is added only when one concrete regex occurrence
+    /// crosses a recorded boundary. Different messages, independent embedding
+    /// strings, and text runs separated by an image/non-text part are never
+    /// joined.
+    fn detect_pii_content_mode(&self, json: &Value) -> Vec<String> {
+        if self.patterns.is_empty() {
+            return Vec::new();
+        }
+
+        let mut hit = vec![false; self.patterns.len()];
+        let texts = self.extract_scan_text(json);
+        for text in texts {
+            for idx in self.detection_set.matches(text).into_iter() {
+                hit[idx] = true;
+            }
+        }
+
+        if let Some(messages) = json.get("messages").and_then(Value::as_array) {
+            for message in messages {
+                if message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| self.exclude_roles.contains(role))
+                {
+                    continue;
+                }
+                if let Some(content) = message.get("content") {
+                    self.mark_cross_part_hits_in_value(content, &mut hit);
+                }
+            }
+        }
+
+        for field in CONTENT_SCAN_FIELDS {
+            if *field == "system" && self.exclude_roles.contains("system") {
+                continue;
+            }
+            if let Some(value) = json.get(field) {
+                self.mark_cross_part_hits_in_value(value, &mut hit);
+            }
+        }
+
+        hit.iter()
+            .enumerate()
+            .filter_map(|(idx, &matched)| {
+                if matched {
+                    self.patterns.get(idx).map(|pattern| pattern.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Find adjacent content-part runs recursively within one prompt field.
+    fn mark_cross_part_hits_in_value(&self, value: &Value, hit: &mut [bool]) {
+        match value {
+            Value::Array(items) => {
+                self.mark_adjacent_text_part_hits(items, hit);
+                for item in items {
+                    let Value::Object(object) = item else {
+                        continue;
+                    };
+                    if object
+                        .get("role")
+                        .and_then(Value::as_str)
+                        .is_some_and(|role| self.exclude_roles.contains(role))
+                    {
+                        continue;
+                    }
+                    if let Some(content) = object.get("content") {
+                        self.mark_cross_part_hits_in_value(content, hit);
+                    }
+                }
+            }
+            Value::Object(object) => {
+                if object
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| self.exclude_roles.contains(role))
+                {
+                    return;
+                }
+                if let Some(content) = object.get("content") {
+                    self.mark_cross_part_hits_in_value(content, hit);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Scan each run of consecutive text content parts as one logical string,
+    /// retaining byte offsets for every part boundary. Matches wholly contained
+    /// in one part are already handled by the ordinary fragment scan; only
+    /// boundary-crossing occurrences are added here.
+    fn mark_adjacent_text_part_hits(&self, items: &[Value], hit: &mut [bool]) {
+        let mut joined = String::new();
+        let mut boundaries = Vec::new();
+        let mut part_count = 0usize;
+
+        for item in items {
+            let text = item
+                .get("type")
+                .and_then(Value::as_str)
+                .filter(|part_type| is_text_content_part_type(part_type))
+                .and_then(|_| item.get("text"))
+                .and_then(Value::as_str);
+
+            let Some(text) = text else {
+                if part_count > 1 {
+                    self.mark_joined_boundary_hits(&joined, &boundaries, hit);
+                }
+                joined.clear();
+                boundaries.clear();
+                part_count = 0;
+                continue;
+            };
+
+            if part_count > 0 {
+                boundaries.push(joined.len());
+                joined.push_str(LOGICAL_TEXT_PART_SEPARATOR);
+            }
+            joined.push_str(text);
+            part_count += 1;
+        }
+
+        if part_count > 1 {
+            self.mark_joined_boundary_hits(&joined, &boundaries, hit);
+        }
+    }
+
+    /// Mark patterns with at least one occurrence crossing a retained part
+    /// boundary. Regex matches and boundary offsets are both ordered, so the
+    /// inner walk is monotonic rather than restarting for each match.
+    fn mark_joined_boundary_hits(&self, joined: &str, boundaries: &[usize], hit: &mut [bool]) {
+        for pattern_index in self.detection_set.matches(joined).into_iter() {
+            let Some(pattern) = self.patterns.get(pattern_index) else {
+                continue;
+            };
+            let mut boundary_index = 0usize;
+            for matched in pattern.regex.find_iter(joined) {
+                while boundaries
+                    .get(boundary_index)
+                    .is_some_and(|boundary| *boundary <= matched.start())
+                {
+                    boundary_index += 1;
+                }
+                if boundaries
+                    .get(boundary_index)
+                    .is_some_and(|boundary| *boundary < matched.end())
+                {
+                    if let Some(slot) = hit.get_mut(pattern_index) {
+                        *slot = true;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     /// Fallback PII scan for a `ScanMode::All` body that failed to parse as
     /// JSON. The decoded walker (`collect_json_strings`) needs a parsed
     /// `Value`; a malformed JSON body has none, so without this the request
@@ -406,15 +661,37 @@ impl AiPromptShield {
         let mut hit = vec![false; self.patterns.len()];
         // Pass 1: decoded tokens.
         let mut texts: Vec<Cow<'_, str>> = Vec::new();
-        collect_json_strings(json, &mut texts);
+        collect_json_strings(json, &mut texts, true);
         for text in &texts {
             for idx in self.detection_set.matches(text.as_ref()).into_iter() {
                 hit[idx] = true;
             }
         }
         // Pass 2: raw serialized body (cross-token / contextual patterns).
+        // Matches wholly contained in an exempt top-level structural scalar are
+        // ignored here too; otherwise the raw pass would re-introduce the exact
+        // false positive the decoded walker excludes. Contextual matches that
+        // span a key/colon remain enforceable because they are not contained by
+        // the scalar's byte range.
+        let preserved_spans = collect_preserved_top_level_scalar_spans(raw, json);
         for idx in self.detection_set.matches(raw).into_iter() {
-            hit[idx] = true;
+            if preserved_spans.is_empty() {
+                hit[idx] = true;
+                continue;
+            }
+            let Some(pattern) = self.patterns.get(idx) else {
+                continue;
+            };
+            let mut span_index = 0usize;
+            if pattern.regex.find_iter(raw).any(|matched| {
+                !match_is_inside_ordered_span(
+                    matched.start()..matched.end(),
+                    &preserved_spans,
+                    &mut span_index,
+                )
+            }) {
+                hit[idx] = true;
+            }
         }
         hit.iter()
             .enumerate()
@@ -492,23 +769,30 @@ impl AiPromptShield {
         // sees serde's decoded `a`.
         for pattern in &self.patterns {
             let mut removable_by_value_span = vec![None; value_spans.len()];
+            let mut span_index = 0usize;
             for m in pattern.regex.find_iter(raw) {
-                let Some(span_index) = value_spans
-                    .iter()
-                    .position(|span| span.start <= m.start() && m.end() <= span.end)
-                else {
+                while value_spans
+                    .get(span_index)
+                    .is_some_and(|span| span.end < m.start())
+                {
+                    span_index += 1;
+                }
+                let Some(span) = value_spans.get(span_index) else {
                     return true;
                 };
+                if span.start > m.start() || m.end() > span.end {
+                    return true;
+                }
 
-                let removable = match removable_by_value_span[span_index] {
+                let removable = match removable_by_value_span.get(span_index).copied().flatten() {
                     Some(removable) => removable,
                     None => {
-                        let removable = raw_value_is_removable_by_value_redactor(
-                            raw,
-                            pattern,
-                            &value_spans[span_index],
-                        );
-                        removable_by_value_span[span_index] = Some(removable);
+                        let removable =
+                            raw_value_is_removable_by_value_redactor(raw, pattern, span);
+                        let Some(slot) = removable_by_value_span.get_mut(span_index) else {
+                            return true;
+                        };
+                        *slot = Some(removable);
                         removable
                     }
                 };
@@ -592,12 +876,19 @@ impl AiPromptShield {
         }
 
         // Content mode: only redact within messages
-        let texts = self.extract_scan_text(&json);
-        if self.detect_pii(&texts).is_empty() {
+        if self.detect_pii_content_mode(&json).is_empty() {
             return RedactionOutcome::NoChange;
         }
         self.redact_body(&mut json);
-        RedactionOutcome::Redacted(json)
+        // Adjacent text-part matches can span two independently rewritable JSON
+        // strings. Redacting either fragment in isolation may be ambiguous or a
+        // no-op, so re-run the boundary-aware detector and fail closed if any
+        // configured pattern remains.
+        if self.detect_pii_content_mode(&json).is_empty() {
+            RedactionOutcome::Redacted(json)
+        } else {
+            RedactionOutcome::Incomplete(json)
+        }
     }
 
     /// After `ScanMode::All` redaction, decide whether any *unredactable* PII
@@ -658,7 +949,10 @@ impl AiPromptShield {
                 // Array content (multimodal)
                 if let Some(parts) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
                     for part in parts.iter_mut() {
-                        if part.get("type").and_then(|t| t.as_str()) == Some("text")
+                        if part
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .is_some_and(is_text_content_part_type)
                             && let Some(text) = part.get("text").and_then(|t| t.as_str())
                         {
                             let redacted = self.redact_text(text);
@@ -698,10 +992,88 @@ impl AiPromptShield {
         for pattern in &self.patterns {
             result = pattern
                 .regex
-                .replace_all(&result, pattern.placeholder.as_str())
+                .replace_all(&result, NoExpand(pattern.placeholder.as_str()))
                 .to_string();
         }
         result
+    }
+
+    /// Enforce the configured scan ceiling without silently bypassing reject or
+    /// redact policy. Warn mode remains observational but records a bounded
+    /// metadata event instead of silently skipping the request.
+    fn handle_oversize_body(&self, ctx: &mut RequestContext, body_size: usize) -> PluginResult {
+        match self.action {
+            ShieldAction::Warn => {
+                warn!(
+                    body_size,
+                    max_scan_bytes = self.max_scan_bytes,
+                    "ai_prompt_shield: request body exceeds scan ceiling (warn mode)"
+                );
+                ctx.metadata.insert(
+                    "ai_shield_warnings".to_string(),
+                    "body_too_large".to_string(),
+                );
+                PluginResult::Continue
+            }
+            ShieldAction::Reject | ShieldAction::Redact => {
+                warn!(
+                    body_size,
+                    max_scan_bytes = self.max_scan_bytes,
+                    "ai_prompt_shield: rejecting request body above scan ceiling"
+                );
+                ctx.metadata.insert(
+                    "ai_shield_rejected".to_string(),
+                    "body_too_large".to_string(),
+                );
+                PluginResult::Reject {
+                    status_code: 413,
+                    body: serde_json::json!({
+                        "error": "Request body exceeds AI prompt shield scan limit",
+                        "message": "Request blocked because the prompt body is too large to inspect safely."
+                    })
+                    .to_string(),
+                    headers: HashMap::new(),
+                }
+            }
+        }
+    }
+
+    /// Handle a compressed body that remained encoded, or a deferred body that
+    /// could not be decoded as UTF-8 JSON. Enforcing actions fail closed; warn
+    /// mode records the uninspectable condition and continues by design.
+    fn handle_uninspectable_deferred_body(
+        &self,
+        ctx: &mut RequestContext,
+        reason: &'static str,
+    ) -> PluginResult {
+        match self.action {
+            ShieldAction::Warn => {
+                warn!(
+                    reason,
+                    "ai_prompt_shield: deferred request body could not be inspected (warn mode)"
+                );
+                ctx.metadata
+                    .insert("ai_shield_warnings".to_string(), reason.to_string());
+                PluginResult::Continue
+            }
+            ShieldAction::Reject | ShieldAction::Redact => {
+                warn!(
+                    reason,
+                    "ai_prompt_shield: rejecting uninspectable deferred request body"
+                );
+                ctx.metadata
+                    .insert("ai_shield_rejected".to_string(), reason.to_string());
+                PluginResult::Reject {
+                    status_code: 400,
+                    body: serde_json::json!({
+                        "error": "Request body could not be inspected",
+                        "message": "Request blocked because the encoded prompt body could not be inspected safely."
+                    })
+                    .to_string(),
+                    headers: HashMap::new(),
+                }
+            }
+        }
     }
 }
 
@@ -733,7 +1105,7 @@ impl Plugin for AiPromptShield {
             && ctx
                 .headers
                 .get("content-type")
-                .is_some_and(|ct| is_json_content_type(ct))
+                .is_some_and(|ct| is_json_content_type(ct) && !is_framed_grpc_content_type(ct))
     }
 
     async fn before_proxy(
@@ -755,6 +1127,22 @@ impl Plugin for AiPromptShield {
             return PluginResult::Continue;
         }
 
+        // `application/grpc+json` and gRPC-Web `+json` variants are framed wire
+        // formats, not bare JSON. Native protobuf/framed gRPC is intentionally
+        // outside this plugin's JSON inspection scope.
+        if is_framed_grpc_content_type(content_type) {
+            return PluginResult::Continue;
+        }
+
+        // Decompression occurs later in request-body transforms. Mark this
+        // instance for final-body inspection instead of parsing compressed bytes
+        // and silently allowing the request.
+        if has_non_identity_content_encoding(headers) {
+            ctx.metadata
+                .insert(self.deferred_compressed_marker.clone(), "true".to_string());
+            return PluginResult::Continue;
+        }
+
         // Get request body
         let body = match ctx.metadata.get("request_body") {
             Some(b) if !b.is_empty() => b.as_str(),
@@ -763,12 +1151,8 @@ impl Plugin for AiPromptShield {
 
         // Size limit check
         if body.len() > self.max_scan_bytes {
-            debug!(
-                "ai_prompt_shield: body size {} exceeds max_scan_bytes {}, skipping",
-                body.len(),
-                self.max_scan_bytes
-            );
-            return PluginResult::Continue;
+            let body_size = body.len();
+            return self.handle_oversize_body(ctx, body_size);
         }
 
         // Detect PII and capture streaming intent from the same parsed JSON.
@@ -793,8 +1177,7 @@ impl Plugin for AiPromptShield {
             match serde_json::from_str::<Value>(body) {
                 Ok(json) => {
                     let is_streaming = json.get("stream").and_then(|s| s.as_bool()) == Some(true);
-                    let texts = self.extract_scan_text(&json);
-                    (self.detect_pii(&texts), is_streaming)
+                    (self.detect_pii_content_mode(&json), is_streaming)
                 }
                 Err(_) => return PluginResult::Continue,
             }
@@ -935,20 +1318,150 @@ impl Plugin for AiPromptShield {
         }
     }
 
+    fn needs_final_request_body_context(&self) -> bool {
+        self.requires_request_body
+    }
+
+    /// Inspect a compressed request after all request-body transforms. This is
+    /// the authoritative policy decision for the backend-visible plaintext body.
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        if ctx
+            .metadata
+            .remove(&self.deferred_compressed_marker)
+            .is_none()
+        {
+            return PluginResult::Continue;
+        }
+
+        let content_type = headers
+            .get("content-type")
+            .map(String::as_str)
+            .unwrap_or("");
+        if !is_json_content_type(content_type) || is_framed_grpc_content_type(content_type) {
+            return PluginResult::Continue;
+        }
+
+        if has_non_identity_content_encoding(headers) {
+            return self.handle_uninspectable_deferred_body(ctx, "compressed_body");
+        }
+
+        if body.len() > self.max_scan_bytes {
+            return self.handle_oversize_body(ctx, body.len());
+        }
+
+        let Ok(body_text) = std::str::from_utf8(body) else {
+            return self.handle_uninspectable_deferred_body(ctx, "non_utf8_body");
+        };
+        let Ok(json) = serde_json::from_str::<Value>(body_text) else {
+            return self.handle_uninspectable_deferred_body(ctx, "malformed_json");
+        };
+
+        if json.get("stream").and_then(Value::as_bool) == Some(true) {
+            ctx.metadata
+                .insert("ai_request_streaming".to_string(), "true".to_string());
+        }
+
+        let detected = match self.scan_mode {
+            ScanMode::All => self.detect_pii_all_mode(&json, body_text),
+            ScanMode::Content => self.detect_pii_content_mode(&json),
+        };
+        if detected.is_empty() {
+            return PluginResult::Continue;
+        }
+
+        match self.action {
+            ShieldAction::Reject => {
+                debug!(
+                    "ai_prompt_shield: PII detected after request decompression (types: {:?}), rejecting request",
+                    detected
+                );
+                ctx.metadata
+                    .insert("ai_shield_rejected".to_string(), detected.join(","));
+                PluginResult::Reject {
+                    status_code: 400,
+                    body: serde_json::json!({
+                        "error": "PII detected in request",
+                        "detected_types": detected,
+                        "message": "Request blocked: potential PII detected. Remove sensitive data before sending to AI provider."
+                    })
+                    .to_string(),
+                    headers: HashMap::new(),
+                }
+            }
+            ShieldAction::Warn => {
+                warn!(
+                    "ai_prompt_shield: PII detected after request decompression (types: {:?}), passing through (warn mode)",
+                    detected
+                );
+                ctx.metadata
+                    .insert("ai_shield_warnings".to_string(), detected.join(","));
+                PluginResult::Continue
+            }
+            ShieldAction::Redact => {
+                // This hook can reject but cannot replace the final wire bytes.
+                // Forwarding would leak the plaintext body, so redaction policy
+                // must fail closed on a compressed request containing PII.
+                warn!(
+                    "ai_prompt_shield: PII detected after request decompression (types: {:?}) but final body cannot be rewritten, rejecting request",
+                    detected
+                );
+                ctx.metadata
+                    .insert("ai_shield_rejected".to_string(), detected.join(","));
+                PluginResult::Reject {
+                    status_code: 400,
+                    body: serde_json::json!({
+                        "error": "PII detected in request",
+                        "detected_types": detected,
+                        "message": "Request blocked: compressed sensitive data could not be redacted safely."
+                    })
+                    .to_string(),
+                    headers: HashMap::new(),
+                }
+            }
+        }
+    }
+
+    async fn transform_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+        request_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        // A later compression plugin may already have stripped the encoding
+        // header in `before_proxy` even though its body transform has not run
+        // yet. The instance marker is therefore the authoritative signal that
+        // these bytes are still the deferred encoded representation.
+        if ctx.metadata.contains_key(&self.deferred_compressed_marker) {
+            return None;
+        }
+        self.transform_request_body(body, content_type, request_headers)
+            .await
+    }
+
     async fn transform_request_body(
         &self,
         body: &[u8],
         content_type: Option<&str>,
-        _request_headers: &std::collections::HashMap<String, String>,
+        request_headers: &std::collections::HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         if self.action != ShieldAction::Redact {
             return None;
         }
 
         // Only transform JSON
-        if let Some(ct) = content_type
-            && !is_json_content_type(ct)
-        {
+        if let Some(ct) = content_type {
+            if !is_json_content_type(ct) || is_framed_grpc_content_type(ct) {
+                return None;
+            }
+        }
+
+        if has_non_identity_content_encoding(request_headers) {
             return None;
         }
 
@@ -1041,7 +1554,8 @@ fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option
 }
 
 /// Collect every decoded JSON token for `ScanMode::All` detection so the
-/// decoded walker matches the coverage of the original raw-body scan.
+/// decoded walker matches the coverage of the original raw-body scan, except
+/// for the same preserved top-level structural scalars the redactor exempts.
 ///
 /// Serde has already resolved `\uXXXX` and other JSON string escapes here, so
 /// detection sees the same text the backend LLM will receive after parsing.
@@ -1059,24 +1573,184 @@ fn optional_positive_usize(config: &Value, field: &'static str) -> Result<Option
 /// noise. The walker yields `Cow<str>` (`Borrowed` for strings/keys,
 /// `Owned` for stringified numbers) so number text can be included without
 /// allocating for the common string case.
-fn collect_json_strings<'a>(value: &'a Value, texts: &mut Vec<Cow<'a, str>>) {
+fn collect_json_strings<'a>(value: &'a Value, texts: &mut Vec<Cow<'a, str>>, top_level: bool) {
     match value {
         Value::String(s) => texts.push(Cow::Borrowed(s.as_str())),
         Value::Number(n) => texts.push(Cow::Owned(n.to_string())),
         Value::Array(items) => {
             for item in items {
-                collect_json_strings(item, texts);
+                collect_json_strings(item, texts, false);
             }
         }
         Value::Object(map) => {
             for (key, value) in map {
                 texts.push(Cow::Borrowed(key.as_str()));
-                collect_json_strings(value, texts);
+                if top_level && should_preserve_top_level_scalar(key, value) {
+                    continue;
+                }
+                collect_json_strings(value, texts, false);
             }
         }
         // Bool / Null carry no PII; deliberately dropped.
         _ => {}
     }
+}
+
+/// Test whether an ordered match range lies wholly inside one of a sorted,
+/// non-overlapping set of ranges. `span_index` only moves forward, so callers
+/// can process ordered regex matches in O(matches + spans).
+fn match_is_inside_ordered_span(
+    matched: Range<usize>,
+    spans: &[Range<usize>],
+    span_index: &mut usize,
+) -> bool {
+    while spans
+        .get(*span_index)
+        .is_some_and(|span| span.end < matched.start)
+    {
+        *span_index += 1;
+    }
+    spans
+        .get(*span_index)
+        .is_some_and(|span| span.start <= matched.start && matched.end <= span.end)
+}
+
+fn skip_json_whitespace(bytes: &[u8], mut index: usize) -> usize {
+    while bytes
+        .get(index)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+    {
+        index += 1;
+    }
+    index
+}
+
+/// Return the byte offset immediately after a JSON string beginning at `start`.
+fn json_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut index = start + 1;
+    while let Some(byte) = bytes.get(index) {
+        match byte {
+            b'\\' => index = index.checked_add(2)?,
+            b'"' => return index.checked_add(1),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Return the byte offset immediately after one valid JSON value. The caller
+/// invokes this only after `serde_json` parsed the complete body, so malformed
+/// nesting conservatively returns `None` and disables the exclusion.
+fn json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    match bytes.get(start)? {
+        b'"' => json_string_end(bytes, start),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut index = start;
+            while let Some(byte) = bytes.get(index) {
+                match byte {
+                    b'"' => index = json_string_end(bytes, index)?,
+                    b'{' | b'[' => {
+                        depth = depth.checked_add(1)?;
+                        index += 1;
+                    }
+                    b'}' | b']' => {
+                        depth = depth.checked_sub(1)?;
+                        index += 1;
+                        if depth == 0 {
+                            return Some(index);
+                        }
+                    }
+                    _ => index += 1,
+                }
+            }
+            None
+        }
+        _ => {
+            let mut index = start;
+            while bytes.get(index).is_some_and(|byte| {
+                !matches!(byte, b' ' | b'\n' | b'\r' | b'\t' | b',' | b'}' | b']')
+            }) {
+                index += 1;
+            }
+            (index > start).then_some(index)
+        }
+    }
+}
+
+/// Locate the exact raw byte ranges of preserved scalar values held directly
+/// by the root object. Keeping these offsets in the original serialization lets
+/// all-mode detection retain whitespace-sensitive contextual custom patterns
+/// while ignoring incidental built-in matches wholly inside exempt values.
+fn collect_preserved_top_level_scalar_spans(raw: &str, json: &Value) -> Vec<Range<usize>> {
+    if !json.is_object() {
+        return Vec::new();
+    }
+
+    let bytes = raw.as_bytes();
+    let mut index = skip_json_whitespace(bytes, 0);
+    if bytes.get(index) != Some(&b'{') {
+        return Vec::new();
+    }
+    index += 1;
+    let mut spans = Vec::new();
+
+    loop {
+        index = skip_json_whitespace(bytes, index);
+        if bytes.get(index) == Some(&b'}') {
+            break;
+        }
+
+        let key_start = index;
+        let Some(key_end) = json_string_end(bytes, key_start) else {
+            return Vec::new();
+        };
+        let Some(raw_key) = raw.get(key_start..key_end) else {
+            return Vec::new();
+        };
+        let key: Cow<'_, str> = if raw_key.as_bytes().contains(&b'\\') {
+            let Ok(decoded) = serde_json::from_str::<String>(raw_key) else {
+                return Vec::new();
+            };
+            Cow::Owned(decoded)
+        } else {
+            let Some(unquoted) = raw_key.get(1..raw_key.len().saturating_sub(1)) else {
+                return Vec::new();
+            };
+            Cow::Borrowed(unquoted)
+        };
+
+        index = skip_json_whitespace(bytes, key_end);
+        if bytes.get(index) != Some(&b':') {
+            return Vec::new();
+        }
+        index = skip_json_whitespace(bytes, index + 1);
+        let value_start = index;
+        let Some(value_end) = json_value_end(bytes, value_start) else {
+            return Vec::new();
+        };
+
+        if (STRUCTURAL_KEYS.contains(&key.as_ref())
+            || NUMERIC_LLM_PARAMETER_KEYS.contains(&key.as_ref()))
+            && let Some(raw_value) = raw.get(value_start..value_end)
+            && let Ok(value) = serde_json::from_str::<Value>(raw_value)
+            && should_preserve_top_level_scalar(key.as_ref(), &value)
+        {
+            spans.push(value_start..value_end);
+        }
+
+        index = skip_json_whitespace(bytes, value_end);
+        match bytes.get(index) {
+            Some(b',') => index += 1,
+            Some(b'}') => break,
+            _ => return Vec::new(),
+        }
+    }
+
+    spans
 }
 
 /// Scan a raw JSON body and return the byte spans of every *rewritable* value —
@@ -1447,7 +2121,7 @@ fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern], top_level: bo
             for pattern in patterns {
                 result = pattern
                     .regex
-                    .replace_all(&result, pattern.placeholder.as_str())
+                    .replace_all(&result, NoExpand(pattern.placeholder.as_str()))
                     .to_string();
             }
             if result != *s {
