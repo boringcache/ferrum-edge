@@ -423,7 +423,7 @@ async fn test_plugin_creation_all_plugins() {
                 "sink": {"endpoint_url": "http://localhost:9200/audit"}
             }),
             "ldap_auth" => json!({
-                "ldap_url": "ldap://ldap.example.com:389",
+                "ldap_url": "ldaps://ldap.example.com:636",
                 "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
             }),
             "cors" => json!({"origins": ["*"]}),

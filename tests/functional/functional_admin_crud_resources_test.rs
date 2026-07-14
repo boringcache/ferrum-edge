@@ -1514,7 +1514,7 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
             "behavior": {"trusted_redirect_hosts": ["app.example.com"]}
         }),
         "ldap_auth" => json!({
-            "ldap_url": "ldap://ldap.example.com:389",
+            "ldap_url": "ldaps://ldap.example.com:636",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
         }),
         "opa" => json!({

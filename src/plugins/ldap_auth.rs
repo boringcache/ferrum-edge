@@ -12,8 +12,9 @@
 //! `required_groups` is set, the user must belong to at least one of the
 //! listed groups (OR logic) for authentication to succeed.
 //!
-//! Successful authentications can be cached in-memory (keyed by username +
-//! password hash) to avoid hitting the LDAP server on every request.
+//! Successful authentications can be cached in-memory (keyed by a random-key
+//! HMAC over username + password) to avoid hitting the LDAP server on every
+//! request.
 //!
 //! ## TLS integration
 //!
@@ -34,16 +35,22 @@
 use async_trait::async_trait;
 use base64::Engine;
 use dashmap::DashMap;
-use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
+use hmac::{Hmac, KeyInit, Mac};
+use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Scope, SearchEntry, SearchOptions};
+use ring::rand::SecureRandom;
 use rustls::ClientConfig;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer};
 use serde_json::Map;
 use serde_json::Value;
-use std::collections::HashSet;
+use sha2::Sha256;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 use url::{Host, Url};
+use zeroize::Zeroizing;
 
 use crate::consumer_index::ConsumerIndex;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
@@ -51,6 +58,34 @@ use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use super::utils::PluginHttpClient;
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
 use super::{RequestContext, strip_auth_scheme};
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub const LDAP_AUTH_DEFAULT_CACHE_TTL_SECONDS: u64 = 0;
+pub const LDAP_AUTH_MAX_CACHE_TTL_SECONDS: u64 = 86_400;
+pub const LDAP_AUTH_DEFAULT_MAX_CACHE_ENTRIES: usize = 10_000;
+
+const LDAP_AUTH_DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 5;
+const LDAP_AUTH_MAX_CONNECT_TIMEOUT_SECONDS: u64 = 300;
+const LDAP_AUTH_DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 15;
+const LDAP_AUTH_MAX_REQUEST_TIMEOUT_SECONDS: u64 = 300;
+const LDAP_AUTH_DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 64;
+const LDAP_AUTH_MAX_CONCURRENT_REQUESTS: usize = 1_024;
+const LDAP_AUTH_USER_SEARCH_SIZE_LIMIT: i32 = 2;
+const LDAP_AUTH_GROUP_SEARCH_SIZE_LIMIT: i32 = 1_000;
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct CacheKey([u8; 32]);
+
+struct CacheEntry {
+    expires_at: Instant,
+    canonical_identity: String,
+}
+
+struct AuthenticatedUser {
+    dn: String,
+    canonical_identity: String,
+}
 
 /// Outcome of an LDAP authentication attempt, distinguishing a genuine
 /// credential-negative result (wrong password / user not found) from a
@@ -104,6 +139,8 @@ pub struct LdapAuth {
     search_base_dn: Option<String>,
     /// Search filter with {username} placeholder, e.g. "(&(objectClass=person)(sAMAccountName={username}))"
     search_filter: Option<String>,
+    /// Attribute returned by search-then-bind and used as the Ferrum identity.
+    canonical_identity_attribute: Option<String>,
     /// Service account for search-then-bind
     service_account_dn: Option<String>,
     service_account_password: Option<String>,
@@ -117,10 +154,19 @@ pub struct LdapAuth {
     starttls: bool,
     /// LDAP connection timeout
     connect_timeout: Duration,
+    /// Server-side time limit applied to each LDAP search.
+    search_time_limit_seconds: i32,
+    /// Strict wall-clock deadline for one complete uncached authentication.
+    request_timeout: Duration,
+    /// Immediate admission bound for uncached LDAP authentication work.
+    ldap_concurrency: Arc<Semaphore>,
     /// Cache TTL for successful auth results (0 = disabled)
     cache_ttl: Duration,
-    /// In-memory cache: key = "username\0sha256(password)" -> expiry instant
-    cache: Arc<DashMap<String, Instant>>,
+    /// In-memory cache keyed by a process-random HMAC over username + password.
+    cache: Arc<DashMap<CacheKey, CacheEntry>>,
+    cache_entries: AtomicUsize,
+    /// Zeroized on drop. A full-memory compromise can still recover this key.
+    cache_hmac_key: Option<Zeroizing<[u8; 32]>>,
     /// Maximum entries in the auth result cache. Prevents unbounded growth
     /// from brute-force attempts with unique credentials. Default: 10000.
     max_cache_entries: usize,
@@ -141,11 +187,19 @@ impl LdapAuth {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         let config_obj = config
             .as_object()
-            .ok_or_else(|| format!("ldap_auth: config must be an object, got: {config}"))?;
+            .ok_or_else(|| "ldap_auth: config must be an object".to_string())?;
+        reject_unknown_config_keys(config_obj)?;
 
         let ldap_url = parse_required_ldap_url(config_obj)?.to_owned();
         let parsed_ldap_url = Url::parse(&ldap_url)
             .map_err(|e| format!("ldap_auth: 'ldap_url' is not a valid URL: {e}"))?;
+
+        if !parsed_ldap_url.username().is_empty() || parsed_ldap_url.password().is_some() {
+            return Err(
+                "ldap_auth: 'ldap_url' must not contain embedded credentials; use the service account fields"
+                    .to_string(),
+            );
+        }
 
         let is_ldaps = match parsed_ldap_url.scheme() {
             "ldap" => false,
@@ -167,10 +221,13 @@ impl LdapAuth {
 
         let search_filter = parse_optional_string(config_obj, "search_filter")?;
 
+        let canonical_identity_attribute =
+            parse_optional_string(config_obj, "canonical_identity_attribute")?;
+
         let service_account_dn = parse_optional_string(config_obj, "service_account_dn")?;
 
         let service_account_password =
-            parse_optional_string(config_obj, "service_account_password")?;
+            parse_optional_secret_string(config_obj, "service_account_password")?;
 
         // Validate: must have either bind_dn_template or search-then-bind config
         let has_direct_bind = bind_dn_template.is_some();
@@ -188,6 +245,13 @@ impl LdapAuth {
             return Err(
                 "ldap_auth: search-then-bind mode requires 'service_account_dn' and \
                  'service_account_password'"
+                    .to_string(),
+            );
+        }
+
+        if has_search_bind && !has_direct_bind && canonical_identity_attribute.is_none() {
+            return Err(
+                "ldap_auth: search-then-bind mode requires 'canonical_identity_attribute' so the authenticated directory entry, not the presented username, defines the Ferrum identity"
                     .to_string(),
             );
         }
@@ -225,6 +289,17 @@ impl LdapAuth {
             );
         }
 
+        if !required_groups.is_empty()
+            && group_filter.as_ref().is_some_and(|filter| {
+                !filter.contains("{user_dn}") && !filter.contains("{username}")
+            })
+        {
+            return Err(
+                "ldap_auth: 'group_filter' must contain '{user_dn}' or '{username}' when 'required_groups' is set"
+                    .to_string(),
+            );
+        }
+
         // Finding #33: when group enforcement is configured but no service
         // account is available, the group-membership search runs over an
         // ANONYMOUS-bound connection. Many directories deny anonymous reads of
@@ -257,21 +332,105 @@ impl LdapAuth {
             );
         }
 
-        let connect_timeout_secs = parse_u64(config_obj, "connect_timeout_seconds", 5)?;
+        let connect_timeout_secs = parse_u64(
+            config_obj,
+            "connect_timeout_seconds",
+            LDAP_AUTH_DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        )?;
         if connect_timeout_secs == 0 {
             return Err(
                 "ldap_auth: 'connect_timeout_seconds' must be greater than zero".to_string(),
             );
         }
+        if connect_timeout_secs > LDAP_AUTH_MAX_CONNECT_TIMEOUT_SECONDS {
+            return Err(format!(
+                "ldap_auth: 'connect_timeout_seconds' must not exceed {LDAP_AUTH_MAX_CONNECT_TIMEOUT_SECONDS}"
+            ));
+        }
+        let search_time_limit_seconds = i32::try_from(connect_timeout_secs).map_err(|_| {
+            "ldap_auth: 'connect_timeout_seconds' cannot be represented as an LDAP search time limit"
+                .to_string()
+        })?;
 
-        let cache_ttl_secs = parse_u64(config_obj, "cache_ttl_seconds", 0)?;
+        let default_request_timeout_secs =
+            LDAP_AUTH_DEFAULT_REQUEST_TIMEOUT_SECONDS.max(connect_timeout_secs);
+        let request_timeout_secs = parse_u64(
+            config_obj,
+            "request_timeout_seconds",
+            default_request_timeout_secs,
+        )?;
+        if request_timeout_secs == 0 {
+            return Err(
+                "ldap_auth: 'request_timeout_seconds' must be greater than zero".to_string(),
+            );
+        }
+        if request_timeout_secs > LDAP_AUTH_MAX_REQUEST_TIMEOUT_SECONDS {
+            return Err(format!(
+                "ldap_auth: 'request_timeout_seconds' must not exceed {LDAP_AUTH_MAX_REQUEST_TIMEOUT_SECONDS}"
+            ));
+        }
 
-        let max_cache_entries = parse_usize(config_obj, "max_cache_entries", 10_000)?;
+        let max_concurrent_requests = parse_usize(
+            config_obj,
+            "max_concurrent_requests",
+            LDAP_AUTH_DEFAULT_MAX_CONCURRENT_REQUESTS,
+        )?;
+        if max_concurrent_requests == 0 {
+            return Err(
+                "ldap_auth: 'max_concurrent_requests' must be greater than zero".to_string(),
+            );
+        }
+        if max_concurrent_requests > LDAP_AUTH_MAX_CONCURRENT_REQUESTS {
+            return Err(format!(
+                "ldap_auth: 'max_concurrent_requests' must not exceed {LDAP_AUTH_MAX_CONCURRENT_REQUESTS}"
+            ));
+        }
+
+        let cache_ttl_secs = parse_u64(
+            config_obj,
+            "cache_ttl_seconds",
+            LDAP_AUTH_DEFAULT_CACHE_TTL_SECONDS,
+        )?;
+        if cache_ttl_secs > LDAP_AUTH_MAX_CACHE_TTL_SECONDS {
+            return Err(format!(
+                "ldap_auth: 'cache_ttl_seconds' must not exceed {LDAP_AUTH_MAX_CACHE_TTL_SECONDS}"
+            ));
+        }
+
+        let max_cache_entries = parse_usize(
+            config_obj,
+            "max_cache_entries",
+            LDAP_AUTH_DEFAULT_MAX_CACHE_ENTRIES,
+        )?;
         if max_cache_entries == 0 {
             return Err("ldap_auth: 'max_cache_entries' must be greater than zero".to_string());
         }
 
         let consumer_mapping = parse_bool(config_obj, "consumer_mapping", true)?;
+
+        let allow_plaintext = parse_bool(config_obj, "allow_plaintext", false)?;
+        if !is_ldaps && !starttls && !is_loopback_ldap_endpoint(&parsed_ldap_url) {
+            if !allow_plaintext {
+                return Err(
+                    "ldap_auth: non-loopback 'ldap://' endpoints require STARTTLS or LDAPS; set 'allow_plaintext: true' only for an isolated development environment"
+                        .to_string(),
+                );
+            }
+            warn!(
+                "ldap_auth: ALLOWING PLAINTEXT LDAP to a non-loopback endpoint; service-account and user passwords have no transport confidentiality ('allow_plaintext: true' is development-only)"
+            );
+        }
+
+        let cache_hmac_key = if cache_ttl_secs == 0 {
+            None
+        } else {
+            let mut key = Zeroizing::new([0u8; 32]);
+            ring::rand::SystemRandom::new()
+                .fill(key.as_mut())
+                .map_err(|_| "ldap_auth: failed to generate cache HMAC key".to_string())?;
+            Some(key)
+        };
+        let cache_shard_amount = http_client.pool_shard_amount();
 
         // Build rustls TLS config respecting gateway settings, including the
         // gateway's parsed CRL list (`FERRUM_TLS_CRL_FILE_PATH`) so revoked LDAP
@@ -294,6 +453,7 @@ impl LdapAuth {
             bind_dn_template,
             search_base_dn,
             search_filter,
+            canonical_identity_attribute,
             service_account_dn,
             service_account_password,
             group_base_dn,
@@ -303,8 +463,13 @@ impl LdapAuth {
             group_attribute,
             starttls,
             connect_timeout: Duration::from_secs(connect_timeout_secs),
+            search_time_limit_seconds,
+            request_timeout: Duration::from_secs(request_timeout_secs),
+            ldap_concurrency: Arc::new(Semaphore::new(max_concurrent_requests)),
             cache_ttl: Duration::from_secs(cache_ttl_secs),
-            cache: Arc::new(DashMap::new()),
+            cache: Arc::new(DashMap::with_shard_amount(cache_shard_amount)),
+            cache_entries: AtomicUsize::new(0),
+            cache_hmac_key,
             max_cache_entries,
             consumer_mapping,
             tls_config,
@@ -313,52 +478,124 @@ impl LdapAuth {
         })
     }
 
-    /// Build a cache key from username + password (hashed for safety).
-    fn cache_key(username: &str, password: &str) -> String {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(password.as_bytes());
-        let hash = hex::encode(hasher.finalize());
-        format!("{}\0{}", username, hash)
+    /// Build an opaque cache key using the per-instance random HMAC key.
+    fn cache_key(&self, username: &str, password: &str) -> Option<CacheKey> {
+        let key = self.cache_hmac_key.as_deref()?;
+        let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
+            warn!("ldap_auth: failed to initialize cache HMAC");
+            return None;
+        };
+        let username_len = u64::try_from(username.len()).ok()?;
+        mac.update(&username_len.to_be_bytes());
+        mac.update(username.as_bytes());
+        mac.update(password.as_bytes());
+        let digest = mac.finalize().into_bytes();
+        let mut cache_key = [0u8; 32];
+        cache_key.copy_from_slice(&digest);
+        Some(CacheKey(cache_key))
     }
 
     /// Check if a successful auth result is cached and still valid.
-    fn check_cache(&self, username: &str, password: &str) -> bool {
+    fn check_cache(&self, username: &str, password: &str) -> Option<String> {
         if self.cache_ttl.is_zero() {
-            return false;
+            return None;
         }
-        let key = Self::cache_key(username, password);
-        if let Some(expiry) = self.cache.get(&key) {
-            if Instant::now() < *expiry {
-                return true;
+        let key = self.cache_key(username, password)?;
+        if let Some(entry) = self.cache.get(&key) {
+            if Instant::now() < entry.expires_at {
+                return Some(entry.canonical_identity.clone());
             }
             // Expired — remove the entry
-            drop(expiry);
-            self.cache.remove(&key);
+            drop(entry);
+            if self.cache.remove(&key).is_some() {
+                self.release_cache_slot();
+            }
         }
-        false
+        None
     }
 
     /// Cache a successful authentication result.
-    fn set_cache(&self, username: &str, password: &str) {
+    fn set_cache(&self, username: &str, password: &str, canonical_identity: &str) {
         if self.cache_ttl.is_zero() {
             return;
         }
-        // Enforce max size: evict expired entries first, then skip if still at capacity
-        if self.cache.len() >= self.max_cache_entries {
-            self.evict_expired();
-            if self.cache.len() >= self.max_cache_entries {
+        let Some(key) = self.cache_key(username, password) else {
+            return;
+        };
+        let Some(expires_at) = Instant::now().checked_add(self.cache_ttl) else {
+            warn!("ldap_auth: cache expiry could not be represented; skipping cache admission");
+            return;
+        };
+        let new_entry = || CacheEntry {
+            expires_at,
+            canonical_identity: canonical_identity.to_string(),
+        };
+
+        if let Some(mut existing) = self.cache.get_mut(&key) {
+            *existing = new_entry();
+            return;
+        }
+
+        if !self.try_reserve_cache_slot() {
+            // Bounded replacement: evict at most one entry instead of scanning
+            // the entire map on every saturated-cache miss.
+            if !self.evict_one_cache_entry() || !self.try_reserve_cache_slot() {
                 return;
             }
         }
-        let key = Self::cache_key(username, password);
-        self.cache.insert(key, Instant::now() + self.cache_ttl);
+
+        match self.cache.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                occupied.insert(new_entry());
+                self.release_cache_slot();
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(new_entry());
+            }
+        }
     }
 
-    /// Remove all expired entries from the cache.
-    fn evict_expired(&self) {
-        let now = Instant::now();
-        self.cache.retain(|_, expiry| now < *expiry);
+    fn release_cache_slot(&self) {
+        if self
+            .cache_entries
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(1)
+            })
+            .is_err()
+        {
+            warn!("ldap_auth: cache entry accounting underflow prevented");
+        }
+    }
+
+    fn try_reserve_cache_slot(&self) -> bool {
+        let mut current = self.cache_entries.load(Ordering::Acquire);
+        loop {
+            if current >= self.max_cache_entries {
+                return false;
+            }
+            match self.cache_entries.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn evict_one_cache_entry(&self) -> bool {
+        let victim = self.cache.iter().next().map(|entry| *entry.key());
+        let Some(victim) = victim else {
+            return false;
+        };
+        if self.cache.remove(&victim).is_some() {
+            self.release_cache_slot();
+            true
+        } else {
+            false
+        }
     }
 
     /// Connect to the LDAP server with configured settings.
@@ -376,21 +613,18 @@ impl LdapAuth {
             settings = settings.set_config(config.clone());
         }
 
-        let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &self.ldap_url)
+        let (conn, ldap) = LdapConnAsync::with_settings(settings, &self.ldap_url)
             .await
             .map_err(|e| AuthError::Backend(format!("ldap_auth: connection failed: {e}")))?;
 
         // Drive the connection in the background
         ldap3::drive!(conn);
 
-        // Set operation timeout to match connect timeout
-        ldap.with_timeout(self.connect_timeout);
-
         Ok(ldap)
     }
 
     /// Authenticate a user via direct bind or search-then-bind.
-    /// Returns the user's DN on success.
+    /// Returns the user's DN and canonical Ferrum identity on success.
     ///
     /// Errors are classified ([`AuthError`]) so that a rejected user bind /
     /// "user not found" surfaces as a 401 while a directory outage, a failed
@@ -398,18 +632,27 @@ impl LdapAuth {
     /// #32). A bind that *fails* (transport / RPC error) is a backend problem;
     /// a bind that is *rejected* (LDAP returned a non-success result code for
     /// the end user's credentials) is the genuine invalid-credential case.
-    async fn authenticate_user(&self, username: &str, password: &str) -> Result<String, AuthError> {
+    async fn authenticate_user(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<AuthenticatedUser, AuthError> {
         let mut ldap = self.connect().await?;
 
-        let user_dn = if let Some(ref template) = self.bind_dn_template {
+        let authenticated_user = if let Some(ref template) = self.bind_dn_template {
             // Direct bind: substitute DN-escaped username into template (RFC 4514)
             let dn = template.replace("{username}", &escape_dn_value(username));
             let bind_result = ldap
+                .with_timeout(self.connect_timeout)
                 .simple_bind(&dn, password)
                 .await
                 .map_err(|e| AuthError::Backend(format!("ldap_auth: bind failed: {e}")))?;
             classify_user_bind_result(bind_result, "bind")?;
-            dn
+            let _ = ldap.with_timeout(self.connect_timeout).unbind().await;
+            AuthenticatedUser {
+                dn,
+                canonical_identity: username.to_string(),
+            }
         } else {
             // Search-then-bind: find user DN via service account
             let service_dn = self.service_account_dn.as_deref().unwrap_or_default();
@@ -418,7 +661,8 @@ impl LdapAuth {
             // A failed/rejected service-account bind is an operator
             // misconfiguration, never the end user's fault — classify both as
             // backend errors so the client is not told its credentials are wrong.
-            ldap.simple_bind(service_dn, service_pw)
+            ldap.with_timeout(self.connect_timeout)
+                .simple_bind(service_dn, service_pw)
                 .await
                 .map_err(|e| {
                     AuthError::Backend(format!("ldap_auth: service account bind failed: {e}"))
@@ -434,45 +678,92 @@ impl LdapAuth {
                 .as_deref()
                 .unwrap_or_default()
                 .replace("{username}", &escape_filter_value(username));
+            let canonical_identity_attribute =
+                self.canonical_identity_attribute.as_deref().ok_or_else(|| {
+                    AuthError::Backend(
+                        "ldap_auth: canonical identity attribute is missing in search-then-bind mode"
+                            .to_string(),
+                    )
+                })?;
 
-            let (rs, _result) = ldap
+            let search_result = ldap
+                .with_search_options(
+                    SearchOptions::new()
+                        .sizelimit(LDAP_AUTH_USER_SEARCH_SIZE_LIMIT)
+                        .timelimit(self.search_time_limit_seconds),
+                )
+                .with_timeout(self.connect_timeout)
                 // The DN is part of every LDAP search result, not a regular
-                // attribute. Request no attributes; `SearchEntry::dn` still
-                // carries the bind target and avoids servers rejecting a
-                // pseudo-attribute request for "dn".
-                .search(search_base, Scope::Subtree, &filter, Vec::<&str>::new())
+                // attribute. Request only the configured canonical identity
+                // attribute; `SearchEntry::dn` still carries the bind target.
+                .search(
+                    search_base,
+                    Scope::Subtree,
+                    &filter,
+                    vec![canonical_identity_attribute],
+                )
                 .await
-                .map_err(|e| AuthError::Backend(format!("ldap_auth: user search failed: {e}")))?
-                .success()
-                .map_err(|e| AuthError::Backend(format!("ldap_auth: user search error: {e}")))?;
+                .map_err(|e| AuthError::Backend(format!("ldap_auth: user search failed: {e}")))?;
 
-            if rs.is_empty() {
+            if search_result.1.rc == 4 && search_result.0.len() >= 2 {
                 return Err(AuthError::Credential(
-                    "ldap_auth: user not found".to_string(),
+                    "ldap_auth: user search was ambiguous".to_string(),
                 ));
             }
 
-            let entry = SearchEntry::construct(rs.into_iter().next().ok_or_else(|| {
-                AuthError::Backend("ldap_auth: user not found after non-empty check".to_string())
-            })?);
+            let (rs, _result) = search_result
+                .success()
+                .map_err(|e| AuthError::Backend(format!("ldap_auth: user search error: {e}")))?;
+
+            let result_entry = match rs.len() {
+                0 => {
+                    return Err(AuthError::Credential(
+                        "ldap_auth: user not found".to_string(),
+                    ));
+                }
+                1 => rs.into_iter().next().ok_or_else(|| {
+                    AuthError::Backend(
+                        "ldap_auth: user result disappeared after uniqueness check".to_string(),
+                    )
+                })?,
+                _ => {
+                    return Err(AuthError::Credential(
+                        "ldap_auth: user search was ambiguous".to_string(),
+                    ));
+                }
+            };
+            let entry = SearchEntry::construct(result_entry);
+            let canonical_identity = unique_ldap_attribute_value(
+                &entry.attrs,
+                canonical_identity_attribute,
+                "canonical identity",
+            )?
+            .ok_or_else(|| {
+                AuthError::Backend(format!(
+                    "ldap_auth: user search result is missing canonical identity attribute '{canonical_identity_attribute}'"
+                ))
+            })?;
             let user_dn = entry.dn;
 
             // Unbind the service account, re-connect and bind as the user
-            let _ = ldap.unbind().await;
+            let _ = ldap.with_timeout(self.connect_timeout).unbind().await;
 
             let mut user_ldap = self.connect().await?;
             let user_bind_result = user_ldap
+                .with_timeout(self.connect_timeout)
                 .simple_bind(&user_dn, password)
                 .await
                 .map_err(|e| AuthError::Backend(format!("ldap_auth: user bind failed: {e}")))?;
             classify_user_bind_result(user_bind_result, "user bind")?;
 
-            let _ = user_ldap.unbind().await;
-            user_dn
+            let _ = user_ldap.with_timeout(self.connect_timeout).unbind().await;
+            AuthenticatedUser {
+                dn: user_dn,
+                canonical_identity,
+            }
         };
 
-        let _ = ldap.unbind().await;
-        Ok(user_dn)
+        Ok(authenticated_user)
     }
 
     /// Check if the authenticated user belongs to at least one of the required groups.
@@ -484,7 +775,7 @@ impl LdapAuth {
     async fn check_group_membership(
         &self,
         user_dn: &str,
-        username: &str,
+        presented_username: &str,
     ) -> Result<bool, AuthError> {
         if self.required_groups.is_empty() {
             return Ok(true);
@@ -492,21 +783,7 @@ impl LdapAuth {
 
         let group_base = self.group_base_dn.as_deref().unwrap_or_default();
 
-        // Default filter checks both `member` (AD/static groups) and `memberUid` (posixGroup).
-        // DN values in filters must be filter-escaped (RFC 4515), not DN-escaped.
-        let escaped_user_dn = escape_filter_value(user_dn);
-        let escaped_username = escape_filter_value(username);
-        let default_filter = format!(
-            "(|(member={escaped_user_dn})(uniqueMember={escaped_user_dn})(memberUid={escaped_username}))"
-        );
-        let filter = self
-            .group_filter
-            .as_ref()
-            .map(|f| {
-                f.replace("{user_dn}", &escaped_user_dn)
-                    .replace("{username}", &escaped_username)
-            })
-            .unwrap_or(default_filter);
+        let filter = self.group_search_filter(user_dn, presented_username);
 
         // Bind with the service account when one is configured; otherwise the
         // group search runs over an ANONYMOUS-bound connection. Many directories
@@ -519,7 +796,8 @@ impl LdapAuth {
         let used_service_account = if let (Some(dn), Some(pw)) =
             (&self.service_account_dn, &self.service_account_password)
         {
-            ldap.simple_bind(dn, pw)
+            ldap.with_timeout(self.connect_timeout)
+                .simple_bind(dn, pw)
                 .await
                 .map_err(|e| {
                     AuthError::Backend(format!("ldap_auth: group check bind failed: {e}"))
@@ -533,7 +811,13 @@ impl LdapAuth {
             false
         };
 
-        let (rs, _result) = ldap
+        let search_result = ldap
+            .with_search_options(
+                SearchOptions::new()
+                    .sizelimit(LDAP_AUTH_GROUP_SEARCH_SIZE_LIMIT)
+                    .timelimit(self.search_time_limit_seconds),
+            )
+            .with_timeout(self.connect_timeout)
             .search(
                 group_base,
                 Scope::Subtree,
@@ -541,11 +825,18 @@ impl LdapAuth {
                 vec![self.group_attribute.as_str()],
             )
             .await
-            .map_err(|e| AuthError::Backend(format!("ldap_auth: group search failed: {e}")))?
-            .success()
-            .map_err(|e| AuthError::Backend(format!("ldap_auth: group search error: {e}")))?;
+            .map_err(|e| AuthError::Backend(format!("ldap_auth: group search failed: {e}")))?;
 
-        let _ = ldap.unbind().await;
+        let result_code = search_result.1.rc;
+        if result_code != 0 && result_code != 4 {
+            let _ = ldap.with_timeout(self.connect_timeout).unbind().await;
+            return Err(AuthError::Backend(format!(
+                "ldap_auth: group search error: {}",
+                search_result.1
+            )));
+        }
+        let size_limit_exceeded = result_code == 4;
+        let rs = search_result.0;
 
         // A zero-entry result is ambiguous: the user may genuinely belong to no
         // group, OR the directory may have silently returned nothing because an
@@ -558,29 +849,218 @@ impl LdapAuth {
                  anonymous bind; this is either a genuine no-membership result or the directory \
                  restricts anonymous reads of group objects — configure 'service_account_dn'/\
                  'service_account_password' if groups are not being matched",
-                username, group_base
+                presented_username, group_base
             );
         }
 
+        let mut membership_result = Ok(false);
         for result_entry in rs {
             let entry = SearchEntry::construct(result_entry);
-            if let Some(group_names) = entry.attrs.get(&self.group_attribute) {
-                for name in group_names {
-                    if self.required_group_lookup.contains(&name.to_lowercase()) {
-                        return Ok(true);
-                    }
+            let is_required_group = match self.entry_matches_required_group(&entry) {
+                Ok(is_match) => is_match,
+                Err(error) => {
+                    membership_result = Err(error);
+                    break;
+                }
+            };
+            if !is_required_group {
+                continue;
+            }
+
+            // The built-in filter itself is the membership proof. A custom
+            // filter may contain static branches that also return this group,
+            // so re-check the exact returned entry with a server-side,
+            // schema-aware membership predicate before authorizing it.
+            if self.group_filter.is_none() {
+                membership_result = Ok(true);
+                break;
+            }
+            match self
+                .returned_group_proves_membership(&mut ldap, &entry.dn, user_dn, presented_username)
+                .await
+            {
+                Ok(true) => {
+                    membership_result = Ok(true);
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    membership_result = Err(error);
+                    break;
                 }
             }
-            // Also check the DN's CN component as a fallback
-            if let Some(cn) = extract_cn_from_dn(&entry.dn)
-                && self.required_group_lookup.contains(&cn.to_lowercase())
-            {
-                return Ok(true);
-            }
+        }
+
+        let _ = ldap.with_timeout(self.connect_timeout).unbind().await;
+        if membership_result? {
+            return Ok(true);
+        }
+
+        if size_limit_exceeded {
+            return Err(AuthError::Backend(
+                "ldap_auth: group search exceeded the configured size limit before proving required membership"
+                    .to_string(),
+            ));
         }
 
         Ok(false)
     }
+
+    fn group_search_filter(&self, user_dn: &str, presented_username: &str) -> String {
+        // `{username}` retains its documented meaning as the login value used
+        // by the user search. The canonical identity is for Ferrum identity
+        // export/Consumer mapping and may intentionally differ (for example,
+        // email login versus an immutable directory ID).
+        let default_filter = group_membership_filter(user_dn, presented_username);
+        let escaped_user_dn = escape_filter_value(user_dn);
+        let escaped_username = escape_filter_value(presented_username);
+        self.group_filter
+            .as_ref()
+            .map(|filter| {
+                filter
+                    .replace("{user_dn}", &escaped_user_dn)
+                    .replace("{username}", &escaped_username)
+            })
+            .unwrap_or(default_filter)
+    }
+
+    fn entry_matches_required_group(&self, entry: &SearchEntry) -> Result<bool, AuthError> {
+        if let Some(group_names) =
+            ldap_attribute_values(&entry.attrs, &self.group_attribute, "group")?
+            && group_names
+                .iter()
+                .any(|name| self.required_group_lookup.contains(&name.to_lowercase()))
+        {
+            return Ok(true);
+        }
+
+        // Also check the DN's CN component as a fallback.
+        Ok(extract_cn_from_dn(&entry.dn)
+            .is_some_and(|cn| self.required_group_lookup.contains(&cn.to_lowercase())))
+    }
+
+    async fn returned_group_proves_membership(
+        &self,
+        ldap: &mut Ldap,
+        group_dn: &str,
+        user_dn: &str,
+        presented_username: &str,
+    ) -> Result<bool, AuthError> {
+        let membership_filter = group_membership_filter(user_dn, presented_username);
+        let (entries, _result) = ldap
+            .with_search_options(
+                SearchOptions::new()
+                    .sizelimit(1)
+                    .timelimit(self.search_time_limit_seconds),
+            )
+            .with_timeout(self.connect_timeout)
+            .search(group_dn, Scope::Base, &membership_filter, vec!["1.1"])
+            .await
+            .map_err(|e| {
+                AuthError::Backend(format!(
+                    "ldap_auth: returned group membership verification failed: {e}"
+                ))
+            })?
+            .success()
+            .map_err(|e| {
+                AuthError::Backend(format!(
+                    "ldap_auth: returned group membership verification error: {e}"
+                ))
+            })?;
+
+        match entries.len() {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(AuthError::Backend(
+                "ldap_auth: base-scope group membership verification returned multiple entries"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+fn group_membership_filter(user_dn: &str, presented_username: &str) -> String {
+    let escaped_user_dn = escape_filter_value(user_dn);
+    let escaped_username = escape_filter_value(presented_username);
+    format!(
+        "(|(member={escaped_user_dn})(uniqueMember={escaped_user_dn})(memberUid={escaped_username}))"
+    )
+}
+
+fn ldap_attribute_values<'a>(
+    attrs: &'a HashMap<String, Vec<String>>,
+    attribute: &str,
+    purpose: &str,
+) -> Result<Option<&'a Vec<String>>, AuthError> {
+    let mut match_values = None;
+    for (name, values) in attrs {
+        if name.eq_ignore_ascii_case(attribute) {
+            if match_values.is_some() {
+                return Err(AuthError::Backend(format!(
+                    "ldap_auth: directory returned duplicate case-variant {purpose} attributes for '{attribute}'"
+                )));
+            }
+            match_values = Some(values);
+        }
+    }
+    Ok(match_values)
+}
+
+fn unique_ldap_attribute_value(
+    attrs: &HashMap<String, Vec<String>>,
+    attribute: &str,
+    purpose: &str,
+) -> Result<Option<String>, AuthError> {
+    let Some(values) = ldap_attribute_values(attrs, attribute, purpose)? else {
+        return Ok(None);
+    };
+    if values.len() != 1 {
+        return Err(AuthError::Backend(format!(
+            "ldap_auth: directory must return exactly one {purpose} value for '{attribute}'"
+        )));
+    }
+    let Some(value) = values.first() else {
+        return Err(AuthError::Backend(format!(
+            "ldap_auth: directory returned no {purpose} value for '{attribute}'"
+        )));
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(AuthError::Backend(format!(
+            "ldap_auth: directory returned an empty {purpose} value for '{attribute}'"
+        )));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn reject_unknown_config_keys(config: &Map<String, Value>) -> Result<(), String> {
+    const KNOWN_KEYS: [&str; 19] = [
+        "ldap_url",
+        "bind_dn_template",
+        "search_base_dn",
+        "search_filter",
+        "canonical_identity_attribute",
+        "service_account_dn",
+        "service_account_password",
+        "group_base_dn",
+        "group_filter",
+        "required_groups",
+        "group_attribute",
+        "starttls",
+        "allow_plaintext",
+        "connect_timeout_seconds",
+        "request_timeout_seconds",
+        "max_concurrent_requests",
+        "cache_ttl_seconds",
+        "max_cache_entries",
+        "consumer_mapping",
+    ];
+    for key in config.keys() {
+        if !KNOWN_KEYS.contains(&key.as_str()) {
+            return Err(format!("ldap_auth: unknown config key '{key}'"));
+        }
+    }
+    Ok(())
 }
 
 fn parse_required_ldap_url(config: &Map<String, Value>) -> Result<&str, String> {
@@ -598,6 +1078,22 @@ fn parse_required_ldap_url(config: &Map<String, Value>) -> Result<&str, String> 
         return Err("ldap_auth: 'ldap_url' must not be empty".to_string());
     }
     Ok(value)
+}
+
+fn is_loopback_ldap_endpoint(parsed: &Url) -> bool {
+    match parsed.host() {
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        Some(Host::Domain(hostname)) => {
+            let hostname = hostname.trim_end_matches('.');
+            hostname
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+                || hostname.eq_ignore_ascii_case("localhost")
+                || hostname.to_ascii_lowercase().ends_with(".localhost")
+        }
+        None => false,
+    }
 }
 
 fn ldap_url_hostname(parsed: &Url) -> Result<String, String> {
@@ -636,6 +1132,23 @@ fn parse_optional_string(
     let raw = value
         .as_str()
         .ok_or_else(|| format!("ldap_auth: '{field}' must be a string, got: {value}"))?;
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(format!("ldap_auth: '{field}' must not be empty"));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn parse_optional_secret_string(
+    config: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let raw = value
+        .as_str()
+        .ok_or_else(|| format!("ldap_auth: '{field}' must be a string"))?;
     let value = raw.trim();
     if value.is_empty() {
         return Err(format!("ldap_auth: '{field}' must not be empty"));
@@ -963,58 +1476,38 @@ impl AuthMechanism for LdapAuth {
         let ExtractedCredential::BasicAuth { username, password } = credential else {
             return VerifyOutcome::NotApplicable;
         };
+        let password = Zeroizing::new(password);
 
         // Check cache first
-        if self.check_cache(&username, &password) {
+        if let Some(canonical_identity) = self.check_cache(&username, &password) {
             debug!("ldap_auth: cache hit for user '{}'", username);
-            return self.identity_outcome(&username, consumer_index);
+            return self.identity_outcome(&canonical_identity, consumer_index);
         }
 
-        // Authenticate against LDAP. Distinguish a genuine credential failure
-        // (401) from a backend/config failure (500); see finding #32. The
-        // client always receives a generic message — the specific cause is only
-        // logged via `warn!`.
-        let user_dn = match self.authenticate_user(&username, &password).await {
-            Ok(dn) => dn,
-            Err(AuthError::Credential(e)) => {
-                warn!("{}", e);
-                return VerifyOutcome::Invalid(r#"{"error":"LDAP authentication failed"}"#.into());
-            }
-            Err(AuthError::Backend(e)) => {
-                warn!("{}", e);
+        let _permit = match self.ldap_concurrency.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!("ldap_auth: maximum concurrent authentication work reached");
                 return VerifyOutcome::Internal(
                     r#"{"error":"LDAP authentication temporarily unavailable"}"#.into(),
                 );
             }
         };
 
-        // Check group membership if required
-        if !self.required_groups.is_empty() {
-            match self.check_group_membership(&user_dn, &username).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    warn!(
-                        "ldap_auth: user '{}' is not a member of any required group",
-                        username
-                    );
-                    return VerifyOutcome::Forbidden(
-                        r#"{"error":"User is not a member of any required group"}"#.into(),
-                    );
-                }
-                Err(e) => {
-                    warn!("{}", e.log_message());
-                    return VerifyOutcome::Internal(
-                        r#"{"error":"LDAP group membership check failed"}"#.into(),
-                    );
-                }
+        match tokio::time::timeout(
+            self.request_timeout,
+            self.verify_uncached(&username, &password, consumer_index),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                warn!("ldap_auth: authentication exceeded the configured wall-clock deadline");
+                VerifyOutcome::Internal(
+                    r#"{"error":"LDAP authentication temporarily unavailable"}"#.into(),
+                )
             }
         }
-
-        // Cache successful auth
-        self.set_cache(&username, &password);
-
-        debug!("ldap_auth: authenticated user '{}'", username);
-        self.identity_outcome(&username, consumer_index)
     }
 }
 
@@ -1033,6 +1526,67 @@ auth_flow::impl_auth_plugin!(
 );
 
 impl LdapAuth {
+    async fn verify_uncached(
+        &self,
+        presented_username: &str,
+        password: &str,
+        consumer_index: &ConsumerIndex,
+    ) -> VerifyOutcome {
+        // Authenticate against LDAP. Distinguish a genuine credential failure
+        // (401) from a backend/config failure (500); see finding #32. The
+        // client always receives a generic message — the specific cause is only
+        // logged via `warn!`.
+        let authenticated_user = match self.authenticate_user(presented_username, password).await {
+            Ok(user) => user,
+            Err(AuthError::Credential(e)) => {
+                warn!("{}", e);
+                return VerifyOutcome::Invalid(r#"{"error":"LDAP authentication failed"}"#.into());
+            }
+            Err(AuthError::Backend(e)) => {
+                warn!("{}", e);
+                return VerifyOutcome::Internal(
+                    r#"{"error":"LDAP authentication temporarily unavailable"}"#.into(),
+                );
+            }
+        };
+
+        if !self.required_groups.is_empty() {
+            match self
+                .check_group_membership(&authenticated_user.dn, presented_username)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        "ldap_auth: user '{}' is not a member of any required group",
+                        authenticated_user.canonical_identity
+                    );
+                    return VerifyOutcome::Forbidden(
+                        r#"{"error":"User is not a member of any required group"}"#.into(),
+                    );
+                }
+                Err(e) => {
+                    warn!("{}", e.log_message());
+                    return VerifyOutcome::Internal(
+                        r#"{"error":"LDAP group membership check failed"}"#.into(),
+                    );
+                }
+            }
+        }
+
+        self.set_cache(
+            presented_username,
+            password,
+            &authenticated_user.canonical_identity,
+        );
+
+        debug!(
+            "ldap_auth: authenticated canonical identity '{}'",
+            authenticated_user.canonical_identity
+        );
+        self.identity_outcome(&authenticated_user.canonical_identity, consumer_index)
+    }
+
     /// Build the auth result for a successfully authenticated LDAP user.
     fn identity_outcome(&self, username: &str, consumer_index: &ConsumerIndex) -> VerifyOutcome {
         let consumer = if self.consumer_mapping {
@@ -1092,6 +1646,142 @@ mod tests {
             Some(value) => value,
             None => panic!("{context}"),
         }
+    }
+
+    fn cached_test_plugin(max_cache_entries: usize) -> LdapAuth {
+        must(
+            LdapAuth::new(
+                &serde_json::json!({
+                    "ldap_url": "ldap://127.0.0.1:389",
+                    "bind_dn_template": "uid={username},dc=example,dc=com",
+                    "cache_ttl_seconds": 60,
+                    "max_cache_entries": max_cache_entries
+                }),
+                PluginHttpClient::default(),
+            ),
+            "build cached LDAP plugin",
+        )
+    }
+
+    #[test]
+    fn raised_connect_timeout_raises_the_default_whole_flow_deadline() {
+        let plugin = must(
+            LdapAuth::new(
+                &serde_json::json!({
+                    "ldap_url": "ldap://127.0.0.1:389",
+                    "bind_dn_template": "uid={username},dc=example,dc=com",
+                    "connect_timeout_seconds": 60
+                }),
+                PluginHttpClient::default(),
+            ),
+            "build LDAP plugin with raised operation timeout",
+        );
+
+        assert_eq!(plugin.request_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn group_username_placeholder_keeps_the_presented_login_value() {
+        let plugin = must(
+            LdapAuth::new(
+                &serde_json::json!({
+                    "ldap_url": "ldap://127.0.0.1:389",
+                    "search_base_dn": "ou=users,dc=example,dc=com",
+                    "search_filter": "(mail={username})",
+                    "canonical_identity_attribute": "entryUUID",
+                    "service_account_dn": "cn=admin,dc=example,dc=com",
+                    "service_account_password": "service-secret",
+                    "group_base_dn": "ou=groups,dc=example,dc=com",
+                    "group_filter": "(memberUid={username})",
+                    "required_groups": ["admins"]
+                }),
+                PluginHttpClient::default(),
+            ),
+            "build search-bind LDAP plugin",
+        );
+
+        assert_eq!(
+            plugin.group_search_filter(
+                "entryUUID=immutable-id,ou=users,dc=example,dc=com",
+                "alice@example.com",
+            ),
+            "(memberUid=alice@example.com)"
+        );
+    }
+
+    #[test]
+    fn cache_key_is_random_keyed_hmac_not_bare_password_digest() {
+        use sha2::Digest;
+
+        let first = cached_test_plugin(4);
+        let second = cached_test_plugin(4);
+        let first_key = must_some(first.cache_key("alice", "password"), "first cache key");
+        let second_key = must_some(second.cache_key("alice", "password"), "second cache key");
+        let digest = sha2::Sha256::digest(b"password");
+        let mut bare_password_digest = [0u8; 32];
+        bare_password_digest.copy_from_slice(&digest);
+
+        assert_ne!(first_key.0, bare_password_digest);
+        assert_ne!(first_key.0, second_key.0);
+    }
+
+    #[test]
+    fn saturated_cache_replaces_one_entry_and_preserves_hard_cap() {
+        let plugin = cached_test_plugin(4);
+        for index in 0..100 {
+            let username = format!("user-{index}");
+            plugin.set_cache(&username, "password", &username);
+            assert!(plugin.cache.len() <= 4);
+            assert!(plugin.cache_entries.load(Ordering::Acquire) <= 4);
+        }
+
+        assert_eq!(plugin.cache.len(), 4);
+        assert_eq!(plugin.cache_entries.load(Ordering::Acquire), 4);
+        assert_eq!(
+            plugin.check_cache("user-99", "password").as_deref(),
+            Some("user-99")
+        );
+    }
+
+    #[test]
+    fn concurrent_cache_admission_never_exceeds_hard_cap() {
+        let plugin = Arc::new(cached_test_plugin(8));
+        std::thread::scope(|scope| {
+            for worker in 0..32 {
+                let plugin = Arc::clone(&plugin);
+                scope.spawn(move || {
+                    for item in 0..32 {
+                        let username = format!("worker-{worker}-item-{item}");
+                        plugin.set_cache(&username, "password", &username);
+                    }
+                });
+            }
+        });
+
+        assert!(plugin.cache.len() <= 8);
+        assert_eq!(
+            plugin.cache_entries.load(Ordering::Acquire),
+            plugin.cache.len()
+        );
+    }
+
+    #[test]
+    fn unrepresentable_cache_expiry_is_skipped_without_panicking() {
+        let mut plugin = cached_test_plugin(4);
+        plugin.cache_ttl = Duration::MAX;
+        plugin.set_cache("alice", "password", "alice");
+        assert!(plugin.cache.is_empty());
+        assert_eq!(plugin.cache_entries.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn case_variant_duplicate_ldap_attributes_fail_closed() {
+        let attrs = HashMap::from([
+            ("sAMAccountName".to_string(), vec!["admins".to_string()]),
+            ("samaccountname".to_string(), vec!["guests".to_string()]),
+        ]);
+        let result = ldap_attribute_values(&attrs, "SAMACCOUNTNAME", "group");
+        assert!(result.is_err());
     }
 
     struct TestCa {

@@ -11522,6 +11522,7 @@ components:
 
     LdapAuthConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: ldap_auth — LDAP directory authentication with optional AD group
         filtering. Status codes distinguish failure classes: invalid credentials
@@ -11535,61 +11536,159 @@ components:
         directory permits anonymous reads of group objects, so a service account
         is recommended. TLS connections (`ldaps://`/STARTTLS) honor the gateway
         CRL (`FERRUM_TLS_CRL_FILE_PATH`), rejecting revoked server certificates.
+        Non-loopback plaintext `ldap://` is rejected unless the development-only
+        `allow_plaintext` override is explicitly enabled. Search-then-bind requires
+        a canonical identity attribute, rejects ambiguous searches, and exports the
+        selected entry's canonical value rather than the presented username.
       required:
         - ldap_url
+      allOf:
+        - anyOf:
+            - required: [bind_dn_template]
+            - required:
+                - search_base_dn
+                - search_filter
+                - canonical_identity_attribute
+                - service_account_dn
+                - service_account_password
+        - if:
+            required: [search_base_dn, search_filter]
+          then:
+            required: [service_account_dn, service_account_password]
+        - if:
+            required: [ldap_url]
+            properties:
+              ldap_url:
+                pattern: "^ldap://"
+          then:
+            anyOf:
+              - required: [starttls]
+                properties:
+                  starttls:
+                    const: true
+              - required: [allow_plaintext]
+                properties:
+                  allow_plaintext:
+                    const: true
+              - properties:
+                  ldap_url:
+                    pattern: '^ldap://(?:127(?:\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){3}|\[::1\]|(?:[^/?#@]+\.)?[lL][oO][cC][aA][lL][hH][oO][sS][tT]\.?)(?::[0-9]+)?(?:[/?#]|$)'
+        - if:
+            required: [required_groups]
+            properties:
+              required_groups:
+                minItems: 1
+          then:
+            required: [group_base_dn]
+            properties:
+              group_filter:
+                pattern: '\{(?:user_dn|username)\}'
+        - not:
+            required: [ldap_url, starttls]
+            properties:
+              ldap_url:
+                pattern: "^ldaps://"
+              starttls:
+                const: true
       properties:
         ldap_url:
           type: string
-          description: "LDAP server URL (ldap:// or ldaps://)"
-          example: "ldap://ldap.example.com:389"
+          minLength: 1
+          pattern: "^ldaps?://"
+          not:
+            pattern: "^ldaps?://[^/?#]*@"
+          description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. Embedded URL credentials are rejected."
+          example: "ldaps://ldap.example.com:636"
         bind_dn_template:
           type: string
+          minLength: 1
+          pattern: '\{username\}'
           description: "Direct bind DN template with {username} placeholder"
           example: "uid={username},ou=users,dc=example,dc=com"
         search_base_dn:
           type: string
+          minLength: 1
           description: "Base DN for search-then-bind user search"
         search_filter:
           type: string
+          minLength: 1
+          pattern: '\{username\}'
           description: "LDAP search filter with {username} placeholder"
           example: "(&(objectClass=user)(sAMAccountName={username}))"
+        canonical_identity_attribute:
+          type: string
+          minLength: 1
+          description: "Required for search-then-bind. Exactly one value from the uniquely selected entry becomes the authenticated identity and Consumer mapping key (for example uid or sAMAccountName). Attribute-name matching is LDAP case-insensitive."
         service_account_dn:
           type: string
+          minLength: 1
           description: "DN for the service account used in search-then-bind"
         service_account_password:
           type: string
+          minLength: 1
+          writeOnly: true
+          format: password
           description: "Password for the service account"
         group_base_dn:
           type: string
+          minLength: 1
           description: "Base DN for group membership search"
         group_filter:
           type: string
-          description: "Group search filter with {user_dn} and {username} placeholders"
+          minLength: 1
+          description: "Group search filter. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the presented login value; canonical_identity_attribute controls the exported Ferrum identity. Before authorization, every custom-filter match is rechecked against the exact returned group DN using member, uniqueMember, and memberUid so a static branch cannot fabricate membership."
         required_groups:
           type: array
           items:
             type: string
+            minLength: 1
           description: "LDAP/AD group names the user must belong to (OR logic)"
         group_attribute:
           type: string
+          minLength: 1
           default: "cn"
-          description: "Attribute containing the group name"
+          description: "Attribute containing the group name; returned LDAP attribute names are matched case-insensitively"
         starttls:
           type: boolean
           default: false
-          description: "Use STARTTLS to upgrade ldap:// connections"
+          description: "Use STARTTLS to upgrade ldap:// connections; invalid with ldaps://"
+        allow_plaintext:
+          type: boolean
+          default: false
+          description: "Development-only override allowing a non-loopback ldap:// endpoint without STARTTLS. Service-account and user passwords then have no transport confidentiality."
         connect_timeout_seconds:
           type: integer
+          format: uint64
           default: 5
-          description: "LDAP connection and operation timeout in seconds"
+          minimum: 1
+          maximum: 300
+          description: "Per-connection and per-operation timeout in seconds; also applied as the server-side LDAP search time limit"
+        request_timeout_seconds:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 300
+          description: "Strict wall-clock deadline in seconds for the complete uncached authentication and group-check flow. The effective default is 15 seconds, raised to connect_timeout_seconds when that value is larger."
+        max_concurrent_requests:
+          type: integer
+          format: uint64
+          default: 64
+          minimum: 1
+          maximum: 1024
+          description: "Maximum concurrent uncached LDAP authentication flows per plugin instance; excess requests fail immediately"
         cache_ttl_seconds:
           type: integer
+          format: uint64
           default: 0
-          description: "Cache TTL for successful auth results (0 = disabled)"
+          minimum: 0
+          maximum: 86400
+          description: "Cache TTL for successful auth results (0 = disabled, maximum 24 hours)"
         max_cache_entries:
           type: integer
+          format: uint64
           default: 10000
-          description: "Maximum entries in the auth result cache. Prevents unbounded growth from brute-force attempts with unique credentials"
+          minimum: 1
+          description: "Strict maximum entries in the auth result cache. At capacity, one existing entry is replaced without a full-cache scan."
         consumer_mapping:
           type: boolean
           default: true
