@@ -46,6 +46,72 @@ struct PriorityOverridePlugin {
     priority: u16,
 }
 
+const MESH_ROUTE_DISPATCH_NAME: &str = "mesh_route_dispatch";
+const MESH_ROUTE_DISPATCH_FINALIZER_NAME: &str = "__mesh_route_dispatch_finalizer";
+
+/// Cache-internal sentinel placed immediately after the last route-dispatch
+/// instance. Individual instances stage fail-closed misses on `RequestContext`;
+/// this sentinel rejects only when the aggregate chain produced neither a
+/// match nor an override from an earlier routing plugin.
+struct MeshRouteDispatchFinalizer {
+    priority: u16,
+}
+
+#[async_trait]
+impl Plugin for MeshRouteDispatchFinalizer {
+    fn name(&self) -> &str {
+        MESH_ROUTE_DISPATCH_FINALIZER_NAME
+    }
+
+    fn priority(&self) -> u16 {
+        self.priority
+    }
+
+    fn supported_protocols(&self) -> &'static [crate::plugins::ProxyProtocol] {
+        crate::plugins::HTTP_FAMILY_PROTOCOLS
+    }
+
+    async fn before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &mut std::collections::HashMap<String, String>,
+    ) -> PluginResult {
+        if !std::mem::take(&mut ctx.mesh_route_dispatch_reject_unmatched)
+            || ctx.mesh_route_dispatch_matched
+            || ctx.has_route_overrides()
+        {
+            return PluginResult::Continue;
+        }
+        crate::plugins::mesh_route_dispatch::reject_unmatched_result()
+    }
+}
+
+/// Enable aggregate unmatched handling and install exactly one finalizer at
+/// the execution boundary after the final `mesh_route_dispatch` instance.
+/// Existing finalizers may be present when a global list is cloned during an
+/// incremental rebuild, so remove them before recomputing the boundary.
+fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) {
+    plugins.retain(|plugin| plugin.name() != MESH_ROUTE_DISPATCH_FINALIZER_NAME);
+    let Some(last_index) = plugins
+        .iter()
+        .rposition(|plugin| plugin.name() == MESH_ROUTE_DISPATCH_NAME)
+    else {
+        return;
+    };
+
+    for plugin in plugins
+        .iter()
+        .filter(|plugin| plugin.name() == MESH_ROUTE_DISPATCH_NAME)
+    {
+        plugin.enable_deferred_unmatched_rejection();
+    }
+    let priority = plugins[last_index].priority();
+    plugins.insert(
+        last_index + 1,
+        Arc::new(MeshRouteDispatchFinalizer { priority }),
+    );
+}
+
 #[async_trait]
 impl Plugin for PriorityOverridePlugin {
     fn name(&self) -> &str {
@@ -94,6 +160,9 @@ impl Plugin for PriorityOverridePlugin {
         headers: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
         self.inner.before_proxy(ctx, headers).await
+    }
+    fn enable_deferred_unmatched_rejection(&self) {
+        self.inner.enable_deferred_unmatched_rejection();
     }
     fn is_backend_admission_plugin(&self) -> bool {
         self.inner.is_backend_admission_plugin()
@@ -1178,6 +1247,7 @@ impl PluginCache {
                 }
             }
             global_plugins.sort_by_key(|p| p.priority());
+            install_mesh_route_dispatch_finalizer(&mut global_plugins);
             Arc::new(global_plugins)
         } else {
             Arc::clone(&current.global_plugins)
@@ -1359,6 +1429,7 @@ impl PluginCache {
             }
 
             merged.sort_by_key(|p| p.priority());
+            install_mesh_route_dispatch_finalizer(&mut merged);
             new_map.insert(proxy.id.clone(), Arc::new(merged));
         }
 
@@ -1848,6 +1919,7 @@ impl PluginCache {
 
             // Sort by priority so execution order is deterministic
             merged.sort_by_key(|p| p.priority());
+            install_mesh_route_dispatch_finalizer(&mut merged);
 
             // Pre-compute whether any plugin requires response body buffering
             let needs_buffering = merged.iter().any(|p| p.requires_response_body_buffering());
@@ -1888,6 +1960,7 @@ impl PluginCache {
 
         // Sort global fallback list too
         global_plugins.sort_by_key(|p| p.priority());
+        install_mesh_route_dispatch_finalizer(&mut global_plugins);
         let global_needs_buffering = global_plugins
             .iter()
             .any(|p| p.requires_response_body_buffering());

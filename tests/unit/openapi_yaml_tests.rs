@@ -147,6 +147,12 @@ fn typed_component_properties_match_serde_field_inventories() {
     };
     use ferrum_edge::modes::mesh::config::MeshTrafficPolicyTls;
     use ferrum_edge::modes::mesh::slice::{MeshEgressScopeResource, MeshEgressScopeSnapshot};
+    use ferrum_edge::plugins::mesh_route_dispatch::{
+        FaultAbortConfig, FaultActionConfig, FaultDelayConfig, MatchCriteria,
+        MeshRouteDispatchConfig, RouteDestination, RouteRedirectConfig, RouteRewriteConfig,
+        RouteRule,
+    };
+    use ferrum_edge::plugins::utils::route_header_transform::RawRouteHeaderTransformRule;
 
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -219,6 +225,52 @@ fn typed_component_properties_match_serde_field_inventories() {
     );
     check!(CircuitBreakerConfig, "CircuitBreakerConfig");
     check!(RetryConfig, "RetryConfig");
+    check!(MeshRouteDispatchConfig, "MeshRouteDispatchConfig");
+    check_at!(
+        RouteRule,
+        "MeshRouteDispatchConfig.rules[]",
+        "/components/schemas/MeshRouteDispatchConfig/properties/rules/items/properties"
+    );
+    check_at!(
+        MatchCriteria,
+        "MeshRouteDispatchConfig.rules[].match",
+        "/components/schemas/MeshRouteDispatchConfig/properties/rules/items/properties/match/properties"
+    );
+    check_at!(
+        RouteDestination,
+        "MeshRouteDispatchConfig.rules[].destination",
+        "/components/schemas/MeshRouteDispatchConfig/properties/rules/items/properties/destination/properties"
+    );
+    check_at!(
+        RawRouteHeaderTransformRule,
+        "MeshRouteDispatchConfig.rules[].request_transform[]",
+        "/components/schemas/MeshRouteDispatchConfig/properties/rules/items/properties/request_transform/items/properties"
+    );
+    check_at!(
+        FaultActionConfig,
+        "MeshRouteDispatchConfig.rules[].fault",
+        "/components/schemas/MeshRouteDispatchConfig/properties/rules/items/properties/fault/properties"
+    );
+    check_at!(
+        FaultDelayConfig,
+        "MeshRouteDispatchConfig.rules[].fault.delay",
+        "/components/schemas/MeshRouteDispatchConfig/properties/rules/items/properties/fault/properties/delay/properties"
+    );
+    check_at!(
+        FaultAbortConfig,
+        "MeshRouteDispatchConfig.rules[].fault.abort",
+        "/components/schemas/MeshRouteDispatchConfig/properties/rules/items/properties/fault/properties/abort/properties"
+    );
+    check_at!(
+        RouteRewriteConfig,
+        "MeshRouteDispatchConfig.rules[].rewrite",
+        "/components/schemas/MeshRouteDispatchConfig/properties/rules/items/properties/rewrite/properties"
+    );
+    check_at!(
+        RouteRedirectConfig,
+        "MeshRouteDispatchConfig.rules[].redirect",
+        "/components/schemas/MeshRouteDispatchConfig/properties/rules/items/properties/redirect/properties"
+    );
     check!(MeshEgressScopeSnapshot, "MeshEgressScopeSnapshot");
     check!(MeshEgressScopeResource, "MeshEgressScopeResource");
 }
@@ -1106,6 +1158,130 @@ fn assert_component_validity(
         actual_valid, expected_valid,
         "unexpected {component} validation result for {instance}"
     );
+}
+
+#[test]
+fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
+    use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let representative = json!({
+        "rules": [
+            {
+                "match": {
+                    "methods": [{"regex": "GET|POST"}],
+                    "uri": {"regex": "/api/[a-z]+"}
+                },
+                "destination": {
+                    "backend_host": "api.internal.example",
+                    "backend_port": 8443,
+                    "backend_tls": {
+                        "client_cert_path": "/tls/client.pem",
+                        "client_key_path": "/tls/client.key",
+                        "server_ca_cert_path": "/tls/ca.pem",
+                        "verify_server_cert": true,
+                        "sni": "api.internal.example",
+                        "san_allow_list": ["api.internal.example"]
+                    },
+                    "requires_node_waypoint_authz": true
+                },
+                "timeout_ms": 1500,
+                "retry": {
+                    "max_retries": 2,
+                    "retryable_status_codes": [502],
+                    "retryable_methods": ["GET"],
+                    "backoff": {"fixed": {"delay_ms": 25}},
+                    "retry_on_connect_failure": true
+                },
+                "request_transform": [
+                    {
+                        "operation": "add",
+                        "target": "header",
+                        "key": "x-route",
+                        "value": "api"
+                    },
+                    {"operation": "remove", "key": "x-internal"}
+                ],
+                "response_transform": [{
+                    "operation": "update",
+                    "key": "x-served-by",
+                    "value": "edge"
+                }],
+                "fault": {"delay": {"duration_ms": 1, "percentage": 1.0}},
+                "rewrite": {"uri": "/v2", "match_prefix": "/api"}
+            },
+            {
+                "match": {"methods": ["HEAD"]},
+                "redirect": {"redirect_code": 308}
+            },
+            {
+                "match": {"methods": ["PUT"]},
+                "destination": {"upstream_id": "fallback"},
+                "timeout_ms": null,
+                "timeout_disabled": true,
+                "retry": null,
+                "retry_disabled": true
+            }
+        ],
+        "reject_unmatched": true
+    });
+
+    assert_component_validity(&spec, "MeshRouteDispatchConfig", &representative, true);
+    MeshRouteDispatch::new(&representative).expect("representative config is runtime-valid");
+
+    let documented_old_transform = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "api"},
+            "request_transform": [{"op": "update", "key": "x-route", "value": "api"}]
+        }]
+    });
+    assert_component_validity(
+        &spec,
+        "MeshRouteDispatchConfig",
+        &documented_old_transform,
+        false,
+    );
+    assert!(MeshRouteDispatch::new(&documented_old_transform).is_err());
+
+    for invalid_transform in [
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "request_transform": [{"operation": "add", "key": "x-route"}]
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "request_transform": [{
+                    "operation": "remove",
+                    "key": "x-route",
+                    "value": "unexpected"
+                }]
+            }]
+        }),
+    ] {
+        assert_component_validity(&spec, "MeshRouteDispatchConfig", &invalid_transform, false);
+        assert!(MeshRouteDispatch::new(&invalid_transform).is_err());
+    }
+
+    let status_only_redirect = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "redirect": {"redirect_code": 308}
+        }]
+    });
+    assert_component_validity(
+        &spec,
+        "MeshRouteDispatchConfig",
+        &status_only_redirect,
+        true,
+    );
+    MeshRouteDispatch::new(&status_only_redirect).expect("status-only redirects are runtime-valid");
 }
 
 #[test]
