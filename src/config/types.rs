@@ -3024,6 +3024,81 @@ impl GatewayConfig {
         }
     }
 
+    /// Validate that every effective `mtls_auth` instance can receive a verified
+    /// client certificate on the proxy transport where it will execute.
+    pub fn validate_mtls_auth_compatibility(&self) -> Result<(), Vec<String>> {
+        let errors = self.mtls_auth_compatibility_errors();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    fn mtls_auth_compatibility_errors(&self) -> Vec<String> {
+        let plugin_by_id: HashMap<&str, &PluginConfig> = self
+            .plugin_configs
+            .iter()
+            .map(|plugin| (plugin.id.as_str(), plugin))
+            .collect();
+        let global_mtls: Vec<&PluginConfig> = self
+            .plugin_configs
+            .iter()
+            .filter(|plugin| {
+                plugin.enabled
+                    && plugin.scope == PluginScope::Global
+                    && plugin.plugin_name == "mtls_auth"
+            })
+            .collect();
+        let mut errors = Vec::new();
+
+        for proxy in &self.proxies {
+            let scheme = proxy.effective_scheme();
+            if !scheme.is_stream() {
+                continue;
+            }
+
+            let local_mtls: Vec<&PluginConfig> = proxy
+                .plugins
+                .iter()
+                .filter_map(|association| {
+                    let plugin = plugin_by_id.get(association.plugin_config_id.as_str())?;
+                    (plugin.enabled
+                        && plugin.plugin_name == "mtls_auth"
+                        && matches!(plugin.scope, PluginScope::Proxy | PluginScope::ProxyGroup))
+                    .then_some(*plugin)
+                })
+                .collect();
+            let effective_plugins = if local_mtls.is_empty() {
+                global_mtls.as_slice()
+            } else {
+                local_mtls.as_slice()
+            };
+
+            for plugin in effective_plugins {
+                if !proxy.frontend_tls || proxy.passthrough {
+                    errors.push(format!(
+                        "Proxy '{}' cannot use mtls_auth PluginConfig '{}': stream mTLS authentication requires frontend_tls=true with TLS/DTLS termination (passthrough=false)",
+                        proxy.id, plugin.id
+                    ));
+                }
+                if scheme.is_udp()
+                    && plugin
+                        .config
+                        .get("allowed_ca_fingerprints_sha256")
+                        .is_some()
+                {
+                    errors.push(format!(
+                        "Proxy '{}' cannot use allowed_ca_fingerprints_sha256 from mtls_auth PluginConfig '{}': UDP/DTLS does not expose the verified certificate chain; use allowed_issuers with a pinned ca_certificate_pem",
+                        proxy.id, plugin.id
+                    ));
+                }
+            }
+        }
+
+        errors
+    }
+
     /// Validate host entries on all proxies.
     ///
     /// Each host must be either a valid lowercase hostname or a wildcard
@@ -3387,6 +3462,8 @@ impl GatewayConfig {
     /// Validate that consumer credentials are unique across all consumers.
     ///
     /// Checks keyauth API keys, basicauth usernames, and mTLS identities.
+    /// mTLS identities are exact by default and additionally ASCII-case-folded
+    /// when an enabled `san_dns` mTLS policy can consume the DNS lookup index.
     /// If two consumers share the same credential, the ConsumerIndex silently
     /// overwrites one, causing the wrong consumer to be authenticated.
     pub fn validate_unique_consumer_credentials(&self) -> Result<(), Vec<String>> {
@@ -3426,6 +3503,56 @@ impl GatewayConfig {
                 {
                     duplicates.push(format!(
                         "Duplicate mtls_auth identity '{}' in consumer '{}' (conflicts with consumer '{}')",
+                        identity, consumer.id, existing_id
+                    ));
+                }
+            }
+        }
+
+        if let Err(dns_duplicates) = self.validate_unique_mtls_dns_identities() {
+            duplicates.extend(dns_duplicates);
+        }
+
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            Err(duplicates)
+        }
+    }
+
+    /// Reject case-variant identities before publishing the lower-cased DNS
+    /// lookup index. Exact-match mTLS policies remain case-sensitive.
+    pub fn validate_unique_mtls_dns_identities(&self) -> Result<(), Vec<String>> {
+        let dns_identity_matching_enabled = self.plugin_configs.iter().any(|plugin| {
+            plugin.enabled
+                && plugin.plugin_name == "mtls_auth"
+                && plugin
+                    .config
+                    .get("cert_field")
+                    .and_then(|value| value.as_str())
+                    == Some("san_dns")
+        });
+        if !dns_identity_matching_enabled {
+            return Ok(());
+        }
+
+        let mut seen_exact: HashMap<&str, &str> = HashMap::new();
+        let mut seen_dns: HashMap<String, &str> = HashMap::new();
+        let mut duplicates = Vec::new();
+        for consumer in &self.consumers {
+            for entry in consumer.credential_entries("mtls_auth") {
+                let Some(identity) = entry.get("identity").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                if seen_exact.insert(identity, &consumer.id).is_some() {
+                    // The general credential validator reports exact duplicates.
+                    continue;
+                }
+                if let Some(existing_id) =
+                    seen_dns.insert(identity.to_ascii_lowercase(), &consumer.id)
+                {
+                    duplicates.push(format!(
+                        "Duplicate mtls_auth DNS identity '{}' (ASCII case-insensitive) in consumer '{}' (conflicts with consumer '{}')",
                         identity, consumer.id, existing_id
                     ));
                 }
@@ -3818,6 +3945,8 @@ impl GatewayConfig {
                 }
             }
         }
+
+        errors.extend(self.mtls_auth_compatibility_errors());
 
         if errors.is_empty() {
             Ok(())
@@ -5239,6 +5368,23 @@ impl Consumer {
         {
             self.custom_id = None;
         }
+        if let Some(entries) = self
+            .credentials
+            .get_mut("mtls_auth")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for entry in entries {
+                if let Some(object) = entry.as_object_mut()
+                    && let Some(identity) = object
+                        .get("identity")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .map(str::to_owned)
+                {
+                    object.insert("identity".to_string(), serde_json::Value::String(identity));
+                }
+            }
+        }
     }
 
     /// Validate all fields of a consumer for correctness and safe lengths.
@@ -5332,6 +5478,23 @@ impl Consumer {
                 };
             for (idx, obj) in objects.iter().enumerate() {
                 let prefix = format!("credentials.{}[{}]", cred_type, idx);
+                if cred_type == "mtls_auth" {
+                    if obj.len() != 1 || !obj.contains_key("identity") {
+                        errors.push(format!(
+                            "{} must contain exactly one field named 'identity'",
+                            prefix
+                        ));
+                    }
+                    match obj.get("identity") {
+                        Some(serde_json::Value::String(identity))
+                            if !identity.trim().is_empty() => {}
+                        Some(serde_json::Value::String(_)) => {
+                            errors.push(format!("{}.identity must not be empty", prefix));
+                        }
+                        Some(_) => errors.push(format!("{}.identity must be a string", prefix)),
+                        None => {}
+                    }
+                }
                 for (key, val) in *obj {
                     if let Some(s) = val.as_str() {
                         if s.len() > MAX_CREDENTIAL_VALUE_LENGTH {

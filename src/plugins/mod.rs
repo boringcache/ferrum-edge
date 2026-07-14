@@ -552,6 +552,11 @@ pub struct RequestContext {
     /// Contains all certificates after the peer cert (index 1+) sent during the handshake.
     /// Used by the mtls_auth plugin for per-proxy CA fingerprint verification.
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+    /// Connection-local cache of `mtls_auth` certificate-derived decisions.
+    /// Shared by all HTTP/2 or HTTP/3 requests on the same TLS connection so
+    /// X.509 parsing and issuer-chain cryptography run once per plugin policy.
+    #[doc(hidden)]
+    pub mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     /// Peer SPIFFE identity, populated by the `spiffe_identity` plugin when the
     /// client certificate carries a `spiffe://` URI SAN. `None` for non-mesh
     /// deployments and for clients that present a non-SPIFFE certificate.
@@ -798,6 +803,7 @@ impl RequestContext {
             mesh_request_auth_claims: HashMap::new(),
             tls_client_cert_der: None,
             tls_client_cert_chain_der: None,
+            mtls_auth_connection_cache: None,
             peer_spiffe_id: None,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -894,6 +900,7 @@ impl RequestContext {
             mesh_request_auth_claims: self.mesh_request_auth_claims.clone(),
             tls_client_cert_der: self.tls_client_cert_der.clone(),
             tls_client_cert_chain_der: self.tls_client_cert_chain_der.clone(),
+            mtls_auth_connection_cache: self.mtls_auth_connection_cache.clone(),
             peer_spiffe_id: self.peer_spiffe_id.clone(),
             plugin_http_call_ns: Arc::clone(&self.plugin_http_call_ns),
             reject_hook_execution_ns: Arc::clone(&self.reject_hook_execution_ns),

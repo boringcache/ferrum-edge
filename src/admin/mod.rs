@@ -2778,6 +2778,24 @@ async fn ensure_credential_unique(
     }
 }
 
+async fn ensure_mtls_consumer_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> Result<(), Box<Response<Full<Bytes>>>> {
+    match crud::mtls_consumer_candidate_errors(db, namespace, consumer).await {
+        Ok(errors) if errors.is_empty() => Ok(()),
+        Ok(errors) => Err(Box::new(json_response(
+            StatusCode::CONFLICT,
+            &json!({"error": errors.join("; ")}),
+        ))),
+        Err(error) => Err(Box::new(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &db_error_response(&error),
+        ))),
+    }
+}
+
 async fn persist_consumer_update(
     db: &dyn DatabaseBackend,
     mut consumer: Consumer,
@@ -3341,12 +3359,6 @@ async fn handle_update_credentials(
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut cred_value) {
         return Ok(*resp);
     }
-    if let Err(resp) =
-        ensure_credential_unique(db.as_ref(), namespace, consumer_id, cred_type, &cred_value).await
-    {
-        return Ok(*resp);
-    }
-
     let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
         Ok(consumer) => consumer,
         Err(resp) => return Ok(*resp),
@@ -3355,9 +3367,27 @@ async fn handle_update_credentials(
     consumer
         .credentials
         .insert(cred_type.to_string(), cred_value);
+    consumer.normalize_fields();
 
     if let Err(field_errors) = consumer.validate_fields() {
         return Ok(invalid_credential_fields_response(&field_errors));
+    }
+    if let Some(normalized_credential) = consumer.credentials.get(cred_type)
+        && let Err(resp) = ensure_credential_unique(
+            db.as_ref(),
+            namespace,
+            consumer_id,
+            cred_type,
+            normalized_credential,
+        )
+        .await
+    {
+        return Ok(*resp);
+    }
+    if cred_type == "mtls_auth"
+        && let Err(resp) = ensure_mtls_consumer_candidate(db.as_ref(), namespace, &consumer).await
+    {
+        return Ok(*resp);
     }
 
     let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
@@ -3470,19 +3500,6 @@ async fn handle_append_credential(
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut new_cred) {
         return Ok(*resp);
     }
-    let uniqueness_probe = Value::Array(vec![new_cred.clone()]);
-    if let Err(resp) = ensure_credential_unique(
-        db.as_ref(),
-        namespace,
-        consumer_id,
-        cred_type,
-        &uniqueness_probe,
-    )
-    .await
-    {
-        return Ok(*resp);
-    }
-
     let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
         Ok(consumer) => consumer,
         Err(resp) => return Ok(*resp),
@@ -3512,9 +3529,27 @@ async fn handle_append_credential(
     consumer
         .credentials
         .insert(cred_type.to_string(), new_value);
+    consumer.normalize_fields();
 
     if let Err(field_errors) = consumer.validate_fields() {
         return Ok(invalid_credential_fields_response(&field_errors));
+    }
+    if let Some(normalized_credential) = consumer.credentials.get(cred_type)
+        && let Err(resp) = ensure_credential_unique(
+            db.as_ref(),
+            namespace,
+            consumer_id,
+            cred_type,
+            normalized_credential,
+        )
+        .await
+    {
+        return Ok(*resp);
+    }
+    if cred_type == "mtls_auth"
+        && let Err(resp) = ensure_mtls_consumer_candidate(db.as_ref(), namespace, &consumer).await
+    {
+        return Ok(*resp);
     }
 
     let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
@@ -4080,6 +4115,54 @@ async fn handle_batch_create(
             .and_then(|config| config.mesh.clone()),
         ..Default::default()
     };
+
+    match db.load_namespace_snapshot(namespace).await {
+        Ok(mut candidate_config) => {
+            for consumer in &batch.consumers {
+                if let Some(existing) = candidate_config
+                    .consumers
+                    .iter_mut()
+                    .find(|item| item.id == consumer.id)
+                {
+                    *existing = consumer.clone();
+                } else {
+                    candidate_config.consumers.push(consumer.clone());
+                }
+            }
+            for proxy in &batch.proxies {
+                if let Some(existing) = candidate_config
+                    .proxies
+                    .iter_mut()
+                    .find(|item| item.id == proxy.id)
+                {
+                    *existing = proxy.clone();
+                } else {
+                    candidate_config.proxies.push(proxy.clone());
+                }
+            }
+            for plugin in &batch.plugin_configs {
+                if let Some(existing) = candidate_config
+                    .plugin_configs
+                    .iter_mut()
+                    .find(|item| item.id == plugin.id)
+                {
+                    *existing = plugin.clone();
+                } else {
+                    candidate_config.plugin_configs.push(plugin.clone());
+                }
+            }
+            if let Err(errors) = candidate_config.validate_mtls_auth_compatibility() {
+                validation_errors.extend(errors);
+            }
+            if let Err(errors) = candidate_config.validate_unique_consumer_credentials() {
+                validation_errors.extend(errors);
+            }
+        }
+        Err(error) => validation_errors.push(format!(
+            "Failed to load namespace config for mTLS candidate validation: {}",
+            error
+        )),
+    }
 
     match ValidationPipeline::new(&mut batch_config)
         .validate_unique_resource_ids(ValidationAction::Collect)

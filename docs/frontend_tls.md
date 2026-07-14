@@ -458,47 +458,70 @@ For reqwest-based backend paths (HTTP/1.1, HTTP/2 via reqwest, HTTP/3 frontend-t
 
 ### Per-Proxy CA Filtering with `mtls_auth`
 
-The global `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` applies to all connections on the HTTPS listener — the TLS handshake happens before routing, so the gateway cannot know which proxy a request targets until after the handshake completes.
+The global `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` applies to all connections on the HTTPS listener — the TLS handshake happens before routing, so the gateway cannot know which proxy a request targets until after the handshake completes. The same source controls terminated TCP+TLS; UDP+DTLS uses the separate `FERRUM_DTLS_CLIENT_CA_CERT_PATH` / `_SOURCE`. When the client-CA source for a frontend is configured, Ferrum requires every client to present a certificate that validates to it. Without that source, the frontend does not request a client certificate, so an `mtls_auth` plugin will not have a certificate to authenticate.
 
 For per-proxy CA restrictions, use the `mtls_auth` plugin's `allowed_issuers` and `allowed_ca_fingerprints_sha256` options. This gives you a two-layer approach:
 
 1. **TLS layer (global)** — accepts any client cert signed by any CA in the truststore
-2. **Plugin layer (per-proxy)** — verifies the cert's issuer DN and/or chain CA fingerprints match the proxy's policy
+2. **Plugin layer (per-proxy)** — verifies a cryptographic CA pin and/or a verified chain CA fingerprint matches the proxy's policy
 
 ```yaml
-# Proxy A: only accepts certs from Internal Services CA
-- id: "proxy-a"
-  listen_path: "/internal/"
-  auth_mode: single
-  plugins:
-    - plugin_config_id: "mtls-internal-only"
-
-# Plugin config: mtls-internal-only
-- id: "mtls-internal-only"
-  name: "mtls_auth"
-  config:
-    cert_field: "subject_cn"
-    allowed_issuers:
-      - cn: "Internal Services CA"
-
-# Proxy B: accepts certs from either Internal or Partner CAs
-- id: "proxy-b"
-  listen_path: "/partner/"
-  auth_mode: single
-  plugins:
-    - plugin_config_id: "mtls-internal-and-partner"
-
-# Plugin config: mtls-internal-and-partner
-- id: "mtls-internal-and-partner"
-  name: "mtls_auth"
-  config:
-    cert_field: "subject_cn"
-    allowed_issuers:
-      - cn: "Internal Services CA"
-      - cn: "Partner Portal CA"
+version: "1"
+proxies:
+  - id: "proxy-a"
+    listen_path: "/internal/"
+    backend_scheme: "https"
+    backend_host: "internal-api.example.com"
+    backend_port: 443
+    auth_mode: "single"
+    plugins:
+      - plugin_config_id: "mtls-internal-only"
+  - id: "proxy-b"
+    listen_path: "/partner/"
+    backend_scheme: "https"
+    backend_host: "partner-api.example.com"
+    backend_port: 443
+    auth_mode: "single"
+    plugins:
+      - plugin_config_id: "mtls-partner-only"
+consumers:
+  - id: "internal-client"
+    username: "internal-client"
+    credentials:
+      mtls_auth:
+        - identity: "internal-client.example.com"
+  - id: "partner-client"
+    username: "partner-client"
+    credentials:
+      mtls_auth:
+        - identity: "partner-client.example.com"
+plugin_configs:
+  - id: "mtls-internal-only"
+    plugin_name: "mtls_auth"
+    scope: "proxy"
+    proxy_id: "proxy-a"
+    enabled: true
+    config:
+      cert_field: "subject_cn"
+      # Replace with the SHA-256 fingerprint of a verified intermediate/CA
+      # certificate that clients present in their TLS chain.
+      allowed_ca_fingerprints_sha256:
+        - "0000000000000000000000000000000000000000000000000000000000000000"
+  - id: "mtls-partner-only"
+    plugin_name: "mtls_auth"
+    scope: "proxy"
+    proxy_id: "proxy-b"
+    enabled: true
+    config:
+      cert_field: "subject_cn"
+      allowed_ca_fingerprints_sha256:
+        - "1111111111111111111111111111111111111111111111111111111111111111"
+upstreams: []
 ```
 
-This approach works with `auth_mode: multi` — if the mTLS check fails, the gateway tries the next auth plugin (e.g., JWT, API key).
+For an issuer pin that also works with UDP+DTLS, use an `allowed_issuers` entry with descriptive `cn`/`o`/`ou` fields and a `ca_certificate_pem` containing exactly one CA certificate. Ferrum verifies the leaf signature path to that pinned key; issuer DN text alone is never trusted. Because the DTLS frontend exposes only the leaf to plugins, this must be the immediate issuing CA for UDP+DTLS. HTTP/TCP TLS frontends can pin a higher-level root when the client presents the needed intermediate chain.
+
+`auth_mode: multi` does not provide a fallback for TLS handshake failures. A missing or untrusted client certificate is rejected before routing when the frontend client-CA bundle is configured. Multi-auth fallback applies only after a successful certificate-bearing handshake reaches the plugin pipeline.
 
 ## Troubleshooting
 

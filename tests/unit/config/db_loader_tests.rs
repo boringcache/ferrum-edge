@@ -1,12 +1,14 @@
 use ferrum_edge::_test_support::{
     DbPoolConfig, db_append_connect_timeout, db_code_is_transient, db_diff_removed,
     db_mongo_error_is_transient, db_mysql_error_number_is_transient,
-    db_wrap_mysql_isolation_read_error, parse_auth_mode, parse_scheme, statement_timeout_sql,
+    db_wrap_mysql_isolation_read_error, is_config_validation_rejection, parse_auth_mode,
+    parse_scheme, statement_timeout_sql,
 };
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, Upstream, UpstreamTarget,
+    AuthMode, BackendScheme, Consumer, LoadBalancerAlgorithm, PluginConfig, PluginScope, Upstream,
+    UpstreamTarget,
 };
 use serde_json::json;
 use sqlx::error::{DatabaseError, ErrorKind};
@@ -399,6 +401,153 @@ async fn consumer_credential_index_enforces_keyauth_uniqueness() {
             || msg.contains("UNIQUE")
             || msg.contains("constraint"),
         "unexpected duplicate-key error: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn consumer_credential_index_preserves_exact_mtls_identity_semantics() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("consumer_mtls_identity_index.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{ "identity": "API.Example.COM" }]),
+    );
+    store.create_consumer(&c1).await.unwrap();
+
+    assert!(
+        store
+            .check_mtls_identity_unique("ferrum", "api.example.com", None)
+            .await
+            .unwrap()
+    );
+
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{ "identity": "api.example.com" }]),
+    );
+    store
+        .create_consumer(&c2)
+        .await
+        .expect("case-variant exact identities must coexist in the credential index");
+    let loaded = store.load_full_config("ferrum").await.unwrap();
+    assert_eq!(loaded.consumers.len(), 2);
+    assert_eq!(loaded.consumers[0].username, "alice");
+
+    let now = chrono::Utc::now();
+    store
+        .create_plugin_config(&PluginConfig {
+            id: "dns-mtls".to_string(),
+            plugin_name: "mtls_auth".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({"cert_field": "san_dns"}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    let error = store
+        .load_full_config("ferrum")
+        .await
+        .expect_err("DNS identity collisions must reject the runtime snapshot");
+    assert!(is_config_validation_rejection(&error));
+
+    let mut c3 = make_consumer("c3", "carol");
+    c3.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{ "identity": "API.Example.COM" }]),
+    );
+    let error = store
+        .create_consumer(&c3)
+        .await
+        .expect_err("an exact duplicate mTLS identity must violate the credential index");
+    let message = error.to_string();
+    assert!(
+        message.contains("consumer_credential_index")
+            || message.contains("UNIQUE")
+            || message.contains("constraint"),
+        "unexpected exact duplicate-identity error: {message}"
+    );
+}
+
+#[tokio::test]
+async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_whitespace_index_rows() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir
+        .path()
+        .join("consumer_legacy_mtls_identity_index.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    let mut consumer = make_consumer("legacy", "alice");
+    consumer.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{ "identity": " API.Example.COM " }]),
+    );
+    store.create_consumer(&consumer).await.unwrap();
+
+    // Simulate an index row written before surrounding whitespace was
+    // canonicalized. A trimmed exact lookup misses this row, so admission must
+    // inspect the authoritative Consumer record instead of treating it as unique.
+    sqlx::query(
+        "UPDATE consumer_credential_index SET credential_hash = ? \
+         WHERE namespace = ? AND consumer_id = ? AND credential_type = ?",
+    )
+    .bind("legacy-case-sensitive-hash")
+    .bind("ferrum")
+    .bind("legacy")
+    .bind("mtls_auth")
+    .execute(&store.pool())
+    .await
+    .unwrap();
+
+    assert!(
+        !store
+            .check_mtls_identity_unique("ferrum", "API.Example.COM", None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .check_mtls_identity_unique("ferrum", "api.example.com", None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .check_mtls_identity_unique("ferrum", "API.Example.COM", Some("legacy"))
+            .await
+            .unwrap()
+    );
+
+    sqlx::query("UPDATE consumers SET credentials = ? WHERE namespace = ? AND id = ?")
+        .bind("not-json")
+        .bind("ferrum")
+        .bind("legacy")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+    let error = store
+        .check_mtls_identity_unique("ferrum", "other.example.com", None)
+        .await
+        .expect_err("malformed stored credentials must fail uniqueness closed");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to parse credentials JSON")
     );
 }
 

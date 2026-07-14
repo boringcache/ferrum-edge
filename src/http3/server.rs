@@ -739,6 +739,9 @@ async fn handle_h3_connection(
         .as_ref()
         .filter(|certs| certs.len() > 1)
         .map(|certs| Arc::new(certs[1..].to_vec()));
+    let mtls_auth_connection_cache = client_cert_der
+        .as_ref()
+        .map(|_| Arc::new(crate::plugins::mtls_auth::MtlsAuthConnectionCache::new()));
     let frontend_sni_hostname = connection
         .handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
@@ -787,6 +790,7 @@ async fn handle_h3_connection(
                 let state = Arc::clone(&state);
                 let cert = client_cert_der.clone();
                 let chain = client_cert_chain_der.clone();
+                let mtls_auth_connection_cache = mtls_auth_connection_cache.clone();
                 let frontend_sni_hostname = frontend_sni_hostname.clone();
                 let socket_ip = Arc::clone(&socket_ip);
                 // Snapshot the early-data flag NOW — before spawning the task.
@@ -806,6 +810,7 @@ async fn handle_h3_connection(
                                 frontend_sni_hostname,
                                 cert,
                                 chain,
+                                mtls_auth_connection_cache,
                                 is_early_data,
                             )
                             .await
@@ -845,6 +850,7 @@ async fn handle_h3_request(
     frontend_sni_hostname: Option<String>,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+    mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     is_early_data: bool,
 ) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
@@ -900,6 +906,7 @@ async fn handle_h3_request(
     ctx.frontend_sni_hostname = frontend_sni_hostname;
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
+    ctx.mtls_auth_connection_cache = mtls_auth_connection_cache;
 
     // Validate header sizes without materializing headers into owned Strings.
     // The raw HeaderMap is stored on ctx for deferred materialization.

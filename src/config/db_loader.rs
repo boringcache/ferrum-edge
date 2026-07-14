@@ -147,6 +147,10 @@ fn credential_value_hash(value: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn canonical_mtls_identity(identity: &str) -> &str {
+    identity.trim()
+}
+
 fn consumer_credential_index_entries(consumer: &Consumer) -> Vec<ConsumerCredentialIndexEntry> {
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
@@ -167,7 +171,7 @@ fn consumer_credential_index_entries(consumer: &Consumer) -> Vec<ConsumerCredent
         if let Some(identity) = entry.get("identity").and_then(|value| value.as_str()) {
             let indexed = ConsumerCredentialIndexEntry {
                 credential_type: "mtls_auth",
-                credential_hash: credential_value_hash(identity),
+                credential_hash: credential_value_hash(canonical_mtls_identity(identity)),
             };
             if seen.insert(indexed.clone()) {
                 entries.push(indexed);
@@ -3874,7 +3878,8 @@ impl DatabaseStore {
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let credential_hash = credential_value_hash(mtls_identity);
+        let canonical_identity = canonical_mtls_identity(mtls_identity);
+        let credential_hash = credential_value_hash(canonical_identity);
         let row: Option<AnyRow> =
             sqlx::query(&self.q("SELECT consumer_id FROM consumer_credential_index \
                  WHERE namespace = ? AND credential_type = ? AND credential_hash = ?"))
@@ -3883,15 +3888,82 @@ impl DatabaseStore {
             .bind(credential_hash)
             .fetch_optional(&self.pool())
             .await?;
-        let is_unique = match row {
-            Some(row) => {
-                let consumer_id: String = row.try_get("consumer_id")?;
-                exclude_consumer_id == Some(consumer_id.as_str())
+        if let Some(row) = row {
+            let consumer_id: String = row.try_get("consumer_id")?;
+            if exclude_consumer_id != Some(consumer_id.as_str()) {
+                self.check_slow_query("check_mtls_identity_unique", start);
+                return Ok(false);
             }
-            None => true,
-        };
+        }
+
+        // Rows written before surrounding whitespace was normalized have a hash
+        // that a trimmed probe cannot find. Fall back to the authoritative
+        // Consumer rows before admitting a write. Matching remains exact here:
+        // only san_dns plugin candidates apply ASCII case-folded uniqueness.
+        // The path is admin-only and paginated; malformed stored credentials
+        // fail closed as a database error.
+        let is_unique = self
+            .stored_mtls_identity_is_unique(namespace, canonical_identity, exclude_consumer_id)
+            .await?;
         self.check_slow_query("check_mtls_identity_unique", start);
         Ok(is_unique)
+    }
+
+    async fn stored_mtls_identity_is_unique(
+        &self,
+        namespace: &str,
+        canonical_identity: &str,
+        exclude_consumer_id: Option<&str>,
+    ) -> Result<bool, anyhow::Error> {
+        let mut last_id: Option<String> = None;
+        loop {
+            let sql = if last_id.is_some() {
+                "SELECT id, credentials FROM consumers WHERE namespace = ? AND id > ? ORDER BY id LIMIT ?"
+            } else {
+                "SELECT id, credentials FROM consumers WHERE namespace = ? ORDER BY id LIMIT ?"
+            };
+            let query_sql = self.q(sql);
+            let mut query = sqlx::query(&query_sql).bind(namespace);
+            if let Some(last_id) = last_id.as_deref() {
+                query = query.bind(last_id);
+            }
+            let rows: Vec<AnyRow> = query
+                .bind(self.full_load_page_size)
+                .fetch_all(&self.pool())
+                .await?;
+            let fetched = rows.len();
+            for row in rows {
+                let consumer_id: String = row.try_get("id")?;
+                let credentials_json: String = row.try_get("credentials")?;
+                let credentials: HashMap<String, serde_json::Value> =
+                    serde_json::from_str(&credentials_json).map_err(|error| {
+                        anyhow::anyhow!(
+                            "Consumer {}: failed to parse credentials JSON while checking mTLS uniqueness: {}",
+                            consumer_id,
+                            error
+                        )
+                    })?;
+                let excluded = exclude_consumer_id == Some(consumer_id.as_str());
+                if !excluded
+                    && credentials.get("mtls_auth").is_some_and(|credential| {
+                        Consumer::credential_entries_from_value(credential)
+                            .iter()
+                            .any(|entry| {
+                                entry
+                                    .get("identity")
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|identity| identity.trim() == canonical_identity)
+                            })
+                    })
+                {
+                    return Ok(false);
+                }
+                last_id = Some(consumer_id);
+            }
+            if (fetched as i64) < self.full_load_page_size {
+                return Ok(true);
+            }
+        }
     }
 
     /// Check if a listen_port is unique across all stream proxies.

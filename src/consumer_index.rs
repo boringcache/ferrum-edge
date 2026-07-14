@@ -15,6 +15,8 @@ pub(crate) struct ConsumerIndexInner {
     identity_index: HashMap<String, Arc<Consumer>>,
     /// mTLS identity index: maps `mtls_auth.identity` -> Consumer for O(1) cert-based auth.
     mtls_index: HashMap<String, Arc<Consumer>>,
+    /// DNS SAN identities use RFC case-insensitive matching. Keys are normalized at reload time.
+    mtls_dns_index: HashMap<String, Arc<Consumer>>,
     /// Full consumer list for plugins that need iteration (jwt_auth, jwks_auth).
     /// Wrapped in `Arc` so `consumers()` can return a cheap clone without O(n) Vec cloning.
     all_consumers: Arc<Vec<Arc<Consumer>>>,
@@ -43,6 +45,7 @@ struct IndexMaps {
     basic: HashMap<String, Arc<Consumer>>,
     identity: HashMap<String, Arc<Consumer>>,
     mtls: HashMap<String, Arc<Consumer>>,
+    mtls_dns: HashMap<String, Arc<Consumer>>,
     all: Vec<Arc<Consumer>>,
     jwt_count: usize,
     hmac_count: usize,
@@ -128,6 +131,11 @@ impl ConsumerIndex {
         self.with_inner(|inner| inner.find_by_mtls_identity(identity))
     }
 
+    /// O(1) lookup by an already-lowercased DNS SAN identity. No allocation.
+    pub fn find_by_mtls_dns_identity(&self, identity: &str) -> Option<Arc<Consumer>> {
+        self.with_inner(|inner| inner.find_by_mtls_dns_identity(identity))
+    }
+
     /// Returns the full consumer list for custom plugins that need to iterate.
     ///
     /// Returns `Arc<Vec<…>>` — cheap pointer clone, no O(n) Vec copy.
@@ -154,6 +162,7 @@ impl ConsumerIndex {
         let mut basic = current.basic_index.clone();
         let mut identity = current.identity_index.clone();
         let mut mtls = current.mtls_index.clone();
+        let mut mtls_dns = current.mtls_dns_index.clone();
         let mut all: Vec<Arc<Consumer>> = current.all_consumers.as_ref().clone();
 
         // Collect all IDs that need removal (deleted + modified consumers being re-inserted)
@@ -176,6 +185,7 @@ impl ConsumerIndex {
             let mut old_basic_keys: Vec<String> = Vec::new();
             let mut old_identity_keys: Vec<String> = Vec::new();
             let mut old_mtls_keys: Vec<String> = Vec::new();
+            let mut old_mtls_dns_keys: Vec<String> = Vec::new();
 
             for consumer in all.iter() {
                 if !ids_to_remove.contains(consumer.id.as_str()) {
@@ -198,6 +208,7 @@ impl ConsumerIndex {
                 for mtls_creds in consumer.credential_entries("mtls_auth") {
                     if let Some(id) = mtls_creds.get("identity").and_then(|s| s.as_str()) {
                         old_mtls_keys.push(id.to_string());
+                        old_mtls_dns_keys.push(id.to_ascii_lowercase());
                     }
                 }
                 // Collect old identity keys (username, id, custom_id)
@@ -238,6 +249,13 @@ impl ConsumerIndex {
                     mtls.remove(key);
                 }
             }
+            for key in &old_mtls_dns_keys {
+                if let Some(existing) = mtls_dns.get(key)
+                    && ids_to_remove.contains(existing.id.as_str())
+                {
+                    mtls_dns.remove(key);
+                }
+            }
 
             // Remove from all-consumers list (single pass with HashSet lookup)
             all.retain(|c| !ids_to_remove.contains(c.id.as_str()));
@@ -248,10 +266,12 @@ impl ConsumerIndex {
                 &mut basic,
                 &mut identity,
                 &mut mtls,
+                &mut mtls_dns,
                 &old_keyauth_keys,
                 &old_basic_keys,
                 &old_identity_keys,
                 &old_mtls_keys,
+                &old_mtls_dns_keys,
             );
         }
 
@@ -280,6 +300,7 @@ impl ConsumerIndex {
             for mtls_creds in consumer.credential_entries("mtls_auth") {
                 if let Some(id) = mtls_creds.get("identity").and_then(|s| s.as_str()) {
                     mtls.insert(id.to_string(), Arc::clone(&arc_consumer));
+                    mtls_dns.insert(id.to_ascii_lowercase(), Arc::clone(&arc_consumer));
                 }
             }
             identity.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
@@ -299,6 +320,7 @@ impl ConsumerIndex {
             basic_index: basic,
             identity_index: identity,
             mtls_index: mtls,
+            mtls_dns_index: mtls_dns,
             all_consumers: Arc::new(all),
             jwt_credential_count: jwt_count,
             hmac_credential_count: hmac_count,
@@ -335,6 +357,7 @@ impl ConsumerIndex {
         let mut keyauth = HashMap::with_capacity(consumers.len());
         let mut basic = HashMap::with_capacity(consumers.len());
         let mut mtls = HashMap::with_capacity(consumers.len());
+        let mut mtls_dns = HashMap::with_capacity(consumers.len());
         // identity has up to 3 entries per consumer (username, id, custom_id)
         let mut identity = HashMap::with_capacity(consumers.len() * 3);
         let mut all = Vec::with_capacity(consumers.len());
@@ -383,6 +406,16 @@ impl ConsumerIndex {
                             id, consumer.id, existing.id
                         );
                     }
+                    let normalized = id.to_ascii_lowercase();
+                    let prev = mtls_dns.insert(normalized, Arc::clone(&arc_consumer));
+                    if let Some(existing) = prev
+                        && existing.id != consumer.id
+                    {
+                        warn!(
+                            "Credential collision: case-insensitive mtls_auth DNS identity '{}' for consumer '{}' overwrites consumer '{}'",
+                            id, consumer.id, existing.id
+                        );
+                    }
                 }
             }
 
@@ -415,6 +448,7 @@ impl ConsumerIndex {
             basic,
             identity,
             mtls,
+            mtls_dns,
             all,
             jwt_count,
             hmac_count,
@@ -428,20 +462,24 @@ impl ConsumerIndex {
         basic: &mut HashMap<String, Arc<Consumer>>,
         identity: &mut HashMap<String, Arc<Consumer>>,
         mtls: &mut HashMap<String, Arc<Consumer>>,
+        mtls_dns: &mut HashMap<String, Arc<Consumer>>,
         keyauth_keys: &[String],
         basic_keys: &[String],
         identity_keys: &[String],
         mtls_keys: &[String],
+        mtls_dns_keys: &[String],
     ) {
         let keyauth_keys: HashSet<&str> = keyauth_keys.iter().map(String::as_str).collect();
         let basic_keys: HashSet<&str> = basic_keys.iter().map(String::as_str).collect();
         let identity_keys: HashSet<&str> = identity_keys.iter().map(String::as_str).collect();
         let mtls_keys: HashSet<&str> = mtls_keys.iter().map(String::as_str).collect();
+        let mtls_dns_keys: HashSet<&str> = mtls_dns_keys.iter().map(String::as_str).collect();
 
         if keyauth_keys.is_empty()
             && basic_keys.is_empty()
             && identity_keys.is_empty()
             && mtls_keys.is_empty()
+            && mtls_dns_keys.is_empty()
         {
             return;
         }
@@ -474,10 +512,14 @@ impl ConsumerIndex {
             }
 
             for mtls_creds in consumer.credential_entries("mtls_auth") {
-                if let Some(id) = mtls_creds.get("identity").and_then(|s| s.as_str())
-                    && mtls_keys.contains(id)
-                {
-                    mtls.insert(id.to_string(), Arc::clone(consumer));
+                if let Some(id) = mtls_creds.get("identity").and_then(|s| s.as_str()) {
+                    if mtls_keys.contains(id) {
+                        mtls.insert(id.to_string(), Arc::clone(consumer));
+                    }
+                    let normalized = id.to_ascii_lowercase();
+                    if mtls_dns_keys.contains(normalized.as_str()) {
+                        mtls_dns.insert(normalized, Arc::clone(consumer));
+                    }
                 }
             }
         }
@@ -491,6 +533,7 @@ impl ConsumerIndexInner {
             basic_index: maps.basic,
             identity_index: maps.identity,
             mtls_index: maps.mtls,
+            mtls_dns_index: maps.mtls_dns,
             all_consumers: Arc::new(maps.all),
             jwt_credential_count: maps.jwt_count,
             hmac_credential_count: maps.hmac_count,
@@ -515,6 +558,11 @@ impl ConsumerIndexInner {
     /// O(1) lookup by mTLS identity (for mtls_auth plugin). No allocation.
     pub fn find_by_mtls_identity(&self, identity: &str) -> Option<Arc<Consumer>> {
         self.mtls_index.get(identity).cloned()
+    }
+
+    /// O(1) lookup by an already-lowercased DNS SAN identity. No allocation.
+    pub fn find_by_mtls_dns_identity(&self, identity: &str) -> Option<Arc<Consumer>> {
+        self.mtls_dns_index.get(identity).cloned()
     }
 
     pub fn consumers(&self) -> Arc<Vec<Arc<Consumer>>> {

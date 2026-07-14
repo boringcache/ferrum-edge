@@ -9895,6 +9895,10 @@ mod inner {
                     && source.contains(".unique(true)"),
                 "MongoDB must enforce keyauth and mTLS credential uniqueness with indexes"
             );
+            assert!(
+                !source.contains("drop_index(\"namespace_1_credentials.mtls_auth.identity_1\")"),
+                "mTLS index setup must never drop the exact-match uniqueness backstop"
+            );
         }
 
         /// Regression guard for the MongoDB unique+sparse index on

@@ -59,6 +59,75 @@ pub(crate) enum ValidationError {
     Message(String),
 }
 
+async fn validate_mtls_auth_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxy: Option<&Proxy>,
+    plugin: Option<&PluginConfig>,
+    removed_plugin_id: Option<&str>,
+) -> Result<(), AfterValidateError> {
+    let mut config = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    if let Some(proxy) = proxy {
+        if let Some(existing) = config.proxies.iter_mut().find(|item| item.id == proxy.id) {
+            *existing = proxy.clone();
+        } else {
+            config.proxies.push(proxy.clone());
+        }
+    }
+    if let Some(plugin) = plugin {
+        if let Some(existing) = config
+            .plugin_configs
+            .iter_mut()
+            .find(|item| item.id == plugin.id)
+        {
+            *existing = plugin.clone();
+        } else {
+            config.plugin_configs.push(plugin.clone());
+        }
+    }
+    if let Some(removed_plugin_id) = removed_plugin_id {
+        config
+            .plugin_configs
+            .retain(|plugin| plugin.id != removed_plugin_id);
+    }
+    let mut errors = config
+        .validate_mtls_auth_compatibility()
+        .err()
+        .unwrap_or_default();
+    if let Err(credential_errors) = config.validate_unique_consumer_credentials() {
+        errors.extend(credential_errors);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AfterValidateError::BadRequest(errors))
+    }
+}
+
+pub(crate) async fn mtls_consumer_candidate_errors(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> DbResult<Vec<String>> {
+    let mut config = db.load_namespace_snapshot(namespace).await?;
+    if let Some(existing) = config
+        .consumers
+        .iter_mut()
+        .find(|item| item.id == consumer.id)
+    {
+        *existing = consumer.clone();
+    } else {
+        config.consumers.push(consumer.clone());
+    }
+    Ok(config
+        .validate_unique_consumer_credentials()
+        .err()
+        .unwrap_or_default())
+}
+
 impl ValidationError {
     fn into_messages(self) -> Vec<String> {
         match self {
@@ -202,6 +271,16 @@ pub(crate) trait AdminResource:
         _namespace: &str,
         _resource: &Self,
         _existing: Option<&Self>,
+        _ctx: &ValidationCtx<'_>,
+    ) -> Result<(), AfterValidateError> {
+        Ok(())
+    }
+
+    async fn before_delete(
+        _db: &dyn DatabaseBackend,
+        _state: &AdminState,
+        _namespace: &str,
+        _existing: &Self,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
         Ok(())
@@ -375,6 +454,11 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         }
         Ok(Some(resource)) => resource,
     };
+
+    let validation_ctx = ValidationCtx::from_state(state);
+    if let Err(error) = R::before_delete(db, state, namespace, &existing, &validation_ctx).await {
+        return Ok(map_after_validate_error::<R>(error));
+    }
 
     match R::db_delete(db, namespace, id).await {
         Ok(true) => {
@@ -1578,7 +1662,7 @@ impl AdminResource for PluginConfig {
         state: &AdminState,
         namespace: &str,
         resource: &Self,
-        _existing: Option<&Self>,
+        existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
     ) -> Result<(), AfterValidateError> {
         let known_plugins = crate::plugins::available_plugins();
@@ -1640,6 +1724,25 @@ impl AdminResource for PluginConfig {
             return Err(AfterValidateError::BadRequest(retry_errors));
         }
 
+        if resource.plugin_name == "mtls_auth"
+            || existing.is_some_and(|plugin| plugin.plugin_name == "mtls_auth")
+        {
+            validate_mtls_auth_candidate(db, namespace, None, Some(resource), None).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn before_delete(
+        db: &dyn DatabaseBackend,
+        _state: &AdminState,
+        namespace: &str,
+        existing: &Self,
+        _ctx: &ValidationCtx<'_>,
+    ) -> Result<(), AfterValidateError> {
+        if existing.plugin_name == "mtls_auth" {
+            validate_mtls_auth_candidate(db, namespace, None, None, Some(&existing.id)).await?;
+        }
         Ok(())
     }
 }
@@ -1998,6 +2101,10 @@ impl AdminResource for Proxy {
             Err(error) => return Err(AfterValidateError::Db(error)),
         }
 
+        if resource.effective_scheme().is_stream() {
+            validate_mtls_auth_candidate(db, namespace, Some(resource), None, None).await?;
+        }
+
         if resource.dispatch_kind.is_stream()
             && let Some(port) = resource.listen_port
             && ctx.mode != "cp"
@@ -2108,6 +2215,10 @@ impl AdminResource for Consumer {
         consumer_response_body(resource)
     }
 
+    fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {
+        super::json_response(StatusCode::CONFLICT, &json!({"error": errors.join("; ")}))
+    }
+
     fn prepare_for_write(&mut self) -> Result<(), String> {
         hash_consumer_credentials(self)
     }
@@ -2171,6 +2282,27 @@ impl AdminResource for Consumer {
 
         check_consumer_credential_uniqueness(db, namespace, resource, exclude_id).await
     }
+
+    async fn after_validate(
+        db: &dyn DatabaseBackend,
+        _state: &AdminState,
+        namespace: &str,
+        resource: &Self,
+        _existing: Option<&Self>,
+        _ctx: &ValidationCtx<'_>,
+    ) -> Result<(), AfterValidateError> {
+        if !resource.has_credential("mtls_auth") {
+            return Ok(());
+        }
+        let errors = mtls_consumer_candidate_errors(db, namespace, resource)
+            .await
+            .map_err(AfterValidateError::Db)?;
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(AfterValidateError::BadRequest(errors))
+        }
+    }
 }
 
 fn not_found_response<R: AdminResource>() -> Response<Full<Bytes>> {
@@ -2178,6 +2310,14 @@ fn not_found_response<R: AdminResource>() -> Response<Full<Bytes>> {
         StatusCode::NOT_FOUND,
         &json!({"error": R::NOT_FOUND_MESSAGE}),
     )
+}
+
+fn map_after_validate_error<R: AdminResource>(error: AfterValidateError) -> Response<Full<Bytes>> {
+    match error {
+        AfterValidateError::BadRequest(field_errors) => R::map_after_validate_errors(&field_errors),
+        AfterValidateError::Db(error) => R::map_precheck_db_error(&error),
+        AfterValidateError::Response(response) => response,
+    }
 }
 
 fn config_update_target_was_not_found(error: &anyhow::Error) -> bool {
@@ -2324,13 +2464,7 @@ async fn handle_write<R: AdminResource>(
     )
     .await
     {
-        return Ok(match error {
-            AfterValidateError::BadRequest(field_errors) => {
-                R::map_after_validate_errors(&field_errors)
-            }
-            AfterValidateError::Db(error) => R::map_precheck_db_error(&error),
-            AfterValidateError::Response(response) => response,
-        });
+        return Ok(map_after_validate_error::<R>(error));
     }
 
     if let Err(message) = resource.prepare_for_write() {

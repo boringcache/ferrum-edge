@@ -932,3 +932,79 @@ async fn test_credential_rotation_limit_enforcement() {
         kc
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_mtls_append_normalizes_identity_before_uniqueness_and_persistence() {
+    let harness = RotationTestHarness::new()
+        .await
+        .expect("Failed to create harness");
+    let client = reqwest::Client::new();
+    let auth = harness.admin_auth_header();
+    let admin_url = &harness.admin_base_url;
+
+    create_consumer(&client, admin_url, &auth, "mtls-owner", "mtls-owner")
+        .await
+        .unwrap();
+    put_credential(
+        &client,
+        admin_url,
+        &auth,
+        "mtls-owner",
+        "mtls_auth",
+        &json!({"identity": "api.example.com"}),
+    )
+    .await
+    .unwrap();
+
+    create_plugin_config(
+        &client,
+        admin_url,
+        &auth,
+        &json!({
+            "id": "mtls-dns-identity-policy",
+            "plugin_name": "mtls_auth",
+            "scope": "global",
+            "enabled": true,
+            "config": {"cert_field": "san_dns"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    create_consumer(&client, admin_url, &auth, "mtls-rotating", "mtls-rotating")
+        .await
+        .unwrap();
+    let conflict = append_credential(
+        &client,
+        admin_url,
+        &auth,
+        "mtls-rotating",
+        "mtls_auth",
+        &json!({"identity": " API.Example.COM "}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        conflict.status().as_u16(),
+        409,
+        "padded case variant must conflict with the canonical identity"
+    );
+
+    let appended = append_credential(
+        &client,
+        admin_url,
+        &auth,
+        "mtls-rotating",
+        "mtls_auth",
+        &json!({"identity": " Unique.Example.COM "}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(appended.status().as_u16(), 200);
+    let body: serde_json::Value = appended.json().await.unwrap();
+    assert_eq!(
+        body["credentials"]["mtls_auth"][0]["identity"], "Unique.Example.COM",
+        "append response and persisted credential must use the trimmed identity"
+    );
+}

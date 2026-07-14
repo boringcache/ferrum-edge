@@ -5,14 +5,17 @@
 //! fingerprint, or serial) against the consumer's `mtls_auth.identity`
 //! credential for O(1) lookup.
 //!
-//! Optionally validates the certificate issuer against an allow-list to ensure
-//! only certificates from trusted CAs are accepted (defense-in-depth on top
-//! of the TLS layer's CA verification).
+//! Optionally validates the certificate issuer against cryptographically pinned
+//! per-proxy CA certificates (defense-in-depth on top of the TLS layer's CA
+//! verification).
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use tracing::debug;
 use x509_parser::prelude::*;
 
@@ -22,7 +25,7 @@ use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOu
 use super::{PluginResult, RequestContext, StreamConnectionContext};
 
 /// Supported certificate fields for consumer identity matching.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum CertField {
     /// Subject Common Name (CN)
     SubjectCn,
@@ -40,6 +43,78 @@ enum CertField {
     /// bytes, no separators, DER sign padding removed (i.e. the lowercase of
     /// `openssl x509 -serial` output).
     Serial,
+}
+
+static NEXT_MTLS_AUTH_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone)]
+enum CertificateEvaluation {
+    Identity(String),
+    InvalidCertificate,
+    Forbidden(String),
+}
+
+/// Connection-local cache for mTLS certificate evaluation.
+///
+/// HTTP/2 and HTTP/3 create one cache per transport connection and share it
+/// across multiplexed request contexts. Entries are keyed by the concrete
+/// `mtls_auth` plugin instance so different per-proxy certificate policies do
+/// not reuse each other's decision. The common path is one lock-free ArcSwap
+/// load plus a HashMap lookup; `OnceLock` serializes only the first evaluation
+/// for a plugin/connection pair.
+pub struct MtlsAuthConnectionCache {
+    evaluations: ArcSwap<HashMap<u64, Arc<OnceLock<CertificateEvaluation>>>>,
+    evaluation_count: AtomicUsize,
+}
+
+impl std::fmt::Debug for MtlsAuthConnectionCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MtlsAuthConnectionCache")
+            .field("entries", &self.evaluations.load().len())
+            .field("evaluation_count", &self.evaluation_count())
+            .finish()
+    }
+}
+
+impl Default for MtlsAuthConnectionCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MtlsAuthConnectionCache {
+    pub fn new() -> Self {
+        Self {
+            evaluations: ArcSwap::from_pointee(HashMap::new()),
+            evaluation_count: AtomicUsize::new(0),
+        }
+    }
+
+    /// Number of certificate evaluations performed by this connection cache.
+    /// Exposed for instrumentation-backed regression tests.
+    pub fn evaluation_count(&self) -> usize {
+        self.evaluation_count.load(Ordering::Relaxed)
+    }
+
+    fn evaluation_slot(&self, instance_id: u64) -> Arc<OnceLock<CertificateEvaluation>> {
+        let mut current = self.evaluations.load();
+        loop {
+            if let Some(slot) = current.get(&instance_id) {
+                return Arc::clone(slot);
+            }
+
+            let slot = Arc::new(OnceLock::new());
+            let mut updated = current.as_ref().clone();
+            updated.insert(instance_id, Arc::clone(&slot));
+            let previous = self
+                .evaluations
+                .compare_and_swap(&*current, Arc::new(updated));
+            if Arc::ptr_eq(&*current, &*previous) {
+                return slot;
+            }
+            current = previous;
+        }
+    }
 }
 
 impl CertField {
@@ -65,7 +140,7 @@ fn canonical_serial_bytes(raw_serial: &[u8]) -> &[u8] {
     }
 }
 
-/// Per-proxy issuer filter: matches against the peer certificate's issuer DN.
+/// Per-proxy issuer filter: binds descriptive CA subject fields to a pinned CA key.
 ///
 /// All specified fields must match (AND logic within a single filter).
 /// Multiple filters in `allowed_issuers` are OR'd — any one matching is sufficient.
@@ -77,6 +152,10 @@ struct IssuerFilter {
     o: Option<String>,
     /// Issuer Organizational Unit (OU)
     ou: Option<String>,
+    /// DER certificate that cryptographically pins this issuer. Keeping the
+    /// certificate (rather than only its subject DN) also permits verification
+    /// when a root trust anchor was omitted from the client-presented chain.
+    ca_cert_der: Vec<u8>,
 }
 
 impl IssuerFilter {
@@ -85,16 +164,22 @@ impl IssuerFilter {
             .as_object()
             .ok_or_else(|| format!("mtls_auth: '{context}' entries must be objects, got: {val}"))?;
         for key in obj.keys() {
-            if !matches!(key.as_str(), "cn" | "o" | "ou") {
+            if !matches!(key.as_str(), "cn" | "o" | "ou" | "ca_certificate_pem") {
                 return Err(format!(
                     "mtls_auth: '{context}' contains unsupported issuer field '{key}'"
                 ));
             }
         }
+        let ca_certificate_pem = string_field(obj, "ca_certificate_pem", context)?.ok_or_else(|| {
+            format!(
+                "mtls_auth: '{context}.ca_certificate_pem' is required to cryptographically pin the issuer"
+            )
+        })?;
         Self::from_fields(
             string_field(obj, "cn", context)?,
             string_field(obj, "o", context)?,
             string_field(obj, "ou", context)?,
+            parse_ca_certificate_pem(&ca_certificate_pem, context)?,
             context,
         )
     }
@@ -103,6 +188,7 @@ impl IssuerFilter {
         cn: Option<String>,
         o: Option<String>,
         ou: Option<String>,
+        ca_cert_der: Vec<u8>,
         context: &str,
     ) -> Result<Self, String> {
         if cn.is_none() && o.is_none() && ou.is_none() {
@@ -110,15 +196,26 @@ impl IssuerFilter {
                 "mtls_auth: '{context}' issuer filter must specify at least one field"
             ));
         }
-        Ok(Self { cn, o, ou })
+        let filter = Self {
+            cn,
+            o,
+            ou,
+            ca_cert_der,
+        };
+        let (_, ca_cert) = X509Certificate::from_der(&filter.ca_cert_der).map_err(|_| {
+            format!("mtls_auth: '{context}.ca_certificate_pem' is not a valid X.509 certificate")
+        })?;
+        if !filter.matches_name(ca_cert.subject()) {
+            return Err(format!(
+                "mtls_auth: '{context}' DN fields do not match ca_certificate_pem subject"
+            ));
+        }
+        Ok(filter)
     }
 
-    /// Check if this filter matches the given certificate's issuer DN.
-    fn matches(&self, cert: &X509Certificate<'_>) -> bool {
-        let issuer = cert.issuer();
-
+    fn matches_name(&self, name: &X509Name<'_>) -> bool {
         if let Some(expected_cn) = &self.cn {
-            let actual = issuer
+            let actual = name
                 .iter_common_name()
                 .next()
                 .and_then(|attr| attr.as_str().ok());
@@ -128,7 +225,7 @@ impl IssuerFilter {
         }
 
         if let Some(expected_o) = &self.o {
-            let actual = issuer
+            let actual = name
                 .iter_by_oid(&oid_registry::OID_X509_ORGANIZATION_NAME)
                 .next()
                 .and_then(|attr| attr.as_str().ok());
@@ -138,7 +235,7 @@ impl IssuerFilter {
         }
 
         if let Some(expected_ou) = &self.ou {
-            let actual = issuer
+            let actual = name
                 .iter_by_oid(&oid_registry::OID_X509_ORGANIZATIONAL_UNIT)
                 .next()
                 .and_then(|attr| attr.as_str().ok());
@@ -149,6 +246,27 @@ impl IssuerFilter {
 
         true
     }
+}
+
+fn parse_ca_certificate_pem(pem: &str, context: &str) -> Result<Vec<u8>, String> {
+    let items = rustls_pemfile::read_all(&mut Cursor::new(pem.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| format!("mtls_auth: '{context}.ca_certificate_pem' contains malformed PEM"))?;
+    let [rustls_pemfile::Item::X509Certificate(certificate)] = items.as_slice() else {
+        return Err(format!(
+            "mtls_auth: '{context}.ca_certificate_pem' must contain exactly one certificate and no other PEM items"
+        ));
+    };
+    let der = certificate.as_ref().to_vec();
+    let (_, parsed) = X509Certificate::from_der(&der).map_err(|_| {
+        format!("mtls_auth: '{context}.ca_certificate_pem' is not a valid X.509 certificate")
+    })?;
+    if !parsed.is_ca() {
+        return Err(format!(
+            "mtls_auth: '{context}.ca_certificate_pem' must contain a CA certificate"
+        ));
+    }
+    Ok(der)
 }
 
 /// mTLS authentication plugin.
@@ -165,8 +283,10 @@ impl IssuerFilter {
 /// {
 ///   "cert_field": "subject_cn",
 ///   "allowed_issuers": [
-///     { "cn": "Internal Services CA" },
-///     { "o": "My Corp", "ou": "Engineering" }
+///     {
+///       "cn": "Internal Services CA",
+///       "ca_certificate_pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"
+///     }
 ///   ],
 ///   "allowed_ca_fingerprints_sha256": [
 ///     "a1b2c3d4e5f6..."
@@ -176,15 +296,15 @@ impl IssuerFilter {
 ///
 /// ## Issuer Filtering
 ///
-/// When `allowed_issuers` is set, the plugin verifies the peer certificate's
-/// issuer DN matches at least one filter. Within each filter, all specified
-/// fields must match (AND logic). Across filters, any match is sufficient (OR).
+/// When `allowed_issuers` is set, each filter's DN fields identify the pinned CA
+/// subject and the plugin cryptographically verifies a peer path to that
+/// filter's `ca_certificate_pem`. DN labels alone never authorize a CA.
 ///
 /// When `allowed_ca_fingerprints_sha256` is set, the plugin verifies that at
 /// least one certificate in the client's chain (intermediate/CA certs sent
 /// during the TLS handshake) has a matching SHA-256 fingerprint. Note: root
-/// CAs are typically not included in the client's chain — use `allowed_issuers`
-/// for root CA filtering.
+/// CAs are typically not included in the client's chain — `allowed_issuers`
+/// can verify against its configured CA even when that CA is omitted.
 ///
 /// When both are configured, both constraints must pass (AND logic).
 ///
@@ -205,12 +325,11 @@ impl IssuerFilter {
 /// Consumers authenticate via their `mtls_auth` credential:
 /// ```json
 /// {
-///   "mtls_auth": {
-///     "identity": "client.example.com"
-///   }
+///   "mtls_auth": [{ "identity": "client.example.com" }]
 /// }
 /// ```
 pub struct MtlsAuth {
+    instance_id: u64,
     cert_field: CertField,
     /// Optional per-proxy issuer DN filters (OR across filters, AND within).
     allowed_issuers: Vec<IssuerFilter>,
@@ -220,11 +339,13 @@ pub struct MtlsAuth {
 
 impl MtlsAuth {
     pub fn new(config: &Value) -> Result<Self, String> {
+        validate_top_level_keys(config)?;
         let cert_field = parse_cert_field(config)?;
         let allowed_issuers = parse_allowed_issuers(config)?;
         let allowed_ca_fingerprints_sha256 = parse_allowed_ca_fingerprints(config)?;
 
         Ok(Self {
+            instance_id: NEXT_MTLS_AUTH_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             cert_field,
             allowed_issuers,
             allowed_ca_fingerprints_sha256,
@@ -246,9 +367,16 @@ impl MtlsAuth {
         peer_cert_der: &[u8],
         chain_der: Option<&[Vec<u8>]>,
     ) -> Result<(), String> {
-        // Check allowed_issuers against the peer cert's issuer DN
+        // Each filter's DN attributes were bound to the pinned certificate's
+        // subject at construction. Runtime authorization therefore depends on a
+        // cryptographically verified path to that pinned CA, which may be the
+        // immediate issuer, an intermediate, or a root. DN labels alone are not
+        // unique CA identities.
         if !self.allowed_issuers.is_empty() {
-            let matched = self.allowed_issuers.iter().any(|f| f.matches(peer_cert));
+            let chain = chain_der.unwrap_or(&[]);
+            let matched = self.allowed_issuers.iter().any(|filter| {
+                self.chain_reaches_pinned_ca(peer_cert_der, chain, filter.ca_cert_der.as_slice())
+            });
             if !matched {
                 let issuer_cn = peer_cert
                     .issuer()
@@ -285,6 +413,60 @@ impl MtlsAuth {
         }
 
         Ok(())
+    }
+
+    fn chain_reaches_pinned_ca<'a>(
+        &self,
+        leaf_der: &'a [u8],
+        chain: &'a [Vec<u8>],
+        pinned_ca_der: &[u8],
+    ) -> bool {
+        let Ok((_, leaf)) = X509Certificate::from_der(leaf_der) else {
+            return false;
+        };
+        let Ok((_, pinned_ca)) = X509Certificate::from_der(pinned_ca_der) else {
+            return false;
+        };
+
+        // 0 = unseen, 1 = reachable and pending, 2 = processed. Reusing one
+        // state vector as the work queue keeps path search iterative and
+        // bounded to O(n^2), including alternate and cyclic presented chains.
+        let mut states = vec![0u8; chain.len()];
+        let mut current = leaf;
+        loop {
+            if current.issuer() == pinned_ca.subject()
+                && current
+                    .verify_signature(Some(pinned_ca.public_key()))
+                    .is_ok()
+            {
+                return true;
+            }
+
+            for (idx, cert_der) in chain.iter().enumerate() {
+                if states[idx] != 0 {
+                    continue;
+                }
+                let Ok((_, candidate)) = X509Certificate::from_der(cert_der) else {
+                    continue;
+                };
+                if candidate.subject() == current.issuer()
+                    && current
+                        .verify_signature(Some(candidate.public_key()))
+                        .is_ok()
+                {
+                    states[idx] = 1;
+                }
+            }
+
+            let Some(next_idx) = states.iter().position(|state| *state == 1) else {
+                return false;
+            };
+            states[next_idx] = 2;
+            let Ok((_, parsed)) = X509Certificate::from_der(&chain[next_idx]) else {
+                continue;
+            };
+            current = parsed;
+        }
     }
 
     fn validated_issuer_chain<'a>(
@@ -377,7 +559,7 @@ impl MtlsAuth {
                         {
                             san.general_names.iter().find_map(|name| {
                                 if let GeneralName::DNSName(dns) = name {
-                                    Some(dns.to_string())
+                                    Some(dns.to_ascii_lowercase())
                                 } else {
                                     None
                                 }
@@ -423,17 +605,16 @@ impl MtlsAuth {
         }
     }
 
-    fn verify_client_cert(
+    fn evaluate_client_cert(
         &self,
         cert_der: &[u8],
         chain_der: Option<&[Vec<u8>]>,
-        consumer_index: &ConsumerIndex,
-    ) -> VerifyOutcome {
+    ) -> CertificateEvaluation {
         let (_, parsed_cert) = match X509Certificate::from_der(cert_der) {
             Ok(parsed) => parsed,
             Err(e) => {
                 debug!("mtls_auth: failed to parse certificate: {}", e);
-                return VerifyOutcome::Invalid(r#"{"error":"Invalid client certificate"}"#.into());
+                return CertificateEvaluation::InvalidCertificate;
             }
         };
 
@@ -441,24 +622,89 @@ impl MtlsAuth {
             && let Err(reason) = self.verify_issuer_constraints(&parsed_cert, cert_der, chain_der)
         {
             debug!("mtls_auth: issuer constraint failed: {}", reason);
-            return VerifyOutcome::Forbidden(serde_json::json!({ "error": reason }).to_string());
+            return CertificateEvaluation::Forbidden(
+                serde_json::json!({ "error": reason }).to_string(),
+            );
         }
 
         let identity = match self.extract_cert_identity(&parsed_cert, cert_der) {
             Ok(id) => id,
             Err(e) => {
                 debug!("mtls_auth: failed to extract identity: {}", e);
-                return VerifyOutcome::Invalid(r#"{"error":"Invalid client certificate"}"#.into());
+                return CertificateEvaluation::InvalidCertificate;
             }
         };
 
-        match consumer_index.find_by_mtls_identity(&identity) {
+        CertificateEvaluation::Identity(identity)
+    }
+
+    fn evaluation_outcome(
+        &self,
+        evaluation: &CertificateEvaluation,
+        consumer_index: &ConsumerIndex,
+    ) -> VerifyOutcome {
+        let identity = match evaluation {
+            CertificateEvaluation::Identity(identity) => identity,
+            CertificateEvaluation::InvalidCertificate => {
+                return VerifyOutcome::Invalid(r#"{"error":"Invalid client certificate"}"#.into());
+            }
+            CertificateEvaluation::Forbidden(body) => {
+                return VerifyOutcome::Forbidden(body.clone());
+            }
+        };
+
+        let consumer = if matches!(self.cert_field, CertField::SanDns) {
+            consumer_index.find_by_mtls_dns_identity(identity)
+        } else {
+            consumer_index.find_by_mtls_identity(identity)
+        };
+        match consumer {
             Some(consumer) => VerifyOutcome::consumer(consumer),
             None => VerifyOutcome::ConsumerNotFound(
                 r#"{"error":"No consumer found for client certificate"}"#.into(),
             ),
         }
     }
+
+    fn verify_client_cert(
+        &self,
+        cert_der: &[u8],
+        chain_der: Option<&[Vec<u8>]>,
+        connection_cache: Option<&MtlsAuthConnectionCache>,
+        consumer_index: &ConsumerIndex,
+    ) -> VerifyOutcome {
+        if let Some(cache) = connection_cache {
+            let slot = cache.evaluation_slot(self.instance_id);
+            let evaluation = slot.get_or_init(|| {
+                cache.evaluation_count.fetch_add(1, Ordering::Relaxed);
+                self.evaluate_client_cert(cert_der, chain_der)
+            });
+            self.evaluation_outcome(evaluation, consumer_index)
+        } else {
+            let evaluation = self.evaluate_client_cert(cert_der, chain_der);
+            self.evaluation_outcome(&evaluation, consumer_index)
+        }
+    }
+}
+
+fn validate_top_level_keys(config: &Value) -> Result<(), String> {
+    if config.is_null() {
+        return Ok(());
+    }
+    let obj = config
+        .as_object()
+        .ok_or_else(|| "mtls_auth: config must be an object".to_string())?;
+    for key in obj.keys() {
+        if !matches!(
+            key.as_str(),
+            "cert_field" | "allowed_issuers" | "allowed_ca_fingerprints_sha256"
+        ) {
+            return Err(format!(
+                "mtls_auth: config contains unsupported field '{key}'"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn string_field(
@@ -481,7 +727,7 @@ fn string_field(
 
 fn parse_cert_field(config: &Value) -> Result<CertField, String> {
     match config.get("cert_field") {
-        None | Some(Value::Null) => Ok(CertField::SubjectCn),
+        None => Ok(CertField::SubjectCn),
         Some(Value::String(value)) => CertField::from_str(value).ok_or_else(|| {
             format!("mtls_auth: 'cert_field' must be a supported certificate field, got: {value:?}")
         }),
@@ -494,18 +740,19 @@ fn parse_cert_field(config: &Value) -> Result<CertField, String> {
 fn parse_allowed_issuers(config: &Value) -> Result<Vec<IssuerFilter>, String> {
     let mut filters = Vec::new();
 
-    if config.get("issuer_verification").is_some() {
-        return Err(
-            "mtls_auth: 'issuer_verification' was removed; use 'allowed_issuers'".to_string(),
-        );
-    }
-
-    if let Some(value) = config.get("allowed_issuers")
-        && !value.is_null()
-    {
+    if let Some(value) = config.get("allowed_issuers") {
+        if value.is_null() {
+            return Err("mtls_auth: 'allowed_issuers' must be an array, got: null".to_string());
+        }
         let arr = value.as_array().ok_or_else(|| {
             format!("mtls_auth: 'allowed_issuers' must be an array, got: {value}")
         })?;
+        if arr.is_empty() {
+            return Err(
+                "mtls_auth: 'allowed_issuers' must not be empty; omit the field to disable issuer filtering"
+                    .to_string(),
+            );
+        }
         filters.reserve(arr.len());
         for (idx, entry) in arr.iter().enumerate() {
             filters.push(IssuerFilter::from_json(
@@ -523,12 +770,20 @@ fn parse_allowed_ca_fingerprints(config: &Value) -> Result<HashSet<[u8; 32]>, St
         return Ok(HashSet::new());
     };
     if value.is_null() {
-        return Ok(HashSet::new());
+        return Err(
+            "mtls_auth: 'allowed_ca_fingerprints_sha256' must be an array, got: null".to_string(),
+        );
     }
 
     let arr = value.as_array().ok_or_else(|| {
         format!("mtls_auth: 'allowed_ca_fingerprints_sha256' must be an array, got: {value}")
     })?;
+    if arr.is_empty() {
+        return Err(
+            "mtls_auth: 'allowed_ca_fingerprints_sha256' must not be empty; omit the field to disable CA fingerprint filtering"
+                .to_string(),
+        );
+    }
     let mut fingerprints = HashSet::with_capacity(arr.len());
     for (idx, entry) in arr.iter().enumerate() {
         let raw = entry.as_str().ok_or_else(|| {
@@ -563,6 +818,7 @@ impl AuthMechanism for MtlsAuth {
             Some(der_bytes) => ExtractedCredential::MtlsCert {
                 der_bytes: Arc::clone(der_bytes),
                 chain_der: ctx.tls_client_cert_chain_der.clone(),
+                connection_cache: ctx.mtls_auth_connection_cache.clone(),
             },
             None => ExtractedCredential::Missing,
         }
@@ -576,6 +832,7 @@ impl AuthMechanism for MtlsAuth {
         let ExtractedCredential::MtlsCert {
             der_bytes,
             chain_der,
+            connection_cache,
         } = credential
         else {
             return VerifyOutcome::NotApplicable;
@@ -584,6 +841,7 @@ impl AuthMechanism for MtlsAuth {
         self.verify_client_cert(
             der_bytes.as_slice(),
             chain_der.as_ref().map(|chain| chain.as_slice()),
+            connection_cache.as_deref(),
             consumer_index,
         )
     }
@@ -610,6 +868,7 @@ auth_flow::impl_auth_plugin!(
         match self.verify_client_cert(
             cert_der.as_slice(),
             ctx.tls_client_cert_chain_der.as_ref().map(|c| c.as_slice()),
+            None,
             ctx.consumer_index.as_ref(),
         ) {
             VerifyOutcome::Success {

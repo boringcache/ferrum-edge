@@ -30,7 +30,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value;
 use tempfile::TempDir;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_stream::wrappers::{
     IntervalStream, ReceiverStream, TcpListenerStream, UnboundedReceiverStream, UnixListenerStream,
@@ -9130,7 +9130,7 @@ struct LiveXcDnsServer {
 #[cfg(target_os = "linux")]
 impl LiveXcDnsServer {
     async fn start(advertised_ip: std::net::Ipv4Addr) -> Result<Self, String> {
-        let socket = UdpSocket::bind(SocketAddr::from((advertised_ip, 0)))
+        let socket = tokio::net::UdpSocket::bind(SocketAddr::from((advertised_ip, 0)))
             .await
             .map_err(|error| format!("bind live fixture DNS responder: {error}"))?;
         let port = socket

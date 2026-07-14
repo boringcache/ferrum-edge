@@ -7935,6 +7935,7 @@ async fn handle_connection(
                 false,
                 None,
                 None,
+                None,
                 connection_metadata,
             )
             .await
@@ -12574,6 +12575,9 @@ async fn handle_tls_connection(
     let client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>> = peer_certs
         .filter(|certs| certs.len() > 1)
         .map(|certs| Arc::new(certs[1..].iter().map(|c| c.to_vec()).collect()));
+    let mtls_auth_connection_cache = client_cert_der
+        .as_ref()
+        .map(|_| Arc::new(crate::plugins::mtls_auth::MtlsAuthConnectionCache::new()));
     let frontend_sni_hostname = tls_stream
         .get_ref()
         .1
@@ -12626,6 +12630,7 @@ async fn handle_tls_connection(
         let addr = remote_addr;
         let cert = client_cert_der.clone();
         let chain = client_cert_chain_der.clone();
+        let mtls_auth_connection_cache = mtls_auth_connection_cache.clone();
         let frontend_sni_hostname = frontend_sni_hostname.clone();
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port: tls_connection_metadata.frontend_listen_port,
@@ -12644,6 +12649,7 @@ async fn handle_tls_connection(
                 true,
                 cert,
                 chain,
+                mtls_auth_connection_cache,
                 connection_metadata,
             )
             .await
@@ -13860,6 +13866,9 @@ pub async fn handle_proxy_request(
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
+    let mtls_auth_connection_cache = tls_client_cert_der
+        .as_ref()
+        .map(|_| Arc::new(crate::plugins::mtls_auth::MtlsAuthConnectionCache::new()));
     handle_proxy_request_on_frontend_port(
         req,
         Arc::new(state),
@@ -13867,11 +13876,13 @@ pub async fn handle_proxy_request(
         is_tls,
         tls_client_cert_der,
         tls_client_cert_chain_der,
+        mtls_auth_connection_cache,
         RequestConnectionMetadata::default(),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_proxy_request_on_frontend_port(
     req: Request<Incoming>,
     state: Arc<ProxyState>,
@@ -13879,6 +13890,7 @@ async fn handle_proxy_request_on_frontend_port(
     is_tls: bool,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+    mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     if req.method() == hyper::Method::GET
@@ -13930,6 +13942,7 @@ async fn handle_proxy_request_on_frontend_port(
         is_tls,
         tls_client_cert_der,
         tls_client_cert_chain_der,
+        mtls_auth_connection_cache,
         connection_metadata,
     )
     .await;
@@ -13945,6 +13958,7 @@ async fn handle_proxy_request_on_frontend_port(
 
 /// Inner implementation of [`handle_proxy_request`] — separated so the outer
 /// function can attach the [`RequestGuard`] to the response body.
+#[allow(clippy::too_many_arguments)]
 async fn handle_proxy_request_inner(
     req: Request<Incoming>,
     state: Arc<ProxyState>,
@@ -13952,6 +13966,7 @@ async fn handle_proxy_request_inner(
     is_tls: bool,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+    mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
@@ -13999,6 +14014,7 @@ async fn handle_proxy_request_inner(
         connection_metadata.mesh_inbound_pre_handshake_app_port;
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
+    ctx.mtls_auth_connection_cache = mtls_auth_connection_cache;
     if let Some(identity) = connection_metadata.node_waypoint_identity {
         // In node-waypoint topology, the node-agent/eBPF cookie-derived pod
         // identity is the authenticated source workload for policy. It

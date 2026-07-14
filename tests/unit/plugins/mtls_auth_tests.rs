@@ -1,6 +1,7 @@
+use base64::Engine;
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
-use ferrum_edge::plugins::mtls_auth::MtlsAuth;
+use ferrum_edge::plugins::mtls_auth::{MtlsAuth, MtlsAuthConnectionCache};
 use ferrum_edge::plugins::{
     HTTP_FAMILY_AND_STREAM_PROTOCOLS, Plugin, RequestContext, StreamConnectionContext, priority,
 };
@@ -87,6 +88,153 @@ fn create_ca_signed_cert(
     let client_der = client_cert.der().to_vec();
 
     (ca_der, client_der)
+}
+
+/// Create root -> intermediate -> client certificate material.
+/// Returns (root_der, intermediate_der, client_der).
+fn create_intermediate_signed_cert(
+    root_cn: &str,
+    intermediate_cn: &str,
+    client_cn: &str,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut root_params = rcgen::CertificateParams::default();
+    let mut root_dn = rcgen::DistinguishedName::new();
+    root_dn.push(rcgen::DnType::CommonName, root_cn);
+    root_params.distinguished_name = root_dn;
+    root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let root_key = rcgen::KeyPair::generate().unwrap();
+    let root_cert = root_params.self_signed(&root_key).unwrap();
+    let root_der = root_cert.der().to_vec();
+    let root_issuer = rcgen::Issuer::new(root_params, root_key);
+
+    let mut intermediate_params = rcgen::CertificateParams::default();
+    let mut intermediate_dn = rcgen::DistinguishedName::new();
+    intermediate_dn.push(rcgen::DnType::CommonName, intermediate_cn);
+    intermediate_params.distinguished_name = intermediate_dn;
+    intermediate_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let intermediate_key = rcgen::KeyPair::generate().unwrap();
+    let intermediate_cert = intermediate_params
+        .signed_by(&intermediate_key, &root_issuer)
+        .unwrap();
+    let intermediate_der = intermediate_cert.der().to_vec();
+    let intermediate_issuer = rcgen::Issuer::new(intermediate_params, intermediate_key);
+
+    let mut client_params = rcgen::CertificateParams::default();
+    let mut client_dn = rcgen::DistinguishedName::new();
+    client_dn.push(rcgen::DnType::CommonName, client_cn);
+    client_params.distinguished_name = client_dn;
+    let client_key = rcgen::KeyPair::generate().unwrap();
+    let client_cert = client_params
+        .signed_by(&client_key, &intermediate_issuer)
+        .unwrap();
+
+    (root_der, intermediate_der, client_cert.der().to_vec())
+}
+
+/// Create a client chain with two cross-signed versions of the same
+/// intermediate key. Only the second intermediate reaches the pinned root.
+/// Returns (pinned_root_der, unpinned_intermediate_der,
+/// pinned_intermediate_der, client_der).
+fn create_cross_signed_intermediate_chain() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut unpinned_root_params = rcgen::CertificateParams::default();
+    let mut unpinned_root_dn = rcgen::DistinguishedName::new();
+    unpinned_root_dn.push(rcgen::DnType::CommonName, "Unpinned Root CA");
+    unpinned_root_params.distinguished_name = unpinned_root_dn;
+    unpinned_root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let unpinned_root_key = rcgen::KeyPair::generate().unwrap();
+    let unpinned_root_issuer = rcgen::Issuer::new(unpinned_root_params, unpinned_root_key);
+
+    let mut pinned_root_params = rcgen::CertificateParams::default();
+    let mut pinned_root_dn = rcgen::DistinguishedName::new();
+    pinned_root_dn.push(rcgen::DnType::CommonName, "Pinned Root CA");
+    pinned_root_params.distinguished_name = pinned_root_dn;
+    pinned_root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let pinned_root_key = rcgen::KeyPair::generate().unwrap();
+    let pinned_root_cert = pinned_root_params.self_signed(&pinned_root_key).unwrap();
+    let pinned_root_der = pinned_root_cert.der().to_vec();
+    let pinned_root_issuer = rcgen::Issuer::new(pinned_root_params, pinned_root_key);
+
+    let mut intermediate_params = rcgen::CertificateParams::default();
+    let mut intermediate_dn = rcgen::DistinguishedName::new();
+    intermediate_dn.push(rcgen::DnType::CommonName, "Cross-Signed Intermediate CA");
+    intermediate_params.distinguished_name = intermediate_dn;
+    intermediate_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let intermediate_key = rcgen::KeyPair::generate().unwrap();
+    let unpinned_intermediate = intermediate_params
+        .signed_by(&intermediate_key, &unpinned_root_issuer)
+        .unwrap()
+        .der()
+        .to_vec();
+    let pinned_intermediate = intermediate_params
+        .signed_by(&intermediate_key, &pinned_root_issuer)
+        .unwrap()
+        .der()
+        .to_vec();
+    let intermediate_issuer = rcgen::Issuer::new(intermediate_params, intermediate_key);
+
+    let mut client_params = rcgen::CertificateParams::default();
+    let mut client_dn = rcgen::DistinguishedName::new();
+    client_dn.push(rcgen::DnType::CommonName, "client.example.com");
+    client_params.distinguished_name = client_dn;
+    let client_key = rcgen::KeyPair::generate().unwrap();
+    let client_der = client_params
+        .signed_by(&client_key, &intermediate_issuer)
+        .unwrap()
+        .der()
+        .to_vec();
+
+    (
+        pinned_root_der,
+        unpinned_intermediate,
+        pinned_intermediate,
+        client_der,
+    )
+}
+
+fn cert_der_to_pem(cert_der: &[u8]) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(cert_der);
+    let body = encoded
+        .as_bytes()
+        .chunks(64)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n")
+}
+
+fn issuer_filter(ca_der: &[u8], cn: Option<&str>, o: Option<&str>, ou: Option<&str>) -> Value {
+    let mut filter = Map::new();
+    if let Some(cn) = cn {
+        filter.insert("cn".to_string(), Value::String(cn.to_string()));
+    }
+    if let Some(o) = o {
+        filter.insert("o".to_string(), Value::String(o.to_string()));
+    }
+    if let Some(ou) = ou {
+        filter.insert("ou".to_string(), Value::String(ou.to_string()));
+    }
+    filter.insert(
+        "ca_certificate_pem".to_string(),
+        Value::String(cert_der_to_pem(ca_der)),
+    );
+    Value::Object(filter)
+}
+
+fn create_test_cert_with_dns_sans(cn: &str, dns_names: &[&str]) -> Vec<u8> {
+    let mut params = rcgen::CertificateParams::default();
+    let mut dn = rcgen::DistinguishedName::new();
+    dn.push(rcgen::DnType::CommonName, cn);
+    params.distinguished_name = dn;
+    for dns_name in dns_names {
+        params
+            .subject_alt_names
+            .push(rcgen::SanType::DnsName((*dns_name).try_into().unwrap()));
+    }
+    params
+        .self_signed(&rcgen::KeyPair::generate().unwrap())
+        .unwrap()
+        .der()
+        .to_vec()
 }
 
 /// Create a test consumer with mtls_auth credentials.
@@ -201,6 +349,49 @@ async fn test_mtls_auth_success_by_san_dns() {
     let result = plugin.authenticate(&mut ctx, &index).await;
     assert_continue(result);
     assert!(ctx.identified_consumer.is_some());
+}
+
+#[tokio::test]
+async fn test_mtls_auth_san_dns_matching_is_ascii_case_insensitive() {
+    let cert_der = create_test_cert("unused-cn", None, Some("API.Example.COM"));
+    let consumer = create_mtls_consumer("c1", "alice", "Api.Example.Com");
+    let index = ConsumerIndex::new(&[consumer]);
+    let plugin = MtlsAuth::new(&json!({"cert_field": "san_dns"})).unwrap();
+    let mut ctx = create_ctx_with_cert(cert_der);
+
+    assert_continue(plugin.authenticate(&mut ctx, &index).await);
+    assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "alice");
+}
+
+#[tokio::test]
+async fn test_mtls_auth_san_dns_uses_only_first_dns_value() {
+    let cert_der =
+        create_test_cert_with_dns_sans("unused-cn", &["first.example.com", "second.example.com"]);
+    let plugin = MtlsAuth::new(&json!({"cert_field": "san_dns"})).unwrap();
+
+    let first_index =
+        ConsumerIndex::new(&[create_mtls_consumer("c1", "alice", "first.example.com")]);
+    let mut first_ctx = create_ctx_with_cert(cert_der.clone());
+    assert_continue(plugin.authenticate(&mut first_ctx, &first_index).await);
+
+    let second_index =
+        ConsumerIndex::new(&[create_mtls_consumer("c2", "bob", "second.example.com")]);
+    let mut second_ctx = create_ctx_with_cert(cert_der);
+    assert_reject(
+        plugin.authenticate(&mut second_ctx, &second_index).await,
+        Some(401),
+    );
+}
+
+#[tokio::test]
+async fn test_mtls_auth_non_dns_identity_matching_remains_case_sensitive() {
+    let cert_der = create_test_cert("Client.Example.COM", None, None);
+    let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
+    let index = ConsumerIndex::new(&[consumer]);
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
+    let mut ctx = create_ctx_with_cert(cert_der);
+
+    assert_reject(plugin.authenticate(&mut ctx, &index).await, Some(401));
 }
 
 #[tokio::test]
@@ -388,13 +579,12 @@ async fn test_mtls_auth_rejects_missing_san_dns() {
 async fn test_mtls_auth_allowed_issuers_cn_match() {
     let (ca_der, client_der) =
         create_ca_signed_cert("Internal CA", None, None, "client.example.com");
-    let _ = ca_der; // CA cert not needed for issuer DN matching (it's in the peer cert)
     let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
     let index = ConsumerIndex::new(&[consumer]);
 
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
-        "allowed_issuers": [{"cn": "Internal CA"}]
+        "allowed_issuers": [issuer_filter(&ca_der, Some("Internal CA"), None, None)]
     }))
     .unwrap();
     let mut ctx = create_ctx_with_cert(client_der);
@@ -405,15 +595,72 @@ async fn test_mtls_auth_allowed_issuers_cn_match() {
 }
 
 #[tokio::test]
+async fn test_mtls_auth_allowed_root_accepts_intermediate_issued_client() {
+    let (root_der, intermediate_der, client_der) = create_intermediate_signed_cert(
+        "Corporate Root CA",
+        "Issuing Intermediate CA",
+        "client.example.com",
+    );
+    let plugin = MtlsAuth::new(&json!({
+        "cert_field": "subject_cn",
+        "allowed_issuers": [issuer_filter(&root_der, Some("Corporate Root CA"), None, None)]
+    }))
+    .unwrap();
+    let index = ConsumerIndex::new(&[create_mtls_consumer("c1", "alice", "client.example.com")]);
+
+    let mut valid_ctx = create_ctx_with_cert_and_chain(client_der.clone(), vec![intermediate_der]);
+    assert_continue(plugin.authenticate(&mut valid_ctx, &index).await);
+
+    let mut missing_intermediate_ctx = create_ctx_with_cert(client_der);
+    assert_reject(
+        plugin
+            .authenticate(&mut missing_intermediate_ctx, &index)
+            .await,
+        Some(403),
+    );
+}
+
+#[tokio::test]
+async fn test_mtls_auth_backtracks_across_cross_signed_intermediates() {
+    let (pinned_root, unpinned_intermediate, pinned_intermediate, client_der) =
+        create_cross_signed_intermediate_chain();
+    let plugin = MtlsAuth::new(&json!({
+        "cert_field": "subject_cn",
+        "allowed_issuers": [issuer_filter(&pinned_root, Some("Pinned Root CA"), None, None)]
+    }))
+    .unwrap();
+    let index = ConsumerIndex::new(&[create_mtls_consumer("c1", "alice", "client.example.com")]);
+
+    let mut valid_ctx = create_ctx_with_cert_and_chain(
+        client_der.clone(),
+        vec![
+            vec![0, 1, 2, 3],
+            unpinned_intermediate.clone(),
+            pinned_intermediate,
+        ],
+    );
+    assert_continue(plugin.authenticate(&mut valid_ctx, &index).await);
+
+    let mut unpinned_only_ctx =
+        create_ctx_with_cert_and_chain(client_der, vec![unpinned_intermediate]);
+    assert_reject(
+        plugin.authenticate(&mut unpinned_only_ctx, &index).await,
+        Some(403),
+    );
+}
+
+#[tokio::test]
 async fn test_mtls_auth_allowed_issuers_rejects_wrong_ca() {
     let (_ca_der, client_der) =
         create_ca_signed_cert("Internal CA", None, None, "client.example.com");
+    let (external_ca_der, _) =
+        create_ca_signed_cert("External Partner CA", None, None, "unused.example.com");
     let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
     let index = ConsumerIndex::new(&[consumer]);
 
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
-        "allowed_issuers": [{"cn": "External Partner CA"}]
+        "allowed_issuers": [issuer_filter(&external_ca_der, Some("External Partner CA"), None, None)]
     }))
     .unwrap();
     let mut ctx = create_ctx_with_cert(client_der);
@@ -425,8 +672,10 @@ async fn test_mtls_auth_allowed_issuers_rejects_wrong_ca() {
 
 #[tokio::test]
 async fn test_mtls_auth_allowed_issuers_multiple_filters_or_logic() {
-    let (_ca_der, client_der) =
+    let (partner_ca_der, client_der) =
         create_ca_signed_cert("Partner CA", None, None, "client.example.com");
+    let (internal_ca_der, _) =
+        create_ca_signed_cert("Internal CA", None, None, "unused.example.com");
     let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
     let index = ConsumerIndex::new(&[consumer]);
 
@@ -434,8 +683,8 @@ async fn test_mtls_auth_allowed_issuers_multiple_filters_or_logic() {
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
         "allowed_issuers": [
-            {"cn": "Internal CA"},
-            {"cn": "Partner CA"}
+            issuer_filter(&internal_ca_der, Some("Internal CA"), None, None),
+            issuer_filter(&partner_ca_der, Some("Partner CA"), None, None)
         ]
     }))
     .unwrap();
@@ -448,7 +697,7 @@ async fn test_mtls_auth_allowed_issuers_multiple_filters_or_logic() {
 
 #[tokio::test]
 async fn test_mtls_auth_allowed_issuers_multi_field_and_logic() {
-    let (_ca_der, client_der) =
+    let (ca_der, client_der) =
         create_ca_signed_cert("Internal CA", Some("My Corp"), None, "client.example.com");
     let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
     let index = ConsumerIndex::new(&[consumer]);
@@ -456,7 +705,7 @@ async fn test_mtls_auth_allowed_issuers_multi_field_and_logic() {
     // Both cn AND o must match (AND logic within a filter)
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
-        "allowed_issuers": [{"cn": "Internal CA", "o": "My Corp"}]
+        "allowed_issuers": [issuer_filter(&ca_der, Some("Internal CA"), Some("My Corp"), None)]
     }))
     .unwrap();
     let mut ctx = create_ctx_with_cert(client_der);
@@ -467,34 +716,30 @@ async fn test_mtls_auth_allowed_issuers_multi_field_and_logic() {
 }
 
 #[tokio::test]
-async fn test_mtls_auth_allowed_issuers_multi_field_rejects_partial_match() {
-    let (_ca_der, client_der) =
+async fn test_mtls_auth_allowed_issuers_rejects_dn_that_disagrees_with_pin() {
+    let (ca_der, _client_der) =
         create_ca_signed_cert("Internal CA", Some("My Corp"), None, "client.example.com");
-    let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
-    let index = ConsumerIndex::new(&[consumer]);
-
-    // CN matches but O doesn't — AND logic should reject
-    let plugin = MtlsAuth::new(&json!({
+    let error = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
-        "allowed_issuers": [{"cn": "Internal CA", "o": "Other Corp"}]
+        "allowed_issuers": [issuer_filter(&ca_der, Some("Internal CA"), Some("Other Corp"), None)]
     }))
-    .unwrap();
-    let mut ctx = create_ctx_with_cert(client_der);
-
-    let result = plugin.authenticate(&mut ctx, &index).await;
-    assert_reject(result, Some(403));
+    .err()
+    .expect("DN labels that disagree with the pinned CA must be rejected");
+    assert!(error.contains("DN fields do not match"), "got: {error}");
 }
 
 #[tokio::test]
 async fn test_mtls_auth_issuer_rejection_body_is_valid_json_with_control_chars() {
     let (_ca_der, client_der) =
         create_ca_signed_cert("Internal\nCA", None, None, "client.example.com");
+    let (external_ca_der, _) =
+        create_ca_signed_cert("External CA", None, None, "unused.example.com");
     let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
     let index = ConsumerIndex::new(&[consumer]);
 
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
-        "allowed_issuers": [{"cn": "External CA"}]
+        "allowed_issuers": [issuer_filter(&external_ca_der, Some("External CA"), None, None)]
     }))
     .unwrap();
     let mut ctx = create_ctx_with_cert(client_der);
@@ -514,7 +759,7 @@ async fn test_mtls_auth_issuer_rejection_body_is_valid_json_with_control_chars()
 
 #[tokio::test]
 async fn test_mtls_auth_allowed_issuers_with_ou() {
-    let (_ca_der, client_der) = create_ca_signed_cert(
+    let (ca_der, client_der) = create_ca_signed_cert(
         "Internal CA",
         Some("My Corp"),
         Some("Engineering"),
@@ -525,7 +770,7 @@ async fn test_mtls_auth_allowed_issuers_with_ou() {
 
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
-        "allowed_issuers": [{"ou": "Engineering"}]
+        "allowed_issuers": [issuer_filter(&ca_der, None, None, Some("Engineering"))]
     }))
     .unwrap();
     let mut ctx = create_ctx_with_cert(client_der);
@@ -533,6 +778,28 @@ async fn test_mtls_auth_allowed_issuers_with_ou() {
     let result = plugin.authenticate(&mut ctx, &index).await;
     assert_continue(result);
     assert!(ctx.identified_consumer.is_some());
+}
+
+#[tokio::test]
+async fn test_mtls_auth_allowed_issuer_rejects_same_dn_different_key() {
+    let (pinned_ca_der, pinned_client_der) =
+        create_ca_signed_cert("Shared CA Name", None, None, "client.example.com");
+    let (_impostor_ca_der, impostor_client_der) =
+        create_ca_signed_cert("Shared CA Name", None, None, "client.example.com");
+    let plugin = MtlsAuth::new(&json!({
+        "allowed_issuers": [issuer_filter(&pinned_ca_der, Some("Shared CA Name"), None, None)]
+    }))
+    .unwrap();
+    let index = ConsumerIndex::new(&[create_mtls_consumer("c1", "alice", "client.example.com")]);
+
+    let mut pinned_ctx = create_ctx_with_cert(pinned_client_der);
+    assert_continue(plugin.authenticate(&mut pinned_ctx, &index).await);
+
+    let mut impostor_ctx = create_ctx_with_cert(impostor_client_der);
+    assert_reject(
+        plugin.authenticate(&mut impostor_ctx, &index).await,
+        Some(403),
+    );
 }
 
 // --- CA fingerprint tests ---
@@ -616,7 +883,7 @@ async fn test_mtls_auth_both_issuer_and_fingerprint_must_pass() {
     // Both constraints configured — both must pass (AND logic)
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
-        "allowed_issuers": [{"cn": "Internal CA"}],
+        "allowed_issuers": [issuer_filter(&ca_der, Some("Internal CA"), None, None)],
         "allowed_ca_fingerprints_sha256": [ca_fingerprint]
     }))
     .unwrap();
@@ -637,7 +904,7 @@ async fn test_mtls_auth_issuer_pass_fingerprint_fail_rejects() {
     // Issuer matches but fingerprint doesn't — should reject
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
-        "allowed_issuers": [{"cn": "Internal CA"}],
+        "allowed_issuers": [issuer_filter(&ca_der, Some("Internal CA"), None, None)],
         "allowed_ca_fingerprints_sha256": ["0000000000000000000000000000000000000000000000000000000000000000"]
     })).unwrap();
     let mut ctx = create_ctx_with_cert_and_chain(client_der, vec![ca_der]);
@@ -726,14 +993,15 @@ async fn test_mtls_auth_no_issuer_constraints_allows_any_ca() {
 
 #[tokio::test]
 async fn test_mtls_auth_self_signed_cert_issuer_is_self() {
-    // Self-signed cert has issuer == subject
-    let cert_der = create_test_cert("client.example.com", None, None);
+    // A pinned self-signed CA certificate has issuer == subject and verifies with its own key.
+    let (cert_der, _) =
+        create_ca_signed_cert("client.example.com", None, None, "unused.example.com");
     let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
     let index = ConsumerIndex::new(&[consumer]);
 
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
-        "allowed_issuers": [{"cn": "client.example.com"}]
+        "allowed_issuers": [issuer_filter(&cert_der, Some("client.example.com"), None, None)]
     }))
     .unwrap();
     let mut ctx = create_ctx_with_cert(cert_der);
@@ -818,16 +1086,20 @@ fn test_mtls_auth_rejects_empty_allowed_issuer_filter() {
         .err()
         .expect("empty issuer filter must be rejected");
     assert!(
-        err.contains("must specify at least one field"),
+        err.contains("ca_certificate_pem") && err.contains("required"),
         "got: {err}"
     );
 }
 
 #[test]
 fn test_mtls_auth_rejects_non_string_allowed_issuer_field() {
-    let err = MtlsAuth::new(&json!({"allowed_issuers": [{"cn": 42}]}))
-        .err()
-        .expect("non-string issuer field must be rejected");
+    let (ca_der, _) = create_ca_signed_cert("CA", None, None, "unused.example.com");
+    let err = MtlsAuth::new(&json!({"allowed_issuers": [{
+        "cn": 42,
+        "ca_certificate_pem": cert_der_to_pem(&ca_der)
+    }]}))
+    .err()
+    .expect("non-string issuer field must be rejected");
     assert!(err.contains("allowed_issuers[0].cn"), "got: {err}");
 }
 
@@ -877,6 +1149,95 @@ fn test_mtls_auth_rejects_malformed_ca_fingerprint() {
     assert!(err.contains("64 hex characters"), "got: {err}");
 }
 
+#[test]
+fn test_mtls_auth_rejects_unknown_top_level_field() {
+    let error = MtlsAuth::new(&json!({"cert_field": "subject_cn", "typo": true}))
+        .err()
+        .expect("unknown top-level fields must fail closed");
+    assert!(error.contains("unsupported field 'typo'"), "got: {error}");
+}
+
+#[test]
+fn test_mtls_auth_rejects_explicit_empty_constraint_arrays_and_nulls() {
+    for config in [
+        json!({"allowed_issuers": []}),
+        json!({"allowed_issuers": null}),
+        json!({"allowed_ca_fingerprints_sha256": []}),
+        json!({"allowed_ca_fingerprints_sha256": null}),
+    ] {
+        assert!(
+            MtlsAuth::new(&config).is_err(),
+            "constraint must not silently disable itself: {config}"
+        );
+    }
+}
+
+#[test]
+fn test_mtls_auth_rejects_malformed_or_ambiguous_ca_pem() {
+    let (ca_der, _) = create_ca_signed_cert("Internal CA", None, None, "unused.example.com");
+    let pem = cert_der_to_pem(&ca_der);
+    for ca_certificate_pem in [
+        "-----BEGIN CERTIFICATE-----\nnot-base64\n-----END CERTIFICATE-----\n".to_string(),
+        format!("{pem}{pem}"),
+        "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n".to_string(),
+    ] {
+        let error = MtlsAuth::new(&json!({
+            "allowed_issuers": [{
+                "cn": "Internal CA",
+                "ca_certificate_pem": ca_certificate_pem
+            }]
+        }))
+        .err()
+        .expect("malformed or multi-item CA PEM must be rejected");
+        assert!(error.contains("ca_certificate_pem"), "got: {error}");
+    }
+}
+
+#[test]
+fn test_mtls_auth_rejects_non_ca_issuer_pin() {
+    let leaf_der = create_test_cert("Not A CA", None, None);
+    let error = MtlsAuth::new(&json!({
+        "allowed_issuers": [{
+            "cn": "Not A CA",
+            "ca_certificate_pem": cert_der_to_pem(&leaf_der)
+        }]
+    }))
+    .err()
+    .expect("issuer pins must be CA certificates");
+    assert!(
+        error.contains("must contain a CA certificate"),
+        "got: {error}"
+    );
+}
+
+#[tokio::test]
+async fn test_mtls_auth_connection_cache_reuses_crypto_but_refreshes_consumer_lookup() {
+    let cert_der = Arc::new(create_test_cert("client.example.com", None, None));
+    let cache = Arc::new(MtlsAuthConnectionCache::new());
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
+    let index = ConsumerIndex::new(&[create_mtls_consumer("c1", "alice", "client.example.com")]);
+
+    let mut first_ctx = create_ctx_with_cert(Vec::new());
+    first_ctx.tls_client_cert_der = Some(Arc::clone(&cert_der));
+    first_ctx.mtls_auth_connection_cache = Some(Arc::clone(&cache));
+    assert_continue(plugin.authenticate(&mut first_ctx, &index).await);
+    assert_eq!(
+        first_ctx.identified_consumer.as_ref().unwrap().username,
+        "alice"
+    );
+
+    index.rebuild(&[create_mtls_consumer("c2", "bob", "client.example.com")]);
+    let mut second_ctx = create_ctx_with_cert(Vec::new());
+    second_ctx.tls_client_cert_der = Some(Arc::clone(&cert_der));
+    second_ctx.mtls_auth_connection_cache = Some(Arc::clone(&cache));
+    assert_continue(plugin.authenticate(&mut second_ctx, &index).await);
+    assert_eq!(
+        second_ctx.identified_consumer.as_ref().unwrap().username,
+        "bob"
+    );
+    assert_eq!(cache.evaluation_count(), 1);
+}
+
 // --- Consumer index tests ---
 
 #[test]
@@ -890,6 +1251,21 @@ fn test_consumer_index_mtls_lookup() {
 
     // Unknown identity should return None
     assert!(index.find_by_mtls_identity("unknown").is_none());
+}
+
+#[test]
+fn test_consumer_index_mtls_dns_lookup_is_case_insensitive() {
+    let consumer = create_mtls_consumer("c1", "alice", "Api.Example.COM");
+    let index = ConsumerIndex::new(&[consumer]);
+
+    assert_eq!(
+        index
+            .find_by_mtls_dns_identity("api.example.com")
+            .unwrap()
+            .username,
+        "alice"
+    );
+    assert!(index.find_by_mtls_identity("api.example.com").is_none());
 }
 
 #[test]
@@ -1110,7 +1486,7 @@ async fn test_mtls_auth_dtls_with_allowed_issuer() {
     let consumer = create_mtls_consumer("c1", "bob", "dtls-client.example.com");
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
-        "allowed_issuers": [{"cn": "Test CA"}]
+        "allowed_issuers": [issuer_filter(&ca_der, Some("Test CA"), Some("TestOrg"), None)]
     }))
     .unwrap();
     let mut ctx = StreamConnectionContext {
@@ -1126,7 +1502,9 @@ async fn test_mtls_auth_dtls_with_allowed_issuer() {
         auth_method: None,
         metadata: None,
         tls_client_cert_der: Some(Arc::new(client_der)),
-        tls_client_cert_chain_der: Some(Arc::new(vec![ca_der])),
+        // The DTLS implementation exposes the leaf only. The configured CA pin
+        // still verifies the leaf signature without requiring the root in-chain.
+        tls_client_cert_chain_der: None,
         sni_hostname: None,
         mesh_direction: None,
         node_waypoint_policy_scope: None,
@@ -1143,10 +1521,11 @@ async fn test_mtls_auth_dtls_with_allowed_issuer() {
 async fn test_mtls_auth_dtls_allowed_issuer_rejects_mismatch() {
     let (ca_der, client_der) =
         create_ca_signed_cert("Test CA", Some("TestOrg"), None, "dtls-client.example.com");
+    let (other_ca_der, _) = create_ca_signed_cert("Other CA", None, None, "unused.example.com");
     let consumer = create_mtls_consumer("c1", "bob", "dtls-client.example.com");
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
-        "allowed_issuers": [{"cn": "Other CA"}]
+        "allowed_issuers": [issuer_filter(&other_ca_der, Some("Other CA"), None, None)]
     }))
     .unwrap();
     let mut ctx = StreamConnectionContext {
