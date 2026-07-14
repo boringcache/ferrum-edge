@@ -176,7 +176,7 @@ impl AuthTestHarness {
         let gw = TestGateway::builder()
             .jwt_secret("test-admin-jwt-secret-key-1234567890")
             .jwt_issuer("ferrum-edge-auth-test")
-            .basic_auth_hmac_secret("test-hmac-server-secret")
+            .basic_auth_hmac_secret("test-hmac-server-secret-0123456789abcdef")
             .log_level("info")
             .spawn()
             .await?;
