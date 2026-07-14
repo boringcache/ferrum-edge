@@ -8046,7 +8046,7 @@ components:
 
     MeshTrafficPolicyTls:
       type: object
-      required: [mode, subject_alt_names, insecure_skip_verify]
+      required: [mode, insecure_skip_verify]
       properties:
         mode:
           type: string
@@ -13127,7 +13127,8 @@ components:
         runtime_overlay_scope:
           type: string
           minLength: 1
-          description: Optional RTDS boolean key controlling whether the transformer runs.
+          pattern: "\\S"
+          description: Optional RTDS boolean key controlling whether the transformer runs. Must contain at least one non-whitespace character; surrounding whitespace is trimmed at runtime.
         default_enabled:
           type: boolean
           default: true
@@ -13187,7 +13188,8 @@ components:
         runtime_overlay_scope:
           type: string
           minLength: 1
-          description: Optional RTDS boolean key controlling whether the transformer runs.
+          pattern: "\\S"
+          description: Optional RTDS boolean key controlling whether the transformer runs. Must contain at least one non-whitespace character; surrounding whitespace is trimmed at runtime.
         default_enabled:
           type: boolean
           default: true
@@ -14548,7 +14550,7 @@ components:
         function_url:
           type: string
           format: uri
-          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://"
+          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^/?#\\s]+"
           description: "HTTP(S) trigger URL. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda invocation (the URL is derived from region + function name), but still validated when supplied."
         aws_region:
           type: string
@@ -14571,7 +14573,7 @@ components:
         aws_endpoint_url:
           type: string
           format: uri
-          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://"
+          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://[^/?#\\s]+"
           description: >-
             Optional HTTP(S) Lambda endpoint override for LocalStack or a
             VPC-internal endpoint. Falls back to `AWS_LAMBDA_ENDPOINT_URL`.

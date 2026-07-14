@@ -987,6 +987,36 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
         }),
         false,
     );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https:///api/transform"
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "ServerlessFunctionConfig",
+        &json!({
+            "provider": "aws_lambda",
+            "aws_endpoint_url": "http:///lambda"
+        }),
+        false,
+    );
+
+    for component in ["RequestTransformerConfig", "ResponseTransformerConfig"] {
+        assert_component_validity(
+            &spec,
+            component,
+            &json!({
+                "rules": [{"operation": "remove", "key": "x-review-pin"}],
+                "runtime_overlay_scope": " \t "
+            }),
+            false,
+        );
+    }
 }
 
 fn assert_component_validity(
@@ -1035,8 +1065,7 @@ fn upstream_runtime_serialization_is_covered_by_openapi() {
                 "hash_on": "header:x-tenant",
                 "tls": {
                     "mode": "simple",
-                    "sni": "backend.example",
-                    "subject_alt_names": ["backend.example"]
+                    "sni": "backend.example"
                 },
                 "connect_timeout_ms": 750,
                 "passive_health_check": {}
@@ -1075,6 +1104,12 @@ fn upstream_runtime_serialization_is_covered_by_openapi() {
     }))
     .expect("representative upstream deserializes");
     let serialized = serde_json::to_value(upstream).expect("upstream serializes");
+    assert!(
+        serialized
+            .pointer("/subsets/0/traffic_policy/tls/subject_alt_names")
+            .is_none(),
+        "empty subject_alt_names must be omitted by MeshTrafficPolicyTls serialization"
+    );
 
     assert_component_validity(&spec, "Upstream", &serialized, true);
 }
