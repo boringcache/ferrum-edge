@@ -2042,7 +2042,10 @@ impl Plugin for AiSemanticFirewall {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        if !self.requires_response_body_buffering() || is_native_grpc_request(ctx) {
+        if !self.requires_response_body_buffering()
+            || ctx.method.eq_ignore_ascii_case("HEAD")
+            || is_native_grpc_request(ctx)
+        {
             return false;
         }
         // `buffer` mode pins this response onto the buffered path even when an
@@ -2086,7 +2089,10 @@ impl Plugin for AiSemanticFirewall {
         response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
-        if !self.requires_response_body_buffering() || is_native_grpc_request(ctx) {
+        if !self.requires_response_body_buffering()
+            || ctx.method.eq_ignore_ascii_case("HEAD")
+            || is_native_grpc_request(ctx)
+        {
             return false;
         }
 
@@ -2206,6 +2212,9 @@ impl Plugin for AiSemanticFirewall {
         if !self.enabled || !self.inspect_response || !self.has_response_rules {
             return PluginResult::Continue;
         }
+        if ctx.method.eq_ignore_ascii_case("HEAD") {
+            return PluginResult::Continue;
+        }
         if !(200..300).contains(&response_status) || matches!(response_status, 204 | 205) {
             return PluginResult::Continue;
         }
@@ -2215,7 +2224,9 @@ impl Plugin for AiSemanticFirewall {
                 .engine
                 .handle_uninspectable_body(ctx, Direction::Response, "empty_body");
         }
-        if has_non_identity_content_encoding(response_headers) {
+        if has_non_identity_content_encoding(response_headers)
+            && !gateway_response_compression_planned(ctx, response_headers)
+        {
             self.set_response_hash(ctx, sha256_hex_bytes(body));
             return self
                 .engine
@@ -2237,6 +2248,9 @@ impl Plugin for AiSemanticFirewall {
         body: &[u8],
     ) -> PluginResult {
         if !self.enabled || !self.inspect_response || !self.has_response_rules {
+            return PluginResult::Continue;
+        }
+        if ctx.method.eq_ignore_ascii_case("HEAD") {
             return PluginResult::Continue;
         }
         if !(200..300).contains(&response_status) || matches!(response_status, 204 | 205) {
@@ -3368,12 +3382,15 @@ impl StreamWindowEngine {
                 }
             }
         }
-        // Bound retained tool-call arguments the same way: the window just
-        // inspected them clean, so drop all but the overlap tail. (These have no
-        // linear prose offset, so they are trimmed independently of `cleared_len`
-        // — the prose-based raw-frame release above is unaffected.)
-        self.reassembler
-            .truncate_streamed_tool_args(self.config.overlap_bytes);
+        // Bound retained tool-call names/arguments the same way: the window just
+        // inspected them clean, so prose and every attacker-selected tool index
+        // share one aggregate overlap budget. These fields have no linear prose
+        // offset, so give them only the budget not already occupied by prose.
+        let tool_overlap = self
+            .config
+            .overlap_bytes
+            .saturating_sub(self.reassembler.assistant_content_len());
+        self.reassembler.truncate_streamed_tool_state(tool_overlap);
         out
     }
 
@@ -4819,6 +4836,22 @@ fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool 
     content_encoding_value(headers).is_some()
 }
 
+/// The compression plugin advertises its selected encoding in headers during
+/// `after_proxy`, before it transforms a buffered plaintext body. Its private
+/// algorithm marker distinguishes that planned gateway representation from an
+/// already-encoded origin body at the initial inspection hook.
+fn gateway_response_compression_planned(
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+) -> bool {
+    let Some(encoding) = content_encoding_value(headers) else {
+        return false;
+    };
+    ctx.metadata
+        .get("compression:algorithm")
+        .is_some_and(|algorithm| algorithm.eq_ignore_ascii_case(encoding))
+}
+
 fn strip_json_bom(body: &[u8]) -> &[u8] {
     body.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(body)
 }
@@ -5605,6 +5638,29 @@ mod stream_window_tests {
                 .any(|t| t.kind == SseTextKind::ChatToolArguments && t.text.contains("rm -rf")),
             "tool-call arguments must be inspectable: {texts:?}"
         );
+    }
+
+    #[test]
+    fn released_long_tool_name_keeps_capacity_for_later_events() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Bytes, 4096, 64));
+        let long_name = "N".repeat(800);
+        let tool = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"name\":\"{long_name}\",\"arguments\":\"\"}}}}]}}}}]}}\n\n"
+        )
+        .into_bytes();
+        assert!(!ingest(&mut eng, &tool));
+        assert!(finish(&mut eng));
+        let _ = eng.release();
+        assert!(
+            eng.retained_bytes() <= 64,
+            "released tool state exceeded overlap: {}",
+            eng.retained_bytes()
+        );
+
+        let next = content_event("later");
+        let step = eng.ingest_step(&next);
+        assert!(step.consumed > 0, "retained tool state stalled the stream");
+        assert!(eng.retained_bytes() <= 4096);
     }
 
     #[test]

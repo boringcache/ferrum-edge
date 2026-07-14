@@ -15212,7 +15212,6 @@ components:
           properties:
             request_json_paths:
               type: array
-              minItems: 1
               items:
                 type: string
                 enum:
@@ -15246,7 +15245,6 @@ components:
               description: Supported simple request extraction paths. When configured, this list replaces the defaults.
             response_json_paths:
               type: array
-              minItems: 1
               items:
                 type: string
                 enum:

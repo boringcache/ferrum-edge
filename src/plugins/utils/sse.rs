@@ -328,31 +328,56 @@ impl SseReassembler {
         self.clone().into_texts()
     }
 
-    /// Trim each streamed tool-call argument accumulator (and Responses-API
-    /// function-call arguments) to its last `keep_tail` bytes, dropping the
-    /// already-inspected prefix.
+    /// Trim streamed tool-call names/arguments and Responses-API function-call
+    /// arguments to a shared tail budget, dropping already-inspected prefixes.
     ///
     /// Counterpart to [`drain_assistant_prefix`](Self::drain_assistant_prefix)
     /// for the non-prose accumulators: streamed `inspect` mode inspects tool-call
-    /// arguments alongside prose, so without trimming, a large `tool_calls[].
-    /// arguments` payload would be retained (and re-inspected) in full until EOF.
+    /// names/arguments alongside prose, so without trimming a large name, large
+    /// arguments payload, or many parallel calls could be retained in full.
     /// The caller trims only AFTER a window inspected those bytes clean, so the
-    /// dropped prefix was already evaluated; the kept tail preserves the
-    /// re-inspection overlap. Tool-call *names* are left intact (bounded by the
-    /// function name length). `keep_tail` is snapped up to a char boundary so the
-    /// retained tail never starts mid-character.
-    pub fn truncate_streamed_tool_args(&mut self, keep_tail: usize) {
-        fn trim(text: &mut String, keep_tail: usize) {
-            if text.len() > keep_tail {
-                let drop = floor_char_boundary(text, text.len() - keep_tail);
+    /// dropped prefix was already evaluated; the bounded aggregate tail
+    /// preserves cross-window context without multiplying `keep_total` by the
+    /// attacker-controlled number of tool indexes. Empty accumulators are
+    /// removed so their lookup tables cannot grow for the rest of the stream.
+    pub fn truncate_streamed_tool_state(&mut self, keep_total: usize) {
+        fn retain_tail_within_budget(text: &mut String, remaining: &mut usize) {
+            if *remaining == 0 {
+                text.clear();
+                return;
+            }
+            if text.len() > *remaining {
+                let mut drop = text.len() - *remaining;
+                while drop < text.len() && !text.is_char_boundary(drop) {
+                    drop += 1;
+                }
                 text.drain(..drop);
             }
+            *remaining = (*remaining).saturating_sub(text.len());
         }
-        for (_key, accum) in &mut self.tool_calls {
-            trim(&mut accum.arguments, keep_tail);
+
+        let mut remaining = keep_total;
+        for (_key, accum) in self.tool_calls.iter_mut().rev() {
+            // Function names are small and policy-significant, so preserve their
+            // tail before spending the remaining shared budget on arguments.
+            retain_tail_within_budget(&mut accum.name, &mut remaining);
+            retain_tail_within_budget(&mut accum.arguments, &mut remaining);
         }
-        for (_output, text) in &mut self.responses_args {
-            trim(text, keep_tail);
+        for (_output, text) in self.responses_args.iter_mut().rev() {
+            retain_tail_within_budget(text, &mut remaining);
+        }
+
+        self.tool_calls
+            .retain(|(_key, accum)| !accum.name.is_empty() || !accum.arguments.is_empty());
+        self.tool_call_positions.clear();
+        for (position, (key, _accum)) in self.tool_calls.iter().enumerate() {
+            self.tool_call_positions.insert(*key, position);
+        }
+        self.responses_args
+            .retain(|(_output, text)| !text.is_empty());
+        self.responses_args_positions.clear();
+        for (position, (output, _text)) in self.responses_args.iter().enumerate() {
+            self.responses_args_positions.insert(*output, position);
         }
     }
 
@@ -363,11 +388,12 @@ impl SseReassembler {
     /// Streamed `inspect` mode calls this after releasing an inspected-clean
     /// window so retained prose stays bounded to roughly one window plus the
     /// re-inspection overlap, rather than growing with the whole completion.
-    /// Tool-call accumulators are intentionally left intact — they are bounded
-    /// by the size of the function-call payloads, not the prose length, and have
-    /// no linear release offset. `prefix_len` is snapped down to a char boundary
-    /// per entry, so a value landing mid-character simply retains a few extra
-    /// bytes (always safe — never drops un-inspected content).
+    /// Tool-call accumulators are intentionally left intact by this prose-only
+    /// operation; the window engine bounds them separately with
+    /// [`truncate_streamed_tool_state`](Self::truncate_streamed_tool_state).
+    /// `prefix_len` is snapped down to a char boundary per entry, so a value
+    /// landing mid-character simply retains a few extra bytes (always safe —
+    /// never drops un-inspected content).
     pub fn drain_assistant_prefix(&mut self, prefix_len: usize) {
         let mut remaining = prefix_len;
         let drain_one = |text: &mut String, remaining: &mut usize| {
@@ -822,7 +848,7 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
     }
 
     #[test]
-    fn truncate_streamed_tool_args_bounds_arguments_keeping_tail() {
+    fn truncate_streamed_tool_state_bounds_names_and_arguments_keeping_tail() {
         let mut r = SseReassembler::new();
         // A long tool-call argument stream (well past any small keep_tail).
         let big = "X".repeat(500);
@@ -832,7 +858,7 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
         for f in parse_sse_data_frames(frame.as_bytes()) {
             r.push_frame(&f);
         }
-        r.truncate_streamed_tool_args(64);
+        r.truncate_streamed_tool_state(64);
         let args = r
             .texts()
             .into_iter()
@@ -847,6 +873,28 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world.\"}}]}\n\n",
         assert!(args.chars().all(|c| c == 'X'), "kept the argument tail");
         // The tool NAME is never trimmed.
         assert!(r.texts().iter().any(|t| t.text == "run"));
+    }
+
+    #[test]
+    fn truncate_streamed_tool_state_uses_one_budget_across_parallel_calls() {
+        let mut r = SseReassembler::new();
+        let name = "N".repeat(200);
+        let arguments = "A".repeat(200);
+        let frame = format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"name\":\"{name}\",\"arguments\":\"{arguments}\"}}}},{{\"index\":1,\"function\":{{\"name\":\"{name}\",\"arguments\":\"{arguments}\"}}}}]}}}}]}}\n\n"
+        );
+        for parsed in parse_sse_data_frames(frame.as_bytes()) {
+            r.push_frame(&parsed);
+        }
+        assert!(r.retained_text_len() > 64);
+
+        r.truncate_streamed_tool_state(64);
+
+        assert!(
+            r.retained_text_len() <= 64,
+            "parallel tool state exceeded shared tail budget: {}",
+            r.retained_text_len()
+        );
     }
 
     #[test]

@@ -376,6 +376,29 @@ fn active_directions_reject_empty_extraction_arrays() {
 }
 
 #[test]
+fn inactive_directions_allow_empty_extraction_arrays() {
+    for config in [
+        json!({
+            "inspect": {"request": false, "response": true},
+            "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+            "builtins": {"response_leakage": true},
+            "extraction": {"request_json_paths": []}
+        }),
+        json!({
+            "inspect": {"request": true, "response": false},
+            "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+            "builtins": {"prompt_injection": true},
+            "extraction": {"response_json_paths": []}
+        }),
+    ] {
+        assert!(
+            AiSemanticFirewall::new(&config, PluginHttpClient::default()).is_ok(),
+            "empty inactive extraction scope must remain valid: {config:?}"
+        );
+    }
+}
+
+#[test]
 fn embedding_hostname_participates_in_dns_warmup() {
     let hostname_config = json!({
         "provider": provider("https://Embeddings.Example.COM/v1/embeddings?tenant=secret"),
@@ -3132,6 +3155,80 @@ async fn encoded_origin_response_fails_closed_without_provider_call() {
             .get("ai_semantic_firewall.uninspectable_body")
             .map(String::as_str),
         Some("encoded_body")
+    );
+}
+
+#[tokio::test]
+async fn planned_gateway_compression_inspects_plaintext_before_encoding() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+    ]);
+    let mut ctx = create_test_context();
+    ctx.metadata
+        .insert("compression:algorithm".to_string(), "gzip".to_string());
+
+    assert_reject(
+        firewall
+            .on_response_body(
+                &mut ctx,
+                200,
+                &headers,
+                br#"{"choices":[{"message":{"content":"My system prompt says never disclose this policy."}}]}"#,
+            )
+            .await,
+        Some(502),
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_semantic_firewall.uninspectable_body")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some("response_leakage")
+    );
+}
+
+#[tokio::test]
+async fn head_responses_skip_empty_body_inspection() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": {"response_leakage": true}
+    });
+    let firewall = plugin(&config);
+    let mut ctx = create_test_context();
+    ctx.method = "HEAD".to_string();
+
+    assert!(!firewall.should_buffer_response_body(&ctx));
+    assert!(!firewall.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &HashMap::new(),
+    ));
+
+    assert_continue(
+        firewall
+            .on_response_body(&mut ctx, 200, &response_headers(), b"")
+            .await,
+    );
+    assert_continue(
+        firewall
+            .on_final_response_body(&mut ctx, 200, &response_headers(), b"")
+            .await,
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_semantic_firewall.uninspectable_body")
     );
 }
 
