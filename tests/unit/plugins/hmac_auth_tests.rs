@@ -153,34 +153,37 @@ fn sign_sha256_with_digest(
 ) -> String {
     sign_sha256_for_identity(
         secret,
-        TEST_USERNAME,
-        TEST_AUTHORITY,
-        method,
-        path,
-        "",
-        date,
-        digest_header,
+        HmacSigningInput {
+            username: TEST_USERNAME,
+            authority: TEST_AUTHORITY,
+            method,
+            path,
+            query: "",
+            date,
+            digest_header,
+        },
     )
 }
 
-fn sign_sha256_for_identity(
-    secret: &str,
-    username: &str,
-    authority: &str,
-    method: &str,
-    path: &str,
-    query: &str,
-    date: &str,
-    digest_header: &str,
-) -> String {
+struct HmacSigningInput<'a> {
+    username: &'a str,
+    authority: &'a str,
+    method: &'a str,
+    path: &'a str,
+    query: &'a str,
+    date: &'a str,
+    digest_header: &'a str,
+}
+
+fn sign_sha256_for_identity(secret: &str, input: HmacSigningInput<'_>) -> String {
     let signing_string = build_signing_string(
-        username,
-        authority,
-        method,
-        path,
-        query,
-        date,
-        digest_header,
+        input.username,
+        input.authority,
+        input.method,
+        input.path,
+        input.query,
+        input.date,
+        input.digest_header,
     );
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(signing_string.as_bytes());
@@ -198,13 +201,15 @@ fn sign_sha256_with_query(
     let digest_header = sha256_digest_header(&[]);
     sign_sha256_for_identity(
         secret,
-        TEST_USERNAME,
-        TEST_AUTHORITY,
-        method,
-        path,
-        query,
-        date,
-        &digest_header,
+        HmacSigningInput {
+            username: TEST_USERNAME,
+            authority: TEST_AUTHORITY,
+            method,
+            path,
+            query,
+            date,
+            digest_header: &digest_header,
+        },
     )
 }
 
@@ -359,13 +364,15 @@ async fn test_auth_params_accept_quoted_commas_escapes_and_mixed_case_names() {
     let digest = sha256_digest_header(&[]);
     let signature = sign_sha256_for_identity(
         TEST_SECRET,
-        username,
-        TEST_AUTHORITY,
-        method,
-        path,
-        "",
-        &date,
-        &digest,
+        HmacSigningInput {
+            username,
+            authority: TEST_AUTHORITY,
+            method,
+            path,
+            query: "",
+            date: &date,
+            digest_header: &digest,
+        },
     );
     let mut ctx = make_ctx(method, path);
     ctx.headers.insert(
@@ -415,13 +422,15 @@ async fn test_signature_binds_authority_and_username() {
     let digest = sha256_digest_header(&[]);
     let signature = sign_sha256_for_identity(
         shared,
-        "alice",
-        TEST_AUTHORITY,
-        "GET",
-        "/bound",
-        "",
-        &date,
-        &digest,
+        HmacSigningInput {
+            username: "alice",
+            authority: TEST_AUTHORITY,
+            method: "GET",
+            path: "/bound",
+            query: "",
+            date: &date,
+            digest_header: &digest,
+        },
     );
 
     let mut relabeled = make_ctx("GET", "/bound");

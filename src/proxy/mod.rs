@@ -7070,6 +7070,13 @@ impl ProxyState {
         new_config.normalize_fields();
         // Resolve upstream TLS into each proxy's resolved_tls before applying.
         new_config.resolve_upstream_tls();
+        // Full snapshots can arrive from sources that bypass the SQL/Mongo
+        // loaders, notably CP-to-DP config sync. Quarantine malformed, weak,
+        // or cross-Consumer duplicate HMAC credentials at the common swap
+        // boundary so none can reach the runtime ConsumerIndex.
+        for message in new_config.quarantine_invalid_hmac_credentials() {
+            error!("Config reload: {}", message);
+        }
         inject_gateway_workload_metrics_if_svid(
             &mut new_config,
             &self.gateway_svid_bundle,
@@ -7672,11 +7679,12 @@ impl ProxyState {
         new_config.normalize_fields();
         new_config.resolve_upstream_tls();
         // Fail-closed hmac_auth secret policy for point-loaded consumer rows:
-        // full loads quarantine weak/duplicate hmac secrets in the loaders,
-        // but incremental polls merge raw changed rows here. Unlike consumer
-        // identities (whose persistence-level index blocks out-of-band
-        // collisions), hmac secrets have no storage constraint, so strip
-        // violations before the merged snapshot publishes.
+        // full snapshots quarantine weak/duplicate hmac secrets in
+        // `update_config`, but incremental polls merge raw changed rows and
+        // publish through a separate path here. Unlike consumer identities
+        // (whose persistence-level index blocks out-of-band collisions), hmac
+        // secrets have no storage constraint, so strip violations before the
+        // merged snapshot publishes.
         for message in new_config.quarantine_invalid_hmac_credentials() {
             error!("Incremental config: {}", message);
         }

@@ -364,6 +364,39 @@ async fn update_config_rejected_candidate_reports_rejected() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn update_config_quarantines_invalid_hmac_credentials_before_full_snapshot_swap() {
+    let state = empty_proxy_state();
+    let shared_secret = "shared-hmac-secret-at-least-32-characters";
+    let mut first = test_consumer("c1", "alice");
+    first.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": shared_secret}]),
+    );
+    let mut duplicate = test_consumer("c2", "bob");
+    duplicate.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": shared_secret}]),
+    );
+    let mut weak = test_consumer("c3", "carol");
+    weak.credentials.insert(
+        "hmac_auth".to_string(),
+        serde_json::json!([{"secret": "too-short"}]),
+    );
+
+    let outcome = state.update_config(GatewayConfig {
+        consumers: vec![first, duplicate, weak],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    });
+
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    let config = state.config.load();
+    assert!(config.consumers[0].has_credential("hmac_auth"));
+    assert!(!config.consumers[1].has_credential("hmac_auth"));
+    assert!(!config.consumers[2].has_credential("hmac_auth"));
+}
+
 /// Empty incremental result returns `Unchanged` so the polling loop can still
 /// advance `last_poll_at` (no work to retry).
 #[tokio::test(flavor = "multi_thread")]

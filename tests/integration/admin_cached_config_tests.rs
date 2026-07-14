@@ -1565,6 +1565,45 @@ async fn test_batch_create_consumers_and_proxies() {
 }
 
 #[tokio::test]
+async fn test_batch_create_rejects_hmac_secret_reused_by_persisted_consumer() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let shared_secret = "batch-shared-hmac-secret-at-least-32-characters";
+
+    let existing = json!({
+        "id": "existing-hmac-consumer",
+        "username": "alice",
+        "credentials": {"hmac_auth": [{"secret": shared_secret}]}
+    });
+    let (status, body) = admin_post(&base_url, "/consumers", &token, &existing).await;
+    assert_eq!(status, 201, "consumer seed should succeed: {body:?}");
+
+    let conflicting_batch = json!({
+        "consumers": [{
+            "id": "batch-hmac-consumer",
+            "username": "bob",
+            "credentials": {"hmac_auth": [{"secret": shared_secret}]}
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &conflicting_batch).await;
+
+    assert_eq!(status, 400, "batch HMAC reuse must be rejected: {body:?}");
+    assert!(
+        body["validation_errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|error| error
+                .as_str()
+                .is_some_and(|error| error.contains("Duplicate hmac_auth shared secret"))))
+    );
+    assert!(
+        !body.to_string().contains(shared_secret),
+        "validation response must not disclose the shared secret"
+    );
+}
+
+#[tokio::test]
 async fn test_batch_create_plugin_configs() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

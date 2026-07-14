@@ -4215,9 +4215,12 @@ async fn handle_batch_create(
             if let Err(errors) = candidate_config.validate_unique_mtls_credentials() {
                 validation_errors.extend(errors);
             }
+            if let Err(errors) = candidate_config.validate_unique_hmac_credentials() {
+                validation_errors.extend(errors);
+            }
         }
         Err(error) => validation_errors.push(format!(
-            "Failed to load namespace config for mTLS candidate validation: {}",
+            "Failed to load namespace config for credential candidate validation: {}",
             error
         )),
     }
