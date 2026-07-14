@@ -19,8 +19,8 @@ use url::{Host, Url};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::sse::{
-    SseReassembler, SseText, SseTextKind, encode_sse_error_event, floor_char_boundary,
-    last_paragraph_boundary, last_sentence_boundary, parse_sse_data_frames_checked,
+    SseReassembler, SseText, SseTextKind, encode_sse_error_event, last_paragraph_boundary,
+    last_sentence_boundary, parse_sse_data_frames_checked,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
@@ -75,13 +75,13 @@ const MAX_INSPECTION_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// instances on one proxy never consume one another's dedup state.
 static NEXT_FIREWALL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Chat-completions streaming `delta.*` response paths. These are reassembled
+/// Incremental chat/completions streaming response paths. These are reassembled
 /// across frames by [`SseReassembler`]; per-frame extraction must skip them or
 /// it re-introduces the meaningless per-fragment segments reassembly exists to
-/// avoid. Non-delta paths (`message.*`, `output_text`, `output[*].*`) are not
-/// listed here because per-frame extraction handles them correctly — they never
-/// match a streaming `delta` frame, so there is no double counting.
+/// avoid. Non-incremental paths (`message.*`, `output_text`, `output[*].*`) are
+/// not listed here because per-frame extraction handles them correctly.
 const SSE_DELTA_RESPONSE_PATHS: &[&str] = &[
+    "$.choices[*].text",
     "$.choices[*].delta.content",
     "$.choices[*].delta.tool_calls[*].function.name",
     "$.choices[*].delta.tool_calls[*].function.arguments",
@@ -912,7 +912,8 @@ impl AiSemanticFirewall {
 
         let segments = extract_request_segments(json, &self.engine.extraction);
         if segments.is_empty() {
-            return if looks_like_governed_request_json(json) {
+            return if !self.engine.allow_topics.is_empty() || looks_like_governed_request_json(json)
+            {
                 self.set_request_hash(ctx, sha256_hex_bytes(body));
                 self.engine.handle_uninspectable_body(
                     ctx,
@@ -2939,17 +2940,18 @@ fn extract_response_segments_from_json(
 /// Two passes, merged and deduped, so the buffered path inspects everything in
 /// the body:
 ///
-/// 1. **Delta reassembly.** Streaming bodies arrive as many tiny delta frames
-///    (`data: {"choices":[{"delta":{"content":"Hel"}}]}`); inspecting each frame
-///    in isolation is meaningless, so the deltas are concatenated per choice /
-///    tool call into coherent text first (see [`SseReassembler`]).
+/// 1. **Incremental reassembly.** Streaming bodies arrive as many tiny fragments
+///    (`data: {"choices":[{"delta":{"content":"Hel"}}]}` or legacy
+///    `choices[].text`); inspecting each frame in isolation is meaningless, so
+///    the fragments are concatenated per choice / tool call into coherent text
+///    first (see [`SseReassembler`]).
 /// 2. **Per-frame non-delta extraction.** A buffered stream can also carry
 ///    non-delta JSON events — a final `choices[].message.content` / `output_text`
 ///    summary, or a side-channel event — which could smuggle a violation past a
-///    clean delta stream. These are extracted per frame using only the non-delta
-///    paths; the chat-completions `delta.*` paths are excluded here because pass
-///    (1) already covers them and per-frame extraction would re-introduce the
-///    per-fragment segments reassembly exists to avoid.
+///    clean delta stream. These are extracted per frame using only the
+///    non-incremental paths; streamed `choices[].text` and `delta.*` paths are
+///    excluded here because pass (1) already covers them and per-frame extraction
+///    would re-introduce the per-fragment segments reassembly exists to avoid.
 ///
 /// Only fragments whose canonical JSON path is enabled in `response_json_paths`
 /// are kept, preserving operator extraction overrides.
@@ -2999,9 +3001,9 @@ fn reassemble_sse_response_segments(
     (dedupe_segments(segments), parsed.fully_parsed)
 }
 
-/// Whether a response JSON path is a chat-completions streaming `delta.*` path
-/// handled by [`SseReassembler`] (and therefore excluded from per-frame
-/// extraction in [`reassemble_sse_response_segments`]).
+/// Whether a response JSON path is an incremental streaming path handled by
+/// [`SseReassembler`] (and therefore excluded from per-frame extraction in
+/// [`reassemble_sse_response_segments`]).
 fn is_sse_delta_response_path(path: &str) -> bool {
     SSE_DELTA_RESPONSE_PATHS.contains(&path)
 }
@@ -3395,15 +3397,41 @@ impl StreamWindowEngine {
             }
         }
 
-        // Bound retained prose: drop everything before the re-inspection overlap,
+        // Split the aggregate overlap budget when tool state is present so prose
+        // cannot consume every retained byte and erase a tool argument/name tail.
+        // The shared cap remains fixed (parallel attacker-selected tool indexes
+        // cannot multiply it), while each content class keeps cross-window context.
+        let has_tool_state =
+            self.reassembler.retained_text_len() > self.reassembler.assistant_content_len();
+        let tool_overlap_reserve = if has_tool_state {
+            self.config.overlap_bytes.div_ceil(2)
+        } else {
+            0
+        };
+        let prose_overlap = self
+            .config
+            .overlap_bytes
+            .saturating_sub(tool_overlap_reserve);
+
+        // Bound retained prose: drop everything before its allocated overlap,
         // rebasing the offsets that count from the front of the reassembly.
-        let keep_from = self.cleared_len.saturating_sub(self.config.overlap_bytes);
+        let keep_from = self.cleared_len.saturating_sub(prose_overlap);
         if keep_from > 0 {
             let content = self.reassembler.assistant_content();
-            let drop = floor_char_boundary(&content, keep_from);
+            // This prefix was inspected clean. Snap the drop UP to a UTF-8
+            // boundary so retained prose cannot exceed its allocation and starve
+            // the reserved tool tail by a partial multibyte character.
+            let max_drop = self.cleared_len.min(content.len());
+            let mut drop = keep_from.min(max_drop);
+            while drop < max_drop && !content.is_char_boundary(drop) {
+                drop += 1;
+            }
+            while drop > 0 && !content.is_char_boundary(drop) {
+                drop -= 1;
+            }
             if drop > 0 {
                 self.reassembler.drain_assistant_prefix(drop);
-                self.cleared_len -= drop;
+                self.cleared_len = self.cleared_len.saturating_sub(drop);
                 for e in &mut self.held {
                     e.content_len_after = e.content_len_after.saturating_sub(drop);
                 }
@@ -3412,7 +3440,9 @@ impl StreamWindowEngine {
         // Bound retained tool-call names/arguments the same way: the window just
         // inspected them clean, so prose and every attacker-selected tool index
         // share one aggregate overlap budget. These fields have no linear prose
-        // offset, so give them only the budget not already occupied by prose.
+        // offset, so give them the budget not already occupied by prose. The
+        // split above guarantees a non-zero reservation when overlap and tool
+        // state are both present.
         let tool_overlap = self
             .config
             .overlap_bytes
@@ -3924,6 +3954,7 @@ impl ResponseStreamInspector for StreamInspector {
 /// streamed equivalent instead of silently dropping it.
 fn sse_text_to_segment(text: SseText, extraction: &ExtractionConfig) -> Option<TextSegment> {
     let (path_patterns, kind): (&[&str], SegmentKind) = match text.kind {
+        SseTextKind::CompletionText => (&["$.choices[*].text"], SegmentKind::AssistantMessage),
         SseTextKind::ChatContent => (
             &["$.choices[*].delta.content", "$.choices[*].message.content"],
             SegmentKind::AssistantMessage,
@@ -5527,7 +5558,9 @@ mod stream_window_tests {
             .filter(|t| {
                 matches!(
                     t.kind,
-                    SseTextKind::ChatContent | SseTextKind::ResponsesText
+                    SseTextKind::CompletionText
+                        | SseTextKind::ChatContent
+                        | SseTextKind::ResponsesText
                 )
             })
             .map(|t| t.text)
@@ -5606,6 +5639,19 @@ mod stream_window_tests {
         assert!(prose.ends_with("Second."));
         // Overlap re-introduced cleared text, so the window exceeds just the new text.
         assert!(prose.len() > "Second.".len());
+    }
+
+    #[test]
+    fn legacy_completion_chunks_are_windowed_as_reassembled_prose() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 8));
+        let first = b"data: {\"choices\":[{\"index\":0,\"text\":\"My system \"}]}\n\n";
+        let second = b"data: {\"choices\":[{\"index\":0,\"text\":\"prompt is secret.\"}]}\n\n";
+        assert!(!ingest(&mut eng, first));
+        assert!(ingest(&mut eng, second));
+        assert_eq!(window_prose(&eng), "My system prompt is secret.");
+        assert!(eng.snapshot_texts().iter().any(|text| {
+            text.kind == SseTextKind::CompletionText && text.text == "My system prompt is secret."
+        }));
     }
 
     #[test]
@@ -5692,6 +5738,32 @@ mod stream_window_tests {
         let step = eng.ingest_step(&next);
         assert!(step.consumed > 0, "retained tool state stalled the stream");
         assert!(eng.retained_bytes() <= 4096);
+    }
+
+    #[test]
+    fn mixed_window_reserves_overlap_for_tool_argument_tail() {
+        let mut eng = StreamWindowEngine::new(cfg(StreamWindowKind::Sentence, 4096, 16));
+        let first = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"This prose is longer than overlap.\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"prefix-one\"}}]}}]}\n\n";
+        assert!(ingest(&mut eng, first));
+        let _ = eng.release();
+        assert!(
+            eng.retained_bytes() <= 16,
+            "mixed overlap exceeded aggregate budget: {}",
+            eng.retained_bytes()
+        );
+        assert!(
+            eng.snapshot_texts().iter().any(|text| {
+                text.kind == SseTextKind::ChatToolArguments && text.text.ends_with("-one")
+            }),
+            "prose must not starve the retained tool tail"
+        );
+
+        let second = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"-two\"}}]}}]}\n\n";
+        assert!(!ingest(&mut eng, second));
+        assert!(finish(&mut eng));
+        assert!(eng.snapshot_texts().iter().any(|text| {
+            text.kind == SseTextKind::ChatToolArguments && text.text.ends_with("-one-two")
+        }));
     }
 
     #[test]

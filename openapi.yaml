@@ -15144,7 +15144,7 @@ components:
               type: integer
               format: uint
               default: 256
-              description: Bytes of already-cleared text re-inspected with the next window so a violation phrase split across a boundary is still caught. Must be less than max_window_bytes and is included within that aggregate retained-state cap.
+              description: Bytes of already-cleared text re-inspected with the next window so a violation phrase split across a boundary is still caught. Prose and tool-call tails split this aggregate budget with a reserved tool-state share. Must be less than max_window_bytes and is included within that aggregate retained-state cap.
             max_inspections:
               type: integer
               format: uint

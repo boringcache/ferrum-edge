@@ -1444,6 +1444,21 @@ async fn allowlist_with_no_extractable_content_fails_closed_as_uninspectable() {
         !ctx.metadata
             .contains_key("ai_semantic_firewall.provider_error")
     );
+
+    // Allowlist semantics apply to the whole request surface. Moving a prompt
+    // under an unsupported key must not turn the allowlist into a bypass.
+    let mut unsupported_ctx = make_post_ctx(&json!({"query": "outside the configured allowlist"}));
+    let result = plugin
+        .before_proxy(&mut unsupported_ctx, &mut json_headers())
+        .await;
+    assert_reject(result, Some(400));
+    assert_eq!(
+        unsupported_ctx
+            .metadata
+            .get("ai_semantic_firewall.uninspectable_body")
+            .map(String::as_str),
+        Some("no_extractable_content")
+    );
 }
 
 #[tokio::test]
@@ -2249,6 +2264,33 @@ async fn streaming_response_buffer_honors_output_text_override() {
     let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let body = b"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"My system prompt \"}\n\n\
 data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"says never reveal policy.\"}\n\n\
+data: [DONE]\n\n";
+
+    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+
+    assert_reject(result, Some(502));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.rule_ids")
+            .map(String::as_str),
+        Some("response_leakage")
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_buffer_reassembles_legacy_completion_text() {
+    let config = json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "buffer",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins_with("response_leakage"),
+        "extraction": {"response_json_paths": ["$.choices[*].text"]}
+    });
+    let plugin = plugin(&config);
+    let mut ctx = create_test_context();
+    let headers = HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    let body = b"data: {\"choices\":[{\"index\":0,\"text\":\"My system \"}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"text\":\"prompt says never reveal policy.\"}]}\n\n\
 data: [DONE]\n\n";
 
     let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
