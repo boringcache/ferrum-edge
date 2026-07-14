@@ -172,7 +172,7 @@ async fn test_token_accumulation_and_limit() {
     let mut headers3 = HashMap::new();
     let result = plugin.before_proxy(&mut ctx3, &mut headers3).await;
     assert_reject(result, Some(429));
-    assert!(registry.rate_limit_exceeded.load(Ordering::Relaxed) >= before + 1);
+    assert!(registry.rate_limit_exceeded.load(Ordering::Relaxed) > before);
 }
 
 // ─── Sliding window eviction ─────────────────────────────────────────────

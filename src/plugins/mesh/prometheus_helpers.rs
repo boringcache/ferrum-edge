@@ -470,6 +470,7 @@ pub fn increment_xds_warming_partial_apply(namespace: impl AsRef<str>) {
 /// Render process-static mesh families without a gateway namespace label.
 /// Retained for diagnostics/tests that consume these helpers outside the
 /// configured Prometheus plugin.
+#[allow(dead_code)]
 pub fn render_mesh_observability_metrics(output: &mut String) {
     render_mesh_observability_metrics_with_gateway_namespace(output, "");
 }

@@ -122,7 +122,7 @@ async fn test_frames_exceeding_limit_return_close_1008() {
         }
         other => panic!("Expected Close frame, got {:?}", other),
     }
-    assert!(registry.rate_limit_exceeded.load(Ordering::Relaxed) >= before + 1);
+    assert!(registry.rate_limit_exceeded.load(Ordering::Relaxed) > before);
 }
 
 // === Per-connection isolation ===

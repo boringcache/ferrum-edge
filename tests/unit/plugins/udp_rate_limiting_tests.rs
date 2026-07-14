@@ -215,7 +215,7 @@ async fn datagrams_exceeding_limit_are_dropped() {
     let before = registry.rate_limit_exceeded.load(Ordering::Relaxed);
     let ctx = make_ctx("10.0.0.1", 100);
     assert_eq!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop);
-    assert!(registry.rate_limit_exceeded.load(Ordering::Relaxed) >= before + 1);
+    assert!(registry.rate_limit_exceeded.load(Ordering::Relaxed) > before);
 }
 
 #[tokio::test]
