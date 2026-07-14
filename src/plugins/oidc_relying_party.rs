@@ -1860,11 +1860,10 @@ fn reject_unknown_fields(
     allowed: &[&str],
     scope: &str,
 ) -> Result<(), String> {
-    if let Some(field) = config.keys().find(|field| {
-        !allowed
-            .iter()
-            .any(|allowed_field| field.as_str() == *allowed_field)
-    }) {
+    if let Some(field) = config
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
         return Err(format!(
             "oidc_relying_party: unknown field '{scope}.{field}'"
         ));
@@ -2271,15 +2270,13 @@ fn validate_oidc_audience_and_azp(
         }
         _ => return Err(r#"{"error":"Invalid ID token audience"}"#.to_string()),
     }
-    if audiences.is_empty() || !audiences.iter().any(|audience| *audience == client_id) {
+    if audiences.is_empty() || !audiences.contains(&client_id) {
         return Err(r#"{"error":"Invalid ID token audience"}"#.to_string());
     }
     if !configured_audiences.is_empty()
-        && !configured_audiences.iter().any(|expected| {
-            audiences
-                .iter()
-                .any(|audience| *audience == expected.as_str())
-        })
+        && !configured_audiences
+            .iter()
+            .any(|expected| audiences.contains(&expected.as_str()))
     {
         return Err(r#"{"error":"Invalid ID token audience"}"#.to_string());
     }
