@@ -15,6 +15,8 @@ use crate::plugins::{
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
 
+use super::mesh_udp_capture::{CapturedUdpOutcome, CapturedUdpOutcomeSignal};
+
 const WORKLOAD_METRICS_PLUGIN: &str = "workload_metrics";
 
 pub(crate) struct CapturedMeshEgressLifecycle {
@@ -34,6 +36,8 @@ pub(crate) struct CapturedMeshEgressLifecycle {
     error_class: Option<ErrorClass>,
     disconnect_direction: Option<Direction>,
     disconnect_cause: Option<DisconnectCause>,
+    udp_outcome_signal: Option<Arc<CapturedUdpOutcomeSignal>>,
+    completion_recorded: bool,
 }
 
 impl CapturedMeshEgressLifecycle {
@@ -141,7 +145,13 @@ impl CapturedMeshEgressLifecycle {
             error_class: Some(ErrorClass::ConnectionPoolError),
             disconnect_direction: Some(Direction::ClientToBackend),
             disconnect_cause: Some(DisconnectCause::BackendError),
+            udp_outcome_signal: None,
+            completion_recorded: false,
         })
+    }
+
+    pub(crate) fn set_udp_outcome_signal(&mut self, outcome_signal: Arc<CapturedUdpOutcomeSignal>) {
+        self.udp_outcome_signal = Some(outcome_signal);
     }
 
     pub(crate) fn set_target(&mut self, target: &crate::config::types::UpstreamTarget) {
@@ -159,6 +169,7 @@ impl CapturedMeshEgressLifecycle {
     }
 
     pub(crate) fn complete_tcp(&mut self, result: &crate::proxy::tcp_proxy::StreamCopyResult) {
+        self.completion_recorded = true;
         self.bytes_sent = result.bytes_client_to_backend;
         self.bytes_received = result.bytes_backend_to_client;
         match result.first_failure.as_ref() {
@@ -180,6 +191,7 @@ impl CapturedMeshEgressLifecycle {
         bytes_received: u64,
         outcome: CapturedUdpOutcome,
     ) {
+        self.completion_recorded = true;
         self.bytes_sent = bytes_sent;
         self.bytes_received = bytes_received;
         match outcome {
@@ -210,6 +222,7 @@ impl CapturedMeshEgressLifecycle {
     }
 
     fn complete_gracefully(&mut self) {
+        self.completion_recorded = true;
         self.connection_error = None;
         self.error_class = None;
         self.disconnect_direction = None;
@@ -246,6 +259,14 @@ impl CapturedMeshEgressLifecycle {
 
 impl Drop for CapturedMeshEgressLifecycle {
     fn drop(&mut self) {
+        if !self.completion_recorded
+            && let Some(outcome) = self
+                .udp_outcome_signal
+                .as_ref()
+                .and_then(|signal| signal.producer_shutdown_outcome())
+        {
+            self.complete_udp(self.bytes_sent, self.bytes_received, outcome);
+        }
         let Some(summary) = self.take_summary() else {
             return;
         };
@@ -263,14 +284,6 @@ impl Drop for CapturedMeshEgressLifecycle {
             }
         });
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CapturedUdpOutcome {
-    ReturnPathEnded,
-    EgressPathEnded,
-    IdleTimeout,
-    ProducerShutdown,
 }
 
 #[cfg(test)]
@@ -346,6 +359,8 @@ mod tests {
             error_class: Some(ErrorClass::ConnectionPoolError),
             disconnect_direction: Some(Direction::ClientToBackend),
             disconnect_cause: Some(DisconnectCause::BackendError),
+            udp_outcome_signal: None,
+            completion_recorded: false,
         };
         lifecycle.complete_tcp(&crate::proxy::tcp_proxy::StreamCopyResult {
             bytes_client_to_backend: 42,
@@ -392,6 +407,8 @@ mod tests {
             error_class: Some(ErrorClass::ConnectionPoolError),
             disconnect_direction: Some(Direction::ClientToBackend),
             disconnect_cause: Some(DisconnectCause::BackendError),
+            udp_outcome_signal: None,
+            completion_recorded: false,
         };
         lifecycle.complete_udp(7, 9, CapturedUdpOutcome::IdleTimeout);
 

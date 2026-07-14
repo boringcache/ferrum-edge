@@ -12702,6 +12702,9 @@ components:
                       Metric family targeted by this override. Supported values
                       are `REQUEST_COUNT`, `REQUEST_DURATION`, their Ferrum
                       metric names, and `ALL_METRICS`; omitted means all metrics.
+                      Recognized Istio standard families Ferrum does not emit
+                      are accepted and ignored with a bounded construction-time
+                      warning; unknown families remain configuration errors.
                   name:
                     type: string
                     description: |
@@ -12732,7 +12735,9 @@ components:
               description: |
                 Names of metrics suppressed by this workload. Supported values
                 are `REQUEST_COUNT`, `REQUEST_DURATION`, their Ferrum metric
-                names, and `ALL_METRICS`.
+                names, and `ALL_METRICS`. Recognized Istio standard families
+                Ferrum does not emit are accepted and ignored with a bounded
+                construction-time warning; unknown families remain errors.
         tracing_providers:
           type: array
           items:

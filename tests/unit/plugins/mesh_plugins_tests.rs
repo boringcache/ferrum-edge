@@ -5467,6 +5467,124 @@ async fn workload_metrics_outbound_listener_stamps_mesh_direction_outbound() {
 }
 
 #[tokio::test]
+async fn workload_metrics_node_waypoint_http_outbound_uses_asserted_pod_before_baggage() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "topology": "node_waypoint",
+        "namespace": "istio-system",
+        "workload_spiffe_id": "spiffe://cluster.local/ns/istio-system/sa/waypoint",
+        "labels": {
+            "service.istio.io/canonical-name": "node-waypoint"
+        },
+        "trusted_hbone_assertors": [
+            "spiffe://cluster.local/ns/storefront/sa/frontend"
+        ]
+    }))
+    .expect("plugin config");
+    let proxy: Proxy = serde_json::from_value(json!({
+        "id": "reviews-proxy",
+        "name": "reviews",
+        "namespace": "default",
+        "hosts": ["reviews.default.svc.cluster.local"],
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080
+    }))
+    .expect("proxy fixture");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/storefront/sa/frontend"));
+    ctx.node_waypoint_pod_uid = Some([7; 16]);
+    ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
+    ctx.matched_proxy = Some(Arc::new(proxy));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut headers = HashMap::from([(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/attacker/sa/spoofed".to_string(),
+    )]);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/storefront/sa/frontend")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.namespace")
+            .map(String::as_str),
+        Some("storefront")
+    );
+    assert_eq!(
+        ctx.metadata.get("mesh.source.workload").map(String::as_str),
+        Some("frontend")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.destination.workload")
+            .map(String::as_str),
+        Some("reviews")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_non_waypoint_outbound_keeps_local_source_semantics() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "namespace": "default",
+        "workload_spiffe_id": "spiffe://cluster.local/ns/default/sa/local-client",
+        "labels": {"app": "local-client"}
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/remote/sa/transport-peer"));
+    ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/default/sa/local-client")
+    );
+    assert_eq!(
+        ctx.metadata.get("mesh.source.workload").map(String::as_str),
+        Some("local-client")
+    );
+}
+
+#[tokio::test]
+async fn workload_metrics_node_waypoint_inbound_keeps_peer_as_source() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "namespace": "default",
+        "workload_spiffe_id": "spiffe://cluster.local/ns/default/sa/reviews",
+        "labels": {"app": "reviews"}
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/storefront/sa/frontend"));
+    ctx.node_waypoint_pod_uid = Some([8; 16]);
+    ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/storefront/sa/frontend")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.destination.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/default/sa/reviews")
+    );
+}
+
+#[tokio::test]
 async fn workload_metrics_unstamped_request_does_not_emit_direction_metadata() {
     // Non-mesh listeners (file / db / cp / dp) leave `mesh_direction = None`.
     // The plugin must not invent a value, since downstream consumers rely on

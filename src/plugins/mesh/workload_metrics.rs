@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::Value;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::identity::{SpiffeId, TrustDomain};
@@ -236,10 +236,16 @@ impl WorkloadMetrics {
                     .collect()
             })
             .unwrap_or_default();
-        let (custom_tags, custom_header_tags, custom_trace_attributes_marker) =
-            validate_custom_tags(custom_tags, custom_header_tags)?;
-        let (request_count_tag_overrides, request_duration_tag_overrides, disabled_metrics_marker) =
-            parse_metric_config(config.get("metrics"))?;
+        let ValidatedCustomTags {
+            custom_tags,
+            custom_header_tags,
+            custom_trace_attributes_marker,
+        } = validate_custom_tags(custom_tags, custom_header_tags)?;
+        let ParsedMetricConfig {
+            request_count_tag_overrides,
+            request_duration_tag_overrides,
+            disabled_metrics_marker,
+        } = parse_metric_config(config.get("metrics"))?;
         let tracing_providers = parse_tracing_providers(config)?;
         let span_reporting_disabled = config
             .get("span_reporting_disabled")
@@ -352,10 +358,26 @@ impl WorkloadMetrics {
                 self.insert_local_destination_workload_labels(&mut ctx.metadata);
             }
             Some(MeshTrafficDirection::Outbound) => {
-                if let Some(identity) = self.workload_spiffe_id.as_ref() {
+                // A NodeWaypoint outbound listener serves many captured pods.
+                // Its accept path authenticates the originating pod and stamps
+                // both fields together; use that asserted identity directly so
+                // request baggage cannot spoof it and the shared waypoint is
+                // never reported as the application source. Other outbound
+                // topologies continue to attribute the local workload.
+                let node_waypoint_source_identity = if ctx.node_waypoint_pod_uid.is_some() {
+                    ctx.peer_spiffe_id.clone()
+                } else {
+                    None
+                };
+                if let Some(identity) = node_waypoint_source_identity.as_ref() {
                     insert_source_spiffe_labels(&mut ctx.metadata, identity);
+                    self.insert_remote_source_workload_labels(&mut ctx.metadata, Some(identity));
+                } else {
+                    if let Some(identity) = self.workload_spiffe_id.as_ref() {
+                        insert_source_spiffe_labels(&mut ctx.metadata, identity);
+                    }
+                    self.insert_local_source_workload_labels(&mut ctx.metadata);
                 }
-                self.insert_local_source_workload_labels(&mut ctx.metadata);
                 if let Some(proxy) = ctx.matched_proxy.as_ref() {
                     self.insert_proxy_destination_labels(
                         &mut ctx.metadata,
@@ -932,17 +954,103 @@ fn parse_tracing_providers(config: &Value) -> Result<Vec<TracingProvider>, Strin
     }
 }
 
-fn parse_metric_config(
-    value: Option<&Value>,
-) -> Result<(Option<String>, Option<String>, Option<String>), String> {
+struct ParsedMetricConfig {
+    request_count_tag_overrides: Option<String>,
+    request_duration_tag_overrides: Option<String>,
+    disabled_metrics_marker: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum MetricSelector {
+    All,
+    Emitted(MeshMetricFamily),
+    RecognizedUnsupported(&'static str),
+}
+
+fn metric_selector(name: &str) -> Option<MetricSelector> {
+    if name.trim().eq_ignore_ascii_case("ALL_METRICS") {
+        return Some(MetricSelector::All);
+    }
+    if let Some(family) = MeshMetricFamily::from_config_name(name) {
+        return Some(MetricSelector::Emitted(family));
+    }
+    match name.trim().to_ascii_uppercase().as_str() {
+        "REQUEST_SIZE" => Some(MetricSelector::RecognizedUnsupported("REQUEST_SIZE")),
+        "RESPONSE_SIZE" => Some(MetricSelector::RecognizedUnsupported("RESPONSE_SIZE")),
+        "TCP_OPENED_CONNECTIONS" => Some(MetricSelector::RecognizedUnsupported(
+            "TCP_OPENED_CONNECTIONS",
+        )),
+        "TCP_CLOSED_CONNECTIONS" => Some(MetricSelector::RecognizedUnsupported(
+            "TCP_CLOSED_CONNECTIONS",
+        )),
+        "TCP_SENT_BYTES" => Some(MetricSelector::RecognizedUnsupported("TCP_SENT_BYTES")),
+        "TCP_RECEIVED_BYTES" => Some(MetricSelector::RecognizedUnsupported("TCP_RECEIVED_BYTES")),
+        "GRPC_REQUEST_MESSAGES" => Some(MetricSelector::RecognizedUnsupported(
+            "GRPC_REQUEST_MESSAGES",
+        )),
+        "GRPC_RESPONSE_MESSAGES" => Some(MetricSelector::RecognizedUnsupported(
+            "GRPC_RESPONSE_MESSAGES",
+        )),
+        _ => None,
+    }
+}
+
+enum ParsedTagOperation<'a> {
+    Remove,
+    Rename(&'a str),
+    Set(&'a str),
+}
+
+fn parse_tag_operation(
+    name: &str,
+    operation: &serde_json::Map<String, Value>,
+) -> Result<ParsedTagOperation<'_>, String> {
+    match operation.get("type").and_then(Value::as_str) {
+        Some("remove") => Ok(ParsedTagOperation::Remove),
+        Some("rename") => operation
+            .get("new_name")
+            .and_then(Value::as_str)
+            .map(ParsedTagOperation::Rename)
+            .ok_or_else(|| {
+                format!("workload_metrics: new_name is required to rename metric tag '{name}'")
+            }),
+        Some("set") => {
+            let value = operation
+                .get("value")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!("workload_metrics: value is required to set metric tag '{name}'")
+                })?;
+            if value.len() > MAX_METRIC_TAG_VALUE_BYTES {
+                return Err(format!(
+                    "workload_metrics: metric tag '{name}' value exceeds {MAX_METRIC_TAG_VALUE_BYTES} bytes"
+                ));
+            }
+            Ok(ParsedTagOperation::Set(value))
+        }
+        Some(operation_type) => Err(format!(
+            "workload_metrics: unsupported operation '{operation_type}' for metric tag '{name}'"
+        )),
+        None => Err(format!(
+            "workload_metrics: operation type is required for metric tag '{name}'"
+        )),
+    }
+}
+
+fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, String> {
     let Some(metrics) = value else {
-        return Ok((None, None, None));
+        return Ok(ParsedMetricConfig {
+            request_count_tag_overrides: None,
+            request_duration_tag_overrides: None,
+            disabled_metrics_marker: None,
+        });
     };
     let object = metrics
         .as_object()
         .ok_or_else(|| "workload_metrics: 'metrics' must be an object".to_string())?;
     let mut disabled_count = false;
     let mut disabled_duration = false;
+    let mut ignored_metric_families = BTreeSet::new();
     if let Some(value) = object.get("disabled_metrics") {
         let disabled = value.as_array().ok_or_else(|| {
             "workload_metrics: metrics.disabled_metrics must be an array".to_string()
@@ -951,14 +1059,20 @@ fn parse_metric_config(
             let name = metric.as_str().ok_or_else(|| {
                 "workload_metrics: disabled metric names must be strings".to_string()
             })?;
-            if name.trim().eq_ignore_ascii_case("ALL_METRICS") {
-                disabled_count = true;
-                disabled_duration = true;
-                continue;
-            }
-            match MeshMetricFamily::from_config_name(name) {
-                Some(MeshMetricFamily::RequestCount) => disabled_count = true,
-                Some(MeshMetricFamily::RequestDuration) => disabled_duration = true,
+            match metric_selector(name) {
+                Some(MetricSelector::All) => {
+                    disabled_count = true;
+                    disabled_duration = true;
+                }
+                Some(MetricSelector::Emitted(MeshMetricFamily::RequestCount)) => {
+                    disabled_count = true;
+                }
+                Some(MetricSelector::Emitted(MeshMetricFamily::RequestDuration)) => {
+                    disabled_duration = true;
+                }
+                Some(MetricSelector::RecognizedUnsupported(canonical)) => {
+                    ignored_metric_families.insert(canonical);
+                }
                 None => {
                     return Err(format!(
                         "workload_metrics: unsupported disabled metric '{name}'"
@@ -978,82 +1092,77 @@ fn parse_metric_config(
             let name = entry.get("name").and_then(Value::as_str).ok_or_else(|| {
                 "workload_metrics: metric tag override name is required".to_string()
             })?;
-            let label = MeshMetricLabel::from_config_name(name)
-                .ok_or_else(|| format!("workload_metrics: unsupported metric tag '{name}'"))?;
             let operation = entry
                 .get("operation")
                 .and_then(Value::as_object)
                 .ok_or_else(|| {
                     format!("workload_metrics: operation is required for metric tag '{name}'")
                 })?;
-            let encoded = match operation.get("type").and_then(Value::as_str) {
-                Some("remove") => format!("r{};", label.index()),
-                Some("rename") => {
-                    let new_name = operation
-                        .get("new_name")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            format!(
-                                "workload_metrics: new_name is required to rename metric tag '{name}'"
-                            )
-                        })?;
+            let operation = parse_tag_operation(name, operation)?;
+            let selector = match entry.get("metric") {
+                None | Some(Value::Null) => MetricSelector::All,
+                Some(Value::String(metric)) => metric_selector(metric).ok_or_else(|| {
+                    format!(
+                        "workload_metrics: unsupported metric '{metric}' for tag override '{name}'"
+                    )
+                })?,
+                Some(_) => {
+                    return Err(format!(
+                        "workload_metrics: metric for tag override '{name}' must be a string"
+                    ));
+                }
+            };
+            let emitted_family = match selector {
+                MetricSelector::All => None,
+                MetricSelector::Emitted(family) => Some(family),
+                MetricSelector::RecognizedUnsupported(canonical) => {
+                    ignored_metric_families.insert(canonical);
+                    continue;
+                }
+            };
+            let label = MeshMetricLabel::from_config_name(name)
+                .ok_or_else(|| format!("workload_metrics: unsupported metric tag '{name}'"))?;
+            let encoded = match operation {
+                ParsedTagOperation::Remove => format!("r{};", label.index()),
+                ParsedTagOperation::Rename(new_name) => {
                     let new_label =
                         MeshMetricLabel::from_config_name(new_name).ok_or_else(|| {
                             format!("workload_metrics: unsupported renamed metric tag '{new_name}'")
                         })?;
                     format!("n{},{};", label.index(), new_label.index())
                 }
-                Some("set") => {
-                    let value =
-                        operation
-                            .get("value")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| {
-                                format!(
-                                    "workload_metrics: value is required to set metric tag '{name}'"
-                                )
-                            })?;
-                    if value.len() > MAX_METRIC_TAG_VALUE_BYTES {
-                        return Err(format!(
-                            "workload_metrics: metric tag '{name}' value exceeds {MAX_METRIC_TAG_VALUE_BYTES} bytes"
-                        ));
-                    }
-                    format!(
-                        "s{},{value_len}:{value};",
-                        label.index(),
-                        value_len = value.len()
-                    )
-                }
-                Some(operation_type) => {
-                    return Err(format!(
-                        "workload_metrics: unsupported operation '{operation_type}' for metric tag '{name}'"
-                    ));
-                }
-                None => {
-                    return Err(format!(
-                        "workload_metrics: operation type is required for metric tag '{name}'"
-                    ));
-                }
+                ParsedTagOperation::Set(value) => format!(
+                    "s{},{value_len}:{value};",
+                    label.index(),
+                    value_len = value.len()
+                ),
             };
-            let metric = entry
-                .get("metric")
-                .and_then(Value::as_str)
-                .unwrap_or("ALL_METRICS");
-            if metric.trim().eq_ignore_ascii_case("ALL_METRICS") {
-                request_count_plan.push_str(&encoded);
-                request_duration_plan.push_str(&encoded);
-                continue;
-            }
-            match MeshMetricFamily::from_config_name(metric) {
-                Some(MeshMetricFamily::RequestCount) => request_count_plan.push_str(&encoded),
-                Some(MeshMetricFamily::RequestDuration) => request_duration_plan.push_str(&encoded),
+            match emitted_family {
                 None => {
-                    return Err(format!(
-                        "workload_metrics: unsupported metric '{metric}' for tag override '{name}'"
-                    ));
+                    request_count_plan.push_str(&encoded);
+                    request_duration_plan.push_str(&encoded);
+                }
+                Some(MeshMetricFamily::RequestCount) => {
+                    request_count_plan.push_str(&encoded);
+                }
+                Some(MeshMetricFamily::RequestDuration) => {
+                    request_duration_plan.push_str(&encoded);
                 }
             }
         }
+    }
+
+    if !ignored_metric_families.is_empty() {
+        let metric_families = ignored_metric_families
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::warn!(
+            plugin = "workload_metrics",
+            %metric_families,
+            "ignoring Istio metric-family policy for standard families Ferrum does not emit"
+        );
     }
 
     let disabled_marker = match (disabled_count, disabled_duration) {
@@ -1062,24 +1171,24 @@ fn parse_metric_config(
         (false, true) => Some("request_duration".to_string()),
         (false, false) => None,
     };
-    Ok((
-        (!request_count_plan.is_empty()).then_some(request_count_plan),
-        (!request_duration_plan.is_empty()).then_some(request_duration_plan),
-        disabled_marker,
-    ))
+    Ok(ParsedMetricConfig {
+        request_count_tag_overrides: (!request_count_plan.is_empty()).then_some(request_count_plan),
+        request_duration_tag_overrides: (!request_duration_plan.is_empty())
+            .then_some(request_duration_plan),
+        disabled_metrics_marker: disabled_marker,
+    })
+}
+
+struct ValidatedCustomTags {
+    custom_tags: HashMap<String, String>,
+    custom_header_tags: HashMap<String, String>,
+    custom_trace_attributes_marker: Option<String>,
 }
 
 fn validate_custom_tags(
     custom_tags: HashMap<String, String>,
     custom_header_tags: HashMap<String, String>,
-) -> Result<
-    (
-        HashMap<String, String>,
-        HashMap<String, String>,
-        Option<String>,
-    ),
-    String,
-> {
+) -> Result<ValidatedCustomTags, String> {
     let mut names: Vec<String> = custom_tags
         .keys()
         .chain(custom_header_tags.keys())
@@ -1118,7 +1227,11 @@ fn validate_custom_tags(
     }
 
     let marker = (!names.is_empty()).then(|| names.join(","));
-    Ok((custom_tags, normalized_header_tags, marker))
+    Ok(ValidatedCustomTags {
+        custom_tags,
+        custom_header_tags: normalized_header_tags,
+        custom_trace_attributes_marker: marker,
+    })
 }
 
 fn validate_custom_tag_name(name: &str) -> Result<(), String> {

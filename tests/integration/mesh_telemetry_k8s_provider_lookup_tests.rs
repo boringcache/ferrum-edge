@@ -1,8 +1,12 @@
+use std::collections::HashMap;
+
 use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::modes::mesh::config::{MeshTracingConfig, TelemetryTracingMode, TracingProvider};
+use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::{Value, json};
 
 fn options() -> K8sTranslationOptions {
@@ -357,4 +361,95 @@ fn k8s_telemetry_match_mode_server_plus_client_union_becomes_client_and_server()
     }))]);
 
     assert_eq!(tracing.mode, Some(TelemetryTracingMode::ClientAndServer));
+}
+
+#[tokio::test]
+async fn translated_unsupported_standard_metric_families_do_not_omit_plugin() {
+    let translation = translate_k8s_objects(
+        &[telemetry(json!({
+            "metrics": [{
+                "overrides": [
+                    {
+                        "match": {"metric": "REQUEST_SIZE"},
+                        "disabled": true,
+                        "tagOverrides": {
+                            "request_bytes": {"operation": "REMOVE"}
+                        }
+                    },
+                    {
+                        "match": {"metric": "RESPONSE_SIZE"},
+                        "disabled": true
+                    },
+                    {
+                        "match": {"metric": "REQUEST_DURATION"},
+                        "disabled": true
+                    }
+                ]
+            }]
+        }))],
+        options(),
+    )
+    .expect("translation succeeds");
+    let metrics = translation
+        .config
+        .mesh
+        .expect("mesh config")
+        .telemetry_resources[0]
+        .config
+        .metrics
+        .clone()
+        .expect("metrics config");
+    let plugin = WorkloadMetrics::new(&json!({
+        "namespace": "default",
+        "workload_spiffe_id": "spiffe://cluster.local/ns/default/sa/frontend",
+        "labels": {"app": "frontend"},
+        "metrics": serde_json::to_value(metrics).expect("serialize metrics")
+    }))
+    .expect("recognized non-emitted standard families must not omit workload_metrics");
+    let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.source.principal")
+            .map(String::as_str),
+        Some("spiffe://cluster.local/ns/default/sa/frontend")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("mesh.metrics.disabled")
+            .map(String::as_str),
+        Some("request_duration"),
+        "supported family policy must survive while size-family policy is ignored"
+    );
+}
+
+#[test]
+fn workload_metrics_still_rejects_unknown_or_malformed_metric_policy() {
+    let unknown = WorkloadMetrics::new(&json!({
+        "metrics": {"disabled_metrics": ["NOT_AN_ISTIO_METRIC"]}
+    }));
+    let unknown_error = match unknown {
+        Ok(_) => panic!("unknown metric family must be rejected"),
+        Err(error) => error,
+    };
+    assert!(unknown_error.contains("unsupported disabled metric"));
+
+    let malformed = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": 7,
+                "name": "source_workload",
+                "operation": {"type": "remove"}
+            }]
+        }
+    }));
+    let malformed_error = match malformed {
+        Ok(_) => panic!("non-string metric selector must be rejected"),
+        Err(error) => error,
+    };
+    assert!(malformed_error.contains("must be a string"));
 }
