@@ -526,8 +526,12 @@ impl OidcRelyingParty {
             cookie_attrs,
             context_id: session_context_id,
             correlation_cookie_name,
-            correlation_cookie_attrs: format!(
-                "Path={callback_path}; SameSite=Lax; Secure; HttpOnly"
+            correlation_cookie_attrs: build_cookie_attrs(
+                true,
+                true,
+                "Lax",
+                domain.as_deref(),
+                &callback_path,
             ),
             max_cookie_bytes: max_cookie_bytes as usize,
             ttl: Duration::from_secs(ttl_secs),

@@ -72,6 +72,7 @@ async fn test_retain_active_uris_removes_stale_entries() {
     let store_a = get_or_create_jwks_store(&uri_a, &client(), Duration::from_secs(300));
     let store_b = get_or_create_jwks_store(&uri_b, &client(), Duration::from_secs(300));
     let store_c = get_or_create_jwks_store(&uri_c, &client(), Duration::from_secs(300));
+    let weak_b = Arc::downgrade(&store_b);
 
     // Keep only A and C — B should be evicted
     let active: HashSet<String> = [uri_a.clone(), uri_c.clone()].into();
@@ -83,9 +84,18 @@ async fn test_retain_active_uris_removes_stale_entries() {
     assert!(Arc::ptr_eq(&store_a, &store_a2));
     assert!(Arc::ptr_eq(&store_c, &store_c2));
 
-    // B should be a brand new store (was evicted, recreated on access)
+    // B stays refreshable while an old generation still owns it, then is
+    // reaped without requiring another retain_active_uris call.
+    drop(store_b);
+    for _ in 0..20 {
+        if weak_b.upgrade().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(weak_b.upgrade().is_none());
     let store_b2 = get_or_create_jwks_store(&uri_b, &client(), Duration::from_secs(300));
-    assert!(!Arc::ptr_eq(&store_b, &store_b2));
+    assert_eq!(store_b2.jwks_uri(), uri_b);
 
     clear_jwks_cache();
 }
@@ -97,12 +107,42 @@ async fn test_retain_active_uris_empty_set_clears_all() {
     let _guard = cache_test_lock().lock().unwrap();
     clear_jwks_cache();
     let original = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
+    let weak = Arc::downgrade(&original);
 
-    // Empty active set — everything should be removed
+    // Empty active set retires the store, but the external owner keeps its
+    // refresh worker alive until that generation drops.
     retain_active_uris(&HashSet::new());
+    drop(original);
+    for _ in 0..20 {
+        if weak.upgrade().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(weak.upgrade().is_none());
 
     let recreated = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
-    assert!(!Arc::ptr_eq(&original, &recreated));
+    assert_eq!(recreated.jwks_uri(), uri);
+
+    clear_jwks_cache();
+}
+
+#[tokio::test]
+async fn test_retired_store_revival_cancels_pending_reaper() {
+    let server = wiremock::MockServer::start().await;
+    let uri = format!("{}/.well-known/jwks.json", server.uri());
+    let _guard = cache_test_lock().lock().unwrap();
+    clear_jwks_cache();
+    let old_generation = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
+
+    retain_active_uris(&HashSet::new());
+    let revived = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
+    assert!(Arc::ptr_eq(&old_generation, &revived));
+    drop(old_generation);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let still_cached = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
+    assert!(Arc::ptr_eq(&revived, &still_cached));
 
     clear_jwks_cache();
 }

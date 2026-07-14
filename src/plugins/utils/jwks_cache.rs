@@ -8,11 +8,12 @@
 //! initialized on first access and lives for the process lifetime.
 //!
 //! On config reload, [`retain_active_uris`] removes entries for JWKS URIs
-//! that are no longer referenced by any active `jwks_auth` plugin instance,
-//! aborting their background refresh tasks to prevent leaked tokio tasks.
+//! that are no longer referenced by any active JWKS consumer, aborting their
+//! background refresh tasks after any retired in-flight consumers finish.
 
 use dashmap::DashMap;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -25,7 +26,10 @@ use super::jwks_store::JwksKeyStore;
 struct JwksCacheEntry {
     store: Arc<JwksKeyStore>,
     refresh_handle: JoinHandle<()>,
+    retirement_epoch: Arc<AtomicU64>,
 }
+
+const RETIRED_STORE_REAP_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Global, process-wide cache of JWKS key stores keyed by `jwks_uri`.
 static JWKS_CACHE: OnceLock<Arc<DashMap<String, JwksCacheEntry>>> = OnceLock::new();
@@ -51,47 +55,86 @@ pub fn get_or_create_jwks_store(
 
     // Fast path: store already exists
     if let Some(entry) = cache.get(jwks_uri) {
+        // A new consumer revives an entry that may have been marked retired by
+        // a concurrent plugin-cache publication. Bumping the epoch invalidates
+        // any pending last-owner reaper before cloning the store.
+        entry.retirement_epoch.fetch_add(1, Ordering::AcqRel);
         return Arc::clone(&entry.value().store);
     }
 
     // Slow path: create new store (DashMap entry API handles races)
-    cache
-        .entry(jwks_uri.to_string())
-        .or_insert_with(|| {
-            info!("JWKS cache: creating shared store for {}", jwks_uri);
-            let store = JwksKeyStore::new(jwks_uri.to_string(), http_client.clone());
-            let refresh_handle = store.start_background_refresh(refresh_interval);
-            JwksCacheEntry {
-                store: Arc::new(store),
-                refresh_handle,
-            }
-        })
-        .value()
-        .store
-        .clone()
+    let entry = cache.entry(jwks_uri.to_string()).or_insert_with(|| {
+        info!("JWKS cache: creating shared store for {}", jwks_uri);
+        let store = JwksKeyStore::new(jwks_uri.to_string(), http_client.clone());
+        let refresh_handle = store.start_background_refresh(refresh_interval);
+        JwksCacheEntry {
+            store: Arc::new(store),
+            refresh_handle,
+            retirement_epoch: Arc::new(AtomicU64::new(0)),
+        }
+    });
+    entry.retirement_epoch.fetch_add(1, Ordering::AcqRel);
+    entry.value().store.clone()
 }
 
 /// Remove JWKS cache entries whose URIs are not in `active_uris`.
 ///
-/// Aborts the background refresh task for each removed entry so leaked
-/// tokio tasks don't accumulate across config reloads. Called by
-/// `PluginCache::rebuild()` and `PluginCache::apply_delta()` after the
-/// new plugin set is constructed.
+/// Aborts the background refresh task for each removed entry so leaked tokio
+/// tasks don't accumulate across config reloads. Stores still owned by a
+/// retired plugin generation are reaped after their final external owner
+/// drops. Called by `PluginCache::rebuild()` and `PluginCache::apply_delta()`
+/// after the new plugin set is constructed.
 pub fn retain_active_uris(active_uris: &HashSet<String>) {
     let cache = global_cache();
     cache.retain(|uri, entry| {
-        // Keep a store while a plugin instance still owns it even if an
-        // asynchronous discovery publication races with the plugin-cache URI
-        // snapshot. The cache itself accounts for one strong reference; any
-        // additional reference is a live (or in-flight retired-generation)
-        // consumer. A later cleanup pass removes it after the last consumer is
-        // dropped.
-        if active_uris.contains(uri) || Arc::strong_count(&entry.store) > 1 {
+        if active_uris.contains(uri) {
+            // Cancel a reaper scheduled by an older publication if this URI is
+            // active again in the newly committed plugin generation.
+            entry.retirement_epoch.fetch_add(1, Ordering::AcqRel);
+            true
+        } else if Arc::strong_count(&entry.store) > 1 {
+            // Keep refreshes alive while an old plugin generation, an in-flight
+            // request, or an asynchronously publishing discovery worker still
+            // owns the store. The epoch-bound reaper removes it promptly after
+            // the cache becomes the final owner, without requiring another
+            // configuration reload.
+            schedule_retired_store_reaper(uri.clone(), entry);
             true
         } else {
             info!("JWKS cache: removing stale store for {}", uri);
             entry.refresh_handle.abort();
             false
+        }
+    });
+}
+
+fn schedule_retired_store_reaper(uri: String, entry: &JwksCacheEntry) {
+    let retirement_epoch = Arc::clone(&entry.retirement_epoch);
+    let epoch = retirement_epoch
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    let store = Arc::downgrade(&entry.store);
+    let cache = Arc::clone(global_cache());
+
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(RETIRED_STORE_REAP_INTERVAL).await;
+            if retirement_epoch.load(Ordering::Acquire) != epoch {
+                return;
+            }
+            if store.strong_count() > 1 {
+                continue;
+            }
+
+            if let Some((_, stale)) = cache.remove_if(&uri, |_, current| {
+                Arc::ptr_eq(&current.retirement_epoch, &retirement_epoch)
+                    && retirement_epoch.load(Ordering::Acquire) == epoch
+                    && Arc::strong_count(&current.store) == 1
+            }) {
+                info!("JWKS cache: removing retired store for {}", uri);
+                stale.refresh_handle.abort();
+            }
+            return;
         }
     });
 }
