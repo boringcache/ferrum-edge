@@ -1497,6 +1497,11 @@ async fn max_prompt_characters_counts_anthropic_text_document_sources() {
             "media_type": "text/markdown",
             "data": "this document is much too long"
         }),
+        // Media types are ASCII case-insensitive.
+        json!({
+            "media_type": "TEXT/PLAIN",
+            "data": "this document is much too long"
+        }),
     ] {
         let mut ctx = make_post_ctx(&json!({
             "model": "claude-sonnet",
@@ -2216,8 +2221,8 @@ async fn strict_schema_rejects_payloads_outside_configured_schema_family() {
 async fn strict_chat_schema_rejects_provider_native_marker_bodies() {
     // A body carrying both a `messages` array and a provider-native top-level
     // marker (Anthropic `system`, Cohere `preamble`/`message`/`chat_history`,
-    // RAG `documents`/`tool_results`) is NOT OpenAI Chat Completions and must be
-    // rejected under strict `chat_completions`.
+    // TGI `inputs`, RAG `documents`/`tool_results`) is NOT OpenAI Chat
+    // Completions and must be rejected under strict `chat_completions`.
     let plugin = AiRequestGuard::new(&json!({
         "strict_schema": true,
         "supported_schema": "chat_completions"
@@ -2234,6 +2239,10 @@ async fn strict_chat_schema_rejects_provider_native_marker_bodies() {
         json!({
             "messages": [{"role": "user", "content": "hi"}],
             "documents": [{"text": "rag doc"}]
+        }),
+        json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "inputs": "TGI prompt"
         }),
     ] {
         let mut ctx = make_post_ctx(&body);
@@ -3044,6 +3053,43 @@ async fn final_hook_enforces_clamp_and_default_after_later_body_transform() {
     assert_reject_error(
         defaulted
             .on_final_request_body_with_context(&mut default_ctx, &headers, &cap_removed)
+            .await,
+        400,
+        "Missing output token cap after request transforms",
+    );
+
+    for invalid_cap in [serde_json::Value::Null, json!("128")] {
+        let mut invalid_ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
+        let mut headers = make_post_headers();
+        assert_continue(defaulted.before_proxy(&mut invalid_ctx, &mut headers).await);
+        let invalid = json!({
+            "model": "gpt-4",
+            "messages": [],
+            "max_tokens": invalid_cap
+        })
+        .to_string()
+        .into_bytes();
+        assert_reject_error(
+            defaulted
+                .on_final_request_body_with_context(&mut invalid_ctx, &headers, &invalid)
+                .await,
+            400,
+            "Missing output token cap after request transforms",
+        );
+    }
+
+    let mut tgi_ctx = make_post_ctx(&json!({"inputs": "hello"}));
+    let mut headers = make_post_headers();
+    assert_continue(defaulted.before_proxy(&mut tgi_ctx, &mut headers).await);
+    let invalid_tgi = json!({
+        "inputs": "hello",
+        "parameters": {"max_new_tokens": "128"}
+    })
+    .to_string()
+    .into_bytes();
+    assert_reject_error(
+        defaulted
+            .on_final_request_body_with_context(&mut tgi_ctx, &headers, &invalid_tgi)
             .await,
         400,
         "Missing output token cap after request transforms",

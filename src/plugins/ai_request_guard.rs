@@ -869,13 +869,14 @@ fn looks_like_chat_completions(json: &Value) -> bool {
         // Provider-native top-level markers disqualify the body from the OpenAI
         // Chat Completions family even when it also carries a `messages` array
         // (e.g. Anthropic `{"system": ..., "messages": [...]}`, Cohere
-        // `preamble`/`message`/`chat_history`, RAG `documents`). In strict
-        // `chat_completions` mode these must be rejected rather than admitted as
-        // chat schema.
+        // `preamble`/`message`/`chat_history`, TGI `inputs`, RAG `documents`). In
+        // strict `chat_completions` mode these must be rejected rather than
+        // admitted as chat schema.
         && json.get("system").is_none()
         && json.get("preamble").is_none()
         && json.get("message").is_none()
         && json.get("chat_history").is_none()
+        && json.get("inputs").is_none()
         && json.get("documents").is_none()
         && json.get("retrieved_context").is_none()
         && json.get("tool_results").is_none()
@@ -1258,9 +1259,42 @@ fn has_required_default_token_cap(json: &Value, schema: SupportedSchema) -> bool
     let wants_top_level_fallback = matches!(target, DefaultTokenTarget::TopLevel)
         || (has_top_level_prompt_marker(json) && !bedrock_converse_native);
 
-    (!wants_top_level_fallback || top_level_cap_present(json))
+    (!wants_top_level_fallback || top_level_numeric_cap_present(json))
         && (matches!(target, DefaultTokenTarget::TopLevel)
-            || target_already_caps_output(json, target))
+            || target_has_numeric_output_cap(json, target))
+}
+
+fn top_level_numeric_cap_present(json: &Value) -> bool {
+    if is_responses_shape(json) {
+        json.get("max_output_tokens")
+            .and_then(Value::as_u64)
+            .is_some()
+    } else {
+        ["max_tokens", "max_completion_tokens"]
+            .into_iter()
+            .any(|field| json.get(field).and_then(Value::as_u64).is_some())
+    }
+}
+
+fn target_has_numeric_output_cap(json: &Value, target: DefaultTokenTarget) -> bool {
+    match target {
+        DefaultTokenTarget::Gemini => json
+            .get("generationConfig")
+            .and_then(|value| value.get("maxOutputTokens"))
+            .and_then(Value::as_u64)
+            .is_some(),
+        DefaultTokenTarget::Bedrock => json
+            .get("inferenceConfig")
+            .and_then(|value| value.get("maxTokens"))
+            .and_then(Value::as_u64)
+            .is_some(),
+        DefaultTokenTarget::TextGeneration => json
+            .get("parameters")
+            .and_then(|value| value.get("max_new_tokens"))
+            .and_then(Value::as_u64)
+            .is_some(),
+        DefaultTokenTarget::TopLevel => top_level_numeric_cap_present(json),
+    }
 }
 
 fn count_message_entries(json: &Value) -> u64 {
@@ -1428,7 +1462,12 @@ fn source_is_text_document(source: &Value) -> bool {
         None => source
             .get("media_type")
             .and_then(Value::as_str)
-            .is_some_and(|media_type| media_type.starts_with("text/")),
+            .is_some_and(|media_type| {
+                media_type
+                    .as_bytes()
+                    .get(..5)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"text/"))
+            }),
         Some(_) => false,
     }
 }
