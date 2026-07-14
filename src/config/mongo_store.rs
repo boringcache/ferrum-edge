@@ -93,6 +93,11 @@ mod inner {
         MONGO_MIGRATION_LEASE_DURATION.as_millis() as i64;
     const MONGO_MIGRATION_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
     const MONGO_MIGRATION_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+    // Dedicated migration-lease pool size. Lease upkeep only issues tiny
+    // update_one/delete_one operations, so a couple of connections is ample
+    // while keeping the lease client fully isolated from the migration-work
+    // pool that may be saturated by a long-running create_index.
+    const MONGO_MIGRATION_LEASE_POOL_SIZE: u32 = 2;
 
     #[derive(Clone, Copy)]
     struct ConfigChangeWrite<'a> {
@@ -262,18 +267,32 @@ mod inner {
     struct MongoConnectionBundle {
         client: Client,
         db: Database,
+        // Fully materialized effective `ClientOptions` (TLS applied, primary
+        // read preference forced) captured before `Client::with_options`
+        // consumed a clone of them. The migration-lease upkeep path clones
+        // these to build a dedicated small pool so it never re-derives or
+        // forks the TLS materialization logic.
+        client_options: ClientOptions,
         // Own generated TLS PEM files for exactly as long as this driver
         // client can open new sockets using their paths.
         _tls_temp_paths: Vec<tempfile::TempPath>,
     }
 
     struct MongoMigrationLease {
+        // Collection handle bound to the DEDICATED lease client/pool (see
+        // `acquire_migration_lease`), deliberately separate from the store's
+        // migration-work pool so acquire/renew/release/Drop cleanup can never
+        // be starved by a long-running create_index.
         collection: Collection<Document>,
         owner: String,
         stop_tx: Option<tokio::sync::watch::Sender<bool>>,
         renew_task: Option<tokio::task::JoinHandle<()>>,
         valid: Arc<AtomicBool>,
         released: bool,
+        // Keeps the live connection bundle — and the generated TLS PEM temp
+        // files it owns — alive for as long as the dedicated lease client may
+        // open new sockets, including the best-effort Drop cleanup task.
+        _connection: Arc<MongoConnectionBundle>,
     }
 
     impl MongoMigrationLease {
@@ -317,8 +336,13 @@ mod inner {
             let collection = self.collection.clone();
             let owner = self.owner.clone();
             let renew_task = self.renew_task.take();
+            // Keep the bundle (and its TLS temp files) alive for the whole
+            // best-effort cleanup so the dedicated lease client can still open
+            // a socket even if the store's bundle was already swapped/dropped.
+            let connection = self._connection.clone();
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 let _cleanup_task = runtime.spawn(async move {
+                    let _connection = connection;
                     if let Some(renew_task) = renew_task {
                         let _ = renew_task.await;
                     }
@@ -334,10 +358,16 @@ mod inner {
     }
 
     impl MongoConnectionBundle {
-        fn new(client: Client, db: Database, tls_temp_paths: Vec<tempfile::TempPath>) -> Self {
+        fn new(
+            client: Client,
+            db: Database,
+            client_options: ClientOptions,
+            tls_temp_paths: Vec<tempfile::TempPath>,
+        ) -> Self {
             Self {
                 client,
                 db,
+                client_options,
                 _tls_temp_paths: tls_temp_paths,
             }
         }
@@ -664,7 +694,10 @@ mod inner {
                 );
             }
 
-            let client = Client::with_options(client_options)?;
+            // Capture the fully materialized effective options before the
+            // client consumes a clone so the migration-lease path can build a
+            // dedicated pool from the identical TLS/read-preference settings.
+            let client = Client::with_options(client_options.clone())?;
             let db = client.database(&settings.database_name);
 
             // Verify connectivity
@@ -684,7 +717,7 @@ mod inner {
             );
 
             Ok((
-                MongoConnectionBundle::new(client, db, tls_temp_paths),
+                MongoConnectionBundle::new(client, db, client_options, tls_temp_paths),
                 replica_set_configured,
             ))
         }
@@ -1013,7 +1046,29 @@ mod inner {
         }
 
         async fn acquire_migration_lease(&self) -> Result<MongoMigrationLease, anyhow::Error> {
-            let collection = self.db().collection::<Document>("_ferrum_migration_locks");
+            // Give the lease acquire/renew/release (and Drop cleanup) path its
+            // own dedicated connection pool, separate from the store's
+            // migration-work pool. Cloning the bundle's already-materialized
+            // effective `ClientOptions` reuses the exact TLS/read-preference
+            // setup with no re-derivation, while capping the pool at a couple
+            // of connections keeps it cheap — the lease only issues tiny
+            // update_one/delete_one commands. This isolation is what prevents a
+            // long-running `create_index` from holding the sole pooled
+            // connection (e.g. maxPoolSize=1) and starving the 30s renewal:
+            // otherwise the 120s lease could expire mid-migration and let a
+            // second replica run the index/drop sequence concurrently, or make
+            // this instance fail lease release after the indexes succeeded.
+            let connection = self.connection();
+            let mut lease_options = connection.client_options.clone();
+            lease_options.max_pool_size = Some(MONGO_MIGRATION_LEASE_POOL_SIZE);
+            // Never let a URL-derived minPoolSize exceed the capped max (which
+            // would fail client construction) or eagerly warm this throwaway
+            // upkeep pool.
+            lease_options.min_pool_size = None;
+            let lease_client = Client::with_options(lease_options)?;
+            let collection = lease_client
+                .database(connection.db.name())
+                .collection::<Document>("_ferrum_migration_locks");
             let owner = Uuid::new_v4().to_string();
 
             loop {
@@ -1119,6 +1174,7 @@ mod inner {
                 renew_task: Some(renew_task),
                 valid,
                 released: false,
+                _connection: connection,
             })
         }
 
@@ -9927,10 +9983,10 @@ mod inner {
             let opts = mongodb::options::ClientOptions::builder()
                 .hosts(vec![])
                 .build();
-            let client = mongodb::Client::with_options(opts)
+            let client = mongodb::Client::with_options(opts.clone())
                 .expect("Client::with_options should accept empty hosts");
             let db = client.database(&settings.database_name);
-            let connection = MongoConnectionBundle::new(client, db, Vec::new());
+            let connection = MongoConnectionBundle::new(client, db, opts, Vec::new());
             MongoStore {
                 connection: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(connection)),
                 conn_settings: settings,
@@ -10025,7 +10081,7 @@ mod inner {
             let opts = mongodb::options::ClientOptions::builder()
                 .hosts(vec![])
                 .build();
-            let new_client = mongodb::Client::with_options(opts).unwrap();
+            let new_client = mongodb::Client::with_options(opts.clone()).unwrap();
             let new_db = new_client.database("after_failover");
 
             // Confirm the accessor sees the original namespace before the swap.
@@ -10037,6 +10093,7 @@ mod inner {
                 .store(std::sync::Arc::new(MongoConnectionBundle::new(
                     new_client,
                     new_db,
+                    opts,
                     Vec::new(),
                 )));
 
@@ -10155,34 +10212,32 @@ mod inner {
             let temp_path = temp_path.expect("generated temp guard");
 
             let store = make_test_store(vec![]);
-            let old_client = mongodb::Client::with_options(
-                mongodb::options::ClientOptions::builder()
-                    .hosts(vec![])
-                    .build(),
-            )
-            .expect("old client");
+            let old_opts = mongodb::options::ClientOptions::builder()
+                .hosts(vec![])
+                .build();
+            let old_client = mongodb::Client::with_options(old_opts.clone()).expect("old client");
             let old_db = old_client.database("old_with_temp");
             store
                 .connection
                 .store(std::sync::Arc::new(MongoConnectionBundle::new(
                     old_client,
                     old_db,
+                    old_opts,
                     vec![temp_path],
                 )));
 
             let old_cursor_collection_guard = store.proxies();
-            let new_client = mongodb::Client::with_options(
-                mongodb::options::ClientOptions::builder()
-                    .hosts(vec![])
-                    .build(),
-            )
-            .expect("new client");
+            let new_opts = mongodb::options::ClientOptions::builder()
+                .hosts(vec![])
+                .build();
+            let new_client = mongodb::Client::with_options(new_opts.clone()).expect("new client");
             let new_db = new_client.database("new_without_temp");
             store
                 .connection
                 .store(std::sync::Arc::new(MongoConnectionBundle::new(
                     new_client,
                     new_db,
+                    new_opts,
                     Vec::new(),
                 )));
 
