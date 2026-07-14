@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "ferrum-gateway values",
+  "type": "object",
+  "required": ["mode", "image"],
+  "properties": {
+    "mode": {
+      "type": "string",
+      "description": "Core gateway operating mode. mesh/injector/node_agent live in the ferrum-mesh chart.",
+      "enum": ["database", "file", "cp", "dp"]
+    },
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        },
+        "pullSecrets": { "type": "array" }
+      }
+    },
+    "shutdownDrainSeconds": { "type": ["integer", "null"], "minimum": 0 },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+    "secretVolumeDefaultMode": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 511,
+      "description": "Kubernetes Secret projection mode in decimal. Defaults to 288 (octal 0440) so fsGroup can read TLS and _FILE material."
+    },
+    "ports": {
+      "type": "object",
+      "properties": {
+        "proxyHttp": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "proxyHttps": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "adminHttp": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "adminHttps": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "cpGrpc": { "type": "integer", "minimum": 0, "maximum": 65535, "description": "Control-plane gRPC port (cp mode). 0 disables the listener; the container/Service gRPC ports are then omitted." }
+      }
+    },
+    "streamPorts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "containerPort"],
+        "properties": {
+          "name": { "type": "string" },
+          "containerPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+          "protocol": { "type": "string", "enum": ["TCP", "UDP"] },
+          "service": { "type": "boolean" },
+          "servicePort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+        }
+      }
+    },
+    "admin": {
+      "type": "object",
+      "properties": {
+        "bindAddress": { "type": "string" },
+        "allowedCidrs": {
+          "type": "string",
+          "description": "Comma-separated admin source allowlist using strict bare IP/CIDR syntax; malformed entries, empty comma segments, and bracketed IPv6 are rejected. Lists covering a whole family (including /0, mapped IPv6 /96 to IPv4 /0, and full-coverage unions) do not protect plaintext; computed exec probes require an entry containing their observed TCP source (for example 127.0.0.0/8, 127.0.0.1/32, or bare 127.0.0.1)."
+        },
+        "allowInsecureHttp": { "type": "boolean" },
+        "jwtSecret": {
+          "type": "object",
+          "description": "Required in database/cp/dp unless supplied by secretFileMounts name=FERRUM_ADMIN_JWT_SECRET.",
+          "properties": {
+            "value": { "type": "string", "minLength": 32 },
+            "existingSecret": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "type": "string" }
+              }
+            },
+            "valueFrom": { "type": "object" }
+          }
+        },
+        "service": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "type": { "type": "string" },
+            "annotations": { "type": "object" }
+          }
+        }
+      }
+    },
+    "grpc": {
+      "type": "object",
+      "properties": {
+        "jwtSecret": {
+          "type": "object",
+          "description": "Required in cp/dp unless supplied by secretFileMounts name=FERRUM_CP_DP_GRPC_JWT_SECRET.",
+          "properties": {
+            "value": { "type": "string", "minLength": 32 },
+            "existingSecret": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "type": "string" }
+              }
+            },
+            "valueFrom": { "type": "object" }
+          }
+        },
+        "allowPlaintext": {
+          "type": "boolean",
+          "description": "Explicitly permit plaintext CP/DP config sync (FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT). Required for a non-loopback plaintext CP gRPC bind or a non-loopback http:// DP CP URL; dev only. Prefer tls.cpGrpc or a complete CP cert/key SOURCE pair plus tls.dpGrpc trust for production."
+        }
+      }
+    },
+    "database": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["", "sqlite", "postgres", "mysql", "mongodb"] }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "description": "TLS Secret mounts. Equivalent complete cert/key SOURCE pairs supplied through env/extraEnv are also recognized for frontend, admin, and CP gRPC listener gating. The DP proxy HTTPS listener may also use CP-delivered TLS.",
+      "properties": {
+        "frontend": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "secretName": { "type": "string" },
+            "mountPath": { "type": "string" },
+            "certKey": { "type": "string" },
+            "keyKey": { "type": "string" },
+            "clientCaKey": { "type": "string" }
+          }
+        },
+        "admin": { "type": "object" },
+        "backend": { "type": "object" },
+        "cpGrpc": { "type": "object" },
+        "dpGrpc": { "type": "object" }
+      }
+    },
+    "secretFileMounts": {
+      "type": "array",
+      "description": "Secret keys exposed through <name>_FILE. Matching entries satisfy required DB/JWT source guards. FERRUM_DB_URL, FERRUM_ADMIN_JWT_SECRET, and FERRUM_CP_DP_GRPC_JWT_SECRET are the only chart-managed bases replaceable this way; other managed env names are rejected to prevent duplicate providers.",
+      "items": {
+        "type": "object",
+        "required": ["name", "secretName"],
+        "properties": {
+          "name": { "type": "string", "pattern": "^FERRUM_[A-Z0-9_]+$" },
+          "secretName": { "type": "string", "minLength": 1 },
+          "secretKey": { "type": "string", "minLength": 1 },
+          "mountPath": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "podSecurityContext": {
+      "type": "object",
+      "description": "Pod security context. Defaults pin UID/GID/fsGroup 65532 so the distroless nonroot runtime can read group-readable Secret projections."
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": {
+          "description": "Set to null to clear the default and select maxUnavailable instead.",
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "string", "pattern": "^[0-9]+%$" },
+            { "type": "null" }
+          ]
+        },
+        "maxUnavailable": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "string", "pattern": "^[0-9]+%$" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "probes": {
+      "type": "object",
+      "description": "Health probes. Liveness/startup use `ferrum-edge health --live` (GET /live); readiness uses `ferrum-edge health` (GET /health). Overrides are per-probe so liveness and readiness cannot be silently coupled.",
+      "additionalProperties": false,
+      "properties": {
+        "startup": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "failureThreshold": { "type": "integer", "minimum": 1 },
+            "periodSeconds": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "liveness": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+            "periodSeconds": { "type": "integer", "minimum": 1 },
+            "override": {
+              "type": "object",
+              "description": "Custom liveness handler (exec/httpGet/tcpSocket) replacing the computed /live check; also used by the startup probe."
+            }
+          }
+        },
+        "readiness": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+            "periodSeconds": { "type": "integer", "minimum": 1 },
+            "override": {
+              "type": "object",
+              "description": "Custom readiness handler (exec/httpGet/tcpSocket) replacing the computed /health check."
+            }
+          }
+        }
+      }
+    }
+  }
+}

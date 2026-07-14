@@ -1,0 +1,28 @@
+# Database mode: read/write admin + proxy, backed by PostgreSQL.
+#
+# Create the Secrets first:
+#   kubectl -n ferrum create secret generic ferrum-gateway-db \
+#     --from-literal=url='postgres://ferrum:<percent-encoded-pw>@postgres.ferrum.svc:5432/ferrum'
+#   kubectl -n ferrum create secret generic ferrum-gateway-credentials \
+#     --from-literal=admin-jwt-secret="$(openssl rand -hex 32)"
+#
+#   helm install ferrum ./charts/ferrum-gateway -n ferrum \
+#     -f charts/ferrum-gateway/examples/database-values.yaml
+mode: database
+
+replicaCount: 2
+
+database:
+  type: postgres
+  existingSecret:
+    name: ferrum-gateway-db
+    urlKey: url
+
+admin:
+  jwtSecret:
+    existingSecret:
+      name: ferrum-gateway-credentials
+      key: admin-jwt-secret
+
+service:
+  type: LoadBalancer

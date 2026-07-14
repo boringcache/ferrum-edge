@@ -1,0 +1,21 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "ferrum-gateway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferrum-gateway.labels" . | nindent 4 }}
+spec:
+  {{- /* Presence, not hasKey: values.yaml ships a default minAvailable: 1, so an
+         operator selects maxUnavailable by setting minAvailable: null. A null/
+         absent minAvailable falls through instead of rendering `<no value>`. */}}
+  {{- if not (kindIs "invalid" .Values.podDisruptionBudget.minAvailable) }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- else if not (kindIs "invalid" .Values.podDisruptionBudget.maxUnavailable) }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "ferrum-gateway.selectorLabels" . | nindent 6 }}
+{{- end }}

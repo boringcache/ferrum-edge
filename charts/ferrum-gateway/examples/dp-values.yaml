@@ -1,0 +1,45 @@
+# Data-plane mode: read-only admin + proxy, config pulled from one or more
+# control planes over gRPC. Pairs with cp-values.yaml.
+#
+# Reuse the admin + CP/DP gRPC JWT Secret created for the control plane:
+#   kubectl -n ferrum create secret generic ferrum-grpc-credentials \
+#     --from-literal=admin-jwt-secret="<at least 32 characters>" \
+#     --from-literal=cp-dp-grpc-jwt-secret="<same value as the CP>"
+#
+#   helm install ferrum-dp ./charts/ferrum-gateway -n ferrum \
+#     -f charts/ferrum-gateway/examples/dp-values.yaml
+mode: dp
+
+replicaCount: 3
+
+dp:
+  # Single CP (simple) or comma-separated list for multi-CP failover.
+  cpGrpcUrls: "http://ferrum-cp-ferrum-gateway-grpc.ferrum.svc:50051"
+  # failoverPrimaryRetrySeconds: "300"
+
+grpc:
+  jwtSecret:
+    existingSecret:
+      name: ferrum-grpc-credentials
+      key: cp-dp-grpc-jwt-secret
+  # Must match the CP example's explicit plaintext development opt-in (the
+  # http:// CP URL above is non-loopback plaintext). Remove this and configure
+  # tls.cpGrpc/tls.dpGrpc for production.
+  allowPlaintext: true
+
+admin:
+  jwtSecret:
+    existingSecret:
+      name: ferrum-grpc-credentials
+      key: admin-jwt-secret
+
+service:
+  type: LoadBalancer
+
+# For production, pin CP trust with DP gRPC TLS:
+# tls:
+#   dpGrpc:
+#     enabled: true
+#     secretName: ferrum-dp-grpc-tls
+#     caKey: ca.crt
+#     clientCertKey: tls.crt

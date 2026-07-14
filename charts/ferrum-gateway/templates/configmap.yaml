@@ -1,0 +1,12 @@
+{{- if and (eq .Values.mode "file") .Values.file.inlineConfig (not .Values.file.existingConfigMap) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ferrum-gateway.configMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferrum-gateway.labels" . | nindent 4 }}
+data:
+  {{ .Values.file.fileName | default "config.yaml" }}: |
+    {{- .Values.file.inlineConfig | nindent 4 }}
+{{- end }}

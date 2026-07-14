@@ -1,0 +1,474 @@
+# Ferrum Edge core-gateway Helm chart values.
+#
+# This chart deploys the Ferrum Edge binary in one of the CORE gateway operating
+# modes: database, file, cp (control plane), or dp (data plane). The mesh,
+# injector, and node_agent modes live in the separate `ferrum-mesh` chart.
+#
+# Secrets (admin JWT, DB URL, CP/DP gRPC JWT) are NEVER generated or rendered
+# into ConfigMaps by this chart. Provide them as inline values (dev only) or,
+# preferably, as references to Secrets you create out-of-band.
+
+# -----------------------------------------------------------------------------
+# Operating mode (first-class, required). One of: database, file, cp, dp.
+#   database - read/write admin + proxy; polls a PostgreSQL/MySQL/SQLite/MongoDB
+#   file     - read-only admin + proxy; config from a mounted YAML/JSON file
+#   cp       - read/write admin, no proxy; distributes config to DPs over gRPC
+#   dp       - read-only admin + proxy; pulls config from one or more CPs
+# Any other value (mesh/injector/node_agent/migrate) fails at template time.
+# -----------------------------------------------------------------------------
+mode: file
+
+# Optional name overrides (standard Helm convention).
+nameOverride: ""
+fullnameOverride: ""
+
+# Extra labels stamped on every rendered object (merged into the label helper).
+commonLabels: {}
+
+image:
+  repository: ferrumedge/ferrum-edge
+  # Defaults to the chart appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+  # Names of imagePullSecrets to attach to the pod.
+  pullSecrets: []
+
+# Number of gateway replicas. A proxy is horizontally scalable; the control
+# plane (cp) can also run multiple replicas behind its gRPC Service.
+replicaCount: 2
+
+# Logical Ferrum namespace selector (FERRUM_NAMESPACE). Optional; leave empty to
+# use the binary default.
+ferrumNamespace: ""
+
+# Graceful shutdown. terminationGracePeriodSeconds must be >= shutdownDrainSeconds
+# + ~5s cleanup or the chart fails render. On SIGTERM the gateway stops accept
+# loops, marks itself draining, adds `Connection: close`, and waits up to
+# FERRUM_SHUTDOWN_DRAIN_SECONDS for in-flight work before exiting. A value of 0
+# is honored (skip draining) and rendered explicitly; set to null to omit the
+# env and take the binary's 30s default.
+shutdownDrainSeconds: 30
+terminationGracePeriodSeconds: 40
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# -----------------------------------------------------------------------------
+# Ports. Container ports are derived from these; a port of 0 disables that
+# listener (and the matching container/service port is not rendered).
+#   proxyHttp/proxyHttps - front-door proxy listeners (FERRUM_PROXY_HTTP/S_PORT)
+#   adminHttp/adminHttps - admin API listeners (FERRUM_ADMIN_HTTP/S_PORT)
+#   cpGrpc               - control-plane gRPC listener (cp mode only); 0 disables
+#                          it (the gRPC container port and CP Service are omitted)
+# -----------------------------------------------------------------------------
+ports:
+  proxyHttp: 8000
+  proxyHttps: 8443
+  adminHttp: 9000
+  adminHttps: 9443
+  cpGrpc: 50051
+
+# Stream (raw TCP/UDP) proxy listeners. Ferrum binds these from its config
+# (`listen_port`); Kubernetes only routes to them if the matching container and
+# Service ports exist. Declare each here. `service: true` publishes the port on
+# the proxy Service.
+#   - name: postgres-tcp
+#     containerPort: 15432
+#     protocol: TCP
+#     service: true
+#   - name: dns-udp
+#     containerPort: 15353
+#     protocol: UDP
+#     service: true
+streamPorts: []
+
+# -----------------------------------------------------------------------------
+# Admin API. The admin listeners bind to loopback (127.0.0.1) by default, so
+# admin is NOT reachable through the pod IP unless you set admin.bindAddress.
+#
+# SAFETY: in the write-capable database and cp modes the binary HARD-FAILS on a
+# non-loopback PLAINTEXT admin bind unless you also supply one of:
+#   - admin.allowedCidrs (an IP allowlist)
+#   - admin TLS (tls.admin Secret or complete cert/key SOURCE pair) with
+#     ports.adminHttp=0 (drop plaintext)
+#   - admin.allowInsecureHttp=true (local/dev; always pair with a NetworkPolicy)
+# The chart mirrors this and fails render early instead of shipping a pod that
+# crash-loops. Every comma-separated allowlist entry is strictly validated; a
+# typo or empty segment fails render. Any list that covers a whole address family
+# is not protection; the chart rejects /0 entries, mapped IPv6 /96 spellings that
+# canonicalize to IPv4 /0, and full-coverage CIDR unions.
+# If you set admin.allowedCidrs while using the computed exec probes, include the
+# probe source (directly or through a covering CIDR) so the admin TCP filter does
+# not drop them. The probe source tracks admin.bindAddress: 127.0.0.1 for the
+# empty default / 0.0.0.0 and every concrete 127/8 bind, ::1 for ::, and the
+# configured address itself for other concrete binds (e.g. add 10.0.0.0/8 or
+# 10.0.0.5/32 when admin.bindAddress=10.0.0.5). Use bare IPv6 CIDR syntax such as
+# fd00::/8; the runtime rejects bracketed forms such as [fd00::]/8.
+# -----------------------------------------------------------------------------
+admin:
+  # Empty keeps the safe loopback default. Set to "0.0.0.0" or "::" to expose
+  # admin through a Service (required when admin.service.enabled=true). Must be an
+  # IP literal: the binary rejects any non-IP FERRUM_ADMIN_BIND_ADDRESS, so the
+  # chart rejects hostnames ("localhost", "admin.internal", ...) at render — use
+  # "127.0.0.1" (or "::1") for loopback. The admin listener binds ONLY this
+  # address, so the computed exec probes dial it directly: wildcard binds
+  # (0.0.0.0 / ::) probe loopback (127.0.0.1 / ::1), while a concrete bind (::1,
+  # 10.0.0.5, ...) is probed as-is. The listener normally observes that same TCP
+  # source, except a concrete 127/8 destination uses 127.0.0.1 on Linux; any
+  # admin.allowedCidrs must cover the observed source.
+  bindAddress: ""
+  allowedCidrs: ""
+  allowInsecureHttp: false
+  # Admin JWT secret (FERRUM_ADMIN_JWT_SECRET). REQUIRED and >=32 chars for
+  # database, cp, and dp modes. Optional for file (a random read-only secret is
+  # generated at startup). A matching secretFileMounts entry may supply it via
+  # FERRUM_ADMIN_JWT_SECRET_FILE instead. The chart never mints it.
+  jwtSecret:
+    # value: "at-least-32-characters-long-dev-only"
+    existingSecret:
+      name: ""
+      key: admin-jwt-secret
+    valueFrom: {}
+  # Cluster-internal admin Service (ClusterIP). Only enable together with a
+  # non-loopback admin.bindAddress and a NetworkPolicy restricting access. The
+  # admin-https is published when tls.admin is enabled with a Secret or a complete
+  # FERRUM_ADMIN_TLS_CERT_SOURCE / FERRUM_ADMIN_TLS_KEY_SOURCE pair is supplied.
+  # If neither a plaintext admin port (ports.adminHttp>0) nor usable admin HTTPS
+  # is available the Service would have no ports, so the chart fails render.
+  service:
+    enabled: false
+    type: ClusterIP
+    annotations: {}
+
+# CP/DP gRPC JWT secret (FERRUM_CP_DP_GRPC_JWT_SECRET). REQUIRED and >=32 chars
+# for cp and dp modes; the CP mints/validates and the DP presents this token.
+grpc:
+  jwtSecret:
+    # value: "at-least-32-characters-long-dev-only"
+    existingSecret:
+      name: ""
+      key: cp-dp-grpc-jwt-secret
+    valueFrom: {}
+  # Explicitly permit PLAINTEXT CP/DP config sync (FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT).
+  # The binary hard-fails on a non-loopback plaintext CP gRPC bind (cp mode) or a
+  # non-loopback http:// CP URL (dp mode) unless gRPC TLS is configured or this is
+  # true. The chart mirrors that guard at render. Dev/in-cluster only; for
+  # production configure tls.cpGrpc (CP), or a complete
+  # FERRUM_CP_GRPC_TLS_CERT_SOURCE / FERRUM_CP_GRPC_TLS_KEY_SOURCE pair, plus
+  # tls.dpGrpc trust on the DP instead of enabling this. Pair any plaintext use
+  # with a NetworkPolicy.
+  allowPlaintext: false
+
+# -----------------------------------------------------------------------------
+# Database settings (database and cp modes). Provide EXACTLY ONE URL source:
+#   url               - direct FERRUM_DB_URL value (dev only)
+#   urlFrom           - full EnvVarSource (e.g. secretKeyRef) for FERRUM_DB_URL
+#   existingSecret    - shorthand Secret reference {name, urlKey}
+#   sqlite.path       - convenience: renders sqlite:<path>?mode=<mode>
+#   structured host/* - host/port/name/username/password/params, percent-encoded
+# For Secret-backed network credentials, store the fully percent-encoded URL in
+# a Secret and use existingSecret or urlFrom (structured Secret-backed
+# username/password cannot be safely encoded and is rejected).
+# -----------------------------------------------------------------------------
+database:
+  # One of: sqlite, postgres, mysql, mongodb.
+  type: ""
+  url: ""
+  urlFrom: {}
+  existingSecret:
+    name: ""
+    urlKey: url
+  sqlite:
+    path: ""
+    mode: rwc
+  host: ""
+  port: null
+  name: ""
+  username: ""
+  password: ""
+  params: {}
+
+# -----------------------------------------------------------------------------
+# File-mode config (mode=file). Provide EITHER an inline config (rendered into a
+# ConfigMap and mounted) OR reference an existing ConfigMap. Kubernetes does not
+# send SIGHUP on ConfigMap change; roll the Deployment (or use a reloader) after
+# editing config. The chart stamps a checksum annotation so `helm upgrade`
+# rolls pods when inlineConfig changes.
+# -----------------------------------------------------------------------------
+file:
+  mountPath: /etc/ferrum/config
+  fileName: config.yaml
+  # Minimal valid default config (no proxies). Replace with your routes.
+  # GatewayConfig deserialization (src/config/types.rs, deny_unknown_fields)
+  # requires version, proxies, consumers, and plugin_configs with no serde
+  # defaults, so all four top-level lists must be present or the file-mode pod
+  # fails to boot.
+  inlineConfig: |
+    version: "1"
+    proxies: []
+    consumers: []
+    plugin_configs: []
+  # Reference an out-of-band ConfigMap instead of inlineConfig.
+  existingConfigMap: ""
+
+# -----------------------------------------------------------------------------
+# Control-plane settings (mode=cp).
+# -----------------------------------------------------------------------------
+cp:
+  # gRPC listener bind host (combined with ports.cpGrpc for FERRUM_CP_GRPC_LISTEN_ADDR).
+  # Must be an IP literal: the runtime parses this as an IP:port socket address and
+  # rejects hostnames like "localhost" at boot, so the chart rejects non-IP binds at
+  # render. Use 0.0.0.0 or :: to expose the listener, or 127.0.0.1/::1 for loopback.
+  # IPv6 literals are bracketed automatically ("::" -> "[::]:50051"). A loopback
+  # bind (127.0.0.1/::1) is unreachable through cp.service, so the chart requires
+  # cp.service.enabled=false with a loopback bind.
+  grpcBindAddress: "0.0.0.0"
+  # Comma-separated namespaces this CP serves (FERRUM_CP_NAMESPACES). Optional.
+  namespaces: ""
+  # Require a JWT `ns` claim on namespace-scoped gRPC calls (FERRUM_CP_REQUIRE_NAMESPACE_CLAIM).
+  requireNamespaceClaim: false
+  # gRPC Service (ClusterIP) exposing the CP to DP pods.
+  service:
+    enabled: true
+    type: ClusterIP
+    annotations: {}
+
+# -----------------------------------------------------------------------------
+# Data-plane settings (mode=dp).
+# -----------------------------------------------------------------------------
+dp:
+  # Comma-separated CP gRPC URLs (FERRUM_DP_CP_GRPC_URLS). REQUIRED for dp.
+  # e.g. "https://ferrum-cp-east:50051,https://ferrum-cp-west:50051"
+  # Each entry must use an http/https/grpc/grpcs scheme AND carry a non-empty host
+  # (the chart rejects typos, schemeless host:port, and host-less values such as
+  # "https://" at render); a non-loopback http:// URL additionally requires
+  # grpc.allowPlaintext=true.
+  cpGrpcUrls: ""
+  # Optional multi-CP failover primary retry seconds (FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS).
+  # 0 disables primary-CP retry and is rendered explicitly; "" (or null) omits the
+  # env and takes the binary's 300s default.
+  failoverPrimaryRetrySeconds: ""
+
+# -----------------------------------------------------------------------------
+# TLS material. Each enabled surface mounts a Secret (standard tls.crt/tls.key/
+# ca.crt keys) read-only and sets the matching FERRUM_*_TLS_*_PATH env vars.
+# Complete server cert/key SOURCE pairs in env/extraEnv are supported alternatives
+# for frontend, admin, and CP gRPC TLS and participate in listener/Service guards.
+# cpGrpc applies only in cp mode; dpGrpc only in dp mode. Secret files default
+# to group-readable 0440 (decimal 288); podSecurityContext.fsGroup grants the
+# non-root runtime that group. Both settings are operator-overridable.
+# -----------------------------------------------------------------------------
+tls:
+  frontend:
+    # Alternatively, a complete FERRUM_FRONTEND_TLS_CERT_SOURCE /
+    # FERRUM_FRONTEND_TLS_KEY_SOURCE pair in env/extraEnv starts frontend TLS and
+    # makes the chart publish the HTTPS (and enabled HTTP/3) Service ports.
+    enabled: false
+    secretName: ""
+    mountPath: /etc/ferrum/tls/frontend
+    certKey: tls.crt
+    keyKey: tls.key
+    # Optional mTLS client CA bundle key within the same Secret.
+    clientCaKey: ""
+  admin:
+    # Alternatively, a complete FERRUM_ADMIN_TLS_CERT_SOURCE /
+    # FERRUM_ADMIN_TLS_KEY_SOURCE pair in env/extraEnv starts admin HTTPS and is
+    # recognized by TLS-only probes and the optional admin Service.
+    enabled: false
+    secretName: ""
+    mountPath: /etc/ferrum/tls/admin
+    certKey: tls.crt
+    keyKey: tls.key
+    # Optional admin mTLS client CA bundle key. NOTE: setting this, or supplying
+    # FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_SOURCE through env/extraEnv, makes the
+    # admin HTTPS listener demand a client cert, which the computed exec probes
+    # cannot present. With ports.adminHttp=0 (TLS-only admin) the chart therefore
+    # requires you to override/disable the computed probes, or keep a plaintext
+    # loopback admin listener (ports.adminHttp>0) for them.
+    clientCaKey: ""
+  backend:
+    enabled: false
+    secretName: ""
+    mountPath: /etc/ferrum/tls/backend
+    clientCertKey: tls.crt
+    clientKeyKey: tls.key
+  cpGrpc:
+    # Alternatively, a complete FERRUM_CP_GRPC_TLS_CERT_SOURCE /
+    # FERRUM_CP_GRPC_TLS_KEY_SOURCE pair in env/extraEnv secures the CP listener.
+    enabled: false
+    secretName: ""
+    mountPath: /etc/ferrum/tls/cp-grpc
+    certKey: tls.crt
+    keyKey: tls.key
+    clientCaKey: ""
+  dpGrpc:
+    enabled: false
+    secretName: ""
+    mountPath: /etc/ferrum/tls/dp-grpc
+    caKey: ca.crt
+    clientCertKey: ""
+    clientKeyKey: tls.key
+
+# Kubernetes Secret projection mode in decimal (288 = octal 0440). Used for
+# both tls.* and secretFileMounts volumes.
+secretVolumeDefaultMode: 288
+
+# -----------------------------------------------------------------------------
+# External-secret _FILE suffix mounts. Ferrum resolves any FERRUM_* env var with
+# a `_FILE` suffix by reading the referenced file. Use this to mount a Secret
+# key at a path and point `<name>_FILE` at it (e.g. name: FERRUM_ADMIN_JWT_SECRET).
+# Only FERRUM_DB_URL, FERRUM_ADMIN_JWT_SECRET, and
+# FERRUM_CP_DP_GRPC_JWT_SECRET may replace chart-managed variables this way;
+# other managed names are rejected because their direct env is still rendered.
+#   - name: FERRUM_ADMIN_JWT_SECRET
+#     secretName: ferrum-admin
+#     secretKey: admin-jwt-secret
+#     mountPath: /etc/ferrum/secret-files/admin
+# -----------------------------------------------------------------------------
+secretFileMounts: []
+
+# Extra simple string env vars (map form). Reserved keys managed by first-class
+# values (FERRUM_MODE, FERRUM_DB_*, FERRUM_ADMIN_JWT_SECRET, etc.) are rejected,
+# as are their external-secret resolver suffixes (_VAULT/_AWS/_AZURE/_GCP/_FILE):
+# a suffixed source of a chart-managed base var resolves into that base var and
+# would collide with the chart's own source at startup. A secretFileMounts entry
+# also reserves both `<name>` and `<name>_FILE`, because configuring the direct
+# base alongside the file source is the same provider conflict. Use the dedicated
+# value (existingSecret / valueFrom / secretFileMounts) to source a managed secret.
+# Example: FERRUM_LOG_LEVEL: info
+# Enabling HTTP/3 (FERRUM_ENABLE_HTTP3: "true") makes the proxy Service publish
+# its HTTPS port on UDP too (QUIC); it needs frontend TLS (or dp mode) and a
+# nonzero ports.proxyHttps. Frontend TLS may come from tls.frontend or a complete
+# FERRUM_FRONTEND_TLS_CERT_SOURCE / FERRUM_FRONTEND_TLS_KEY_SOURCE pair here.
+env: {}
+
+# Extra raw env entries (list form) for valueFrom / fieldRef cases. The same
+# reserved-name guard (including the resolver suffixes above) applies. A
+# valueFrom-sourced FERRUM_ENABLE_HTTP3 cannot be inspected at render, so those
+# installs must hand-add the UDP Service/stream port for QUIC.
+#   - name: FERRUM_DB_CONFIG_BACKUP_PATH
+#     value: /etc/ferrum/backup-config.json
+extraEnv: []
+
+# Arbitrary extra volumes / mounts (e.g. a PVC for a sqlite database file).
+extraVolumes: []
+extraVolumeMounts: []
+
+# -----------------------------------------------------------------------------
+# Health probes. Admin binds loopback by default, so the defaults use the in-pod
+# exec `ferrum-edge health` check (a kubelet httpGet targets the pod IP and would
+# miss a loopback listener).
+#
+# Liveness and startup run `ferrum-edge health --live` (GET /live): 200 whenever
+# the process + admin listener are up, even during startup or while serving
+# degraded. Readiness runs `ferrum-edge health` (GET /health): returns 503 until
+# the gateway is ready, so an alive-but-unready pod is dropped from Service
+# endpoints WITHOUT being restart-looped by liveness. Do NOT point liveness at
+# /health — that couples the two and restart-loops a healthy-but-unready pod
+# (e.g. a dp that has lost its cp).
+#
+# When ports.adminHttp=0 (TLS-only admin) both exec commands auto-detect TLS +
+# 9443. Liveness and readiness have SEPARATE override knobs so a custom handler
+# cannot silently re-couple them; set one to a custom exec/httpGet to replace
+# only that probe's computed default.
+# -----------------------------------------------------------------------------
+probes:
+  startup:
+    enabled: true
+    failureThreshold: 30
+    periodSeconds: 5
+  liveness:
+    enabled: true
+    initialDelaySeconds: 10
+    periodSeconds: 15
+    # Replaces the computed liveness handler (also used by the startup probe).
+    # e.g.:
+    # override:
+    #   httpGet:
+    #     path: /live
+    #     port: admin-http
+    override: {}
+  readiness:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    # Replaces the computed readiness handler, e.g.:
+    # override:
+    #   httpGet:
+    #     path: /health
+    #     port: admin-http
+    override: {}
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 64Mi
+  limits:
+    cpu: "2"
+    memory: 256Mi
+
+# Rolling update tuned for a proxy: never drop below the desired count while a
+# new revision comes up.
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+# Pod-level security context and container security context. Defaults harden the
+# runtime for a distroless, non-root image.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+# Proxy Service (front-door). Publishes proxyHttp; proxyHttps only when
+# tls.frontend is enabled with a Secret or a complete frontend cert/key SOURCE
+# pair is set (file/database), or in dp mode where the HTTPS listener binds on
+# the port alone and hot-swaps CP-delivered TLS; plus any streamPorts marked
+# `service: true`. When HTTP/3 is enabled
+# (env.FERRUM_ENABLE_HTTP3: "true") the HTTPS port is also published on UDP
+# (QUIC) alongside the TCP entry.
+service:
+  enabled: true
+  type: ClusterIP
+  annotations: {}
+  # Optional fixed ports on the Service; targetPort tracks the container ports.
+  httpPort: 80
+  httpsPort: 443
+
+# Optional HorizontalPodAutoscaler.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: null
+
+# Optional PodDisruptionBudget. Set exactly one of minAvailable / maxUnavailable
+# (a PDB rejects both). minAvailable ships as a default, so to use maxUnavailable
+# set minAvailable: null to clear it; a null/absent minAvailable falls through.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  # minAvailable: null
+  # maxUnavailable: 1

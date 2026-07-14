@@ -1,0 +1,28 @@
+# File mode: read-only admin + proxy, config from an inline ConfigMap.
+# No external Secrets required (file mode generates a random read-only admin JWT
+# secret at startup).
+#
+#   helm install ferrum ./charts/ferrum-gateway -n ferrum \
+#     -f charts/ferrum-gateway/examples/file-values.yaml
+mode: file
+
+replicaCount: 2
+
+file:
+  inlineConfig: |
+    version: "1"
+    proxies:
+      - id: httpbin
+        name: HTTPBin Proxy
+        listen_path: /httpbin
+        backend_scheme: https
+        backend_host: httpbin.org
+        backend_port: 443
+        strip_listen_path: true
+        auth_mode: single
+        plugins: []
+    consumers: []
+    plugin_configs: []
+
+service:
+  type: LoadBalancer
