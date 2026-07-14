@@ -87,8 +87,8 @@ path, not for routine build-out schema work.
 
 When Ferrum Edge starts in `database`, `cp`, or `migrate` mode, it runs the **MigrationRunner** which:
 
-1. Acquires a cross-process migration lock (`pg_advisory_lock` on PostgreSQL,
-   `GET_LOCK` on MySQL, and `BEGIN IMMEDIATE` on SQLite)
+1. Acquires a cross-process migration lock (`pg_try_advisory_lock` polling on
+   PostgreSQL, `GET_LOCK` on MySQL, and `BEGIN IMMEDIATE` on SQLite)
 2. Creates the `_ferrum_migrations` tracking table if it doesn't exist
 3. Checks which migrations have been applied by reading `_ferrum_migrations`
 4. Runs any pending migrations in order

@@ -465,6 +465,10 @@ pub mod _test_support {
         known.difference(current).cloned().collect()
     }
 
+    pub fn db_code_is_transient(code: &str, is_sqlite: bool) -> bool {
+        crate::config::db_loader::is_transient_database_code(code, is_sqlite)
+    }
+
     pub fn parse_scheme(s: &str) -> Result<BackendScheme, String> {
         crate::config::db_loader::parse_scheme(s)
     }

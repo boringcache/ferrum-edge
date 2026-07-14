@@ -89,7 +89,8 @@ mod inner {
     const CHANGE_LOG_RETAIN_PER_NAMESPACE: u64 = 100_000;
     const MONGO_MIGRATION_LOCK_ID: &str = "global";
     const MONGO_MIGRATION_LEASE_DURATION: Duration = Duration::from_secs(120);
-    const MONGO_MIGRATION_LEASE_DURATION_MILLIS: i64 = 120_000;
+    const MONGO_MIGRATION_LEASE_DURATION_MILLIS: i64 =
+        MONGO_MIGRATION_LEASE_DURATION.as_millis() as i64;
     const MONGO_MIGRATION_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
     const MONGO_MIGRATION_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 

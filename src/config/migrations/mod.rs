@@ -10,6 +10,9 @@ use tracing::{info, warn};
 
 const POSTGRES_MIGRATION_LOCK_ID: i64 = 0x4645_5252_554D_4D47;
 const MYSQL_MIGRATION_LOCK_NAME: &str = "ferrum-edge:migrations";
+const MIGRATION_LOCK_WAIT_WARNING_INTERVAL: Duration = Duration::from_secs(30);
+const POSTGRES_MIGRATION_LOCK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const SQLITE_MIGRATION_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// One cross-process migration lock held on a dedicated database connection.
 ///
@@ -26,25 +29,50 @@ struct MigrationConnectionLock {
 
 impl MigrationConnectionLock {
     async fn acquire(pool: &AnyPool, db_type: &str) -> Result<Self, anyhow::Error> {
-        let mut connection = pool.acquire().await?;
+        let connection = pool.acquire().await?;
+        // Install the close-on-drop guard before the first lock statement is
+        // awaited. If this future is cancelled after the server grants a
+        // session lock (or starts the SQLite transaction), the connection is
+        // closed instead of returning to the pool while still holding it.
+        let mut migration_lock = Self {
+            connection,
+            db_type: db_type.to_string(),
+            active: true,
+        };
+        migration_lock.acquire_on_connection().await?;
+        Ok(migration_lock)
+    }
 
-        match db_type {
-            "postgres" => {
-                sqlx::query("SELECT pg_advisory_lock($1)")
+    async fn acquire_on_connection(&mut self) -> Result<(), anyhow::Error> {
+        let wait_started = Instant::now();
+        let mut last_wait_warning = Instant::now();
+
+        match self.db_type.as_str() {
+            "postgres" => loop {
+                let row = sqlx::query("SELECT pg_try_advisory_lock($1) AS migration_lock_acquired")
                     .bind(POSTGRES_MIGRATION_LOCK_ID)
-                    .execute(&mut *connection)
+                    .fetch_one(&mut *self.connection)
                     .await?;
-            }
+                if row.try_get::<bool, _>("migration_lock_acquired")? {
+                    break;
+                }
+                warn_if_migration_lock_waiting("postgres", wait_started, &mut last_wait_warning);
+                tokio::time::sleep(POSTGRES_MIGRATION_LOCK_RETRY_INTERVAL).await;
+            },
             "mysql" => loop {
                 let row = sqlx::query(
                     "SELECT CAST(GET_LOCK(?, 30) AS SIGNED) AS migration_lock_acquired",
                 )
                 .bind(MYSQL_MIGRATION_LOCK_NAME)
-                .fetch_one(&mut *connection)
+                .fetch_one(&mut *self.connection)
                 .await?;
                 match row.try_get::<Option<i64>, _>("migration_lock_acquired")? {
                     Some(1) => break,
-                    Some(0) => continue,
+                    Some(0) => warn_if_migration_lock_waiting(
+                        "mysql",
+                        wait_started,
+                        &mut last_wait_warning,
+                    ),
                     _ => {
                         anyhow::bail!("MySQL GET_LOCK returned NULL for the Ferrum migration lock")
                     }
@@ -52,19 +80,24 @@ impl MigrationConnectionLock {
             },
             "sqlite" => {
                 sqlx::query("PRAGMA foreign_keys = ON")
-                    .execute(&mut *connection)
+                    .execute(&mut *self.connection)
                     .await?;
                 sqlx::query("PRAGMA busy_timeout = 5000")
-                    .execute(&mut *connection)
+                    .execute(&mut *self.connection)
                     .await?;
                 loop {
                     match sqlx::query("BEGIN IMMEDIATE")
-                        .execute(&mut *connection)
+                        .execute(&mut *self.connection)
                         .await
                     {
                         Ok(_) => break,
                         Err(error) if is_sqlite_lock_contention(&error) => {
-                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            warn_if_migration_lock_waiting(
+                                "sqlite",
+                                wait_started,
+                                &mut last_wait_warning,
+                            );
+                            tokio::time::sleep(SQLITE_MIGRATION_LOCK_RETRY_INTERVAL).await;
                         }
                         Err(error) => return Err(error.into()),
                     }
@@ -72,12 +105,7 @@ impl MigrationConnectionLock {
             }
             other => anyhow::bail!("Unsupported database type for migrations: {other}"),
         }
-
-        Ok(Self {
-            connection,
-            db_type: db_type.to_string(),
-            active: true,
-        })
+        Ok(())
     }
 
     fn connection(&mut self) -> &mut AnyConnection {
@@ -113,6 +141,21 @@ impl MigrationConnectionLock {
         }
         self.active = false;
         Ok(())
+    }
+}
+
+fn warn_if_migration_lock_waiting(
+    db_type: &str,
+    wait_started: Instant,
+    last_warning: &mut Instant,
+) {
+    if last_warning.elapsed() >= MIGRATION_LOCK_WAIT_WARNING_INTERVAL {
+        warn!(
+            database_type = db_type,
+            waited_seconds = wait_started.elapsed().as_secs(),
+            "Still waiting for the cross-process migration lock"
+        );
+        *last_warning = Instant::now();
     }
 }
 

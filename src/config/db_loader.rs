@@ -541,24 +541,28 @@ fn is_transient_sqlx_error(error: &sqlx::Error) -> bool {
             {
                 return true;
             }
+            let is_sqlite = database_error
+                .try_downcast_ref::<sqlx::sqlite::SqliteError>()
+                .is_some();
             database_error
                 .code()
-                .is_some_and(|code| is_transient_database_code(code.as_ref()))
+                .is_some_and(|code| is_transient_database_code(code.as_ref(), is_sqlite))
         }
         _ => false,
     }
 }
 
-fn is_transient_database_code(code: &str) -> bool {
+pub(crate) fn is_transient_database_code(code: &str, is_sqlite: bool) -> bool {
     code.starts_with("08")
-        || code
-            .parse::<i32>()
-            .is_ok_and(|code| matches!(code & 0xff, 5 | 6 | 14))
+        || is_sqlite
+            && code
+                .parse::<i32>()
+                .is_ok_and(|code| matches!(code & 0xff, 5 | 6 | 14))
         || matches!(
             code,
-            // SQLite base/extended codes 5/6 are lock contention and 14 is an
-            // unavailable database file. PostgreSQL shutdown and resource-
-            // exhaustion connection failures are listed explicitly below.
+            // PostgreSQL shutdown and resource-exhaustion connection failures
+            // are listed explicitly. SQLite base/extended codes are handled
+            // above only when the Any-driver error downcasts to SqliteError.
             "53300" | "57P01" | "57P02" | "57P03"
         )
 }

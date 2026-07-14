@@ -1,6 +1,6 @@
 use ferrum_edge::_test_support::{
-    DbPoolConfig, db_append_connect_timeout, db_diff_removed, parse_auth_mode, parse_scheme,
-    statement_timeout_sql,
+    DbPoolConfig, db_append_connect_timeout, db_code_is_transient, db_diff_removed,
+    parse_auth_mode, parse_scheme, statement_timeout_sql,
 };
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::db_loader::DatabaseStore;
@@ -580,17 +580,38 @@ fn initial_config_load_transient_sqlx_error_stays_backup_eligible() {
 }
 
 #[test]
-fn initial_config_load_sqlite_lock_codes_stay_backup_eligible() {
+fn sqlite_low_byte_codes_stay_transient_only_for_sqlite() {
     // SQLite reports base result codes in the low byte of extended codes.
-    // BUSY (5), LOCKED (6), BUSY_SNAPSHOT (517), and LOCKED_SHAREDCACHE
-    // (262) are temporary contention, not schema/data failures.
-    for code in ["5", "6", "517", "262"] {
+    // BUSY/LOCKED/CANTOPEN and their extended forms are temporary resource or
+    // connectivity failures, but only when emitted by the SQLite driver.
+    for code in ["5", "6", "14", "517", "262", "1038"] {
+        assert!(
+            db_code_is_transient(code, true),
+            "SQLite result code {code} must remain transient"
+        );
+        assert!(
+            !db_code_is_transient(code, false),
+            "non-SQLite result code {code} must not use SQLite low-byte classification"
+        );
+    }
+}
+
+#[test]
+fn numeric_postgres_sqlstates_do_not_use_sqlite_low_byte_classification() {
+    // PostgreSQL has all-numeric SQLSTATEs whose low bytes collide with
+    // SQLITE_BUSY/CANTOPEN. They are data exceptions and must refuse failover
+    // and backup bootstrap rather than being treated as transient.
+    for code in ["22021", "22030"] {
+        assert!(
+            !db_code_is_transient(code, false),
+            "non-SQLite SQLSTATE {code} must not use SQLite low-byte classification"
+        );
         let raw = anyhow::Error::new(sqlx::Error::Database(Box::new(TestDatabaseError { code })))
-            .context("load_full_config: SQLite query failed");
+            .context("load_full_config: PostgreSQL query failed");
         let classified = DatabaseStore::classify_initial_config_load_error(raw);
         assert!(
-            !DatabaseStore::is_non_transient_init_error(&classified),
-            "SQLite lock code {code} must remain backup-eligible: {classified}"
+            DatabaseStore::is_non_transient_init_error(&classified),
+            "PostgreSQL data-exception SQLSTATE {code} must refuse backup bootstrap: {classified}"
         );
     }
 }
