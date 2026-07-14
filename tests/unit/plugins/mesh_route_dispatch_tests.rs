@@ -6,8 +6,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::Utc;
 use ferrum_edge::config::types::{
-    BackendTlsConfig, Proxy, ResolvedPortOverride, Upstream, UpstreamPortOverride,
+    BackendTlsConfig, GatewayConfig, PluginConfig, PluginScope, Proxy, ResolvedPortOverride,
+    Upstream, UpstreamPortOverride,
 };
 use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
@@ -60,6 +62,309 @@ fn ctx() -> RequestContext {
         "GET".to_string(),
         "/api".to_string(),
     )
+}
+
+fn mesh_route_plugin_config(config: serde_json::Value) -> PluginConfig {
+    PluginConfig {
+        id: "mesh-route".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "mesh_route_dispatch".to_string(),
+        config,
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[test]
+fn mesh_route_dispatch_rejects_empty_backend_tls_paths_at_admission() {
+    let invalid_tls_configs = [
+        json!({"client_cert_path": ""}),
+        json!({"client_key_path": ""}),
+        json!({"client_cert_path": "", "client_key_path": ""}),
+        json!({"server_ca_cert_path": ""}),
+    ];
+
+    for backend_tls in invalid_tls_configs {
+        let config = json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {
+                    "backend_host": "secure.internal",
+                    "backend_port": 443,
+                    "backend_tls": backend_tls
+                }
+            }]
+        });
+        let error = MeshRouteDispatch::new(&config)
+            .expect_err("an explicitly empty TLS material path must fail admission");
+        assert!(error.contains("must not be empty"), "got: {error}");
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("mesh_route_dispatch", &config).is_err(),
+            "the shared file/admin plugin admission path must reject {config}"
+        );
+    }
+}
+
+#[test]
+fn mesh_route_dispatch_file_dependency_validation_reports_empty_tls_paths() {
+    let config = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {
+                "backend_host": "secure.internal",
+                "backend_port": 443,
+                "backend_tls": {
+                    "client_cert_path": "",
+                    "client_key_path": "",
+                    "server_ca_cert_path": ""
+                }
+            }
+        }]
+    });
+    let gateway = GatewayConfig {
+        plugin_configs: vec![mesh_route_plugin_config(config)],
+        ..Default::default()
+    };
+
+    let errors = gateway.validate_plugin_file_dependencies();
+    for field in ["client_cert_path", "client_key_path", "server_ca_cert_path"] {
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains(field) && error.contains("must not be empty")),
+            "missing {field} error in {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn mesh_route_dispatch_rejects_unknown_fields_at_every_owned_object_boundary() {
+    let invalid_configs = [
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"}
+            }],
+            "reject_unmtached": true
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "timeout_millis": 100
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"method": ["GET"], "methods": ["GET"]},
+                "destination": {"upstream_id": "api"}
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {
+                    "upstream_id": "api",
+                    "requires_node_waypoint_auth": true
+                }
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "fault": {
+                    "delay": {"duration_ms": 1, "percentage": 1.0},
+                    "delai": {"duration_ms": 1, "percentage": 1.0}
+                }
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "fault": {
+                    "delay": {"duration_ms": 1, "percentage": 1.0, "percent": 1.0}
+                }
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "fault": {
+                    "abort": {"status_code": 503, "percentage": 1.0, "status": 503}
+                }
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "rewrite": {"uri": "/v2", "authorit": "api.internal"}
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "api"},
+                "request_transform": [{
+                    "operation": "update",
+                    "key": "x-route",
+                    "value": "api",
+                    "new_key": "x-route-new"
+                }]
+            }]
+        }),
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "redirect": {"redirect_code": 308, "redirect_cod": 307}
+            }]
+        }),
+    ];
+
+    for config in invalid_configs {
+        let error = MeshRouteDispatch::new(&config)
+            .expect_err("unknown mesh_route_dispatch fields must fail closed");
+        assert!(error.contains("unknown field"), "got: {error}");
+    }
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_method_regex_requires_a_full_match() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"methods": [{"regex": "GET|GETTING|POST"}]},
+            "destination": {"upstream_id": "sensitive"}
+        }]
+    }))
+    .expect("plugin config");
+
+    for method in ["GET", "GETTING", "POST"] {
+        let mut request = RequestContext::new(
+            "127.0.0.1".to_string(),
+            method.to_string(),
+            "/api".to_string(),
+        );
+        let result = plugin.before_proxy(&mut request, &mut HashMap::new()).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            request.route_override_upstream_id.as_deref(),
+            Some("sensitive")
+        );
+    }
+
+    for method in ["XGET", "GETX", "XPOSTY"] {
+        let mut request = RequestContext::new(
+            "127.0.0.1".to_string(),
+            method.to_string(),
+            "/api".to_string(),
+        );
+        let result = plugin.before_proxy(&mut request, &mut HashMap::new()).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert!(
+            request.route_override_upstream_id.is_none(),
+            "substring method {method} must not select the sensitive route"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_uri_regex_requires_a_full_match() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"uri": {"regex": "/admin|/admin/settings"}},
+            "destination": {"upstream_id": "admin"}
+        }]
+    }))
+    .expect("plugin config");
+
+    for path in ["/admin", "/admin/settings"] {
+        let mut exact =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
+        assert!(matches!(
+            plugin.before_proxy(&mut exact, &mut HashMap::new()).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(exact.route_override_upstream_id.as_deref(), Some("admin"));
+    }
+
+    for path in ["/public/admin", "/admin/settings/child", "x/admin"] {
+        let mut request =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
+        let result = plugin.before_proxy(&mut request, &mut HashMap::new()).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert!(
+            request.route_override_upstream_id.is_none(),
+            "substring URI {path} must not select the admin route"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_anchored_regexes_allow_longer_alternatives() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {
+                "authority": {"regex": "api|api\\.internal"},
+                "headers": {"x-tier": {"regex": "gold|gold-plus"}}
+            },
+            "destination": {"upstream_id": "specific"}
+        }]
+    }))
+    .expect("plugin config");
+    let mut request = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::from([
+        ("host".to_string(), "api.internal".to_string()),
+        ("x-tier".to_string(), "gold-plus".to_string()),
+    ]);
+
+    let result = plugin.before_proxy(&mut request, &mut headers).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        request.route_override_upstream_id.as_deref(),
+        Some("specific"),
+        "a shorter first alternative must not hide a later full-input match"
+    );
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_precomputed_node_waypoint_key_preserves_canonical_matching() {
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {
+                "backend_host": "Stable.Default.Svc.Cluster.Local.",
+                "backend_port": 80
+            }
+        }]
+    }))
+    .expect("plugin config");
+    let mut request = ctx();
+    request.metadata.insert(
+        "mesh_authz.node_waypoint_authorized_backend".to_string(),
+        "stable.default.svc.cluster.local|80".to_string(),
+    );
+
+    let result = plugin.before_proxy(&mut request, &mut HashMap::new()).await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        request.route_override_backend_host.as_deref(),
+        Some("stable.default.svc.cluster.local.")
+    );
+    assert_eq!(request.route_override_backend_port, Some(80));
 }
 
 #[tokio::test]

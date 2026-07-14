@@ -487,8 +487,9 @@ x-ferrum-plugins:
   - id: orders-jwt
     plugin_name: jwt_auth
     config:
-      uri_param_names: []
-      header_names: [authorization]
+      token_lookup: header:Authorization
+      expected_issuer: https://identity.example.com
+      audiences: [orders-api]
 ```
 
 ### 4. Proxy with generated OpenAPI validation

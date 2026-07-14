@@ -61,6 +61,7 @@ pub struct RouteHeaderTransformRule {
 /// `request_transformer` / `response_transformer` rule shape so a future
 /// shared validator can be lifted out without re-spelling the wire format.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RawRouteHeaderTransformRule {
     pub operation: String,
     /// Always `"header"` for route-level transforms. Kept for shape parity
