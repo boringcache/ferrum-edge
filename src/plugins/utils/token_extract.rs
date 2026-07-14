@@ -1,5 +1,6 @@
 use crate::plugins::RequestContext;
 
+use super::auth_attempt::AuthenticationAttempt;
 use super::auth_flow::ExtractedCredential;
 
 /// Metadata-key prefix marking a query parameter that carried the auth token and
@@ -106,35 +107,31 @@ pub fn provider_locations_extract_token(
         })
 }
 
-pub fn mark_original_token_stripping_metadata(
-    ctx: &mut RequestContext,
+pub fn stage_original_token_stripping(
+    attempt: &mut AuthenticationAttempt,
     token_locations: &[TokenLocation],
     strip_authorization_metadata_key: &str,
     strip_header_metadata_prefix: &str,
     strip_query_param_metadata_prefix: &str,
 ) {
     if token_locations.is_empty() {
-        ctx.metadata.insert(
-            strip_authorization_metadata_key.to_string(),
-            "true".to_string(),
-        );
+        attempt.stage_stripping_metadata(strip_authorization_metadata_key.to_string());
         return;
     }
 
     for location in token_locations {
         match location {
             TokenLocation::Header(header) => {
-                ctx.metadata.insert(
-                    format!("{strip_header_metadata_prefix}{}", header.name),
-                    "true".to_string(),
-                );
+                attempt.stage_stripping_metadata(format!(
+                    "{strip_header_metadata_prefix}{}",
+                    header.name
+                ));
             }
             TokenLocation::QueryParam(name) => {
-                ctx.metadata.insert(
+                attempt.stage_query_param_strip(
                     format!("{strip_query_param_metadata_prefix}{name}"),
-                    "true".to_string(),
+                    name.clone(),
                 );
-                ctx.query_params.remove(name);
             }
         }
     }

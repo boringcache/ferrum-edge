@@ -20,9 +20,12 @@ use url::{Host, Url};
 use crate::consumer_index::ConsumerIndex;
 
 use super::utils::PluginHttpClient;
-use super::utils::auth_flow::{VerifyOutcome, constant_time_eq};
+use super::utils::auth_attempt::AuthenticationAttempt;
+use super::utils::auth_flow::{
+    VerifyOutcome, commit_authentication_attempt, constant_time_eq, nonblank_identity,
+};
 use super::utils::claim_header_fanout::{
-    ClaimHeaderMapping, apply_claim_headers_from_context, emit_claim_headers_to_context,
+    ClaimHeaderMapping, apply_claim_headers_from_context, emit_claim_headers_to_attempt,
     parse_claim_headers,
 };
 use super::utils::claim_resolver::extract_claim_string;
@@ -1170,9 +1173,15 @@ impl OidcRelyingParty {
         ) {
             return reject(status, body);
         }
-        emit_claim_headers_to_context(ctx, &payload.claims, &self.provider.claim_headers, ",");
+        let mut attempt = AuthenticationAttempt::new();
+        emit_claim_headers_to_attempt(
+            &mut attempt,
+            &payload.claims,
+            &self.provider.claim_headers,
+            ",",
+        );
         let outcome = self.resolve_identity(&payload.claims, consumer_index);
-        apply_verify_outcome(ctx, outcome)
+        apply_verify_outcome(ctx, attempt, outcome)
     }
 
     /// Advance the sliding idle window. To keep the response `Set-Cookie` (and the
@@ -1321,7 +1330,10 @@ impl OidcRelyingParty {
     }
 
     fn resolve_identity(&self, claims: &Value, consumer_index: &ConsumerIndex) -> VerifyOutcome {
-        let identity = extract_claim_string(claims, &self.provider.consumer_identity_claim);
+        let identity = nonblank_identity(extract_claim_string(
+            claims,
+            &self.provider.consumer_identity_claim,
+        ));
         let header = if self.provider.consumer_header_claim == self.provider.consumer_identity_claim
         {
             identity.clone()
@@ -1967,38 +1979,22 @@ where
     serde_json::from_slice(&body).map_err(|error| error.to_string())
 }
 
-fn apply_verify_outcome(ctx: &mut RequestContext, outcome: VerifyOutcome) -> PluginResult {
-    match outcome {
-        VerifyOutcome::Success {
-            consumer,
-            external_identity,
-            external_identity_header,
-        } => {
-            let consumer_identified = consumer.is_some();
-            let external_identity_identified = external_identity.is_some();
-            if let Some(consumer) = consumer
-                && ctx.identified_consumer.is_none()
-            {
-                ctx.identified_consumer = Some(consumer);
-            }
-            if let Some(identity) = external_identity {
-                ctx.authenticated_identity = Some(identity);
-            }
-            if let Some(header) = external_identity_header {
-                ctx.authenticated_identity_header = Some(header);
-            }
-            if ctx.auth_method.is_none() && (consumer_identified || external_identity_identified) {
-                ctx.auth_method = Some("oidc_relying_party");
-            }
+fn apply_verify_outcome(
+    ctx: &mut RequestContext,
+    attempt: AuthenticationAttempt,
+    outcome: VerifyOutcome,
+) -> PluginResult {
+    match commit_authentication_attempt(ctx, attempt, outcome, "oidc_relying_party", true) {
+        Ok(_) => PluginResult::Continue,
+        Err(VerifyOutcome::Forbidden(body)) => reject(403, body),
+        Err(VerifyOutcome::Invalid(body))
+        | Err(VerifyOutcome::InvalidFormat(body))
+        | Err(VerifyOutcome::ConsumerNotFound(body))
+        | Err(VerifyOutcome::VerificationFailed(body)) => reject(401, body),
+        Err(VerifyOutcome::Internal(body)) => reject(500, body),
+        Err(VerifyOutcome::Success { .. }) | Err(VerifyOutcome::NotApplicable) => {
             PluginResult::Continue
         }
-        VerifyOutcome::Forbidden(body) => reject(403, body),
-        VerifyOutcome::Invalid(body)
-        | VerifyOutcome::InvalidFormat(body)
-        | VerifyOutcome::ConsumerNotFound(body)
-        | VerifyOutcome::VerificationFailed(body) => reject(401, body),
-        VerifyOutcome::Internal(body) => reject(500, body),
-        VerifyOutcome::NotApplicable => PluginResult::Continue,
     }
 }
 
@@ -3356,6 +3352,35 @@ mod tests {
         build_plugin_with_client(token_endpoint, "client-1")
     }
 
+    fn build_claim_identity_plugin(required_scopes: &[&str]) -> OidcRelyingParty {
+        OidcRelyingParty::new(
+            &json!({
+                "providers": [{
+                    "issuer": "https://idp.example.com",
+                    "client_id": "client-1",
+                    "authorization_endpoint": "https://idp.example.com/authorize",
+                    "token_endpoint": "https://idp.example.com/token",
+                    "jwks_uri": "https://idp.example.com/jwks",
+                    "scopes": ["openid"],
+                    "redirect_uri": "https://app.example.com/oauth/callback",
+                    "callback_path": "/oauth/callback",
+                    "client_auth": {"method": "client_secret_basic", "client_secret": "shhh"},
+                    "consumer_identity_claim": "email",
+                    "consumer_header_claim": "display_name",
+                    "claim_headers": {"tenant": "X-Tenant"},
+                    "required_scopes": required_scopes
+                }],
+                "session": {
+                    "encryption_secret": "0123456789012345678901234567890123",
+                    "ttl_secs": 3600,
+                    "idle_ttl_secs": 1800
+                }
+            }),
+            PluginHttpClient::default(),
+        )
+        .expect("OIDC claim identity config is valid")
+    }
+
     fn build_plugin_with_client(token_endpoint: &str, client_id: &str) -> OidcRelyingParty {
         OidcRelyingParty::new(
             &json!({
@@ -4142,6 +4167,123 @@ mod tests {
                 .await,
             PluginResult::Continue
         ));
+    }
+
+    #[tokio::test]
+    async fn principal_less_session_discards_claim_header_and_identity_header_state() {
+        let plugin = build_claim_identity_plugin(&[]);
+        let now = chrono::Utc::now().timestamp();
+
+        for email in [None, Some("   ")] {
+            let mut payload = session_payload(now - 100, now - 100, None, now + 100_000);
+            payload.claims = json!({
+                "sub": "user-1",
+                "display_name": "Header Without Principal",
+                "tenant": "unaccepted-tenant"
+            });
+            if let Some(email) = email {
+                payload.claims["email"] = json!(email);
+            }
+            let mut ctx = ctx_with_session(&plugin, &payload);
+
+            assert!(matches!(
+                plugin
+                    .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                    .await,
+                PluginResult::Continue
+            ));
+            assert!(ctx.identified_consumer.is_none());
+            assert!(ctx.authenticated_identity.is_none());
+            assert!(ctx.authenticated_identity_header.is_none());
+            assert!(ctx.auth_method.is_none());
+            assert!(
+                !ctx.metadata
+                    .values()
+                    .any(|value| value == "unaccepted-tenant")
+            );
+
+            let mut headers = HashMap::new();
+            assert!(matches!(
+                plugin.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ));
+            assert!(!headers.contains_key("x-tenant"));
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_session_preserves_identity_and_claim_header_exactly() {
+        let plugin = build_claim_identity_plugin(&[]);
+        let now = chrono::Utc::now().timestamp();
+        let mut payload = session_payload(now - 100, now - 100, None, now + 100_000);
+        payload.claims = json!({
+            "sub": "user-1",
+            "email": " accepted@example.com ",
+            "display_name": "   ",
+            "tenant": " tenant-original "
+        });
+        let mut ctx = ctx_with_session(&plugin, &payload);
+
+        assert!(matches!(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            ctx.authenticated_identity.as_deref(),
+            Some(" accepted@example.com ")
+        );
+        assert!(ctx.authenticated_identity_header.is_none());
+        assert_eq!(
+            ctx.backend_consumer_username(),
+            Some(" accepted@example.com ")
+        );
+
+        let mut headers = HashMap::new();
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            headers.get("x-tenant").map(String::as_str),
+            Some(" tenant-original ")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_session_authorization_leaves_no_claim_state() {
+        let plugin = build_claim_identity_plugin(&["admin"]);
+        let now = chrono::Utc::now().timestamp();
+        let mut payload = session_payload(now - 100, now - 100, None, now + 100_000);
+        payload.claims = json!({
+            "sub": "user-1",
+            "email": "accepted@example.com",
+            "display_name": "Accepted User",
+            "tenant": "must-not-commit",
+            "scope": "read"
+        });
+        let mut ctx = ctx_with_session(&plugin, &payload);
+
+        assert!(matches!(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ));
+        assert!(ctx.authenticated_identity.is_none());
+        assert!(ctx.authenticated_identity_header.is_none());
+        assert!(ctx.auth_method.is_none());
+
+        let mut headers = HashMap::new();
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert!(!headers.contains_key("x-tenant"));
     }
 
     // Finding #36 regression: during a discovery outage a browser challenge must

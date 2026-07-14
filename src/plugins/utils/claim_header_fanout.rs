@@ -5,6 +5,7 @@ use serde_json::{Map, Value};
 
 use crate::plugins::RequestContext;
 
+use super::auth_attempt::AuthenticationAttempt;
 use super::claim_resolver::{parse_claim_path_value, resolve_claim_path};
 
 #[derive(Clone, Debug)]
@@ -47,8 +48,8 @@ pub fn parse_claim_headers(
     Ok(mappings)
 }
 
-pub fn emit_claim_headers_to_context(
-    ctx: &mut RequestContext,
+pub fn emit_claim_headers_to_attempt(
+    attempt: &mut AuthenticationAttempt,
     claims: &Value,
     mappings: &[ClaimHeaderMapping],
     separator: &str,
@@ -57,8 +58,7 @@ pub fn emit_claim_headers_to_context(
         let Some(value) = claim_value_for_header(claims, &mapping.claim_path, separator) else {
             continue;
         };
-        ctx.pending_claim_headers
-            .insert(mapping.metadata_key.clone(), value);
+        attempt.stage_claim_header(mapping.metadata_key.clone(), value);
     }
 }
 
@@ -176,12 +176,25 @@ mod tests {
             },
         ];
         let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
-        emit_claim_headers_to_context(
-            &mut ctx,
+        let mut attempt = AuthenticationAttempt::new();
+        emit_claim_headers_to_attempt(
+            &mut attempt,
             &json!({"email": "a@example.com", "roles": ["admin", "editor"]}),
             &mapping,
             ",",
         );
+        crate::plugins::utils::auth_flow::commit_authentication_attempt(
+            &mut ctx,
+            attempt,
+            crate::plugins::utils::auth_flow::VerifyOutcome::success(
+                None,
+                Some("accepted-principal".to_string()),
+                None,
+            ),
+            "test_auth",
+            true,
+        )
+        .expect("attempt commits");
         assert_eq!(
             ctx.pending_claim_headers
                 .get("p.x-user-email")

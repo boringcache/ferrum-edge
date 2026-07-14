@@ -465,9 +465,10 @@ pub struct RequestContext {
     pub timestamp_received: DateTime<Utc>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
-    /// Claim-derived upstream headers staged by authentication plugins until
-    /// `before_proxy`. Kept out of `metadata` so authorization-phase rejection
-    /// logging can never serialize raw claim values.
+    /// Claim-derived upstream headers committed by the first accepted
+    /// authentication attempt and held until `before_proxy`. Kept out of
+    /// `metadata` so authorization-phase rejection logging can never serialize
+    /// raw claim values.
     pub(crate) pending_claim_headers: HashMap<String, String>,
     /// Semantic-cache embedding vector staged between `before_proxy` and
     /// `on_final_response_body`. Kept out of `metadata` so high-dimensional

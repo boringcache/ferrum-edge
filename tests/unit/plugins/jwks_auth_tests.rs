@@ -1,15 +1,19 @@
 //! Tests for jwks_auth plugin
 
 use ferrum_edge::ConsumerIndex;
+use ferrum_edge::config::types::AuthMode;
 use ferrum_edge::plugins::{
     HTTP_FAMILY_PROTOCOLS, JwtAuthAttributeValue, Plugin, PluginHttpClient, RequestContext,
-    jwks_auth::JwksAuth, priority, validate_plugin_config, validate_plugin_config_with_policy,
+    jwks_auth::JwksAuth, key_auth::KeyAuth, priority, validate_plugin_config,
+    validate_plugin_config_with_policy,
 };
+use ferrum_edge::proxy::run_authentication_phase;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::plugin_utils::{assert_continue, assert_reject};
+use super::plugin_utils::{assert_continue, assert_reject, create_test_consumer};
 
 static JWKS_TEST_PATH_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -1415,6 +1419,160 @@ async fn claim_headers_writes_simple_and_array_claims_to_outbound_headers() {
         headers.get("x-user-roles").map(String::as_str),
         Some("admin|editor")
     );
+}
+
+#[tokio::test]
+async fn principal_less_jwks_attempt_is_discarded_before_later_key_auth_success() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    let jwks_plugin = Arc::new(
+        JwksAuth::new(
+            &json!({
+                "providers": [{
+                    "jwks": jwks,
+                    "consumer_identity_claim": "principal",
+                    "forward_original_token": false,
+                    "claim_headers": {"email": "X-User-Email"}
+                }],
+                "emit_mesh_request_principal_metadata": true
+            }),
+            default_client(),
+        )
+        .expect("valid inline JWKS config"),
+    );
+    let key_plugin = Arc::new(KeyAuth::new(&json!({})).expect("valid key auth config"));
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![jwks_plugin.clone(), key_plugin];
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+
+    for claims in [
+        json!({
+            "iss": "https://issuer.example",
+            "sub": "token-subject",
+            "principal": "   ",
+            "email": "unaccepted@example.com"
+        }),
+        json!({
+            "iss": "https://issuer.example",
+            "sub": "token-subject",
+            "email": "unaccepted@example.com"
+        }),
+    ] {
+        let token = create_rs256_token(&claims, private_key_pem);
+        let authorization = format!("Bearer {token}");
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("authorization".to_string(), authorization.clone());
+        ctx.headers
+            .insert("x-api-key".to_string(), "test-api-key".to_string());
+
+        assert!(
+            run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index,)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            ctx.identified_consumer
+                .as_ref()
+                .map(|consumer| consumer.username.as_str()),
+            Some("testuser")
+        );
+        assert_eq!(ctx.auth_method, Some("key_auth"));
+        assert!(ctx.authenticated_identity.is_none());
+        assert!(ctx.authenticated_identity_header.is_none());
+        assert!(!ctx.metadata.contains_key("mesh.request_principal"));
+        assert!(ctx.mesh_request_auth_audiences.is_empty());
+        assert!(ctx.mesh_request_auth_claims.is_empty());
+        assert!(
+            !ctx.metadata
+                .values()
+                .any(|value| value == "unaccepted@example.com")
+        );
+
+        let mut headers = ctx.headers.clone();
+        assert_continue(jwks_plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some(authorization.as_str()),
+            "an unaccepted JWKS attempt must not strip its bearer token"
+        );
+        assert!(!headers.contains_key("x-user-email"));
+    }
+}
+
+#[tokio::test]
+async fn first_accepted_jwks_instance_owns_identity_and_claim_headers() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwks = build_rsa_jwks_from_pem(public_key_pem);
+    let first = Arc::new(
+        JwksAuth::new(
+            &json!({"providers": [{
+                "jwks": jwks,
+                "from_headers": [{"name": "x-jwt-a"}],
+                "forward_original_token": false,
+                "consumer_header_claim": "display",
+                "claim_headers": {"email": "X-Selected-Email"}
+            }]}),
+            default_client(),
+        )
+        .expect("first JWKS config"),
+    );
+    let second = Arc::new(
+        JwksAuth::new(
+            &json!({"providers": [{
+                "jwks": build_rsa_jwks_from_pem(public_key_pem),
+                "from_headers": [{"name": "x-jwt-b"}],
+                "forward_original_token": false,
+                "consumer_header_claim": "display",
+                "claim_headers": {"email": "X-Selected-Email"}
+            }]}),
+            default_client(),
+        )
+        .expect("second JWKS config"),
+    );
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![first.clone(), second.clone()];
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "x-jwt-a".to_string(),
+        create_rs256_token(
+            &json!({"sub": "first", "display": "First Display", "email": "first@example.com"}),
+            private_key_pem,
+        ),
+    );
+    ctx.headers.insert(
+        "x-jwt-b".to_string(),
+        create_rs256_token(
+            &json!({"sub": "second", "display": "Second Display", "email": "second@example.com"}),
+            private_key_pem,
+        ),
+    );
+
+    assert!(
+        run_authentication_phase(
+            AuthMode::Single,
+            &auth_plugins,
+            &mut ctx,
+            &ConsumerIndex::new(&[]),
+        )
+        .await
+        .is_none()
+    );
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("first"));
+    assert_eq!(
+        ctx.authenticated_identity_header.as_deref(),
+        Some("First Display")
+    );
+
+    let mut headers = ctx.headers.clone();
+    assert_continue(first.before_proxy(&mut ctx, &mut headers).await);
+    assert_continue(second.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        headers.get("x-selected-email").map(String::as_str),
+        Some("first@example.com")
+    );
+    assert!(!headers.contains_key("x-jwt-a"));
+    assert!(!headers.contains_key("x-jwt-b"));
 }
 
 #[test]

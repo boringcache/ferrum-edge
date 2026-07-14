@@ -11,11 +11,15 @@ use url::{Host, Url};
 use crate::consumer_index::ConsumerIndex;
 
 use super::utils::PluginHttpClient;
+use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::constant_time_eq;
-use super::utils::auth_flow::{AuthMechanism, ExtractedCredential, VerifyOutcome};
+use super::utils::auth_flow::{
+    AuthMechanism, ExtractedCredential, VerifyOutcome, commit_authentication_attempt,
+    nonblank_identity,
+};
 use super::utils::cert_hash::sha256_base64url_no_pad;
 use super::utils::claim_header_fanout::{
-    ClaimHeaderMapping, apply_claim_headers_from_context, emit_claim_headers_to_context,
+    ClaimHeaderMapping, apply_claim_headers_from_context, emit_claim_headers_to_attempt,
     parse_claim_headers, parse_separator,
 };
 use super::utils::claim_resolver::{extract_claim_string, parse_claim_path_value};
@@ -30,9 +34,8 @@ use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::token_extract::{
     STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
-    extract_authorization_bearer, extract_from_location,
-    mark_original_token_stripping_metadata as mark_token_stripping_metadata,
-    mark_present_query_credential_locations, provider_locations_extract_token,
+    extract_authorization_bearer, extract_from_location, mark_present_query_credential_locations,
+    provider_locations_extract_token, stage_original_token_stripping as stage_token_stripping,
 };
 use super::{JwtAuthAttributeValue, PluginResult, RequestContext};
 
@@ -491,7 +494,7 @@ impl JwksAuth {
             .as_deref()
             .unwrap_or(&self.consumer_header_claim);
 
-        let identity = extract_claim_string(claims, effective_identity_claim);
+        let identity = nonblank_identity(extract_claim_string(claims, effective_identity_claim));
         let header_value = if effective_header_claim == effective_identity_claim {
             identity.clone()
         } else {
@@ -502,15 +505,14 @@ impl JwksAuth {
             match consumer_index.find_by_identity(id) {
                 Some(consumer) => {
                     debug!(
-                        "jwks_auth: identified consumer '{}' via claim '{}'='{}'",
-                        consumer.username, effective_identity_claim, id
+                        "jwks_auth: identified consumer '{}' via configured identity claim",
+                        consumer.username
                     );
                     Some(consumer)
                 }
                 None => {
                     debug!(
-                        "jwks_auth: no consumer found for '{}'='{}' — using external identity",
-                        effective_identity_claim, id
+                        "jwks_auth: no consumer mapping found for configured identity claim — using external principal"
                     );
                     None
                 }
@@ -665,9 +667,9 @@ impl JwksAuth {
         Ok(())
     }
 
-    fn emit_claim_headers(
+    fn stage_claim_headers(
         &self,
-        ctx: &mut RequestContext,
+        attempt: &mut AuthenticationAttempt,
         claims: &Value,
         provider: &JwksProvider,
     ) {
@@ -683,7 +685,7 @@ impl JwksAuth {
             .claim_headers_separator
             .as_deref()
             .unwrap_or(&self.claim_headers_separator);
-        emit_claim_headers_to_context(ctx, claims, mappings, separator);
+        emit_claim_headers_to_attempt(attempt, claims, mappings, separator);
     }
 
     async fn authenticate_request(
@@ -727,51 +729,32 @@ impl JwksAuth {
                     return reject(status, body);
                 }
 
-                match self.resolve_identity(&claims, provider, consumer_index) {
-                    VerifyOutcome::Success {
-                        consumer,
-                        external_identity,
-                        external_identity_header,
-                    } => {
-                        let consumer_identified = consumer.is_some();
-                        let external_identity_identified = external_identity.is_some();
+                let mut attempt = AuthenticationAttempt::new();
+                if self.emit_mesh_request_principal_metadata {
+                    stage_mesh_request_principal_metadata(&claims, &mut attempt);
+                }
+                self.stage_claim_headers(&mut attempt, &claims, provider);
+                if !provider.forward_original_token {
+                    stage_original_token_stripping(&mut attempt, provider);
+                }
 
-                        if let Some(consumer) = consumer
-                            && ctx.identified_consumer.is_none()
-                        {
-                            debug!("jwks_auth: identified consumer '{}'", consumer.username);
-                            ctx.identified_consumer = Some(consumer);
-                        }
-
-                        if let Some(external_identity) = external_identity {
-                            ctx.authenticated_identity = Some(external_identity);
-                        }
-                        if let Some(external_identity_header) = external_identity_header {
-                            ctx.authenticated_identity_header = Some(external_identity_header);
-                        }
-
-                        if ctx.auth_method.is_none()
-                            && (consumer_identified || external_identity_identified)
-                        {
-                            ctx.auth_method = Some("jwks_auth");
-                        }
-                        if self.emit_mesh_request_principal_metadata {
-                            set_mesh_request_principal_metadata(&claims, ctx);
-                        }
-                        self.emit_claim_headers(ctx, &claims, provider);
-
-                        if !provider.forward_original_token {
-                            mark_original_token_stripping_metadata(ctx, provider);
-                        }
+                match commit_authentication_attempt(
+                    ctx,
+                    attempt,
+                    self.resolve_identity(&claims, provider, consumer_index),
+                    "jwks_auth",
+                    true,
+                ) {
+                    Ok(_) => PluginResult::Continue,
+                    Err(VerifyOutcome::InvalidFormat(body))
+                    | Err(VerifyOutcome::Invalid(body))
+                    | Err(VerifyOutcome::ConsumerNotFound(body))
+                    | Err(VerifyOutcome::VerificationFailed(body)) => reject(401, body),
+                    Err(VerifyOutcome::Forbidden(body)) => reject(403, body),
+                    Err(VerifyOutcome::Internal(body)) => reject(500, body),
+                    Err(VerifyOutcome::Success { .. }) | Err(VerifyOutcome::NotApplicable) => {
                         PluginResult::Continue
                     }
-                    VerifyOutcome::NotApplicable => PluginResult::Continue,
-                    VerifyOutcome::InvalidFormat(body)
-                    | VerifyOutcome::Invalid(body)
-                    | VerifyOutcome::ConsumerNotFound(body)
-                    | VerifyOutcome::VerificationFailed(body) => reject(401, body),
-                    VerifyOutcome::Forbidden(body) => reject(403, body),
-                    VerifyOutcome::Internal(body) => reject(500, body),
                 }
             }
         }
@@ -908,9 +891,9 @@ enum JwksExtractedCredential {
     Missing,
 }
 
-fn mark_original_token_stripping_metadata(ctx: &mut RequestContext, provider: &JwksProvider) {
-    mark_token_stripping_metadata(
-        ctx,
+fn stage_original_token_stripping(attempt: &mut AuthenticationAttempt, provider: &JwksProvider) {
+    stage_token_stripping(
+        attempt,
         &provider.token_locations,
         STRIP_AUTHORIZATION_METADATA_KEY,
         STRIP_HEADER_METADATA_PREFIX,
@@ -1751,20 +1734,20 @@ fn origin_from_parsed_url(parsed: &Url) -> Option<UrlOrigin> {
 /// string-array leaves in the already-validated token; nested object claims are
 /// materialized only at leaf paths so nested Istio condition keys remain
 /// addressable without serializing whole objects.
-fn set_mesh_request_principal_metadata(claims: &Value, ctx: &mut RequestContext) {
+fn stage_mesh_request_principal_metadata(claims: &Value, attempt: &mut AuthenticationAttempt) {
     if let (Some(iss), Some(sub)) = (
         claims.get("iss").and_then(|v| v.as_str()),
         claims.get("sub").and_then(|v| v.as_str()),
     ) {
-        ctx.metadata
-            .insert("mesh.request_principal".to_string(), format!("{iss}/{sub}"));
+        attempt
+            .stage_principal_metadata("mesh.request_principal".to_string(), format!("{iss}/{sub}"));
     }
 
     // `request.auth.audiences` — string or string-array form.
     if let Some(aud) = claims.get("aud")
         && let Some(audiences) = string_scalar_or_array(aud)
     {
-        ctx.mesh_request_auth_audiences = audiences;
+        attempt.stage_mesh_request_auth_audiences(audiences);
     }
 
     // `request.auth.claims[<name>]` — scalar claims and string arrays only.
@@ -1778,7 +1761,7 @@ fn set_mesh_request_principal_metadata(claims: &Value, ctx: &mut RequestContext)
             if claim_path_segment_is_ambiguous(name) {
                 continue;
             }
-            set_mesh_claim_attribute(name, value, ctx);
+            stage_mesh_claim_attribute(name, value, attempt);
         }
     }
 }
@@ -1787,7 +1770,7 @@ fn set_mesh_request_principal_metadata(claims: &Value, ctx: &mut RequestContext)
 /// `request.auth.claims[...]` matching. String claims render directly; string
 /// arrays stay as lists so one item containing a comma does not broaden policy
 /// matching. Objects and non-string leaves are skipped by this leaf renderer;
-/// object traversal happens in [`set_mesh_claim_attribute`].
+/// object traversal happens in [`stage_mesh_claim_attribute`].
 fn render_claim_leaf_attribute_value(value: &Value) -> Option<JwtAuthAttributeValue> {
     match value {
         Value::String(s) => Some(JwtAuthAttributeValue::Scalar(s.clone())),
@@ -1796,10 +1779,9 @@ fn render_claim_leaf_attribute_value(value: &Value) -> Option<JwtAuthAttributeVa
     }
 }
 
-fn set_mesh_claim_attribute(path: &str, value: &Value, ctx: &mut RequestContext) {
+fn stage_mesh_claim_attribute(path: &str, value: &Value, attempt: &mut AuthenticationAttempt) {
     if let Some(rendered) = render_claim_leaf_attribute_value(value) {
-        ctx.mesh_request_auth_claims
-            .insert(path.to_string(), rendered);
+        attempt.stage_mesh_request_auth_claim(path.to_string(), rendered);
         return;
     }
 
@@ -1815,7 +1797,7 @@ fn set_mesh_claim_attribute(path: &str, value: &Value, ctx: &mut RequestContext)
         nested_path.push_str(path);
         nested_path.push_str("][");
         nested_path.push_str(name);
-        set_mesh_claim_attribute(&nested_path, nested, ctx);
+        stage_mesh_claim_attribute(&nested_path, nested, attempt);
     }
 }
 
