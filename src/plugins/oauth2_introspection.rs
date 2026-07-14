@@ -846,18 +846,23 @@ impl Oauth2Introspection {
                             provider_idx: idx,
                             source: CredentialSource::ProviderLocation(location_idx),
                         }];
-                        for (other_idx, other_provider) in self.providers.iter().enumerate() {
-                            if other_idx != idx
-                                && let Some(other_location_idx) = provider_location_extracting_token(
-                                    &other_provider.token_locations,
-                                    ctx,
-                                    &token,
-                                )
-                            {
-                                candidates.push(ProviderCandidate {
-                                    provider_idx: other_idx,
-                                    source: CredentialSource::ProviderLocation(other_location_idx),
-                                });
+                        if self.allow_provider_fanout {
+                            for (other_idx, other_provider) in self.providers.iter().enumerate() {
+                                if other_idx != idx
+                                    && let Some(other_location_idx) =
+                                        provider_location_extracting_token(
+                                            &other_provider.token_locations,
+                                            ctx,
+                                            &token,
+                                        )
+                                {
+                                    candidates.push(ProviderCandidate {
+                                        provider_idx: other_idx,
+                                        source: CredentialSource::ProviderLocation(
+                                            other_location_idx,
+                                        ),
+                                    });
+                                }
                             }
                         }
                         candidates.sort_unstable_by_key(|candidate| candidate.provider_idx);

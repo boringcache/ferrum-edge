@@ -1123,6 +1123,56 @@ async fn provider_specific_location_routes_without_disclosing_to_siblings() {
 }
 
 #[tokio::test]
+async fn duplicate_provider_hints_do_not_fan_out_without_shared_trust() {
+    let provider_a = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"active": false})))
+        .mount(&provider_a)
+        .await;
+    let provider_b = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"active": true, "username": "b"})),
+        )
+        .mount(&provider_b)
+        .await;
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [
+                {
+                    "introspection_endpoint": format!("{}/introspect", provider_a.uri()),
+                    "client_auth": {"method": "none"},
+                    "from_headers": [{"name": "x-provider-a-token"}]
+                },
+                {
+                    "introspection_endpoint": format!("{}/introspect", provider_b.uri()),
+                    "client_auth": {"method": "none"},
+                    "from_headers": [{"name": "x-provider-b-token"}]
+                }
+            ]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/test".into());
+    ctx.headers
+        .insert("x-provider-a-token".to_string(), "shared-token".to_string());
+    ctx.headers
+        .insert("x-provider-b-token".to_string(), "shared-token".to_string());
+    assert_bearer_reject(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+        401,
+        "invalid_token",
+    );
+    assert_eq!(provider_a.received_requests().await.unwrap().len(), 1);
+    assert!(provider_b.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn cache_policy_is_owned_by_each_live_plugin_instance() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
