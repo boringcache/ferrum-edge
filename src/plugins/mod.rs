@@ -607,6 +607,15 @@ pub struct RequestContext {
     /// Set on HTTP/3 via quinn's `into_0rtt()` detection, and on HTTPS via the
     /// `Early-Data: 1` header (RFC 8470) from upstream proxies/CDNs.
     pub is_early_data: bool,
+    /// Aggregate fail-closed decision staged by cache-managed
+    /// `mesh_route_dispatch` instances. The cache inserts a finalizer directly
+    /// after the last instance so disjoint rules can all participate before a
+    /// 404 is emitted. Kept out of public metadata and transaction logs.
+    pub(crate) mesh_route_dispatch_reject_unmatched: bool,
+    /// Whether any cache-managed `mesh_route_dispatch` instance matched.
+    /// Kept separate from route overrides because rewrite-only and transform-
+    /// only rules are successful matches too.
+    pub(crate) mesh_route_dispatch_matched: bool,
     /// Plugin-set override for the proxy's `upstream_id`. When `Some`, the
     /// dispatch path uses this instead of `proxy.upstream_id`. Used by
     /// `mesh_route_dispatch` to implement Istio `VirtualService` header/method
@@ -796,6 +805,8 @@ impl RequestContext {
             request_body_bytes: None,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             is_early_data: false,
+            mesh_route_dispatch_reject_unmatched: false,
+            mesh_route_dispatch_matched: false,
             route_override_upstream_id: None,
             route_override_backend_host: None,
             route_override_backend_scheme: None,
@@ -890,6 +901,8 @@ impl RequestContext {
             request_body_bytes: None,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
             is_early_data: self.is_early_data,
+            mesh_route_dispatch_reject_unmatched: self.mesh_route_dispatch_reject_unmatched,
+            mesh_route_dispatch_matched: self.mesh_route_dispatch_matched,
             route_override_upstream_id: self.route_override_upstream_id.clone(),
             route_override_backend_host: self.route_override_backend_host.clone(),
             route_override_backend_scheme: self.route_override_backend_scheme,
@@ -2815,6 +2828,11 @@ pub trait Plugin: Send + Sync {
     ) -> PluginResult {
         PluginResult::Continue
     }
+
+    /// Enables cache-managed aggregation of a plugin's unmatched decision.
+    /// The default is a no-op; `mesh_route_dispatch` uses this to preserve
+    /// standalone behavior while coordinating multiple cached instances.
+    fn enable_deferred_unmatched_rejection(&self) {}
 
     /// Returns `true` if this plugin participates in target-aware backend
     /// admission after load balancing and before backend dispatch.

@@ -8121,23 +8121,29 @@ components:
 
     BackendTlsConfig:
       type: object
-      required: [client_cert_path, client_key_path, server_ca_cert_path, verify_server_cert]
       properties:
         client_cert_path:
           type: [string, "null"]
+          minLength: 1
         client_key_path:
           type: [string, "null"]
+          minLength: 1
         server_ca_cert_path:
           type: [string, "null"]
+          minLength: 1
         verify_server_cert:
           type: boolean
           default: true
         sni:
           type: [string, "null"]
+          maxLength: 253
         san_allow_list:
           type: array
+          maxItems: 256
+          default: []
           items:
             type: string
+            maxLength: 2048
 
     TcpKeepaliveCfg:
       type: object
@@ -11972,6 +11978,7 @@ components:
 
     MeshRouteDispatchConfig:
       type: object
+      additionalProperties: false
       description: |
         Plugin: mesh_route_dispatch — Per-request route override driven by
         method / header / query-param predicates. Closes the Istio
@@ -11993,6 +12000,7 @@ components:
           minItems: 1
           items:
             type: object
+            additionalProperties: false
             description: |
               One ordered route rule. `destination` is required unless the
               rule carries a `redirect` (which answers the request itself and
@@ -12000,9 +12008,29 @@ components:
             anyOf:
               - required: [destination]
               - required: [redirect]
+            allOf:
+              - if:
+                  required: [timeout_disabled]
+                  properties:
+                    timeout_disabled:
+                      const: true
+                then:
+                  properties:
+                    timeout_ms:
+                      type: "null"
+              - if:
+                  required: [retry_disabled]
+                  properties:
+                    retry_disabled:
+                      const: true
+                then:
+                  properties:
+                    retry:
+                      type: "null"
             properties:
               match:
                 type: object
+                additionalProperties: false
                 description: |
                   Match criteria — all configured fields must match for the
                   rule to fire. At least one of `methods`/`headers`/
@@ -12018,9 +12046,10 @@ components:
                         - type: object
                           description: |
                             Istio StringMatch shape — exactly one of
-                            `exact` / `prefix` / `regex`. Prefix/regex
-                            patterns are uppercased at compile time
-                            (methods are uppercase ASCII per RFC 9110 §9.1).
+                            `exact` / `prefix` / `regex`. Prefix patterns are
+                            uppercased at compile time (methods are uppercase
+                            ASCII per RFC 9110 §9.1); regex patterns are
+                            interpreted verbatim inside full-input anchors.
                           additionalProperties: false
                           properties:
                             exact:
@@ -12062,7 +12091,7 @@ components:
                       gates URI selection; the VirtualService translator emits
                       it for widened `ignoreUriCase` routes and collapsed
                       route-order fallbacks that need dispatch-layer URI
-                      precision.
+                      precision. Regex patterns must match the full URI path.
                     oneOf:
                       - type: object
                         required: [exact]
@@ -12141,6 +12170,7 @@ components:
                             type: string
               destination:
                 type: object
+                additionalProperties: false
                 description: |
                   Override applied on match. At least one field must be set.
                   `upstream_id` is mutually exclusive with the direct-backend
@@ -12156,7 +12186,42 @@ components:
                     minimum: 1
                   backend_tls:
                     description: Optional per-rule backend TLS override (direct backends only).
-                    type: [object, "null"]
+                    oneOf:
+                      - $ref: "#/components/schemas/BackendTlsConfig"
+                      - type: "null"
+                  requires_node_waypoint_authz:
+                    type: boolean
+                    default: false
+                    description: |
+                      Trusted mesh-translator marker. When scoped NodeWaypoint
+                      authorization is active, a matching destination carrying
+                      this marker requires an authorized destination stamp.
+              timeout_ms:
+                type: [integer, "null"]
+                format: uint64
+                description: |
+                  Optional route-local backend response/read timeout in
+                  milliseconds. Mutually exclusive with
+                  `timeout_disabled: true`.
+              timeout_disabled:
+                type: boolean
+                default: false
+                description: |
+                  Explicitly clear the selected proxy's inherited backend
+                  response/read timeout. Cannot be true when `timeout_ms` is set.
+              retry:
+                oneOf:
+                  - $ref: "#/components/schemas/RetryConfig"
+                  - type: "null"
+                description: |
+                  Optional route-local retry policy. Mutually exclusive with
+                  `retry_disabled: true`.
+              retry_disabled:
+                type: boolean
+                default: false
+                description: |
+                  Explicitly clear the selected proxy's inherited retry
+                  policy. Cannot be true when `retry` is set.
               request_transform:
                 type: array
                 description: |
@@ -12171,16 +12236,41 @@ components:
                   rejected.
                 items:
                   type: object
-                  required: [op, key]
+                  additionalProperties: false
+                  required: [operation, key]
+                  allOf:
+                    - if:
+                        required: [operation]
+                        properties:
+                          operation:
+                            enum: [add, update]
+                      then:
+                        required: [value]
+                        properties:
+                          value:
+                            type: string
+                    - if:
+                        required: [operation]
+                        properties:
+                          operation:
+                            const: remove
+                      then:
+                        properties:
+                          value:
+                            type: "null"
                   properties:
-                    op:
+                    operation:
                       type: string
                       enum: [add, update, remove]
+                    target:
+                      type: string
+                      enum: [header]
+                      default: header
                     key:
                       type: string
                     value:
-                      type: string
-                      description: Required for add/update; omitted for remove.
+                      type: [string, "null"]
+                      description: Required and non-null for add/update; omitted or null for remove.
               response_transform:
                 type: array
                 description: |
@@ -12190,17 +12280,44 @@ components:
                   the `response_transformer` plugin.
                 items:
                   type: object
-                  required: [op, key]
+                  additionalProperties: false
+                  required: [operation, key]
+                  allOf:
+                    - if:
+                        required: [operation]
+                        properties:
+                          operation:
+                            enum: [add, update]
+                      then:
+                        required: [value]
+                        properties:
+                          value:
+                            type: string
+                    - if:
+                        required: [operation]
+                        properties:
+                          operation:
+                            const: remove
+                      then:
+                        properties:
+                          value:
+                            type: "null"
                   properties:
-                    op:
+                    operation:
                       type: string
                       enum: [add, update, remove]
+                    target:
+                      type: string
+                      enum: [header]
+                      default: header
                     key:
                       type: string
                     value:
-                      type: string
+                      type: [string, "null"]
+                      description: Required and non-null for add/update; omitted or null for remove.
               fault:
                 type: object
+                additionalProperties: false
                 description: |
                   Optional per-rule fault action. Projects Istio
                   `VirtualService.http[].fault` onto the matched dispatch
@@ -12220,6 +12337,7 @@ components:
                 properties:
                   delay:
                     type: object
+                    additionalProperties: false
                     required: [duration_ms, percentage]
                     properties:
                       duration_ms:
@@ -12242,6 +12360,7 @@ components:
                           (omit the action to disable it instead).
                   abort:
                     type: object
+                    additionalProperties: false
                     required: [status_code, percentage]
                     properties:
                       status_code:
@@ -12269,6 +12388,7 @@ components:
                         description: Optional response body; empty when omitted.
               rewrite:
                 type: object
+                additionalProperties: false
                 description: |
                   Optional per-rule URI / authority rewrite. Projects Istio
                   `VirtualService.http[].rewrite` onto the matched dispatch
@@ -12298,21 +12418,33 @@ components:
                       VirtualService translator, not hand-authored.
               redirect:
                 type: object
+                additionalProperties: false
                 description: |
                   Optional per-rule HTTP redirect. Projects Istio
                   `VirtualService.http[].redirect`. When the rule matches the
                   request is answered with a 3xx + `Location` and never reaches
                   a backend; takes precedence over `rewrite` and the route
-                  override destination. At least one of `uri` / `authority` /
-                  `scheme` must be set. A rule carrying a `redirect` does not
-                  require a `destination`.
+                  override destination. A status-only redirect is valid and
+                  preserves the original URL. A rule carrying a `redirect`
+                  does not require a `destination`.
                 properties:
                   uri:
                     type: [string, "null"]
                     description: Replacement path for the Location header; request path preserved when unset.
+                  match_prefix:
+                    type: [string, "null"]
+                    description: |
+                      Literal matched path prefix replaced by `uri`; the
+                      unmatched suffix is preserved. Normally emitted by the
+                      VirtualService translator.
                   authority:
                     type: [string, "null"]
                     description: Replacement authority (host[:port]) for the Location header; request authority preserved when unset.
+                  port:
+                    type: [integer, "null"]
+                    format: uint16
+                    minimum: 1
+                    description: Replacement authority port; request host is preserved when authority is unset.
                   scheme:
                     type: [string, "null"]
                     enum: [http, https, null]
@@ -12331,7 +12463,9 @@ components:
             instead of falling through to the proxy's default backend. The
             Istio VirtualService translator sets this so a route gated by a
             method/header/query-param `match` does not serve traffic that
-            misses those predicates.
+            misses those predicates. Across multiple attached instances, the
+            decision is finalized only after all instances run and only when
+            no instance matched and no earlier route override exists.
 
     WorkloadMetricsConfig:
       type: object

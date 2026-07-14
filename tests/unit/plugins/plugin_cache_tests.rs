@@ -178,6 +178,155 @@ fn make_config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> Gatewa
     }
 }
 
+async fn run_before_proxy_chain(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+) -> PluginResult {
+    let mut headers = HashMap::new();
+    for plugin in plugins {
+        match plugin.before_proxy(ctx, &mut headers).await {
+            PluginResult::Continue => {}
+            reject => return reject,
+        }
+    }
+    PluginResult::Continue
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_reject_unmatched_is_aggregated_across_instances() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["get-route", "post-route"])],
+        vec![
+            make_plugin_config_with_json(
+                "get-route",
+                "mesh_route_dispatch",
+                json!({
+                    "rules": [{
+                        "match": {"methods": ["GET"]},
+                        "destination": {"upstream_id": "get-backend"}
+                    }],
+                    "reject_unmatched": true
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "post-route",
+                "mesh_route_dispatch",
+                json!({
+                    "rules": [{
+                        "match": {"methods": ["POST"]},
+                        "destination": {"upstream_id": "post-backend"}
+                    }],
+                    "reject_unmatched": true
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("plugin cache");
+    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+
+    for (method, expected_upstream) in [("GET", "get-backend"), ("POST", "post-backend")] {
+        let mut request = RequestContext::new(
+            "127.0.0.1".to_string(),
+            method.to_string(),
+            "/api".to_string(),
+        );
+        let result = run_before_proxy_chain(&plugins, &mut request).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{method} must survive the other instance's local miss, got {result:?}"
+        );
+        assert_eq!(
+            request.route_override_upstream_id.as_deref(),
+            Some(expected_upstream)
+        );
+    }
+
+    let mut unmatched = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "DELETE".to_string(),
+        "/api".to_string(),
+    );
+    match run_before_proxy_chain(&plugins, &mut unmatched).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 404),
+        other => panic!("an aggregate miss must fail closed, got {other:?}"),
+    }
+
+    let mut earlier_override = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "DELETE".to_string(),
+        "/api".to_string(),
+    );
+    earlier_override.route_override_upstream_id = Some("mcp-selected".to_string());
+    let result = run_before_proxy_chain(&plugins, &mut earlier_override).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "an earlier successful route override must survive aggregate local misses"
+    );
+    assert_eq!(
+        earlier_override.route_override_upstream_id.as_deref(),
+        Some("mcp-selected")
+    );
+}
+
+#[test]
+fn mesh_route_dispatch_rejects_priority_interleaving_before_fail_closed_finalization() {
+    let first_route = make_plugin_config_with_json(
+        "first-route",
+        "mesh_route_dispatch",
+        json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "get-backend"}
+            }],
+            "reject_unmatched": true
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let mut second_route = make_plugin_config_with_json(
+        "second-route",
+        "mesh_route_dispatch",
+        json!({
+            "rules": [{
+                "match": {"methods": ["POST"]},
+                "destination": {"upstream_id": "post-backend"}
+            }],
+            "reject_unmatched": true
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    second_route.priority_override = Some(3040);
+    let response_mock = make_plugin_config_with_json(
+        "mock",
+        "response_mock",
+        json!({
+            "rules": [{"path": "/api", "status_code": 200, "body": "mocked"}]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["first-route", "mock", "second-route"],
+        )],
+        vec![first_route, response_mock, second_route],
+    );
+
+    let error = match PluginCache::new(&config) {
+        Ok(_) => panic!("an interleaved short-circuit plugin must reject cache construction"),
+        Err(error) => error,
+    };
+    assert!(error.contains("must remain contiguous"), "got: {error}");
+    assert!(error.contains("priority overrides"), "got: {error}");
+}
+
 fn plugin_ptr_by_name(plugins: &[Arc<dyn Plugin>], name: &str) -> usize {
     let plugin = plugins
         .iter()

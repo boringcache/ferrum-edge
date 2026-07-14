@@ -46,6 +46,87 @@ struct PriorityOverridePlugin {
     priority: u16,
 }
 
+const MESH_ROUTE_DISPATCH_NAME: &str = "mesh_route_dispatch";
+const MESH_ROUTE_DISPATCH_FINALIZER_NAME: &str = "__mesh_route_dispatch_finalizer";
+
+/// Cache-internal sentinel placed immediately after the last route-dispatch
+/// instance. Individual instances stage fail-closed misses on `RequestContext`;
+/// this sentinel rejects only when the aggregate chain produced neither a
+/// match nor an override from an earlier routing plugin.
+struct MeshRouteDispatchFinalizer {
+    priority: u16,
+}
+
+#[async_trait]
+impl Plugin for MeshRouteDispatchFinalizer {
+    fn name(&self) -> &str {
+        MESH_ROUTE_DISPATCH_FINALIZER_NAME
+    }
+
+    fn priority(&self) -> u16 {
+        self.priority
+    }
+
+    fn supported_protocols(&self) -> &'static [crate::plugins::ProxyProtocol] {
+        crate::plugins::HTTP_FAMILY_PROTOCOLS
+    }
+
+    async fn before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &mut std::collections::HashMap<String, String>,
+    ) -> PluginResult {
+        if !std::mem::take(&mut ctx.mesh_route_dispatch_reject_unmatched)
+            || ctx.mesh_route_dispatch_matched
+            || ctx.has_route_overrides()
+        {
+            return PluginResult::Continue;
+        }
+        crate::plugins::mesh_route_dispatch::reject_unmatched_result()
+    }
+}
+
+/// Enable aggregate unmatched handling and install exactly one finalizer at
+/// the execution boundary after the final `mesh_route_dispatch` instance.
+/// Existing finalizers may be present when a global list is cloned during an
+/// incremental rebuild, so remove them before recomputing the boundary.
+fn install_mesh_route_dispatch_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), String> {
+    plugins.retain(|plugin| plugin.name() != MESH_ROUTE_DISPATCH_FINALIZER_NAME);
+    let first_index = plugins
+        .iter()
+        .position(|plugin| plugin.name() == MESH_ROUTE_DISPATCH_NAME);
+    let Some(last_index) = plugins
+        .iter()
+        .rposition(|plugin| plugin.name() == MESH_ROUTE_DISPATCH_NAME)
+    else {
+        return Ok(());
+    };
+    let first_index = first_index.unwrap_or(last_index);
+
+    if plugins[first_index..=last_index]
+        .iter()
+        .any(|plugin| plugin.name() != MESH_ROUTE_DISPATCH_NAME)
+    {
+        return Err(
+            "mesh_route_dispatch instances must remain contiguous so reject_unmatched is finalized before later short-circuit plugins; remove priority overrides that interleave another plugin"
+                .to_string(),
+        );
+    }
+
+    for plugin in plugins
+        .iter()
+        .filter(|plugin| plugin.name() == MESH_ROUTE_DISPATCH_NAME)
+    {
+        plugin.enable_deferred_unmatched_rejection();
+    }
+    let priority = plugins[last_index].priority();
+    plugins.insert(
+        last_index + 1,
+        Arc::new(MeshRouteDispatchFinalizer { priority }),
+    );
+    Ok(())
+}
+
 #[async_trait]
 impl Plugin for PriorityOverridePlugin {
     fn name(&self) -> &str {
@@ -94,6 +175,9 @@ impl Plugin for PriorityOverridePlugin {
         headers: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
         self.inner.before_proxy(ctx, headers).await
+    }
+    fn enable_deferred_unmatched_rejection(&self) {
+        self.inner.enable_deferred_unmatched_rejection();
     }
     fn is_backend_admission_plugin(&self) -> bool {
         self.inner.is_backend_admission_plugin()
@@ -1206,6 +1290,9 @@ impl PluginCache {
                 }
             }
             global_plugins.sort_by_key(|p| p.priority());
+            if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
+                plugin_errors.push(format!("global plugins: {e}"));
+            }
             Arc::new(global_plugins)
         } else {
             Arc::clone(&current.global_plugins)
@@ -1387,6 +1474,9 @@ impl PluginCache {
             }
 
             merged.sort_by_key(|p| p.priority());
+            if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
             new_map.insert(proxy.id.clone(), Arc::new(merged));
         }
 
@@ -1883,6 +1973,9 @@ impl PluginCache {
 
             // Sort by priority so execution order is deterministic
             merged.sort_by_key(|p| p.priority());
+            if let Err(e) = install_mesh_route_dispatch_finalizer(&mut merged) {
+                plugin_errors.push(format!("proxy_id={}: {e}", proxy.id));
+            }
 
             // Pre-compute whether any plugin requires response body buffering
             let needs_buffering = merged.iter().any(|p| p.requires_response_body_buffering());
@@ -1897,6 +1990,13 @@ impl PluginCache {
             ws_frame_map.insert(proxy.id.clone(), needs_ws_frame);
 
             proxy_map.insert(proxy.id.clone(), Arc::new(merged));
+        }
+
+        // Sort and validate the global fallback list before committing the
+        // staged registry so ordering errors reject the whole cache build.
+        global_plugins.sort_by_key(|p| p.priority());
+        if let Err(e) = install_mesh_route_dispatch_finalizer(&mut global_plugins) {
+            plugin_errors.push(format!("global plugins: {e}"));
         }
 
         // If any enabled plugin failed validation or could not be resolved,
@@ -1926,8 +2026,6 @@ impl PluginCache {
         // Pairs with the `begin_reload` at the start of this function.
         crate::plugins::utils::log_schema::registry::commit_reload();
 
-        // Sort global fallback list too
-        global_plugins.sort_by_key(|p| p.priority());
         let global_needs_buffering = global_plugins
             .iter()
             .any(|p| p.requires_response_body_buffering());

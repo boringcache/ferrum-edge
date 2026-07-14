@@ -6936,12 +6936,27 @@ impl GatewayConfig {
                     };
                     let client_cert = backend_tls
                         .get("client_cert_path")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|path| !path.is_empty());
+                        .and_then(serde_json::Value::as_str);
                     let client_key = backend_tls
                         .get("client_key_path")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|path| !path.is_empty());
+                        .and_then(serde_json::Value::as_str);
+                    let server_ca = backend_tls
+                        .get("server_ca_cert_path")
+                        .and_then(serde_json::Value::as_str);
+                    for (field, path) in [
+                        ("client_cert_path", client_cert),
+                        ("client_key_path", client_key),
+                        ("server_ca_cert_path", server_ca),
+                    ] {
+                        if path.is_some_and(str::is_empty) {
+                            errors.push(format!(
+                                "PluginConfig '{}': mesh_route_dispatch.rules[{}].destination.backend_tls.{} must not be empty",
+                                pc.id, rule_idx, field
+                            ));
+                        }
+                    }
+                    let client_cert = client_cert.filter(|path| !path.is_empty());
+                    let client_key = client_key.filter(|path| !path.is_empty());
                     match (client_cert, client_key) {
                         (Some(_), None) => errors.push(format!(
                             "PluginConfig '{}': mesh_route_dispatch.rules[{}].destination.backend_tls.client_cert_path is set but client_key_path is missing",
@@ -6971,10 +6986,7 @@ impl GatewayConfig {
                     {
                         errors.push(format!("PluginConfig '{}': {}", pc.id, e));
                     }
-                    if let Some(path) = backend_tls
-                        .get("server_ca_cert_path")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|path| !path.is_empty())
+                    if let Some(path) = server_ca.filter(|path| !path.is_empty())
                         && validated_paths.insert(path.to_string())
                         && let Err(e) = validate_pem_cert_file(
                             "mesh_route_dispatch.backend_tls.server_ca_cert_path",

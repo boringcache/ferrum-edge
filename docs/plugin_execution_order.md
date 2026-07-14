@@ -268,6 +268,14 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 
 `mesh_route_dispatch` intentionally sits at priority 2995: authentication, `mesh_authz`, and rate limiting evaluate the original public proxy identity, then route overrides apply before request transformers, mirror/serverless/caching plugins, and backend dispatch. For node-waypoint Service egress with scoped mesh policies, `mesh_authz` stamps the authorized Service upstream and `mesh_route_dispatch` rejects any matching rule that would rewrite that request to a different upstream or direct backend. When multiple instances are attached to the same proxy, each matching instance replaces the complete override destination and route-local timeout/retry policy from earlier instances; a non-matching later instance leaves any earlier match in place. Per-rule `backend_tls` is only valid for direct `backend_host`/`backend_port` destinations; `upstream_id` destinations use TLS from the referenced `Upstream`. For WebSockets, the override selects only the upgrade handshake backend; the upgraded connection is pinned to that backend and frame hooks do not re-route individual frames. HBONE CONNECT traffic flows through the standard `before_proxy` chain before the HBONE relay consumes route overrides; inner H2 frames are not re-classified per stream.
 
+`reject_unmatched` is evaluated across all attached `mesh_route_dispatch`
+instances: a local miss never short-circuits a later instance, and the request
+returns 404 only after every instance has run, fail-closed behavior was requested,
+and no instance matched or earlier route override exists.
+All attached instances must remain a contiguous priority block so this
+finalization runs before later short-circuit plugins. Cache construction rejects
+priority overrides that interleave another plugin between dispatch instances.
+
 When a `mesh_route_dispatch` rule matches on query params, the plugin opts the whole proxy into decoded query-param materialization for HTTP/3 so its `query_params` predicates see the same percent-decoded values as HTTP/1.1 and HTTP/2. That means every plugin on that proxy observes decoded `ctx.query_params` while the query-rule instance is configured.
 
 A `mesh_route_dispatch` rule may also carry a per-rule `fault` action (`{delay, abort}`) that runs as soon as the rule matches and BEFORE any route override is applied. The fault uses the shared `FaultRoller` (`src/plugins/utils/fault_roll.rs`) so a static-percentage rule samples identically to the proxy-scoped `fault_injection` plugin. When delay and abort both trigger, the delay runs first; the abort then short-circuits dispatch and the route override is skipped. The plugin honours `ctx.metadata["fault_injected"]=true` set by an earlier-priority `fault_injection` plugin (2940 < 2995) and no-ops in that case so the two surfaces never stack a second delay + abort.
