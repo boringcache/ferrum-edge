@@ -7134,13 +7134,12 @@ async fn dispatch_grpc_native_h3(
             health_error_class,
             backend_admission_response_elapsed,
         );
-        if let Some(grpc_status) = backend_header_grpc_status
-            .as_deref()
-            .map(crate::proxy::grpc_proxy::parse_grpc_status_value)
-        {
-            ctx.metadata
-                .insert("grpc_status".to_string(), grpc_status.to_string());
-        }
+        let grpc_status = wire_grpc_status.as_deref().map_or(
+            crate::proxy::grpc_proxy::grpc_status::UNKNOWN,
+            crate::proxy::grpc_proxy::parse_grpc_status_value,
+        );
+        ctx.metadata
+            .insert("grpc_status".to_string(), grpc_status.to_string());
         log_h3_grpc_transaction(
             proxy,
             ctx,
@@ -7655,14 +7654,15 @@ async fn dispatch_grpc_native_h3(
         body_outcome_error_class,
         backend_admission_response_elapsed,
     );
-    if let Some(grpc_status) = grpc_trailer_status.or_else(|| {
-        backend_header_grpc_status
-            .as_deref()
-            .map(crate::proxy::grpc_proxy::parse_grpc_status_value)
-    }) {
-        ctx.metadata
-            .insert("grpc_status".to_string(), grpc_status.to_string());
-    }
+    let grpc_status = grpc_trailer_status
+        .or_else(|| {
+            wire_grpc_status
+                .as_deref()
+                .map(crate::proxy::grpc_proxy::parse_grpc_status_value)
+        })
+        .unwrap_or(crate::proxy::grpc_proxy::grpc_status::UNKNOWN);
+    ctx.metadata
+        .insert("grpc_status".to_string(), grpc_status.to_string());
     log_h3_grpc_transaction(
         proxy,
         ctx,

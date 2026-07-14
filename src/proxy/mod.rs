@@ -17000,6 +17000,14 @@ async fn handle_proxy_request_inner(
                     }
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
+                // Hooks may rewrite/remove a Trailers-Only grpc-status in the
+                // initial header block. Seed deferred metadata from the final
+                // client-visible headers; a later real trailer overrides it.
+                grpc_proxy::refresh_grpc_status_metadata(
+                    &mut ctx.metadata,
+                    &EMPTY_HEADERS,
+                    &response_headers,
+                );
 
                 // Check if the streaming request body exceeded the size limit
                 // BEFORE logging — otherwise the transaction summary captures a

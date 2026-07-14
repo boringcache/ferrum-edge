@@ -2645,14 +2645,6 @@ where
     S: SendStream<Bytes>,
 {
     let current_target_ref: Option<&UpstreamTarget> = current_target.map(|t| t.as_ref());
-    let backend_header_grpc_status = streaming
-        .headers
-        .get("grpc-status")
-        .map(|status| crate::proxy::grpc_proxy::parse_grpc_status_value(status));
-    if let Some(grpc_status) = backend_header_grpc_status {
-        ctx.metadata
-            .insert("grpc_status".to_string(), grpc_status.to_string());
-    }
     // Pre-head late-overflow guard (codex P2): if the client upload already tripped
     // `max_grpc_recv_size_bytes` by the time the backend response is ready — e.g. a
     // trailers-only success whose `grpc-status` rides the HEADER block — do NOT
@@ -2797,6 +2789,17 @@ where
         sticky_cookie_needed,
         &mut streaming.headers,
     );
+    // Hooks may rewrite/remove a Trailers-Only status. Record their final
+    // client-visible header result now; a real terminal trailer wins below.
+    let client_header_grpc_status = streaming
+        .headers
+        .get("grpc-status")
+        .map(|status| crate::proxy::grpc_proxy::parse_grpc_status_value(status));
+    crate::proxy::grpc_proxy::refresh_grpc_status_metadata(
+        &mut ctx.metadata,
+        &HashMap::new(),
+        &streaming.headers,
+    );
 
     if let Err(error) = send_response_headers(stream, streaming.status, &streaming.headers).await {
         debug!("cross-protocol H3 gRPC streaming response header write failed: {error}");
@@ -2939,14 +2942,14 @@ where
         backend_admission_start.elapsed(),
     );
     let terminal_grpc_status = if request_overflowed_late {
-        Some(grpc_proxy::grpc_status::RESOURCE_EXHAUSTED)
+        grpc_proxy::grpc_status::RESOURCE_EXHAUSTED
     } else {
-        grpc_trailer_status.or(backend_header_grpc_status)
+        grpc_trailer_status
+            .or(client_header_grpc_status)
+            .unwrap_or(grpc_proxy::grpc_status::UNKNOWN)
     };
-    if let Some(grpc_status) = terminal_grpc_status {
-        ctx.metadata
-            .insert("grpc_status".to_string(), grpc_status.to_string());
-    }
+    ctx.metadata
+        .insert("grpc_status".to_string(), terminal_grpc_status.to_string());
     Ok(CrossProtocolOutcome {
         response_status: streaming.status,
         response_streamed: true,

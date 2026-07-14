@@ -1664,6 +1664,24 @@ pub(crate) async fn enabled_prometheus_metrics_owner_exists(
     namespace: &str,
     exclude_id: Option<&str>,
 ) -> DbResult<bool> {
+    enabled_prometheus_metrics_owner_exists_inner(db, namespace, exclude_id, false).await
+}
+
+/// Restore replaces one namespace wholesale, so owners in that namespace do
+/// not conflict with the incoming payload; owners in every other namespace do.
+pub(crate) async fn enabled_prometheus_metrics_owner_exists_outside_namespace(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+) -> DbResult<bool> {
+    enabled_prometheus_metrics_owner_exists_inner(db, namespace, None, true).await
+}
+
+async fn enabled_prometheus_metrics_owner_exists_inner(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    exclude_id: Option<&str>,
+    exclude_current_namespace: bool,
+) -> DbResult<bool> {
     const PAGE_SIZE: i64 = 1_000;
     let mut namespaces = db.list_namespaces_authoritative().await?;
     namespaces.push(namespace.to_string());
@@ -1671,6 +1689,9 @@ pub(crate) async fn enabled_prometheus_metrics_owner_exists(
     namespaces.dedup();
 
     for candidate_namespace in namespaces {
+        if exclude_current_namespace && candidate_namespace == namespace {
+            continue;
+        }
         let mut offset = 0_i64;
         loop {
             let page = db

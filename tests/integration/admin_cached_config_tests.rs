@@ -2024,6 +2024,61 @@ async fn test_restore_rejects_invalid_plugin_config_before_delete() {
 }
 
 #[tokio::test]
+async fn restore_prometheus_owner_conflicts_only_with_other_namespaces() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+    let owner = json!({
+        "id": "restore-prometheus-existing",
+        "plugin_name": "prometheus_metrics",
+        "scope": "global",
+        "enabled": true,
+        "config": {}
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &owner).await;
+    assert_eq!(status, 201, "owner seed should succeed: {body:?}");
+
+    let restore_payload = json!({
+        "plugin_configs": [{
+            "id": "restore-prometheus-incoming",
+            "plugin_name": "prometheus_metrics",
+            "scope": "global",
+            "enabled": true,
+            "config": {}
+        }]
+    });
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/restore?confirm=true"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Ferrum-Namespace", "restore-other-tenant")
+        .json(&restore_payload)
+        .send()
+        .await
+        .expect("cross-namespace restore request");
+    assert_eq!(
+        response.status().as_u16(),
+        400,
+        "restore must reject an owner in another namespace"
+    );
+    let body: Value = response.json().await.expect("restore conflict body");
+    assert!(
+        body["validation_errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|error| error
+                .as_str()
+                .is_some_and(|error| error.contains("another namespace"))))
+    );
+
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+    assert_eq!(
+        status, 200,
+        "restoring the current namespace replaces its prior owner: {body:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_restore_rolls_back_prior_config_after_mid_import_failure() {
     let tc = TestConfig::default();
     let temp_dir = tempfile::TempDir::new().unwrap();

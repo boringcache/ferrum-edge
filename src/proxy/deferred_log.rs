@@ -246,6 +246,18 @@ impl DeferredTransactionLogger {
         if let Some(grpc_status) = outcome.grpc_status {
             ctx.metadata
                 .insert("grpc_status".to_string(), grpc_status.to_string());
+        } else if summary
+            .metadata
+            .get("request_protocol")
+            .or_else(|| ctx.metadata.get("request_protocol"))
+            .is_some_and(|protocol| protocol == "grpc")
+        {
+            // A gRPC stream that ends without terminal status is UNKNOWN, not
+            // an unqualified successful HTTP 200. Preserve a Trailers-Only
+            // header status when one was captured; otherwise seed code 2.
+            ctx.metadata
+                .entry("grpc_status".to_string())
+                .or_insert_with(|| crate::proxy::grpc_proxy::grpc_status::UNKNOWN.to_string());
         }
 
         // Re-derive wall-clock latencies so streaming responses report the
@@ -389,6 +401,30 @@ mod tests {
             Some("14")
         );
         assert_eq!(summary.response_status_code, 200);
+    }
+
+    #[tokio::test]
+    async fn fire_marks_missing_grpc_terminal_status_unknown() {
+        let captured = Arc::new(Mutex::new(None::<TransactionSummary>));
+        let capturer: Arc<dyn Plugin> = Arc::new(CapturingPlugin(captured.clone()));
+        let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![capturer]);
+        let mut ctx = RequestContext::new(
+            "1.2.3.4".to_string(),
+            "POST".to_string(),
+            "/rpc".to_string(),
+        );
+        ctx.metadata
+            .insert("request_protocol".to_string(), "grpc".to_string());
+        let logger = DeferredTransactionLogger::new(fake_summary(), plugins, ctx);
+
+        logger.fire(BodyOutcome::success(0));
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let summary = captured.lock().unwrap().clone().expect("log fired");
+        assert_eq!(
+            summary.metadata.get("grpc_status").map(String::as_str),
+            Some("2")
+        );
     }
 
     #[tokio::test]

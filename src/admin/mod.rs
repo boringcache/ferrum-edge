@@ -4685,6 +4685,35 @@ async fn handle_restore(
                 }
             }
         }
+        if temp_config
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.enabled && plugin.plugin_name == "prometheus_metrics")
+        {
+            match crud::enabled_prometheus_metrics_owner_exists_outside_namespace(
+                db.as_ref(),
+                namespace,
+            )
+            .await
+            {
+                Ok(true) => validation_errors.push(
+                    "prometheus_metrics permits at most one enabled global instance; another namespace already owns the process registry"
+                        .to_string(),
+                ),
+                Ok(false) => {}
+                Err(error) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Restore aborted: prometheus_metrics ownership could not be validated: {}. Existing config was NOT deleted.",
+                                error
+                            )
+                        }),
+                    ));
+                }
+            }
+        }
         if !validation_errors.is_empty() {
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
