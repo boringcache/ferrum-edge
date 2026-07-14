@@ -631,6 +631,63 @@ async fn authorization_scheme_is_case_insensitive_but_non_bearer_is_rejected() {
 }
 
 #[tokio::test]
+async fn explicit_authorization_location_routes_case_insensitive_bearer_scheme() {
+    let authorization_provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"active": true, "username": "u"})),
+        )
+        .mount(&authorization_provider)
+        .await;
+    let other_provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"active": false})))
+        .mount(&other_provider)
+        .await;
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [
+                {
+                    "introspection_endpoint": format!(
+                        "{}/introspect",
+                        authorization_provider.uri()
+                    ),
+                    "client_auth": {"method": "none"},
+                    "from_headers": [{"name": "Authorization", "prefix": "Bearer "}]
+                },
+                {
+                    "introspection_endpoint": format!("{}/introspect", other_provider.uri()),
+                    "client_auth": {"method": "none"},
+                    "from_headers": [{"name": "x-other-provider-token"}]
+                }
+            ]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/test".into());
+    ctx.headers.insert(
+        "authorization".to_string(),
+        "bEaReR explicit-provider-token".to_string(),
+    );
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert_eq!(
+        authorization_provider
+            .received_requests()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(other_provider.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn malformed_active_values_are_503_and_never_negative_cached() {
     let server = MockServer::start().await;
     let responses = Arc::new([

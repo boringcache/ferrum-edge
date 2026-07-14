@@ -817,7 +817,7 @@ impl Oauth2Introspection {
         let mut first_invalid_format = None;
         for (idx, provider) in self.providers.iter().enumerate() {
             for (location_idx, location) in provider.token_locations.iter().enumerate() {
-                match extract_from_location(location, ctx) {
+                match extract_provider_token_location(location, ctx) {
                     TokenLocationExtract::Missing => {}
                     TokenLocationExtract::Credential(ExtractedCredential::InvalidFormat(body)) => {
                         first_invalid_format.get_or_insert(body);
@@ -924,7 +924,7 @@ fn provider_location_extracting_token(
         .iter()
         .enumerate()
         .find_map(
-            |(location_idx, location)| match extract_from_location(location, ctx) {
+            |(location_idx, location)| match extract_provider_token_location(location, ctx) {
                 TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token))
                     if token == expected_token =>
                 {
@@ -933,6 +933,19 @@ fn provider_location_extracting_token(
                 _ => None,
             },
         )
+}
+
+fn extract_provider_token_location(
+    location: &TokenLocation,
+    ctx: &RequestContext,
+) -> TokenLocationExtract {
+    if is_authorization_bearer_location(location) {
+        return match extract_authorization_bearer(ctx) {
+            ExtractedCredential::Missing => TokenLocationExtract::Missing,
+            credential => TokenLocationExtract::Credential(credential),
+        };
+    }
+    extract_from_location(location, ctx)
 }
 
 fn register_provider_location(
@@ -1878,6 +1891,9 @@ fn token_location_matches(
     ctx: &RequestContext,
     expected_token: &str,
 ) -> bool {
+    if is_authorization_bearer_location(location) {
+        return authorization_bearer_matches(ctx, expected_token);
+    }
     match location {
         TokenLocation::Header(header) => ctx.headers.get(&header.name).is_some_and(|value| {
             let token = match header.prefix.as_deref() {
