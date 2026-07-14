@@ -517,16 +517,49 @@ fn is_transient_config_load_error(error: &anyhow::Error) -> bool {
 }
 
 /// MongoDB counterpart to [`is_transient_sqlx_error`] for the full-config load
-/// path: only network I/O, connection-pool, server-selection, and DNS failures
-/// are transient. Command/write/auth/decode failures are non-transient.
-fn is_transient_mongo_load_error(error: &mongodb::error::Error) -> bool {
-    matches!(
-        error.kind.as_ref(),
+/// path: network I/O, connection-pool, server-selection, DNS, and retryable
+/// topology command failures are transient. Other command/write/auth/decode
+/// failures are non-transient.
+pub(crate) fn is_transient_mongo_load_error(error: &mongodb::error::Error) -> bool {
+    match error.kind.as_ref() {
         mongodb::error::ErrorKind::Io(_)
-            | mongodb::error::ErrorKind::ConnectionPoolCleared { .. }
-            | mongodb::error::ErrorKind::ServerSelection { .. }
-            | mongodb::error::ErrorKind::DnsResolve { .. }
-    )
+        | mongodb::error::ErrorKind::ConnectionPoolCleared { .. }
+        | mongodb::error::ErrorKind::ServerSelection { .. }
+        | mongodb::error::ErrorKind::DnsResolve { .. } => true,
+        mongodb::error::ErrorKind::Command(command_error) => {
+            // Prefer retryability labels supplied/derived by the driver, then
+            // cover topology command responses that may remain after its one
+            // retry and do not consistently carry a label across server
+            // versions.
+            error.contains_label(mongodb::error::RETRYABLE_WRITE_ERROR)
+                || error.contains_label(mongodb::error::RETRYABLE_ERROR)
+                || error.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR)
+                || is_transient_mongo_command_code(command_error.code)
+        }
+        _ => false,
+    }
+}
+
+// Retryable topology codes from the MongoDB retryable-reads specification and
+// the driver's retryable read/write code lists. Authentication, decode, and
+// write-concern validation codes are intentionally absent.
+const TRANSIENT_MONGO_COMMAND_CODES: &[i32] = &[
+    6,     // HostUnreachable
+    7,     // HostNotFound
+    89,    // NetworkTimeout
+    91,    // ShutdownInProgress
+    189,   // PrimarySteppedDown
+    262,   // ExceededTimeLimit
+    9001,  // SocketException
+    10107, // NotWritablePrimary
+    11600, // InterruptedAtShutdown
+    11602, // InterruptedDueToReplStateChange
+    13435, // NotPrimaryNoSecondaryOk
+    13436, // NotPrimaryOrSecondary
+];
+
+pub(crate) fn is_transient_mongo_command_code(code: i32) -> bool {
+    TRANSIENT_MONGO_COMMAND_CODES.contains(&code)
 }
 
 fn is_transient_sqlx_error(error: &sqlx::Error) -> bool {
@@ -568,12 +601,22 @@ pub(crate) fn is_transient_database_code(code: &str, is_sqlite: bool) -> bool {
         )
 }
 
-fn is_transient_mysql_error_number(number: u16) -> bool {
+pub(crate) fn is_transient_mysql_error_number(number: u16) -> bool {
     matches!(
         number,
         // Connection/resource and network read/write failures. Query and lock
         // wait timeouts (1205/3024) stay on the active topology.
-        1040 | 1158 | 1159 | 1160 | 1161 | 2002 | 2003 | 2006 | 2013
+        1040
+            | 1158
+            | 1159
+            | 1160
+            | 1161
+            | 1203 // ER_TOO_MANY_USER_CONNECTIONS (max_user_connections)
+            | 1226 // ER_USER_LIMIT_REACHED (per-user resource quota)
+            | 2002
+            | 2003
+            | 2006
+            | 2013
     )
 }
 

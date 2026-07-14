@@ -469,6 +469,14 @@ pub mod _test_support {
         crate::config::db_loader::is_transient_database_code(code, is_sqlite)
     }
 
+    pub fn db_mongo_error_is_transient(error: &mongodb::error::Error) -> bool {
+        crate::config::db_loader::is_transient_mongo_load_error(error)
+    }
+
+    pub fn db_mysql_error_number_is_transient(number: u16) -> bool {
+        crate::config::db_loader::is_transient_mysql_error_number(number)
+    }
+
     /// Build the exact error shape `mysql_transaction_isolation` returns when
     /// both the `@@transaction_isolation` and `@@tx_isolation` reads fail, so a
     /// test can pin that a transient MySQL disconnect during that read stays
@@ -537,6 +545,10 @@ pub mod _test_support {
         crate::config::mongo_store::MongoStore::migration_lease_renew_update_classic(
             mongodb::bson::DateTime::from_millis(client_now_millis),
         )
+    }
+
+    pub fn mongo_pipeline_update_unsupported(error: &mongodb::error::Error) -> bool {
+        crate::config::mongo_store::MongoStore::pipeline_update_unsupported_for_test(error)
     }
 
     // ── plugins/grpc_web ─────────────────────────────────────────────────────

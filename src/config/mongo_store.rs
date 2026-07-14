@@ -208,24 +208,40 @@ mod inner {
     /// *queries*, but it does NOT implement pipeline-form `findOneAndUpdate` /
     /// `updateOne`. When the primary `$$NOW` acquire pipeline is issued, a
     /// DocumentDB backend rejects the command up-front — before any lock
-    /// document is touched — with a server Command error whose message names the
-    /// unsupported feature (DocumentDB phrases such capability gaps as, e.g.,
-    /// "... is not supported" and, for this case, references the update pipeline
-    /// / aggregation update). We match NARROWLY on a Command error whose message
-    /// mentions BOTH that something is unsupported AND that it is an
-    /// update-pipeline/aggregation-update feature, so a transient connectivity
-    /// or contention error is never mistaken for this permanent capability gap.
-    /// A genuine MongoDB server accepts the pipeline and never reaches here.
+    /// document is touched — either as an unsupported feature or as a type/parse
+    /// error because the update value is an array rather than an object.
+    ///
+    /// This check runs ONLY on the first acquire attempt in pipeline mode. A
+    /// false positive merely moves that lease to the fully functional classic
+    /// client-time path, while a false negative prevents DocumentDB migrations
+    /// from starting at all, so matching is deliberately moderately broad while
+    /// remaining restricted to Command errors that reference the update shape.
+    /// Connectivity and duplicate-key contention use other ErrorKind/code paths
+    /// and cannot trigger this capability fallback. A genuine MongoDB server
+    /// accepts the pipeline and never reaches here.
     fn is_pipeline_update_unsupported(err: &mongodb::error::Error) -> bool {
         let mongodb::error::ErrorKind::Command(command_error) = err.kind.as_ref() else {
             return false;
         };
         let message = command_error.message.to_ascii_lowercase();
         let says_unsupported = message.contains("not supported") || message.contains("unsupported");
-        let names_pipeline_update = message.contains("pipeline")
+        let references_update = message.contains("update")
+            || message.contains("pipeline")
+            || message.contains("aggregation");
+        let names_pipeline_form = message.contains("pipeline")
             || message.contains("aggregation")
             || (message.contains("update") && message.contains("array"));
-        says_unsupported && names_pipeline_update
+        let names_value_type = message.contains("object") || message.contains("array");
+        let says_type_error = message.contains("must be")
+            || message.contains("expected")
+            || message.contains("wrong type")
+            || message.contains("badvalue")
+            || message.contains("typemismatch");
+        let has_pipeline_type_or_parse_code = matches!(command_error.code, 2 | 9 | 14);
+
+        (says_unsupported && names_pipeline_form)
+            || (references_update
+                && ((says_type_error && names_value_type) || has_pipeline_type_or_parse_code))
     }
 
     fn mesh_route_dispatch_references_upstream_id(
@@ -1102,6 +1118,10 @@ mod inner {
         /// assert the classic acquire/renew builders stamp `now + duration`).
         pub(crate) fn migration_lease_duration_millis() -> i64 {
             MONGO_MIGRATION_LEASE_DURATION_MILLIS
+        }
+
+        pub(crate) fn pipeline_update_unsupported_for_test(error: &mongodb::error::Error) -> bool {
+            is_pipeline_update_unsupported(error)
         }
 
         /// Client-time expiry (`now + lease duration`) as a BSON `DateTime`, so

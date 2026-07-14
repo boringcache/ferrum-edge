@@ -1,5 +1,6 @@
 use ferrum_edge::_test_support::{
     DbPoolConfig, db_append_connect_timeout, db_code_is_transient, db_diff_removed,
+    db_mongo_error_is_transient, db_mysql_error_number_is_transient,
     db_wrap_mysql_isolation_read_error, parse_auth_mode, parse_scheme, statement_timeout_sql,
 };
 use ferrum_edge::config::db_backend::DatabaseBackend;
@@ -627,6 +628,45 @@ fn sqlite_low_byte_codes_stay_transient_only_for_sqlite() {
             "non-SQLite result code {code} must not use SQLite low-byte classification"
         );
     }
+}
+
+fn mongo_command_error(code: i32, message: &str) -> mongodb::error::Error {
+    let command_error: mongodb::error::CommandError = mongodb::bson::from_document(
+        mongodb::bson::doc! { "code": code, "codeName": "TestCommandError", "errmsg": message },
+    )
+    .unwrap();
+    mongodb::error::ErrorKind::Command(command_error).into()
+}
+
+#[test]
+fn mongo_election_command_errors_stay_backup_eligible() {
+    let stepped_down = mongo_command_error(189, "primary stepped down during config read");
+    assert!(
+        db_mongo_error_is_transient(&stepped_down),
+        "PrimarySteppedDown must remain eligible for backup fallback"
+    );
+
+    for (code, name) in [(13, "Unauthorized"), (18, "AuthenticationFailed")] {
+        let auth_error = mongo_command_error(code, name);
+        assert!(
+            !db_mongo_error_is_transient(&auth_error),
+            "authentication-ish command code {code} must refuse backup fallback"
+        );
+    }
+}
+
+#[test]
+fn mysql_per_user_connection_limits_stay_transient() {
+    for code in [1203, 1226] {
+        assert!(
+            db_mysql_error_number_is_transient(code),
+            "temporary MySQL per-user resource limit {code} must remain failover/backup-eligible"
+        );
+    }
+    assert!(
+        !db_mysql_error_number_is_transient(1045),
+        "MySQL access denied must remain non-transient"
+    );
 }
 
 #[test]

@@ -5,13 +5,13 @@
 //! is immune to client clock skew. AWS DocumentDB is documented as
 //! MongoDB-compatible but does NOT support pipeline-form updates, so the lease
 //! falls back to classic operator updates stamped from the CLIENT clock. These
-//! tests pin the classic builder shapes exactly (the disposition's spec); the
-//! server-time pipeline path and the DocumentDB error detection are exercised
-//! against a live/DocumentDB backend, not unit-testable here.
+//! tests pin the classic builder shapes and the command-error capability
+//! detection without requiring a live DocumentDB backend.
 
 use ferrum_edge::_test_support::{
     mongo_migration_lease_acquire_filter_classic, mongo_migration_lease_acquire_update_classic,
     mongo_migration_lease_duration_millis, mongo_migration_lease_renew_update_classic,
+    mongo_pipeline_update_unsupported,
 };
 
 const OWNER: &str = "test-owner-uuid";
@@ -20,6 +20,46 @@ const NOW_MILLIS: i64 = 1_700_000_000_000;
 
 fn expiry_millis() -> i64 {
     NOW_MILLIS + mongo_migration_lease_duration_millis()
+}
+
+fn mongo_command_error(code: i32, message: &str) -> mongodb::error::Error {
+    let command_error: mongodb::error::CommandError = mongodb::bson::from_document(
+        mongodb::bson::doc! { "code": code, "codeName": "TestCommandError", "errmsg": message },
+    )
+    .unwrap();
+    mongodb::error::ErrorKind::Command(command_error).into()
+}
+
+#[test]
+fn pipeline_update_rejection_matches_unsupported_and_type_error_shapes() {
+    for error in [
+        mongo_command_error(303, "Aggregation pipeline updates are not supported"),
+        mongo_command_error(
+            14,
+            "The update value must be an object, but received an array",
+        ),
+    ] {
+        assert!(
+            mongo_pipeline_update_unsupported(&error),
+            "DocumentDB pipeline rejection must select the classic lease: {error}"
+        );
+    }
+}
+
+#[test]
+fn pipeline_update_rejection_excludes_contention_connectivity_and_auth() {
+    let duplicate_key = mongo_command_error(11_000, "duplicate key during update");
+    assert!(!mongo_pipeline_update_unsupported(&duplicate_key));
+
+    let network_error: mongodb::error::Error = std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "connection reset during update",
+    )
+    .into();
+    assert!(!mongo_pipeline_update_unsupported(&network_error));
+
+    let unauthorized = mongo_command_error(13, "not authorized to execute update command");
+    assert!(!mongo_pipeline_update_unsupported(&unauthorized));
 }
 
 #[test]
