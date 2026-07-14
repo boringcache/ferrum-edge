@@ -1224,9 +1224,6 @@ async fn handle_h3_request(
         .authority()
         .map(|a| a.as_str())
         .or_else(|| ctx.raw_header_get("host"));
-    ctx.request_authority = raw_host.and_then(|authority| {
-        crate::proxy::normalize_request_authority_for_signing(authority, Some("https"))
-    });
     let request_host: Option<String> = match raw_host {
         Some(h) => match crate::proxy::normalize_request_host_for_routing(h) {
             Some(normalized) => Some(normalized),
@@ -1247,6 +1244,10 @@ async fn handle_h3_request(
         },
         None => None,
     };
+    let request_authority = raw_host.and_then(|authority| {
+        crate::proxy::normalize_request_authority_for_signing(authority, Some("https"))
+    });
+    ctx.request_authority = request_authority;
 
     let epoch = state.request_epoch.load();
 

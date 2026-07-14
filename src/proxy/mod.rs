@@ -14394,12 +14394,6 @@ async fn handle_proxy_request_inner(
     let raw_host = ctx
         .raw_header_get("host")
         .or_else(|| req.uri().authority().map(|a| a.as_str()));
-    ctx.request_authority = raw_host.and_then(|authority| {
-        normalize_request_authority_for_signing(
-            authority,
-            Some(if is_tls { "https" } else { "http" }),
-        )
-    });
     // One `split_request_authority` pass yields both the routing host (port
     // stripped, as before) and the request's EXPLICIT authority port —
     // consumed only by mesh inbound multi-port sibling selection below, where
@@ -14433,6 +14427,13 @@ async fn handle_proxy_request_inner(
         },
         None => None,
     };
+    let request_authority = raw_host.and_then(|authority| {
+        normalize_request_authority_for_signing(
+            authority,
+            Some(if is_tls { "https" } else { "http" }),
+        )
+    });
+    ctx.request_authority = request_authority;
     let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
     let epoch = state.request_epoch.load();
 
