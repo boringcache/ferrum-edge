@@ -13755,9 +13755,15 @@ pub fn request_is_authenticated(ctx: &RequestContext) -> bool {
 
 const MISSING_AUTHENTICATION_BODY: &[u8] = br#"{"error":"Authentication required"}"#;
 
-fn missing_authentication_reject() -> (u16, Vec<u8>, HashMap<String, String>) {
+fn missing_authentication_reject(
+    auth_plugins: &[Arc<dyn Plugin>],
+) -> (u16, Vec<u8>, HashMap<String, String>) {
     let mut headers = HashMap::new();
-    headers.insert("WWW-Authenticate".to_string(), "ferrum-edge".to_string());
+    let challenge = auth_plugins
+        .iter()
+        .find_map(|plugin| plugin.authentication_challenge())
+        .unwrap_or("ferrum-edge");
+    headers.insert("WWW-Authenticate".to_string(), challenge.to_string());
     (401, MISSING_AUTHENTICATION_BODY.to_vec(), headers)
 }
 
@@ -13800,7 +13806,7 @@ pub async fn run_authentication_phase(
             {
                 None
             } else {
-                Some(last_reject.unwrap_or_else(missing_authentication_reject))
+                Some(last_reject.unwrap_or_else(|| missing_authentication_reject(auth_plugins)))
             }
         }
         AuthMode::Single => {
@@ -13826,7 +13832,7 @@ pub async fn run_authentication_phase(
             {
                 None
             } else {
-                Some(missing_authentication_reject())
+                Some(missing_authentication_reject(auth_plugins))
             }
         }
     }

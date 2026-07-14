@@ -1,15 +1,18 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use http::header::HeaderName;
+use base64::Engine as _;
+use dashmap::DashMap;
+use http::HeaderValue;
+use http::header::{AUTHORIZATION, HeaderName};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
+use tokio::sync::{OnceCell, Semaphore};
 use tracing::{debug, info, warn};
 use url::{Host, Url};
 
@@ -22,36 +25,68 @@ use super::utils::claim_header_fanout::{
     parse_claim_headers,
 };
 use super::utils::claim_resolver::{extract_claim_string, parse_claim_path_value};
-use super::utils::introspection_cache::{
-    CacheLookup, IntrospectionCache, get_or_create_introspection_cache,
-};
+use super::utils::introspection_cache::{CacheLookup, IntrospectionCache, TokenKey};
+use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::token_extract::{
     STRIP_QUERY_PARAM_METADATA_PREFIX, TokenHeaderLocation, TokenLocation, TokenLocationExtract,
     extract_authorization_bearer, extract_from_location,
-    mark_original_token_stripping_metadata as mark_token_stripping_metadata,
-    provider_locations_extract_token,
 };
 use super::{PluginResult, RequestContext};
 
 const STRIP_AUTHORIZATION_METADATA_KEY: &str = "oauth2_introspection.strip_authorization";
 const STRIP_HEADER_METADATA_PREFIX: &str = "oauth2_introspection.strip_header.";
 const CLAIM_HEADER_METADATA_PREFIX: &str = "oauth2_introspection.claim_header.";
+const MAX_PROVIDERS: usize = 16;
+const MAX_TOKEN_BYTES: usize = 8 * 1024;
+const MAX_INTROSPECTION_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_DISCOVERY_RESPONSE_BYTES: usize = 128 * 1024;
+const MAX_PROVIDER_CONCURRENT_INTROSPECTIONS: usize = 32;
+const MAX_GLOBAL_CONCURRENT_INTROSPECTIONS: usize = 128;
+
+static GLOBAL_INTROSPECTION_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn global_introspection_limit() -> Arc<Semaphore> {
+    Arc::clone(
+        GLOBAL_INTROSPECTION_LIMIT
+            .get_or_init(|| Arc::new(Semaphore::new(MAX_GLOBAL_CONCURRENT_INTROSPECTIONS))),
+    )
+}
+
+type InFlightResult = Result<Arc<Value>, IntrospectionDecision>;
+type InFlightCell = OnceCell<InFlightResult>;
+
+struct InFlightEntryGuard {
+    entries: Arc<DashMap<TokenKey, Arc<InFlightCell>>>,
+    key: TokenKey,
+    cell: Arc<InFlightCell>,
+}
+
+impl Drop for InFlightEntryGuard {
+    fn drop(&mut self) {
+        self.entries
+            .remove_if(&self.key, |_, current| Arc::ptr_eq(current, &self.cell));
+    }
+}
 
 pub struct Oauth2Introspection {
     providers: Vec<IntrospectionProvider>,
     http_client: PluginHttpClient,
+    global_introspection_limit: Arc<Semaphore>,
     global_scope_claim: String,
     global_role_claim: String,
     consumer_identity_claim: String,
     consumer_header_claim: String,
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
+    allow_provider_fanout: bool,
+    discovery_tasks: Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 struct IntrospectionProvider {
     issuer: Option<String>,
     introspection_endpoint: Arc<ArcSwap<Option<String>>>,
+    discovery_url: Option<String>,
     assertion_audience: Option<String>,
     audiences: Vec<String>,
     token_locations: Vec<TokenLocation>,
@@ -68,12 +103,13 @@ struct IntrospectionProvider {
     token_hint_param: Option<String>,
     claim_headers: Vec<ClaimHeaderMapping>,
     warmup_hostnames: Vec<String>,
+    introspection_limit: Arc<Semaphore>,
+    in_flight: Arc<DashMap<TokenKey, Arc<InFlightCell>>>,
 }
 
 enum ClientAuth {
     Basic {
-        client_id: String,
-        client_secret: SecretString,
+        authorization: HeaderValue,
     },
     Post {
         client_id: String,
@@ -86,17 +122,6 @@ enum ClientAuth {
         kid: Option<String>,
     },
     None,
-}
-
-impl ClientAuth {
-    fn client_id_for_cache(&self) -> &str {
-        match self {
-            Self::Basic { client_id, .. }
-            | Self::Post { client_id, .. }
-            | Self::PrivateKeyJwt { client_id, .. } => client_id,
-            Self::None => "none",
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -120,13 +145,39 @@ impl fmt::Display for SecretString {
     }
 }
 
+impl Drop for Oauth2Introspection {
+    fn drop(&mut self) {
+        let tasks = match self.discovery_tasks.get_mut() {
+            Ok(tasks) => tasks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(tasks) = tasks.take() {
+            for task in tasks {
+                task.abort();
+            }
+        }
+    }
+}
+
 enum Oauth2ExtractedCredential {
     BearerToken {
         token: String,
-        provider_indices: Vec<usize>,
+        candidates: Vec<ProviderCandidate>,
     },
     InvalidFormat(String),
     Missing,
+}
+
+#[derive(Clone, Copy)]
+struct ProviderCandidate {
+    provider_idx: usize,
+    source: CredentialSource,
+}
+
+#[derive(Clone, Copy)]
+enum CredentialSource {
+    Authorization,
+    ProviderLocation(usize),
 }
 
 impl Oauth2Introspection {
@@ -134,6 +185,21 @@ impl Oauth2Introspection {
         let config_obj = config.as_object().ok_or_else(|| {
             format!("oauth2_introspection: config must be an object, got: {config}")
         })?;
+        reject_unknown_keys(
+            config_obj,
+            &[
+                "providers",
+                "scope_claim",
+                "role_claim",
+                "consumer_identity_claim",
+                "consumer_header_claim",
+                "allow_provider_fanout",
+            ],
+            "oauth2_introspection",
+        )?;
+        let allow_provider_fanout =
+            optional_top_level_bool(config_obj, "allow_provider_fanout", "oauth2_introspection")?
+                .unwrap_or(false);
         let global_scope_claim =
             optional_claim_path(config_obj, "scope_claim", "scope", "oauth2_introspection")?;
         let global_role_claim =
@@ -158,6 +224,11 @@ impl Oauth2Introspection {
         if providers_arr.is_empty() {
             return Err("oauth2_introspection: 'providers' array must not be empty".to_string());
         }
+        if providers_arr.len() > MAX_PROVIDERS {
+            return Err(format!(
+                "oauth2_introspection: 'providers' must contain at most {MAX_PROVIDERS} entries"
+            ));
+        }
 
         let shard_amount = http_client.pool_shard_amount();
         let mut providers = Vec::with_capacity(providers_arr.len());
@@ -165,6 +236,32 @@ impl Oauth2Introspection {
             let prov_obj = prov_cfg.as_object().ok_or_else(|| {
                 format!("oauth2_introspection: provider[{idx}] must be an object, got: {prov_cfg}")
             })?;
+            reject_unknown_keys(
+                prov_obj,
+                &[
+                    "introspection_endpoint",
+                    "discovery_url",
+                    "issuer",
+                    "audiences",
+                    "client_auth",
+                    "from_headers",
+                    "from_params",
+                    "forward_original_token",
+                    "positive_cache_ttl_secs",
+                    "negative_cache_ttl_secs",
+                    "request_timeout_ms",
+                    "max_cache_entries",
+                    "token_hint_param",
+                    "required_scopes",
+                    "required_roles",
+                    "scope_claim",
+                    "role_claim",
+                    "consumer_identity_claim",
+                    "consumer_header_claim",
+                    "claim_headers",
+                ],
+                &format!("oauth2_introspection: provider[{idx}]"),
+            )?;
 
             let endpoint = parse_url_field(prov_obj, "introspection_endpoint", idx)?;
             let discovery = parse_url_field(prov_obj, "discovery_url", idx)?;
@@ -180,9 +277,7 @@ impl Oauth2Introspection {
             }
 
             let issuer = optional_non_empty_string(prov_obj, "issuer", idx)?;
-            // Canonicalize audiences (sort + dedup) so equivalent audience sets map to
-            // one cache partition: `["a","b"]` and `["b","a"]` are equivalent under
-            // `audience_matches`, and dedup does not change membership.
+            // Canonicalize audiences so equivalent policies behave identically.
             let mut audiences = parse_string_array(prov_obj, "audiences", idx)?;
             audiences.sort();
             audiences.dedup();
@@ -218,32 +313,12 @@ impl Oauth2Introspection {
             let endpoint_slot = Arc::new(ArcSwap::from_pointee(
                 endpoint.as_ref().map(|parsed| parsed.url.clone()),
             ));
-            if let Some(discovery) = discovery.as_ref() {
-                spawn_discovery_task(
-                    endpoint_slot.clone(),
-                    http_client.clone(),
-                    discovery.url.clone(),
-                );
-            }
-
-            let endpoint_for_key = endpoint
-                .as_ref()
-                .map(|parsed| parsed.url.as_str())
-                .or_else(|| discovery.as_ref().map(|parsed| parsed.url.as_str()))
-                .unwrap_or("pending");
-            let cache_key = introspection_cache_key(
-                endpoint_for_key,
-                client_auth.client_id_for_cache(),
-                issuer.as_deref(),
-                &audiences,
-            );
-            let cache = get_or_create_introspection_cache(
-                &cache_key,
+            let cache = Arc::new(IntrospectionCache::new(
                 max_cache_entries,
                 Duration::from_secs(positive_cache_ttl_secs),
                 Duration::from_secs(negative_cache_ttl_secs),
                 shard_amount,
-            );
+            ));
             let mut warmup_hostnames = Vec::new();
             if let Some(endpoint) = endpoint.as_ref() {
                 warmup_hostnames.push(endpoint.hostname.clone());
@@ -260,6 +335,7 @@ impl Oauth2Introspection {
                 assertion_audience: issuer.clone(),
                 issuer,
                 introspection_endpoint: endpoint_slot,
+                discovery_url: discovery.as_ref().map(|parsed| parsed.url.clone()),
                 audiences,
                 token_locations,
                 required_scopes,
@@ -275,17 +351,43 @@ impl Oauth2Introspection {
                 token_hint_param,
                 claim_headers,
                 warmup_hostnames,
+                introspection_limit: Arc::new(Semaphore::new(
+                    MAX_PROVIDER_CONCURRENT_INTROSPECTIONS,
+                )),
+                in_flight: Arc::new(DashMap::with_shard_amount(shard_amount)),
             });
         }
 
-        let strip_authorization_on_success = providers.iter().any(|provider| {
-            !provider.forward_original_token
-                && (provider.token_locations.is_empty()
-                    || provider
-                        .token_locations
-                        .iter()
-                        .any(|location| matches!(location, TokenLocation::Header(_))))
-        });
+        let authorization_provider_count = providers
+            .iter()
+            .filter(|provider| provider.token_locations.is_empty())
+            .count();
+        if authorization_provider_count > 1 && !allow_provider_fanout {
+            return Err(
+                "oauth2_introspection: multiple providers use the Authorization bearer location; set 'allow_provider_fanout' to true only when every provider shares one trust boundary, or configure distinct from_headers/from_params routing hints"
+                    .to_string(),
+            );
+        }
+        if !allow_provider_fanout {
+            let mut location_owners: HashMap<String, usize> = HashMap::new();
+            for (provider_idx, provider) in providers.iter().enumerate() {
+                for location in &provider.token_locations {
+                    let key = token_location_routing_key(location);
+                    if let Some(previous_provider_idx) = location_owners.insert(key, provider_idx)
+                        && previous_provider_idx != provider_idx
+                    {
+                        return Err(
+                            "oauth2_introspection: provider token locations must be distinct unless 'allow_provider_fanout' explicitly enables a shared trust boundary"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+
+        let strip_authorization_on_success = providers
+            .iter()
+            .any(|provider| !provider.forward_original_token);
         let has_custom_query_token_locations = providers.iter().any(|provider| {
             provider
                 .token_locations
@@ -296,12 +398,15 @@ impl Oauth2Introspection {
         Ok(Self {
             providers,
             http_client,
+            global_introspection_limit: global_introspection_limit(),
             global_scope_claim,
             global_role_claim,
             consumer_identity_claim,
             consumer_header_claim,
             strip_authorization_on_success,
             has_custom_query_token_locations,
+            allow_provider_fanout,
+            discovery_tasks: Mutex::new(None),
         })
     }
 
@@ -315,23 +420,28 @@ impl Oauth2Introspection {
                 debug!("oauth2_introspection: no credential present");
                 PluginResult::Continue
             }
-            Oauth2ExtractedCredential::InvalidFormat(body) => reject(401, body),
-            Oauth2ExtractedCredential::BearerToken {
-                token,
-                provider_indices,
-            } => {
-                let (claims, provider_idx) =
-                    match self.validate_token(&token, &provider_indices).await {
-                        Ok(result) => result,
-                        Err((status, body)) => return reject(status, body),
-                    };
-                let provider = &self.providers[provider_idx];
+            Oauth2ExtractedCredential::InvalidFormat(body) => {
+                reject_bearer(401, body, "invalid_request")
+            }
+            Oauth2ExtractedCredential::BearerToken { token, candidates } => {
+                if token.len() > MAX_TOKEN_BYTES {
+                    return reject_bearer(
+                        401,
+                        r#"{"error":"Bearer token exceeds maximum length"}"#.to_string(),
+                        "invalid_request",
+                    );
+                }
+                let (claims, candidate) = match self.validate_token(&token, &candidates).await {
+                    Ok(result) => result,
+                    Err(rejection) => return rejection.into_plugin_result(),
+                };
+                let provider = &self.providers[candidate.provider_idx];
                 if let Err((status, body)) = self.check_claims_authorization(&claims, provider) {
                     return reject(status, body);
                 }
                 self.emit_claim_headers(ctx, &claims, provider);
                 if !provider.forward_original_token {
-                    mark_original_token_stripping_metadata(ctx, provider);
+                    mark_original_token_stripping_metadata(ctx, provider, candidate.source);
                 }
                 let outcome = self.resolve_identity(&claims, provider, consumer_index);
                 apply_verify_outcome(ctx, outcome, "oauth2_introspection")
@@ -342,34 +452,42 @@ impl Oauth2Introspection {
     async fn validate_token(
         &self,
         token: &str,
-        provider_indices: &[usize],
-    ) -> Result<(Arc<Value>, usize), (u16, String)> {
-        // A token may be validatable by any of the candidate providers
-        // (multi-IdP routing), so a non-first provider's `active:false`,
-        // issuer/audience mismatch, or transport failure must not short-circuit
-        // a provider that would accept it. Try every candidate, accept the first
-        // success, and fall back to the first provider's verdict when none
-        // succeed — which keeps single-provider behavior byte-for-byte unchanged.
-        let mut first_error: Option<(u16, String)> = None;
-        for &idx in provider_indices {
-            let Some(provider) = self.providers.get(idx) else {
+        candidates: &[ProviderCandidate],
+    ) -> Result<(Arc<Value>, ProviderCandidate), IntrospectionRejection> {
+        // Fan-out is only reachable after explicit shared-trust opt-in or when
+        // the request carried the same token in multiple provider-specific
+        // locations. If no provider accepts, an unavailable candidate takes
+        // precedence: that provider might have accepted the token if healthy,
+        // so reporting an authoritative invalid-token result would be false.
+        let mut first_auth_error: Option<IntrospectionDecision> = None;
+        let mut provider_unavailable = false;
+        for &candidate in candidates {
+            let Some(provider) = self.providers.get(candidate.provider_idx) else {
                 continue;
             };
-            match self.introspect_with_provider(token, provider, idx).await {
-                Ok(claims) => return Ok((claims, idx)),
+            match self
+                .introspect_with_provider(token, provider, candidate.provider_idx)
+                .await
+            {
+                Ok(claims) => return Ok((claims, candidate)),
+                Err(IntrospectionDecision::Unavailable) => provider_unavailable = true,
                 Err(decision) => {
-                    if first_error.is_none() {
-                        first_error = Some(decision.into_rejection());
+                    if first_auth_error.is_none() {
+                        first_auth_error = Some(decision);
                     }
                 }
             }
         }
-        Err(first_error.unwrap_or_else(|| {
-            (
-                401,
-                r#"{"error":"Invalid or unrecognized token"}"#.to_string(),
-            )
-        }))
+        if provider_unavailable {
+            return Err(IntrospectionDecision::Unavailable.into_rejection());
+        }
+        Err(first_auth_error
+            .unwrap_or_else(|| {
+                IntrospectionDecision::Unauthorized(
+                    r#"{"error":"Invalid or unrecognized token"}"#.to_string(),
+                )
+            })
+            .into_rejection())
     }
 
     async fn introspect_with_provider(
@@ -385,6 +503,40 @@ impl Oauth2Introspection {
             CacheLookup::Miss => {}
         }
 
+        let token_key = TokenKey::from_token(token);
+        let proposed = Arc::new(InFlightCell::new());
+        let cell = provider
+            .in_flight
+            .entry(token_key.clone())
+            .or_insert_with(|| Arc::clone(&proposed))
+            .clone();
+        let _cleanup = Arc::ptr_eq(&cell, &proposed).then(|| InFlightEntryGuard {
+            entries: Arc::clone(&provider.in_flight),
+            key: token_key,
+            cell: Arc::clone(&cell),
+        });
+        let result = cell
+            .get_or_init(|| self.introspect_uncached(token, provider, provider_idx))
+            .await
+            .clone();
+        result
+    }
+
+    async fn introspect_uncached(
+        &self,
+        token: &str,
+        provider: &IntrospectionProvider,
+        provider_idx: usize,
+    ) -> Result<Arc<Value>, IntrospectionDecision> {
+        let now = Instant::now();
+        // Another completed request can populate the cache between the caller's
+        // initial lookup and installation of a new in-flight cell.
+        match provider.cache.get(token, now) {
+            CacheLookup::Active(claims) => return Ok(claims),
+            CacheLookup::Negative => return Err(IntrospectionDecision::Inactive),
+            CacheLookup::Miss => {}
+        }
+
         let guard = provider.introspection_endpoint.load();
         let Some(endpoint) = guard.as_ref().as_ref().cloned() else {
             warn!(
@@ -394,20 +546,40 @@ impl Oauth2Introspection {
             return Err(IntrospectionDecision::Unavailable);
         };
 
+        let _provider_permit = provider
+            .introspection_limit
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                warn!(
+                    plugin = "oauth2_introspection",
+                    provider_idx, "provider introspection concurrency limit reached"
+                );
+                IntrospectionDecision::Unavailable
+            })?;
+        let _global_permit = self
+            .global_introspection_limit
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                warn!(
+                    plugin = "oauth2_introspection",
+                    provider_idx, "global introspection concurrency limit reached"
+                );
+                IntrospectionDecision::Unavailable
+            })?;
+
         let mut params: Vec<(String, String)> = vec![("token".to_string(), token.to_string())];
         if let Some(hint) = &provider.token_hint_param {
             params.push(("token_type_hint".to_string(), hint.clone()));
         }
         let request = match &provider.client_auth {
-            ClientAuth::Basic {
-                client_id,
-                client_secret,
-            } => self
+            ClientAuth::Basic { authorization } => self
                 .http_client
                 .get()
                 .post(&endpoint)
                 .timeout(provider.request_timeout)
-                .basic_auth(client_id, Some(client_secret.expose()))
+                .header(AUTHORIZATION, authorization.clone())
                 .with_form_body(&params)?,
             ClientAuth::Post {
                 client_id,
@@ -479,7 +651,18 @@ impl Oauth2Introspection {
             );
             return Err(IntrospectionDecision::Unavailable);
         }
-        let claims: Value = response.json().await.map_err(|e| {
+        let body = read_response_body_bounded(response, MAX_INTROSPECTION_RESPONSE_BYTES)
+            .await
+            .map_err(|e| {
+                warn!(
+                    plugin = "oauth2_introspection",
+                    provider_idx,
+                    error = %e,
+                    "token introspection response body read failed"
+                );
+                IntrospectionDecision::Unavailable
+            })?;
+        let claims: Value = serde_json::from_slice(&body).map_err(|e| {
             warn!(
                 plugin = "oauth2_introspection",
                 provider_idx,
@@ -488,9 +671,41 @@ impl Oauth2Introspection {
             );
             IntrospectionDecision::Unavailable
         })?;
-        if claims.get("active").and_then(Value::as_bool) != Some(true) {
-            provider.cache.insert_negative(token, now);
-            return Err(IntrospectionDecision::Inactive);
+        match claims.get("active").and_then(Value::as_bool) {
+            Some(true) => {}
+            Some(false) => {
+                provider.cache.insert_negative(token, now);
+                return Err(IntrospectionDecision::Inactive);
+            }
+            None => {
+                warn!(
+                    plugin = "oauth2_introspection",
+                    provider_idx,
+                    "token introspection response has a missing or non-boolean active member"
+                );
+                return Err(IntrospectionDecision::Unavailable);
+            }
+        }
+        if claims.get("cnf").is_some() {
+            return Err(IntrospectionDecision::Unauthorized(
+                r#"{"error":"Sender-constrained tokens are not supported"}"#.to_string(),
+            ));
+        }
+        match claims.get("token_type") {
+            None => {}
+            Some(Value::String(token_type)) if token_type.eq_ignore_ascii_case("bearer") => {}
+            Some(Value::String(_)) => {
+                return Err(IntrospectionDecision::Unauthorized(
+                    r#"{"error":"Unsupported introspected token type"}"#.to_string(),
+                ));
+            }
+            Some(_) => {
+                warn!(
+                    plugin = "oauth2_introspection",
+                    provider_idx, "token introspection response has a non-string token_type member"
+                );
+                return Err(IntrospectionDecision::Unavailable);
+            }
         }
         if let Some(issuer) = &provider.issuer
             && claims.get("iss").and_then(Value::as_str) != Some(issuer.as_str())
@@ -578,31 +793,34 @@ impl Oauth2Introspection {
     fn extract_credential(&self, ctx: &RequestContext) -> Oauth2ExtractedCredential {
         let mut first_invalid_format = None;
         for (idx, provider) in self.providers.iter().enumerate() {
-            for location in &provider.token_locations {
+            for (location_idx, location) in provider.token_locations.iter().enumerate() {
                 match extract_from_location(location, ctx) {
                     TokenLocationExtract::Missing => {}
                     TokenLocationExtract::Credential(ExtractedCredential::InvalidFormat(body)) => {
                         first_invalid_format.get_or_insert(body);
                     }
                     TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token)) => {
-                        let mut provider_indices = vec![idx];
+                        let mut candidates = vec![ProviderCandidate {
+                            provider_idx: idx,
+                            source: CredentialSource::ProviderLocation(location_idx),
+                        }];
                         for (other_idx, other_provider) in self.providers.iter().enumerate() {
                             if other_idx != idx
-                                && provider_locations_extract_token(
+                                && let Some(other_location_idx) = provider_location_extracting_token(
                                     &other_provider.token_locations,
                                     ctx,
                                     &token,
                                 )
                             {
-                                provider_indices.push(other_idx);
+                                candidates.push(ProviderCandidate {
+                                    provider_idx: other_idx,
+                                    source: CredentialSource::ProviderLocation(other_location_idx),
+                                });
                             }
                         }
-                        provider_indices.sort_unstable();
-                        provider_indices.dedup();
-                        return Oauth2ExtractedCredential::BearerToken {
-                            token,
-                            provider_indices,
-                        };
+                        candidates.sort_unstable_by_key(|candidate| candidate.provider_idx);
+                        candidates.dedup_by_key(|candidate| candidate.provider_idx);
+                        return Oauth2ExtractedCredential::BearerToken { token, candidates };
                     }
                     TokenLocationExtract::Credential(_) => {}
                 }
@@ -617,10 +835,37 @@ impl Oauth2Introspection {
                 .map(Oauth2ExtractedCredential::InvalidFormat)
                 .unwrap_or(Oauth2ExtractedCredential::InvalidFormat(body)),
             ExtractedCredential::BearerToken(token) => {
-                let provider_indices = (0..self.providers.len()).collect();
+                let provider_indices: Vec<usize> = if self.allow_provider_fanout {
+                    (0..self.providers.len()).collect()
+                } else {
+                    self.providers
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, provider)| {
+                            provider.token_locations.is_empty().then_some(idx)
+                        })
+                        .collect()
+                };
+                let provider_indices = if provider_indices.is_empty() && self.providers.len() == 1 {
+                    vec![0]
+                } else {
+                    provider_indices
+                };
+                if provider_indices.is_empty() {
+                    return Oauth2ExtractedCredential::InvalidFormat(
+                        r#"{"error":"Bearer token does not identify an introspection provider"}"#
+                            .to_string(),
+                    );
+                }
                 Oauth2ExtractedCredential::BearerToken {
                     token,
-                    provider_indices,
+                    candidates: provider_indices
+                        .into_iter()
+                        .map(|provider_idx| ProviderCandidate {
+                            provider_idx,
+                            source: CredentialSource::Authorization,
+                        })
+                        .collect(),
                 }
             }
             _ => Oauth2ExtractedCredential::Missing,
@@ -628,48 +873,49 @@ impl Oauth2Introspection {
     }
 }
 
-/// Builds the global introspection-cache partition key for a provider.
-///
-/// The positive/negative caches are process-global and keyed by this string, so the
-/// key must fully capture every input that affects whether a cached introspection
-/// result may be reused: the endpoint (or `"pending"` discovery placeholder), the
-/// client id used for endpoint authentication, and the issuer/audience constraints
-/// enforced after a cache miss in `introspect_with_provider`. Omitting the policy
-/// material lets a token validated by a permissive provider be served from cache to a
-/// stricter provider sharing endpoint+client_id, bypassing its `iss`/`aud` checks.
-///
-/// Components are length-prefixed before hashing so no arrangement of delimiter bytes
-/// (e.g. `|` or `,`) inside any single field can collide with a functionally
-/// different policy. `issuer` is tagged so `None` is distinct from `Some("")`.
-/// Callers must pass canonicalized (sorted, deduped) audiences so equivalent audience
-/// sets map to the same key.
-fn introspection_cache_key(
-    endpoint: &str,
-    client_id: &str,
-    issuer: Option<&str>,
-    audiences: &[String],
-) -> String {
-    fn absorb(hasher: &mut Sha256, bytes: &[u8]) {
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
-    }
-    let mut hasher = Sha256::new();
-    absorb(&mut hasher, endpoint.as_bytes());
-    absorb(&mut hasher, client_id.as_bytes());
-    match issuer {
-        Some(issuer) => {
-            hasher.update([1u8]);
-            absorb(&mut hasher, issuer.as_bytes());
-        }
-        None => hasher.update([0u8]),
-    }
-    hasher.update((audiences.len() as u64).to_le_bytes());
-    for audience in audiences {
-        absorb(&mut hasher, audience.as_bytes());
-    }
-    hex::encode(hasher.finalize())
+fn provider_location_extracting_token(
+    token_locations: &[TokenLocation],
+    ctx: &RequestContext,
+    expected_token: &str,
+) -> Option<usize> {
+    token_locations
+        .iter()
+        .enumerate()
+        .find_map(
+            |(location_idx, location)| match extract_from_location(location, ctx) {
+                TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token))
+                    if token == expected_token =>
+                {
+                    Some(location_idx)
+                }
+                _ => None,
+            },
+        )
 }
 
+fn token_location_routing_key(location: &TokenLocation) -> String {
+    match location {
+        TokenLocation::Header(header) => {
+            let prefix = header.prefix.as_deref().unwrap_or("");
+            let mut key = String::with_capacity(
+                "header:".len() + header.name.len() + prefix.len().saturating_add(1),
+            );
+            key.push_str("header:");
+            key.push_str(&header.name);
+            key.push(':');
+            key.push_str(prefix);
+            key
+        }
+        TokenLocation::QueryParam(name) => {
+            let mut key = String::with_capacity("query:".len() + name.len());
+            key.push_str("query:");
+            key.push_str(name);
+            key
+        }
+    }
+}
+
+#[derive(Clone)]
 enum IntrospectionDecision {
     Inactive,
     Unauthorized(String),
@@ -677,16 +923,49 @@ enum IntrospectionDecision {
 }
 
 impl IntrospectionDecision {
-    /// Map a per-provider failure to the `(status, body)` returned to the client
-    /// when no candidate provider accepts the token.
-    fn into_rejection(self) -> (u16, String) {
+    fn into_rejection(self) -> IntrospectionRejection {
         match self {
-            Self::Inactive => (401, r#"{"error":"Inactive token"}"#.to_string()),
-            Self::Unauthorized(body) => (401, body),
-            Self::Unavailable => (
+            Self::Inactive => IntrospectionRejection::bearer(
                 401,
+                r#"{"error":"Inactive token"}"#.to_string(),
+                "invalid_token",
+            ),
+            Self::Unauthorized(body) => IntrospectionRejection::bearer(401, body, "invalid_token"),
+            Self::Unavailable => IntrospectionRejection::plain(
+                503,
                 r#"{"error":"Token introspection unavailable"}"#.to_string(),
             ),
+        }
+    }
+}
+
+struct IntrospectionRejection {
+    status_code: u16,
+    body: String,
+    bearer_error: Option<&'static str>,
+}
+
+impl IntrospectionRejection {
+    fn plain(status_code: u16, body: String) -> Self {
+        Self {
+            status_code,
+            body,
+            bearer_error: None,
+        }
+    }
+
+    fn bearer(status_code: u16, body: String, error: &'static str) -> Self {
+        Self {
+            status_code,
+            body,
+            bearer_error: Some(error),
+        }
+    }
+
+    fn into_plugin_result(self) -> PluginResult {
+        match self.bearer_error {
+            Some(error) => reject_bearer(self.status_code, self.body, error),
+            None => reject(self.status_code, self.body),
         }
     }
 }
@@ -722,6 +1001,54 @@ impl super::Plugin for Oauth2Introspection {
 
     fn is_auth_plugin(&self) -> bool {
         true
+    }
+
+    fn authentication_challenge(&self) -> Option<&'static str> {
+        Some("Bearer")
+    }
+
+    fn start_background_tasks(&self) -> Result<(), String> {
+        let mut task_slot = self
+            .discovery_tasks
+            .lock()
+            .map_err(|_| "oauth2_introspection: discovery task state lock poisoned".to_string())?;
+        if task_slot.is_some() {
+            return Ok(());
+        }
+
+        let discoveries: Vec<_> = self
+            .providers
+            .iter()
+            .filter_map(|provider| {
+                provider.discovery_url.as_ref().map(|discovery_url| {
+                    (
+                        Arc::clone(&provider.introspection_endpoint),
+                        discovery_url.clone(),
+                    )
+                })
+            })
+            .collect();
+        if discoveries.is_empty() {
+            *task_slot = Some(Vec::new());
+            return Ok(());
+        }
+
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            "oauth2_introspection: live discovery startup requires a Tokio runtime".to_string()
+        })?;
+        let tasks = discoveries
+            .into_iter()
+            .map(|(endpoint_slot, discovery_url)| {
+                spawn_discovery_task(
+                    &runtime,
+                    endpoint_slot,
+                    self.http_client.clone(),
+                    discovery_url,
+                )
+            })
+            .collect();
+        *task_slot = Some(tasks);
+        Ok(())
     }
 
     fn priority(&self) -> u16 {
@@ -831,10 +1158,10 @@ fn apply_verify_outcome(
             PluginResult::Continue
         }
         VerifyOutcome::Forbidden(body) => reject(403, body),
+        VerifyOutcome::InvalidFormat(body) => reject_bearer(401, body, "invalid_request"),
         VerifyOutcome::Invalid(body)
-        | VerifyOutcome::InvalidFormat(body)
         | VerifyOutcome::ConsumerNotFound(body)
-        | VerifyOutcome::VerificationFailed(body) => reject(401, body),
+        | VerifyOutcome::VerificationFailed(body) => reject_bearer(401, body, "invalid_token"),
         VerifyOutcome::Internal(body) => reject(500, body),
         VerifyOutcome::NotApplicable => PluginResult::Continue,
     }
@@ -845,22 +1172,48 @@ fn parse_client_auth(
     provider_idx: usize,
     endpoint: Option<&ParsedEndpoint>,
 ) -> Result<ClientAuth, String> {
-    let auth = config
-        .get("client_auth")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let method = auth
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("client_secret_basic")
-        .trim();
-    let client_id = auth
-        .get("client_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
+    let auth = match config.get("client_auth") {
+        Some(value) => value.as_object().cloned().ok_or_else(|| {
+            format!("oauth2_introspection: provider[{provider_idx}].client_auth must be an object")
+        })?,
+        None => Map::new(),
+    };
+    reject_unknown_keys(
+        &auth,
+        &[
+            "method",
+            "client_id",
+            "client_secret",
+            "private_key_pem",
+            "private_key_jwt_alg",
+            "private_key_jwt_kid",
+        ],
+        &format!("oauth2_introspection: provider[{provider_idx}].client_auth"),
+    )?;
+    let method = match auth.get("method") {
+        Some(value) => value.as_str().ok_or_else(|| {
+            format!(
+                "oauth2_introspection: provider[{provider_idx}].client_auth.method must be a string"
+            )
+        })?,
+        None => "client_secret_basic",
+    }
+    .trim();
+    let client_id = match auth.get("client_id") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| {
+                    format!(
+                        "oauth2_introspection: provider[{provider_idx}].client_auth.client_id must be a string"
+                    )
+                })?
+                .trim(),
+        ),
+        None => None,
+    }
+    .filter(|value| !value.is_empty())
+    .map(ToOwned::to_owned);
 
     // Credentialed methods transmit client credentials to the provider:
     // `client_secret_basic` puts Base64(client_id:client_secret) in the
@@ -881,18 +1234,21 @@ fn parse_client_auth(
     }
 
     match method {
-        "client_secret_basic" => Ok(ClientAuth::Basic {
-            client_id: client_id.ok_or_else(|| {
+        "client_secret_basic" => {
+            let client_id = client_id.ok_or_else(|| {
                 format!(
                     "oauth2_introspection: provider[{provider_idx}].client_auth.client_id is required"
                 )
-            })?,
-            client_secret: SecretString(required_auth_string(
+            })?;
+            let client_secret = required_auth_string(
                 &auth,
                 "client_secret",
                 provider_idx,
-            )?),
-        }),
+            )?;
+            Ok(ClientAuth::Basic {
+                authorization: oauth_basic_authorization_header(&client_id, &client_secret)?,
+            })
+        }
         "client_secret_post" => Ok(ClientAuth::Post {
             client_id: client_id.ok_or_else(|| {
                 format!(
@@ -939,12 +1295,17 @@ fn parse_client_auth(
                     ));
                 }
             };
-            let kid = auth
-                .get("private_key_jwt_kid")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned);
+            let kid = match auth.get("private_key_jwt_kid") {
+                Some(value) => Some(value.as_str().ok_or_else(|| {
+                    format!(
+                        "oauth2_introspection: provider[{provider_idx}].client_auth.private_key_jwt_kid must be a string"
+                    )
+                })?),
+                None => None,
+            }
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
             Ok(ClientAuth::PrivateKeyJwt {
                 client_id,
                 encoding_key,
@@ -987,8 +1348,51 @@ fn required_auth_string(
     Ok(raw.to_string())
 }
 
+fn oauth_basic_authorization_header(
+    client_id: &str,
+    client_secret: &str,
+) -> Result<HeaderValue, String> {
+    let encoded_client_id = oauth_form_encode_component(client_id)?;
+    let encoded_client_secret = oauth_form_encode_component(client_secret)?;
+    let mut credential = String::with_capacity(
+        encoded_client_id
+            .len()
+            .saturating_add(encoded_client_secret.len())
+            .saturating_add(1),
+    );
+    credential.push_str(&encoded_client_id);
+    credential.push(':');
+    credential.push_str(&encoded_client_secret);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(credential.as_bytes());
+    let mut value = String::with_capacity("Basic ".len().saturating_add(encoded.len()));
+    value.push_str("Basic ");
+    value.push_str(&encoded);
+    let mut header = HeaderValue::from_bytes(value.as_bytes())
+        .map_err(|_| "oauth2_introspection: failed to encode client credentials".to_string())?;
+    header.set_sensitive(true);
+    Ok(header)
+}
+
+fn oauth_form_encode_component(value: &str) -> Result<String, String> {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("value", value);
+    serializer
+        .finish()
+        .strip_prefix("value=")
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "oauth2_introspection: failed to form-encode client credentials".to_string())
+}
+
 fn parse_private_key_alg(value: Option<&Value>, provider_idx: usize) -> Result<Algorithm, String> {
-    match value.and_then(Value::as_str).unwrap_or("RS256") {
+    let algorithm = match value {
+        Some(value) => value.as_str().ok_or_else(|| {
+            format!(
+                "oauth2_introspection: provider[{provider_idx}].client_auth.private_key_jwt_alg must be a string"
+            )
+        })?,
+        None => "RS256",
+    };
+    match algorithm {
         "RS256" => Ok(Algorithm::RS256),
         "RS384" => Ok(Algorithm::RS384),
         "RS512" => Ok(Algorithm::RS512),
@@ -1043,6 +1447,11 @@ fn parse_token_locations(
                     "oauth2_introspection: 'provider[{provider_idx}].from_headers[{idx}]' must be an object"
                 )
             })?;
+            reject_unknown_keys(
+                object,
+                &["name", "prefix"],
+                &format!("oauth2_introspection: provider[{provider_idx}].from_headers[{idx}]"),
+            )?;
             let raw_name = object.get("name").and_then(Value::as_str).ok_or_else(|| {
                 format!(
                     "oauth2_introspection: 'provider[{provider_idx}].from_headers[{idx}].name' is required"
@@ -1091,6 +1500,32 @@ fn optional_claim_path(
         Some(value) => parse_claim_path_value(field, value, plugin),
         None => Ok(default_value.to_string()),
     }
+}
+
+fn reject_unknown_keys(
+    object: &Map<String, Value>,
+    allowed: &[&str],
+    path: &str,
+) -> Result<(), String> {
+    if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!("{path} contains unknown field '{unknown}'"));
+    }
+    Ok(())
+}
+
+fn optional_top_level_bool(
+    config: &Map<String, Value>,
+    field: &str,
+    plugin: &str,
+) -> Result<Option<bool>, String> {
+    config
+        .get(field)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| format!("{plugin}: '{field}' must be a boolean"))
+        })
+        .transpose()
 }
 
 fn optional_provider_claim_path(
@@ -1339,14 +1774,40 @@ fn audience_matches(claims: &Value, audiences: &[String]) -> bool {
 fn mark_original_token_stripping_metadata(
     ctx: &mut RequestContext,
     provider: &IntrospectionProvider,
+    source: CredentialSource,
 ) {
-    mark_token_stripping_metadata(
-        ctx,
-        &provider.token_locations,
-        STRIP_AUTHORIZATION_METADATA_KEY,
-        STRIP_HEADER_METADATA_PREFIX,
-        STRIP_QUERY_PARAM_METADATA_PREFIX,
-    );
+    match source {
+        CredentialSource::Authorization => {
+            ctx.metadata.insert(
+                STRIP_AUTHORIZATION_METADATA_KEY.to_string(),
+                "true".to_string(),
+            );
+        }
+        CredentialSource::ProviderLocation(location_idx) => {
+            let Some(location) = provider.token_locations.get(location_idx) else {
+                warn!(
+                    plugin = "oauth2_introspection",
+                    location_idx, "accepted token source no longer exists"
+                );
+                return;
+            };
+            match location {
+                TokenLocation::Header(header) => {
+                    ctx.metadata.insert(
+                        format!("{STRIP_HEADER_METADATA_PREFIX}{}", header.name),
+                        "true".to_string(),
+                    );
+                }
+                TokenLocation::QueryParam(name) => {
+                    ctx.metadata.insert(
+                        format!("{STRIP_QUERY_PARAM_METADATA_PREFIX}{name}"),
+                        "true".to_string(),
+                    );
+                    ctx.query_params.remove(name);
+                }
+            }
+        }
+    }
 }
 
 fn reject(status_code: u16, body: String) -> PluginResult {
@@ -1357,12 +1818,26 @@ fn reject(status_code: u16, body: String) -> PluginResult {
     }
 }
 
+fn reject_bearer(status_code: u16, body: String, error: &'static str) -> PluginResult {
+    let mut headers = HashMap::new();
+    headers.insert(
+        "www-authenticate".to_string(),
+        format!(r#"Bearer error="{error}""#),
+    );
+    PluginResult::Reject {
+        status_code,
+        body,
+        headers,
+    }
+}
+
 fn spawn_discovery_task(
+    runtime: &tokio::runtime::Handle,
     endpoint_slot: Arc<ArcSwap<Option<String>>>,
     http_client: PluginHttpClient,
     discovery_url: String,
-) {
-    tokio::spawn(async move {
+) -> tokio::task::JoinHandle<()> {
+    runtime.spawn(async move {
         const INITIAL_BACKOFF_SECS: u64 = 2;
         const MAX_BACKOFF_SECS: u64 = 300;
         let mut attempt: u32 = 0;
@@ -1394,7 +1869,7 @@ fn spawn_discovery_task(
                 }
             }
         }
-    });
+    })
 }
 
 async fn discover_introspection_endpoint(
@@ -1411,10 +1886,11 @@ async fn discover_introspection_endpoint(
     if !response.status().is_success() {
         return Err(format!("discovery returned HTTP {}", response.status()));
     }
-    let body: Value = response
-        .json()
+    let bytes = read_response_body_bounded(response, MAX_DISCOVERY_RESPONSE_BYTES)
         .await
-        .map_err(|e| format!("discovery parse failed: {e}"))?;
+        .map_err(|e| format!("discovery response body read failed: {e}"))?;
+    let body: Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("discovery parse failed: {e}"))?;
     let endpoint = body
         .get("introspection_endpoint")
         .and_then(Value::as_str)
@@ -1458,64 +1934,19 @@ fn validate_discovered_endpoint(
             "discovery {field} host must match discovery_url host"
         ));
     }
+    if !parsed.scheme().eq_ignore_ascii_case(discovery.scheme())
+        || parsed.port_or_known_default() != discovery.port_or_known_default()
+    {
+        return Err(format!(
+            "discovery {field} origin must match discovery_url origin"
+        ));
+    }
     Ok(endpoint.trim().to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn introspection_cache_key_partitions_by_policy_and_is_collision_resistant() {
-        let base = introspection_cache_key("https://idp/i", "cid", None, &[]);
-
-        // Differing issuer or audiences must produce distinct partitions.
-        assert_ne!(
-            base,
-            introspection_cache_key("https://idp/i", "cid", Some("https://iss"), &[])
-        );
-        assert_ne!(
-            base,
-            introspection_cache_key("https://idp/i", "cid", None, &["aud".to_string()])
-        );
-        // `None` issuer is distinct from an empty-string issuer.
-        assert_ne!(
-            base,
-            introspection_cache_key("https://idp/i", "cid", Some(""), &[])
-        );
-        // Endpoint and client id remain part of the partition.
-        assert_ne!(
-            base,
-            introspection_cache_key("https://idp/i", "other", None, &[])
-        );
-        assert_ne!(
-            base,
-            introspection_cache_key("https://other/i", "cid", None, &[])
-        );
-
-        // Delimiter bytes inside fields cannot forge a collision across distinct
-        // policies (the pre-hardening `|`/`,` join could).
-        assert_ne!(
-            introspection_cache_key("https://idp/i", "cid", Some("X|stuff"), &["a".to_string()]),
-            introspection_cache_key("https://idp/i", "cid", Some("X"), &["stuff|a".to_string()])
-        );
-
-        // Same policy yields the same key (cache reuse for equivalent providers).
-        assert_eq!(
-            introspection_cache_key(
-                "https://idp/i",
-                "cid",
-                Some("https://iss"),
-                &["a".to_string(), "b".to_string()]
-            ),
-            introspection_cache_key(
-                "https://idp/i",
-                "cid",
-                Some("https://iss"),
-                &["a".to_string(), "b".to_string()]
-            )
-        );
-    }
 
     #[test]
     fn local_introspection_host_accepts_loopback_and_localhost_only() {
@@ -1563,6 +1994,13 @@ mod tests {
     }
 
     #[test]
+    fn oauth_basic_header_is_form_encoded_and_sensitive() {
+        let header = oauth_basic_authorization_header("client:id", "s%cret").unwrap();
+        assert_eq!(header.as_bytes(), b"Basic Y2xpZW50JTNBaWQ6cyUyNWNyZXQ=");
+        assert!(header.is_sensitive());
+    }
+
+    #[test]
     fn discovery_downgrade_to_http_remote_endpoint_is_rejected() {
         // An https discovery document must not be allowed to downgrade the
         // credential exchange to a plaintext non-loopback introspection
@@ -1583,6 +2021,42 @@ mod tests {
                 "introspection_endpoint",
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn discovered_endpoint_requires_exact_effective_origin() {
+        assert!(
+            validate_discovered_endpoint(
+                "https://issuer.example.com/.well-known/openid-configuration",
+                "https://issuer.example.com:443/introspect",
+                "introspection_endpoint",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_discovered_endpoint(
+                "https://issuer.example.com/.well-known/openid-configuration",
+                "https://issuer.example.com:8443/introspect",
+                "introspection_endpoint",
+            )
+            .is_err()
+        );
+        assert!(
+            validate_discovered_endpoint(
+                "https://[2001:db8::1]:443/.well-known/openid-configuration",
+                "https://[2001:db8::1]/introspect",
+                "introspection_endpoint",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_discovered_endpoint(
+                "https://[2001:db8::1]:443/.well-known/openid-configuration",
+                "https://[2001:db8::1]:9443/introspect",
+                "introspection_endpoint",
+            )
+            .is_err()
         );
     }
 }

@@ -1365,13 +1365,14 @@ Claim header fan-out refuses reserved hop-by-hop, authorization, host, and consu
 
 ### `oauth2_introspection`
 
-Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspection endpoints. Supports direct endpoint URLs or OIDC discovery, multi-provider routing, client authentication, bounded token caches, claim-based authorization, consumer lookup, claim header fan-out, and optional token stripping before proxying.
+Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspection endpoints. Supports direct endpoint URLs or OIDC discovery, explicit multi-provider routing, client authentication, bounded token caches and outbound work, claim-based authorization, consumer lookup, claim header fan-out, and optional token stripping before proxying.
 
 **Priority:** 1050
 
 | Parameter | Type | Description |
 |---|---|---|
 | `providers` | Array | Introspection provider configurations (required) |
+| `allow_provider_fanout` | Boolean | Submit an Authorization bearer token to multiple providers (default `false`). Enable only when all providers share one credential trust boundary |
 | `providers[].introspection_endpoint` | String | Direct token introspection endpoint URL (`https` required for non-loopback hosts) |
 | `providers[].discovery_url` | String | OIDC discovery URL used to resolve `introspection_endpoint` (`https` required for non-loopback hosts) |
 | `providers[].issuer` | String (optional) | Expected `iss` claim in active introspection responses |
@@ -1397,7 +1398,13 @@ Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspecti
 | `consumer_identity_claim` | String | Global claim used for consumer lookup (default: `"username"`) |
 | `consumer_header_claim` | String | Global claim used for `X-Consumer-Username` when no consumer maps |
 
-Credentialed `client_auth.method` values (`client_secret_basic`, `client_secret_post`, `private_key_jwt`) and `none` all require an `https` `introspection_endpoint`/`discovery_url` when the host is not loopback/localhost; `http` is only accepted for loopback endpoints so client credentials are never sent over plaintext to a remote host. Discovery-provided introspection endpoints must stay on the discovery host and are also held to the same https-for-non-loopback rule. Claim header mappings reject reserved headers.
+Credentialed `client_auth.method` values (`client_secret_basic`, `client_secret_post`, `private_key_jwt`) require an `https` `introspection_endpoint`/`discovery_url` when the host is not loopback/localhost; `http` is only accepted for loopback endpoints so client credentials are never sent over plaintext to a remote host. The `none` method is loopback-only regardless of scheme. `client_secret_basic` form-encodes the client ID and secret separately before constructing the Basic credential, as required by OAuth 2.0. Discovery-provided introspection endpoints must use the discovery URL's exact origin (scheme, normalized host, and effective port). Claim header mappings reject reserved headers.
+
+Configuration is strict at the plugin, provider, client-auth, and header-location layers: unknown fields reject validation and reload. At most 16 providers and 8 KiB bearer tokens are accepted. Introspection work is capped at 32 concurrent calls per provider and 128 process-wide; identical in-flight token checks are coalesced by a SHA-256 token key. Introspection responses are capped at 64 KiB and discovery documents at 128 KiB.
+
+Authorization fallback never fans a token across providers by default. Multi-provider configurations should use distinct `from_headers` or `from_params` locations as deterministic routing hints. Set `allow_provider_fanout: true` only for providers inside one shared trust boundary. When `forward_original_token: false`, the exact header, query parameter, or Authorization fallback that supplied the accepted credential is stripped before proxying.
+
+Only ordinary bearer tokens are supported. Active responses containing `cnf` or a non-Bearer `token_type` fail closed because this plugin does not validate DPoP or mTLS proof-of-possession. Missing or non-Boolean `active` members, oversized/malformed responses, provider transport failures, and non-success provider responses are treated as dependency failures and return `503`; only explicit `active: false` is negative-cached and returned as `401`. OAuth authentication failures include a `WWW-Authenticate: Bearer` challenge; when an authentication chain has no credential, the first configured auth plugin challenge is advertised.
 
 ```yaml
 plugin_name: oauth2_introspection

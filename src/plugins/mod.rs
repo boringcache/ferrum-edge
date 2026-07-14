@@ -3341,6 +3341,22 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns the challenge advertised when the full authentication chain
+    /// completes without a credential or identity. The first configured auth
+    /// plugin that supplies a challenge wins; direct plugin rejections retain
+    /// their own response headers.
+    fn authentication_challenge(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Starts runtime-owned background work after the complete plugin-cache
+    /// generation has validated and before it is published. Constructors must
+    /// remain pure because offline validation invokes them without a runtime.
+    /// Implementations must be idempotent and stop owned work when dropped.
+    fn start_background_tasks(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Returns `true` if this plugin participates in the authorization phase.
     ///
     /// The gateway uses this to pre-filter authorize callbacks at config

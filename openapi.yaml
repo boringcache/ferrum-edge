@@ -11146,14 +11146,17 @@ components:
 
     Oauth2IntrospectionConfig:
       type: object
-      description: "Plugin: oauth2_introspection — RFC 7662 bearer token introspection with multi-provider routing."
+      additionalProperties: false
+      description: "Plugin: oauth2_introspection — RFC 7662 bearer token introspection with bounded, explicit multi-provider routing."
       required: [providers]
       properties:
         providers:
           type: array
           minItems: 1
+          maxItems: 16
           items:
             type: object
+            additionalProperties: false
             properties:
               introspection_endpoint:
                 type: string
@@ -11168,7 +11171,8 @@ components:
                   OIDC discovery URL used to resolve introspection_endpoint. Must
                   use https when client_auth.method is credentialed and the host
                   is not loopback/localhost; http is only permitted for loopback
-                  hosts.
+                  hosts. The discovered endpoint must preserve the discovery
+                  URL's scheme, normalized host, and effective port.
               issuer:
                 type: string
                 description: Expected iss claim in active introspection responses
@@ -11179,6 +11183,7 @@ components:
                 description: Accepted aud claims; OR matched
               client_auth:
                 type: object
+                additionalProperties: false
                 properties:
                   method:
                     type: string
@@ -11212,6 +11217,7 @@ components:
                 type: array
                 items:
                   type: object
+                  additionalProperties: false
                   required: [name]
                   properties:
                     name:
@@ -11263,6 +11269,15 @@ components:
                 additionalProperties:
                   type: string
                 description: Claim path to upstream header mappings
+        allow_provider_fanout:
+          type: boolean
+          default: false
+          description: >-
+            Allow one Authorization bearer token to be submitted sequentially
+            to multiple providers. Enable only when every provider shares one
+            credential trust boundary. By default, multi-provider configs must
+            use distinct from_headers/from_params routing hints or have exactly
+            one provider that uses the Authorization location.
         scope_claim:
           type: string
           default: scope
