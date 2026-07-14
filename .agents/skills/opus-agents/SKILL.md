@@ -10,6 +10,14 @@ decomposition, worktree isolation, effort selection, liveness, independent diff 
 final merge recommendation. Never accept a worker's report without checking the repository and
 GitHub state yourself.
 
+**Guard: do NOT use this skill when you are yourself a dispatched worker.** If your session
+prompt says you were dispatched by an orchestrator — it references the `sol-agents` briefs
+(`agent-brief.md` / `continuation-brief.md`), says "YOU are the implementer", or hands you an
+existing worktree and findings to fix — then this skill does not apply: implement directly in
+your session. Your model and reasoning effort were chosen deliberately by the dispatching
+orchestrator; delegating to an Opus worker silently substitutes different hands at a different
+effort. This skill is only for sessions where the USER asked Codex to delegate to Claude.
+
 ## Preflight
 
 1. Read `AGENTS.md`, the relevant `.claude/rules/*.md`, and the issue or PR before dispatching.

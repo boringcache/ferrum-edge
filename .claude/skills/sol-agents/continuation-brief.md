@@ -1,10 +1,22 @@
-# Continuation-agent brief (resume a dead agent's PR)
+# Continuation-agent brief (fix round / resume on an existing PR)
 
-You are resuming a PR whose previous agent died mid-loop (model-capacity outage). All rules
-of /Volumes/JustusStorage/Conductor2/workspaces/ferrum-edge/san-diego/.context/agent-brief.md
-apply (no local builds/tests — `cargo fmt --all` only; one `@codex review` per round; never
-merge; final report). Do NOT create a new worktree or branch — work in the existing worktree
-given in your prompt (the branch is checked out there).
+You are working an EXISTING PR: either resuming one whose previous agent died mid-loop
+(model-capacity outage) or running a fix round on findings handed to you by the orchestrator.
+All rules of `agent-brief.md` — the file sitting NEXT TO this one in the same skill directory
+(the orchestrator's prompt gives you its absolute path) — apply: no local builds/tests
+(`cargo fmt --all` only), one `@codex review` per round, never merge, final report. Do NOT
+create a new worktree or branch — work in the existing worktree given in your prompt (the
+branch is checked out there).
+
+## YOU are the implementer (do not sub-dispatch)
+
+Implement, commit, and push the changes YOURSELF, in this session. Do NOT invoke any
+agent-dispatch skill or script available in your environment (e.g. `opus-agents`,
+`.agents/skills/*/scripts/dispatch-agent.sh`, `claude` CLI workers) and do NOT spawn nested
+workers — the orchestrator chose this session's model and reasoning effort deliberately, and
+delegating the implementation silently substitutes different hands at a different effort. If a
+skill index entry fails to load (stale path), ignore it and continue; you need nothing beyond
+this brief, `agent-brief.md`, and your prompt.
 
 Resume procedure, in order:
 1. `git status` + `git log --oneline -5` in the worktree. If there is uncommitted WIP, read it,

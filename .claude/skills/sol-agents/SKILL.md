@@ -48,11 +48,23 @@ Non-negotiables:
 
 Every prompt starts with:
 `First read <path-to>/agent-brief.md and follow it exactly` (implementer mode) or
-`Read <path-to>/continuation-brief.md and follow it` (fix/shepherd modes).
+`Read <path-to>/continuation-brief.md AND <path-to>/agent-brief.md and follow them`
+(fix/shepherd modes — give BOTH absolute paths; the continuation brief defers to
+agent-brief for ground rules and must never be dispatched alone).
 Use the copies in THIS skill directory (they carry worktree isolation, no-local-builds
 policy, review-loop discipline, known-flake list, final-report format). Verify the
 briefs' review-bot section matches reality before dispatching (codex vs claude
 trigger — credits come and go); update the briefs if stale.
+
+Every prompt must also PIN THE WORKER'S ROLE explicitly (the briefs repeat it, but the
+prompt is what survives a partial brief read):
+"YOU are the implementer: write, commit, and push the changes yourself in this session.
+Do NOT invoke agent-dispatch skills from your environment (opus-agents,
+.agents/skills/*/scripts/dispatch-agent.sh, claude CLI workers) and do NOT spawn nested
+workers." The repo intentionally ships the mirror skill `.agents/skills/opus-agents/`
+(codex→Claude dispatch, for when the USER asks codex to delegate); without this pin a
+codex worker can pattern-match fix-round vocabulary onto that skill and silently delegate
+the implementation to a different model at a different effort than the user chose.
 
 Then append the mode block:
 
@@ -101,3 +113,11 @@ The orchestrator then handles verdicts/green-waiting between rounds.
   working bot; treat BOTH bots' threads (chatgpt-codex-connector, claude) as state.
 - Two agents naming a test identically → E0428 on merge; grep before enabling
   gated tests.
+- A codex worker's own skill registry may advertise stale paths (e.g.
+  `~/.codex/skills/.system/opus-agents/SKILL.md` → "No such file or directory" on its
+  first read). Harmless — workers self-recover — but it is also the on-ramp to the
+  nested-dispatch failure above: the worker goes looking for the repo-local
+  `.agents/skills/opus-agents/` copy and then follows it. The role pin in the prompt
+  (and now in both briefs) is the fix; if a completed run's report mentions
+  "dispatching a worker", treat the ACTUAL implementing model/effort as unknown and
+  weight your independent diff review accordingly.
