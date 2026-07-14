@@ -142,6 +142,7 @@ impl Plugin for UdpRateLimiting {
         let key = Arc::clone(&ctx.client_ip);
 
         if over_capacity && !self.limiter.contains_local_key(&key) {
+            super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
             return UdpDatagramVerdict::Drop;
         }
 
@@ -159,6 +160,7 @@ impl Plugin for UdpRateLimiting {
         if outcome.allowed {
             return UdpDatagramVerdict::Forward;
         }
+        super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
 
         match outcome.metric {
             Some("bytes") => warn!(

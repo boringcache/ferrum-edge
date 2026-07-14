@@ -1413,6 +1413,7 @@ impl Plugin for AiRateLimiter {
         self.evict_stale_entries();
 
         if !outcome.allowed {
+            super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
             let usage = outcome.usage.unwrap_or(0);
             warn!(
                 rate_limit_key = %key,

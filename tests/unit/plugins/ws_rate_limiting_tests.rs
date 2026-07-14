@@ -6,6 +6,7 @@ use ferrum_edge::plugins::{
     Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection, priority,
 };
 use serde_json::json;
+use std::sync::atomic::Ordering;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 // === Plugin creation and metadata ===
@@ -98,7 +99,10 @@ async fn test_frames_exceeding_limit_return_close_1008() {
         assert!(result.is_none());
     }
 
-    // 4th should be rejected with close code 1008
+    // 4th should be rejected with close code 1008 and exported by the
+    // aggregate limiter metric.
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry.rate_limit_exceeded.load(Ordering::Relaxed);
     let result = plugin
         .on_ws_frame(
             "test-proxy",
@@ -118,6 +122,7 @@ async fn test_frames_exceeding_limit_return_close_1008() {
         }
         other => panic!("Expected Close frame, got {:?}", other),
     }
+    assert!(registry.rate_limit_exceeded.load(Ordering::Relaxed) >= before + 1);
 }
 
 // === Per-connection isolation ===

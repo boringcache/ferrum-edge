@@ -467,7 +467,22 @@ pub fn increment_xds_warming_partial_apply(namespace: impl AsRef<str>) {
         .fetch_add(1, Ordering::Relaxed);
 }
 
+/// Render process-static mesh families without a gateway namespace label.
+/// Retained for diagnostics/tests that consume these helpers outside the
+/// configured Prometheus plugin.
 pub fn render_mesh_observability_metrics(output: &mut String) {
+    render_mesh_observability_metrics_with_gateway_namespace(output, "");
+}
+
+/// Render process-static mesh families with the configured gateway namespace.
+///
+/// `gateway_ns_label` is either empty or a pre-escaped fragment beginning with
+/// `,gateway_namespace=`. Mesh/resource families already use `namespace` for
+/// their own identity, so the distinct key avoids duplicate Prometheus labels.
+pub fn render_mesh_observability_metrics_with_gateway_namespace(
+    output: &mut String,
+    gateway_ns_label: &str,
+) {
     let now = unix_now_seconds();
     maybe_evict_stale_mesh_cert_expiry_series(now);
 
@@ -483,9 +498,10 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
                 .load(Ordering::Relaxed)
                 .saturating_sub(now);
             output.push_str(&format!(
-                "ferrum_mesh_cert_expiry_seconds{{spiffe_id=\"{}\",source=\"{}\"}} {}\n",
+                "ferrum_mesh_cert_expiry_seconds{{spiffe_id=\"{}\",source=\"{}\"{}}} {}\n",
                 escape_label_value(&entry.key().spiffe_id),
                 escape_label_value(&entry.key().source),
+                gateway_ns_label,
                 seconds_until_expiry
             ));
         }
@@ -498,9 +514,10 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
         output.push_str("# TYPE ferrum_mesh_cert_rotation_failures_total counter\n");
         for entry in MESH_CERT_ROTATION_FAILURES.iter() {
             output.push_str(&format!(
-                "ferrum_mesh_cert_rotation_failures_total{{spiffe_id=\"{}\",source=\"{}\"}} {}\n",
+                "ferrum_mesh_cert_rotation_failures_total{{spiffe_id=\"{}\",source=\"{}\"{}}} {}\n",
                 escape_label_value(&entry.key().spiffe_id),
                 escape_label_value(&entry.key().source),
+                gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)
             ));
         }
@@ -513,8 +530,9 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
         output.push_str("# TYPE ferrum_mesh_ca_health gauge\n");
         for entry in MESH_CA_HEALTH.iter() {
             output.push_str(&format!(
-                "ferrum_mesh_ca_health{{ca_type=\"{}\"}} {}\n",
+                "ferrum_mesh_ca_health{{ca_type=\"{}\"{}}} {}\n",
                 escape_label_value(&entry.key().ca_type),
+                gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)
             ));
         }
@@ -527,9 +545,10 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
         output.push_str("# TYPE ferrum_mesh_trust_bundle_version gauge\n");
         for entry in MESH_TRUST_BUNDLE_VERSIONS.iter() {
             output.push_str(&format!(
-                "ferrum_mesh_trust_bundle_version{{trust_domain=\"{}\",source=\"{}\"}} {}\n",
+                "ferrum_mesh_trust_bundle_version{{trust_domain=\"{}\",source=\"{}\"{}}} {}\n",
                 escape_label_value(&entry.key().trust_domain),
                 escape_label_value(&entry.key().source),
+                gateway_ns_label,
                 entry.value().version.load(Ordering::Relaxed)
             ));
         }
@@ -540,8 +559,9 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
         output.push_str("# TYPE ferrum_mesh_config_last_received_timestamp_seconds gauge\n");
         for entry in MESH_CONFIG_LAST_RECEIVED.iter() {
             output.push_str(&format!(
-                "ferrum_mesh_config_last_received_timestamp_seconds{{namespace=\"{}\"}} {}\n",
+                "ferrum_mesh_config_last_received_timestamp_seconds{{namespace=\"{}\"{}}} {}\n",
                 escape_label_value(entry.key()),
+                gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)
             ));
         }
@@ -554,8 +574,9 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
         output.push_str("# TYPE ferrum_mesh_mtls_handshake_failures_total counter\n");
         for entry in MESH_MTLS_HANDSHAKE_FAILURES.iter() {
             output.push_str(&format!(
-                "ferrum_mesh_mtls_handshake_failures_total{{reason=\"{}\"}} {}\n",
+                "ferrum_mesh_mtls_handshake_failures_total{{reason=\"{}\"{}}} {}\n",
                 escape_label_value(&entry.key().reason),
+                gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)
             ));
         }
@@ -565,10 +586,12 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
         "# HELP ferrum_mesh_inbound_plaintext_allowed 1 when the mesh inbound listener was allowed to come up without enforced mTLS (dev opt-out posture; production mode refuses this). 0 otherwise.\n",
     );
     output.push_str("# TYPE ferrum_mesh_inbound_plaintext_allowed gauge\n");
-    output.push_str(&format!(
-        "ferrum_mesh_inbound_plaintext_allowed {}\n",
-        MESH_INBOUND_PLAINTEXT_ALLOWED.load(Ordering::Relaxed)
-    ));
+    render_mesh_process_metric(
+        output,
+        "ferrum_mesh_inbound_plaintext_allowed",
+        MESH_INBOUND_PLAINTEXT_ALLOWED.load(Ordering::Relaxed),
+        gateway_ns_label,
+    );
 
     if !MESH_FEDERATION_POLL_FAILURES.is_empty() {
         output.push_str(
@@ -577,9 +600,10 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
         output.push_str("# TYPE ferrum_mesh_federation_poll_failures_total counter\n");
         for entry in MESH_FEDERATION_POLL_FAILURES.iter() {
             output.push_str(&format!(
-                "ferrum_mesh_federation_poll_failures_total{{trust_domain=\"{}\",endpoint=\"{}\"}} {}\n",
+                "ferrum_mesh_federation_poll_failures_total{{trust_domain=\"{}\",endpoint=\"{}\"{}}} {}\n",
                 escape_label_value(&entry.key().trust_domain),
                 escape_label_value(&entry.key().endpoint),
+                gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)
             ));
         }
@@ -598,16 +622,16 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
             let last = entry.value().load(Ordering::Relaxed);
             let trust_domain = escape_label_value(entry.key());
             output.push_str(&format!(
-                "ferrum_mesh_federation_last_success_timestamp_seconds{{trust_domain=\"{}\"}} {}\n",
-                trust_domain, last
+                "ferrum_mesh_federation_last_success_timestamp_seconds{{trust_domain=\"{}\"{}}} {}\n",
+                trust_domain, gateway_ns_label, last
             ));
             // Age clamps to 0 when the cached "last" timestamp is somehow in the
             // future (clock skew on a restart). Saturating subtraction keeps the
             // gauge non-negative for a Prometheus `gauge` type.
             let age = now.saturating_sub(last);
             output.push_str(&format!(
-                "ferrum_mesh_federation_bundle_age_seconds{{trust_domain=\"{}\"}} {}\n",
-                trust_domain, age
+                "ferrum_mesh_federation_bundle_age_seconds{{trust_domain=\"{}\"{}}} {}\n",
+                trust_domain, gateway_ns_label, age
             ));
         }
     }
@@ -619,10 +643,11 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
         output.push_str("# TYPE ferrum_mesh_remote_discovery_poll_failures_total counter\n");
         for entry in MESH_REMOTE_DISCOVERY_POLL_FAILURES.iter() {
             output.push_str(&format!(
-                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{}\",trust_domain=\"{}\",control_plane=\"{}\"}} {}\n",
+                "ferrum_mesh_remote_discovery_poll_failures_total{{cluster=\"{}\",trust_domain=\"{}\",control_plane=\"{}\"{}}} {}\n",
                 escape_label_value(&entry.key().cluster),
                 escape_label_value(&entry.key().trust_domain),
                 escape_label_value(&entry.key().control_plane),
+                gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)
             ));
         }
@@ -635,9 +660,10 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
         output.push_str("# TYPE ferrum_mesh_remote_discovery_poll_successes_total counter\n");
         for entry in MESH_REMOTE_DISCOVERY_POLL_SUCCESSES.iter() {
             output.push_str(&format!(
-                "ferrum_mesh_remote_discovery_poll_successes_total{{cluster=\"{}\",trust_domain=\"{}\"}} {}\n",
+                "ferrum_mesh_remote_discovery_poll_successes_total{{cluster=\"{}\",trust_domain=\"{}\"{}}} {}\n",
                 escape_label_value(&entry.key().cluster),
                 escape_label_value(&entry.key().trust_domain),
+                gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)
             ));
         }
@@ -658,13 +684,13 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
             let cluster = escape_label_value(&entry.key().cluster);
             let trust_domain = escape_label_value(&entry.key().trust_domain);
             output.push_str(&format!(
-                "ferrum_mesh_remote_discovery_last_success_timestamp_seconds{{cluster=\"{}\",trust_domain=\"{}\"}} {}\n",
-                cluster, trust_domain, last
+                "ferrum_mesh_remote_discovery_last_success_timestamp_seconds{{cluster=\"{}\",trust_domain=\"{}\"{}}} {}\n",
+                cluster, trust_domain, gateway_ns_label, last
             ));
             let age = now.saturating_sub(last);
             output.push_str(&format!(
-                "ferrum_mesh_remote_discovery_endpoint_age_seconds{{cluster=\"{}\",trust_domain=\"{}\"}} {}\n",
-                cluster, trust_domain, age
+                "ferrum_mesh_remote_discovery_endpoint_age_seconds{{cluster=\"{}\",trust_domain=\"{}\"{}}} {}\n",
+                cluster, trust_domain, gateway_ns_label, age
             ));
         }
     }
@@ -675,9 +701,12 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
             "# HELP ferrum_xds_streams_rejected_total ADS streams rejected for exceeding the per-node concurrent-stream ceiling.\n",
         );
         output.push_str("# TYPE ferrum_xds_streams_rejected_total counter\n");
-        output.push_str(&format!(
-            "ferrum_xds_streams_rejected_total {xds_streams_rejected}\n"
-        ));
+        render_mesh_process_metric(
+            output,
+            "ferrum_xds_streams_rejected_total",
+            xds_streams_rejected,
+            gateway_ns_label,
+        );
     }
 
     if !XDS_WARMING_PARTIAL_APPLIES.is_empty() {
@@ -687,8 +716,9 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
         output.push_str("# TYPE ferrum_xds_warming_partial_applies_total counter\n");
         for entry in XDS_WARMING_PARTIAL_APPLIES.iter() {
             output.push_str(&format!(
-                "ferrum_xds_warming_partial_applies_total{{namespace=\"{}\"}} {}\n",
+                "ferrum_xds_warming_partial_applies_total{{namespace=\"{}\"{}}} {}\n",
                 escape_label_value(entry.key()),
+                gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)
             ));
         }
@@ -701,12 +731,29 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
         output.push_str("# TYPE ferrum_xds_first_slice_nacks_total counter\n");
         for entry in XDS_FIRST_SLICE_NACKS.iter() {
             output.push_str(&format!(
-                "ferrum_xds_first_slice_nacks_total{{namespace=\"{}\",type_url=\"{}\"}} {}\n",
+                "ferrum_xds_first_slice_nacks_total{{namespace=\"{}\",type_url=\"{}\"{}}} {}\n",
                 escape_label_value(&entry.key().namespace),
                 escape_label_value(&entry.key().type_url),
+                gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)
             ));
         }
+    }
+}
+
+fn render_mesh_process_metric(
+    output: &mut String,
+    metric_name: &str,
+    value: u64,
+    gateway_ns_label: &str,
+) {
+    if gateway_ns_label.is_empty() {
+        let _ = writeln!(output, "{metric_name} {value}");
+    } else {
+        let label_body = gateway_ns_label
+            .strip_prefix(',')
+            .unwrap_or(gateway_ns_label);
+        let _ = writeln!(output, "{metric_name}{{{label_body}}} {value}");
     }
 }
 
@@ -934,32 +981,33 @@ pub fn render_mesh_histogram(
     output: &mut String,
     key: &MeshRequestKey,
     histogram: &HistogramBuckets,
+    gateway_ns_label: &str,
 ) {
     let base_labels = mesh_label_base_fragment(key);
     for (i, boundary) in histogram.boundaries.iter().enumerate() {
         let count = histogram.counts[i].load(Ordering::Relaxed);
         let _ = writeln!(
             output,
-            "ferrum_mesh_request_duration_ms_bucket{{{},le=\"{}\"}} {}",
-            base_labels, boundary, count
+            "ferrum_mesh_request_duration_ms_bucket{{{},le=\"{}\"{}}} {}",
+            base_labels, boundary, gateway_ns_label, count
         );
     }
     let total_count = histogram.count.load(Ordering::Relaxed);
     let _ = writeln!(
         output,
-        "ferrum_mesh_request_duration_ms_bucket{{{},le=\"+Inf\"}} {}",
-        base_labels, total_count
+        "ferrum_mesh_request_duration_ms_bucket{{{},le=\"+Inf\"{}}} {}",
+        base_labels, gateway_ns_label, total_count
     );
     let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
     let _ = writeln!(
         output,
-        "ferrum_mesh_request_duration_ms_sum{{{}}} {:.2}",
-        base_labels, sum
+        "ferrum_mesh_request_duration_ms_sum{{{}{}}} {:.2}",
+        base_labels, gateway_ns_label, sum
     );
     let _ = writeln!(
         output,
-        "ferrum_mesh_request_duration_ms_count{{{}}} {}",
-        base_labels, total_count
+        "ferrum_mesh_request_duration_ms_count{{{}{}}} {}",
+        base_labels, gateway_ns_label, total_count
     );
 }
 

@@ -184,6 +184,7 @@ impl Plugin for WsRateLimiting {
     ) -> Option<Message> {
         let over_capacity = self.maybe_evict();
         if over_capacity && !self.limiter.contains_local_key(&connection_id) {
+            super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
             warn!(
                 plugin = "ws_rate_limiting",
                 proxy_id = %proxy_id,
@@ -209,6 +210,7 @@ impl Plugin for WsRateLimiting {
         if outcome.allowed {
             return None;
         }
+        super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
 
         let dir_label = match direction {
             WebSocketFrameDirection::ClientToBackend => "client->backend",

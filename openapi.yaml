@@ -7061,6 +7061,8 @@ components:
                 const: prometheus_metrics
           then:
             properties:
+              scope:
+                const: global
               config:
                 $ref: "#/components/schemas/PrometheusMetricsConfig"
         - if:
@@ -10453,7 +10455,10 @@ components:
 
     PrometheusMetricsConfig:
       type: object
-      description: "Plugin: prometheus_metrics — Exports gateway metrics in Prometheus format."
+      description: >-
+        Plugin: prometheus_metrics — Exports gateway metrics in Prometheus
+        format. At most one enabled instance is permitted and it must use
+        global scope because the registry and tunables are process-wide.
       properties:
         render_cache_ttl_seconds:
           type: integer

@@ -196,6 +196,7 @@ impl RateLimiting {
         let outcome = self.limiter.check(key.clone(), &key, limit_op).await;
         self.maybe_evict_stale_entries();
         if !outcome.allowed {
+            super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
             warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded");
             return self.reject(&outcome);
         }
@@ -208,6 +209,7 @@ impl RateLimiting {
         let outcome = self.limiter.check(key.clone(), &key, limit_op).await;
         self.maybe_evict_stale_entries();
         if !outcome.allowed {
+            super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
             warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded (stream)");
             return self.reject(&outcome);
         }

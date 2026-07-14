@@ -42,6 +42,10 @@ pub struct BodyOutcome {
     /// True when the body did not complete because the client stopped
     /// consuming. Also true for the `Drop` safety-net path.
     pub client_disconnected: bool,
+    /// Terminal gRPC application status observed in trailers. This remains
+    /// separate from the HTTP response status because gRPC application
+    /// failures normally complete under HTTP 200.
+    pub grpc_status: Option<u32>,
 }
 
 impl BodyOutcome {
@@ -52,6 +56,7 @@ impl BodyOutcome {
             body_error_class: None,
             bytes_streamed,
             client_disconnected: false,
+            grpc_status: None,
         }
     }
 
@@ -63,6 +68,7 @@ impl BodyOutcome {
             body_error_class: Some(class),
             bytes_streamed,
             client_disconnected,
+            grpc_status: None,
         }
     }
 
@@ -74,7 +80,13 @@ impl BodyOutcome {
             body_error_class: Some(ErrorClass::ClientDisconnect),
             bytes_streamed,
             client_disconnected: true,
+            grpc_status: None,
         }
+    }
+
+    pub fn with_grpc_status(mut self, grpc_status: Option<u32>) -> Self {
+        self.grpc_status = grpc_status;
+        self
     }
 }
 
@@ -231,6 +243,10 @@ impl DeferredTransactionLogger {
         // body wrapper finishes or is dropped. Buffered responses populate
         // `bytes_received` synchronously and never reach the deferred logger.
         summary.bytes_received = outcome.bytes_streamed;
+        if let Some(grpc_status) = outcome.grpc_status {
+            ctx.metadata
+                .insert("grpc_status".to_string(), grpc_status.to_string());
+        }
 
         // Re-derive wall-clock latencies so streaming responses report the
         // real body-completion time instead of the header-flush snapshot.
@@ -350,6 +366,29 @@ mod tests {
         let summary = captured.lock().unwrap().clone().expect("log fired");
         assert_eq!(summary.bytes_received, 12345);
         assert!(summary.body_completed);
+    }
+
+    #[tokio::test]
+    async fn fire_patches_terminal_grpc_status_from_trailers() {
+        let captured = Arc::new(Mutex::new(None::<TransactionSummary>));
+        let capturer: Arc<dyn Plugin> = Arc::new(CapturingPlugin(captured.clone()));
+        let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![capturer]);
+        let ctx = RequestContext::new(
+            "1.2.3.4".to_string(),
+            "POST".to_string(),
+            "/rpc".to_string(),
+        );
+        let logger = DeferredTransactionLogger::new(fake_summary(), plugins, ctx);
+
+        logger.fire(BodyOutcome::success(12).with_grpc_status(Some(14)));
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let summary = captured.lock().unwrap().clone().expect("log fired");
+        assert_eq!(
+            summary.metadata.get("grpc_status").map(String::as_str),
+            Some("14")
+        );
+        assert_eq!(summary.response_status_code, 200);
     }
 
     #[tokio::test]

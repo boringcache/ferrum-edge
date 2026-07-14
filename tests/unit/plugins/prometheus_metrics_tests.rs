@@ -8,7 +8,9 @@ use ferrum_edge::plugins::prometheus_metrics::{
 };
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Direction, Plugin, StreamTransactionSummary, TransactionSummary,
+    WsDisconnectContext,
 };
+use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::ErrorClass;
 use serde_json::json;
 use std::collections::HashMap;
@@ -81,6 +83,28 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
     }
 }
 
+fn make_ws_summary(proxy_id: &str) -> WsDisconnectContext {
+    WsDisconnectContext {
+        namespace: "ferrum".to_string(),
+        proxy_id: proxy_id.to_string(),
+        proxy_name: Some("WebSocket Test".to_string()),
+        client_ip: "127.0.0.1".to_string(),
+        backend_target: "ws://backend.test/socket".to_string(),
+        listen_port: 8080,
+        duration_ms: 125.0,
+        frames_client_to_backend: 3,
+        frames_backend_to_client: 5,
+        bytes_client_to_backend: 30,
+        bytes_backend_to_client: 50,
+        direction: None,
+        io_side: None,
+        error_class: None,
+        consumer_username: None,
+        auth_method: None,
+        metadata: HashMap::new(),
+    }
+}
+
 #[tokio::test]
 async fn test_prometheus_plugin_creation() {
     let config = json!({});
@@ -88,6 +112,7 @@ async fn test_prometheus_plugin_creation() {
     assert_eq!(plugin.name(), "prometheus_metrics");
     assert_eq!(plugin.priority(), 9300);
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
+    assert!(plugin.requires_ws_disconnect_hooks());
 }
 
 #[tokio::test]
@@ -125,12 +150,109 @@ async fn test_registry_records_request_counter() {
 
     let key = CounterKey {
         proxy_id: Arc::from("proxy-1"),
-        method: Arc::from("GET"),
+        method: "GET",
         status_code: 200,
+        grpc_status: None,
     };
     assert!(registry.request_counter.contains_key(&key));
     let count = registry.request_counter.get(&key).unwrap();
     assert_eq!(count.value.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn test_registry_bounds_hostile_http_methods_to_other() {
+    let registry = MetricsRegistry::new();
+    for index in 0..100 {
+        let method = format!("X-HOSTILE-{index}-{}", "x".repeat(2048));
+        registry.record(&make_summary("method-bounded", &method, 200, 1.0, 1.0));
+    }
+
+    let key = CounterKey {
+        proxy_id: Arc::from("method-bounded"),
+        method: "OTHER",
+        status_code: 200,
+        grpc_status: None,
+    };
+    assert_eq!(registry.request_counter.len(), 1);
+    assert_eq!(
+        registry
+            .request_counter
+            .get(&key)
+            .expect("all extension methods share one bounded series")
+            .value
+            .load(Ordering::Relaxed),
+        100
+    );
+    let output = registry.render_uncached();
+    assert!(output.contains("method=\"OTHER\""));
+    assert!(!output.contains("X-HOSTILE"));
+}
+
+#[test]
+fn test_registry_distinguishes_bounded_grpc_terminal_statuses() {
+    let registry = MetricsRegistry::new();
+    for status in ["0", "14", "99", "malformed"] {
+        let mut summary = make_summary("grpc-status", "POST", 200, 1.0, 1.0);
+        summary
+            .metadata
+            .insert("grpc_status".to_string(), status.to_string());
+        registry.record(&summary);
+    }
+
+    let output = registry.render_uncached();
+    assert!(
+        output
+            .contains(r#"proxy_id="grpc-status",method="POST",status_code="200",grpc_status="0""#)
+    );
+    assert!(
+        output
+            .contains(r#"proxy_id="grpc-status",method="POST",status_code="200",grpc_status="14""#)
+    );
+    let other_key = CounterKey {
+        proxy_id: Arc::from("grpc-status"),
+        method: "POST",
+        status_code: 200,
+        grpc_status: Some("OTHER"),
+    };
+    assert_eq!(
+        registry
+            .request_counter
+            .get(&other_key)
+            .expect("non-standard and malformed status values share OTHER")
+            .value
+            .load(Ordering::Relaxed),
+        2
+    );
+}
+
+#[test]
+fn test_registry_records_websocket_completion_metrics() {
+    let registry = MetricsRegistry::new();
+    registry.record_ws_session(&make_ws_summary("ws-metrics"));
+
+    let mut failed = make_ws_summary("ws-metrics");
+    failed.duration_ms = 250.0;
+    failed.direction = Some(Direction::BackendToClient);
+    failed.io_side = Some(StreamIoSide::Read);
+    failed.error_class = Some(ErrorClass::ConnectionReset);
+    registry.record_ws_session(&failed);
+
+    let output = registry.render_uncached();
+    assert!(output.contains(
+        r#"ferrum_websocket_sessions_total{proxy_id="ws-metrics",result="success",direction="unknown",io_side="unknown",error_class="none"} 1"#
+    ));
+    assert!(output.contains(
+        r#"ferrum_websocket_sessions_total{proxy_id="ws-metrics",result="error",direction="backend_to_client",io_side="read",error_class="connection_reset"} 1"#
+    ));
+    assert!(output.contains(
+        r#"ferrum_websocket_bytes_total{proxy_id="ws-metrics",direction="client_to_backend"} 60"#
+    ));
+    assert!(output.contains(
+        r#"ferrum_websocket_frames_total{proxy_id="ws-metrics",direction="backend_to_client"} 10"#
+    ));
+    assert!(output.contains(
+        r#"ferrum_websocket_session_duration_ms_count{proxy_id="ws-metrics",result="error",direction="backend_to_client",io_side="read",error_class="connection_reset"} 1"#
+    ));
 }
 
 #[tokio::test]
@@ -143,8 +265,9 @@ async fn test_registry_ignores_mirror_summary() {
 
     let key = CounterKey {
         proxy_id: Arc::from("proxy-1"),
-        method: Arc::from("GET"),
+        method: "GET",
         status_code: 503,
+        grpc_status: None,
     };
     assert!(!registry.request_counter.contains_key(&key));
     assert!(registry.request_duration_buckets.is_empty());
@@ -389,8 +512,9 @@ async fn test_registry_increments_counter_on_repeated_requests() {
 
     let key = CounterKey {
         proxy_id: Arc::from("proxy-1"),
-        method: Arc::from("POST"),
+        method: "POST",
         status_code: 201,
+        grpc_status: None,
     };
     let count = registry.request_counter.get(&key).unwrap();
     assert_eq!(count.value.load(Ordering::Relaxed), 5);
@@ -448,8 +572,9 @@ async fn test_registry_separate_counters_per_proxy_method_status() {
             .request_counter
             .get(&CounterKey {
                 proxy_id: Arc::from("proxy-a"),
-                method: Arc::from("GET"),
-                status_code: 200
+                method: "GET",
+                status_code: 200,
+                grpc_status: None,
             })
             .unwrap()
             .value
@@ -461,8 +586,9 @@ async fn test_registry_separate_counters_per_proxy_method_status() {
             .request_counter
             .get(&CounterKey {
                 proxy_id: Arc::from("proxy-a"),
-                method: Arc::from("POST"),
-                status_code: 200
+                method: "POST",
+                status_code: 200,
+                grpc_status: None,
             })
             .unwrap()
             .value
@@ -474,8 +600,9 @@ async fn test_registry_separate_counters_per_proxy_method_status() {
             .request_counter
             .get(&CounterKey {
                 proxy_id: Arc::from("proxy-b"),
-                method: Arc::from("GET"),
-                status_code: 200
+                method: "GET",
+                status_code: 200,
+                grpc_status: None,
             })
             .unwrap()
             .value
@@ -487,8 +614,9 @@ async fn test_registry_separate_counters_per_proxy_method_status() {
             .request_counter
             .get(&CounterKey {
                 proxy_id: Arc::from("proxy-a"),
-                method: Arc::from("GET"),
-                status_code: 500
+                method: "GET",
+                status_code: 500,
+                grpc_status: None,
             })
             .unwrap()
             .value
@@ -576,8 +704,9 @@ async fn test_registry_unknown_proxy_uses_default_key() {
 
     assert!(registry.request_counter.contains_key(&CounterKey {
         proxy_id: Arc::from("unknown"),
-        method: Arc::from("GET"),
-        status_code: 200
+        method: "GET",
+        status_code: 200,
+        grpc_status: None,
     }));
 }
 
@@ -668,8 +797,8 @@ async fn test_registry_rate_limit_counter() {
     let registry = MetricsRegistry::new();
     assert_eq!(registry.rate_limit_exceeded.load(Ordering::Relaxed), 0);
 
-    registry.rate_limit_exceeded.fetch_add(1, Ordering::Relaxed);
-    registry.rate_limit_exceeded.fetch_add(1, Ordering::Relaxed);
+    registry.record_rate_limit_exceeded();
+    registry.record_rate_limit_exceeded();
 
     let output = registry.render_uncached();
     assert!(output.contains("ferrum_rate_limit_exceeded_total 2"));
@@ -736,8 +865,9 @@ async fn test_plugin_log_hook_records_metrics() {
     // Note: global registry is shared across tests, so we check our specific key exists
     assert!(registry.request_counter.contains_key(&CounterKey {
         proxy_id: Arc::from("log-hook-test"),
-        method: Arc::from("DELETE"),
-        status_code: 204
+        method: "DELETE",
+        status_code: 204,
+        grpc_status: None,
     }));
 }
 
@@ -805,8 +935,9 @@ async fn test_registry_render_escapes_prometheus_label_values() {
     let output = registry.render_uncached();
 
     assert!(output.contains(
-        "ferrum_requests_total{proxy_id=\"proxy\\\"line\\nslash\\\\id\",method=\"PO\\\"ST\",status_code=\"200\"} 1"
+        "ferrum_requests_total{proxy_id=\"proxy\\\"line\\nslash\\\\id\",method=\"OTHER\",status_code=\"200\"} 1"
     ));
+    assert!(!output.contains("PO\\\"ST"));
     assert!(output.contains(
         "ferrum_stream_connections_total{proxy_id=\"stream\\\"proxy\\nid\",protocol=\"tc\\\\p\"} 1"
     ));
@@ -818,6 +949,10 @@ async fn test_evict_stale_removes_old_entries() {
 
     registry.record(&make_summary("stale-proxy", "GET", 200, 10.0, 5.0));
     registry.record_stream(&make_stream_summary("stale-stream", "tcp"));
+    registry.record_ws_session(&make_ws_summary("stale-ws"));
+    registry.record_tls_source_refresh("vault", "certificate", "frontend", "success");
+    registry.record_mesh_outbound_registry_decision("stale-ns", "backend.test", "admit");
+    registry.record_mesh_outbound_registry_stream_decision("stale-ns", "tcp", "deny");
 
     // All entries exist
     assert_eq!(registry.request_counter.len(), 1);
@@ -834,6 +969,13 @@ async fn test_evict_stale_removes_old_entries() {
     assert!(registry.gateway_overhead_buckets.is_empty());
     assert!(registry.stream_connection_counter.is_empty());
     assert!(registry.stream_duration_buckets.is_empty());
+    assert!(registry.ws_session_counter.is_empty());
+    assert!(registry.ws_session_duration_buckets.is_empty());
+    assert!(registry.ws_bytes_counter.is_empty());
+    assert!(registry.ws_frames_counter.is_empty());
+    assert!(registry.tls_source_refresh_counter.is_empty());
+    assert!(registry.mesh_outbound_registry_decisions.is_empty());
+    assert!(registry.mesh_outbound_registry_stream_decisions.is_empty());
 }
 
 #[tokio::test]
@@ -841,6 +983,9 @@ async fn test_evict_stale_keeps_fresh_entries() {
     let registry = MetricsRegistry::new();
 
     registry.record(&make_summary("fresh-proxy", "GET", 200, 10.0, 5.0));
+    registry.record_tls_source_refresh("file", "certificate", "admin", "unchanged");
+    registry.record_mesh_outbound_registry_decision("fresh-ns", "backend.test", "deny");
+    registry.record_mesh_outbound_registry_stream_decision("fresh-ns", "udp", "admit");
 
     // Evict with a very large TTL — nothing should be evicted
     let evicted = registry.evict_stale(u64::MAX);
@@ -848,6 +993,9 @@ async fn test_evict_stale_keeps_fresh_entries() {
 
     // Entry should still exist
     assert_eq!(registry.request_counter.len(), 1);
+    assert_eq!(registry.tls_source_refresh_counter.len(), 1);
+    assert_eq!(registry.mesh_outbound_registry_decisions.len(), 1);
+    assert_eq!(registry.mesh_outbound_registry_stream_decisions.len(), 1);
 }
 
 #[tokio::test]
@@ -960,6 +1108,39 @@ async fn test_namespace_label_present_for_non_default_namespace() {
     ));
     // Rate limit counter should also have namespace label
     assert!(output.contains(r#"ferrum_rate_limit_exceeded_total{namespace="staging"}"#));
+}
+
+#[test]
+fn test_mesh_metrics_use_distinct_gateway_namespace_label() {
+    let registry = MetricsRegistry::new();
+    registry.configure(5, 3600, 0, "staging");
+    let mut summary = make_summary("mesh-namespace", "GET", 200, 10.0, 5.0);
+    summary.metadata = HashMap::from([
+        ("mesh.source.workload".to_string(), "frontend".to_string()),
+        (
+            "mesh.source.namespace".to_string(),
+            "application".to_string(),
+        ),
+        (
+            "mesh.destination.namespace".to_string(),
+            "payments".to_string(),
+        ),
+    ]);
+    registry.record(&summary);
+    prometheus_helpers::set_mesh_ca_health("gateway_namespace_test", true);
+
+    let output = registry.render_uncached();
+    let red_line = output
+        .lines()
+        .find(|line| line.starts_with("ferrum_mesh_requests_total{"))
+        .expect("mesh RED counter line");
+    assert!(red_line.contains(r#"source_namespace="application""#));
+    assert!(red_line.contains(r#"destination_namespace="payments""#));
+    assert!(red_line.contains(r#"gateway_namespace="staging""#));
+    assert!(!red_line.contains(r#",namespace="staging""#));
+    assert!(output.contains(
+        r#"ferrum_mesh_ca_health{ca_type="gateway_namespace_test",gateway_namespace="staging"} 1"#
+    ));
 }
 
 #[tokio::test]

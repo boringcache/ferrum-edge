@@ -1370,13 +1370,32 @@ pub(crate) fn grpc_admission_status_from_maps(
     headers: &HashMap<String, String>,
     http_status: u16,
 ) -> u16 {
-    trailers
-        .get("grpc-status")
-        .or_else(|| headers.get("grpc-status"))
-        .and_then(|s| s.trim().parse::<u32>().ok())
+    grpc_status_from_maps(trailers, headers)
         .filter(|&code| code != 0)
         .map(grpc_status_to_http_status)
         .unwrap_or(http_status)
+}
+
+/// Extract the terminal gRPC application status without mapping it onto HTTP.
+/// Trailers take precedence over trailers-only initial headers, matching the
+/// wire protocol. Callers use this for transaction metadata and metrics while
+/// retaining HTTP 200 as the transport status.
+pub(crate) fn grpc_status_from_maps(
+    trailers: &HashMap<String, String>,
+    headers: &HashMap<String, String>,
+) -> Option<u32> {
+    trailers
+        .get("grpc-status")
+        .or_else(|| headers.get("grpc-status"))
+        .map(|status| parse_grpc_status_value(status))
+}
+
+/// Parse a peer-supplied gRPC status without allowing malformed values to look
+/// like success. `u32::MAX` is outside the standard 0..=16 range, maps to an
+/// HTTP 500 health outcome, and is rendered in the bounded `OTHER` metric
+/// bucket.
+pub(crate) fn parse_grpc_status_value(status: &str) -> u32 {
+    status.trim().parse::<u32>().unwrap_or(u32::MAX)
 }
 
 /// Effective request-body cap for the sidecar mesh-mTLS dispatch path (issue
@@ -2743,6 +2762,27 @@ mod tests {
         AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
     };
     use chrono::Utc;
+
+    #[test]
+    fn terminal_grpc_status_prefers_trailers_and_preserves_ok() {
+        let headers = HashMap::from([("grpc-status".to_string(), "14".to_string())]);
+        let trailers = HashMap::from([("grpc-status".to_string(), "0".to_string())]);
+        assert_eq!(grpc_status_from_maps(&trailers, &headers), Some(0));
+        assert_eq!(
+            grpc_admission_status_from_maps(&trailers, &headers, 200),
+            200
+        );
+
+        let malformed = HashMap::from([("grpc-status".to_string(), "hostile".to_string())]);
+        assert_eq!(
+            grpc_status_from_maps(&malformed, &HashMap::new()),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            grpc_admission_status_from_maps(&malformed, &HashMap::new(), 200),
+            500
+        );
+    }
 
     /// Build a minimal `Proxy` for thread-local key tests. Uses HTTPS so the
     /// gRPC pool path is the realistic codepath (gRPC over TLS).

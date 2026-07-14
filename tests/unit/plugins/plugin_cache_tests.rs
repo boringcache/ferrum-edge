@@ -215,6 +215,105 @@ fn test_global_plugins_returned_for_all_proxies() {
 }
 
 #[test]
+fn test_prometheus_metrics_requires_global_and_unique_registry_owner() {
+    let scoped = make_config(
+        vec![make_proxy("p1", "/api", vec!["prometheus"])],
+        vec![make_plugin_config(
+            "prometheus",
+            "prometheus_metrics",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let scoped_error = PluginCache::new(&scoped)
+        .err()
+        .expect("plugin cache must reject a scoped registry owner");
+    assert!(scoped_error.contains("must have scope 'global'"));
+
+    let duplicate = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![
+            make_plugin_config(
+                "prometheus-a",
+                "prometheus_metrics",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+            make_plugin_config(
+                "prometheus-b",
+                "prometheus_metrics",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+        ],
+    );
+    let duplicate_error = PluginCache::new(&duplicate)
+        .err()
+        .expect("plugin cache must reject competing registry owners");
+    assert!(duplicate_error.contains("at most one enabled global instance"));
+}
+
+#[test]
+fn test_single_prometheus_metrics_instance_is_shared_once_across_protocols() {
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec![]),
+            make_proxy("p2", "/web", vec![]),
+        ],
+        vec![make_plugin_config(
+            "prometheus",
+            "prometheus_metrics",
+            PluginScope::Global,
+            None,
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).expect("one global registry owner is valid");
+    let p1_http = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let p1_tcp = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let p2_http = cache.get_plugins_for_protocol("p2", ProxyProtocol::Http);
+
+    assert_eq!(
+        p1_http
+            .iter()
+            .filter(|plugin| plugin.name() == "prometheus_metrics")
+            .count(),
+        1
+    );
+    assert_eq!(
+        p1_tcp
+            .iter()
+            .filter(|plugin| plugin.name() == "prometheus_metrics")
+            .count(),
+        1
+    );
+    assert_eq!(
+        p2_http
+            .iter()
+            .filter(|plugin| plugin.name() == "prometheus_metrics")
+            .count(),
+        1
+    );
+    let p1_http_prometheus = p1_http
+        .iter()
+        .find(|plugin| plugin.name() == "prometheus_metrics")
+        .expect("HTTP plugin");
+    let p1_tcp_prometheus = p1_tcp
+        .iter()
+        .find(|plugin| plugin.name() == "prometheus_metrics")
+        .expect("TCP plugin");
+    let p2_http_prometheus = p2_http
+        .iter()
+        .find(|plugin| plugin.name() == "prometheus_metrics")
+        .expect("second proxy HTTP plugin");
+    assert!(Arc::ptr_eq(p1_http_prometheus, p1_tcp_prometheus));
+    assert!(Arc::ptr_eq(p1_http_prometheus, p2_http_prometheus));
+}
+
+#[test]
 fn test_proxy_scoped_plugins_override_globals_of_same_name() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["ps1"])],
